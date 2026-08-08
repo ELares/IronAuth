@@ -1022,6 +1022,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0121_org_scoped_clients.sql"),
         },
+        Migration {
+            version: 122,
+            name: "org_token_lifetime",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0122_org_token_lifetime.sql"),
+        },
     ]
 }
 

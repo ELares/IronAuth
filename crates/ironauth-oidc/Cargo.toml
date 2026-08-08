@@ -1122,6 +1122,11 @@ name = "org_permissions_claim"
 path = "tests/org_permissions_claim.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "org_scoped_client_ttl"
+path = "tests/org_scoped_client_ttl.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true
 

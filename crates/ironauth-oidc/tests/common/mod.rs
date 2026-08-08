@@ -1159,6 +1159,31 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the experimental org-scoped-clients surface (issue #103, bet 1) and rebuild the
+    /// protocol router over the SAME store, env and registry, so an organization's stated
+    /// access-token lifetime narrows the tokens its clients receive.
+    ///
+    /// Built as a rebuild rather than a `start_with` variant so a single test can measure
+    /// the SAME environment, the SAME client and the SAME organization policy with the flag
+    /// off and then on: the difference it observes is then attributable to the flag and to
+    /// nothing else, which is what criterion 2 (zero behaviour change while off) needs.
+    pub fn enable_org_scoped_clients(&mut self) {
+        let state = OidcState::new(
+            self.db.store().clone(),
+            self.env.clone(),
+            Arc::clone(&self.registry),
+            &OidcConfig {
+                require_pkce_for_confidential_clients: false,
+                ..OidcConfig::default()
+            },
+            ISSUER_BASE,
+        )
+        .with_org_scoped_clients_enabled(true)
+        .with_third_party_admin_consent_required(false);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Arm the experimental signup fraud-review-queue surface (issue #82, PR 2) for the
     /// harness scope and rebuild the protocol router. Builds a fresh state over the SAME store,
     /// env, and registry from `config`, plus `with_signup_quarantine_enabled(true)` (the arming

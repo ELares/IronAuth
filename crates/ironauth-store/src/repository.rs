@@ -2689,6 +2689,43 @@ impl ClientRepo<'_> {
         Ok(row.and_then(|row| row.get::<Option<String>, _>("id_token_signed_response_alg")))
     }
 
+    /// The organization that OWNS this client (issue #103, migration 0121), or
+    /// `None` when the client is environment-owned or absent in this scope.
+    ///
+    /// `None` is the answer for the overwhelming majority of clients and is NOT an
+    /// error: `clients.organization_id` is nullable with no default precisely because
+    /// environment-owned is the permanent default. A caller must therefore treat
+    /// `None` as "no organization opinion applies" and leave its own defaults alone,
+    /// never as "the organization stated nothing restrictive".
+    ///
+    /// Returned as the raw stored string rather than a parsed `OrganizationId` so the
+    /// PARSE FAILURE is the caller's decision to make, and the two callers do not want
+    /// the same thing. A caller on the issuance path must fail closed: an unparseable
+    /// owner means the organization's policy cannot be read, and treating that as
+    /// absence would silently issue the token the policy exists to shorten.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn owning_organization(&self, id: &ClientId) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT organization_id FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| row.get::<Option<String>, _>("organization_id")))
+    }
+
     /// The client's stored STATIC custom-claims configuration within scope (issue
     /// #23), as the raw JSON text of the stored `custom_token_claims` JSONB, or
     /// `None` when the client configured none (the column is NULL) or is absent in
@@ -4979,6 +5016,136 @@ impl ActingClientRepo<'_> {
             target: id,
         };
         insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Set or clear the ORGANIZATION that owns a client (issue #103, migration 0121),
+    /// auditing `client.owning_organization.set` in the same transaction.
+    ///
+    /// `None` clears the ownership and returns the client to environment-owned, which is
+    /// the default every client holds today and the state migration 0121 keeps expressible
+    /// forever. Re-pointing an owned client at a DIFFERENT organization is permitted, for
+    /// the reason recorded on 0121: ownership confers no authority the way a project grant
+    /// does, so moving a client between organizations is an ordinary administrative act.
+    ///
+    /// # The CONTROL plane only
+    ///
+    /// Migration 0121 grants `UPDATE (organization_id)` on `clients` to `ironauth_control`
+    /// alone, so this must be reached through the control store; through the app store the
+    /// engine refuses it. That is the #31 column-scoped split doing its job rather than an
+    /// inconvenience: assigning a client to an organization is a management act, and the
+    /// authorization path (which runs as the app role and READS this column on every mint)
+    /// must not be able to rewrite the ownership it is about to obey.
+    ///
+    /// # The organization must be live in the client's own scope
+    ///
+    /// The migration's foreign key references `organizations (id)` and nothing more, so
+    /// the ENGINE alone would accept an organization belonging to another environment, and
+    /// would accept a soft-deleted one (the row is still there). The scoped existence probe
+    /// below refuses both, and it is load-bearing rather than tidy: the issuance path
+    /// resolves the owner with `parse_in_scope` and FAILS CLOSED when it does not parse in
+    /// scope, so a cross-scope assignment accepted here would stop that client issuing
+    /// tokens at all. A management write would have silently bricked a client.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such client is visible in this scope, or if the
+    /// organization is absent from it; [`StoreError::Database`] on a persistence failure.
+    pub async fn set_owning_organization(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        organization: Option<&OrganizationId>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let owner = organization.map(ToString::to_string);
+
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // The organization must exist and be LIVE in this scope.
+        //
+        // What refuses what, measured rather than assumed. A mutation sweep deleted an
+        // `organization.scope() != scope` guard that stood above this, and then gutted this
+        // query's own scope predicate, and a cross-scope organization was still refused
+        // both times: FORCED row-level security on `organizations` inside the scoped
+        // transaction is the layer that actually hides it, and neither of those two was
+        // doing the work its comment claimed. The predicate stays because a query that
+        // states its scope survives a future caller that opens the transaction differently,
+        // but it is not the thing to rely on.
+        //
+        // `deleted_at IS NULL` is the clause that carries its own weight: removing it makes
+        // a soft-deleted organization assignable, which nothing else here catches. The
+        // foreign key cannot, because the row is still present.
+        if let Some(owner) = owner.as_deref() {
+            let present = sqlx::query(
+                "SELECT 1 FROM organizations \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                 AND deleted_at IS NULL",
+            )
+            .bind(owner)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if present.is_none() {
+                return Err(StoreError::NotFound);
+            }
+        }
+
+        // Change-only write, matching every sibling above: a same-value writer changes
+        // nothing and writes no audit row. `IS DISTINCT FROM` is what makes that true for
+        // a NULLABLE column, where `<>` would answer NULL and match no row at all, so a
+        // clear-to-NULL on an already-NULL client would look like a real change.
+        let changed = sqlx::query(
+            "UPDATE clients SET organization_id = $1 \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND organization_id IS DISTINCT FROM $1 \
+             RETURNING id",
+        )
+        .bind(owner.as_deref())
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if changed.is_none() {
+            let exists = sqlx::query(
+                "SELECT 1 FROM clients \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound);
+            }
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::ClientOwningOrganizationSet,
+            target: id,
+        };
+        // The DIRECTION only. The organization identifier never reaches the audit detail,
+        // matching every other write here: the row already targets the client, and the
+        // reader who may see the detail is not always the reader who may see the org.
+        let detail = if owner.is_some() {
+            "owner=organization"
+        } else {
+            "owner=environment"
+        };
+        insert_audit_row(&mut tx, &spec, Some(detail)).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -42894,7 +43061,7 @@ async fn recompute_org_scoped_identifiers(
 /// drift.
 const ORG_AUTH_POLICY_SELECT_COLUMNS: &str = "id, organization_id, mfa_required, \
      allowed_factors, allowed_email_domains, jit_provisioning, invitations_enabled, \
-     session_ttl_secs, session_idle_ttl_secs, \
+     session_ttl_secs, session_idle_ttl_secs, access_token_ttl_secs, \
      metadata::text AS metadata_text, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
      (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
@@ -43267,11 +43434,12 @@ impl ActingOrgAuthPolicyRepo<'_> {
             "INSERT INTO org_auth_policies \
              (id, tenant_id, environment_id, organization_id, mfa_required, allowed_factors, \
               allowed_email_domains, jit_provisioning, invitations_enabled, session_ttl_secs, \
-              session_idle_ttl_secs, metadata, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                     COALESCE($12::jsonb, '{}'::jsonb), \
-                     TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
-                     TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval) \
+              session_idle_ttl_secs, access_token_ttl_secs, metadata, created_at, \
+              updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                     COALESCE($13::jsonb, '{}'::jsonb), \
+                     TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval) \
              ON CONFLICT (tenant_id, environment_id, organization_id) WHERE deleted_at IS NULL \
              DO UPDATE SET mfa_required = EXCLUDED.mfa_required, \
                            allowed_factors = EXCLUDED.allowed_factors, \
@@ -43280,6 +43448,7 @@ impl ActingOrgAuthPolicyRepo<'_> {
                            invitations_enabled = EXCLUDED.invitations_enabled, \
                            session_ttl_secs = EXCLUDED.session_ttl_secs, \
                            session_idle_ttl_secs = EXCLUDED.session_idle_ttl_secs, \
+                           access_token_ttl_secs = EXCLUDED.access_token_ttl_secs, \
                            metadata = EXCLUDED.metadata, \
                            updated_at = EXCLUDED.updated_at \
              RETURNING id",
@@ -43295,6 +43464,7 @@ impl ActingOrgAuthPolicyRepo<'_> {
         .bind(document.invitations_enabled)
         .bind(document.session_ttl_secs.map(secs_to_i32))
         .bind(document.session_idle_ttl_secs.map(secs_to_i32))
+        .bind(document.access_token_ttl_secs.map(secs_to_i32))
         .bind(None::<&str>)
         .bind(now_micros)
         .fetch_one(&mut *tx)
@@ -47206,6 +47376,9 @@ fn org_auth_policy_from_row(row: &PgRow, scope: &Scope) -> Result<OrgAuthPolicyR
             .map(secs_from_i32),
         session_idle_ttl_secs: row
             .get::<Option<i32>, _>("session_idle_ttl_secs")
+            .map(secs_from_i32),
+        access_token_ttl_secs: row
+            .get::<Option<i32>, _>("access_token_ttl_secs")
             .map(secs_from_i32),
     };
     Ok(OrgAuthPolicyRecord {

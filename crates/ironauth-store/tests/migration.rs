@@ -57,7 +57,7 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      unused app insert and delete grants, idempotency key retention, \
      step up policy control grants, webhook endpoints, webhook secret rotation, webhook \
      delivery attempts, webhook auto disable, client par requirement control grant, webhook \
-     event type filter, domain rule verification, management credential grants, management credential org confinement, project grants, org scoped clients.";
+     event type filter, domain rule verification, management credential grants, management credential org confinement, project grants, org scoped clients, org token lifetime.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -663,7 +663,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        121,
+        122,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -700,7 +700,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
             90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108,
-            109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121
+            109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122
         ]
     );
     let phase_of = |version: i64| async move {
