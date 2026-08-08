@@ -34,6 +34,9 @@ echo "==> audit foreign key claims (no comment asserts an audit_log foreign key 
 scripts/audit-fk-claim-scan.sh
 echo "==> test registration (every tests/*.rs file has a [[test]] entry; autotests are off)"
 scripts/test-registration.sh
+
+echo "==> independently publishable crates"
+scripts/publishable-crates.sh
 echo "==> idempotent write audit (no admin handler splits two store writes behind one Idempotency-Key)"
 scripts/idempotent-write-audit.sh
 
