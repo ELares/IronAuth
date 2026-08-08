@@ -37876,6 +37876,26 @@ impl OrganizationRepo<'_> {
 /// The projection every organization-membership read selects from `org_memberships`
 /// (the timestamp as epoch microseconds, the metadata as JSON text). One constant so
 /// the get and list projections cannot drift.
+/// The columns every [`OrgMembershipRecord`] read projects.
+///
+/// `user_id` is NOT NULL in this projection even though the column has been nullable since
+/// 0124, because this record models the USER membership surface: it has a `user_id` field and
+/// no way to express a principal that is not a user. Every read below therefore filters
+/// `owner_kind = 'user'`, so a service-account membership is INVISIBLE here rather than decoded
+/// into a shape with nowhere to put its principal. That surface is a separate one and is not
+/// built yet; until it is, `effective_permissions_for_service_account` is the only reader that
+/// sees those rows.
+///
+/// The filter is the guarantee and [`org_membership_from_row`] is the backstop: it reads
+/// `user_id` fallibly, so dropping a filter surfaces as a typed decode error rather than as a
+/// panic inside a request handler.
+///
+/// Both were measured together. Removing the discriminator from `get` or from `list_for_org`
+/// fails `a_service_account_membership_is_invisible_to_the_user_membership_surface`, and it
+/// fails carrying the decoder's message, which is what says the backstop fires instead of the
+/// panic. Removing it from `list_for_user` changes nothing and no test can make it: that read
+/// is already keyed on `user_id = $3`, and the NULL a service-account row carries there matches
+/// no value. It stays so the three reads of this projection state the same rule.
 const ORG_MEMBERSHIP_SELECT_COLUMNS: &str = "id, organization_id, user_id, state, \
      metadata::text AS metadata_text, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
@@ -37911,7 +37931,8 @@ impl OrgMembershipRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(&format!(
             "SELECT {ORG_MEMBERSHIP_SELECT_COLUMNS} FROM org_memberships \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL"
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND deleted_at IS NULL AND owner_kind = 'user'"
         ))
         .bind(id.to_string())
         .bind(self.scope.tenant().to_string())
@@ -37944,7 +37965,7 @@ impl OrgMembershipRepo<'_> {
         let rows = sqlx::query(&format!(
             "SELECT {ORG_MEMBERSHIP_SELECT_COLUMNS} FROM org_memberships \
              WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
-             AND deleted_at IS NULL \
+             AND deleted_at IS NULL AND owner_kind = 'user' \
              AND ($4::bigint IS NULL OR (created_at, id) > \
                   (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
              ORDER BY created_at, id LIMIT $6"
@@ -37981,7 +38002,7 @@ impl OrgMembershipRepo<'_> {
         let rows = sqlx::query(&format!(
             "SELECT {ORG_MEMBERSHIP_SELECT_COLUMNS} FROM org_memberships \
              WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3 \
-             AND deleted_at IS NULL \
+             AND deleted_at IS NULL AND owner_kind = 'user' \
              ORDER BY created_at, id LIMIT $4"
         ))
         .bind(self.scope.tenant().to_string())
@@ -47420,7 +47441,17 @@ fn org_membership_from_row(row: &PgRow, scope: &Scope) -> Result<OrgMembershipRe
     let id = OrgMembershipId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
     let organization_id =
         OrganizationId::parse_in_scope(&row.get::<String, _>("organization_id"), scope)?;
-    let user_id = UserId::parse_in_scope(&row.get::<String, _>("user_id"), scope)?;
+    // Fallible on purpose. `user_id` is nullable since 0124 and NULL on a service-account
+    // membership, which this record cannot represent. Every read filters those rows out; this
+    // turns a filter that goes missing into a typed decode error instead of a panic.
+    let user_id: String = row.try_get("user_id").map_err(|_| {
+        StoreError::Database(sqlx::Error::Decode(
+            "org_memberships.user_id is NULL: a membership that does not bind a user reached \
+             the user membership surface"
+                .into(),
+        ))
+    })?;
+    let user_id = UserId::parse_in_scope(&user_id, scope)?;
     let metadata_text: String = row.get("metadata_text");
     // The metadata passed a `::jsonb` cast on write, so a parse failure here is an
     // internal invariant violation; surface it as a decode error, not a silent empty.
