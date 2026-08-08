@@ -763,3 +763,85 @@ async fn a_soft_deleted_organizations_keys_stop_verifying() {
          alone, so a state-only check would keep them working"
     );
 }
+
+/// A SERVICE-ACCOUNT-owned key verifies, and stops when its principal is gone.
+///
+/// The third owner kind, and the last one with no test. `verify` answers the service-account
+/// branch on the JOIN's presence rather than on a state column, because `service_accounts`
+/// carries no state and no `deleted_at`: the principal either exists or it does not.
+///
+/// Written because twelve user tests and two organization tests would otherwise let a reader
+/// infer that all three owner kinds are covered. They were not, and the organization gap that
+/// inference would have hidden was two independent authentication bypasses.
+#[tokio::test]
+async fn a_service_account_owned_key_verifies_and_dies_with_its_principal() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // A service-account principal is minted for a CLIENT, on that client's first
+    // client-credentials issuance. Reached here through the same `ensure` seam.
+    let client = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "a machine client")
+        .await
+        .expect("create the client");
+    let principal = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .service_accounts()
+        .ensure(&env, &client)
+        .await
+        .expect("mint the service-account principal");
+
+    let plaintext = issue(
+        &db,
+        &env,
+        scope,
+        &ApiKeyOwner::ServiceAccount(principal),
+        ApiKeyKindTag::ApiKey,
+    )
+    .await;
+    let resolved = db
+        .store()
+        .scoped(scope)
+        .api_keys()
+        .verify(&plaintext, now_micros(&env))
+        .await
+        .expect("verify")
+        .expect("a service-account key verifies");
+    assert_eq!(resolved.owner, ApiKeyOwner::ServiceAccount(principal));
+
+    // Can the principal actually vanish under a live key? No: migration 0123's
+    // `FOREIGN KEY (service_account_id) REFERENCES service_accounts (id)` has no ON DELETE, so
+    // it RESTRICTS. That is worth pinning, because it means `verify`'s presence check is
+    // unreachable while a key exists rather than a live defence.
+    //
+    // The first version of this test deleted the KEY row and then the principal, and asserted
+    // the key no longer verified. It did not verify because it had been deleted. The assertion
+    // was true and measured nothing.
+    let refused = sqlx::query("DELETE FROM service_accounts WHERE id = $1")
+        .bind(principal.to_string())
+        .execute(db.owner_pool())
+        .await;
+    assert!(
+        refused.is_err(),
+        "the foreign key must REFUSE removing a principal that still owns keys. If this ever \
+         succeeds, `verify`'s service-account presence check becomes load-bearing and needs a \
+         test that actually reaches it"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .api_keys()
+            .verify(&plaintext, now_micros(&env))
+            .await
+            .expect("verify")
+            .is_some(),
+        "the refused delete must leave the key working"
+    );
+}
