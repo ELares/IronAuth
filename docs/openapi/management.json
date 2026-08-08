@@ -13839,6 +13839,203 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules": {
+      "get": {
+        "tags": [
+          "connectors"
+        ],
+        "operationId": "listRoutingRules",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every routing rule in this environment, by evaluation priority",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutingRuleListView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is not a live row of this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "connectors"
+        ],
+        "operationId": "createRoutingRule",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRoutingRuleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created. A DOMAIN rule is created pending and routes nothing until its token is published in DNS and verified",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutingRuleView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, or an unknown selector kind",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment or the organization connection is not a live row of this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "That domain or client is already routed in this environment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/secrets": {
       "get": {
         "tags": [
@@ -20934,6 +21131,38 @@
           }
         }
       },
+      "CreateRoutingRuleRequest": {
+        "type": "object",
+        "description": "A routing rule to create.",
+        "required": [
+          "kind",
+          "value",
+          "org_connection_id"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the rule is enabled. A domain rule that is enabled still routes nothing\nuntil its domain is verified."
+          },
+          "kind": {
+            "type": "string",
+            "description": "The selector kind: `domain`, `app`, or `user`."
+          },
+          "org_connection_id": {
+            "type": "string",
+            "description": "The `ocn_` organization connection a matching login routes to."
+          },
+          "priority": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Evaluation priority; lower is considered first."
+          },
+          "value": {
+            "type": "string",
+            "description": "The selector value: an email domain, a client id, or a login identifier,\naccording to `kind`. A `user` value is blind-indexed by the store and never\nstored in plaintext."
+          }
+        }
+      },
       "CreateTenantRequest": {
         "type": "object",
         "description": "The body to create a tenant. The first environment is created with it.",
@@ -24259,6 +24488,90 @@
           "name": {
             "type": "string",
             "description": "The signal name."
+          }
+        }
+      },
+      "RoutingRuleListView": {
+        "type": "object",
+        "description": "A page of routing rules.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RoutingRuleView"
+            },
+            "description": "Every rule in this environment, by evaluation priority."
+          }
+        }
+      },
+      "RoutingRuleView": {
+        "type": "object",
+        "description": "A routing rule as returned to a caller.",
+        "required": [
+          "id",
+          "kind",
+          "org_connection_id",
+          "priority",
+          "enabled",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client id, present only for an `app` rule."
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time in milliseconds since the epoch."
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The normalized email domain, present only for a `domain` rule."
+          },
+          "domain_verification_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The domain verification state (`pending`, `verified`, `failed`), present only for\na `domain` rule. Routing consults only `verified`."
+          },
+          "domain_verification_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The value to publish as a DNS TXT record on the domain, present only for a\n`domain` rule. Public by design: publishing it IS the proof of control."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the rule is enabled."
+          },
+          "id": {
+            "type": "string",
+            "description": "The rule identifier (`rrl_...`)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "The selector kind (`domain`, `app`, or `user`)."
+          },
+          "org_connection_id": {
+            "type": "string",
+            "description": "The organization connection a matching login routes to."
+          },
+          "priority": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Evaluation priority."
           }
         }
       },

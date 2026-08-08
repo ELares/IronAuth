@@ -303,6 +303,8 @@ struct Fixture {
     doomed_environment: String,
     operator: String,
     client: String,
+    /// A real `ocn_` binding, so the routing-rule create addresses a live target.
+    org_connection: String,
     /// A LIVE grant, so the withdrawal case measures the environment fence rather than
     /// an id that never resolved (issue #102).
     project_grant: String,
@@ -508,6 +510,38 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "create connector: {body}");
         let connector = field(&body, "/id", "seed connector");
+
+        // A real org connection, so the routing-rule create addresses a target that
+        // EXISTS. A synthetic one answers the uniform not-found at a live environment
+        // too, which would make driving it at a soft-deleted one measure nothing.
+        let org_connection = ironauth_store::OrgConnectionId::generate(&env, &scope);
+        h.db()
+            .control_store()
+            .scoped(scope)
+            .acting(h.db().test_actor(&env), CorrelationId::generate(&env))
+            .org_connections()
+            .create(
+                &env,
+                &org_connection,
+                1_000_000,
+                ironauth_store::NewOrgConnection {
+                    organization_id: &ironauth_store::OrganizationId::parse_in_scope(
+                        &organization,
+                        &scope,
+                    )
+                    .expect("the seeded organization id"),
+                    connector_id: &ironauth_store::ConnectorId::parse_in_scope(&connector, &scope)
+                        .expect("the seeded connector id"),
+                    overlay_min_acr: None,
+                    max_age_secs: None,
+                    overlay_min_class: None,
+                    capture_upstream_tokens: false,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("seed org connection");
+        let org_connection = org_connection.to_string();
 
         // A real endpoint, so the delete case addresses an id that PARSES in this scope.
         // A synthetic one is the uniform not-found at a live environment too, which would
@@ -972,6 +1006,7 @@ impl Fixture {
         Self {
             tenant,
             environment,
+            org_connection,
             project_grant,
             doomed_tenant,
             doomed_environment,
@@ -1022,6 +1057,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         doomed_environment,
         operator,
         client,
+        org_connection,
         project_grant,
         connector,
         webhook_endpoint,
@@ -1788,6 +1824,22 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         // valid and means this organization's delegated administrators may assign
         // nothing. It also uses a DIFFERENT application from the seeded grant's, because
         // migration 0120 permits at most one live grant per (client, organization) pair.
+        // Enterprise inbound routing (issue #96).
+        Case::empty(
+            "routing_rules.listRoutingRules",
+            "GET",
+            format!("{base}/routing-rules"),
+        ),
+        Case::json(
+            "routing_rules.createRoutingRule",
+            "POST",
+            format!("{base}/routing-rules"),
+            &serde_json::json!({
+                "kind": "domain",
+                "value": "sweep.example",
+                "org_connection_id": org_connection,
+            }),
+        ),
         Case::empty(
             "project_grants.listProjectGrants",
             "GET",
@@ -2195,6 +2247,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         doomed_environment: "env_1".to_owned(),
         operator: "opr_0".to_owned(),
         client: "cli_0".to_owned(),
+        org_connection: "ocn_0".to_owned(),
         project_grant: "pgt_0".to_owned(),
         connector: "con_0".to_owned(),
         webhook_endpoint: "whe_0".to_owned(),
