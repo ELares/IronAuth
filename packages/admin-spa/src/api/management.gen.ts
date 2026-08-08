@@ -1191,6 +1191,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listOrganizationApiKeys"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role": {
         parameters: {
             query?: never;
@@ -2748,6 +2764,28 @@ export interface components {
              * @example omb_...
              */
             membership_id: string;
+        };
+        /** @description A page of keys. */
+        ApiKeyListView: {
+            /** @description This owner's keys, newest first, revoked ones included. */
+            items: components["schemas"]["ApiKeyView"][];
+        };
+        /** @description One key, as the management surface renders it. */
+        ApiKeyView: {
+            /** @description The operator-facing label. */
+            display_name: string;
+            /**
+             * Format: int64
+             * @description Expiry in milliseconds since the epoch, absent for a key that does not expire.
+             */
+            expires_at_unix_ms?: number | null;
+            /** @description The non-secret `akey_` handle. Every other operation names the key by this. */
+            id: string;
+            /**
+             * Format: int64
+             * @description Revocation time in milliseconds since the epoch, absent while the key is live.
+             */
+            revoked_at_unix_ms?: number | null;
         };
         /**
          * @description The apply request body: the source snapshot to promote, plus the plan's captured
@@ -12547,6 +12585,60 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, or already deactivated: a repeat delete). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listOrganizationApiKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This organization's keys, newest first, revoked ones included */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKeyListView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The organization is not a live row of this scope */
             404: {
                 headers: {
                     [name: string]: unknown;

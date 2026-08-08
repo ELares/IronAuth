@@ -129,9 +129,9 @@ pub use flow_version::{
 };
 pub use id::{
     AbuseBanId, AbuseBanKind, AccountLinkId, AccountLinkKind, AcmeChallengeId, AcmeChallengeKind,
-    AdminSudoElevationId, AdminSudoElevationKind, AgentId, AgentKind, AssertionMappingId,
-    AssertionMappingKind, AttestationConfigId, AttestationConfigKind, AuditId, AuditKind,
-    AuditTarget, AuthorizationCodeId, AuthorizationCodeKind, BackChannelDeliveryId,
+    AdminSudoElevationId, AdminSudoElevationKind, AgentId, AgentKind, ApiKeyId, ApiKeyKind,
+    AssertionMappingId, AssertionMappingKind, AttestationConfigId, AttestationConfigKind, AuditId,
+    AuditKind, AuditTarget, AuthorizationCodeId, AuthorizationCodeKind, BackChannelDeliveryId,
     BackChannelDeliveryKind, BrandId, BrandKind, COMPONENT_BYTES, ClientAdminGrantId,
     ClientAdminGrantKind, ClientId, ClientKind, ClientSessionId, ClientSessionKind, ConnectorId,
     ConnectorKind, ConsentId, ConsentKind, CorrelationId, CorrelationKind, CredentialClassPolicyId,

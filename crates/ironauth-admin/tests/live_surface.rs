@@ -1868,6 +1868,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             }),
         ),
         Case::empty(
+            "api_keys.listOrganizationApiKeys",
+            "GET",
+            format!("{org_base}/api-keys"),
+        ),
+        Case::empty(
             "project_grants.listProjectGrants",
             "GET",
             format!("{org_base}/project-grants"),

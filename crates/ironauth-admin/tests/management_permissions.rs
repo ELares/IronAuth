@@ -274,6 +274,7 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("createRoutingRule", ManagementPermission::WriteConfig),
     ("verifyRoutingRuleDomain", ManagementPermission::WriteConfig),
     ("listRoutingRules", ManagementPermission::Read),
+    ("listOrganizationApiKeys", ManagementPermission::Read),
     ("listProjectGrants", ManagementPermission::Read),
     (
         "withdrawProjectGrant",
@@ -468,6 +469,7 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
 /// The admin source, read at COMPILE time so this cannot be fooled by a working tree that
 /// differs from what was built.
 const ADMIN_SOURCES: &[(&str, &str)] = &[
+    ("api_keys.rs", include_str!("../src/api_keys.rs")),
     ("users.rs", include_str!("../src/users.rs")),
     ("organizations.rs", include_str!("../src/organizations.rs")),
     ("memberships.rs", include_str!("../src/memberships.rs")),

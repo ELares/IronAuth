@@ -608,6 +608,19 @@ impl Fixture {
                 live: StatusCode::OK,
             },
             Case {
+                label: "api_keys.listOrganizationApiKeys",
+                method: "GET",
+                path: format!("{base}/api-keys"),
+                body: None,
+                // No seeded key, so this asserts only the ADDRESSABILITY behaviour the
+                // sweep exists for: 200 while the environment is live, and the uniform
+                // refusal once it is deleted. An empty page is the correct live answer
+                // here, unlike the grants case below, which seeds a row precisely because
+                // a 200 carrying nothing would pass as an audit of a dead surface.
+                intent: Intent::Read(Vec::new()),
+                live: StatusCode::OK,
+            },
+            Case {
                 label: "project_grants.listProjectGrants",
                 method: "GET",
                 path: format!("{base}/project-grants"),

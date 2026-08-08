@@ -209,6 +209,7 @@ fn operation_ids_are_the_stable_set() {
             "listOrgMembershipRoles",
             "listOrgRolePermissions",
             "listOrgRoles",
+            "listOrganizationApiKeys",
             "listOrganizations",
             "listPermissions",
             "listProjectGrants",
@@ -532,6 +533,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members",
@@ -754,7 +756,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        204,
+        205,
         "the documented route count is pinned"
     );
 
