@@ -26,6 +26,7 @@ import {
   createOrgApiKey,
   fetchOrgApiKeys,
   revokeOrgApiKey,
+  rotateOrgApiKey,
 } from "../api/client";
 import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
 import { type OrgScope, inputValue, sudoFor } from "./orgPanels";
@@ -149,6 +150,41 @@ export function OrgApiKeysPanel({
                     to stop, which is the opposite of what the row says. */}
                 {key.revoked_at_unix_ms === undefined ||
                 key.revoked_at_unix_ms === null ? (
+                  <>
+                  <ConfirmButton
+                    label="Rotate"
+                    prompt="Rotate this key? The current key stops authenticating immediately and a replacement is issued in the same transaction, inheriting this key's name and expiry. The new key is shown ONCE and cannot be recovered."
+                    confirmLabel="Confirm rotate"
+                    disabled={mutation.state.pending}
+                    onConfirm={() =>
+                      void mutation
+                        .run(async () => {
+                          const created = await rotateOrgApiKey(
+                            tenantId,
+                            environmentId,
+                            organizationId,
+                            key.id,
+                          );
+                          // Same display-once rule as create, and the same replay
+                          // case: a replay answers with no key, and showing an empty
+                          // secret box would claim material the operator does not
+                          // have.
+                          setIssued(
+                            created.key === undefined || created.key === null
+                              ? null
+                              : { id: created.id, key: created.key },
+                          );
+                        }, "Key rotated.")
+                        .then((ok) => {
+                          if (ok) {
+                            // Plain `reload`, NOT `reloadClearingKey`: the
+                            // replacement key must survive the reload its own
+                            // rotation triggers, exactly as on create.
+                            reload();
+                          }
+                        })
+                    }
+                  />
                   <ConfirmButton
                     label="Revoke"
                     prompt="Revoke this key? Anything using it stops authenticating on its very next request, and the key cannot be recovered or un-revoked. The row stays listed so the revocation is legible."
@@ -176,6 +212,7 @@ export function OrgApiKeysPanel({
                         })
                     }
                   />
+                  </>
                 ) : null}
               </li>
             ))}
