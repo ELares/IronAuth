@@ -30,6 +30,8 @@
 //! refusal, so it is never a membership/existence/state oracle. A disabled or foreign organization
 //! cannot be picked.
 
+use std::collections::BTreeSet;
+
 use ironauth_store::{OrganizationId, Scope, StoreError, UserId};
 
 use super::message::{self, Message, MessageContext};
@@ -114,6 +116,125 @@ pub(super) async fn active_orgs(
     Ok(orgs)
 }
 
+/// The ACTIVE organizations the subject is NOT yet a member of but whose verified-domain policy
+/// would join them at session establishment (issue #96, criterion 5).
+///
+/// # Why this set is not already covered by the memberships above
+///
+/// Just-in-time provisioning (issue #95) runs inside `establish_session`, which is called at flow
+/// COMPLETION, after this step has already rendered and been advanced. So on a first login the
+/// eligible organizations are not memberships yet and the picker never saw them: a new employee at
+/// a verified corporate domain got no choice at all, was joined silently, and was first offered a
+/// picker on their SECOND sign-in. Criterion 5 asks for both sets because at picker time they
+/// genuinely are two sets.
+///
+/// # No new authority
+///
+/// Every organization here is one the subject would have been joined to anyway, moments later, by
+/// the same policy, without being asked. Offering it as a pick grants nothing that was not already
+/// going to be granted; it only lets the subject say which one this login is for. The eligibility
+/// predicate is the store's own `jit_eligible_orgs`, and the domains come from the seam the
+/// provisioner itself uses, so the two cannot drift.
+///
+/// The cheap `any_jit_provisioning_enabled` gate comes first, exactly as it does in the
+/// provisioner, so a deployment not using JIT does no extra read on the login path and this step
+/// behaves byte-identically to before.
+pub(super) async fn jit_eligible_orgs(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+) -> Result<Vec<ActiveOrg>, FlowError> {
+    match state
+        .store()
+        .scoped(scope)
+        .org_auth_policies()
+        .any_jit_provisioning_enabled()
+        .await
+    {
+        Ok(true) => {}
+        // Not in use, or a read fault. Either way, offer nothing: this is the access-granting
+        // direction and a store blip is never a reason to widen the list.
+        Ok(false) | Err(_) => return Ok(Vec::new()),
+    }
+    let domains = crate::interaction::verified_email_domains(state, scope, subject).await;
+    let mut orgs = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // `domains` is a BTreeSet and `jit_eligible_orgs` returns the store's deterministic order, so
+    // the result is stable across runs. The rendered node list is byte-pinned by the golden
+    // corpus, which a set with a nondeterministic order would break intermittently.
+    for domain in &domains {
+        let eligible = state
+            .store()
+            .scoped(scope)
+            .org_auth_policies()
+            .jit_eligible_orgs(domain)
+            .await
+            .map_err(|_| FlowError::Store)?;
+        for org in eligible {
+            if !seen.insert(org.to_string()) {
+                continue;
+            }
+            // Already a member: it is in `active_orgs` and must not be offered twice.
+            if state
+                .store()
+                .scoped(scope)
+                .org_memberships()
+                .exists(&org, subject)
+                .await
+                .map_err(|_| FlowError::Store)?
+            {
+                continue;
+            }
+            match state.store().scoped(scope).organizations().get(&org).await {
+                Ok(record) if record.state.is_active() => orgs.push(ActiveOrg {
+                    id: record.id.to_string(),
+                    display_name: record.display_name,
+                }),
+                Ok(_) | Err(StoreError::NotFound) => {}
+                Err(_) => return Err(FlowError::Store),
+            }
+        }
+    }
+    Ok(orgs)
+}
+
+/// Every organization the subject may pick: their live memberships FIRST, then the organizations
+/// their verified domain makes them eligible to join (issue #96, criterion 5).
+///
+/// Memberships lead because they are the ordinary case and the ordering is what the golden corpus
+/// pins. Both sets render as the same kind of control, deliberately: picking an eligible
+/// organization joins the subject to it through the SAME provisioning path that would have joined
+/// them silently, so there is no second class of pick and nothing for a caller to distinguish.
+pub(super) async fn pickable_orgs(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+) -> Result<Vec<ActiveOrg>, FlowError> {
+    let mut orgs = active_orgs(state, scope, subject).await?;
+    orgs.extend(jit_eligible_orgs(state, scope, subject).await?);
+    Ok(orgs)
+}
+
+/// Whether `org` is one the subject may pick: a live-and-active membership, OR an active
+/// organization their verified domain makes them JIT-eligible for (issue #96, criterion 5).
+///
+/// The acceptance predicate must be the SAME set the offer was built from, or the picker renders
+/// controls that refuse themselves.
+pub(super) async fn is_pickable(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    org: &OrganizationId,
+) -> Result<bool, FlowError> {
+    if is_active_membership(state, scope, subject, org).await? {
+        return Ok(true);
+    }
+    Ok(jit_eligible_orgs(state, scope, subject)
+        .await?
+        .iter()
+        .any(|eligible| eligible.id == org.to_string()))
+}
+
 /// Whether `org` is a LIVE membership of `subject` AND an ACTIVE organization (issue #94, PR-B2):
 /// the EXACT authoritative check PR-B1's parameter path runs (`exists` plus an active-state read),
 /// so a pick is validated identically to a parameter. Used by the advance to accept a pick and by
@@ -159,8 +280,11 @@ pub(super) async fn enter_nodes(
     if requested_org_present(return_to) {
         return Ok(Vec::new());
     }
-    let orgs = active_orgs(state, scope, subject).await?;
-    // Zero or one active membership is already determined (none / auto-selected), so skip.
+    let orgs = pickable_orgs(state, scope, subject).await?;
+    // Zero or one pickable organization is already determined (none, or the single one that
+    // auto-selects or JIT-joins), so skip. The threshold is unchanged; only the set it counts is
+    // wider, so a subject with exactly one eligible organization is still joined silently and
+    // never sees a prompt they have no choice in.
     if orgs.len() < 2 {
         return Ok(Vec::new());
     }
@@ -256,7 +380,7 @@ pub(super) async fn advance(
         OrganizationId::parse_in_scope(raw, &scope).map_err(|_| FlowError::InvalidSubmission)?;
     // Authoritative re-validation, identical to PR-B1's parameter path: a live membership AND an
     // active organization. A disabled or foreign organization cannot be picked.
-    if is_active_membership(state, scope, subject, &org).await? {
+    if is_pickable(state, scope, subject, &org).await? {
         Ok(OrgPickerStep::Complete(org))
     } else {
         Err(FlowError::InvalidSubmission)

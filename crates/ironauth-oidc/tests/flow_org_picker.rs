@@ -550,3 +550,270 @@ async fn the_picked_org_is_per_session_stable_across_a_second_code() {
     );
     assert_eq!(at_b["org_id"], org_a.to_string());
 }
+
+/// Attach an email identifier to `subject` (issue #96, criterion 5). A VERIFIED one is what makes
+/// its domain usable for eligibility; `allowed_email_domains` is an unverified operator assertion,
+/// so an unproven address must earn nothing.
+async fn add_email(harness: &Harness, subject: &str, raw: &str, verified: bool) {
+    let env = harness.env().clone();
+    let user = ironauth_store::UserId::parse_in_scope(subject, &harness.scope())
+        .expect("a well formed subject");
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(
+            harness.db().test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .user_identifiers()
+        .add(
+            &env,
+            ironauth_store::NewUserIdentifier {
+                id: &ironauth_store::UserIdentifierId::generate(&env, &harness.scope()),
+                user_id: &user,
+                identifier_type: ironauth_store::IdentifierType::Email,
+                raw,
+                verified,
+                mode: ironauth_store::UniquenessMode::EnvironmentWide,
+                org: None,
+            },
+            None,
+        )
+        .await
+        .expect("add email identifier");
+}
+
+/// An organization nobody is a member of that accepts `domain` for just-in-time provisioning.
+async fn seed_eligible_org(harness: &Harness, domain: &str) -> OrganizationId {
+    harness
+        .seed_unjoined_org(ironauth_store::AuthPolicy {
+            jit_provisioning: Some(true),
+            allowed_email_domains: Some([domain.to_owned()].into_iter().collect()),
+            ..ironauth_store::AuthPolicy::default()
+        })
+        .await
+}
+
+/// Whether `subject` is a member of `org`.
+async fn is_member(harness: &Harness, org: &OrganizationId, subject: &str) -> bool {
+    let user = ironauth_store::UserId::parse_in_scope(subject, &harness.scope())
+        .expect("a well formed subject");
+    harness
+        .store()
+        .scoped(harness.scope())
+        .org_memberships()
+        .exists(org, &user)
+        .await
+        .expect("membership lookup")
+}
+
+/// Criterion 5's list half: the picker offers organizations the subject is ELIGIBLE for, not only
+/// ones they already belong to.
+///
+/// The defect this closes is a first-login one and it is invisible from the second login onwards.
+/// Just-in-time provisioning runs inside `establish_session`, which is called at flow COMPLETION,
+/// so on a first sign-in the eligible organizations are not memberships yet. A new employee at a
+/// verified corporate domain therefore saw no picker at all, was joined silently, and was first
+/// offered a choice on their SECOND sign-in.
+#[tokio::test]
+async fn the_picker_offers_organizations_the_subject_is_only_eligible_for() {
+    let harness = setup().await;
+    let subject = seed_consenting_user(&harness, "newcomer@jit.test").await;
+    add_email(&harness, &subject, "newcomer@jit.test", true).await;
+
+    let first = seed_eligible_org(&harness, "jit.test").await;
+    let second = seed_eligible_org(&harness, "jit.test").await;
+    assert!(
+        !is_member(&harness, &first, &subject).await
+            && !is_member(&harness, &second, &subject).await,
+        "the fixture must start with NO memberships, or this measures the old behaviour"
+    );
+
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, held) = submit_primary(&harness, &flow_id, &token, "newcomer@jit.test").await;
+    assert_ne!(
+        held["state"], "completed",
+        "the picker must hold the mint: {held}"
+    );
+    let mut offered = picker_option_values(&held["flow"]);
+    offered.sort();
+    let mut expected = vec![first.to_string(), second.to_string()];
+    expected.sort();
+    assert_eq!(
+        offered, expected,
+        "a subject with two eligible organizations and no memberships must be asked which one \
+         this login is for"
+    );
+}
+
+/// Picking an eligible organization joins the subject to it and binds it onto the session.
+///
+/// The join happens through the SAME provisioning path that would have joined them silently, so
+/// the pick grants no authority that was not already going to be granted. What it adds is the
+/// subject saying WHICH one this login is for.
+#[tokio::test]
+async fn picking_an_eligible_organization_joins_it_and_binds_it_to_the_session() {
+    let harness = setup().await;
+    let client_id = harness.client_id().to_string();
+    let subject = seed_consenting_user(&harness, "joiner@jit.test").await;
+    add_email(&harness, &subject, "joiner@jit.test", true).await;
+    let chosen = seed_eligible_org(&harness, "jit.test").await;
+    let other = seed_eligible_org(&harness, "jit.test").await;
+
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, held) = submit_primary(&harness, &flow_id, &token, "joiner@jit.test").await;
+    assert_ne!(
+        held["state"], "completed",
+        "the picker must hold the mint: {held}"
+    );
+    // The render issues a FRESH submit token; the create-time one is spent.
+    let token = held["submit_token"].as_str().expect("token").to_owned();
+    let (status, headers, body) =
+        submit_pick(&harness, &flow_id, &token, &chosen.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "the pick completes: {body}");
+
+    assert!(
+        is_member(&harness, &chosen, &subject).await,
+        "picking an eligible organization must leave the subject a member of it"
+    );
+    // The OTHER eligible organization is joined too, because that is what issue #95's policy
+    // says happens at session establishment and this change does not alter it. The pick decides
+    // the login's org CONTEXT, not which memberships are earned.
+    assert!(
+        is_member(&harness, &other, &subject).await,
+        "the pick must not suppress provisioning the subject was already entitled to"
+    );
+
+    let cookie = session_cookie_from_headers(&headers);
+    let code = authorize_to_code(&harness, &cookie, &authorize_query(&client_id, &[])).await;
+    let (access, id_token) = exchange_claims(&harness, &client_id, &code).await;
+    assert_eq!(
+        access["org_id"],
+        chosen.to_string(),
+        "the access token must carry the PICKED organization"
+    );
+    assert_eq!(id_token["org_id"], chosen.to_string());
+}
+
+/// A single eligible organization still skips the picker. No new prompt for a subject with no
+/// choice to make.
+///
+/// The skip threshold is unchanged; only the set it counts is wider. This is the control that
+/// proves widening the set did not turn every first login at a verified domain into a prompt.
+#[tokio::test]
+async fn a_single_eligible_organization_still_joins_silently_with_no_prompt() {
+    let harness = setup().await;
+    let subject = seed_consenting_user(&harness, "solo@jit.test").await;
+    add_email(&harness, &subject, "solo@jit.test", true).await;
+    let only = seed_eligible_org(&harness, "jit.test").await;
+
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (st, _, done) = submit_primary(&harness, &flow_id, &token, "solo@jit.test").await;
+    assert_eq!(st, StatusCode::OK, "primary: {done}");
+    assert_eq!(
+        done["state"], "completed",
+        "one eligible organization is not a choice, so the login must mint directly exactly as \
+         it did before this change: {done}"
+    );
+    assert!(
+        is_member(&harness, &only, &subject).await,
+        "the silent just-in-time join must still happen"
+    );
+}
+
+/// An UNVERIFIED email earns no offer.
+///
+/// `allowed_email_domains` is an operator assertion about a domain, not proof the subject holds an
+/// address in it. Offering on an unproven address would let anyone be shown, and then join, any
+/// organization by claiming one of its addresses.
+#[tokio::test]
+async fn an_unverified_email_domain_is_never_offered() {
+    let harness = setup().await;
+    let subject = seed_consenting_user(&harness, "unproven@jit.test").await;
+    add_email(&harness, &subject, "unproven@jit.test", false).await;
+    seed_eligible_org(&harness, "jit.test").await;
+    seed_eligible_org(&harness, "jit.test").await;
+
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, done) = submit_primary(&harness, &flow_id, &token, "unproven@jit.test").await;
+    assert_eq!(
+        done["state"], "completed",
+        "two eligible organizations were offered on the strength of an UNVERIFIED address: \
+         {done}"
+    );
+}
+
+/// An organization the subject is neither a member of nor eligible for cannot be picked, even
+/// though the picker is rendering.
+///
+/// The acceptance predicate must be exactly the set the offer was built from. A picker that
+/// renders two controls but accepts a third id is an org-existence oracle.
+#[tokio::test]
+async fn an_organization_that_was_not_offered_is_refused_uniformly() {
+    let harness = setup().await;
+    let subject = seed_consenting_user(&harness, "prober@jit.test").await;
+    add_email(&harness, &subject, "prober@jit.test", true).await;
+    seed_eligible_org(&harness, "jit.test").await;
+    seed_eligible_org(&harness, "jit.test").await;
+    // A real, live organization that accepts a DIFFERENT domain, so it exists and is active and
+    // is nonetheless not this subject's to pick.
+    let foreign = seed_eligible_org(&harness, "elsewhere.test").await;
+
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, held) = submit_primary(&harness, &flow_id, &token, "prober@jit.test").await;
+    assert_eq!(picker_option_values(&held["flow"]).len(), 2);
+
+    let token = held["submit_token"].as_str().expect("token").to_owned();
+    let (status, _, _) = submit_pick(&harness, &flow_id, &token, &foreign.to_string()).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "an organization outside the offered set was accepted"
+    );
+    assert!(
+        !is_member(&harness, &foreign, &subject).await,
+        "the refused pick must leave no membership behind"
+    );
+}
+
+/// An organization the subject is BOTH a member of and eligible for is offered exactly once.
+///
+/// The two sets overlap in the ordinary steady state: after a first login, every organization the
+/// domain made the subject eligible for is also a membership. Without the already-a-member filter
+/// the picker renders the same organization twice, and a duplicate submit control is not a
+/// cosmetic problem: the two controls carry the same value, so the rendered node list stops being
+/// a faithful description of the choice and the golden corpus pins the wrong bytes.
+#[tokio::test]
+async fn an_organization_that_is_both_a_membership_and_eligible_is_offered_once() {
+    let harness = setup().await;
+    let subject = seed_consenting_user(&harness, "returning@jit.test").await;
+    add_email(&harness, &subject, "returning@jit.test", true).await;
+
+    let overlapping = seed_eligible_org(&harness, "jit.test").await;
+    // The membership the first login would have earned.
+    add_member(&harness, &overlapping, &subject).await;
+    let second = create_org(&harness, "Unrelated").await;
+    add_member(&harness, &second, &subject).await;
+
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, held) = submit_primary(&harness, &flow_id, &token, "returning@jit.test").await;
+    assert_ne!(
+        held["state"], "completed",
+        "the picker must hold the mint: {held}"
+    );
+
+    let offered = picker_option_values(&held["flow"]);
+    assert_eq!(
+        offered
+            .iter()
+            .filter(|id| *id == &overlapping.to_string())
+            .count(),
+        1,
+        "the overlapping organization was offered more than once: {offered:?}"
+    );
+    assert_eq!(
+        offered.len(),
+        2,
+        "exactly two distinct organizations: {offered:?}"
+    );
+}

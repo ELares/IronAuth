@@ -920,7 +920,15 @@ async fn consume_and_complete(
             let subject_id =
                 UserId::parse_in_scope(subject, &scope).map_err(|_| FlowError::Store)?;
             let org = OrganizationId::parse_in_scope(raw, &scope).map_err(|_| FlowError::Store)?;
-            if org_picker::is_active_membership(state, scope, &subject_id, &org).await? {
+            // PICKABLE, not member-only (issue #96, criterion 5). The picker now also offers
+            // organizations the subject's verified domain makes them JIT-eligible for, and those
+            // are not memberships YET: `establish_session` below is what provisions them. A
+            // member-only check here would refuse the very controls the step just rendered.
+            //
+            // This does NOT widen what a session can end up bound to. The bind below re-checks
+            // ACTUAL membership after provisioning has run, so an organization that was offered
+            // and then not joined binds nothing.
+            if org_picker::is_pickable(state, scope, &subject_id, &org).await? {
                 Some(org)
             } else {
                 // Uniform refusal: re-render the fenced picker nodes, flow OPEN (not consumed).
@@ -957,13 +965,36 @@ async fn consume_and_complete(
             // wins, so PR-B1's `resolve_org_context` frozen-session-wins branch returns it at
             // code-issue with NO change to `resolve_org_context`. A store fault fails CLOSED.
             if let Some(org) = bind_org {
-                state
-                    .store()
-                    .scoped(scope)
-                    .sessions()
-                    .bind_org(session.session_id(), &org)
-                    .await
-                    .map_err(|_| FlowError::Store)?;
+                // The pick was validated as PICKABLE before the flow was consumed, which for a
+                // JIT-eligible organization means "policy says you will be joined", not "you are
+                // a member". `establish_session` has now run and is what performs that join, so
+                // membership is re-checked HERE, against the state provisioning actually left.
+                //
+                // NO TEST DRIVES THIS BRANCH, and a mutation sweep confirmed it: replacing the
+                // condition with `true` changed nothing observable. That is expected rather than
+                // a gap in the tests. The offer and the provisioner read eligibility through the
+                // same seam, so they cannot disagree on any input a test can construct. What is
+                // left is the runtime case: `jit_provision_memberships` writes with `let _ =` and
+                // SWALLOWS a store fault, so a failed membership write leaves eligibility saying
+                // yes and membership saying no. Without this check that combination binds an
+                // `org_id` claim for an organization the subject is not in.
+                //
+                // Fails CLOSED by binding NOTHING: the login succeeds and the session carries no
+                // organization context, rather than carrying one the subject is not a member of.
+                // The alternative, binding on the strength of the earlier eligibility check,
+                // would put an `org_id` claim in a token for an organization the provisioner
+                // declined or failed to join, which is an unearned grant.
+                let subject_id =
+                    UserId::parse_in_scope(subject, &scope).map_err(|_| FlowError::Store)?;
+                if org_picker::is_active_membership(state, scope, &subject_id, &org).await? {
+                    state
+                        .store()
+                        .scoped(scope)
+                        .sessions()
+                        .bind_org(session.session_id(), &org)
+                        .await
+                        .map_err(|_| FlowError::Store)?;
+                }
             }
             Ok(Continuation::Complete {
                 session: Box::new(session),
