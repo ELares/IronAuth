@@ -502,3 +502,105 @@ async fn a_membership_naming_a_service_account_row_in_another_scope_resolves_to_
         "a principal whose row lives in another scope must resolve to nothing, got {resolved:?}"
     );
 }
+
+/// A service-account membership is INVISIBLE to the user membership surface.
+///
+/// `OrgMembershipRecord` has a `user_id` field and no way to express a principal that is not a
+/// user, so a service-account row must not reach it. The reads filter `owner_kind = 'user'`.
+/// Without that filter `list_for_org` would decode a row whose `user_id` is NULL, and before
+/// the decoder was made fallible that was a panic inside a request handler rather than an
+/// error: an administrator listing an organization would have taken the worker down.
+///
+/// Both halves are asserted together, because "the list is right" and "the id does not resolve"
+/// fail independently and a fence on only one of them is the more likely mistake.
+#[tokio::test]
+async fn a_service_account_membership_is_invisible_to_the_user_membership_surface() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "human@example.test").await;
+    let org = ironauth_store::OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org, now_micros(&env), "acme", None)
+        .await
+        .expect("create org");
+
+    // One ordinary membership, so an empty result cannot pass this test for the wrong reason.
+    let human = ironauth_store::OrgMembershipId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_memberships()
+        .create(
+            &env,
+            ironauth_store::NewMembership {
+                id: &human,
+                organization_id: &org,
+                user_id: &user,
+                metadata: None,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("create the user membership");
+
+    let client = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "a machine client")
+        .await
+        .expect("create client");
+    let principal = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .service_accounts()
+        .ensure(&env, &client)
+        .await
+        .expect("mint the principal");
+    let machine = ironauth_store::OrgMembershipId::generate(&env, &scope);
+    sqlx::query(
+        "INSERT INTO org_memberships \
+         (id, tenant_id, environment_id, organization_id, service_account_id, owner_kind) \
+         VALUES ($1, $2, $3, $4, $5, 'service_account')",
+    )
+    .bind(machine.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(org.to_string())
+    .bind(principal.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("insert the service-account membership");
+
+    let listed = db
+        .control_store()
+        .management()
+        .org_memberships(scope)
+        .list_for_org(&org, 50, None)
+        .await
+        .expect("listing an organization must not fail because a machine is a member");
+    let ids: Vec<String> = listed.iter().map(|row| row.id.to_string()).collect();
+    assert_eq!(
+        ids,
+        vec![human.to_string()],
+        "the user membership surface lists user memberships and nothing else"
+    );
+
+    let direct = db
+        .control_store()
+        .management()
+        .org_memberships(scope)
+        .get(&machine)
+        .await;
+    assert!(
+        matches!(direct, Err(ironauth_store::StoreError::NotFound)),
+        "a service-account membership id must not resolve as a user membership, got {direct:?}"
+    );
+}
