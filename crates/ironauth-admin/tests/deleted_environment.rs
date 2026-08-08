@@ -616,6 +616,18 @@ impl Fixture {
                 live: StatusCode::CREATED,
             },
             Case {
+                label: "api_keys.revokeOrganizationApiKey",
+                method: "DELETE",
+                path: format!("{base}/api-keys/akey_absent"),
+                body: None,
+                // A handle that does not exist. The point is the ENVIRONMENT fence, which
+                // must answer before the key is looked up, so a live environment answers
+                // 404 for the key and a deleted one answers the same uniform refusal for
+                // the environment. Indistinguishable, which is the property.
+                intent: Intent::Write,
+                live: StatusCode::NOT_FOUND,
+            },
+            Case {
                 label: "api_keys.listOrganizationApiKeys",
                 method: "GET",
                 path: format!("{base}/api-keys"),
