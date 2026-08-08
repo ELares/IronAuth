@@ -400,3 +400,245 @@ async fn a_malformed_presentation_never_verifies() {
         );
     }
 }
+
+/// Rotation revokes the old key and issues the new one, and BOTH halves land.
+///
+/// The atomicity is the whole reason this is one operation. Create-first leaves two live keys
+/// on a crash, so a rotation performed to contain a leak has left the leaked key working;
+/// revoke-first leaves none, so a routine rotation has locked the caller out.
+#[tokio::test]
+async fn rotation_kills_the_old_key_and_issues_the_new_one() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "rotating@example.test").await;
+    let owner = ApiKeyOwner::User(user);
+
+    let first = mint_api_key(&env, &scope, ApiKeyKindTag::PersonalAccessToken);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .api_keys()
+        .create(
+            &env,
+            NewApiKey {
+                id: &first.id,
+                key_digest: &first.digest,
+                owner: &owner,
+                display_name: "original",
+                expires_at_unix_micros: None,
+            },
+            now_micros(&env),
+        )
+        .await
+        .expect("create the original");
+
+    let second = mint_api_key(&env, &scope, ApiKeyKindTag::PersonalAccessToken);
+    let rotated_at = now_micros(&env);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .api_keys()
+        .rotate(
+            &env,
+            &first.id,
+            NewApiKey {
+                id: &second.id,
+                key_digest: &second.digest,
+                owner: &owner,
+                display_name: "rotated",
+                expires_at_unix_micros: None,
+            },
+            rotated_at,
+        )
+        .await
+        .expect("rotate");
+
+    let repo = db.store().scoped(scope);
+    assert!(
+        repo.api_keys()
+            .verify(&first.plaintext, now_micros(&env))
+            .await
+            .expect("verify")
+            .is_none(),
+        "the OLD key must stop verifying, or a rotation to contain a leak left it working"
+    );
+    assert!(
+        repo.api_keys()
+            .verify(&second.plaintext, now_micros(&env))
+            .await
+            .expect("verify")
+            .is_some(),
+        "the NEW key must verify, or a routine rotation locked the caller out"
+    );
+
+    // The recorded revocation TIME is the caller's clock, not the database's.
+    //
+    // Verification treats any non-null `revoked_at` as revoked whatever its value, so the
+    // timestamp is invisible to the decision and nothing above would notice it being wrong. A
+    // mutation writing `now + 1 day` survived every other assertion in this file. It matters
+    // anyway: it is what an operator reads to answer "when did we contain this", and every
+    // other timestamp in this codebase comes from the application clock seam so that a test
+    // under a manual clock is deterministic.
+    let recorded: Option<i64> = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint FROM api_keys WHERE id = $1",
+    )
+    .bind(first.id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the revocation time");
+    assert_eq!(
+        recorded,
+        Some(rotated_at),
+        "the revocation time must be the clock the caller passed"
+    );
+}
+
+/// Rotating from an already-revoked key is REFUSED and issues nothing.
+///
+/// A refusal rather than a no-op, unlike plain revoke. Answering Ok would issue a replacement
+/// the caller believes replaced something live, and leave them thinking a dead key had just
+/// been rotated away.
+#[tokio::test]
+async fn rotating_from_a_dead_key_is_refused_and_issues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "deadrotate@example.test").await;
+    let owner = ApiKeyOwner::User(user);
+
+    let first = mint_api_key(&env, &scope, ApiKeyKindTag::PersonalAccessToken);
+    let acting = || {
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+    acting()
+        .api_keys()
+        .create(
+            &env,
+            NewApiKey {
+                id: &first.id,
+                key_digest: &first.digest,
+                owner: &owner,
+                display_name: "original",
+                expires_at_unix_micros: None,
+            },
+            now_micros(&env),
+        )
+        .await
+        .expect("create");
+    acting()
+        .api_keys()
+        .revoke(&env, &first.id, now_micros(&env))
+        .await
+        .expect("revoke");
+
+    let second = mint_api_key(&env, &scope, ApiKeyKindTag::PersonalAccessToken);
+    let outcome = acting()
+        .api_keys()
+        .rotate(
+            &env,
+            &first.id,
+            NewApiKey {
+                id: &second.id,
+                key_digest: &second.digest,
+                owner: &owner,
+                display_name: "should not exist",
+                expires_at_unix_micros: None,
+            },
+            now_micros(&env),
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(ironauth_store::StoreError::NotFound)),
+        "rotating from a revoked key must refuse, got {outcome:?}"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .api_keys()
+            .verify(&second.plaintext, now_micros(&env))
+            .await
+            .expect("verify")
+            .is_none(),
+        "the refused rotation issued a key anyway, so it was not atomic"
+    );
+}
+
+/// The list shows every key of one owner, revoked ones included, and no other owner's.
+///
+/// Revoked rows are included deliberately: a rotation's point is that the old key is visible
+/// next to the new one, and hiding it would leave an operator unable to tell "I revoked that"
+/// from "that was never here".
+#[tokio::test]
+async fn the_list_shows_one_owners_keys_including_revoked_and_no_others() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let mine = ApiKeyOwner::User(seed_user(&db, &env, scope, "mine@example.test").await);
+    let theirs = ApiKeyOwner::User(seed_user(&db, &env, scope, "theirs@example.test").await);
+
+    let live = mint_api_key(&env, &scope, ApiKeyKindTag::PersonalAccessToken);
+    let dead = mint_api_key(&env, &scope, ApiKeyKindTag::PersonalAccessToken);
+    let foreign = mint_api_key(&env, &scope, ApiKeyKindTag::PersonalAccessToken);
+    for (minted, owner, label) in [
+        (&live, &mine, "live"),
+        (&dead, &mine, "dead"),
+        (&foreign, &theirs, "foreign"),
+    ] {
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .api_keys()
+            .create(
+                &env,
+                NewApiKey {
+                    id: &minted.id,
+                    key_digest: &minted.digest,
+                    owner,
+                    display_name: label,
+                    expires_at_unix_micros: None,
+                },
+                now_micros(&env),
+            )
+            .await
+            .expect("create");
+    }
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .api_keys()
+        .revoke(&env, &dead.id, now_micros(&env))
+        .await
+        .expect("revoke");
+
+    let listed = db
+        .store()
+        .scoped(scope)
+        .api_keys()
+        .list_for_owner(&mine)
+        .await
+        .expect("list");
+    let ids: Vec<String> = listed.iter().map(|record| record.id.to_string()).collect();
+    assert!(ids.contains(&live.id.to_string()), "the live key is listed");
+    assert!(
+        ids.contains(&dead.id.to_string()),
+        "the REVOKED key is listed, so a rotation is legible"
+    );
+    assert!(
+        !ids.contains(&foreign.id.to_string()),
+        "another owner's key leaked into this owner's list: {ids:?}"
+    );
+    assert_eq!(listed.len(), 2);
+
+    let revoked_flag = listed
+        .iter()
+        .find(|record| record.id == dead.id)
+        .expect("the dead key")
+        .revoked_at_unix_micros;
+    assert!(
+        revoked_flag.is_some(),
+        "the listed revoked key must carry its revocation time, or a caller cannot tell it apart"
+    );
+}
