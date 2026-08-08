@@ -37,6 +37,41 @@ scripts/test-registration.sh
 
 echo "==> independently publishable crates"
 scripts/publishable-crates.sh
+
+# The freshness and audit lanes CI runs that this gate did not.
+#
+# Main went RED for three consecutive commits because two new message ids made
+# packages/reference-app/src/contract/messages.gen.ts stale. Every one of those commits
+# passed this gate. A local gate that is a strict subset of CI teaches you to trust a green
+# that does not mean what it looks like, and the gap is invisible until something lands.
+#
+# `comm -23` over the script names in .github/workflows/ci.yml and this file is how the six
+# missing ones were found; keep them in step.
+echo "==> route audit (server routes against the published contract)"
+scripts/route-audit.sh
+
+echo "==> admin SPA route audit"
+scripts/admin-spa-route-audit.sh
+
+echo "==> reference app bindings freshness (generated from the published contract)"
+scripts/reference-app-bindings.sh
+
+echo "==> journey transcript replay"
+scripts/journey-replay.sh
+
+echo "==> admin SPA embed freshness"
+scripts/admin-spa-embed.sh
+
+echo "==> admin SPA bindings freshness (generated from the OpenAPI document)"
+# SKIPPED when `openapi-typescript` is absent, which it is on a plain developer machine.
+# Announced rather than silent: a skip nobody sees is how a gate comes to cover less than
+# its output implies, which is the failure this whole block exists to fix. CI installs the
+# tool and runs it for real.
+if command -v openapi-typescript >/dev/null 2>&1; then
+    scripts/admin-spa-bindings.sh
+else
+    echo "admin-spa-bindings: openapi-typescript absent, SKIPPED (CI runs it)"
+fi
 echo "==> idempotent write audit (no admin handler splits two store writes behind one Idempotency-Key)"
 scripts/idempotent-write-audit.sh
 
