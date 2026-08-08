@@ -2167,6 +2167,34 @@ export async function fetchOrgApiKeys(
   return data?.items ?? [];
 }
 
+// Revoke one API key (operationId revokeOrganizationApiKey, issue #99). The key stops
+// verifying on the very next request; the ROW is retained so the revocation stays
+// legible in the listing.
+export async function revokeOrgApiKey(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+  keyId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+          key_id: keyId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
 // Read one role (operationId getOrgRole). The role detail panel reads this fresh
 // rather than reusing the list row, so a rename made elsewhere is visible.
 export async function getOrgRole(

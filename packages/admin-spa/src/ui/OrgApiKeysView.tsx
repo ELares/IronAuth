@@ -20,20 +20,29 @@
 // to be able to tell "revoked at 14:02" from "no such key", and hiding the row makes
 // a rotation look like a replacement.
 
-import { type OrgApiKeyView, fetchOrgApiKeys } from "../api/client";
-import { AsyncBoundary } from "./ResourceView";
-import type { OrgScope } from "./orgPanels";
-import { useAsyncResource } from "./useResource";
+import {
+  type OrgApiKeyView,
+  fetchOrgApiKeys,
+  revokeOrgApiKey,
+} from "../api/client";
+import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import { type OrgScope, sudoFor } from "./orgPanels";
+import { useAsyncResource, useMutation } from "./useResource";
 
 export function OrgApiKeysPanel({
   tenantId,
   environmentId,
   organizationId,
 }: OrgScope) {
-  const { state } = useAsyncResource<OrgApiKeyView[]>(
+  const { state, reload } = useAsyncResource<OrgApiKeyView[]>(
     () => fetchOrgApiKeys(tenantId, environmentId, organizationId),
     [tenantId, environmentId, organizationId],
   );
+  // Held ABOVE the AsyncBoundary. A successful revoke reloads the list, the reload
+  // flips the boundary back to loading, and anything holding state under it is
+  // unmounted, so a mutation owned by a row would have its outcome destroyed by its
+  // own success. Same placement, and same reason, as OrgDefaultRolePanel.
+  const mutation = useMutation();
 
   return (
     <div class="resource-subsection">
@@ -62,11 +71,45 @@ export function OrgApiKeysPanel({
                 <span class="resource-row-name">{key.display_name}</span>
                 <code class="resource-row-id">{key.id}</code>
                 <span class="resource-row-note">{describe(key)}</span>
+                {/* No control on an already revoked key. Revoking twice is a no-op at
+                    the store, but offering the button suggests there is something left
+                    to stop, which is the opposite of what the row says. */}
+                {key.revoked_at_unix_ms === undefined ||
+                key.revoked_at_unix_ms === null ? (
+                  <ConfirmButton
+                    label="Revoke"
+                    prompt="Revoke this key? Anything using it stops authenticating on its very next request, and the key cannot be recovered or un-revoked. The row stays listed so the revocation is legible."
+                    confirmLabel="Confirm revoke"
+                    danger
+                    disabled={mutation.state.pending}
+                    onConfirm={() =>
+                      void mutation
+                        .run(async () => {
+                          await revokeOrgApiKey(
+                            tenantId,
+                            environmentId,
+                            organizationId,
+                            key.id,
+                          );
+                        }, "Key revoked.")
+                        // Reload only on SUCCESS. Reloading after a failure would
+                        // replace the error the boundary is showing with a fresh
+                        // render of the unchanged list, which reads as though the
+                        // revoke worked.
+                        .then((ok) => {
+                          if (ok) {
+                            reload();
+                          }
+                        })
+                    }
+                  />
+                ) : null}
               </li>
             ))}
           </ul>
         )}
       </AsyncBoundary>
+      <MutationFeedback state={mutation.state} sudo={sudoFor(mutation.retry)} />
     </div>
   );
 }
