@@ -1219,3 +1219,179 @@ async fn the_cancellation_link_is_delivered_to_every_verified_channel_and_actual
         "the owner stopped it using only what they were sent"
     );
 }
+
+/// Activate a trait schema whose top-level properties carry the given recovery annotations
+/// (issue #53, criterion 2). Pass an empty slice for a schema that annotates nothing.
+async fn activate_schema_with_recovery_channels(harness: &Harness, channels: &[&str]) {
+    let mut properties = serde_json::Map::new();
+    for name in ["email", "phone"] {
+        let mut field = serde_json::json!({"type": "string"});
+        if channels.contains(&name) {
+            field["x-ironauth"] = serde_json::json!({"recovery": true});
+        }
+        properties.insert(name.to_owned(), field);
+    }
+    let schema = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false,
+    })
+    .to_string();
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let (_, version) = harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(
+            harness.db().test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .trait_schemas()
+        .create_version(&env, &schema, 1_000_000)
+        .await
+        .expect("create schema version");
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(
+            harness.db().test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .trait_schemas()
+        .activate_version(&env, version)
+        .await
+        .expect("activate schema version");
+}
+
+/// Seed carol with two verified emails and a verified phone, and return her subject id.
+async fn seed_three_channels(harness: &Harness) -> ironauth_store::UserId {
+    let subject = harness
+        .seed_user("carol@example.test", "correct horse battery staple")
+        .await;
+    let subject = subject_id(harness, &subject);
+    add_verified_identifier(
+        harness,
+        &subject,
+        IdentifierType::Email,
+        "carol@example.test",
+    )
+    .await;
+    add_verified_identifier(
+        harness,
+        &subject,
+        IdentifierType::Email,
+        "carol.alt@example.test",
+    )
+    .await;
+    add_verified_identifier(harness, &subject, IdentifierType::Phone, "+14155550100").await;
+    subject
+}
+
+/// Drive a standard recovery initiation for `subject` and return how many channels were alerted.
+async fn initiate_and_count(harness: &Harness, subject: &ironauth_store::UserId) -> usize {
+    let outcome = initiate_recovery(
+        harness.state(),
+        &proof(harness, subject, RecoveryFactor::EmailOtp),
+        RecoveryEntryPoint::LostAllFactors,
+        "carol@example.test",
+        None,
+        RecoveryMethod::Standard,
+    )
+    .await;
+    let RecoveryInitiation::Created {
+        channels_notified, ..
+    } = outcome
+    else {
+        panic!("recovery should have been created");
+    };
+    channels_notified
+}
+
+/// Issue #53, criterion 2: the schema's `recovery` annotation DRIVES which channels a recovery
+/// alert reaches.
+///
+/// Before this the annotation was parsed into `TraitAnnotations` and read by exactly one thing,
+/// the admin schema-introspection view. An operator could annotate a schema, see the annotation
+/// echoed back by the API, and have recovery ignore it entirely. That is worse than an
+/// unimplemented feature, because the surface asserts a control that does not act.
+#[tokio::test]
+async fn the_schema_recovery_annotation_narrows_which_channels_are_alerted() {
+    let mut harness = Harness::start_store_backed().await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    let subject = seed_three_channels(&harness).await;
+    activate_schema_with_recovery_channels(&harness, &["email"]).await;
+
+    assert_eq!(
+        initiate_and_count(&harness, &subject).await,
+        2,
+        "only the two verified EMAILS are annotated recovery channels"
+    );
+    assert_eq!(
+        sender.recipients(),
+        vec![
+            "carol.alt@example.test".to_owned(),
+            "carol@example.test".to_owned(),
+        ],
+        "the phone must not be alerted when the schema does not name it"
+    );
+}
+
+/// The other direction, so the test cannot be passing because email happens to be first.
+#[tokio::test]
+async fn annotating_only_the_phone_alerts_only_the_phone() {
+    let mut harness = Harness::start_store_backed().await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    let subject = seed_three_channels(&harness).await;
+    activate_schema_with_recovery_channels(&harness, &["phone"]).await;
+
+    assert_eq!(initiate_and_count(&harness, &subject).await, 1);
+    assert_eq!(sender.recipients(), vec!["+14155550100".to_owned()]);
+}
+
+/// A schema that annotates NO recovery channel leaves every verified channel alerted.
+///
+/// The safe default, and the one that would fail SILENTLY if it were wrong: a deployment that
+/// never wrote a `recovery` annotation would stop sending recovery alerts altogether, and nobody
+/// would find out until someone needed to recover an account. `Any` rather than `Only {}` is what
+/// makes an unannotated schema mean "no opinion" instead of "no channels".
+#[tokio::test]
+async fn a_schema_annotating_no_recovery_channel_alerts_every_verified_one() {
+    let mut harness = Harness::start_store_backed().await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    let subject = seed_three_channels(&harness).await;
+    activate_schema_with_recovery_channels(&harness, &[]).await;
+
+    assert_eq!(
+        initiate_and_count(&harness, &subject).await,
+        3,
+        "an unannotated schema must not narrow anything"
+    );
+    assert_eq!(
+        sender.recipients(),
+        vec![
+            "+14155550100".to_owned(),
+            "carol.alt@example.test".to_owned(),
+            "carol@example.test".to_owned(),
+        ]
+    );
+}
+
+/// Annotating BOTH is the same as annotating neither, in effect. Included because it is the
+/// configuration an operator writes when they want today's behaviour stated explicitly, and it
+/// must not be mistaken for a narrowing that drops one.
+#[tokio::test]
+async fn annotating_both_channels_alerts_both() {
+    let mut harness = Harness::start_store_backed().await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    let subject = seed_three_channels(&harness).await;
+    activate_schema_with_recovery_channels(&harness, &["email", "phone"]).await;
+
+    assert_eq!(initiate_and_count(&harness, &subject).await, 3);
+}
