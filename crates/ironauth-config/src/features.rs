@@ -59,12 +59,25 @@ pub const FEDCM_VERSION: &str = "0.1.0-exp.1";
 /// the one-flag-per-surface FedCM precedent.
 pub const RISK_SIGNALS_FEATURE: &str = "risk-signals";
 
+/// The registry name of the org-scoped-clients experimental feature (issue #103, bet 1).
+/// One flag for the whole ownership surface, so the schema column, the org client surface
+/// and any later TTL resolution graduate together rather than in pieces an operator would
+/// have to reason about separately.
+pub const ORG_SCOPED_CLIENTS_FEATURE: &str = "org-scoped-clients";
+
 /// The experimental `ack` version for the risk-signal ingestion feature (issue #82). It is
 /// EXPLORATORY: the ingestion wire shape (the signed SET contract and the per-source config)
 /// and the CAEP/SSF alignment are early and may break between releases, so enabling it must
 /// acknowledge this exact revision; a graduation that changes the shape bumps it and
 /// invalidates the old ack.
 pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
+
+/// The experimental `ack` version for org-scoped clients (issue #103). It is EXPLORATORY:
+/// this is a schema-forward bet on a capability the ecosystem tracks as open everywhere,
+/// so the ownership model may change between releases and enabling it must acknowledge
+/// this exact revision; a graduation that changes the shape bumps it and invalidates the
+/// old ack.
+pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 
 /// The registry name of the signup fraud-review-queue experimental feature (issue #82,
 /// PR 2). One plain umbrella flag so the whole quarantine surface (the register-path
@@ -241,6 +254,7 @@ impl FeatureRegistry {
         registry.register_custom_domains_acme();
         registry.register_fedcm();
         registry.register_risk_signals();
+        registry.register_org_scoped_clients();
         registry.register_signup_quarantine();
         registry.register_advanced_recovery();
         registry.register_first_party_challenge();
@@ -369,6 +383,25 @@ impl FeatureRegistry {
              and may break between releases.",
             RISK_SIGNALS_VERSION,
             "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
+    /// Registers org-scoped clients (issue #103, bet 1): an OAuth client owned by an
+    /// ORGANIZATION rather than by the environment, managed through the org surface. It is
+    /// EXPLORATORY: the ownership model is a schema-forward bet and the surface may change
+    /// between releases. Off by default; with the flag off `clients.organization_id` is
+    /// never read or written and the org client surface answers a uniform 404, so an
+    /// environment behaves exactly as it did before migration 0121.
+    pub fn register_org_scoped_clients(&mut self) {
+        self.register(Feature::experimental(
+            ORG_SCOPED_CLIENTS_FEATURE,
+            "Organization-owned OAuth clients (issue #103): a client whose owner is an \
+             organization rather than the environment, managed through that organization's \
+             surface. EXPLORATORY: this is a schema-forward bet on a capability the \
+             ecosystem tracks as open everywhere and nobody ships, and the ownership model \
+             may change between releases.",
+            ORG_SCOPED_CLIENTS_VERSION,
+            "crates/ironauth-store/CHANGELOG.md",
         ));
     }
 
@@ -830,6 +863,36 @@ mod tests {
         ));
         registry.validate(&acked).expect("the exact ack boots");
         assert!(registry.is_enabled(&acked, FEDCM_FEATURE));
+    }
+
+    #[test]
+    fn org_scoped_clients_is_experimental_and_off_by_default() {
+        // Issue #103 bet 1 ships org-owned clients behind a default-off experimental flag.
+        // Criterion 2 is that with the flag off there is ZERO behaviour change attributable
+        // to the issue, and this is the half of that which is checkable here: absent from
+        // [features] it resolves disabled, and enabling it without the exact acknowledgment
+        // refuses to boot. Migration 0121's column is nullable with no default, so an
+        // environment that never enables this is bit-for-bit the environment it was.
+        let registry = FeatureRegistry::builtin();
+        let feature = registry
+            .get(ORG_SCOPED_CLIENTS_FEATURE)
+            .expect("org-scoped-clients is registered");
+        assert!(
+            matches!(feature.maturity(), Maturity::Experimental { .. }),
+            "a schema-forward bet must not present as stable"
+        );
+        assert!(
+            !feature.default_enabled(),
+            "default-on would make this a behaviour change for every existing deployment, \
+             which is exactly what criterion 2 forbids"
+        );
+
+        let absent = config_with_features("");
+        registry.validate(&absent).expect("absent is fine");
+        assert!(
+            !registry.is_enabled(&absent, ORG_SCOPED_CLIENTS_FEATURE),
+            "absent from [features] must resolve DISABLED, not defaulted on"
+        );
     }
 
     #[test]
