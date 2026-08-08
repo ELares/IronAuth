@@ -26,6 +26,6 @@ cipher = "0.4"
 ctr = "0.9"
 password-hash = "0.5"
 pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
-scrypt = "0.11"
+scrypt = "0.12"
 sha2.workspace = true
 subtle = "2"
