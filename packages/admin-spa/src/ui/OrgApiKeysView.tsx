@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// The API keys of one organization (issue #99, criterion 6).
+//
+// A PANEL of the organization detail view, because a key belongs to an organization
+// and the list is meaningless without one selected.
+//
+// READ ONLY, and that is a deliberate first slice rather than an unfinished one. The
+// create control has a requirement no other panel here has: the key is returned
+// exactly once, so the panel would have to hold it as display-once state that a
+// reload destroys. Shipping the listing first gives an operator the thing they most
+// need during an incident, which is to see what exists and what was already revoked.
+//
+// It carries NO key material by construction: the listing endpoint has no digest to
+// return, and `OrgApiKeyView` has no field for one. A management surface that showed
+// verifiers would hand a credential-equivalent to everyone allowed to LOOK, which is
+// a strictly larger set than those allowed to USE.
+//
+// Revoked keys are shown rather than filtered. An operator investigating a leak has
+// to be able to tell "revoked at 14:02" from "no such key", and hiding the row makes
+// a rotation look like a replacement.
+
+import { type OrgApiKeyView, fetchOrgApiKeys } from "../api/client";
+import { AsyncBoundary } from "./ResourceView";
+import type { OrgScope } from "./orgPanels";
+import { useAsyncResource } from "./useResource";
+
+export function OrgApiKeysPanel({
+  tenantId,
+  environmentId,
+  organizationId,
+}: OrgScope) {
+  const { state } = useAsyncResource<OrgApiKeyView[]>(
+    () => fetchOrgApiKeys(tenantId, environmentId, organizationId),
+    [tenantId, environmentId, organizationId],
+  );
+
+  return (
+    <div class="resource-subsection">
+      <h3>API keys</h3>
+      <p class="resource-note">
+        The keys that authenticate as this organization. The key itself is shown once,
+        when it is created, and is never recoverable afterwards: this list carries only
+        the handle. Revoked keys stay listed so a rotation is legible.
+      </p>
+      <AsyncBoundary
+        state={state}
+        loadingLabel="Loading the API keys of the organization"
+        empty={{
+          when: (keys) => keys.length === 0,
+          render: () => (
+            <p class="resource-empty">
+              This organization has no API keys.
+            </p>
+          ),
+        }}
+      >
+        {(keys) => (
+          <ul class="resource-list">
+            {keys.map((key) => (
+              <li key={key.id} class="resource-row">
+                <span class="resource-row-name">{key.display_name}</span>
+                <code class="resource-row-id">{key.id}</code>
+                <span class="resource-row-note">{describe(key)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </AsyncBoundary>
+    </div>
+  );
+}
+
+// What to say about one key's lifecycle, in words rather than a raw timestamp.
+//
+// Revoked wins over expired: a key that was revoked and then passed its expiry is
+// revoked, and reporting the expiry would suggest it lapsed on its own rather than
+// that somebody killed it.
+export function describe(key: OrgApiKeyView): string {
+  if (key.revoked_at_unix_ms !== undefined && key.revoked_at_unix_ms !== null) {
+    return `Revoked ${formatWhen(key.revoked_at_unix_ms)}`;
+  }
+  if (key.expires_at_unix_ms !== undefined && key.expires_at_unix_ms !== null) {
+    return `Expires ${formatWhen(key.expires_at_unix_ms)}`;
+  }
+  return "Live, no expiry";
+}
+
+function formatWhen(unixMs: number): string {
+  return new Date(unixMs).toISOString().replace("T", " ").slice(0, 19) + " UTC";
+}
