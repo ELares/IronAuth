@@ -2,11 +2,15 @@
 [package]
 name = "ironauth-hash-scheme"
 version = "0.1.0"
-description = "Algorithm-tagged foreign password-hash verification and rehash decisions (bcrypt, Argon2, scrypt, PBKDF2, Firebase modified scrypt), with import-time cost bounds"
+description = "Algorithm-tagged verification of foreign password hashes (bcrypt, Argon2, scrypt, PBKDF2, Firebase modified scrypt), with import-time cost bounds"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/ironauth-hash-scheme"
+keywords = ["password", "bcrypt", "argon2", "scrypt", "migration"]
+categories = ["authentication", "cryptography"]
 
 # This crate depends on NO ironauth-* crate, deliberately, and that is the whole point
 # of it existing separately (issue #55): it is the one layer of the import path that is

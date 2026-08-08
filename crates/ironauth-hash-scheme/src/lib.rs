@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// The README is included as crate documentation so its Rust examples are COMPILED and RUN
+// by `cargo test`. The first draft of that README invented an API (a `Verdict` enum and a
+// `verify` returning `Result`) that this crate has never had. A README example nobody
+// compiles is the unmeasured-sentence defect in its most public form: it is the first thing
+// a crates.io reader tries.
+#![doc = include_str!("../README.md")]
+
 //! The algorithm-tagged foreign password-hash scheme layer (issue #55).
 //!
 //! This is the passwap-style reusable core: a stored foreign hash is PARSED into a
@@ -655,6 +662,93 @@ mod independence {
             offenders.is_empty(),
             "this crate gained an ironauth dependency, which makes it unpublishable on its \
              own and undoes the split issue #55 asked for: {offenders:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod publishability {
+    /// This crate's own manifest, read at compile time.
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    /// The crate depends on NO `ironauth-*` crate.
+    ///
+    /// The manifest carries a comment saying this absence is load-bearing and that adding
+    /// such a dependency "would silently revoke" the crate's ability to be published on its
+    /// own. Nothing enforced it, so the comment was a promise rather than a property: a
+    /// single `ironauth-store = { path = ... }` would have made every future
+    /// `cargo publish` fail, and the first person to find out would have been whoever ran
+    /// the release.
+    ///
+    /// Scanned over the DEPENDENCY sections only, because the comment itself names
+    /// `ironauth-*` and a scan of the whole file would match its own warning and pass for
+    /// the wrong reason.
+    #[test]
+    fn the_crate_depends_on_no_ironauth_crate() {
+        let mut in_dependencies = false;
+        let mut offenders: Vec<&str> = Vec::new();
+        for line in MANIFEST.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_dependencies = trimmed.contains("dependencies");
+                continue;
+            }
+            if !in_dependencies || trimmed.starts_with('#') || trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("ironauth-") || trimmed.starts_with("ironauth_") {
+                offenders.push(trimmed);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "this crate gained an ironauth-* dependency, which is what makes it publishable \
+             on its own. Publishing would now require publishing that crate too, and every \
+             one below it. Offending entries: {offenders:?}"
+        );
+    }
+
+    /// The metadata crates.io requires of a published crate is present.
+    ///
+    /// Criterion 6 of issue #55 asks the crate to publish "with its own documentation". A
+    /// missing `readme` is not a build failure and not a publish failure; it is a crate page
+    /// with no body, discovered after the version is permanent and unyankable into
+    /// correctness.
+    #[test]
+    fn the_publish_metadata_is_present() {
+        for key in [
+            "description",
+            "readme",
+            "documentation",
+            "license",
+            "repository",
+        ] {
+            assert!(
+                MANIFEST
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(key)),
+                "the manifest is missing `{key}`, which a published crate needs"
+            );
+        }
+    }
+
+    /// The description does not promise a capability the crate does not contain.
+    ///
+    /// It said "and rehash decisions". There is no rehash logic here and never was: the
+    /// crate answers whether a password matches, and the policy that decides whether to
+    /// replace a stored hash lives with the password policy, which this crate cannot see.
+    /// That string is the single most-read sentence the crate ships, since it is what
+    /// crates.io lists, and it was wrong.
+    #[test]
+    fn the_description_does_not_claim_rehash() {
+        let description = MANIFEST
+            .lines()
+            .find(|line| line.trim_start().starts_with("description"))
+            .expect("a description");
+        assert!(
+            !description.to_ascii_lowercase().contains("rehash"),
+            "the published description claims rehash decisions this crate does not make: \
+             {description}"
         );
     }
 }
