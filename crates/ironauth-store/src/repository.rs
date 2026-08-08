@@ -78,7 +78,7 @@ use crate::federation_state::{ConsumedFederationLoginState, NewFederationLoginSt
 use crate::flow::{FlowRecord, NewFlow};
 use crate::flow_version::{FlowVersionRecord, NewFlowVersion};
 use crate::id::{
-    AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
+    AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId, ApiKeyId,
     AssertionMappingId, AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId, BrandId,
     ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId,
     CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId,
@@ -340,6 +340,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn org_memberships(&self) -> OrgMembershipRepo<'a> {
         OrgMembershipRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// API keys and personal access tokens (issue #99).
+    #[must_use]
+    pub fn api_keys(&self) -> ApiKeyRepo<'a> {
+        ApiKeyRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1337,6 +1346,17 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn clients(&self) -> ActingClientRepo<'a> {
         ActingClientRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// API keys and personal access tokens (issue #99). Writes here require the CONTROL
+    /// plane; reached through the app-role store the engine refuses them.
+    #[must_use]
+    pub fn api_keys(&self) -> ActingApiKeyRepo<'a> {
+        ActingApiKeyRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -56042,5 +56062,377 @@ mod variant_lists_match_the_enum_declarations {
     #[should_panic(expected = "expected exactly one `pub enum NoSuchEnumExistsHere`")]
     fn the_declaration_parser_refuses_an_enum_it_cannot_find() {
         let _ = declared_variants(&source(), "NoSuchEnumExistsHere");
+    }
+}
+
+/// Which principal an API key belongs to (issue #99).
+///
+/// The exclusive arc `api_keys.owner_kind` discriminates, reconstructed here as a sum type so
+/// a caller cannot hold a key whose owner is ambiguous or absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeyOwner {
+    /// A user: the key is a personal access token.
+    User(UserId),
+    /// A service account.
+    ServiceAccount(ServiceAccountId),
+    /// An organization.
+    Organization(OrganizationId),
+}
+
+/// One API key or personal access token, reconstructed from its row (issue #99).
+///
+/// Carries NO secret and no digest. The digest is a verifier and belongs only in the WHERE
+/// clause that found this row; handing it back would put a credential-equivalent into every
+/// caller that lists keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyRecord {
+    /// The non-secret handle.
+    pub id: ApiKeyId,
+    /// Who the key belongs to.
+    pub owner: ApiKeyOwner,
+    /// The operator-facing label.
+    pub display_name: String,
+    /// Expiry, microseconds since the Unix epoch, or `None` for a key that does not expire.
+    pub expires_at_unix_micros: Option<i64>,
+    /// When it was revoked, or `None` while live.
+    pub revoked_at_unix_micros: Option<i64>,
+}
+
+/// What to create (issue #99).
+#[derive(Debug, Clone)]
+pub struct NewApiKey<'a> {
+    /// The non-secret handle, minted alongside the key by `api_key::mint_api_key`.
+    pub id: &'a ApiKeyId,
+    /// The SHA-256 digest of the whole key. The plaintext is NEVER passed to the store.
+    pub key_digest: &'a str,
+    /// Who owns it.
+    pub owner: &'a ApiKeyOwner,
+    /// The operator-facing label.
+    pub display_name: &'a str,
+    /// Optional expiry, microseconds since the Unix epoch.
+    pub expires_at_unix_micros: Option<i64>,
+}
+
+/// The API key read repository (issue #99), on the DATA plane.
+///
+/// The data plane verifies and nothing else: `api_keys` grants it `SELECT` only, because
+/// minting a credential is a management act and the plane serving unauthenticated traffic must
+/// not be able to mint one for itself.
+pub struct ApiKeyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ApiKeyRepo<'_> {
+    /// Resolve a PRESENTED key to its record, or `None` if it does not verify (issue #99).
+    ///
+    /// # What "does not verify" covers, and why it is one answer
+    ///
+    /// Unrecognized prefix, malformed shape, unknown digest, revoked, expired, or an owner who
+    /// may no longer authenticate. All of them answer `None`, identically, because any
+    /// distinction here is an oracle: a caller able to tell "revoked" from "never existed"
+    /// learns which keys once existed, and one able to tell "owner disabled" from "wrong key"
+    /// learns about principals it has not authenticated as.
+    ///
+    /// # Criterion 1 is enforced HERE rather than by a sweep on disable
+    ///
+    /// Disabling an organization invalidates its keys, and disabling a user invalidates that
+    /// user's keys and PATs, because this read consults the owner's CURRENT state on every
+    /// verification. There is deliberately no revocation sweep at disable time. A sweep can
+    /// partially fail and leave live keys behind; it makes re-enabling silently destructive,
+    /// since the keys would stay revoked; and it puts a write on an administrative path that
+    /// must not be able to half-succeed. Reading the owner's state cannot drift from the
+    /// owner's state.
+    ///
+    /// The state PREDICATE is applied in Rust through [`UserState::can_authenticate`] rather
+    /// than as a SQL `IN` list, so there is ONE definition of which states may sign in. A
+    /// second copy in a WHERE clause is a copy that a later state addition can miss.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure. A store fault is an error rather
+    /// than `None`, so a blip fails the request instead of silently reading as a bad key.
+    pub async fn verify(
+        &self,
+        presented: &str,
+        now_micros: i64,
+    ) -> Result<Option<ApiKeyRecord>, StoreError> {
+        use crate::api_key::{ApiKeyKindTag, api_key_digest, api_key_handle};
+        // The shape must be well formed for ONE of the two kinds.
+        //
+        // NOT a correctness guard, and a mutation sweep says so: deleting this changes no
+        // observable outcome, because a garbage string simply hashes to a digest no row
+        // holds. It stays because it keeps arbitrary input off the DATABASE. This runs on an
+        // unauthenticated path, so without it anyone spraying random strings gets one indexed
+        // lookup per string, at whatever rate they can send them. The cost of the check is a
+        // prefix compare.
+        if api_key_handle(presented, ApiKeyKindTag::ApiKey).is_none()
+            && api_key_handle(presented, ApiKeyKindTag::PersonalAccessToken).is_none()
+        {
+            return Ok(None);
+        }
+        let digest = api_key_digest(presented);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT k.id, k.owner_kind, k.user_id, k.service_account_id, k.organization_id, \
+                    k.display_name, \
+                    (EXTRACT(EPOCH FROM k.expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM k.revoked_at) * 1000000)::bigint AS revoked_us, \
+                    u.state AS user_state, \
+                    o.state AS organization_state, \
+                    (o.deleted_at IS NOT NULL) AS organization_deleted, \
+                    s.id AS service_account_present \
+             FROM api_keys k \
+             LEFT JOIN users u ON u.id = k.user_id \
+             LEFT JOIN organizations o ON o.id = k.organization_id \
+             LEFT JOIN service_accounts s ON s.id = k.service_account_id \
+             WHERE k.key_digest = $1 AND k.tenant_id = $2 AND k.environment_id = $3",
+        )
+        .bind(&digest)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let Some(row) = row else { return Ok(None) };
+        if row.get::<Option<i64>, _>("revoked_us").is_some() {
+            return Ok(None);
+        }
+        if let Some(expires) = row.get::<Option<i64>, _>("expires_us") {
+            if expires <= now_micros {
+                return Ok(None);
+            }
+        }
+
+        let owner_kind: String = row.get("owner_kind");
+        let owner = match owner_kind.as_str() {
+            "user" => {
+                let raw: Option<String> = row.get("user_id");
+                let state: Option<String> = row.get("user_state");
+                // A state that does not parse reads as not-authenticatable rather than as a
+                // default, because an unrecognized state is precisely the case where the
+                // safe answer is no.
+                let permitted = state
+                    .as_deref()
+                    .and_then(UserState::from_wire)
+                    .is_some_and(|state| state.can_authenticate());
+                if !permitted {
+                    return Ok(None);
+                }
+                let Some(id) = raw.and_then(|raw| UserId::parse_in_scope(&raw, &self.scope).ok())
+                else {
+                    return Ok(None);
+                };
+                ApiKeyOwner::User(id)
+            }
+            "organization" => {
+                let raw: Option<String> = row.get("organization_id");
+                let deleted: Option<bool> = row.get("organization_deleted");
+                let state: Option<String> = row.get("organization_state");
+                if deleted != Some(false) || state.as_deref() != Some("active") {
+                    return Ok(None);
+                }
+                let Some(id) =
+                    raw.and_then(|raw| OrganizationId::parse_in_scope(&raw, &self.scope).ok())
+                else {
+                    return Ok(None);
+                };
+                ApiKeyOwner::Organization(id)
+            }
+            "service_account" => {
+                // The join answers presence. A service account row that has gone means the
+                // principal is gone, and its keys go with it.
+                if row
+                    .get::<Option<String>, _>("service_account_present")
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                let raw: Option<String> = row.get("service_account_id");
+                let Some(id) =
+                    raw.and_then(|raw| ServiceAccountId::parse_in_scope(&raw, &self.scope).ok())
+                else {
+                    return Ok(None);
+                };
+                ApiKeyOwner::ServiceAccount(id)
+            }
+            // The CHECK constrains this column to three values, so an unknown one is a
+            // corrupt row. Fail closed rather than guess which principal it meant.
+            _ => return Ok(None),
+        };
+
+        let id_raw: String = row.get("id");
+        let Ok(id) = ApiKeyId::parse_in_scope(&id_raw, &self.scope) else {
+            return Ok(None);
+        };
+        Ok(Some(ApiKeyRecord {
+            id,
+            owner,
+            display_name: row.get("display_name"),
+            expires_at_unix_micros: row.get("expires_us"),
+            revoked_at_unix_micros: None,
+        }))
+    }
+}
+
+/// The API key WRITE repository (issue #99), on the CONTROL plane.
+///
+/// `api_keys` grants `INSERT` and a column-scoped `UPDATE (revoked_at, updated_at)` to
+/// `ironauth_control` alone. Reached through the app-role store, every write here is refused
+/// by the engine, which is the #31 split doing its job: the plane that VERIFIES keys on the
+/// authentication path must not be able to mint one.
+pub struct ActingApiKeyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingApiKeyRepo<'_> {
+    /// Create a key, auditing `api_key.created` in the same transaction.
+    ///
+    /// Takes the DIGEST, never the plaintext. The plaintext is minted by
+    /// `api_key::mint_api_key`, returned once by the caller, and never crosses this boundary,
+    /// so there is no argument a future logging change could accidentally record.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id or the owner is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure, including the permission error
+    /// raised when this is reached through the app-role store.
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewApiKey<'_>,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let (kind, user, service_account, organization) = match spec.owner {
+            ApiKeyOwner::User(id) if id.scope() == self.scope => {
+                ("user", Some(id.to_string()), None, None)
+            }
+            ApiKeyOwner::ServiceAccount(id) if id.scope() == self.scope => {
+                ("service_account", None, Some(id.to_string()), None)
+            }
+            ApiKeyOwner::Organization(id) if id.scope() == self.scope => {
+                ("organization", None, None, Some(id.to_string()))
+            }
+            // A cross-scope owner is the uniform not-found. Left to the foreign key it would
+            // be an opaque database fault mid-transaction, aborting the transaction the audit
+            // row still has to be written in.
+            _ => return Err(StoreError::NotFound),
+        };
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ApiKeyCreated,
+                target: spec.id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO api_keys \
+                     (key_digest, id, tenant_id, environment_id, owner_kind, user_id, \
+                      service_account_id, organization_id, display_name, expires_at, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                             CASE WHEN $10::bigint IS NULL THEN NULL ELSE \
+                                  TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval \
+                             END, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+                )
+                .bind(spec.key_digest)
+                .bind(spec.id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(kind)
+                .bind(user.as_deref())
+                .bind(service_account.as_deref())
+                .bind(organization.as_deref())
+                .bind(spec.display_name)
+                .bind(spec.expires_at_unix_micros)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            // No poison-after-audit: this write creates a credential rather than destroying
+            // one, so there is no prior state an interrupted run could leave half-removed.
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Revoke a live key, auditing `api_key.revoked` in the same transaction.
+    ///
+    /// Idempotent: revoking an already-revoked key changes nothing and writes NO second audit
+    /// row, matching every other change-only write in this file. An absent key is the uniform
+    /// not-found, and the two are distinguished by a scoped existence probe rather than by the
+    /// UPDATE's row count, which cannot tell them apart.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such key is visible in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn revoke(
+        &self,
+        env: &Env,
+        id: &ApiKeyId,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let changed = sqlx::query(
+            "UPDATE api_keys \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND revoked_at IS NULL \
+             RETURNING id",
+        )
+        .bind(now_micros)
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if changed.is_none() {
+            let exists = sqlx::query(
+                "SELECT 1 FROM api_keys \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound);
+            }
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::ApiKeyRevoked,
+            target: id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(())
     }
 }

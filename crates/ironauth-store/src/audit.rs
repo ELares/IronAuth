@@ -1050,6 +1050,13 @@ pub enum Action {
     /// targets the `cli_` client, and the detail names which way it moved. It never
     /// carries the organization identifier, matching every other write in this file.
     ClientOwningOrganizationSet,
+    /// An API key or personal access token was CREATED (issue #99). The row targets the
+    /// `akey_` handle, never the key and never its digest, and the detail names the owner
+    /// KIND only.
+    ApiKeyCreated,
+    /// An API key or personal access token was REVOKED (issue #99). The row targets the
+    /// `akey_` handle.
+    ApiKeyRevoked,
     /// An admin sudo elevation was RECORDED (issue #73): a management credential
     /// completed a re-authentication that opens a freshness window for admin
     /// mutations in a (tenant, environment). The row targets the `elv_` elevation; the
@@ -1483,6 +1490,8 @@ impl Action {
             Action::ClientStepUpPolicySet => "client.step_up_policy.set",
             Action::ClientIdTokenAlgSet => "client.id_token_signed_response_alg.set",
             Action::ClientOwningOrganizationSet => "client.owning_organization.set",
+            Action::ApiKeyCreated => "api_key.created",
+            Action::ApiKeyRevoked => "api_key.revoked",
             Action::AdminPrivilegeElevated => "admin.privilege.elevated",
             Action::AdminPrivilegeChallenged => "admin.privilege.challenged",
             Action::CredentialClassPolicySet => "credential_class.policy.set",
