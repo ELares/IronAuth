@@ -29,8 +29,13 @@ cd "$(git rev-parse --show-toplevel)"
 HANDLER='crates/ironauth-oidc/src/client_credentials.rs'
 TOKENS='crates/ironauth-oidc/src/tokens.rs'
 REPO='crates/ironauth-store/src/repository.rs'
+# The VERIFICATION path (issue #99, criterion 5), scanned in full. Metering issuance
+# bills a customer once per token; metering VERIFICATION taxes every request an API
+# gateway makes against a cached one, which is the worse of the two and is why the
+# criterion names both. Introspection is where a verification counter would live.
+INTROSPECT='crates/ironauth-oidc/src/introspection.rs'
 
-for path in "$HANDLER" "$TOKENS" "$REPO"; do
+for path in "$HANDLER" "$TOKENS" "$REPO" "$INTROSPECT"; do
   if [ ! -f "$path" ]; then
     echo "no-m2m-metering: expected issuance-path module not found: $path"
     exit 1
@@ -65,6 +70,7 @@ extract_cc_regions() {
 corpus="$(
   {
     awk '{ print FILENAME ":" NR ":" $0 }' "$HANDLER"
+    awk '{ print FILENAME ":" NR ":" $0 }' "$INTROSPECT"
     extract_cc_regions "$TOKENS"
     extract_cc_regions "$REPO"
   }
@@ -87,7 +93,8 @@ hits=$(printf '%s\n' "$corpus" \
   || true)
 
 if [ -n "$hits" ]; then
-  echo "no-m2m-metering: a metering/billing/quota hook is on the M2M issuance path:"
+  echo "no-m2m-metering: a metering/billing/quota hook is on the M2M issuance or"
+  echo "                 verification path:"
   echo "$hits"
   echo
   echo "The client-credentials issuance path must carry NO metering, counting-for-billing,"
@@ -96,4 +103,56 @@ if [ -n "$hits" ]; then
   exit 1
 fi
 
-echo "no-m2m-metering: clean (no metering/billing/quota hook on the M2M issuance path)"
+# The SCHEMA half (issue #99, criterion 5): "confirmed by schema and code audit". A
+# counter that is merely DORMANT sits in a table passing every code scan, waiting to be
+# switched on, so the shipped DDL of the tables these paths write is read too. Read from
+# the migrations rather than a live database because the question is what the project
+# SHIPS; a live check would also pass on a deployment somebody altered by hand.
+# A COLUMN pattern, not the code one. `$FORBIDDEN` is word-boundaried, which is right
+# for code and wrong here: column names are snake_case compounds, and `\bquota\b` does
+# NOT match inside `monthly_quota` because `_` is a word character. A mutation adding
+# exactly that column survived the word-boundaried pattern, so this one matches the stem
+# anywhere in an identifier.
+FORBIDDEN_COLUMN='(meter|metering|billing|billable|quota|chargeable|usage_count|seat_count|rate_limit|ratelimit)'
+
+M2M_TABLES='service_accounts opaque_access_tokens'
+schema_hits=""
+for table in $M2M_TABLES; do
+  ddl_file=$(grep -l "CREATE TABLE ${table}" crates/ironauth-store/migrations/*.sql | head -1)
+  if [ -z "$ddl_file" ]; then
+    echo "no-m2m-metering: no migration declares ${table}, so the schema half of this"
+    echo "                 audit is reading nothing. Point it at the migration that does."
+    exit 1
+  fi
+  ddl=$(awk -v t="CREATE TABLE ${table}" '
+    index($0, t) { inside = 1 }
+    inside { print FILENAME ":" NR ":" $0 }
+    inside && /^\);/ { inside = 0 }
+  ' "$ddl_file")
+  # Non-vacuity: the extracted block must look like a scoped table body, or the
+  # extraction silently matched nothing and the scan below proves nothing.
+  if ! printf '%s\n' "$ddl" | grep -q 'tenant_id'; then
+    echo "no-m2m-metering: the extracted ${table} DDL does not look like a table body,"
+    echo "                 so the schema scan proved nothing."
+    exit 1
+  fi
+  found=$(printf '%s\n' "$ddl" \
+    | grep -iE "$FORBIDDEN_COLUMN" \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*--' \
+    | grep -v 'no-m2m-metering-allow' \
+    || true)
+  [ -n "$found" ] && schema_hits="${schema_hits}${found}\n"
+done
+
+if [ -n "$schema_hits" ]; then
+  echo "no-m2m-metering: a metering/billing/quota COLUMN is on an M2M table:"
+  printf '%b' "$schema_hits"
+  echo
+  echo "A counter in the schema passes every code scan while it sits unused, then becomes"
+  echo "a bill the day something reads it. Metering M2M is a product decision to make"
+  echo "deliberately, not one that arrives in a migration."
+  exit 1
+fi
+
+echo "no-m2m-metering: clean (no metering hook on the M2M issuance or verification path,"
+echo "                 and no metering column on the M2M tables)"
