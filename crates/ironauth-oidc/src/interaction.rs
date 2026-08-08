@@ -1055,6 +1055,47 @@ pub fn forbidden_page() -> Response {
 /// organization accepts. It is a narrowing filter on an address already proven, never
 /// authority for the address itself. Provisioning from an unverified identifier would let
 /// anyone join an organization by claiming one of its addresses.
+/// The subject's VERIFIED email domains, normalized (issue #95, issue #96).
+///
+/// Extracted so the JIT provisioner and the organization picker derive the domain set the SAME
+/// way. They must agree exactly: the picker OFFERS an organization on the strength of a domain
+/// match and the provisioner is what actually grants the membership at session establishment, so
+/// two spellings of "the user's domain" would show a user an organization they can pick and then
+/// silently fail to join them to it.
+///
+/// Unverified identifiers and non-email identifiers are skipped. The domain goes through
+/// `normalize_routing_domain`, the same seam the policy stores its allow-list with, so the
+/// comparison is between two canonical forms rather than two spellings. A read fault yields an
+/// EMPTY set rather than an error: on both call paths this grants access, and a store fault is
+/// never a reason to grant it.
+pub(crate) async fn verified_email_domains(
+    state: &OidcState,
+    scope: Scope,
+    user_id: &ironauth_store::UserId,
+) -> std::collections::BTreeSet<String> {
+    let mut domains: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let Ok(identifiers) = state
+        .store()
+        .scoped(scope)
+        .user_identifiers()
+        .list_for_user(user_id)
+        .await
+    else {
+        return domains;
+    };
+    for record in &identifiers {
+        if !record.verified || record.identifier_type != ironauth_store::IdentifierType::Email {
+            continue;
+        }
+        if let Some((_, domain)) = record.raw.rsplit_once('@') {
+            if let Some(normalized) = ironauth_store::normalize_routing_domain(domain) {
+                domains.insert(normalized);
+            }
+        }
+    }
+    domains
+}
+
 async fn jit_provision_memberships(
     state: &OidcState,
     scope: Scope,
@@ -1076,28 +1117,7 @@ async fn jit_provision_memberships(
     let Ok(user_id) = ironauth_store::UserId::parse_in_scope(subject, &scope) else {
         return;
     };
-    let Ok(identifiers) = state
-        .store()
-        .scoped(scope)
-        .user_identifiers()
-        .list_for_user(&user_id)
-        .await
-    else {
-        return;
-    };
-    let mut domains: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for record in &identifiers {
-        if !record.verified || record.identifier_type != ironauth_store::IdentifierType::Email {
-            continue;
-        }
-        // The domain is normalized through the SAME seam the policy stores its list with, so
-        // the comparison is between two canonical forms rather than two spellings.
-        if let Some((_, domain)) = record.raw.rsplit_once('@') {
-            if let Some(normalized) = ironauth_store::normalize_routing_domain(domain) {
-                domains.insert(normalized);
-            }
-        }
-    }
+    let domains = verified_email_domains(state, scope, &user_id).await;
     for domain in &domains {
         let Ok(orgs) = state
             .store()
