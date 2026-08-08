@@ -642,3 +642,124 @@ async fn the_list_shows_one_owners_keys_including_revoked_and_no_others() {
         "the listed revoked key must carry its revocation time, or a caller cannot tell it apart"
     );
 }
+
+/// Criterion 1's ORGANIZATION half: disabling an organization invalidates its org-scoped keys.
+///
+/// This clause is the FIRST one the criterion states and it had no test. Every other test in
+/// this file uses a user owner, so the organization branch of `verify` (which reads
+/// `organizations.state` and `deleted_at`) was reached by nothing, and I reported criterion 1
+/// as met on the strength of the user half alone.
+///
+/// Like the user case, the invalidation is immediate and reversible, because it is a read of
+/// the owner's current state rather than a revocation sweep.
+#[tokio::test]
+async fn disabling_an_organization_invalidates_its_keys_and_enabling_restores_them() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = ironauth_store::OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org, now_micros(&env), "acme", None)
+        .await
+        .expect("create the organization");
+    let plaintext = issue(
+        &db,
+        &env,
+        scope,
+        &ApiKeyOwner::Organization(org),
+        ApiKeyKindTag::ApiKey,
+    )
+    .await;
+    let verify = || async {
+        db.store()
+            .scoped(scope)
+            .api_keys()
+            .verify(&plaintext, now_micros(&env))
+            .await
+            .expect("verify")
+    };
+    let resolved = verify().await.expect("an org-owned key starts live");
+    assert_eq!(resolved.owner, ApiKeyOwner::Organization(org));
+
+    for (state, may_verify, why) in [
+        (
+            ironauth_store::OrganizationState::Disabled,
+            false,
+            "a disabled organization's key must stop verifying immediately",
+        ),
+        (
+            ironauth_store::OrganizationState::Active,
+            true,
+            "re-enabling the organization must restore its keys, exactly as for a user",
+        ),
+    ] {
+        db.control_store()
+            .management()
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .organizations(scope)
+            .set_state(&env, &org, state, None)
+            .await
+            .expect("set the organization state");
+        assert_eq!(verify().await.is_some(), may_verify, "{why}");
+    }
+}
+
+/// A SOFT-DELETED organization's keys stop verifying too.
+///
+/// Separate from the disabled case because it is a different column. `verify` requires both
+/// `deleted_at IS NULL` and an active state, and a check of only the state would let a deleted
+/// organization's keys go on working: deletion sets `deleted_at` and leaves `state` alone.
+#[tokio::test]
+async fn a_soft_deleted_organizations_keys_stop_verifying() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = ironauth_store::OrganizationId::generate(&env, &scope);
+    let acting = || {
+        db.control_store()
+            .management()
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+    acting()
+        .organizations(scope)
+        .create(&env, &org, now_micros(&env), "briefly here", None)
+        .await
+        .expect("create");
+    let plaintext = issue(
+        &db,
+        &env,
+        scope,
+        &ApiKeyOwner::Organization(org),
+        ApiKeyKindTag::ApiKey,
+    )
+    .await;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .api_keys()
+            .verify(&plaintext, now_micros(&env))
+            .await
+            .expect("verify")
+            .is_some()
+    );
+
+    acting()
+        .organizations(scope)
+        .delete(&env, &org)
+        .await
+        .expect("soft delete");
+    assert!(
+        db.store()
+            .scoped(scope)
+            .api_keys()
+            .verify(&plaintext, now_micros(&env))
+            .await
+            .expect("verify")
+            .is_none(),
+        "a soft-deleted organization's keys must stop verifying. Deletion leaves `state` \
+         alone, so a state-only check would keep them working"
+    );
+}
