@@ -1867,6 +1867,12 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
                 "org_connection_id": org_connection,
             }),
         ),
+        Case::json(
+            "api_keys.createOrganizationApiKey",
+            "POST",
+            format!("{org_base}/api-keys"),
+            &serde_json::json!({ "display_name": "sweep key" }),
+        ),
         Case::empty(
             "api_keys.listOrganizationApiKeys",
             "GET",

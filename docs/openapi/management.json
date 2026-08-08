@@ -8651,6 +8651,137 @@
             "bearer": []
           }
         ]
+      },
+      "post": {
+        "tags": [
+          "org-roles"
+        ],
+        "operationId": "createOrganizationApiKey",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response WITHOUT the key material.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApiKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Idempotent replay, carrying no `key`: it was issued once and is not recoverable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyCreated"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created. The `key` field is the only time the key is returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The organization is not a live row of this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role": {
@@ -20230,6 +20361,36 @@
           }
         }
       },
+      "ApiKeyCreated": {
+        "type": "object",
+        "description": "The creation response: the ONLY place the key itself ever appears.",
+        "required": [
+          "id",
+          "display_name",
+          "key_already_issued"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "id": {
+            "type": "string",
+            "description": "The non-secret `akey_` handle."
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The key. Present exactly once, on the original 201. Copy it now; nothing can recover\nit afterwards, including a replay of this very request."
+          },
+          "key_already_issued": {
+            "type": "boolean",
+            "description": "True on an idempotent REPLAY, where the key is deliberately absent."
+          }
+        }
+      },
       "ApiKeyListView": {
         "type": "object",
         "description": "A page of keys.",
@@ -20978,6 +21139,19 @@
           "revoked": {
             "type": "boolean",
             "description": "Whether the guarded consent UPDATE flipped a live grant to revoked. False for\nthe idempotent no-op (an already-revoked or absent grant), in which case\nnothing was audited and no cascade ran."
+          }
+        }
+      },
+      "CreateApiKeyRequest": {
+        "type": "object",
+        "description": "The create request.",
+        "required": [
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label. Never secret and never part of the key."
           }
         }
       },

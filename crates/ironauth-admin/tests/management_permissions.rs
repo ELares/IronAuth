@@ -274,6 +274,10 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("createRoutingRule", ManagementPermission::WriteConfig),
     ("verifyRoutingRuleDomain", ManagementPermission::WriteConfig),
     ("listRoutingRules", ManagementPermission::Read),
+    (
+        "createOrganizationApiKey",
+        ManagementPermission::WriteCredentials,
+    ),
     ("listOrganizationApiKeys", ManagementPermission::Read),
     ("listProjectGrants", ManagementPermission::Read),
     (

@@ -18,15 +18,19 @@
 //! old key is visible beside the new one, and an operator investigating a leak has to be able
 //! to tell "I revoked that at 14:02" from "no such key ever existed".
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
-use ironauth_store::ApiKeyOwner;
-use serde::Serialize;
+use ironauth_store::api_key::{ApiKeyKindTag, mint_api_key};
+use ironauth_store::{ApiKeyOwner, CorrelationId, IdempotencyWrite, NewApiKey, StoreError};
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
+use crate::idempotency;
+use crate::input::parse_json;
 use crate::org_context::{EnvironmentAccess, resolve_live_org, resolve_scope};
 use crate::response::json;
 use crate::state::AdminState;
@@ -119,5 +123,150 @@ fn view_of(record: ironauth_store::ApiKeyRecord) -> ApiKeyView {
         display_name: record.display_name,
         expires_at_unix_ms: record.expires_at_unix_micros.map(|micros| micros / 1000),
         revoked_at_unix_ms: record.revoked_at_unix_micros.map(|micros| micros / 1000),
+    }
+}
+
+/// The create request.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateApiKeyRequest {
+    /// The operator-facing label. Never secret and never part of the key.
+    pub display_name: String,
+}
+
+/// The creation response: the ONLY place the key itself ever appears.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiKeyCreated {
+    /// The non-secret `akey_` handle.
+    pub id: String,
+    /// The operator-facing label.
+    pub display_name: String,
+    /// The key. Present exactly once, on the original 201. Copy it now; nothing can recover
+    /// it afterwards, including a replay of this very request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// True on an idempotent REPLAY, where the key is deliberately absent.
+    pub key_already_issued: bool,
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
+    operation_id = "createOrganizationApiKey",
+    tag = "org-roles",
+    request_body = CreateApiKeyRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response WITHOUT the key material.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 201, description = "Created. The `key` field is the only time the key is returned", body = ApiKeyCreated),
+        (status = 200, description = "Idempotent replay, carrying no `key`: it was issued once and is not recoverable", body = ApiKeyCreated),
+        (status = 400, description = "Malformed request", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The organization is not a live row of this scope", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn create_organization_api_key(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): WRITE CREDENTIALS rather than write
+    // organizations. Minting a key creates a credential that authenticates AS this
+    // organization, which is strictly higher authority than editing its configuration, and
+    // the permission vocabulary already separates the two.
+    //
+    // NOTHING PROVES THIS IS THE PERMISSION DEMANDED. `management_permissions.rs` classifies
+    // this operation as `WriteCredentials` and separately asserts the handler calls
+    // `require_permission` at all, but as its own comment says, it "cannot tell WHICH
+    // permission a handler demands, only that it demands one". A mutation downgrading this to
+    // `Read` survives both. Proving the specific permission needs an end-to-end test driving
+    // a credential that holds `Read` and not `WriteCredentials`, in the style of
+    // `delegated_admin.rs`, and this endpoint does not have one yet.
+    principal.require_permission(ManagementPermission::WriteCredentials)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+
+    let idem_key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &idem_key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
+    let request: CreateApiKeyRequest = parse_json(&body)?;
+
+    let minted = mint_api_key(state.env(), &scope, ApiKeyKindTag::ApiKey);
+    let created = ApiKeyCreated {
+        id: minted.id.to_string(),
+        display_name: request.display_name.clone(),
+        key: Some(minted.plaintext.clone()),
+        key_already_issued: false,
+    };
+    let created_body = serde_json::to_string(&created).map_err(|_| ApiError::Internal)?;
+
+    // The body STORED for replay carries NO key, and replays as 200 rather than 201.
+    // Following `keys.rs`, which solved this for management keys.
+    //
+    // `idempotency_keys.response_body` is plaintext retained 24 hours. Storing the created
+    // body verbatim would put a live credential there, which is exactly the recoverable copy
+    // migration 0123 exists to prevent: `api_keys` has no column the plaintext can come back
+    // from, and this would have created one in a different table.
+    let stored = ApiKeyCreated {
+        id: minted.id.to_string(),
+        display_name: request.display_name.clone(),
+        key: None,
+        key_already_issued: true,
+    };
+    let stored_body = serde_json::to_string(&stored).map_err(|_| ApiError::Internal)?;
+
+    let result = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .api_keys()
+        .create(
+            state.env(),
+            NewApiKey {
+                id: &minted.id,
+                key_digest: &minted.digest,
+                owner: &ApiKeyOwner::Organization(org_id),
+                display_name: &request.display_name,
+                expires_at_unix_micros: None,
+            },
+            state.now_unix_micros(),
+            Some(IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &idem_key,
+                request_fingerprint: &fingerprint,
+                response_status: 200,
+                response_body: &stored_body,
+            }),
+        )
+        .await;
+
+    match result {
+        Ok(()) => Ok(json(StatusCode::CREATED, created_body)),
+        Err(StoreError::NotFound) => Err(ApiError::NotFound),
+        Err(_) => Err(ApiError::Internal),
     }
 }
