@@ -604,3 +604,107 @@ async fn a_service_account_membership_is_invisible_to_the_user_membership_surfac
         "a service-account membership id must not resolve as a user membership, got {direct:?}"
     );
 }
+
+/// One live membership per service account per organization (issue #99).
+///
+/// 0084 stated this for users. 0124 relaxed `user_id` to nullable, and because a NULL is
+/// distinct from every other NULL in a unique index, that index stopped saying anything about a
+/// membership that binds a service account: two live rows for the same principal in the same
+/// organization satisfied it. 0126 is the counterpart.
+///
+/// The soft-delete half is asserted beside it, because a uniqueness index that also blocked a
+/// re-add would be the wrong fix: it must key the LIVE set only, so removing a principal and
+/// adding it back works, exactly as it does for a user.
+#[tokio::test]
+async fn one_service_account_holds_at_most_one_live_membership_per_organization() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = ironauth_store::OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org, now_micros(&env), "acme", None)
+        .await
+        .expect("create org");
+    let client = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "a machine client")
+        .await
+        .expect("create client");
+    let principal = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .service_accounts()
+        .ensure(&env, &client)
+        .await
+        .expect("mint the principal");
+
+    let first = insert_service_account_membership(&db, &env, scope, &org, &principal).await;
+    assert!(first.is_ok(), "the first membership is admitted: {first:?}");
+    let second = insert_service_account_membership(&db, &env, scope, &org, &principal).await;
+    assert!(
+        second.is_err(),
+        "a second LIVE membership for the same principal in the same organization must be \
+         refused"
+    );
+
+    // Per ORGANIZATION, not per principal: the same service account belongs to a second
+    // organization at the same time, exactly as a user does.
+    let other = ironauth_store::OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &other, now_micros(&env), "beta", None)
+        .await
+        .expect("create the second org");
+    let elsewhere = insert_service_account_membership(&db, &env, scope, &other, &principal).await;
+    assert!(
+        elsewhere.is_ok(),
+        "the same principal may be a live member of a DIFFERENT organization: {elsewhere:?}"
+    );
+
+    // Soft-delete the first, then the same principal may be added back: the index keys the live
+    // set, so a removal genuinely frees the slot.
+    sqlx::query(
+        "UPDATE org_memberships SET deleted_at = now() \
+         WHERE service_account_id = $1 AND organization_id = $2",
+    )
+    .bind(principal.to_string())
+    .bind(org.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("soft delete the membership");
+    let readded = insert_service_account_membership(&db, &env, scope, &org, &principal).await;
+    assert!(
+        readded.is_ok(),
+        "removing a principal frees the slot, exactly as it does for a user: {readded:?}"
+    );
+}
+
+async fn insert_service_account_membership(
+    db: &TestDatabase,
+    env: &ironauth_env::Env,
+    scope: Scope,
+    org: &ironauth_store::OrganizationId,
+    principal: &ironauth_store::ServiceAccountId,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO org_memberships \
+         (id, tenant_id, environment_id, organization_id, service_account_id, owner_kind) \
+         VALUES ($1, $2, $3, $4, $5, 'service_account')",
+    )
+    .bind(ironauth_store::OrgMembershipId::generate(env, &scope).to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(org.to_string())
+    .bind(principal.to_string())
+    .execute(db.owner_pool())
+    .await
+}
