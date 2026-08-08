@@ -319,6 +319,20 @@ impl ScopedKind for IssuedTokenKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// An API key / personal access token identifier (`akey_...`), issue #99. The NON-SECRET
+/// handle for one key: every list, rotate, revoke and audit row names this, never the key
+/// and never its digest.
+///
+/// Not redacted in debug, deliberately and unlike `tok_`. This id is not a credential and
+/// cannot be presented as one; the key itself is a separate 256-bit secret that is never
+/// stored. Redacting it would make an operator's key list unreadable in a log for no gain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ApiKeyKind;
+impl ScopedKind for ApiKeyKind {
+    const PREFIX: &'static str = "akey";
+    const REDACT_DEBUG: bool = false;
+}
+
 /// Marker for a refresh-token FAMILY (`rff_`), the spine rooted at one original
 /// authorization grant that every rotated refresh token in the chain belongs to
 /// (issue #21). Revoking the family invalidates every generation of refresh token
@@ -1494,6 +1508,9 @@ pub type GrantId = ScopedId<GrantKind>;
 /// An issued-token identifier (`tok_...`), the `jti` recorded against a grant
 /// (issue #12).
 pub type IssuedTokenId = ScopedId<IssuedTokenKind>;
+/// An API key or personal access token identifier (`akey_...`), the non-secret handle
+/// (issue #99).
+pub type ApiKeyId = ScopedId<ApiKeyKind>;
 /// A refresh-token family identifier (`rff_...`), the revocation spine every
 /// rotated refresh token in one grant's chain belongs to (issue #21).
 pub type RefreshFamilyId = ScopedId<RefreshFamilyKind>;
