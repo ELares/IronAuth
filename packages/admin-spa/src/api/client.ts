@@ -2127,6 +2127,46 @@ export async function fetchOrgRoles(
   return { items: data?.items ?? [], nextCursor: data?.next_cursor ?? null };
 }
 
+// One API key of an organization, as the management surface renders it (issue #99).
+// Carries NO key material: the listing endpoint has no digest to return and the key
+// itself exists only in the creation response.
+export interface OrgApiKeyView {
+  id: string;
+  display_name: string;
+  // Nullable as well as optional: the generated contract types model a
+  // `skip_serializing_if` Option as `number | null | undefined`, and narrowing this to
+  // `number | undefined` would make the panel's checks disagree with what can arrive.
+  expires_at_unix_ms?: number | null;
+  revoked_at_unix_ms?: number | null;
+}
+
+// List an organization's API keys (operationId listOrganizationApiKeys, issue #99).
+// REVOKED keys are included by the server, deliberately: a rotation is only legible if
+// the old key is visible beside the new one.
+export async function fetchOrgApiKeys(
+  tenantId: string,
+  environmentId: string,
+  organizationId: string,
+): Promise<OrgApiKeyView[]> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
+    {
+      params: {
+        path: {
+          tenant_id: tenantId,
+          environment_id: environmentId,
+          organization_id: organizationId,
+        },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data?.items ?? [];
+}
+
 // Read one role (operationId getOrgRole). The role detail panel reads this fresh
 // rather than reusing the list row, so a rename made elsewhere is visible.
 export async function getOrgRole(

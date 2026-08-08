@@ -57,6 +57,7 @@ import {
   MutationFeedback,
 } from "./ResourceView";
 import { MembershipRolesPanel } from "./MemberRolesView";
+import { OrgApiKeysPanel } from "./OrgApiKeysView";
 import { OrgDefaultRolePanel } from "./OrgDefaultRoleView";
 import { OrgGroupsPanel } from "./OrgGroupsView";
 import { OrgRolesPanel } from "./OrgRolesView";
@@ -363,6 +364,12 @@ function OrganizationDetailFor({
             />
 
             <OrgDefaultRolePanel
+              tenantId={tenantId}
+              environmentId={environmentId}
+              organizationId={organizationId}
+            />
+
+            <OrgApiKeysPanel
               tenantId={tenantId}
               environmentId={environmentId}
               organizationId={organizationId}
