@@ -1898,6 +1898,14 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         // key lookup, so a 404 for an unknown key on a live environment and the uniform
         // refusal on a deleted one are exactly the pair it wants to compare.
         Case::empty(
+            "api_keys.rotateOrganizationApiKey",
+            "POST",
+            format!("{org_base}/api-keys/{api_key}/rotate"),
+        ),
+        // Revoke comes AFTER rotate: rotate already revoked this handle, so revoking it
+        // again is the already-revoked path, which is still a 404 at a live environment.
+        // Both orderings drive the fence; this one also exercises the interaction.
+        Case::empty(
             "api_keys.revokeOrganizationApiKey",
             "DELETE",
             format!("{org_base}/api-keys/{api_key}"),

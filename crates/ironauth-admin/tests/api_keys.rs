@@ -419,3 +419,83 @@ async fn one_organization_cannot_revoke_anothers_key() {
         "the refused revoke revoked it anyway: {entry}"
     );
 }
+
+/// Rotation is ONE request: the old key dies and the new one works, and a retry does neither
+/// again.
+///
+/// The single-request property is the whole reason `rotate` is a store operation rather than
+/// two calls. Exposed as create-then-revoke, a client that crashed between them would leave
+/// the old key live beside the new one, which is the failure a rotation performed to contain
+/// a leak exists to prevent.
+#[tokio::test]
+async fn rotation_is_one_request_and_a_retry_issues_nothing_further() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "ro1").await;
+    let base =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/api-keys");
+    let (status, _, body) = h
+        .post(
+            &base,
+            "ro-1",
+            &serde_json::json!({ "display_name": "ci deploy" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let first: Value = serde_json::from_str(&body).expect("json");
+    let old_id = first["id"].as_str().expect("id").to_owned();
+    let old_key = first["key"].as_str().expect("key").to_owned();
+
+    let (status, _, body) = h.post(&format!("{base}/{old_id}/rotate"), "ro-2", "").await;
+    assert_eq!(status, StatusCode::CREATED, "rotate: {body}");
+    let rotated: Value = serde_json::from_str(&body).expect("json");
+    let new_key = rotated["key"].as_str().expect("key").to_owned();
+    assert_ne!(new_key, old_key, "rotation must issue different material");
+    assert_eq!(
+        rotated["display_name"], "ci deploy",
+        "the replacement inherits the label, so a rotation does not silently rename the \
+         integration an operator is watching"
+    );
+
+    let env = Env::system();
+    let scope = scope_of(&tenant, &environment);
+    let repo = h.db().store();
+    assert!(
+        repo.scoped(scope)
+            .api_keys()
+            .verify(&old_key, now_micros(&env))
+            .await
+            .expect("verify")
+            .is_none(),
+        "the OLD key must be dead, or a rotation to contain a leak left it working"
+    );
+    assert!(
+        repo.scoped(scope)
+            .api_keys()
+            .verify(&new_key, now_micros(&env))
+            .await
+            .expect("verify")
+            .is_some(),
+        "the NEW key must work, or a routine rotation locked the caller out"
+    );
+
+    // The retry: same idempotency key, no key material, and no third credential.
+    let (status, _, replay) = h.post(&format!("{base}/{old_id}/rotate"), "ro-2", "").await;
+    assert_eq!(status, StatusCode::OK, "replay is 200: {replay}");
+    let replay_value: Value = serde_json::from_str(&replay).expect("json");
+    assert_eq!(replay_value["key_already_issued"], true);
+    assert!(
+        replay_value.get("key").is_none(),
+        "the replay repeated the key: {replay}"
+    );
+
+    let (_, _, listed) = h.get(&base).await;
+    let items = serde_json::from_str::<Value>(&listed).expect("json")["items"]
+        .as_array()
+        .expect("items")
+        .len();
+    assert_eq!(
+        items, 2,
+        "one original plus one replacement, not three: {listed}"
+    );
+}

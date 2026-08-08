@@ -455,6 +455,7 @@ async fn rotation_kills_the_old_key_and_issues_the_new_one() {
                 expires_at_unix_micros: None,
             },
             rotated_at,
+            None,
         )
         .await
         .expect("rotate");
@@ -554,6 +555,7 @@ async fn rotating_from_a_dead_key_is_refused_and_issues_nothing() {
                 expires_at_unix_micros: None,
             },
             now_micros(&env),
+            None,
         )
         .await;
     assert!(

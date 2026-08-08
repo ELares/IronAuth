@@ -1062,6 +1062,12 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             ),
         },
         Case {
+            label: "api_keys.rotateOrganizationApiKey",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/api-keys/akey_absent/rotate"),
+            body: None,
+        },
+        Case {
             label: "api_keys.revokeOrganizationApiKey",
             method: "DELETE",
             path: format!("{base}/organizations/{org}/api-keys/akey_absent"),
