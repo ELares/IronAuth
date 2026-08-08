@@ -190,6 +190,11 @@ path = "tests/hierarchy_entitlement_headroom.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "api_keys"
+path = "tests/api_keys.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "org_provisioning"
 path = "tests/org_provisioning.rs"
 required-features = ["testing"]
