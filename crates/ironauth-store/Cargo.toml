@@ -341,6 +341,11 @@ required-features = ["testing"]
 # checksum-mismatch rejection, and the expand-contract example end to end. Needs
 # a real database (DATABASE_URL).
 [[test]]
+name = "membership_principal_arc"
+path = "tests/membership_principal_arc.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "migration"
 path = "tests/migration.rs"
 required-features = ["testing"]
