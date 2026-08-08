@@ -56274,6 +56274,66 @@ impl ApiKeyRepo<'_> {
             revoked_at_unix_micros: None,
         }))
     }
+
+    /// Every key belonging to `owner`, live and revoked, newest first (issue #99, criterion 6).
+    ///
+    /// REVOKED keys are included. A management list exists so an operator can see what exists
+    /// and act on it, and a rotation's whole point is that the old key is visible next to the
+    /// new one. Hiding revoked rows would make a rotation look like a replacement and leave an
+    /// operator unable to tell "I revoked that" from "that was never here", which is the same
+    /// distinction the row retention in migration 0123 exists to preserve.
+    ///
+    /// Carries no digest, because [`ApiKeyRecord`] has no field for one. A list endpoint that
+    /// returned verifiers would hand a credential-equivalent to every caller allowed to look.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_owner(
+        &self,
+        owner: &ApiKeyOwner,
+    ) -> Result<Vec<ApiKeyRecord>, StoreError> {
+        let (column, id) = match owner {
+            ApiKeyOwner::User(id) => ("user_id", id.to_string()),
+            ApiKeyOwner::ServiceAccount(id) => ("service_account_id", id.to_string()),
+            ApiKeyOwner::Organization(id) => ("organization_id", id.to_string()),
+        };
+        // The owner column is chosen from a CLOSED match above, never from caller input, so the
+        // format! carries no injection surface. Written this way rather than as three
+        // near-identical queries because the only difference is the column name.
+        let sql = format!(
+            "SELECT id, owner_kind, user_id, service_account_id, organization_id, display_name, \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us \
+             FROM api_keys \
+             WHERE tenant_id = $1 AND environment_id = $2 AND {column} = $3 \
+             ORDER BY created_at DESC, id DESC"
+        );
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(&id)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id_raw: String = row.get("id");
+            let Ok(key_id) = ApiKeyId::parse_in_scope(&id_raw, &self.scope) else {
+                continue;
+            };
+            out.push(ApiKeyRecord {
+                id: key_id,
+                owner: owner.clone(),
+                display_name: row.get("display_name"),
+                expires_at_unix_micros: row.get("expires_us"),
+                revoked_at_unix_micros: row.get("revoked_us"),
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// The API key WRITE repository (issue #99), on the CONTROL plane.
@@ -56432,6 +56492,131 @@ impl ActingApiKeyRepo<'_> {
             target: id,
         };
         insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Rotate a key: revoke `old` and issue `replacement`, in ONE transaction (issue #99,
+    /// criterion 6).
+    ///
+    /// # Why this is one operation and not create-then-revoke by the caller
+    ///
+    /// The two orderings both have a failure window and both are bad. Create first and a crash
+    /// leaves TWO live keys, so a rotation performed to contain a leaked credential has left
+    /// the leaked one working. Revoke first and a crash leaves NONE, so a routine rotation has
+    /// locked the caller out of its own integration.
+    ///
+    /// One transaction removes the window rather than narrowing it. Either both writes land or
+    /// neither does, and a caller that sees an error knows its old key still works.
+    ///
+    /// Both audit rows are written inside the same transaction, so the trail cannot show a
+    /// revocation whose replacement never existed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `old` is absent from this scope, already revoked, or if the
+    /// replacement's id or owner is out of scope. Already-revoked is a refusal rather than a
+    /// no-op here, unlike [`Self::revoke`]: rotating from a dead key is a caller confusion
+    /// worth surfacing, and answering `Ok` would issue a replacement the caller believes
+    /// replaced something live.
+    ///
+    /// [`StoreError::Database`] on a persistence failure, including the permission error when
+    /// reached through the app-role store.
+    pub async fn rotate(
+        &self,
+        env: &Env,
+        old: &ApiKeyId,
+        replacement: NewApiKey<'_>,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if old.scope() != self.scope || replacement.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let (kind, user, service_account, organization) = match replacement.owner {
+            ApiKeyOwner::User(id) if id.scope() == self.scope => {
+                ("user", Some(id.to_string()), None, None)
+            }
+            ApiKeyOwner::ServiceAccount(id) if id.scope() == self.scope => {
+                ("service_account", None, Some(id.to_string()), None)
+            }
+            ApiKeyOwner::Organization(id) if id.scope() == self.scope => {
+                ("organization", None, None, Some(id.to_string()))
+            }
+            _ => return Err(StoreError::NotFound),
+        };
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+
+        let revoked = sqlx::query(
+            "UPDATE api_keys \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND revoked_at IS NULL \
+             RETURNING id",
+        )
+        .bind(now_micros)
+        .bind(old.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if revoked.is_none() {
+            // Dropping `tx` rolls back, so nothing is issued.
+            return Err(StoreError::NotFound);
+        }
+
+        sqlx::query(
+            "INSERT INTO api_keys \
+             (key_digest, id, tenant_id, environment_id, owner_kind, user_id, \
+              service_account_id, organization_id, display_name, expires_at, \
+              created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                     CASE WHEN $10::bigint IS NULL THEN NULL ELSE \
+                          TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval \
+                     END, \
+                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+        )
+        .bind(replacement.key_digest)
+        .bind(replacement.id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(kind)
+        .bind(user.as_deref())
+        .bind(service_account.as_deref())
+        .bind(organization.as_deref())
+        .bind(replacement.display_name)
+        .bind(replacement.expires_at_unix_micros)
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ApiKeyRevoked,
+                target: old,
+            },
+            None,
+        )
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ApiKeyCreated,
+                target: replacement.id,
+            },
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
