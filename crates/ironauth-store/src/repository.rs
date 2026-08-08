@@ -38597,7 +38597,7 @@ impl OrgGroupRepo<'_> {
         let rows = self
             .resolve_effective(
                 organization_id,
-                user_id,
+                MembershipPrincipal::User(user_id),
                 max_group_depth,
                 EFFECTIVE_ROLE_SLUGS_TAIL,
             )
@@ -38635,7 +38635,7 @@ impl OrgGroupRepo<'_> {
     ) -> Result<BTreeSet<String>, StoreError> {
         self.resolve_effective(
             organization_id,
-            user_id,
+            MembershipPrincipal::User(user_id),
             max_group_depth,
             EFFECTIVE_GROUP_SLUGS_TAIL,
         )
@@ -38700,7 +38700,37 @@ impl OrgGroupRepo<'_> {
     ) -> Result<BTreeSet<String>, StoreError> {
         self.resolve_effective(
             organization_id,
-            user_id,
+            MembershipPrincipal::User(user_id),
+            max_group_depth,
+            EFFECTIVE_PERMISSION_SLUGS_TAIL,
+        )
+        .await
+    }
+
+    /// The permissions a SERVICE ACCOUNT resolves in an organization (issue #99,
+    /// criterion 3).
+    ///
+    /// The same statement, the same closure, the same depth bound and the same tail as the
+    /// user resolution above; only the principal differs. That is the point of the criterion:
+    /// a service account passes the SAME permission checks rather than a parallel set of
+    /// them, so there is one definition of what a membership grants and it cannot drift
+    /// between principal kinds.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization or the principal is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure. A store fault is never swallowed
+    /// into an empty set: on the mint path that is a silent authorization downgrade that
+    /// looks exactly like a principal who legitimately holds nothing.
+    pub async fn effective_permissions_for_service_account(
+        &self,
+        organization_id: &OrganizationId,
+        service_account_id: &ServiceAccountId,
+        max_group_depth: u32,
+    ) -> Result<BTreeSet<String>, StoreError> {
+        self.resolve_effective(
+            organization_id,
+            MembershipPrincipal::ServiceAccount(service_account_id),
             max_group_depth,
             EFFECTIVE_PERMISSION_SLUGS_TAIL,
         )
@@ -38721,12 +38751,12 @@ impl OrgGroupRepo<'_> {
     async fn resolve_effective(
         &self,
         organization_id: &OrganizationId,
-        user_id: &UserId,
+        principal: MembershipPrincipal<'_>,
         max_group_depth: u32,
         tail: &'static str,
     ) -> Result<BTreeSet<String>, StoreError> {
         let rows = self
-            .run_effective(organization_id, user_id, max_group_depth, tail)
+            .run_effective(organization_id, principal, max_group_depth, tail)
             .await?;
         // A BTreeSet rather than the Vec the ORDER BY already sorted: the SQL order
         // and the collection order must agree even if a future edit to either drifts,
@@ -38809,7 +38839,7 @@ impl OrgGroupRepo<'_> {
         let rows = self
             .run_effective(
                 organization_id,
-                user_id,
+                MembershipPrincipal::User(user_id),
                 max_group_depth,
                 EFFECTIVE_ROLE_GRANTS_TAIL,
             )
@@ -38873,11 +38903,11 @@ impl OrgGroupRepo<'_> {
     async fn run_effective(
         &self,
         organization_id: &OrganizationId,
-        user_id: &UserId,
+        principal: MembershipPrincipal<'_>,
         max_group_depth: u32,
         tail: &'static str,
     ) -> Result<Vec<PgRow>, StoreError> {
-        if organization_id.scope() != self.scope || user_id.scope() != self.scope {
+        if organization_id.scope() != self.scope || principal.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         // The read bound is `max_group_depth`, NOT the `max_group_depth + 1` the two
@@ -38897,7 +38927,7 @@ impl OrgGroupRepo<'_> {
             .bind(self.scope.tenant().to_string())
             .bind(self.scope.environment().to_string())
             .bind(organization_id.to_string())
-            .bind(user_id.to_string())
+            .bind(principal.id_string())
             .bind(walk_bound)
             .fetch_all(&mut *tx)
             .await?;
@@ -39318,18 +39348,89 @@ impl OrgGroupRepo<'_> {
 /// [`OrgGroupRepo::effective_roles`] for why a read must not reach a level a write
 /// would refuse). A runtime `sqlx::query` string, never a compile-time macro, so the
 /// database-free lanes stay database-free.
+/// Which principal a membership resolution is FOR (issue #99, criterion 3).
+///
+/// `EFFECTIVE_CLOSURE_CTE` binds one id as `$4` and matches it against either
+/// `org_memberships.user_id` or `.service_account_id` depending on the row's `owner_kind`.
+/// This carries the id AND its scope so the caller-side scope fence keeps working: passing a
+/// bare `&str` would have bound the id fine and silently dropped the check that it belongs to
+/// the scope being read.
+#[derive(Debug, Clone, Copy)]
+pub enum MembershipPrincipal<'a> {
+    /// A user, the only kind before migration 0124.
+    User(&'a UserId),
+    /// A service account.
+    ServiceAccount(&'a ServiceAccountId),
+}
+
+impl MembershipPrincipal<'_> {
+    /// The scope the principal belongs to, for the fence every resolution runs.
+    #[must_use]
+    pub fn scope(&self) -> Scope {
+        match self {
+            Self::User(id) => id.scope(),
+            Self::ServiceAccount(id) => id.scope(),
+        }
+    }
+
+    /// The id as bound to `$4`.
+    #[must_use]
+    pub fn id_string(&self) -> String {
+        match self {
+            Self::User(id) => id.to_string(),
+            Self::ServiceAccount(id) => id.to_string(),
+        }
+    }
+}
+
+/// The membership seed resolves a principal of either kind (issue #99, criterion 3).
+///
+/// `$4` is the principal id and the anchor's two disjuncts decide which column it addresses.
+/// The branches are NOT mirror images, because the tables are not: `users` is soft-deleted and
+/// carries a `state`, while `service_accounts` has neither. A principal's liveness there IS its
+/// existence, so both joins are LEFT joins and each branch asserts its own side matched.
+///
+/// Which of these conditions carry weight was measured, one mutation at a time, against
+/// `tests/effective_permissions.rs` and `tests/membership_principal_arc.rs`. Three are
+/// load bearing and each is killed by exactly one test:
+///
+/// - `u.id IS NOT NULL` by `a_soft_deleted_user_resolves_to_no_permissions`,
+/// - `s.id IS NOT NULL` by
+///   `a_membership_naming_a_service_account_row_in_another_scope_resolves_to_nothing`,
+/// - `m.service_account_id = $4` by
+///   `a_service_account_membership_resolves_the_same_permissions_a_user_would`.
+///
+/// Two SURVIVE every test, and the reason is recorded here rather than left to be rediscovered
+/// as a gap:
+///
+/// - The `m.owner_kind` discriminators are redundant against 0124's `org_memberships_owner_arc`
+///   CHECK, which already makes `user_id IS NOT NULL` equivalent to `owner_kind = 'user'`. A row
+///   that would distinguish them is not representable, so no test can kill them. They stay
+///   because they say out loud which column each branch is reading.
+/// - The scope predicates on the `service_accounts` join are redundant against 0017's
+///   `service_accounts_tenant_isolation` policy, which is FORCE'd and fences the same two
+///   columns from the session settings. They stay for symmetry with the `users` join beside
+///   them, and as the second layer if that policy is ever relaxed.
 const EFFECTIVE_CLOSURE_CTE: &str = "WITH RECURSIVE membership AS ( \
          SELECT m.id \
            FROM org_memberships m \
            JOIN organizations o ON o.id = m.organization_id \
             AND o.tenant_id = $1 AND o.environment_id = $2 \
             AND o.state = 'active' AND o.deleted_at IS NULL \
-           JOIN users u ON u.id = m.user_id \
+           LEFT JOIN users u ON u.id = m.user_id \
             AND u.tenant_id = $1 AND u.environment_id = $2 \
             AND u.deleted_at IS NULL \
+           LEFT JOIN service_accounts s ON s.id = m.service_account_id \
+            AND s.tenant_id = $1 AND s.environment_id = $2 \
           WHERE m.tenant_id = $1 AND m.environment_id = $2 \
-            AND m.organization_id = $3 AND m.user_id = $4 \
+            AND m.organization_id = $3 \
             AND m.state = 'active' AND m.deleted_at IS NULL \
+            AND ( \
+                 (m.owner_kind = 'user' \
+                   AND m.user_id = $4 AND u.id IS NOT NULL) \
+              OR (m.owner_kind = 'service_account' \
+                   AND m.service_account_id = $4 AND s.id IS NOT NULL) \
+            ) \
      ), \
      closure AS ( \
          SELECT g.id, g.parent_id, g.slug, 0::bigint AS depth \

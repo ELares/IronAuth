@@ -2,10 +2,10 @@
 
 //! A membership may bind a service account (issue #99, criterion 3), schema half.
 //!
-//! Migration 0124 makes the row representable. Resolution deliberately does NOT yet include
-//! it, and the last test here asserts that rather than leaving it to be discovered: the
-//! resolution change is `EFFECTIVE_CLOSURE_CTE`'s anchor and lands separately so its diff can
-//! be reviewed and mutation-swept on its own.
+//! Migration 0124 made the row representable; this file's last test is the one that says
+//! resolution reaches it. That test replaced a pin asserting the opposite, so the flip is the
+//! evidence the anchor rewrite in `EFFECTIVE_CLOSURE_CTE` landed rather than something quietly
+//! starting to match.
 
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{CorrelationId, Scope, UserId};
@@ -247,15 +247,17 @@ async fn assert_arc_refuses_and_accepts(
     );
 }
 
-/// A service-account membership does NOT yet resolve permissions, and that is asserted here
-/// rather than left to be discovered.
+/// A service-account membership resolves permissions through the SAME projection a user's
+/// does (issue #99, criterion 3).
 ///
-/// Migration 0124 makes the ROW representable; `EFFECTIVE_CLOSURE_CTE` still anchors on
-/// `JOIN users u ON u.id = m.user_id`, so a service-account membership matches nothing. This
-/// test is the pin that the schema landed WITHOUT changing what any token carries, and it is
-/// the test the resolution change will flip.
+/// This replaces a pin that asserted the opposite while the anchor still read `JOIN users`.
+///
+/// The two branches are NOT symmetric and could not be written by copying. `users` is
+/// soft-deleted and its branch enforces `deleted_at IS NULL`; `service_accounts` carries
+/// neither `deleted_at` nor `state`, so liveness there IS existence, expressed as
+/// `s.id IS NOT NULL` past a LEFT JOIN.
 #[tokio::test]
-async fn a_service_account_membership_does_not_yet_resolve_permissions() {
+async fn a_service_account_membership_resolves_the_same_permissions_a_user_would() {
     let db = TestDatabase::start().await;
     let env = ironauth_env::Env::system();
     let scope = db.seed_scope(&env).await;
@@ -267,6 +269,9 @@ async fn a_service_account_membership_does_not_yet_resolve_permissions() {
         .create(&env, &org, now_micros(&env), "acme", None)
         .await
         .expect("create org");
+
+    let role = grant_reader_role(&db, &env, scope, &org).await;
+
     let client = db
         .store()
         .scoped(scope)
@@ -284,12 +289,13 @@ async fn a_service_account_membership_does_not_yet_resolve_permissions() {
         .await
         .expect("mint the principal");
 
+    let membership = ironauth_store::OrgMembershipId::generate(&env, &scope);
     sqlx::query(
         "INSERT INTO org_memberships \
          (id, tenant_id, environment_id, organization_id, service_account_id, owner_kind) \
          VALUES ($1, $2, $3, $4, $5, 'service_account')",
     )
-    .bind(ironauth_store::OrgMembershipId::generate(&env, &scope).to_string())
+    .bind(membership.to_string())
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
     .bind(org.to_string())
@@ -297,22 +303,202 @@ async fn a_service_account_membership_does_not_yet_resolve_permissions() {
     .execute(db.owner_pool())
     .await
     .expect("insert the service-account membership");
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_membership_roles(scope)
+        .assign(
+            &env,
+            ironauth_store::NewOrgMembershipRole {
+                id: &ironauth_store::OrgMembershipRoleId::generate(&env, &scope),
+                organization_id: &org,
+                membership_id: &membership,
+                role_id: &role,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("grant the role to the membership");
 
-    // The resolution anchor joins `users`, so this row is invisible to it. When the anchor
-    // learns about service accounts this assertion flips, and flipping it deliberately is the
-    // point: nothing about what a token carries changed in this migration.
-    let resolved: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM org_memberships m \
-         JOIN users u ON u.id = m.user_id \
-         WHERE m.organization_id = $1",
+    let resolved = db
+        .control_store()
+        .management()
+        .org_groups(scope)
+        .effective_permissions_for_service_account(&org, &principal, 8)
+        .await
+        .expect("resolve");
+    assert!(
+        resolved.contains("billing.invoice.read"),
+        "a service account holding a role must resolve that role's permissions, got {resolved:?}"
+    );
+}
+
+/// Define one permission, one role, and bind them. Split out only for the length lint.
+async fn grant_reader_role(
+    db: &TestDatabase,
+    env: &ironauth_env::Env,
+    scope: Scope,
+    org: &ironauth_store::OrganizationId,
+) -> ironauth_store::OrgRoleId {
+    let permission = ironauth_store::PermissionId::generate(env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .permissions(scope)
+        .create(
+            env,
+            ironauth_store::NewPermission {
+                id: &permission,
+                slug: "billing.invoice.read",
+                display_name: "Read invoices",
+                metadata: None,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("define the permission");
+    let role = ironauth_store::OrgRoleId::generate(env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_roles(scope)
+        .create(
+            env,
+            ironauth_store::NewOrgRole {
+                id: &role,
+                organization_id: org,
+                slug: "reader",
+                display_name: "Reader",
+                metadata: None,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("define the role");
+    db.control_store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_role_permissions(scope)
+        .assign(
+            env,
+            ironauth_store::NewOrgRolePermission {
+                id: &ironauth_store::OrgRolePermissionId::generate(env, &scope),
+                organization_id: org,
+                role_id: &role,
+                permission_id: &permission,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("grant the permission to the role");
+    role
+}
+
+/// A membership naming a service-account ROW that lives in another scope resolves to nothing.
+///
+/// This is the case that makes `s.id IS NOT NULL` load-bearing rather than decorative, and it
+/// has to be built deliberately. A well-formed foreign principal never reaches the SQL at all:
+/// `ServiceAccountId` carries its scope in the identifier, so `resolve_effective`'s Rust fence
+/// rejects it before a statement is prepared. The row below defeats that fence the only way it
+/// can be defeated, by giving the principal an identifier minted in THIS scope while its row
+/// sits in the other one. The foreign key on `service_account_id` references
+/// `service_accounts (id)` alone and cannot see tenant or environment, so nothing in the schema
+/// objects.
+///
+/// The scope predicates sit on the LEFT JOIN, so the join misses, `s.id` is NULL, and the
+/// disjunct refuses the membership. Delete `AND s.id IS NOT NULL` and this test fails while
+/// every other test in the tree still passes, which is why it is written separately from the
+/// resolution test.
+#[tokio::test]
+async fn a_membership_naming_a_service_account_row_in_another_scope_resolves_to_nothing() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let elsewhere = db.seed_scope(&env).await;
+    assert_ne!(
+        scope.environment(),
+        elsewhere.environment(),
+        "the two scopes must actually differ or this test proves nothing"
+    );
+    let org = ironauth_store::OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org, now_micros(&env), "acme", None)
+        .await
+        .expect("create org");
+    let role = grant_reader_role(&db, &env, scope, &org).await;
+
+    // A client next door, to satisfy the composite foreign key the planted row needs.
+    let client = db
+        .store()
+        .scoped(elsewhere)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "a machine client next door")
+        .await
+        .expect("create client");
+    // The identifier is minted in THIS scope so the Rust fence lets the call through; the row
+    // it names is planted next door.
+    let principal = ironauth_store::ServiceAccountId::generate(&env, &scope);
+    sqlx::query(
+        "INSERT INTO service_accounts (id, tenant_id, environment_id, client_id) \
+         VALUES ($1, $2, $3, $4)",
     )
-    .bind(org.to_string())
-    .fetch_one(db.owner_pool())
+    .bind(principal.to_string())
+    .bind(elsewhere.tenant().to_string())
+    .bind(elsewhere.environment().to_string())
+    .bind(client.to_string())
+    .execute(db.owner_pool())
     .await
-    .expect("count resolvable memberships");
-    assert_eq!(
-        resolved, 0,
-        "the service-account membership resolved through the user anchor, which means this \
-         migration changed what a token carries and it must not have"
+    .expect("plant the cross-scope principal row");
+
+    let membership = ironauth_store::OrgMembershipId::generate(&env, &scope);
+    sqlx::query(
+        "INSERT INTO org_memberships \
+         (id, tenant_id, environment_id, organization_id, service_account_id, owner_kind) \
+         VALUES ($1, $2, $3, $4, $5, 'service_account')",
+    )
+    .bind(membership.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(org.to_string())
+    .bind(principal.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("the arc and the foreign key both admit a cross-scope principal");
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_membership_roles(scope)
+        .assign(
+            &env,
+            ironauth_store::NewOrgMembershipRole {
+                id: &ironauth_store::OrgMembershipRoleId::generate(&env, &scope),
+                organization_id: &org,
+                membership_id: &membership,
+                role_id: &role,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("grant the role to the membership");
+
+    let resolved = db
+        .control_store()
+        .management()
+        .org_groups(scope)
+        .effective_permissions_for_service_account(&org, &principal, 8)
+        .await
+        .expect("resolve");
+    assert!(
+        resolved.is_empty(),
+        "a principal whose row lives in another scope must resolve to nothing, got {resolved:?}"
     );
 }
