@@ -185,6 +185,11 @@ required-features = ["testing"]
 # confusion defence, and the secret-free snapshot export (the user selector is an opaque
 # blind index).
 [[test]]
+name = "hierarchy_entitlement_headroom"
+path = "tests/hierarchy_entitlement_headroom.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "connection_metering"
 path = "tests/connection_metering.rs"
 required-features = ["testing"]
