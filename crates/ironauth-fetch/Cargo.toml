@@ -15,6 +15,7 @@ repository.workspace = true
 autotests = false
 
 [dependencies]
+ironauth-env.workspace = true
 # hyper's low-level client connection API (client + http1) only. No high-level
 # pooling client, so nothing re-resolves the host or pools connections behind
 # our back; the connector resolves, validates, and pins the address itself.

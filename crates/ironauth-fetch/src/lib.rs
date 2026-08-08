@@ -64,6 +64,7 @@ pub mod observe;
 pub mod policy;
 pub(crate) mod resolve;
 pub mod target;
+pub mod txt;
 
 use std::sync::Arc;
 use std::time::Duration;
