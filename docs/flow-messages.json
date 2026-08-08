@@ -367,6 +367,20 @@
     },
     {
       "context_keys": [],
+      "id": 1090003,
+      "kind": "info",
+      "name": "org_picker.create.name.label",
+      "text": "New organization name"
+    },
+    {
+      "context_keys": [],
+      "id": 1090004,
+      "kind": "info",
+      "name": "org_picker.create.label",
+      "text": "Create organization"
+    },
+    {
+      "context_keys": [],
       "id": 1500001,
       "kind": "success",
       "name": "login.success",

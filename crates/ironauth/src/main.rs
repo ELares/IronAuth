@@ -930,6 +930,52 @@ struct OidcPlane {
 ///
 /// The caller merges the three surfaces into one `Router`; see [`OidcPlane`] for why
 /// this returns them instead of mounting them.
+/// The ONE data-plane-to-control-plane crossing (issue #96, criterion 5), or [`None`].
+///
+/// Built only when the deployment asked for it AND a control DSN exists. Both conditions matter:
+/// without the toggle the capability must be ABSENT rather than merely disabled, and without a
+/// control DSN there is no role holding INSERT on `organizations`, so a seam over the data-plane
+/// store would fail at the write with a bare permission error.
+///
+/// # Every failure here is [`None`], never a refusal to boot
+///
+/// A separate function precisely so the early returns mean "no seam" rather than "no OIDC plane".
+/// Inlined in [`build_oidc_plane`], which returns `Option<OidcPlane>`, the same `return None`
+/// would have aborted the whole data plane: a deployment that turned this on and forgot the
+/// control DSN would have failed to serve ANY traffic, turning a configuration typo into an
+/// outage. That is how the first version of this was written.
+///
+/// A configured-but-unusable combination is logged loudly instead, matching how the management
+/// API treats the same missing DSN. An operator should learn about it from a startup line, not
+/// from a refused login and certainly not from a dead server.
+async fn connect_org_provisioning(
+    config: &Config,
+) -> Option<std::sync::Arc<ironauth_store::org_provisioning::OrgProvisioningSeam>> {
+    if !config.oidc.self_service_organizations {
+        return None;
+    }
+    let Some(dsn) = select_control_dsn(config) else {
+        tracing::error!(
+            "self-service organizations disabled: oidc.self_service_organizations is on but no \
+             control-plane DSN is configured, and creating an organization is a control-plane \
+             write"
+        );
+        return None;
+    };
+    match Store::connect(&dsn).await {
+        Ok(control) => Some(std::sync::Arc::new(
+            ironauth_store::org_provisioning::OrgProvisioningSeam::new(control),
+        )),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "self-service organizations disabled: cannot connect the control-plane store"
+            );
+            None
+        }
+    }
+}
+
 // One flat sequence of independent state-builder installs and startup notices; splitting
 // it would scatter the single OIDC mount the boot path performs.
 #[allow(clippy::too_many_lines)]
@@ -1049,7 +1095,10 @@ async fn build_oidc_plane(
     // connector-labeled health gauge and success/error counters carry help/type text.
     ironauth_oidc::describe_connector_health_metrics();
 
+    let org_provisioning = connect_org_provisioning(config).await;
+
     let state = OidcState::new(store, env, registry, oidc_config, issuer_base)
+        .with_org_provisioning(org_provisioning)
         .with_global_token_revocation_enabled(surfaces.global_revocation)
         .with_fedcm_enabled(surfaces.fedcm)
         .with_risk_signals_enabled(surfaces.risk_signals)

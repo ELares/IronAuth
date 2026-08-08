@@ -1159,6 +1159,30 @@ impl Harness {
         self.state = state;
     }
 
+    /// Install the organization-provisioning seam (issue #96, criterion 5) on the EXISTING
+    /// state and rebuild the protocol router, so the login discovery step may create an
+    /// organization.
+    ///
+    /// Mutates the state in place, following `install_hashing_pool`, rather than rebuilding one
+    /// from a fresh `OidcConfig`. A rebuild silently discards whatever the test already
+    /// installed: the first version of this did exactly that and dropped `enable_flows`, so
+    /// every test using it got a 404 from the flow endpoint rather than the behaviour it was
+    /// measuring.
+    ///
+    /// Built over the harness's CONTROL store, which is what the boot path does: `organizations`
+    /// grants the data plane SELECT only, so a seam over the app-role store would fail at the
+    /// write. `the_seam_refuses_to_work_through_the_data_plane_store` in `ironauth-store` pins
+    /// that failure so this choice is measured rather than assumed.
+    pub fn enable_self_service_organizations(&mut self) {
+        let state = self.state.clone().with_org_provisioning(Some(Arc::new(
+            ironauth_store::org_provisioning::OrgProvisioningSeam::new(
+                self.db.control_store().clone(),
+            ),
+        )));
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Arm the experimental org-scoped-clients surface (issue #103, bet 1) and rebuild the
     /// protocol router over the SAME store, env and registry, so an organization's stated
     /// access-token lifetime narrows the tokens its clients receive.

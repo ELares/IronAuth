@@ -817,3 +817,300 @@ async fn an_organization_that_is_both_a_membership_and_eligible_is_offered_once(
         "exactly two distinct organizations: {offered:?}"
     );
 }
+
+/// Submit a new-organization name on an API login flow (issue #96, criterion 5).
+async fn submit_create(
+    harness: &Harness,
+    flow_id: &str,
+    token: &str,
+    name: &str,
+) -> (StatusCode, HeaderMap, Value) {
+    post_json(
+        harness,
+        &submit_path(harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": {"new_organization_name": name},
+        }),
+    )
+    .await
+}
+
+/// The node names the picker rendered.
+fn node_names(flow: &Value) -> Vec<String> {
+    flow["ui"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .filter_map(|node| node["attributes"]["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// With the seam NOT installed, which is every deployment by default, nothing changes.
+///
+/// The capability is absent rather than disabled: no create control renders, and a create
+/// submission is the same uniform refusal as a malformed pick, so the setting is not an
+/// existence oracle either.
+#[tokio::test]
+async fn without_the_seam_no_create_control_renders_and_a_create_submission_is_refused() {
+    let harness = setup().await;
+    let subject = seed_consenting_user(&harness, "nocreate@example.test").await;
+    let org_a = create_org(&harness, "Acme").await;
+    let org_b = create_org(&harness, "Globex").await;
+    add_member(&harness, &org_a, &subject).await;
+    add_member(&harness, &org_b, &subject).await;
+
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, held) = submit_primary(&harness, &flow_id, &token, "nocreate@example.test").await;
+    let names = node_names(&held["flow"]);
+    assert!(
+        !names.iter().any(|name| name == "new_organization_name"),
+        "a create control rendered in a deployment with no provisioning seam: {names:?}"
+    );
+
+    let token = held["submit_token"].as_str().expect("token").to_owned();
+    let (status, _, body) = submit_create(&harness, &flow_id, &token, "Sneaky Ltd").await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a create submission was honoured with no seam installed"
+    );
+    assert_eq!(
+        live_org_count(&harness).await,
+        2,
+        "the refused submission created an organization anyway"
+    );
+
+    // UNIFORM with a malformed pick, byte for byte. This is the property that keeps the setting
+    // from being an existence oracle: a client must not be able to tell "this deployment has
+    // self-service organizations turned off" from "that was not a valid submission". Asserting
+    // only that the status is non-OK does not measure it, and a mutation that changed the
+    // refusal to an internal error survived a test that did.
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, held) = submit_primary(&harness, &flow_id, &token, "nocreate@example.test").await;
+    let token = held["submit_token"].as_str().expect("token").to_owned();
+    let (malformed_status, _, malformed_body) =
+        submit_pick(&harness, &flow_id, &token, "not-an-org-id").await;
+    assert_eq!(
+        (status, body),
+        (malformed_status, malformed_body),
+        "the no-seam refusal must be indistinguishable from a malformed pick"
+    );
+}
+
+/// A subject with NO organization is offered creation, and creating one enrolls them and becomes
+/// the login's organization context.
+///
+/// This is the state criterion 5 is really about: a subject with nowhere to go, in a deployment
+/// that opted into onboarding at sign-in.
+#[tokio::test]
+async fn a_subject_with_no_organization_can_create_one_and_is_enrolled_into_it() {
+    let mut harness = setup().await;
+    harness.enable_self_service_organizations();
+    let client_id = harness.client_id().to_string();
+    let subject = seed_consenting_user(&harness, "founder@example.test").await;
+
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, held) = submit_primary(&harness, &flow_id, &token, "founder@example.test").await;
+    assert_ne!(
+        held["state"], "completed",
+        "the create step must hold: {held}"
+    );
+    let names = node_names(&held["flow"]);
+    assert!(
+        names
+            .iter()
+            .filter(|name| *name == "new_organization_name")
+            .count()
+            == 2,
+        "the name field and its submit control must both render: {names:?}"
+    );
+    assert!(
+        picker_option_values(&held["flow"]).is_empty(),
+        "there is nothing to pick, so no organization control should render"
+    );
+
+    let token = held["submit_token"].as_str().expect("token").to_owned();
+    let (status, headers, done) = submit_create(&harness, &flow_id, &token, "Founders Inc").await;
+    assert_eq!(status, StatusCode::OK, "create: {done}");
+    assert_eq!(
+        done["state"], "completed",
+        "creating completes the login: {done}"
+    );
+
+    let created = sole_live_org(&harness).await;
+    assert!(
+        is_member(&harness, &created, &subject).await,
+        "the creator must be enrolled as the organization's first member"
+    );
+
+    let cookie = session_cookie_from_headers(&headers);
+    let code = authorize_to_code(&harness, &cookie, &authorize_query(&client_id, &[])).await;
+    let (access, id_token) = exchange_claims(&harness, &client_id, &code).await;
+    assert_eq!(access["org_id"], created.to_string());
+    assert_eq!(id_token["org_id"], created.to_string());
+}
+
+/// A subject with exactly ONE organization still skips, even with the seam installed.
+///
+/// Their context is determined. Turning every single-organization login into a prompt is not what
+/// the criterion asks for, and it would be the most-hit login shape in a real deployment.
+#[tokio::test]
+async fn one_organization_still_skips_even_when_creation_is_offered() {
+    let mut harness = setup().await;
+    harness.enable_self_service_organizations();
+    let subject = seed_consenting_user(&harness, "settled@example.test").await;
+    let org = create_org(&harness, "Only Org").await;
+    add_member(&harness, &org, &subject).await;
+
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, done) = submit_primary(&harness, &flow_id, &token, "settled@example.test").await;
+    assert_eq!(
+        done["state"], "completed",
+        "a one-organization login must still mint directly: {done}"
+    );
+}
+
+/// Every rejected name is refused uniformly and creates nothing.
+///
+/// This is the one path where an UNPRIVILEGED subject supplies the string, and the name is echoed
+/// back in a picker to everyone who later joins the organization.
+#[tokio::test]
+async fn a_rejected_organization_name_creates_nothing() {
+    let mut harness = setup().await;
+    harness.enable_self_service_organizations();
+    seed_consenting_user(&harness, "namer@example.test").await;
+
+    // A leading tab is NOT in this list. `trim` strips it before the control-character check
+    // runs, so "\u{9}tabbed" normalizes to "tabbed" and is a perfectly good name; the first
+    // version of this test asserted it was refused and was wrong about its own code. The
+    // control-character rule is about characters SURVIVING normalization, which is what the
+    // interior newline and NUL below test.
+    let over_long = "x".repeat(101);
+    for name in [
+        "",
+        "   ",
+        "line\u{a}break",
+        "nul\u{0}inside",
+        over_long.as_str(),
+    ] {
+        let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+        let (_, _, held) = submit_primary(&harness, &flow_id, &token, "namer@example.test").await;
+        let token = held["submit_token"].as_str().expect("token").to_owned();
+        let (status, _, _) = submit_create(&harness, &flow_id, &token, name).await;
+        assert_ne!(status, StatusCode::OK, "the name {name:?} was accepted");
+    }
+    assert_eq!(
+        live_org_count(&harness).await,
+        0,
+        "a refused name created an organization"
+    );
+
+    // The boundary on the OTHER side, so the bound is measured rather than merely asserted to
+    // exist: exactly the maximum is accepted, and surrounding whitespace is NORMALIZED away
+    // rather than counted toward the bound or stored.
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, held) = submit_primary(&harness, &flow_id, &token, "namer@example.test").await;
+    let token = held["submit_token"].as_str().expect("token").to_owned();
+    let at_limit = format!("  \t{}  ", "y".repeat(100));
+    let (status, _, done) = submit_create(&harness, &flow_id, &token, &at_limit).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a name at the limit, with trimmable whitespace around it, must be accepted: {done}"
+    );
+    assert_eq!(
+        live_org_count(&harness).await,
+        1,
+        "exactly the one accepted name created an organization"
+    );
+    assert_eq!(
+        sole_live_org_name(&harness).await,
+        "y".repeat(100),
+        "the stored name must be the TRIMMED one, so the bound applies to what is stored"
+    );
+}
+
+/// A submission carrying BOTH a pick and a create is refused rather than silently treated as one.
+///
+/// The rendered form cannot produce it, so a client sending both is doing something deliberate
+/// and the safe answer is no. Preferring one would let a client pair a valid create with an
+/// organization id it wanted the server to look at.
+#[tokio::test]
+async fn a_submission_carrying_both_a_pick_and_a_create_is_refused() {
+    let mut harness = setup().await;
+    harness.enable_self_service_organizations();
+    let subject = seed_consenting_user(&harness, "both@example.test").await;
+    let org_a = create_org(&harness, "Acme").await;
+    let org_b = create_org(&harness, "Globex").await;
+    add_member(&harness, &org_a, &subject).await;
+    add_member(&harness, &org_b, &subject).await;
+
+    let (flow_id, token, _) = api_login_create(&harness, &[]).await;
+    let (_, _, held) = submit_primary(&harness, &flow_id, &token, "both@example.test").await;
+    let token = held["submit_token"].as_str().expect("token").to_owned();
+    let (status, _, _) = post_json(
+        &harness,
+        &submit_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": {
+                "organization": org_a.to_string(),
+                "new_organization_name": "Both At Once",
+            },
+        }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a two-control submission was honoured"
+    );
+    assert_eq!(
+        live_org_count(&harness).await,
+        2,
+        "the refused submission created an organization anyway"
+    );
+}
+
+/// How many live organizations exist in the harness scope.
+async fn live_org_count(harness: &Harness) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM organizations \
+         WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(harness.scope().tenant().to_string())
+    .bind(harness.scope().environment().to_string())
+    .fetch_one(harness.db().owner_pool())
+    .await
+    .expect("count organizations")
+}
+
+/// The single live organization in the harness scope.
+async fn sole_live_org(harness: &Harness) -> OrganizationId {
+    let raw: String = sqlx::query_scalar(
+        "SELECT id FROM organizations \
+         WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(harness.scope().tenant().to_string())
+    .bind(harness.scope().environment().to_string())
+    .fetch_one(harness.db().owner_pool())
+    .await
+    .expect("exactly one organization");
+    OrganizationId::parse_in_scope(&raw, &harness.scope()).expect("a well formed org id")
+}
+
+/// The display name of the single live organization in the harness scope.
+async fn sole_live_org_name(harness: &Harness) -> String {
+    sqlx::query_scalar(
+        "SELECT display_name FROM organizations \
+         WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(harness.scope().tenant().to_string())
+    .bind(harness.scope().environment().to_string())
+    .fetch_one(harness.db().owner_pool())
+    .await
+    .expect("exactly one organization")
+}

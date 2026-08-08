@@ -45,6 +45,14 @@ use crate::util::query_get;
 /// control's value is the pick the engine reads server-authoritatively on both transports.
 const ORGANIZATION_NODE: &str = "organization";
 
+/// The submission node carrying a NEW organization's display name (issue #96, criterion 5).
+const CREATE_NAME_NODE: &str = "new_organization_name";
+
+/// The longest display name the create control accepts. Matches nothing in the schema, which
+/// imposes no bound, and exists because this is the one path where an UNPRIVILEGED subject
+/// chooses the string: an unbounded name is a cheap way to fill a column and a picker.
+const CREATE_NAME_MAX_CHARS: usize = 100;
+
 /// The `organization` query parameter name on the resuming `/authorize` target, so the picker knows
 /// whether a parameter was supplied and must therefore skip (the parameter path resolves it).
 const ORGANIZATION_PARAM: &str = "organization";
@@ -65,6 +73,33 @@ pub(super) enum OrgPickerStep {
     /// The subject picked a live-and-active organization they are a member of: freeze it onto the
     /// session at completion. Carries the authoritatively re-validated organization id.
     Complete(OrganizationId),
+}
+
+/// Whether this subject's picker may offer organization CREATION (issue #96, criterion 5).
+///
+/// A capability rather than a flag: it is `true` only when the deployment installed the
+/// provisioning seam, which the boot path does only when `oidc.self_service_organizations` is on
+/// AND a control-plane store was connected. The picker must never render a control it has no way
+/// to honour.
+fn creation_offered(state: &OidcState) -> bool {
+    state.org_provisioning().is_some()
+}
+
+/// Validate a submitted organization display name (issue #96, criterion 5).
+///
+/// Trimmed, non-empty, bounded, and free of control characters. Returns the normalized name.
+/// This is the one path where an unprivileged subject supplies the string, so the bounds are
+/// enforced here rather than left to the column: a name is echoed back in a picker to everyone
+/// who later joins, and a control character or an unbounded length would ride along.
+fn normalized_display_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > CREATE_NAME_MAX_CHARS {
+        return None;
+    }
+    if trimmed.chars().any(char::is_control) {
+        return None;
+    }
+    Some(trimmed.to_owned())
 }
 
 /// Whether the resuming `/authorize` target carried a non-empty `organization` parameter (issue
@@ -281,14 +316,22 @@ pub(super) async fn enter_nodes(
         return Ok(Vec::new());
     }
     let orgs = pickable_orgs(state, scope, subject).await?;
+    let create = creation_offered(state);
     // Zero or one pickable organization is already determined (none, or the single one that
     // auto-selects or JIT-joins), so skip. The threshold is unchanged; only the set it counts is
     // wider, so a subject with exactly one eligible organization is still joined silently and
     // never sees a prompt they have no choice in.
-    if orgs.len() < 2 {
+    //
+    // The ONE exception, and only in a deployment that installed the provisioning seam: a subject
+    // with NO organization at all is offered creation. That is the state criterion 5 is really
+    // about and the state where there is genuinely something to decide. A subject with exactly
+    // one is still skipped even then, because their context is determined and turning every
+    // single-organization login into a prompt is not what the criterion asks for; they create
+    // further organizations from the application, not from the sign-in path.
+    if orgs.len() < 2 && !(create && orgs.is_empty()) {
         return Ok(Vec::new());
     }
-    Ok(picker_nodes(transport, flow_id, &orgs))
+    Ok(picker_nodes(transport, flow_id, &orgs, create))
 }
 
 /// Build the organization-picker nodes (issue #94, PR-B2): a leading prompt, ONE submit control per
@@ -296,7 +339,12 @@ pub(super) async fn enter_nodes(
 /// value), and (on the browser transport) the hidden `flow` continuation node. The SAME builder the
 /// live engine and the golden corpus call, so the rendered bytes are pinned.
 #[must_use]
-pub(super) fn picker_nodes(transport: Transport, flow_id: &str, orgs: &[ActiveOrg]) -> Vec<Node> {
+pub(super) fn picker_nodes(
+    transport: Transport,
+    flow_id: &str,
+    orgs: &[ActiveOrg],
+    create: bool,
+) -> Vec<Node> {
     let mut nodes = Vec::new();
     // The leading prompt copy (informational): choose which organization this login is for.
     nodes.push(Node {
@@ -329,6 +377,40 @@ pub(super) fn picker_nodes(transport: Transport, flow_id: &str, orgs: &[ActiveOr
                 message::ORG_PICKER_OPTION_LABEL,
                 MessageContext::one("name", &org.display_name),
             )),
+        ));
+    }
+    // The create controls, only where the deployment installed the seam. A name field and its
+    // own submit control, so the two submissions are distinguishable by NODE rather than by
+    // guessing at the shape of a value: the engine reads `organization` for a pick and
+    // `new_organization_name` for a creation, and a submission carrying both is refused.
+    if create {
+        nodes.push(Node::input(
+            NodeGroup::Default,
+            3,
+            NodeAttributes::Input {
+                name: CREATE_NAME_NODE.to_owned(),
+                input_type: InputType::Text,
+                value: None,
+                required: false,
+                autocomplete: None,
+                disabled: false,
+                constraints: None,
+            },
+            Some(Message::of(message::ORG_PICKER_CREATE_NAME_LABEL)),
+        ));
+        nodes.push(Node::input(
+            NodeGroup::Submit,
+            4,
+            NodeAttributes::Input {
+                name: CREATE_NAME_NODE.to_owned(),
+                input_type: InputType::Submit,
+                value: None,
+                required: false,
+                autocomplete: None,
+                disabled: false,
+                constraints: None,
+            },
+            Some(Message::of(message::ORG_PICKER_CREATE_LABEL)),
         ));
     }
     if matches!(transport, Transport::Browser) {
@@ -366,6 +448,17 @@ pub(super) async fn advance(
     subject: &UserId,
     submission: &Submission,
 ) -> Result<OrgPickerStep, FlowError> {
+    // The CREATE submission (issue #96, criterion 5), read before the pick so a submission
+    // carrying both nodes is refused rather than silently treated as one of them. Refused, not
+    // preferred: two controls in one submission is not something the rendered form can produce,
+    // so it is a client doing something deliberate and the safe answer is no.
+    let creating = submission.node_values.contains_key(CREATE_NAME_NODE);
+    if creating {
+        if submission.node_values.contains_key(ORGANIZATION_NODE) {
+            return Err(FlowError::InvalidSubmission);
+        }
+        return create_organization(state, scope, subject, submission).await;
+    }
     // The submitted `org_` id (a node value; the client only ever supplies node values). An absent
     // or non-string value is a uniform invalid submission.
     let raw = submission
@@ -385,4 +478,47 @@ pub(super) async fn advance(
     } else {
         Err(FlowError::InvalidSubmission)
     }
+}
+
+/// Create an organization and enroll the subject as its first member (issue #96, criterion 5).
+///
+/// # The capability is re-checked here, not trusted from the render
+///
+/// `creation_offered` is consulted again rather than inferred from "the client submitted the
+/// create node". A submission is a client assertion; the seam's presence is the server's. A
+/// deployment that never installed the seam answers the SAME uniform invalid-submission refusal
+/// it answers for a malformed pick, so the setting is not an existence oracle either.
+async fn create_organization(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    submission: &Submission,
+) -> Result<OrgPickerStep, FlowError> {
+    let Some(seam) = state.org_provisioning() else {
+        return Err(FlowError::InvalidSubmission);
+    };
+    let raw = submission
+        .node_values
+        .get(CREATE_NAME_NODE)
+        .and_then(serde_json::Value::as_str)
+        .ok_or(FlowError::InvalidSubmission)?;
+    let display_name = normalized_display_name(raw).ok_or(FlowError::InvalidSubmission)?;
+
+    let organization = seam
+        .create_and_enroll(
+            state.env(),
+            scope,
+            // The SUBJECT is the actor. The organization and its first membership are attributed
+            // to the person who asked for them, not to the service, so the audit trail answers
+            // "who created this" without a join through the flow record. Derived through the
+            // SAME `user_actor` seam every other audited user action on this path uses, so the
+            // audit trail names the same human here as it does elsewhere.
+            crate::interaction::user_actor(subject),
+            &display_name,
+            subject,
+            crate::util::epoch_micros(state.now()),
+        )
+        .await
+        .map_err(|_| FlowError::Store)?;
+    Ok(OrgPickerStep::Complete(organization))
 }

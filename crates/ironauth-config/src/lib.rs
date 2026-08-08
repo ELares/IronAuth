@@ -2091,6 +2091,23 @@ pub struct OidcConfig {
     /// default until per-environment overrides ride the M5 promotion pipeline.
     pub require_pkce_for_confidential_clients: bool,
 
+    /// Whether an authenticated subject may CREATE an organization from the login discovery
+    /// step (issue #96, criterion 5). Default `false`.
+    ///
+    /// Off means the create control never renders and a create submission is the uniform
+    /// invalid-submission refusal, so an untouched deployment behaves exactly as it did before
+    /// this setting existed. It also means the boot path constructs no
+    /// `OrgProvisioningSeam`, so the one data-plane-to-control-plane crossing in the codebase is
+    /// ABSENT rather than merely unused.
+    ///
+    /// Turning it on is a product decision, not a convenience: it lets any subject who can
+    /// authenticate mint organizations. The step renders only after the primary factor has
+    /// succeeded, so it is not an unauthenticated surface, but a deployment where accounts are
+    /// self-registered should weigh that before enabling it. It also requires a control-plane
+    /// DSN, because organization creation is a control-plane write; without one the setting is
+    /// inert and the boot path says so.
+    pub self_service_organizations: bool,
+
     /// Copy the scope-derived standard claims into the ID token (issue #15). The
     /// spec-conform default (`false`) places scope-derived claims (`profile`,
     /// `email`, `address`, `phone`) at the `UserInfo` endpoint and keeps the ID
@@ -2950,6 +2967,7 @@ impl Default for OidcConfig {
             session_device_binding: false,
             jwks_cache_max_age_secs: 600,
             require_pkce_for_confidential_clients: true,
+            self_service_organizations: false,
             conform_id_token_claims: false,
             client_assertion_audience: ClientAssertionAudience::TokenEndpointOrIssuer,
             client_assertion_max_skew_secs: 60,
