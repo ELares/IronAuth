@@ -345,6 +345,12 @@ name = "membership_principal_arc"
 path = "tests/membership_principal_arc.rs"
 required-features = ["testing"]
 
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "impersonation_sessions"
+path = "tests/impersonation_sessions.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "migration"
 path = "tests/migration.rs"
