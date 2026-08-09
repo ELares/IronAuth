@@ -17929,6 +17929,33 @@ pub struct SessionRecord {
     /// OFF-BY-DEFAULT peer-IP binding knob is enabled (issue #32). The caller
     /// compares it against the presenting request when that knob is on.
     pub peer_ip: Option<String>,
+    /// The impersonation this session was established under (issue #101), absent on an
+    /// ordinary session.
+    ///
+    /// Present here means the session is STILL within its cap: the read that produced this
+    /// record refuses a session whose impersonation has expired, so a caller cannot be handed
+    /// a lapsed impersonation to act on.
+    pub impersonation: Option<SessionImpersonation>,
+}
+
+/// The impersonation carried by a live session (issue #101), as read back.
+///
+/// The read-side counterpart of [`crate::impersonation::Impersonation`]. Owned rather than
+/// borrowed, because it comes off a row; and separate from the write-side type because that
+/// one exists to VALIDATE a request while this one reports what was already stored and
+/// already validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionImpersonation {
+    /// The impersonating principal, which becomes the `act.sub` claim.
+    pub impersonator: String,
+    /// The structured reason, which becomes `act.reason_code`.
+    pub reason_code: String,
+    /// The written justification. Deliberately NOT carried into any token; it belongs to the
+    /// audit stream and to an operator reading this record directly.
+    pub reason_text: String,
+    /// When the impersonation must stop, in microseconds since the Unix epoch. At most the
+    /// hard cap past its start, which migration 0128 enforces.
+    pub expires_at_unix_micros: i64,
 }
 
 /// The read-only bootstrap session repository (issue #20).
@@ -17991,14 +18018,18 @@ impl SessionRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT subject, auth_methods, user_agent, peer_ip, \
+             impersonator, impersonation_reason_code, impersonation_reason_text, \
              (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_us, \
-             (EXTRACT(EPOCH FROM idle_expires_at) * 1000000)::bigint AS idle_us \
+             (EXTRACT(EPOCH FROM idle_expires_at) * 1000000)::bigint AS idle_us, \
+             (EXTRACT(EPOCH FROM impersonation_expires_at) * 1000000)::bigint AS imp_us \
              FROM sessions \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
              AND revoked_at IS NULL AND ended_at IS NULL AND superseded_by IS NULL \
              AND COALESCE(absolute_expires_at, expires_at) > \
                  TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
              AND (idle_expires_at IS NULL OR idle_expires_at > \
+                  TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             AND (impersonation_expires_at IS NULL OR impersonation_expires_at > \
                   TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
         )
         .bind(&id_text)
@@ -18039,12 +18070,24 @@ impl SessionRepo<'_> {
             .await?;
         }
         tx.commit().await?;
+        // The five impersonation columns move together by construction: 0128's arc CHECK
+        // admits all or none, so reading the impersonator is enough to know the rest are
+        // there. Decoding each independently would invent a partial state the table cannot
+        // hold and then have to decide what it means.
+        let impersonator: Option<String> = row.get("impersonator");
+        let impersonation = impersonator.map(|impersonator| SessionImpersonation {
+            impersonator,
+            reason_code: row.get("impersonation_reason_code"),
+            reason_text: row.get("impersonation_reason_text"),
+            expires_at_unix_micros: row.get("imp_us"),
+        });
         Ok(Some(SessionRecord {
             subject: row.get("subject"),
             auth_time_unix_micros: row.get("auth_us"),
             auth_methods: row.get("auth_methods"),
             user_agent: row.get("user_agent"),
             peer_ip: row.get("peer_ip"),
+            impersonation,
         }))
     }
 

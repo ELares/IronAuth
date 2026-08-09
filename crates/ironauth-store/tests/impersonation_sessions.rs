@@ -479,3 +479,169 @@ async fn the_repository_writes_the_impersonation_columns_and_only_when_asked() {
         "an ordinary session must carry no impersonation at all"
     );
 }
+
+/// A live impersonation session reports its impersonation; an ordinary one reports none.
+///
+/// This is what makes the `act` claim reachable from a real session rather than only from a
+/// test that hands the minter an actor directly.
+#[tokio::test]
+async fn a_live_session_reports_the_impersonation_it_was_started_under() {
+    use ironauth_store::impersonation::Impersonation;
+
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let now = now_micros(&env);
+    let far = now + 24 * 60 * MINUTE_MICROS;
+
+    let id = ironauth_store::SessionId::generate(&env, &scope);
+    let act = Impersonation::start(
+        "adm_support_engineer",
+        "support_ticket",
+        "Ticket 4417: reproducing the checkout failure as the user.",
+        now,
+        30 * MINUTE_MICROS,
+    )
+    .expect("a justified request inside the cap");
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .rotate(
+            &env,
+            &id,
+            None,
+            ironauth_store::NewSession {
+                impersonation: Some(act),
+                subject: "usr_target",
+                auth_methods: "pwd",
+                auth_time_micros: now,
+                idle_expires_micros: far,
+                absolute_expires_micros: far,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("start the impersonation session");
+
+    let record = db
+        .store()
+        .scoped(scope)
+        .sessions()
+        .get(&id, now, 0)
+        .await
+        .expect("read")
+        .expect("a live impersonation session resolves");
+    let carried = record
+        .impersonation
+        .expect("the session reports its impersonation");
+    assert_eq!(carried.impersonator, "adm_support_engineer");
+    assert_eq!(carried.reason_code, "support_ticket");
+    assert_eq!(
+        carried.reason_text,
+        "Ticket 4417: reproducing the checkout failure as the user."
+    );
+    assert_eq!(carried.expires_at_unix_micros, now + 30 * MINUTE_MICROS);
+}
+
+/// A session whose IMPERSONATION has lapsed stops resolving, even though the SESSION has not.
+///
+/// The criterion says an impersonation session expires at or before the cap. The schema bounds
+/// what can be stored; this bounds what can be USED, and the two are different claims. Here
+/// the session's own absolute expiry is a day out, so nothing but the impersonation expiry can
+/// refuse it: without that clause the impersonator would keep acting as the user long past the
+/// window they justified, on a session that every other check calls live.
+#[tokio::test]
+async fn a_lapsed_impersonation_stops_the_session_even_while_the_session_lives() {
+    use ironauth_store::impersonation::Impersonation;
+
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let now = now_micros(&env);
+    let far = now + 24 * 60 * MINUTE_MICROS;
+
+    let id = ironauth_store::SessionId::generate(&env, &scope);
+    let act = Impersonation::start(
+        "adm_support_engineer",
+        "support_ticket",
+        "Ticket 4417",
+        now,
+        10 * MINUTE_MICROS,
+    )
+    .expect("justified");
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .rotate(
+            &env,
+            &id,
+            None,
+            ironauth_store::NewSession {
+                impersonation: Some(act),
+                subject: "usr_target",
+                auth_methods: "pwd",
+                auth_time_micros: now,
+                idle_expires_micros: far,
+                absolute_expires_micros: far,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("start");
+
+    let sessions = db.store().scoped(scope).sessions();
+    assert!(
+        sessions
+            .get(&id, now + 5 * MINUTE_MICROS, 0)
+            .await
+            .expect("read")
+            .is_some(),
+        "five minutes in, the impersonation is still within its window"
+    );
+    assert!(
+        sessions
+            .get(&id, now + 11 * MINUTE_MICROS, 0)
+            .await
+            .expect("read")
+            .is_none(),
+        "eleven minutes in the impersonation has lapsed, and the session must stop resolving \
+         even though its own expiry is a day away"
+    );
+
+    // And an ORDINARY session at the same instant is untouched, so the clause above bounds
+    // impersonation rather than shortening every session.
+    let ordinary = ironauth_store::SessionId::generate(&env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .rotate(
+            &env,
+            &ordinary,
+            None,
+            ironauth_store::NewSession {
+                impersonation: None,
+                subject: "usr_ordinary",
+                auth_methods: "pwd",
+                auth_time_micros: now,
+                idle_expires_micros: far,
+                absolute_expires_micros: far,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("start an ordinary session");
+    assert!(
+        sessions
+            .get(&ordinary, now + 11 * MINUTE_MICROS, 0)
+            .await
+            .expect("read")
+            .is_some(),
+        "an ordinary session is unaffected by the impersonation bound"
+    );
+}
