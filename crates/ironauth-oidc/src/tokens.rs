@@ -106,6 +106,27 @@ pub const OPAQUE_ACCESS_TOKEN_DELIMITER: char = '~';
 /// opaque token cannot be guessed or enumerated.
 const OPAQUE_ACCESS_TOKEN_BYTES: usize = 32;
 
+/// The actor behind an impersonated token (issue #101), shaped for RFC 8693 section 4.1.
+///
+/// The RFC defines `act` as a JSON object carrying at least `sub`, with further members
+/// allowed and a nested `act` for delegation chains. This emits `sub` plus the structured
+/// reason, which is the shape M13's token-exchange endpoint can consume unchanged rather than
+/// a shape it would have to be redesigned around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenActor<'a> {
+    /// The impersonating principal, emitted as `act.sub`.
+    pub subject: &'a str,
+    /// The structured reason, emitted as `act.reason_code`.
+    pub reason_code: &'a str,
+}
+
+impl TokenActor<'_> {
+    /// The `act` claim value.
+    fn to_claim(self) -> serde_json::Value {
+        json!({ "sub": self.subject, "reason_code": self.reason_code })
+    }
+}
+
 /// The reserved access-token claim names a per-client STATIC custom claim may NEVER
 /// set (issue #23). The client-credentials mint DROPS any custom claim whose name is
 /// in this set, so a per-client `custom_token_claims` config can never forge or
@@ -144,27 +165,6 @@ const OPAQUE_ACCESS_TOKEN_BYTES: usize = 32;
 ///   reason, and it is the one a reader is likely to miss: the marker grants nothing,
 ///   but forging its ABSENCE, or forging a weaker value, DOWNGRADES the resource
 ///   server's behaviour by convincing it that a WITHHELD set was simply empty.
-/// The actor behind an impersonated token (issue #101), shaped for RFC 8693 section 4.1.
-///
-/// The RFC defines `act` as a JSON object carrying at least `sub`, with further members
-/// allowed and a nested `act` for delegation chains. This emits `sub` plus the structured
-/// reason, which is the shape M13's token-exchange endpoint can consume unchanged rather than
-/// a shape it would have to be redesigned around.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TokenActor<'a> {
-    /// The impersonating principal, emitted as `act.sub`.
-    pub subject: &'a str,
-    /// The structured reason, emitted as `act.reason_code`.
-    pub reason_code: &'a str,
-}
-
-impl TokenActor<'_> {
-    /// The `act` claim value.
-    fn to_claim(self) -> serde_json::Value {
-        json!({ "sub": self.subject, "reason_code": self.reason_code })
-    }
-}
-
 pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     // Protocol claims (RFC 9068 section 2.2 + RFC 7519 registered).
     "iss",
@@ -1785,7 +1785,6 @@ mod tests {
         slugs.iter().map(|slug| (*slug).to_owned()).collect()
     }
 
-    #[test]
     /// The `act` claim is emitted for an impersonated token and for no other (issue #101).
     ///
     /// Both halves, because the criterion states both and the ABSENT half is the one a test
@@ -1859,6 +1858,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn the_three_permission_wire_states_are_mutually_exclusive_and_distinguishable() {
         // Issue #98: the WHOLE contract with a resource server is that these three are
         // different answers. Driven over the one pure function that decides the wire
