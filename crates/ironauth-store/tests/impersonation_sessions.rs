@@ -749,3 +749,138 @@ async fn the_fleet_surface_flags_an_impersonation_session_and_keeps_reporting_it
         "the fleet surface still reports it, so the incident stays legible"
     );
 }
+
+/// The justification is retrievable from the AUDIT STREAM, linked to session, actor and
+/// target, and the end event brackets it (issue #101, criterion 4).
+///
+/// The written justification is carried in no token by design, so the audit row is the only
+/// durable place it exists. That makes this test the whole of criterion 4 rather than a
+/// convenience check: if the detail is wrong or absent, the justification a support engineer
+/// typed is gone.
+///
+/// An ordinary session is revoked alongside, because "an end event is emitted" and "an end
+/// event is emitted for impersonations" are different claims and only the second is wanted.
+#[tokio::test]
+async fn the_justification_is_retrievable_from_the_audit_stream_and_bracketed_by_its_end() {
+    use ironauth_store::impersonation::Impersonation;
+
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let now = now_micros(&env);
+    let far = now + 24 * 60 * MINUTE_MICROS;
+    let justification = "Ticket 4417: cannot complete checkout, reproducing as the user.";
+
+    let impersonated = ironauth_store::SessionId::generate(&env, &scope);
+    let ordinary = ironauth_store::SessionId::generate(&env, &scope);
+    let act = Impersonation::start(
+        "adm_support_engineer",
+        "support_ticket",
+        justification,
+        now,
+        30 * MINUTE_MICROS,
+    )
+    .expect("justified");
+    for (id, subject, impersonation) in [
+        (&impersonated, "usr_target", Some(act)),
+        (&ordinary, "usr_ordinary", None),
+    ] {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .sessions()
+            .rotate(
+                &env,
+                id,
+                None,
+                ironauth_store::NewSession {
+                    impersonation,
+                    subject,
+                    auth_methods: "pwd",
+                    auth_time_micros: now,
+                    idle_expires_micros: far,
+                    absolute_expires_micros: far,
+                    user_agent: None,
+                    peer_ip: None,
+                },
+            )
+            .await
+            .expect("start a session");
+    }
+
+    let (target, detail): (String, String) = sqlx::query_as(
+        "SELECT target_id, detail FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'impersonation.started'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("exactly one start row exists, so the ordinary session produced none");
+    assert_eq!(
+        target,
+        impersonated.to_string(),
+        "the row targets the SESSION, which is what links the justification to everything the \
+         impersonator subsequently did"
+    );
+    let detail: serde_json::Value = serde_json::from_str(&detail).expect("detail is JSON");
+    assert_eq!(detail["impersonator"], "adm_support_engineer");
+    assert_eq!(detail["reason_code"], "support_ticket");
+    assert_eq!(
+        detail["reason_text"], justification,
+        "the WRITTEN justification is here and nowhere else: {detail}"
+    );
+    assert_eq!(detail["session_id"], impersonated.to_string());
+    assert_eq!(detail["expires_at_unix_micros"], now + 30 * MINUTE_MICROS);
+
+    assert_one_end_event_brackets_it(&db, &env, scope, &impersonated, &ordinary).await;
+}
+
+/// The end half, split out because the fixture above and these probes together exceed the
+/// function-length lint, and the probes are the part worth reading.
+async fn assert_one_end_event_brackets_it(
+    db: &TestDatabase,
+    env: &ironauth_env::Env,
+    scope: Scope,
+    impersonated: &ironauth_store::SessionId,
+    ordinary: &ironauth_store::SessionId,
+) {
+    // Ending both sessions must produce exactly ONE end event, for the impersonation.
+    for id in [impersonated, ordinary] {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(env), CorrelationId::generate(env))
+            .sessions()
+            .revoke(
+                env,
+                id,
+                ironauth_store::SessionEndCause::Revoked,
+                false,
+                None,
+            )
+            .await
+            .expect("revoke");
+    }
+    let ends: Vec<(String, String)> = sqlx::query_as(
+        "SELECT target_id, detail FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'impersonation.ended'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the end rows");
+    assert_eq!(
+        ends.len(),
+        1,
+        "an ordinary logout emits no impersonation end event"
+    );
+    assert_eq!(
+        ends[0].0,
+        impersonated.to_string(),
+        "the end row targets the same session the start did, so the pair brackets the window"
+    );
+    let end_detail: serde_json::Value = serde_json::from_str(&ends[0].1).expect("detail is JSON");
+    assert_eq!(end_detail["impersonator"], "adm_support_engineer");
+    assert_eq!(end_detail["cause"], "revoked");
+}

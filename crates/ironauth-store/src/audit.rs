@@ -1057,6 +1057,23 @@ pub enum Action {
     /// An API key or personal access token was REVOKED (issue #99). The row targets the
     /// `akey_` handle.
     ApiKeyRevoked,
+    /// An IMPERSONATION was STARTED (issue #101). The row targets the `ses_` session, which
+    /// is what links the justification to everything the impersonator subsequently did, and
+    /// its detail carries the impersonator, the structured reason, the written justification
+    /// and the cap. The acting actor is the operator who started it.
+    ///
+    /// The detail is the ONLY place the written justification is durably retrievable: it is
+    /// deliberately not carried in any token, because a token is read by the client, by every
+    /// resource server it reaches, and by whatever logs them.
+    ImpersonationStarted,
+    /// An IMPERSONATION was ENDED (issue #101), by a revoke, a logout, or any other cause
+    /// that ends the session. The row targets the same `ses_` session the start did, so the
+    /// pair brackets the window in the audit stream.
+    ///
+    /// Emitted only for a session that CARRIED an impersonation, so an ordinary logout does
+    /// not produce one. A lapse at the cap emits nothing, because no event fires: the bound is
+    /// enforced by refusal on the read and refresh paths rather than by a sweep.
+    ImpersonationEnded,
     /// An admin sudo elevation was RECORDED (issue #73): a management credential
     /// completed a re-authentication that opens a freshness window for admin
     /// mutations in a (tenant, environment). The row targets the `elv_` elevation; the
@@ -1492,6 +1509,8 @@ impl Action {
             Action::ClientOwningOrganizationSet => "client.owning_organization.set",
             Action::ApiKeyCreated => "api_key.created",
             Action::ApiKeyRevoked => "api_key.revoked",
+            Action::ImpersonationStarted => "impersonation.started",
+            Action::ImpersonationEnded => "impersonation.ended",
             Action::AdminPrivilegeElevated => "admin.privilege.elevated",
             Action::AdminPrivilegeChallenged => "admin.privilege.challenged",
             Action::CredentialClassPolicySet => "credential_class.policy.set",
