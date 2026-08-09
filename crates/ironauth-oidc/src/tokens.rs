@@ -780,6 +780,14 @@ pub(crate) fn build_access_token_claims(
     if let Some(org_id) = request.org_id {
         claims["org_id"] = json!(org_id);
     }
+
+    // act (RFC 8693 section 4.1, issue #101), on the ACCESS token as well as the ID token.
+    // Both or neither: a resource server authorizing a request is the reader that most needs
+    // to know somebody is acting as this subject, and an integration test caught this half
+    // missing after the ID token half was wired.
+    if let Some(actor) = request.actor {
+        claims["act"] = actor.to_claim();
+    }
     // roles (issue #97): the subject's effective organization roles, RESOLVED FRESH at
     // this issuance (never replayed from the code or the grant, which is exactly how
     // this differs from org_id above). Emitted on the ACCESS token only: a resource

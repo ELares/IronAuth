@@ -725,10 +725,10 @@ async fn resolve_code_exchange_sid(
     state: &OidcState,
     scope: Scope,
     bindings: &CodeBindings,
-) -> Result<Option<String>, TokenError> {
+) -> Result<CodeExchangeSession, TokenError> {
     let Some(session_ref) = bindings.session_ref.as_deref() else {
         ensure_subject_can_authenticate(state, scope, &bindings.subject).await?;
-        return Ok(None);
+        return Ok(CodeExchangeSession::default());
     };
     // A session_ref that does not parse in the exchange scope names no session we could
     // ever resolve: the grant is not redeemable.
@@ -743,10 +743,12 @@ async fn resolve_code_exchange_sid(
         .get(&session_id, now_micros, idle_ttl)
         .await
         .map_err(|_| TokenError::ServerError)?;
-    if session.is_none() {
-        // Revoked, logged out, rotated away, or expired since the code was issued.
+    let Some(session) = session else {
+        // Revoked, logged out, rotated away, or expired since the code was issued. Since
+        // issue #101 that read also refuses a session whose IMPERSONATION has lapsed, so an
+        // exchange past the cap fails here rather than minting one more token.
         return Err(TokenError::InvalidGrant);
-    }
+    };
     let sid = state
         .store()
         .scoped(scope)
@@ -754,7 +756,24 @@ async fn resolve_code_exchange_sid(
         .ensure_sid(state.env(), &session_id, &bindings.client_id, now_micros)
         .await
         .map_err(|_| TokenError::ServerError)?;
-    Ok(Some(sid))
+    Ok(CodeExchangeSession {
+        sid: Some(sid),
+        impersonation: session.impersonation,
+    })
+}
+
+/// What the code-exchange session read answers (issues #32 and #101).
+///
+/// Both fields come out of ONE store read. The impersonation was already being fetched and
+/// discarded, so carrying it costs no query; fetching it separately at the mint site would
+/// have added one to the hot path and, worse, could disagree with the liveness check that
+/// happens here.
+#[derive(Debug, Default)]
+struct CodeExchangeSession {
+    /// The front-channel `sid`, absent when the grant has no SSO session.
+    sid: Option<String>,
+    /// The impersonation the session was started under, absent on an ordinary session.
+    impersonation: Option<ironauth_store::SessionImpersonation>,
 }
 
 /// The subject's effective organization roles at THIS issuance (issue #97), resolved
@@ -1064,7 +1083,8 @@ async fn mint_tokens(
     // (client, session) and distinct across clients. This ALSO enforces that the SSO
     // session is still live: a code minted before a revoke and redeemed after it is an
     // invalid_grant, never a live token bound to a dead session.
-    let sid = resolve_code_exchange_sid(state, scope, bindings).await?;
+    let session = resolve_code_exchange_sid(state, scope, bindings).await?;
+    let sid = session.sid;
     let sid = sid.as_deref();
     // Resolve the effective organization roles (issue #97) FRESH from the store, in
     // the org context frozen onto the grant. Fresh, not frozen: unlike `org_id` this
@@ -1115,7 +1135,16 @@ async fn mint_tokens(
         signer,
         entry.policy(),
         &MintRequest {
-            actor: None,
+            // The `act` claim comes from the SESSION, never from the request (issue #101).
+            // It rides the same read that proved the session live, so a token cannot claim
+            // an impersonation the liveness check did not agree with.
+            actor: session
+                .impersonation
+                .as_ref()
+                .map(|imp| tokens::TokenActor {
+                    subject: &imp.impersonator,
+                    reason_code: &imp.reason_code,
+                }),
             scope,
             issuer: &issuer,
             subject: &subject,
@@ -2087,6 +2116,17 @@ async fn mint_refresh_access(
         signer,
         entry.policy(),
         &MintRequest {
+            // NOT wired, and deliberately so (issue #101). The refresh resolution carries
+            // no session reference, so setting `act` here would mean a fresh session read on
+            // the hot refresh path. The issue asks for the actor to be PERSISTED in a form
+            // M13's token exchange can consume, and the grant is where that belongs; doing it
+            // there fixes this path without the extra query and serves that bullet at once.
+            //
+            // The consequence while this is None is real and worth naming: an access token
+            // refreshed out of an impersonated session carries no `act`. The pin
+            // `a_refreshed_token_does_not_yet_carry_the_actor_claim` asserts exactly that, so
+            // the slice that persists the actor has to flip it rather than quietly finding it
+            // already true.
             actor: None,
             scope,
             issuer: &issuer,
