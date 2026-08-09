@@ -34737,13 +34737,14 @@ impl ActingInvitationRepo<'_> {
                         scope,
                         &new_membership_id,
                         &org_id,
-                        &user_id,
+                        MembershipPrincipal::User(&user_id),
                         None,
                         now_micros,
                     )
                     .await
                     {
                         Ok(live) => {
+                            let live_id = org_membership_id_from_row(&live.row, &scope)?;
                             // CASCADE SITE 3 of 3 (issue #97), and the one a change
                             // wired only into the admin path would miss. A REVIVED
                             // membership keeps its original id, so without this an
@@ -34759,7 +34760,7 @@ impl ActingInvitationRepo<'_> {
                                     scope,
                                     &acting,
                                     env,
-                                    &live.record.id,
+                                    &live_id,
                                     now_micros,
                                 )
                                 .await?;
@@ -34772,7 +34773,7 @@ impl ActingInvitationRepo<'_> {
                                     acting: &acting,
                                     env,
                                     action: Action::OrganizationMembershipAdd,
-                                    target: &live.record.id,
+                                    target: &live_id,
                                 },
                                 None,
                             )
@@ -36602,6 +36603,46 @@ pub struct OrgMembershipRecord {
     pub created_at_unix_micros: i64,
 }
 
+/// A membership that binds a SERVICE ACCOUNT into an organization (issue #99).
+///
+/// The sibling of [`OrgMembershipRecord`] and deliberately not a widening of it. They are the
+/// same table and the same lifecycle, and they differ in one field, but a record that could
+/// hold either principal would push the choice into every reader, including the admin response
+/// shape. Two records keep each surface able to say what it means; the write primitive under
+/// them is shared, so the lifecycle cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceAccountMembershipRecord {
+    /// The membership identifier (`omb_...`, embeds its `(tenant, environment)`).
+    pub id: OrgMembershipId,
+    /// The organization the principal is bound into (`org_...`).
+    pub organization_id: OrganizationId,
+    /// The service account bound into the organization (`sva_...`).
+    pub service_account_id: ServiceAccountId,
+    /// The membership lifecycle state (a closed set; `active` for now).
+    pub state: String,
+    /// Free-form membership metadata, as stored JSON. Never interpreted by the auth core.
+    pub metadata: serde_json::Value,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+}
+
+/// Everything a service-account membership create needs (issue #99).
+///
+/// It carries no idempotency key, unlike the user create. Idempotency is threaded from an HTTP
+/// route and no route creates one of these yet; a parameter that every caller passes `None` to
+/// is surface with nothing behind it. The route that adds one adds the parameter with it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewServiceAccountMembership<'a> {
+    /// The membership id (minted by the caller, embeds this scope).
+    pub id: &'a OrgMembershipId,
+    /// The organization the principal is bound into (an `org_` id in this scope).
+    pub organization_id: &'a OrganizationId,
+    /// The service account bound into the organization (an `sva_` id in this scope).
+    pub service_account_id: &'a ServiceAccountId,
+    /// Optional free-form membership metadata; `None` stores the empty object.
+    pub metadata: Option<&'a serde_json::Value>,
+}
+
 /// Everything an organization-membership create needs, bundled so the repository
 /// method stays within the readable-argument-count lint (issue #94).
 #[derive(Debug, Clone, Copy)]
@@ -37896,6 +37937,16 @@ impl OrganizationRepo<'_> {
 /// panic. Removing it from `list_for_user` changes nothing and no test can make it: that read
 /// is already keyed on `user_id = $3`, and the NULL a service-account row carries there matches
 /// no value. It stays so the three reads of this projection state the same rule.
+/// The columns a membership WRITE returns.
+///
+/// Unlike [`ORG_MEMBERSHIP_SELECT_COLUMNS`] this carries both principal columns and the
+/// discriminator, because one revive-or-insert serves both surfaces and the caller decides
+/// which record to build. It is a superset, so a decoder written against the read projection
+/// works unchanged against this one.
+const MEMBERSHIP_WRITE_RETURNING_COLUMNS: &str = "id, organization_id, user_id, service_account_id, owner_kind, state, \
+     metadata::text AS metadata_text, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
+
 const ORG_MEMBERSHIP_SELECT_COLUMNS: &str = "id, organization_id, user_id, state, \
      metadata::text AS metadata_text, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
@@ -37981,6 +38032,81 @@ impl OrgMembershipRepo<'_> {
         tx.commit().await?;
         rows.iter()
             .map(|row| org_membership_from_row(row, &self.scope))
+            .collect()
+    }
+
+    /// One live service-account membership by id.
+    ///
+    /// The counterpart of [`OrgMembershipRepo::get`] and fenced the mirror way: that one
+    /// refuses a service-account row, this one refuses a user row. Neither surface can be
+    /// tricked into rendering the other's principal by being handed its id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live service-account membership is visible here.
+    pub async fn get_service_account(
+        &self,
+        id: &OrgMembershipId,
+    ) -> Result<ServiceAccountMembershipRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {MEMBERSHIP_WRITE_RETURNING_COLUMNS} FROM org_memberships \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND deleted_at IS NULL AND owner_kind = 'service_account'"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        service_account_membership_from_row(&row, &self.scope)
+    }
+
+    /// One page of live SERVICE-ACCOUNT memberships for one organization, ordered by
+    /// `(created_at, id)`: the "which machines are in this organization" list.
+    ///
+    /// Separate from [`OrgMembershipRepo::list_for_org`] rather than a flag on it, because the
+    /// two return different records and a caller that wanted both would have to handle the
+    /// difference anyway. A cross-scope `org_id` matches nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_service_accounts_for_org(
+        &self,
+        org_id: &OrganizationId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<ServiceAccountMembershipRecord>, StoreError> {
+        if org_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {MEMBERSHIP_WRITE_RETURNING_COLUMNS} FROM org_memberships \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND deleted_at IS NULL AND owner_kind = 'service_account' \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| service_account_membership_from_row(row, &self.scope))
             .collect()
     }
 
@@ -42996,11 +43122,12 @@ impl ActingOrgMembershipRepo<'_> {
             scope,
             &new_id,
             spec.organization_id,
-            spec.user_id,
+            MembershipPrincipal::User(spec.user_id),
             metadata_opt.as_deref(),
             created_at_micros,
         )
         .await?;
+        let record = org_membership_from_row(&live.row, &scope)?;
         // CASCADE SITE 2 of 3 (issue #97): the admin re-add. A revived membership
         // keeps its original id, so it would otherwise come back holding every group
         // binding and direct role grant it held when it was removed. See
@@ -43014,7 +43141,7 @@ impl ActingOrgMembershipRepo<'_> {
                 scope,
                 &self.acting,
                 env,
-                &live.record.id,
+                &record.id,
                 created_at_micros,
             )
             .await?;
@@ -43027,7 +43154,7 @@ impl ActingOrgMembershipRepo<'_> {
                 acting: &self.acting,
                 env,
                 action: Action::OrganizationMembershipAdd,
-                target: &live.record.id,
+                target: &record.id,
             },
             None,
         )
@@ -43037,9 +43164,85 @@ impl ActingOrgMembershipRepo<'_> {
         // creation time and real metadata (issues #395 and #435). Same transaction as
         // the write: the response and the row it describes commit together or not at
         // all.
-        insert_resolved_idempotency(&mut tx, idempotency, &live.record).await?;
+        insert_resolved_idempotency(&mut tx, idempotency, &record).await?;
         tx.commit().await?;
-        Ok(live.record)
+        Ok(record)
+    }
+
+    /// Bind a SERVICE ACCOUNT into an organization and audit
+    /// `organization.membership.add` in the same transaction (issue #99).
+    ///
+    /// The sibling of [`ActingOrgMembershipRepo::create`], sharing its revive-or-insert
+    /// primitive and therefore its whole lifecycle: a soft-deleted membership for the same
+    /// principal is REVIVED rather than duplicated, and a revive strips the group bindings and
+    /// direct role grants the old row held, so a removed machine cannot be handed its old
+    /// authority back by re-adding it. `revived` is what makes that a decision rather than an
+    /// accident, and this makes the same one the user path makes.
+    ///
+    /// It audits the SAME action as the user path. A membership add is a membership add, the
+    /// audit row's target is the membership itself, and splitting the action would mean every
+    /// consumer of the audit log learning about a distinction the row already carries.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is not in this scope;
+    /// [`StoreError::Conflict`] if the service account is already a live member;
+    /// [`StoreError::Database`] on a persistence failure, including a nonexistent organization
+    /// or service account, which surfaces as the foreign-key violation.
+    pub async fn create_for_service_account(
+        &self,
+        env: &Env,
+        spec: NewServiceAccountMembership<'_>,
+        created_at_micros: i64,
+    ) -> Result<ServiceAccountMembershipRecord, StoreError> {
+        if spec.id.scope() != self.scope
+            || spec.organization_id.scope() != self.scope
+            || spec.service_account_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let new_id = *spec.id;
+        let metadata_opt = metadata_json_opt(spec.metadata)?;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let live = insert_or_revive_membership(
+            &mut tx,
+            scope,
+            &new_id,
+            spec.organization_id,
+            MembershipPrincipal::ServiceAccount(spec.service_account_id),
+            metadata_opt.as_deref(),
+            created_at_micros,
+        )
+        .await?;
+        let record = service_account_membership_from_row(&live.row, &scope)?;
+        if live.revived {
+            revoke_membership_attachments_audited(
+                &mut tx,
+                self.store,
+                scope,
+                &self.acting,
+                env,
+                &record.id,
+                created_at_micros,
+            )
+            .await?;
+        }
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationMembershipAdd,
+                target: &record.id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     /// Remove a membership (soft delete) in this scope and audit
@@ -47121,10 +47324,28 @@ async fn insert_or_revive_membership(
     scope: Scope,
     new_id: &OrgMembershipId,
     organization_id: &OrganizationId,
-    user_id: &UserId,
+    principal: MembershipPrincipal<'_>,
     metadata: Option<&str>,
     now_micros: i64,
 ) -> Result<LiveMembership, StoreError> {
+    // The column the principal lives in and the index the insert conflicts against are the
+    // only two things that vary, and both are chosen HERE from the same value, so a caller
+    // cannot pair a user's column with a service account's index. 0126 added the second index
+    // for exactly this: the user one indexes a column that is NULL on the other kind, and a
+    // NULL constrains nothing.
+    // The conflict PREDICATE varies too, and it is not cosmetic. Postgres infers the arbiter
+    // index only when the statement's predicate implies the index's, and 0126's index is
+    // partial on `service_account_id IS NOT NULL` as well as on live rows. `deleted_at IS NULL`
+    // alone does not imply that, so the service-account insert has to restate it or the
+    // statement fails to plan at all.
+    let (column, owner_kind, conflict_predicate) = match principal {
+        MembershipPrincipal::User(_) => ("user_id", "user", "deleted_at IS NULL"),
+        MembershipPrincipal::ServiceAccount(_) => (
+            "service_account_id",
+            "service_account",
+            "deleted_at IS NULL AND service_account_id IS NOT NULL",
+        ),
+    };
     // Revive a previously removed membership if one exists. Guarded on `deleted_at IS
     // NOT NULL`, so a concurrent create that already revived it re-reads a live row
     // here (zero rows) and falls through to the insert, which then conflicts: exactly
@@ -47142,22 +47363,19 @@ async fn insert_or_revive_membership(
              metadata = COALESCE($1::jsonb, metadata), \
              updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
          WHERE tenant_id = $3 AND environment_id = $4 \
-         AND organization_id = $5 AND user_id = $6 AND deleted_at IS NOT NULL \
-         RETURNING {ORG_MEMBERSHIP_SELECT_COLUMNS}"
+         AND organization_id = $5 AND {column} = $6 AND deleted_at IS NOT NULL \
+         RETURNING {MEMBERSHIP_WRITE_RETURNING_COLUMNS}"
     ))
     .bind(metadata)
     .bind(now_micros)
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
     .bind(organization_id.to_string())
-    .bind(user_id.to_string())
+    .bind(principal.id_string())
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(row) = revived {
-        return Ok(LiveMembership {
-            record: org_membership_from_row(&row, &scope)?,
-            revived: true,
-        });
+        return Ok(LiveMembership { row, revived: true });
     }
     // No dead row to revive: insert a fresh membership. `ON CONFLICT ... DO NOTHING`
     // targets the partial unique index over LIVE rows, so a user who is ALREADY a live
@@ -47167,28 +47385,29 @@ async fn insert_or_revive_membership(
     // abort it), which the accept path relies on to continue after a no-op.
     let inserted = sqlx::query(&format!(
         "INSERT INTO org_memberships \
-         (id, tenant_id, environment_id, organization_id, user_id, \
+         (id, tenant_id, environment_id, organization_id, {column}, owner_kind, \
           state, metadata, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, 'active', COALESCE($6::jsonb, '{{}}'::jsonb), \
+         VALUES ($1, $2, $3, $4, $5, '{owner_kind}', \
+                 'active', COALESCE($6::jsonb, '{{}}'::jsonb), \
                  TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
                  TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
-         ON CONFLICT (tenant_id, environment_id, organization_id, user_id) \
-             WHERE deleted_at IS NULL \
+         ON CONFLICT (tenant_id, environment_id, organization_id, {column}) \
+             WHERE {conflict_predicate} \
          DO NOTHING \
-         RETURNING {ORG_MEMBERSHIP_SELECT_COLUMNS}"
+         RETURNING {MEMBERSHIP_WRITE_RETURNING_COLUMNS}"
     ))
     .bind(new_id.to_string())
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
     .bind(organization_id.to_string())
-    .bind(user_id.to_string())
+    .bind(principal.id_string())
     .bind(metadata)
     .bind(now_micros)
     .fetch_optional(&mut **tx)
     .await?;
     match inserted {
         Some(row) => Ok(LiveMembership {
-            record: org_membership_from_row(&row, &scope)?,
+            row,
             revived: false,
         }),
         // A live membership already exists (the insert conflicted and did nothing).
@@ -47208,13 +47427,17 @@ async fn insert_or_revive_membership(
 /// rather than something a caller can silently not make. See
 /// [`revoke_membership_attachments`] for what the callers do with it and why all of
 /// them must.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct LiveMembership {
     /// The LIVE membership that now exists, AS PERSISTED: the revived row (its
     /// original id, original `created_at` and, when the re-add supplied none, its
     /// existing metadata), or the freshly inserted one. Read back from the write's
     /// own `RETURNING`, so nothing here is a restatement of the request (issue #435).
-    record: OrgMembershipRecord,
+    /// The row is handed back UNDECODED because the two principals decode it into different
+    /// records: a user membership into [`OrgMembershipRecord`], a service-account one into
+    /// [`ServiceAccountMembershipRecord`]. Choosing here would mean this primitive knowing
+    /// about both surfaces when all it does is settle which row is live.
+    row: PgRow,
     /// Whether an existing soft-deleted row was brought back (as opposed to a fresh
     /// row being inserted).
     revived: bool,
@@ -47467,6 +47690,53 @@ fn organization_from_row(row: &PgRow, scope: &Scope) -> Result<OrganizationRecor
 /// Reconstruct an [`OrgMembershipRecord`] from a row read within scope. The stored
 /// ids are parsed back UNDER the scope, so a corrupt cross-scope row fails to decode
 /// rather than being returned; the metadata is parsed from its JSON text.
+/// Decode a service-account membership from a row of the write projection.
+///
+/// `service_account_id` is read fallibly for the same reason its counterpart is: the column is
+/// nullable, NULL on a user membership, and this record has nowhere to put a user. The reads
+/// below filter `owner_kind`, so this fires only if one stops.
+fn service_account_membership_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<ServiceAccountMembershipRecord, StoreError> {
+    let id = OrgMembershipId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
+    let organization_id =
+        OrganizationId::parse_in_scope(&row.get::<String, _>("organization_id"), scope)?;
+    let service_account_id: String = row.try_get("service_account_id").map_err(|_| {
+        StoreError::Database(sqlx::Error::Decode(
+            "org_memberships.service_account_id is NULL: a membership that does not bind a \
+             service account reached the service-account membership surface"
+                .into(),
+        ))
+    })?;
+    let service_account_id = ServiceAccountId::parse_in_scope(&service_account_id, scope)?;
+    let metadata_text: String = row.get("metadata_text");
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_text).map_err(|error| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("org_memberships.metadata is not valid JSON: {error}").into(),
+        ))
+    })?;
+    Ok(ServiceAccountMembershipRecord {
+        id,
+        organization_id,
+        service_account_id,
+        state: row.get("state"),
+        metadata,
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// The membership id out of a write's `RETURNING`, for callers that need only the target.
+///
+/// The invitation accept path audits and cascades against the LIVE membership and never builds
+/// a record, so decoding one would mean decoding a `user_id` it does not read.
+fn org_membership_id_from_row(row: &PgRow, scope: &Scope) -> Result<OrgMembershipId, StoreError> {
+    Ok(OrgMembershipId::parse_in_scope(
+        &row.get::<String, _>("id"),
+        scope,
+    )?)
+}
+
 fn org_membership_from_row(row: &PgRow, scope: &Scope) -> Result<OrgMembershipRecord, StoreError> {
     let id = OrgMembershipId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
     let organization_id =
