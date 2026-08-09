@@ -319,6 +319,26 @@ impl ScopedKind for IssuedTokenKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// Marker for an IMPERSONATION AUTHORIZATION (`imp_`), the control plane's record that an
+/// operator may act as one user, before any session exists (issue #101).
+///
+/// It exists because the control plane cannot create sessions: `INSERT` on `sessions` belongs
+/// to the app plane alone, and widening that grant would let the control plane mint an
+/// ORDINARY session for any user, unflagged and unaudited, which is the capability the
+/// two-plane split exists to deny. So the control plane writes THIS, and the app plane
+/// redeems it into a flagged session.
+///
+/// Not redacted in debug. It is single use and bounded, but it is still the thing that buys a
+/// session, so it is treated as an authorization handle rather than a secret: it is issued to
+/// an already-authenticated operator over an authenticated channel, and an operator reading
+/// their own audit trail needs to see which authorization became which session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImpersonationAuthorizationKind;
+impl ScopedKind for ImpersonationAuthorizationKind {
+    const PREFIX: &'static str = "imp";
+    const REDACT_DEBUG: bool = false;
+}
+
 /// An API key / personal access token identifier (`akey_...`), issue #99. The NON-SECRET
 /// handle for one key: every list, rotate, revoke and audit row names this, never the key
 /// and never its digest.
@@ -1511,6 +1531,10 @@ pub type IssuedTokenId = ScopedId<IssuedTokenKind>;
 /// An API key or personal access token identifier (`akey_...`), the non-secret handle
 /// (issue #99).
 pub type ApiKeyId = ScopedId<ApiKeyKind>;
+/// An impersonation-authorization identifier (`imp_...`): the control plane's single-use
+/// record that an operator may act as one user, which the app plane redeems into a flagged
+/// session (issue #101).
+pub type ImpersonationAuthorizationId = ScopedId<ImpersonationAuthorizationKind>;
 /// A refresh-token family identifier (`rff_...`), the revocation spine every
 /// rotated refresh token in one grant's chain belongs to (issue #21).
 pub type RefreshFamilyId = ScopedId<RefreshFamilyKind>;

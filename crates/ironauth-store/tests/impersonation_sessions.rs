@@ -884,3 +884,232 @@ async fn assert_one_end_event_brackets_it(
     assert_eq!(end_detail["impersonator"], "adm_support_engineer");
     assert_eq!(end_detail["cause"], "revoked");
 }
+
+/// Insert an impersonation authorization directly, for the constraint probes below.
+#[allow(clippy::too_many_arguments)]
+async fn insert_authorization(
+    db: &TestDatabase,
+    env: &ironauth_env::Env,
+    scope: Scope,
+    impersonator: &str,
+    reason_code: &str,
+    reason_text: &str,
+    started_offset: i64,
+    expires_offset: i64,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    let now = now_micros(env);
+    sqlx::query(
+        "INSERT INTO impersonation_authorizations \
+         (id, tenant_id, environment_id, user_id, impersonator, reason_code, reason_text, \
+          started_at, expires_at) \
+         VALUES ($1, $2, $3, 'usr_target', $4, $5, $6, \
+                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+    )
+    .bind(ironauth_store::ImpersonationAuthorizationId::generate(env, &scope).to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(impersonator)
+    .bind(reason_code)
+    .bind(reason_text)
+    .bind(now + started_offset)
+    .bind(now + expires_offset)
+    .execute(db.owner_pool())
+    .await
+}
+
+/// The authorization refuses the same things the session does, one table earlier.
+///
+/// It has to. The session it redeems into inherits this expiry and this justification, so an
+/// authorization that could hold a blank reason or outlast the cap would move the problem
+/// rather than solve it, and the session-level CHECKs would then be refusing rows the product
+/// had already told an operator were accepted.
+#[tokio::test]
+async fn an_authorization_refuses_a_blank_justification_and_a_duration_past_the_cap() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let ok = insert_authorization(
+        &db,
+        &env,
+        scope,
+        "adm_support",
+        "support_ticket",
+        "Ticket 4417",
+        0,
+        30 * MINUTE_MICROS,
+    )
+    .await;
+    assert!(
+        ok.is_ok(),
+        "a justified authorization inside the cap: {ok:?}"
+    );
+
+    for (label, impersonator, code, text) in [
+        (
+            "a blank impersonator",
+            "   ",
+            "support_ticket",
+            "Ticket 4417",
+        ),
+        ("a blank code", "adm_support", "", "Ticket 4417"),
+        (
+            "whitespace passing for text",
+            "adm_support",
+            "support_ticket",
+            "\t\n ",
+        ),
+    ] {
+        let refused = insert_authorization(
+            &db,
+            &env,
+            scope,
+            impersonator,
+            code,
+            text,
+            0,
+            30 * MINUTE_MICROS,
+        )
+        .await;
+        assert!(refused.is_err(), "admitted {label}");
+    }
+
+    for (label, started, expires) in [
+        ("sixty-one minutes", 0, 61 * MINUTE_MICROS),
+        ("expiring before it starts", 0, -MINUTE_MICROS),
+        ("a zero window", 0, 0),
+        // Eighty minutes from a start fifty minutes ago, which is the shape a `now()`-anchored
+        // cap would admit and this one must not.
+        (
+            "eighty minutes from an old start",
+            -50 * MINUTE_MICROS,
+            30 * MINUTE_MICROS,
+        ),
+    ] {
+        let refused = insert_authorization(
+            &db,
+            &env,
+            scope,
+            "adm_support",
+            "support_ticket",
+            "Ticket 4417",
+            started,
+            expires,
+        )
+        .await;
+        assert!(refused.is_err(), "admitted {label}");
+    }
+}
+
+/// Redemption is all or nothing: a spent authorization names the session it bought.
+///
+/// A redemption stamp with no session would make the authorization spent with nothing to show
+/// for it, which reads in an audit as an impersonation that happened and left no trace.
+#[tokio::test]
+async fn a_redeemed_authorization_must_name_the_session_it_bought() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    insert_authorization(
+        &db,
+        &env,
+        scope,
+        "adm_support",
+        "support_ticket",
+        "Ticket 4417",
+        0,
+        30 * MINUTE_MICROS,
+    )
+    .await
+    .expect("issue");
+
+    let half = sqlx::query("UPDATE impersonation_authorizations SET redeemed_at = now()")
+        .execute(db.owner_pool())
+        .await;
+    assert!(
+        half.is_err(),
+        "a redemption stamp with no session was stored"
+    );
+
+    let other_half =
+        sqlx::query("UPDATE impersonation_authorizations SET redeemed_session_id = 'ses_x'")
+            .execute(db.owner_pool())
+            .await;
+    assert!(
+        other_half.is_err(),
+        "a session with no redemption stamp was stored"
+    );
+
+    let both = sqlx::query(
+        "UPDATE impersonation_authorizations \
+         SET redeemed_at = now(), redeemed_session_id = 'ses_x'",
+    )
+    .execute(db.owner_pool())
+    .await;
+    assert!(both.is_ok(), "the pair together is admitted: {both:?}");
+}
+
+/// Each plane holds exactly the authorization privileges its role in the flow needs.
+///
+/// The split is the whole reason this table exists, so it is asserted rather than described.
+/// The control plane ISSUES and READS and may not stamp a redemption: a plane that could burn
+/// an authorization without creating a session could spend an operator's justification on
+/// nothing. The app plane REDEEMS and may not issue: issuing is the authorized, audited act
+/// and belongs to the plane that checked the permission.
+///
+/// Read from the privilege catalogue rather than by attempting writes, because the tests above
+/// use the owner pool and would not notice a widened grant at all.
+#[tokio::test]
+async fn each_plane_holds_exactly_its_authorization_privileges() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let _ = db.seed_scope(&env).await;
+
+    assert_eq!(
+        table_wide_privileges(&db, "ironauth_control").await,
+        vec!["INSERT".to_owned(), "SELECT".to_owned()],
+        "the control plane issues and reads, and must NOT be able to stamp a redemption: \
+         burning an authorization without creating a session spends a justification on nothing"
+    );
+    assert_eq!(
+        table_wide_privileges(&db, "ironauth_app").await,
+        vec!["SELECT".to_owned()],
+        "the app plane reads to redeem and must NOT be able to issue; its UPDATE is column \
+         scoped and so does not appear as a table-wide privilege"
+    );
+
+    let app_updates: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.column_privileges \
+         WHERE grantee = 'ironauth_app' AND privilege_type = 'UPDATE' \
+           AND table_schema = 'public' AND table_name = 'impersonation_authorizations' \
+         ORDER BY column_name",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the column privilege catalogue");
+    assert_eq!(
+        app_updates,
+        vec!["redeemed_at".to_owned(), "redeemed_session_id".to_owned()],
+        "the app plane may stamp the redemption and nothing else: it must not be able to \
+         rewrite the justification or push out the bound of an authorization it is redeeming"
+    );
+}
+
+/// The table-wide privileges one role holds on the authorization table, sorted.
+///
+/// A plain function rather than a closure: two calls need it and a closure capturing `db` by
+/// move cannot be called twice.
+async fn table_wide_privileges(db: &TestDatabase, grantee: &str) -> Vec<String> {
+    let mut held: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT privilege_type::text FROM information_schema.table_privileges \
+         WHERE grantee = $1 AND table_schema = 'public' \
+           AND table_name = 'impersonation_authorizations'",
+    )
+    .bind(grantee)
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the privilege catalogue");
+    held.sort();
+    held
+}
