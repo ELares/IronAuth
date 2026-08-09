@@ -1057,14 +1057,6 @@ pub enum Action {
     /// An API key or personal access token was REVOKED (issue #99). The row targets the
     /// `akey_` handle.
     ApiKeyRevoked,
-    /// An IMPERSONATION was STARTED (issue #101). The row targets the `ses_` session, which
-    /// is what links the justification to everything the impersonator subsequently did, and
-    /// its detail carries the impersonator, the structured reason, the written justification
-    /// and the cap. The acting actor is the operator who started it.
-    ///
-    /// The detail is the ONLY place the written justification is durably retrievable: it is
-    /// deliberately not carried in any token, because a token is read by the client, by every
-    /// resource server it reaches, and by whatever logs them.
     /// An impersonation was AUTHORIZED (issue #101): the control plane issued a single-use
     /// authorization after checking the permission and the justification. The row targets the
     /// `imp_` authorization.
@@ -1074,6 +1066,14 @@ pub enum Action {
     /// impersonation that never happened, which is exactly as misleading as missing one that
     /// did.
     ImpersonationAuthorized,
+    /// An IMPERSONATION was STARTED (issue #101). The row targets the `ses_` session, which
+    /// is what links the justification to everything the impersonator subsequently did, and
+    /// its detail carries the impersonator, the structured reason, the written justification
+    /// and the cap. The acting actor is the operator who started it.
+    ///
+    /// The detail is the ONLY place the written justification is durably retrievable: it is
+    /// deliberately not carried in any token, because a token is read by the client, by every
+    /// resource server it reaches, and by whatever logs them.
     ImpersonationStarted,
     /// An IMPERSONATION was ENDED (issue #101), by a revoke, a logout, or any other cause
     /// that ends the session. The row targets the same `ses_` session the start did, so the

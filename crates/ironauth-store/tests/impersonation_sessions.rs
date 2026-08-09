@@ -1347,3 +1347,77 @@ async fn seed_user(
         .expect("register user");
     id
 }
+
+/// The AUTHORIZED event carries the justification, and is distinct from the STARTED one.
+///
+/// This exists because the first version of `issue` built the detail and dropped it:
+/// `write_audited` has no way to pass one, so the row was written with an empty detail and
+/// nothing failed. An authorization event with no justification records that somebody was
+/// allowed to impersonate and not why, which is the half an auditor actually needs.
+///
+/// The two events are asserted as a pair because their separation is deliberate. An
+/// authorization may be issued and never redeemed; collapsing them would log an impersonation
+/// that never happened.
+#[tokio::test]
+async fn authorizing_audits_the_justification_and_starting_is_a_separate_event() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "target@example.test").await;
+    let id = issue_authorization(&db, &env, scope, &user, 30 * MINUTE_MICROS).await;
+
+    let (target, detail): (String, String) = sqlx::query_as(
+        "SELECT target_id, detail FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'impersonation.authorized'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("exactly one authorization event");
+    assert_eq!(target, id.to_string(), "it targets the authorization");
+    let detail: serde_json::Value = serde_json::from_str(&detail).expect("detail is JSON");
+    assert_eq!(detail["impersonator"], "adm_support_engineer");
+    assert_eq!(detail["reason_code"], "support_ticket");
+    assert_eq!(
+        detail["reason_text"], "Ticket 4417: reproducing the checkout failure as the user.",
+        "the written justification is recorded at AUTHORIZATION time, not only at start"
+    );
+    assert_eq!(detail["user_id"], user.to_string());
+
+    // Issuing alone starts nothing.
+    let started: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'impersonation.started'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count");
+    assert_eq!(
+        started, 0,
+        "an authorization that was never redeemed must not log an impersonation that never \
+         happened"
+    );
+
+    // Redeeming produces the start event, targeting the SESSION rather than the authorization.
+    let redeemed = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .redeem(&env, &id, now_micros(&env))
+        .await
+        .expect("redeem");
+    let start_target: String = sqlx::query_scalar(
+        "SELECT target_id FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'impersonation.started'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("exactly one start event");
+    assert_eq!(start_target, redeemed.session_id.to_string());
+}

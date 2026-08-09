@@ -18306,16 +18306,9 @@ impl ActingImpersonationAuthorizationRepo<'_> {
             "expires_at_unix_micros": act.expires_at_unix_micros(),
         })
         .to_string();
-        write_audited(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::ImpersonationAuthorized,
-                target: spec.id,
-            },
-            async move |tx| {
+        let mut tx = begin_scoped(self.store, scope).await?;
+        {
+            {
                 sqlx::query(
                     "INSERT INTO impersonation_authorizations \
                      (id, tenant_id, environment_id, user_id, impersonator, reason_code, \
@@ -18333,13 +18326,28 @@ impl ActingImpersonationAuthorizationRepo<'_> {
                 .bind(act.reason_text())
                 .bind(act.started_at_unix_micros())
                 .bind(act.expires_at_unix_micros())
-                .execute(&mut **tx)
+                .execute(&mut *tx)
                 .await?;
-                Ok(())
+            }
+        }
+        // The audit row carries the DETAIL, which `write_audited` has no way to pass, so this
+        // inlines its own transaction rather than using that helper. The detail is the point
+        // of the row: an authorization event with no justification records that somebody was
+        // allowed to impersonate and not why.
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ImpersonationAuthorized,
+                target: spec.id,
             },
-            false,
+            Some(&detail),
         )
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
