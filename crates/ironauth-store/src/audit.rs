@@ -1065,6 +1065,15 @@ pub enum Action {
     /// The detail is the ONLY place the written justification is durably retrievable: it is
     /// deliberately not carried in any token, because a token is read by the client, by every
     /// resource server it reaches, and by whatever logs them.
+    /// An impersonation was AUTHORIZED (issue #101): the control plane issued a single-use
+    /// authorization after checking the permission and the justification. The row targets the
+    /// `imp_` authorization.
+    ///
+    /// Distinct from [`Action::ImpersonationStarted`], and the distinction is the point: an
+    /// authorization may be issued and never redeemed. Collapsing the two would record an
+    /// impersonation that never happened, which is exactly as misleading as missing one that
+    /// did.
+    ImpersonationAuthorized,
     ImpersonationStarted,
     /// An IMPERSONATION was ENDED (issue #101), by a revoke, a logout, or any other cause
     /// that ends the session. The row targets the same `ses_` session the start did, so the
@@ -1509,6 +1518,7 @@ impl Action {
             Action::ClientOwningOrganizationSet => "client.owning_organization.set",
             Action::ApiKeyCreated => "api_key.created",
             Action::ApiKeyRevoked => "api_key.revoked",
+            Action::ImpersonationAuthorized => "impersonation.authorized",
             Action::ImpersonationStarted => "impersonation.started",
             Action::ImpersonationEnded => "impersonation.ended",
             Action::AdminPrivilegeElevated => "admin.privilege.elevated",

@@ -84,19 +84,19 @@ use crate::id::{
     CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId,
     EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
     FedcmNonceId, FederationLoginStateId, FlowId, FlowVersionId, FlowVersionPinId, GrantId,
-    InitialAccessTokenId, InvitationId, IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId,
-    ManagementKeyId, Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId, OperatorId,
-    OrgAuthPolicyId, OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
-    OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
-    OutboxMessageId, PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId,
-    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
-    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
-    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId, SigningKeyId,
-    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
-    TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId,
-    UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
-    WebhookDeliveryAttemptId, WebhookEndpointId,
+    ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
+    LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
+    MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
+    OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
+    OrgRolePermissionId, OrganizationId, OutboxMessageId, PermissionId, PowChallengeId,
+    ProjectGrantId, ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
+    RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
+    SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
+    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
+    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -1585,6 +1585,22 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn sms_otp(&self) -> ActingSmsOtpRepo<'a> {
         ActingSmsOtpRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The impersonation-authorization repository for this scope and actor (issue #101).
+    ///
+    /// Both planes reach it through the same accessor and the DATABASE decides what each may
+    /// do: the control plane holds INSERT and SELECT, the app plane holds SELECT and the two
+    /// redemption columns. A method the caller's role is not granted fails as a permission
+    /// error rather than being hidden by a type, which is deliberate: the grant is the
+    /// authority, and a second copy of it in Rust would be a second opinion.
+    #[must_use]
+    pub fn impersonation_authorizations(&self) -> ActingImpersonationAuthorizationRepo<'a> {
+        ActingImpersonationAuthorizationRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -18226,6 +18242,213 @@ impl SessionRepo<'_> {
 fn parse_session_org(row: &PgRow, scope: &Scope) -> Option<OrganizationId> {
     let raw = row.get::<Option<String>, _>("org_id")?;
     OrganizationId::parse_in_scope(&raw, scope).ok()
+}
+
+/// What issuing an impersonation authorization needs (issue #101).
+#[derive(Debug, Clone, Copy)]
+pub struct NewImpersonationAuthorization<'a> {
+    /// The authorization id (minted by the caller, embeds this scope).
+    pub id: &'a ImpersonationAuthorizationId,
+    /// The user to be impersonated.
+    pub user_id: &'a UserId,
+    /// The validated impersonation. Already past every rule 0128 and 0130 enforce, because
+    /// [`Impersonation`] has no other way to exist.
+    pub impersonation: Impersonation<'a>,
+}
+
+/// An authorization redeemed into a session (issue #101).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeemedImpersonation {
+    /// The session the redemption created, flagged and capped.
+    pub session_id: SessionId,
+    /// The user now being impersonated.
+    pub user_id: UserId,
+    /// When the impersonation must stop.
+    pub expires_at_unix_micros: i64,
+}
+
+/// Issue and redeem impersonation authorizations (issue #101).
+pub struct ActingImpersonationAuthorizationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingImpersonationAuthorizationRepo<'_> {
+    /// Issue a single-use authorization, auditing `impersonation.authorized` in the same
+    /// transaction. CONTROL PLANE: the app plane holds no INSERT here and fails closed.
+    ///
+    /// The audit action is distinct from `impersonation.started` because the moments are
+    /// distinct: an authorization may be issued and never redeemed, and recording that as a
+    /// start would log an impersonation that never happened.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure, including the grant refusal a
+    /// caller on the wrong plane gets.
+    pub async fn issue(
+        &self,
+        env: &Env,
+        spec: NewImpersonationAuthorization<'_>,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope || spec.user_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let act = spec.impersonation;
+        let detail = serde_json::json!({
+            "authorization_id": spec.id.to_string(),
+            "user_id": spec.user_id.to_string(),
+            "impersonator": act.impersonator(),
+            "reason_code": act.reason_code(),
+            "reason_text": act.reason_text(),
+            "expires_at_unix_micros": act.expires_at_unix_micros(),
+        })
+        .to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ImpersonationAuthorized,
+                target: spec.id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO impersonation_authorizations \
+                     (id, tenant_id, environment_id, user_id, impersonator, reason_code, \
+                      reason_text, started_at, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+                )
+                .bind(spec.id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(spec.user_id.to_string())
+                .bind(act.impersonator())
+                .bind(act.reason_code())
+                .bind(act.reason_text())
+                .bind(act.started_at_unix_micros())
+                .bind(act.expires_at_unix_micros())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Redeem an authorization into a flagged session, ONCE. APP PLANE.
+    ///
+    /// One transaction, and it has to be. The redemption stamp and the session it names are
+    /// the same fact: a stamp without a session burns an operator's justification on nothing,
+    /// and a session without a stamp is an impersonation whose authorization is still spendable.
+    ///
+    /// Single use comes from the UPDATE's own `redeemed_at IS NULL` guard rather than from a
+    /// read-then-write, so two concurrent redemptions cannot both see it unspent.
+    ///
+    /// An expired authorization is refused here as well as being unstorable past the cap: the
+    /// cap bounds how long one may LAST, and this bounds redeeming one that already lapsed
+    /// while nobody was looking.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the authorization is absent, out of scope, already
+    /// redeemed, or past its expiry;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn redeem(
+        &self,
+        env: &Env,
+        id: &ImpersonationAuthorizationId,
+        now_micros: i64,
+    ) -> Result<RedeemedImpersonation, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let session = SessionId::generate(env, &scope);
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE impersonation_authorizations \
+             SET redeemed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                 redeemed_session_id = $5 \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+               AND redeemed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             RETURNING user_id, impersonator, reason_code, reason_text, \
+                       (EXTRACT(EPOCH FROM started_at) * 1000000)::bigint AS started_us, \
+                       (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_micros)
+        .bind(session.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Err(StoreError::NotFound);
+        };
+        let user_text: String = row.get("user_id");
+        let user_id = UserId::parse_in_scope(&user_text, &scope)?;
+        let impersonator: String = row.get("impersonator");
+        let reason_code: String = row.get("reason_code");
+        let reason_text: String = row.get("reason_text");
+        let started_us: i64 = row.get("started_us");
+        let expires_us: i64 = row.get("expires_us");
+        // Rebuilt through the SAME constructor the issue went through, so a row that somehow
+        // stopped satisfying the rules cannot become a session. It should be impossible, and
+        // that is the point: the check costs nothing and the alternative is trusting a table.
+        let act = Impersonation::start(
+            &impersonator,
+            &reason_code,
+            &reason_text,
+            started_us,
+            expires_us.saturating_sub(started_us),
+        )
+        .map_err(|_| StoreError::NotFound)?;
+        audit_impersonation_start(
+            &mut tx,
+            self.store,
+            scope,
+            &self.acting,
+            env,
+            &session,
+            Some(act),
+        )
+        .await?;
+        insert_session_row(
+            &mut tx,
+            scope,
+            &session,
+            NewSession {
+                impersonation: Some(act),
+                subject: &user_text,
+                auth_methods: "impersonation",
+                auth_time_micros: now_micros,
+                // The session's own expiries ARE the impersonation's, so nothing inspecting
+                // the row can read it as having longer to run than the bound allows.
+                idle_expires_micros: expires_us,
+                absolute_expires_micros: expires_us,
+                user_agent: None,
+                peer_ip: None,
+            },
+            now_micros,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(RedeemedImpersonation {
+            session_id: session,
+            user_id,
+            expires_at_unix_micros: expires_us,
+        })
+    }
 }
 
 /// The mutating bootstrap session repository (issue #20).
