@@ -1117,3 +1117,127 @@ async fn a_confined_credential_cannot_reach_a_service_accounts_keys() {
         "a confined credential MINTED a service-account key: {body}"
     );
 }
+
+/// Seed a user through the management API and answer its id.
+async fn seed_pat_user(h: &Harness, tenant: &str, environment: &str, handle: &str) -> String {
+    let (status, _, body) = h
+        .post(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/users"),
+            handle,
+            &serde_json::json!({ "identifier": handle }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create user: {body}");
+    serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned()
+}
+
+/// A read-only credential may LIST personal access tokens and may not mint, rotate or revoke
+/// one, and the refusals NAME `management.write_credentials` (issue #99, criterion 6).
+///
+/// The third of these, and it exists for the reason the other two give:
+/// `management_permissions.rs` is a text scan that can see THAT a handler demands a permission,
+/// never WHICH. The listing is checked in both directions, so a downgrade of its read to "any
+/// permission" is refused as well as an upgrade of it.
+#[tokio::test]
+async fn a_read_only_credential_cannot_mint_or_kill_a_personal_access_token() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "pak-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "pak-mint").await;
+    let user = seed_pat_user(&h, &tenant, &environment, "pak-user@example.test").await;
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/users/{user}/personal-access-tokens"
+    );
+
+    let (status, _, body) = h
+        .post(
+            &base,
+            "pak-seed",
+            &serde_json::json!({ "display_name": "seed" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed token: {body}");
+    let seeded = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    assert_read_only_is_refused_every_write(&h, &base, &secret, &seeded).await;
+
+    let (write_id, write_secret) = mint_key(&h, &tenant, &environment, "pak-write").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &write_id,
+        &["management.write_credentials"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&base, &write_secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write-only credential LISTED the tokens: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the listing's refusal does not name management.read: {body}"
+    );
+}
+
+/// A credential confined to one organization may not touch a user's personal access tokens.
+///
+/// A personal access token authenticates as its user everywhere that user is a member, which
+/// is not a subset of any one organization, so the confinement has no boundary to check it
+/// against and the route fails closed.
+#[tokio::test]
+async fn a_confined_credential_cannot_reach_a_users_personal_access_tokens() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "pcf-tenant").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "pcf-mint").await;
+    let user = seed_pat_user(&h, &tenant, &environment, "pcf-user@example.test").await;
+    let tokens = format!("{base}/users/{user}/personal-access-tokens");
+
+    let (status, _, body) = h
+        .post(
+            &format!("{base}/organizations"),
+            "pcf-org",
+            &serde_json::json!({ "display_name": "Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // Unconfined it reaches them, which is what makes the refusal below about confinement.
+    let (status, _, body) = h.get_as(&tokens, &secret).await;
+    assert_eq!(status, StatusCode::OK, "before confinement: {body}");
+
+    confine(&h, &tenant, &environment, &key_id, &org).await;
+
+    let (status, _, body) = h.get_as(&tokens, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a confined credential LISTED a user's personal access tokens: {body}"
+    );
+    let (status, _, body) = h
+        .post_as(
+            &tokens,
+            &secret,
+            "pcf-denied",
+            &serde_json::json!({ "display_name": "should not exist" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a confined credential MINTED a personal access token: {body}"
+    );
+}

@@ -315,6 +315,8 @@ struct Fixture {
     /// than an id that never resolved (issue #99).
     service_account: String,
     sa_api_key: String,
+    /// A live personal access token handle, so the PAT cases address a real one (issue #99).
+    pat: String,
     connector: String,
     webhook_endpoint: String,
     family: String,
@@ -735,6 +737,16 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "create sa api key: {body}");
         let sa_api_key = field(&body, "/id", "seed sa api key");
+        let pat_base = format!("{base}/users/{user}/personal-access-tokens");
+        let (status, _, body) = h
+            .post(
+                &pat_base,
+                "seed-pat",
+                &serde_json::json!({ "display_name": "sweep pat" }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "create pat: {body}");
+        let pat = field(&body, "/id", "seed pat");
 
         // A remembered CONSENT from the seeded user to the seeded client, so
         // `listUserConsents` answers with a ROW. The read half of the soft-deleted
@@ -1076,6 +1088,7 @@ impl Fixture {
             api_key,
             service_account,
             sa_api_key,
+            pat,
             doomed_tenant,
             doomed_environment,
             operator,
@@ -1131,6 +1144,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         api_key,
         service_account,
         sa_api_key,
+        pat,
         connector,
         webhook_endpoint,
         family,
@@ -1161,6 +1175,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
     let org_base = format!("{base}/organizations/{organization}");
     let sa_base = format!("{base}/service-accounts/{service_account}/api-keys");
+    let pat_base = format!("{base}/users/{user}/personal-access-tokens");
     let role_ref = serde_json::json!({ "role_id": role });
     let ban = serde_json::json!({
         "subject_kind": "ip", "subject": "203.0.113.7", "auth_path": "password"
@@ -1972,6 +1987,28 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{sa_base}/{sa_api_key}"),
         ),
+        // Personal access tokens, the third owner kind, same four shapes.
+        Case::json(
+            "personal_access_tokens.createUserPersonalAccessToken",
+            "POST",
+            pat_base.clone(),
+            &serde_json::json!({ "display_name": "sweep pat" }),
+        ),
+        Case::empty(
+            "personal_access_tokens.listUserPersonalAccessTokens",
+            "GET",
+            pat_base.clone(),
+        ),
+        Case::empty(
+            "personal_access_tokens.rotateUserPersonalAccessToken",
+            "POST",
+            format!("{pat_base}/{pat}/rotate"),
+        ),
+        Case::empty(
+            "personal_access_tokens.revokeUserPersonalAccessToken",
+            "DELETE",
+            format!("{pat_base}/{pat}"),
+        ),
         Case::empty(
             "project_grants.listProjectGrants",
             "GET",
@@ -2381,6 +2418,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         client: "cli_0".to_owned(),
         service_account: "sva_0".to_owned(),
         sa_api_key: "akey_0".to_owned(),
+        pat: "akey_1".to_owned(),
         org_connection: "ocn_0".to_owned(),
         routing_rule: "rrl_0".to_owned(),
         project_grant: "pgt_0".to_owned(),

@@ -86,6 +86,7 @@ mod organizations;
 mod pagination;
 mod password_hashing;
 mod permissions;
+mod personal_access_tokens;
 mod postures;
 mod project_grants;
 mod promotion;
@@ -528,6 +529,19 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}/rotate",
             post(service_account_keys::rotate_service_account_api_key),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens",
+            axum::routing::get(personal_access_tokens::list_user_personal_access_tokens)
+                .post(personal_access_tokens::create_user_personal_access_token),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens/{key_id}",
+            delete(personal_access_tokens::revoke_user_personal_access_token),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens/{key_id}/rotate",
+            post(personal_access_tokens::rotate_user_personal_access_token),
         )
         // Enterprise inbound routing (issue #96). The store and the data plane have
         // shipped since migration 0059; this is the first time an operator can reach it.

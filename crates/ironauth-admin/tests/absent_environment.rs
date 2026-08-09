@@ -1008,6 +1008,31 @@ fn organization_cases(base: &str, ids: &Ids) -> Vec<Case> {
 }
 
 /// The MEMBERSHIP writes under an organization.
+/// The personal-access-token writes. Their own function because they are not organization
+/// membership cases and the list they were appended to had outgrown the length lint.
+fn personal_access_token_cases(base: &str) -> Vec<Case> {
+    vec![
+        Case {
+            label: "personal_access_tokens.createUserPersonalAccessToken",
+            method: "POST",
+            path: format!("{base}/users/usr_absent/personal-access-tokens"),
+            body: Some("{\"display_name\":\"absent\"}".to_owned()),
+        },
+        Case {
+            label: "personal_access_tokens.rotateUserPersonalAccessToken",
+            method: "POST",
+            path: format!("{base}/users/usr_absent/personal-access-tokens/akey_absent/rotate"),
+            body: None,
+        },
+        Case {
+            label: "personal_access_tokens.revokeUserPersonalAccessToken",
+            method: "DELETE",
+            path: format!("{base}/users/usr_absent/personal-access-tokens/akey_absent"),
+            body: None,
+        },
+    ]
+}
+
 fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
     let Ids {
         user,
@@ -1175,6 +1200,7 @@ fn all_cases(tenant: &str, environment: &str) -> Vec<Case> {
     cases.extend(user_cases(&base, &ids));
     cases.extend(organization_cases(&base, &ids));
     cases.extend(org_membership_cases(&base, &ids));
+    cases.extend(personal_access_token_cases(&base));
     cases.extend(org_role_cases(&base, &ids));
     cases
 }

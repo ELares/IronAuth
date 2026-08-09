@@ -300,6 +300,19 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         "rotateServiceAccountApiKey",
         ManagementPermission::WriteCredentials,
     ),
+    (
+        "createUserPersonalAccessToken",
+        ManagementPermission::WriteCredentials,
+    ),
+    ("listUserPersonalAccessTokens", ManagementPermission::Read),
+    (
+        "revokeUserPersonalAccessToken",
+        ManagementPermission::WriteCredentials,
+    ),
+    (
+        "rotateUserPersonalAccessToken",
+        ManagementPermission::WriteCredentials,
+    ),
     ("listProjectGrants", ManagementPermission::Read),
     (
         "withdrawProjectGrant",
@@ -521,6 +534,12 @@ const PERMISSION_PROVEN: &[&str] = &[
     "listServiceAccountApiKeys",
     "revokeServiceAccountApiKey",
     "rotateServiceAccountApiKey",
+    // Proven in `a_read_only_credential_cannot_mint_or_kill_a_personal_access_token`, on the
+    // same shape and in both directions for the listing.
+    "createUserPersonalAccessToken",
+    "listUserPersonalAccessTokens",
+    "revokeUserPersonalAccessToken",
+    "rotateUserPersonalAccessToken",
 ];
 
 /// Not every unproven operation CAN be proven the same way.
@@ -555,7 +574,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        151,
+        155,
         "the classified set changed size; update the unproven count below with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -572,6 +591,10 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     (
         "service_account_keys.rs",
         include_str!("../src/service_account_keys.rs"),
+    ),
+    (
+        "personal_access_tokens.rs",
+        include_str!("../src/personal_access_tokens.rs"),
     ),
     ("users.rs", include_str!("../src/users.rs")),
     ("organizations.rs", include_str!("../src/organizations.rs")),
