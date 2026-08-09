@@ -106,6 +106,34 @@ pub const OPAQUE_ACCESS_TOKEN_DELIMITER: char = '~';
 /// opaque token cannot be guessed or enumerated.
 const OPAQUE_ACCESS_TOKEN_BYTES: usize = 32;
 
+/// The impersonation a session was started under, for the mint sites that must read it.
+///
+/// Four flows mint tokens from a session: code exchange, the front-channel implicit and hybrid
+/// ID token, the device flow, and FedCM. Each resolves its session differently, so this is the
+/// one thing they share, and it exists to stop the four drifting into three that carry `act`
+/// and one that does not. A missing `act` is not a cosmetic gap: it is a token that says
+/// nobody is acting as this subject when somebody is.
+///
+/// Fails SOFT to `None`. Every caller has already proved the session live to reach its mint,
+/// and a read that faults between those two points must not turn a working login into a server
+/// error. The token is then an ordinary one, which is what it would have been anyway.
+pub(crate) async fn session_actor(
+    state: &crate::state::OidcState,
+    scope: ironauth_store::Scope,
+    session_id: &ironauth_store::SessionId,
+    now_micros: i64,
+) -> Option<ironauth_store::SessionImpersonation> {
+    state
+        .store()
+        .scoped(scope)
+        .sessions()
+        .get(session_id, now_micros, 0)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|session| session.impersonation)
+}
+
 /// The actor behind an impersonated token (issue #101), shaped for RFC 8693 section 4.1.
 ///
 /// The RFC defines `act` as a JSON object carrying at least `sub`, with further members

@@ -883,16 +883,30 @@ async fn resolve_front_channel_sid(
     scope: Scope,
     client_id: &str,
     resolved: &Resolved<'_>,
-) -> Result<String, ()> {
+) -> Result<FrontChannelSession, ()> {
     let session_id = SessionId::parse_in_scope(resolved.session_ref, &scope).map_err(|_| ())?;
     let now_micros = epoch_micros(state.now());
-    state
+    let sid = state
         .store()
         .scoped(scope)
         .client_sessions()
         .ensure_sid(state.env(), &session_id, client_id, now_micros)
         .await
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+    // The impersonation the front-channel ID token must carry (issue #101). This costs one
+    // read that the code-exchange path gets for free, and the alternative is worse: an
+    // implicit or hybrid ID token minted for an impersonated session with no `act` is an
+    // audit hole on exactly the flows where the token goes straight to the browser.
+    let impersonation = tokens::session_actor(state, scope, &session_id, now_micros).await;
+    Ok(FrontChannelSession { sid, impersonation })
+}
+
+/// What the front-channel session read answers (issues #32 and #101).
+struct FrontChannelSession {
+    /// The `sid` claim for this client's view of the session.
+    sid: String,
+    /// The impersonation it was started under, absent on an ordinary session.
+    impersonation: Option<ironauth_store::SessionImpersonation>,
 }
 
 /// Mint the front-channel ID token for the implicit and hybrid flows (issue #17),
@@ -929,7 +943,8 @@ async fn mint_front_channel_id_token(
     //
     // Fails CLOSED: a store error is Err(()) (a server_error through the negotiated
     // response mode), never a silently session-less ID token.
-    let sid = resolve_front_channel_sid(state, scope, &client_id_str, resolved).await?;
+    let session = resolve_front_channel_sid(state, scope, &client_id_str, resolved).await?;
+    let sid = session.sid;
     // c_hash binds the issued code to the hybrid ID token; a pure id_token carries
     // none, and neither ever carries at_hash (no access token is issued here).
     let c_hash = match (response_type, code) {
@@ -947,7 +962,15 @@ async fn mint_front_channel_id_token(
         front_channel_id_token_claims(state, scope, resolved).await
     };
     let request = MintRequest {
-        actor: None,
+        // From the SESSION, never the request (issue #101), so an implicit or hybrid ID
+        // token names the impersonator exactly when the code-exchange path would.
+        actor: session
+            .impersonation
+            .as_ref()
+            .map(|imp| tokens::TokenActor {
+                subject: &imp.impersonator,
+                reason_code: &imp.reason_code,
+            }),
         scope,
         issuer: iss,
         subject: &subject,

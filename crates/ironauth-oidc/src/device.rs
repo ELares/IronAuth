@@ -513,6 +513,15 @@ async fn issue_device_tokens(
     }
 }
 
+/// What the device-flow session read answers (issues #32 and #101).
+#[derive(Default)]
+struct DeviceSession {
+    /// The `sid` claim, absent when the grant has no SSO session.
+    sid: Option<String>,
+    /// The impersonation the approving session was started under.
+    impersonation: Option<ironauth_store::SessionImpersonation>,
+}
+
 /// Resolve the per-(client, session) `sid` for an approved device flow (issue #32),
 /// from the SSO session of the human who approved it at the verification page.
 ///
@@ -549,10 +558,10 @@ async fn resolve_device_sid(
     state: &OidcState,
     scope: Scope,
     grant: &ApprovedDeviceGrant,
-) -> Result<Option<String>, TokenError> {
+) -> Result<DeviceSession, TokenError> {
     let Some(session_ref) = grant.session_ref.as_deref() else {
         crate::token::ensure_subject_can_authenticate(state, scope, &grant.subject).await?;
-        return Ok(None);
+        return Ok(DeviceSession::default());
     };
     let session_id =
         SessionId::parse_in_scope(session_ref, &scope).map_err(|_| TokenError::InvalidGrant)?;
@@ -564,7 +573,13 @@ async fn resolve_device_sid(
         .ensure_sid(state.env(), &session_id, &grant.client_id, now_micros)
         .await
     {
-        Ok(sid) => Ok(Some(sid)),
+        Ok(sid) => Ok(DeviceSession {
+            sid: Some(sid),
+            // The impersonation this session was started under (issue #101). A device-flow
+            // ID token is minted from the SSO session of the human who approved the flow, so
+            // it names an impersonator exactly when that approval was made under one.
+            impersonation: tokens::session_actor(state, scope, &session_id, now_micros).await,
+        }),
         // The store's live-session guard found no live SSO session to bind to.
         Err(StoreError::NotFound) => Err(TokenError::InvalidGrant),
         Err(_) => Err(TokenError::ServerError),
@@ -598,13 +613,20 @@ async fn mint_device_tokens(
     //
     // Fails CLOSED: a store error is a server_error, never a silently session-less ID
     // token that no back-channel logout could target.
-    let sid = resolve_device_sid(state, scope, grant).await?;
+    let session = resolve_device_sid(state, scope, grant).await?;
+    let sid = session.sid;
     tokens::mint(
         state,
         signer,
         entry.policy(),
         &MintRequest {
-            actor: None,
+            actor: session
+                .impersonation
+                .as_ref()
+                .map(|imp| tokens::TokenActor {
+                    subject: &imp.impersonator,
+                    reason_code: &imp.reason_code,
+                }),
             scope,
             issuer: &issuer,
             subject: &subject,
