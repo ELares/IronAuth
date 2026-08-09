@@ -18346,54 +18346,7 @@ impl ActingSessionRepo<'_> {
                 target: id,
             },
             async move |tx| {
-                sqlx::query(
-                    "INSERT INTO sessions \
-                     (id, tenant_id, environment_id, subject, auth_methods, auth_time, \
-                      expires_at, idle_expires_at, absolute_expires_at, last_seen_at, \
-                      user_agent, peer_ip, \
-                      impersonator, impersonation_reason_code, impersonation_reason_text, \
-                      impersonation_started_at, impersonation_expires_at) \
-                     VALUES ($1, $2, $3, $4, $5, \
-                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
-                             $10, $11, \
-                             $12, $13, $14, \
-                             CASE WHEN $15::bigint IS NULL THEN NULL ELSE \
-                                  TIMESTAMPTZ 'epoch' + ($15::text || ' microseconds')::interval \
-                             END, \
-                             CASE WHEN $16::bigint IS NULL THEN NULL ELSE \
-                                  TIMESTAMPTZ 'epoch' + ($16::text || ' microseconds')::interval \
-                             END)",
-                )
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(params.subject)
-                .bind(params.auth_methods)
-                .bind(params.auth_time_micros)
-                .bind(params.idle_expires_micros)
-                .bind(params.absolute_expires_micros)
-                .bind(now_micros)
-                .bind(params.user_agent)
-                .bind(params.peer_ip)
-                .bind(params.impersonation.map(|value| value.impersonator()))
-                .bind(params.impersonation.map(|value| value.reason_code()))
-                .bind(params.impersonation.map(|value| value.reason_text()))
-                .bind(
-                    params
-                        .impersonation
-                        .map(|value| value.started_at_unix_micros()),
-                )
-                .bind(
-                    params
-                        .impersonation
-                        .map(|value| value.expires_at_unix_micros()),
-                )
-                .execute(&mut **tx)
-                .await?;
+                insert_session_row(tx, scope, id, params, now_micros).await?;
                 if let (Some(prior_id), Some(prior_text)) = (prior, &prior_text) {
                     *out = reconcile_prior_session_at_rotation(
                         PriorReconcile {
@@ -18411,6 +18364,21 @@ impl ActingSessionRepo<'_> {
                     )
                     .await?;
                 }
+                // The impersonation START event (issue #101), in the SAME transaction as
+                // the session it describes. The row targets the session, which is what links
+                // this justification to everything the impersonator subsequently does, and
+                // its detail is the only durable place the WRITTEN justification is
+                // retrievable: no token carries it, deliberately.
+                audit_impersonation_start(
+                    tx,
+                    self.store,
+                    scope,
+                    &self.acting,
+                    env,
+                    id,
+                    params.impersonation,
+                )
+                .await?;
                 Ok(())
             },
             poison_after_audit,
@@ -18837,6 +18805,49 @@ impl ActingSessionRepo<'_> {
                     &SessionEndedEmit::from_acting(env, &self.acting),
                 )
                 .await?;
+                // The impersonation END event (issue #101), bracketing the start row in the
+                // audit stream and targeting the SAME session, so a reader can pair them.
+                //
+                // Read INSIDE the transaction and after the revoke, so the row is emitted
+                // exactly when a session that carried an impersonation actually ended. An
+                // ordinary logout emits nothing.
+                //
+                // A LAPSE at the cap emits nothing either, and that is deliberate rather than
+                // an oversight: no event fires at the cap, and the bound is enforced by
+                // refusal on the read and refresh paths. A sweep that manufactured an end
+                // event would be a second, slower answer to "has this stopped" beside the two
+                // that already decide it.
+                let ended: Option<String> = sqlx::query_scalar(
+                    "SELECT impersonator FROM sessions \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .fetch_optional(&mut **tx)
+                .await?
+                .flatten();
+                if let Some(impersonator) = ended {
+                    let detail = serde_json::json!({
+                        "impersonator": impersonator,
+                        "session_id": id.to_string(),
+                        "cause": cause.as_str(),
+                    })
+                    .to_string();
+                    insert_audit_row(
+                        tx,
+                        &AuditedWrite {
+                            store: self.store,
+                            scope,
+                            acting: &self.acting,
+                            env,
+                            action: Action::ImpersonationEnded,
+                            target: id,
+                        },
+                        Some(&detail),
+                    )
+                    .await?;
+                }
                 Ok(())
             },
             poison_after_audit,
@@ -36357,6 +36368,109 @@ where
     // Reached only on a COMMITTED transaction: a mutation that reports what it wrote
     // never reports it for a write that rolled back.
     Ok(reported)
+}
+
+/// Insert the session row (issues #32 and #101).
+///
+/// Split out of `rotate_inner` for the function-length lint. It is also the natural unit: one
+/// statement writing one row, with the impersonation columns riding along or staying NULL.
+async fn insert_session_row(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    id: &SessionId,
+    params: NewSession<'_>,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO sessions \
+         (id, tenant_id, environment_id, subject, auth_methods, auth_time, \
+          expires_at, idle_expires_at, absolute_expires_at, last_seen_at, \
+          user_agent, peer_ip, \
+          impersonator, impersonation_reason_code, impersonation_reason_text, \
+          impersonation_started_at, impersonation_expires_at) \
+         VALUES ($1, $2, $3, $4, $5, \
+                 TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
+                 $10, $11, \
+                 $12, $13, $14, \
+                 CASE WHEN $15::bigint IS NULL THEN NULL ELSE \
+                      TIMESTAMPTZ 'epoch' + ($15::text || ' microseconds')::interval \
+                 END, \
+                 CASE WHEN $16::bigint IS NULL THEN NULL ELSE \
+                      TIMESTAMPTZ 'epoch' + ($16::text || ' microseconds')::interval \
+                 END)",
+    )
+    .bind(id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(params.subject)
+    .bind(params.auth_methods)
+    .bind(params.auth_time_micros)
+    .bind(params.idle_expires_micros)
+    .bind(params.absolute_expires_micros)
+    .bind(now_micros)
+    .bind(params.user_agent)
+    .bind(params.peer_ip)
+    .bind(params.impersonation.map(|value| value.impersonator()))
+    .bind(params.impersonation.map(|value| value.reason_code()))
+    .bind(params.impersonation.map(|value| value.reason_text()))
+    .bind(
+        params
+            .impersonation
+            .map(|value| value.started_at_unix_micros()),
+    )
+    .bind(
+        params
+            .impersonation
+            .map(|value| value.expires_at_unix_micros()),
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Write the impersonation START event, when the session being created carries one.
+///
+/// Split out of `rotate_inner` for the function-length lint, and it reads better here anyway:
+/// the whole of what an impersonation start records is one block rather than a tail on a
+/// function about sessions in general.
+///
+/// The detail is the ONLY durable place the written justification exists. No token carries it,
+/// deliberately, so losing this row loses what the operator typed.
+#[allow(clippy::too_many_arguments)]
+async fn audit_impersonation_start(
+    tx: &mut Transaction<'_, Postgres>,
+    store: &Store,
+    scope: Scope,
+    acting: &ActingContext,
+    env: &Env,
+    session: &SessionId,
+    impersonation: Option<Impersonation<'_>>,
+) -> Result<(), StoreError> {
+    let Some(act) = impersonation else {
+        return Ok(());
+    };
+    let spec = &AuditedWrite {
+        store,
+        scope,
+        acting,
+        env,
+        action: Action::ImpersonationStarted,
+        target: session,
+    };
+    let detail = serde_json::json!({
+        "impersonator": act.impersonator(),
+        "reason_code": act.reason_code(),
+        "reason_text": act.reason_text(),
+        "started_at_unix_micros": act.started_at_unix_micros(),
+        "expires_at_unix_micros": act.expires_at_unix_micros(),
+        "session_id": session.to_string(),
+    })
+    .to_string();
+    insert_audit_row(tx, spec, Some(&detail)).await
 }
 
 /// Insert exactly one audit row into the current transaction, after the data change
