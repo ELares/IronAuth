@@ -645,3 +645,107 @@ async fn a_lapsed_impersonation_stops_the_session_even_while_the_session_lives()
         "an ordinary session is unaffected by the impersonation bound"
     );
 }
+
+/// The fleet surface flags an impersonation session and reports it even once lapsed.
+///
+/// Criterion 2 asks for impersonation sessions to be distinguishable everywhere sessions are
+/// displayed. The fleet surface deliberately reports revoked and ended sessions, so it must
+/// keep reporting a LAPSED impersonation too: an operator reviewing an incident needs to see
+/// that a session WAS somebody acting as this user, and the auth read path is the one that
+/// refuses to let them keep doing it.
+///
+/// An ordinary session is listed beside it, so "flagged" is a difference rather than a label
+/// the surface applies to everything.
+#[tokio::test]
+async fn the_fleet_surface_flags_an_impersonation_session_and_keeps_reporting_it() {
+    use ironauth_store::impersonation::Impersonation;
+
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let now = now_micros(&env);
+    let far = now + 24 * 60 * MINUTE_MICROS;
+
+    let ordinary = ironauth_store::SessionId::generate(&env, &scope);
+    let impersonated = ironauth_store::SessionId::generate(&env, &scope);
+    let act = Impersonation::start(
+        "adm_support_engineer",
+        "support_ticket",
+        "Ticket 4417",
+        now,
+        10 * MINUTE_MICROS,
+    )
+    .expect("justified");
+    for (id, subject, impersonation) in [
+        (&ordinary, "usr_ordinary", None),
+        (&impersonated, "usr_target", Some(act)),
+    ] {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .sessions()
+            .rotate(
+                &env,
+                id,
+                None,
+                ironauth_store::NewSession {
+                    impersonation,
+                    subject,
+                    auth_methods: "pwd",
+                    auth_time_micros: now,
+                    idle_expires_micros: far,
+                    absolute_expires_micros: far,
+                    user_agent: None,
+                    peer_ip: None,
+                },
+            )
+            .await
+            .expect("start a session");
+    }
+
+    let fleet = db.store().scoped(scope).session_fleet();
+    let plain = fleet
+        .get(&ordinary)
+        .await
+        .expect("read")
+        .expect("the ordinary session is listed");
+    assert!(
+        plain.impersonation.is_none(),
+        "an ordinary session must carry no flag"
+    );
+
+    let flagged = fleet
+        .get(&impersonated)
+        .await
+        .expect("read")
+        .expect("the impersonation session is listed");
+    let carried = flagged.impersonation.expect("the flag is present");
+    assert_eq!(carried.impersonator, "adm_support_engineer");
+    assert_eq!(carried.reason_code, "support_ticket");
+    assert_eq!(carried.reason_text, "Ticket 4417");
+    assert_eq!(carried.expires_at_unix_micros, now + 10 * MINUTE_MICROS);
+
+    // Past the cap the AUTH path refuses it, and the FLEET surface still reports it. That
+    // difference is the point: one decides whether the impersonation may continue, the other
+    // is the record that it happened.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .sessions()
+            .get(&impersonated, now + 11 * MINUTE_MICROS, 0)
+            .await
+            .expect("read")
+            .is_none(),
+        "the auth path refuses a lapsed impersonation"
+    );
+    assert!(
+        fleet
+            .get(&impersonated)
+            .await
+            .expect("read")
+            .expect("still listed")
+            .impersonation
+            .is_some(),
+        "the fleet surface still reports it, so the incident stays legible"
+    );
+}
