@@ -1386,3 +1386,116 @@ async fn two_issuances_against_identical_state_emit_an_identical_roles_claim() {
         "a refresh is byte-identical to the code exchange it descends from"
     );
 }
+
+/// A code exchange out of an IMPERSONATION session mints tokens carrying `act` (issue #101).
+///
+/// The claim and its protection shipped in #661 and the session reports its impersonation
+/// since #662; this is the assertion that the two are connected, which is the difference
+/// between the criterion being available and being true.
+///
+/// The impersonation is planted directly on the session row because no start ENDPOINT exists
+/// yet. That is the same shortcut the permission-parity suite used before its writer landed,
+/// and it goes away the same way: when the start route lands, this seeds through it.
+#[tokio::test]
+async fn a_code_exchange_from_an_impersonation_session_mints_the_actor_claim() {
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let (subject, cookie) = consenting_subject(&harness, &client_id).await;
+
+    // An ordinary exchange first, so the absence below is a DIFFERENCE rather than the
+    // default state of a test that never had an impersonation to lose.
+    let code = authorize_to_code(&harness, &client_id, &[], &cookie).await;
+    let (id_claims, at_claims, _) = exchange(&harness, &client_id, &code).await;
+    assert!(
+        id_claims.get("act").is_none() && at_claims.get("act").is_none(),
+        "an ordinary session mints no actor claim: {id_claims} {at_claims}"
+    );
+
+    // Now make the very same session an impersonation. The columns move together or not at
+    // all, which migration 0128 enforces, so this writes all five.
+    let updated = sqlx::query(
+        "UPDATE sessions SET impersonator = $1, impersonation_reason_code = $2, \
+                impersonation_reason_text = $3, impersonation_started_at = now(), \
+                impersonation_expires_at = now() + INTERVAL '30 minutes' \
+         WHERE subject = $4 AND revoked_at IS NULL AND ended_at IS NULL",
+    )
+    .bind("adm_support_engineer")
+    .bind("support_ticket")
+    .bind("Ticket 4417: reproducing the checkout failure as the user.")
+    .bind(&subject)
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("plant the impersonation on the live session");
+    assert_eq!(
+        updated.rows_affected(),
+        1,
+        "exactly one live session belongs to this subject, so the plant is unambiguous"
+    );
+
+    let code = authorize_to_code(&harness, &client_id, &[], &cookie).await;
+    let (id_claims, at_claims, _) = exchange(&harness, &client_id, &code).await;
+    let expected = serde_json::json!({
+        "sub": "adm_support_engineer",
+        "reason_code": "support_ticket",
+    });
+    assert_eq!(
+        id_claims["act"], expected,
+        "the id token names the impersonator and the structured reason: {id_claims}"
+    );
+    assert_eq!(
+        at_claims["act"], expected,
+        "and so does the access token: {at_claims}"
+    );
+    assert_eq!(
+        id_claims["sub"], subject,
+        "the SUBJECT stays the impersonated user; `act` says who is driving, and swapping the \
+         two would make the token authorize the operator instead"
+    );
+    let rendered = format!("{id_claims}{at_claims}");
+    assert!(
+        !rendered.contains("Ticket 4417"),
+        "the written justification never reaches a token: {rendered}"
+    );
+}
+
+/// A REFRESHED access token does not yet carry `act` (issue #101), pinned deliberately.
+///
+/// The refresh resolution carries no session reference, so wiring it would mean a fresh
+/// session read on the hot refresh path. The issue asks instead for the actor to be PERSISTED
+/// in a form M13's token exchange can consume, and the grant is where that belongs.
+///
+/// This pin exists so that slice has to FLIP an assertion rather than quietly discover it was
+/// already true. The gap it records is real: an access token refreshed out of an impersonated
+/// session presently carries no actor.
+#[tokio::test]
+async fn a_refreshed_token_does_not_yet_carry_the_actor_claim() {
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let (subject, cookie) = consenting_subject(&harness, &client_id).await;
+    sqlx::query(
+        "UPDATE sessions SET impersonator = $1, impersonation_reason_code = $2, \
+                impersonation_reason_text = $3, impersonation_started_at = now(), \
+                impersonation_expires_at = now() + INTERVAL '30 minutes' \
+         WHERE subject = $4 AND revoked_at IS NULL AND ended_at IS NULL",
+    )
+    .bind("adm_support_engineer")
+    .bind("support_ticket")
+    .bind("Ticket 4417")
+    .bind(&subject)
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("plant the impersonation");
+
+    let code = authorize_to_code(&harness, &client_id, &[], &cookie).await;
+    let (_, at_claims, refresh_token) = exchange(&harness, &client_id, &code).await;
+    assert!(
+        at_claims.get("act").is_some(),
+        "the code exchange carries the actor, so the refresh below is the only variable"
+    );
+    let (refreshed, _) = refresh(&harness, &client_id, &refresh_token).await;
+    assert!(
+        refreshed.get("act").is_none(),
+        "PIN, not an endorsement: the refresh path has no session reference yet, so it mints \
+         no actor. The slice that persists the actor onto the grant must flip this: {refreshed}"
+    );
+}
