@@ -292,6 +292,7 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         ManagementPermission::WriteCredentials,
     ),
     ("listServiceAccountApiKeys", ManagementPermission::Read),
+    ("getClientServiceAccount", ManagementPermission::Read),
     (
         "revokeServiceAccountApiKey",
         ManagementPermission::WriteCredentials,
@@ -540,6 +541,9 @@ const PERMISSION_PROVEN: &[&str] = &[
     "listUserPersonalAccessTokens",
     "revokeUserPersonalAccessToken",
     "rotateUserPersonalAccessToken",
+    // Proven in `a_read_only_credential_cannot_mint_or_kill_a_service_accounts_key`, which
+    // drives this read in both directions alongside the key routes it sits with.
+    "getClientServiceAccount",
 ];
 
 /// Not every unproven operation CAN be proven the same way.
@@ -574,7 +578,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        155,
+        156,
         "the classified set changed size; update the unproven count below with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

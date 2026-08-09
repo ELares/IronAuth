@@ -2171,6 +2171,133 @@ export async function fetchOrgApiKeys(
   return data?.items ?? [];
 }
 
+// The service-account key surface (issue #99, criterion 6), plus the client-to-principal
+// lookup the console needs to reach it. A principal has no list route because it is minted
+// per CLIENT and lazily, so a client id is the only handle an operator has to start from.
+const SA_KEYS_PATH =
+  "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys";
+const SA_KEY_PATH =
+  "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}";
+const SA_KEY_ROTATE_PATH =
+  "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}/rotate";
+
+// The service account of one client (operationId getClientServiceAccount). `null` means the
+// client is live and has never had a principal minted, which happens at its first
+// client-credentials issuance. That is a different answer from a 404, which means no such
+// client, and the console must not collapse the two into an empty key list.
+export async function fetchClientServiceAccount(
+  tenantId: string,
+  environmentId: string,
+  clientId: string,
+): Promise<string | null> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/service-account",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId, client_id: clientId },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data.service_account_id ?? null;
+}
+
+export async function fetchServiceAccountKeys(
+  tenantId: string,
+  environmentId: string,
+  serviceAccountId: string,
+): Promise<ApiKeyView[]> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(SA_KEYS_PATH, {
+    params: {
+      path: {
+        tenant_id: tenantId,
+        environment_id: environmentId,
+        service_account_id: serviceAccountId,
+      },
+    },
+  });
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data?.items ?? [];
+}
+
+export async function createServiceAccountKey(
+  tenantId: string,
+  environmentId: string,
+  serviceAccountId: string,
+  displayName: string,
+): Promise<ApiKeyCreated> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(SA_KEYS_PATH, {
+    params: {
+      path: {
+        tenant_id: tenantId,
+        environment_id: environmentId,
+        service_account_id: serviceAccountId,
+      },
+      header: { "Idempotency-Key": idempotencyKey() },
+    },
+    body: { display_name: displayName },
+  });
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// ONE request, for the reason the organization rotation gives: the store revokes and issues
+// in one transaction, and splitting it here would reintroduce the window where both are live.
+export async function rotateServiceAccountKey(
+  tenantId: string,
+  environmentId: string,
+  serviceAccountId: string,
+  keyId: string,
+): Promise<ApiKeyCreated> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(SA_KEY_ROTATE_PATH, {
+    params: {
+      path: {
+        tenant_id: tenantId,
+        environment_id: environmentId,
+        service_account_id: serviceAccountId,
+        key_id: keyId,
+      },
+      header: { "Idempotency-Key": idempotencyKey() },
+    },
+  });
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+export async function revokeServiceAccountKey(
+  tenantId: string,
+  environmentId: string,
+  serviceAccountId: string,
+  keyId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(SA_KEY_PATH, {
+    params: {
+      path: {
+        tenant_id: tenantId,
+        environment_id: environmentId,
+        service_account_id: serviceAccountId,
+        key_id: keyId,
+      },
+    },
+  });
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
 // The personal-access-token surface (issue #99, criterion 6). Four calls that mirror the
 // organization ones exactly; only the path and the owner differ. The typed client keys off
 // the literal path, so each is its own function rather than one taking a path.

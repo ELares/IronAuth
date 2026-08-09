@@ -1,0 +1,17 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The control plane maps a client to its service account (issue #99).
+--
+-- 0125 granted the control plane SELECT on (id, tenant_id, environment_id) and said so
+-- deliberately: the resolution join needed exactly those three, and a narrow grant is what
+-- stops a column added later becoming control-plane readable by accident. That reasoning
+-- holds; this is the case it was designed to make visible.
+--
+-- `getClientServiceAccount` answers "which principal belongs to this client", which the
+-- console needs to reach a service account's keys at all, and the only way to ask it is to
+-- filter on client_id. Without this grant the query is a permission error, which the handler
+-- maps to 500: a dead surface where no request an operator can make would ever succeed.
+--
+-- Still column scoped, and still not the whole table. The control plane now reads a service
+-- account's identity and the client it belongs to, and nothing else.
+GRANT SELECT (client_id) ON service_accounts TO ironauth_control;

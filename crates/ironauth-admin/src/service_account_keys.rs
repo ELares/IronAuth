@@ -39,7 +39,9 @@ use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::parse_json;
-use crate::org_context::{EnvironmentAccess, require_live_environment, resolve_scope};
+use crate::org_context::{
+    EnvironmentAccess, require_client_scope_policy, require_live_environment, resolve_scope,
+};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use ironauth_store::Scope;
@@ -104,6 +106,70 @@ async fn resolve_service_account(
     } else {
         Err(ApiError::NotFound)
     }
+}
+
+/// The service account of one client, as the console needs it to reach the keys.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct ClientServiceAccountView {
+    /// The client this principal belongs to (`cli_...`).
+    pub client_id: String,
+    /// The `sva_` principal, ABSENT when the client has never had one minted.
+    ///
+    /// A principal is minted lazily at the client's first client-credentials issuance, so a
+    /// live client legitimately has none yet. That is a different answer from "no such client",
+    /// which is the 404, and collapsing the two would make the console show an empty key list
+    /// for a client id that was simply mistyped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_account_id: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/service-account",
+    operation_id = "getClientServiceAccount",
+    tag = "org-roles",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("client_id" = String, Path, description = "The client identifier (cli_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The client's service account, or an absent field when none has been minted", body = ClientServiceAccountView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope, or a confined credential", body = ErrorBody),
+        (status = 404, description = "Not found (absent, malformed, or another scope's client)", body = ErrorBody)
+    )
+)]
+pub async fn get_client_service_account(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): READ. Which clients have a machine identity is
+    // operational intelligence about the environment, the same class of fact as which keys
+    // exist, so it takes the same authority the key listing beside it takes.
+    principal.require_permission(ManagementPermission::Read)?;
+    require_unconfined(&principal)?;
+    // Reusing the client resolver the scope-policy routes use rather than writing a second
+    // one. It answers exactly the question needed, "is this a live client of this scope",
+    // and a second resolver is a second chance to disagree with the first about what counts.
+    let (id, _policy) =
+        require_client_scope_policy(&state, scope, &client_id, EnvironmentAccess::Read).await?;
+    let principal_id = state
+        .store()
+        .scoped(scope)
+        .service_accounts()
+        .principal_for(&id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let body = serde_json::to_string(&ClientServiceAccountView {
+        client_id: id.to_string(),
+        service_account_id: principal_id.map(|value| value.to_string()),
+    })
+    .map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
 }
 
 #[utoipa::path(

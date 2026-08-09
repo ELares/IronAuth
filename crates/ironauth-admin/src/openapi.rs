@@ -277,6 +277,7 @@ use crate::views::{
         crate::api_keys::create_organization_api_key,
         crate::api_keys::revoke_organization_api_key,
         crate::api_keys::rotate_organization_api_key,
+        crate::service_account_keys::get_client_service_account,
         crate::service_account_keys::list_service_account_api_keys,
         crate::service_account_keys::create_service_account_api_key,
         crate::service_account_keys::revoke_service_account_api_key,
