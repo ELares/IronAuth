@@ -481,9 +481,21 @@ async fn a_removed_membership_holds_nothing(kind: Kind) {
         "held before the removal, so the assertion after it is a difference"
     );
 
-    sqlx::query("UPDATE org_memberships SET deleted_at = now() WHERE id = $1")
-        .bind(fixture.membership.to_string())
-        .execute(fixture.db.owner_pool())
+    // Through the repository, not the engine. `remove` is principal agnostic: it keys on the
+    // membership id, and its user-only cascade (re-pointing org-scoped identifiers) is skipped
+    // when the row bound no user. Running it here is what says a machine's membership is
+    // removable by the same call that removes a human's, and that the attachment cascade
+    // stripping its roles runs either way.
+    fixture
+        .db
+        .control_store()
+        .scoped(fixture.scope)
+        .acting(
+            fixture.db.test_actor(&fixture.env),
+            CorrelationId::generate(&fixture.env),
+        )
+        .org_memberships()
+        .remove(&fixture.env, &fixture.membership)
         .await
         .expect("remove the membership");
     assert_eq!(

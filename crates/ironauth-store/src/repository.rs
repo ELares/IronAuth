@@ -43090,7 +43090,12 @@ impl ActingOrgMembershipRepo<'_> {
                 // RETURNING the endpoints, because the identifier recompute below needs
                 // to know WHO left WHICH organization and the row is gone from the live
                 // set by the time it could be read again.
-                let removed: Option<(String, String)> = sqlx::query_as(
+                // `user_id` is OPTIONAL here: nullable since 0124 and NULL on a membership
+                // that binds a service account. Decoding it as `String` made removing one
+                // fail as a decode error, which is the same defect class the read fence
+                // addressed and the reason this returns an Option rather than filtering the
+                // statement to user memberships. A machine's membership must be removable.
+                let removed: Option<(Option<String>, String)> = sqlx::query_as(
                     "UPDATE org_memberships SET \
                          deleted_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
                          updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
@@ -43116,14 +43121,28 @@ impl ActingOrgMembershipRepo<'_> {
                 // is refused) but can never hide one. The other two sites ADD a
                 // membership, which unbinds nothing and leaves every row under a key at
                 // least as strict as the one it had, so neither needs a recompute.
-                recompute_org_scoped_identifiers(
-                    tx,
-                    scope,
-                    &removed_org,
-                    &removed_user,
-                    now_micros,
-                )
-                .await?;
+                //
+                // Skipped when the membership bound no user (issue #99). Identifiers are a
+                // USER surface: `user_identifiers` keys on a user, a service account has
+                // none, and there is nothing to re-point. This is a skip and not a widening,
+                // which is why it reads off the removed row rather than off the caller.
+                //
+                // The skip itself is not observable and no test can kill it: replacing it
+                // with a recompute against an empty user id passes everything, because no
+                // identifier row keys on one. It stays because running a user cascade for a
+                // principal that is not a user is wrong on its own terms, and because an
+                // empty string is exactly the value that stops being harmless the moment
+                // someone adds a fallback or a prefix match to that query.
+                if let Some(removed_user) = removed_user {
+                    recompute_org_scoped_identifiers(
+                        tx,
+                        scope,
+                        &removed_org,
+                        &removed_user,
+                        now_micros,
+                    )
+                    .await?;
+                }
                 // CASCADE SITE 1 of 3 (issue #97): the admin removal. Guarded behind
                 // the row having actually been removed, so a repeat remove of an
                 // already-removed membership revokes nothing and stays the uniform
