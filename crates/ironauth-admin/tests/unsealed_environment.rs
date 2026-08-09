@@ -124,6 +124,45 @@ struct Case {
     expect: Expect,
 }
 
+/// The personal-access-token cases (issue #99). Their own function because `cases` had
+/// outgrown the length lint, and because they are the only family here that is a sub-resource
+/// with its own handle rather than a property of the user.
+fn personal_access_token_cases() -> Vec<Case> {
+    vec![
+        // Personal access tokens (issue #99). An absent user must answer the same not-found
+        // here as everywhere else: the listing in particular must not answer 200 with an
+        // empty array, which would confirm the user exists.
+        Case {
+            operation_id: "listUserPersonalAccessTokens",
+            method: "GET",
+            suffix: "/personal-access-tokens".to_owned(),
+            body: None,
+            expect: Expect::UniformNotFound,
+        },
+        Case {
+            operation_id: "createUserPersonalAccessToken",
+            method: "POST",
+            suffix: "/personal-access-tokens".to_owned(),
+            body: Some(r#"{"display_name":"sweep"}"#),
+            expect: Expect::UniformNotFound,
+        },
+        Case {
+            operation_id: "rotateUserPersonalAccessToken",
+            method: "POST",
+            suffix: "/personal-access-tokens/akey_unsealedprobe000000000/rotate".to_owned(),
+            body: None,
+            expect: Expect::UniformNotFound,
+        },
+        Case {
+            operation_id: "revokeUserPersonalAccessToken",
+            method: "DELETE",
+            suffix: "/personal-access-tokens/akey_unsealedprobe000000000".to_owned(),
+            body: None,
+            expect: Expect::UniformNotFound,
+        },
+    ]
+}
+
 fn cases(client: &str) -> Vec<Case> {
     vec![
         Case {
@@ -228,6 +267,9 @@ fn cases(client: &str) -> Vec<Case> {
             expect: Expect::UniformNotFound,
         },
     ]
+    .into_iter()
+    .chain(personal_access_token_cases())
+    .collect()
 }
 
 /// How many envelope keys the scope holds, read as the database OWNER so row-level

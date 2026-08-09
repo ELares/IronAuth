@@ -120,6 +120,7 @@ fn operation_ids_are_the_stable_set() {
             "createTraitMigrationJob",
             "createTraitSchemaVersion",
             "createUser",
+            "createUserPersonalAccessToken",
             "createWebhookEndpoint",
             "deleteBrand",
             "deleteBrandFavicon",
@@ -231,6 +232,7 @@ fn operation_ids_are_the_stable_set() {
             "listTraitSchemaVersions",
             "listUserConsents",
             "listUserIdentifiers",
+            "listUserPersonalAccessTokens",
             "listUsers",
             "listVariables",
             "listWebhookDeadLetters",
@@ -258,9 +260,11 @@ fn operation_ids_are_the_stable_set() {
             "revokeServiceAccountApiKey",
             "revokeSession",
             "revokeUserConsent",
+            "revokeUserPersonalAccessToken",
             "revokeUserSessions",
             "rotateOrganizationApiKey",
             "rotateServiceAccountApiKey",
+            "rotateUserPersonalAccessToken",
             "rotateWebhookEndpointSecret",
             "setAutoLinkPosture",
             "setBrand",
@@ -497,6 +501,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers/{identifier_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens/{key_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}",
             "GET /v1/interop/signing-recommendations",
@@ -580,6 +585,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/traits",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/variables",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
@@ -648,6 +654,8 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens/{key_id}/rotate",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
@@ -770,7 +778,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        212,
+        216,
         "the documented route count is pinned"
     );
 

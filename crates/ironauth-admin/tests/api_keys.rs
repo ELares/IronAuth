@@ -678,3 +678,180 @@ async fn a_service_account_that_does_not_exist_is_the_uniform_not_found() {
         "minting a key for an absent principal answered something other than not-found: {body}"
     );
 }
+
+/// Seed a user and answer its id.
+async fn seed_user(h: &Harness, tenant: &str, environment: &str, handle: &str) -> String {
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/users");
+    let body = serde_json::json!({ "identifier": handle }).to_string();
+    let (status, _, response) = h.post(&base, handle, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "create user: {response}");
+    serde_json::from_str::<Value>(&response).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned()
+}
+
+/// A personal access token carries the PUBLISHED `ira_pat_` prefix, not the API-key one.
+///
+/// This is the assertion the whole surface turns on, and no status code can make it. Minting
+/// `ApiKeyKindTag::ApiKey` for a user produces a token that authenticates perfectly, resolves
+/// to the right owner, and passes every other test here. It differs only in its prefix, and
+/// `docs/design/TOKEN-FORMATS.md` publishes that prefix for operators to register with a secret
+/// scanner. Get it wrong and the scanner goes blind to the credential most likely to end up in
+/// a developer's dotfile.
+///
+/// Asserted against the constants rather than against literals, so it links to the same pair
+/// `the_published_scanner_regex_matches_every_generated_key_kind` checks the document against.
+/// The two together are what make the published regex true of what the product issues.
+#[tokio::test]
+async fn a_personal_access_token_carries_the_published_pat_prefix() {
+    use ironauth_store::api_key::{API_KEY_PREFIX, PERSONAL_ACCESS_TOKEN_PREFIX};
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "pat-tenant").await;
+    let user = seed_user(&h, &tenant, &environment, "pat-user@example.test").await;
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/users/{user}/personal-access-tokens"
+    );
+
+    let (status, _, body) = h
+        .post(
+            &base,
+            "pat-create",
+            &serde_json::json!({ "display_name": "laptop" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let token = serde_json::from_str::<Value>(&body).expect("json")["key"]
+        .as_str()
+        .expect("the 201 carries the token exactly once")
+        .to_owned();
+
+    assert!(
+        token.starts_with(PERSONAL_ACCESS_TOKEN_PREFIX),
+        "a personal access token was minted without the published PAT prefix, so the scanner \
+         regex operators register would not match it: {token}"
+    );
+    assert!(
+        !token.starts_with(API_KEY_PREFIX),
+        "the token carries the API-key prefix, which is the exact confusion the two prefixes \
+         exist to prevent: {token}"
+    );
+
+    // And it is a real credential, not merely a well-shaped string.
+    let env = Env::system();
+    let scope = scope_of(&tenant, &environment);
+    let resolved = h
+        .db()
+        .store()
+        .scoped(scope)
+        .api_keys()
+        .verify(&token, now_micros(&env))
+        .await
+        .expect("verify")
+        .expect("the created token must verify");
+    assert_eq!(
+        resolved.owner,
+        ApiKeyOwner::User(ironauth_store::UserId::parse_in_scope(&user, &scope).expect("user id")),
+        "the token authenticates as the wrong principal"
+    );
+}
+
+/// One user's personal access token is invisible and untouchable from another's path.
+#[tokio::test]
+async fn one_user_cannot_see_or_kill_anothers_personal_access_token() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "pat2-tenant").await;
+    let mine = seed_user(&h, &tenant, &environment, "mine@example.test").await;
+    let theirs = seed_user(&h, &tenant, &environment, "theirs@example.test").await;
+    let root = format!("/v1/tenants/{tenant}/environments/{environment}/users");
+
+    let (status, _, body) = h
+        .post(
+            &format!("{root}/{theirs}/personal-access-tokens"),
+            "pat2-create",
+            &serde_json::json!({ "display_name": "theirs" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let their_token = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let (status, _, body) = h
+        .get(&format!("{root}/{mine}/personal-access-tokens"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "list: {body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .len(),
+        0,
+        "another user's token appeared in my listing"
+    );
+
+    let (status, _, body) = h
+        .delete(&format!(
+            "{root}/{mine}/personal-access-tokens/{their_token}"
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "one user revoked another's personal access token: {body}"
+    );
+
+    // The token they could not reach is still live for its owner, so that was a refusal and
+    // not a slower way of destroying it.
+    let (status, _, body) = h
+        .get(&format!("{root}/{theirs}/personal-access-tokens"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "list: {body}");
+    let view = serde_json::from_str::<Value>(&body).expect("json");
+    assert_eq!(view["items"].as_array().expect("items").len(), 1);
+    assert!(
+        view["items"][0]["revoked_at_unix_ms"].is_null(),
+        "the token the other user could not reach was revoked anyway: {view}"
+    );
+}
+
+/// A well-formed user id that names nobody is the uniform not-found.
+///
+/// The same pair of failures the service-account surface has, and worth asserting separately
+/// on each because each surface resolves its owner its own way. Without the check the LISTING
+/// answers 200 with an empty array, telling a caller "this user exists and holds no tokens"
+/// about a user who does not exist; and the CREATE reaches the insert and comes back as the
+/// foreign key's 500, an internal error for what is a caller mistake.
+#[tokio::test]
+async fn a_user_who_does_not_exist_is_the_uniform_not_found_for_tokens() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "pat3-tenant").await;
+    let scope = scope_of(&tenant, &environment);
+    // Well formed and in this scope, so nothing before the existence check refuses it.
+    let absent = ironauth_store::UserId::generate(&Env::system(), &scope);
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/users/{absent}/personal-access-tokens"
+    );
+
+    let (status, _, body) = h.get(&base).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "listing an absent user's tokens answered something other than not-found: {body}"
+    );
+
+    let (status, _, body) = h
+        .post(
+            &base,
+            "pat3-create",
+            &serde_json::json!({ "display_name": "orphan" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "minting a token for an absent user answered something other than not-found: {body}"
+    );
+}
