@@ -668,8 +668,15 @@ async fn mint_assertion(
         .require_auth_time
         .then_some(session.auth_time_unix_micros);
     let extra_claims = serde_json::Map::new();
+    // The impersonation this session was started under (issue #101). A FedCM assertion is an
+    // ID token going straight to a relying party, so omitting `act` here would be the same
+    // audit hole as omitting it at the token endpoint.
+    let actor = tokens::session_actor(state, scope, &session.session_id, now_micros).await;
     let request = MintRequest {
-        actor: None,
+        actor: actor.as_ref().map(|imp| tokens::TokenActor {
+            subject: &imp.impersonator,
+            reason_code: &imp.reason_code,
+        }),
         scope,
         issuer: &issuer,
         subject: public_subject,
