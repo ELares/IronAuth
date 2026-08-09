@@ -2130,7 +2130,11 @@ export async function fetchOrgRoles(
 // One API key of an organization, as the management surface renders it (issue #99).
 // Carries NO key material: the listing endpoint has no digest to return and the key
 // itself exists only in the creation response.
-export interface OrgApiKeyView {
+// Shared by all three key surfaces: organization, service account and user. The Rust
+// side renders one view type for all of them precisely so the three cannot drift into
+// exposing different fields for the same object, and duplicating it here would give
+// back the drift that avoided.
+export interface ApiKeyView {
   id: string;
   display_name: string;
   // Nullable as well as optional: the generated contract types model a
@@ -2147,7 +2151,7 @@ export async function fetchOrgApiKeys(
   tenantId: string,
   environmentId: string,
   organizationId: string,
-): Promise<OrgApiKeyView[]> {
+): Promise<ApiKeyView[]> {
   const client = createManagementClient();
   const { data, error, response } = await client.GET(
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
@@ -2167,10 +2171,113 @@ export async function fetchOrgApiKeys(
   return data?.items ?? [];
 }
 
+// The personal-access-token surface (issue #99, criterion 6). Four calls that mirror the
+// organization ones exactly; only the path and the owner differ. The typed client keys off
+// the literal path, so each is its own function rather than one taking a path.
+const PAT_PATH =
+  "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens";
+const PAT_ITEM_PATH =
+  "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens/{key_id}";
+const PAT_ROTATE_PATH =
+  "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens/{key_id}/rotate";
+
+// List a user's personal access tokens (operationId listUserPersonalAccessTokens).
+// Revoked tokens are included, for the reason the organization listing gives.
+export async function fetchUserPersonalAccessTokens(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+): Promise<ApiKeyView[]> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(PAT_PATH, {
+    params: {
+      path: { tenant_id: tenantId, environment_id: environmentId, user_id: userId },
+    },
+  });
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data?.items ?? [];
+}
+
+// Mint a personal access token (operationId createUserPersonalAccessToken). The caller
+// must treat `key` as display-once: nothing recovers it afterwards, including a replay
+// of this very request.
+export async function createUserPersonalAccessToken(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+  displayName: string,
+): Promise<ApiKeyCreated> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(PAT_PATH, {
+    params: {
+      path: { tenant_id: tenantId, environment_id: environmentId, user_id: userId },
+      header: { "Idempotency-Key": idempotencyKey() },
+    },
+    body: { display_name: displayName },
+  });
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Rotate one personal access token (operationId rotateUserPersonalAccessToken). ONE
+// request, for the reason the organization rotation gives: the store revokes and issues
+// in one transaction, and splitting it here would reintroduce the window where both are
+// live, which is the failure a rotation performed to contain a leak exists to prevent.
+export async function rotateUserPersonalAccessToken(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+  keyId: string,
+): Promise<ApiKeyCreated> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.POST(PAT_ROTATE_PATH, {
+    params: {
+      path: {
+        tenant_id: tenantId,
+        environment_id: environmentId,
+        user_id: userId,
+        key_id: keyId,
+      },
+      header: { "Idempotency-Key": idempotencyKey() },
+    },
+  });
+  if (error !== undefined || !response.ok || data === undefined) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return data;
+}
+
+// Revoke one personal access token (operationId revokeUserPersonalAccessToken).
+export async function revokeUserPersonalAccessToken(
+  tenantId: string,
+  environmentId: string,
+  userId: string,
+  keyId: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.DELETE(PAT_ITEM_PATH, {
+    params: {
+      path: {
+        tenant_id: tenantId,
+        environment_id: environmentId,
+        user_id: userId,
+        key_id: keyId,
+      },
+    },
+  });
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
+
 // What creating a key returns (operationId createOrganizationApiKey, issue #99).
 // `key` is present exactly once, on the original 201, and absent on an idempotent
 // replay. Nothing can recover it afterwards.
-export interface OrgApiKeyCreated {
+export interface ApiKeyCreated {
   id: string;
   display_name: string;
   key?: string | null;
@@ -2185,7 +2292,7 @@ export async function createOrgApiKey(
   environmentId: string,
   organizationId: string,
   displayName: string,
-): Promise<OrgApiKeyCreated> {
+): Promise<ApiKeyCreated> {
   const client = createManagementClient();
   const { data, error, response } = await client.POST(
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
@@ -2217,7 +2324,7 @@ export async function rotateOrgApiKey(
   environmentId: string,
   organizationId: string,
   keyId: string,
-): Promise<OrgApiKeyCreated> {
+): Promise<ApiKeyCreated> {
   const client = createManagementClient();
   const { data, error, response } = await client.POST(
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate",

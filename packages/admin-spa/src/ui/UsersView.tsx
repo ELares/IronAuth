@@ -35,6 +35,7 @@ import {
 import { activeScope } from "../scope/store";
 import type { SudoRecovery } from "./ErrorView";
 import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import { UserPersonalAccessTokensPanel } from "./UserPersonalAccessTokensView";
 import { useAsyncResource, useMutation } from "./useResource";
 
 // The lifecycle states the management contract exposes (issue #52). Every state
@@ -348,6 +349,13 @@ function UserDetailFor({
             />
 
             <UserSessionsForm
+              tenantId={tenantId}
+              environmentId={environmentId}
+              userId={userId}
+              mutation={mutation}
+            />
+
+            <UserPersonalAccessTokensPanel
               tenantId={tenantId}
               environmentId={environmentId}
               userId={userId}
