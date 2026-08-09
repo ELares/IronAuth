@@ -1974,6 +1974,12 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             sa_base.clone(),
         ),
+        // The client's principal, which is how the console reaches the keys above.
+        Case::empty(
+            "service_account_keys.getClientServiceAccount",
+            "GET",
+            format!("{base}/clients/{client}/service-account"),
+        ),
         Case::empty(
             "service_account_keys.rotateServiceAccountApiKey",
             "POST",

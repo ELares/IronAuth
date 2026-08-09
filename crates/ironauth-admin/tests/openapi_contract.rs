@@ -154,6 +154,7 @@ fn operation_ids_are_the_stable_set() {
             "getClientAdminConsent",
             "getClientAllowedScopes",
             "getClientAuthDiagnostics",
+            "getClientServiceAccount",
             "getConnector",
             "getConnectorCapabilities",
             "getConnectorHealth",
@@ -519,6 +520,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/service-account",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
@@ -778,7 +780,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        216,
+        217,
         "the documented route count is pinned"
     );
 

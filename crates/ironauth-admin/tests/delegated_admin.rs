@@ -976,6 +976,32 @@ async fn a_read_only_credential_cannot_mint_or_kill_a_service_accounts_key() {
         body.contains("management.read"),
         "the listing's refusal does not name management.read: {body}"
     );
+
+    // The client-to-principal read that the console uses to REACH those keys takes the same
+    // authority, and is proven the same way. A route the console must call before it can call
+    // any of the others is not a lesser surface for being a lookup.
+    let lookup =
+        format!("/v1/tenants/{tenant}/environments/{environment}/clients/{client}/service-account");
+    let (status, _, body) = h.get_as(&lookup, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted key was refused the principal lookup it holds: {body}"
+    );
+    assert!(
+        body.contains(&principal.to_string()),
+        "the lookup did not answer the principal that was minted for this client: {body}"
+    );
+    let (status, _, body) = h.get_as(&lookup, &write_secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write-only credential read the principal lookup: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the lookup's refusal does not name management.read: {body}"
+    );
 }
 
 /// The read-only half, split out because the fixture above and these four probes together

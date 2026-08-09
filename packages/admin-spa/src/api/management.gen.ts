@@ -385,6 +385,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/service-account": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getClientServiceAccount"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm": {
         parameters: {
             query?: never;
@@ -3182,6 +3198,20 @@ export interface components {
             client_id: string;
             /** @description Whether PAR is required for this client specifically. */
             require_pushed_authorization_requests: boolean;
+        };
+        /** @description The service account of one client, as the console needs it to reach the keys. */
+        ClientServiceAccountView: {
+            /** @description The client this principal belongs to (`cli_...`). */
+            client_id: string;
+            /**
+             * @description The `sva_` principal, ABSENT when the client has never had one minted.
+             *
+             *     A principal is minted lazily at the client's first client-credentials issuance, so a
+             *     live client legitimately has none yet. That is a different answer from "no such client",
+             *     which is the 404, and collapsing the two would make the console show an empty key list
+             *     for a client id that was simply mistyped.
+             */
+            service_account_id?: string | null;
         };
         /** @description The updated per-client signing-algorithm state. */
         ClientSigningAlgorithmView: {
@@ -9062,6 +9092,60 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getClientServiceAccount: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The client identifier (cli_...) */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The client's service account, or an absent field when none has been minted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientServiceAccountView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope, or a confined credential */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, malformed, or another scope's client) */
             404: {
                 headers: {
                     [name: string]: unknown;

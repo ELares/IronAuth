@@ -3001,6 +3001,90 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/service-account": {
+      "get": {
+        "tags": [
+          "org-roles"
+        ],
+        "operationId": "getClientServiceAccount",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The client identifier (cli_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The client's service account, or an absent field when none has been minted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientServiceAccountView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope, or a confined credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, malformed, or another scope's client)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm": {
       "put": {
         "tags": [
@@ -21926,6 +22010,26 @@
           "require_pushed_authorization_requests": {
             "type": "boolean",
             "description": "Whether PAR is required for this client specifically."
+          }
+        }
+      },
+      "ClientServiceAccountView": {
+        "type": "object",
+        "description": "The service account of one client, as the console needs it to reach the keys.",
+        "required": [
+          "client_id"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The client this principal belongs to (`cli_...`)."
+          },
+          "service_account_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `sva_` principal, ABSENT when the client has never had one minted.\n\nA principal is minted lazily at the client's first client-credentials issuance, so a\nlive client legitimately has none yet. That is a different answer from \"no such client\",\nwhich is the 404, and collapsing the two would make the console show an empty key list\nfor a client id that was simply mistyped."
           }
         }
       },

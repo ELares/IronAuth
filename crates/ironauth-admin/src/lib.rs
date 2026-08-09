@@ -518,6 +518,10 @@ pub fn management_router(state: AdminState) -> Router {
             post(api_keys::rotate_organization_api_key),
         )
         .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/service-account",
+            axum::routing::get(service_account_keys::get_client_service_account),
+        )
+        .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys",
             axum::routing::get(service_account_keys::list_service_account_api_keys)
                 .post(service_account_keys::create_service_account_api_key),

@@ -45,6 +45,7 @@ import {
 import { activeScope } from "../scope/store";
 import type { SudoRecovery } from "./ErrorView";
 import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import { ClientServiceAccountKeysPanel } from "./ClientServiceAccountKeysView";
 import { useAsyncResource, useMutation } from "./useResource";
 
 function inputValue(event: Event): string {
@@ -108,6 +109,10 @@ function ClientsForScope({
         environmentId={environmentId}
       />
       <AllowedScopesPanel tenantId={tenantId} environmentId={environmentId} />
+      <ClientServiceAccountKeysPanel
+        tenantId={tenantId}
+        environmentId={environmentId}
+      />
       <DcrPoliciesPanel tenantId={tenantId} environmentId={environmentId} />
       <DcrInitialAccessTokenPanel
         tenantId={tenantId}
