@@ -553,6 +553,7 @@ pub async fn establish_session(
             &session_id,
             prior.as_ref(),
             NewSession {
+                impersonation: None,
                 subject,
                 auth_methods: &event.methods_token(),
                 auth_time_micros: event.auth_time_unix_micros(),

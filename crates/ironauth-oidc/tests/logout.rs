@@ -1052,6 +1052,7 @@ async fn create_foreign_session(harness: &Harness, scope: Scope) -> SessionId {
             &session_id,
             None,
             NewSession {
+                impersonation: None,
                 subject: &subject,
                 auth_methods: "pwd",
                 auth_time_micros: 0,

@@ -2251,6 +2251,7 @@ impl Harness {
                 &session_id,
                 None,
                 ironauth_store::NewSession {
+                    impersonation: None,
                     subject,
                     auth_methods,
                     auth_time_micros,

@@ -54,6 +54,7 @@ async fn create_session(
             &id,
             prior,
             ironauth_store::NewSession {
+                impersonation: None,
                 subject,
                 auth_methods: "pwd",
                 auth_time_micros: 0,

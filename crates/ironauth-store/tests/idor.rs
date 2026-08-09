@@ -422,6 +422,7 @@ async fn plant_session(db: &TestDatabase, env: &Env, scope: Scope) -> SessionId 
             &id,
             None,
             NewSession {
+                impersonation: None,
                 subject: &UserId::generate(env, &scope).to_string(),
                 auth_methods: "pwd",
                 auth_time_micros: 0,

@@ -786,6 +786,7 @@ impl Harness {
                 &id,
                 None,
                 NewSession {
+                    impersonation: None,
                     subject,
                     auth_methods: "pwd",
                     auth_time_micros: 0,

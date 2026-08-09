@@ -13,6 +13,17 @@ use ironauth_store::{CorrelationId, Scope};
 
 const MINUTE_MICROS: i64 = 60 * 1_000_000;
 
+/// The impersonation columns as read straight back from the row: impersonator, reason code,
+/// reason text, start and expiry. Named because the tuple is past the complexity lint, and
+/// because a reader of the assertion below should not have to count `Option<String>`s.
+type StoredImpersonation = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+
 fn now_micros(env: &ironauth_env::Env) -> i64 {
     i64::try_from(
         env.clock()
@@ -358,5 +369,113 @@ async fn an_old_impersonation_session_cannot_be_extended_a_refresh_at_a_time() {
     assert!(
         inside.is_ok(),
         "an extension to exactly the cap must still be allowed: {inside:?}"
+    );
+}
+
+/// The repository writes all five impersonation columns, and an ordinary rotate writes none.
+///
+/// The pairing is the point. A test that only asserted the impersonated row would pass against
+/// a writer that stamped every session with the same impersonator, which is the failure mode
+/// that matters here: an ordinary session wrongly flagged is an audit record accusing somebody.
+#[tokio::test]
+async fn the_repository_writes_the_impersonation_columns_and_only_when_asked() {
+    use ironauth_store::impersonation::Impersonation;
+
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let now = now_micros(&env);
+    let far = now + 24 * 60 * MINUTE_MICROS;
+
+    let plain = ironauth_store::SessionId::generate(&env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .rotate(
+            &env,
+            &plain,
+            None,
+            ironauth_store::NewSession {
+                impersonation: None,
+                subject: "usr_ordinary",
+                auth_methods: "pwd",
+                auth_time_micros: now,
+                idle_expires_micros: far,
+                absolute_expires_micros: far,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("rotate an ordinary session");
+
+    let impersonated = ironauth_store::SessionId::generate(&env, &scope);
+    let act = Impersonation::start(
+        "adm_support_engineer",
+        "support_ticket",
+        "Ticket 4417: cannot complete checkout, reproducing as the user.",
+        now,
+        30 * MINUTE_MICROS,
+    )
+    .expect("a justified request inside the cap");
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .rotate(
+            &env,
+            &impersonated,
+            None,
+            ironauth_store::NewSession {
+                impersonation: Some(act),
+                subject: "usr_target",
+                auth_methods: "pwd",
+                auth_time_micros: now,
+                idle_expires_micros: far,
+                absolute_expires_micros: far,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("rotate an impersonation session");
+
+    let (impersonator, code, text, started, expires): StoredImpersonation = sqlx::query_as(
+        "SELECT impersonator, impersonation_reason_code, impersonation_reason_text, \
+                (EXTRACT(EPOCH FROM impersonation_started_at) * 1000000)::bigint, \
+                (EXTRACT(EPOCH FROM impersonation_expires_at) * 1000000)::bigint \
+         FROM sessions WHERE id = $1",
+    )
+    .bind(impersonated.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the impersonation session back");
+    assert_eq!(impersonator.as_deref(), Some("adm_support_engineer"));
+    assert_eq!(code.as_deref(), Some("support_ticket"));
+    assert_eq!(
+        text.as_deref(),
+        Some("Ticket 4417: cannot complete checkout, reproducing as the user.")
+    );
+    assert_eq!(started, Some(now));
+    assert_eq!(
+        expires,
+        Some(now + 30 * MINUTE_MICROS),
+        "the stored expiry must be the start plus the requested duration"
+    );
+
+    let ordinary: (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT impersonator, \
+                (EXTRACT(EPOCH FROM impersonation_expires_at) * 1000000)::bigint \
+         FROM sessions WHERE id = $1",
+    )
+    .bind(plain.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the ordinary session back");
+    assert_eq!(
+        ordinary,
+        (None, None),
+        "an ordinary session must carry no impersonation at all"
     );
 }

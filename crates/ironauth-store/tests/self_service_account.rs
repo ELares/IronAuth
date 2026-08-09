@@ -62,6 +62,7 @@ async fn create_session(
             &id,
             prior,
             NewSession {
+                impersonation: None,
                 subject,
                 auth_methods: "pwd",
                 auth_time_micros: 0,

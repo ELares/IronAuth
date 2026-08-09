@@ -102,6 +102,7 @@ async fn create_session(db: &TestDatabase, env: &Env, scope: Scope, subject: &st
             &id,
             None,
             NewSession {
+                impersonation: None,
                 subject,
                 auth_methods: "pwd",
                 auth_time_micros: 0,
