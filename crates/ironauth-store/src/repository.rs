@@ -9428,6 +9428,34 @@ pub struct ServiceAccountRepo<'a> {
 }
 
 impl ServiceAccountRepo<'_> {
+    /// Whether this service account exists in this scope (issue #99).
+    ///
+    /// Existence IS liveness here. `service_accounts` carries no `state` and no `deleted_at`:
+    /// a principal, once minted, is stable forever because its id IS the `sub` of every token
+    /// issued for it, so there is no soft-deleted row for this to have to exclude. A caller
+    /// wanting the "is this a usable principal" question asks the client's state, not this.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn exists(&self, id: &ServiceAccountId) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM service_accounts \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+
     /// The stable service-account principal for `client_id` within scope (issue
     /// #23), or [`None`] if the client has not yet had one minted (it is minted
     /// lazily at the first client-credentials issuance) or is out of this scope.

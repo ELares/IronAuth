@@ -69,6 +69,10 @@ crates/ironauth-admin/src/recovery_approvals.rs:decide:2
 crates/ironauth-admin/src/recovery_approvals.rs:resolve_scope:0
 crates/ironauth-admin/src/routing_rules.rs:create_routing_rule:1
 crates/ironauth-admin/src/secrets.rs:set_secret:2
+crates/ironauth-admin/src/service_account_keys.rs:create_service_account_api_key:1
+crates/ironauth-admin/src/service_account_keys.rs:owned_by:0
+crates/ironauth-admin/src/service_account_keys.rs:resolve_service_account:0
+crates/ironauth-admin/src/service_account_keys.rs:rotate_service_account_api_key:1
 crates/ironauth-admin/src/sessions.rs:bulk_revoke_sessions:1
 crates/ironauth-admin/src/sessions.rs:revoke_session:1
 crates/ironauth-admin/src/sessions.rs:revoke_user_sessions:1

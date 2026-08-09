@@ -499,3 +499,182 @@ async fn rotation_is_one_request_and_a_retry_issues_nothing_further() {
         "one original plus one replacement, not three: {listed}"
     );
 }
+
+/// Mint a service-account principal for a fresh client, and answer its id.
+async fn seed_service_account(h: &Harness, scope: Scope, label: &str) -> String {
+    let env = Env::system();
+    let actor = ActorRef::service(ServiceId::generate(&env));
+    let client = h
+        .db()
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(&env))
+        .clients()
+        .create(&env, label)
+        .await
+        .expect("create the client");
+    h.db()
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(&env))
+        .service_accounts()
+        .ensure(&env, &client)
+        .await
+        .expect("mint the principal")
+        .to_string()
+}
+
+/// A key created for a service account verifies AS that service account.
+///
+/// The route hardcodes the owner, and an owner written as `Organization` would still mint a
+/// working key: it would authenticate, and it would carry the wrong principal's authority. The
+/// only way to see the difference is to verify the key and read back who it resolved to.
+#[tokio::test]
+async fn a_service_accounts_key_verifies_as_that_service_account() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "sk-tenant").await;
+    let scope = scope_of(&tenant, &environment);
+    let principal = seed_service_account(&h, scope, "a machine client").await;
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/service-accounts/{principal}/api-keys"
+    );
+
+    let (status, _, body) = h
+        .post(
+            &base,
+            "sk-create",
+            &serde_json::json!({ "display_name": "ci runner" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let key = serde_json::from_str::<Value>(&body).expect("json")["key"]
+        .as_str()
+        .expect("the 201 carries the key exactly once")
+        .to_owned();
+
+    let env = Env::system();
+    let resolved = h
+        .db()
+        .store()
+        .scoped(scope)
+        .api_keys()
+        .verify(&key, now_micros(&env))
+        .await
+        .expect("verify")
+        .expect("the created key must verify");
+    assert_eq!(
+        resolved.owner,
+        ApiKeyOwner::ServiceAccount(
+            ironauth_store::ServiceAccountId::parse_in_scope(&principal, &scope)
+                .expect("principal id")
+        ),
+        "the key authenticates as the wrong principal"
+    );
+}
+
+/// One service account's key is invisible and untouchable from another's path.
+///
+/// The store addresses a key by its handle alone and is environment scoped, so nothing below
+/// the handler distinguishes these two principals. Without the ownership check the path
+/// segment would be decorative: naming any handle under any principal would work.
+#[tokio::test]
+async fn one_service_account_cannot_see_or_kill_anothers_key() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "sk2-tenant").await;
+    let scope = scope_of(&tenant, &environment);
+    let mine = seed_service_account(&h, scope, "my machine").await;
+    let theirs = seed_service_account(&h, scope, "their machine").await;
+    let root = format!("/v1/tenants/{tenant}/environments/{environment}/service-accounts");
+
+    let (status, _, body) = h
+        .post(
+            &format!("{root}/{theirs}/api-keys"),
+            "sk2-create",
+            &serde_json::json!({ "display_name": "theirs" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let their_key = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let (status, _, body) = h.get(&format!("{root}/{mine}/api-keys")).await;
+    assert_eq!(status, StatusCode::OK, "list: {body}");
+    let items = serde_json::from_str::<Value>(&body).expect("json")["items"]
+        .as_array()
+        .expect("items")
+        .len();
+    assert_eq!(items, 0, "another principal's key appeared in my listing");
+
+    let (status, _, body) = h
+        .delete(&format!("{root}/{mine}/api-keys/{their_key}"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "one service account revoked another's key: {body}"
+    );
+
+    let (status, _, body) = h
+        .post(
+            &format!("{root}/{mine}/api-keys/{their_key}/rotate"),
+            "sk2-rotate",
+            "",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "one service account rotated another's key: {body}"
+    );
+
+    // And the key it could not reach is still live for its real owner, so the refusals above
+    // were refusals rather than a slower way of destroying it.
+    let (status, _, body) = h.get(&format!("{root}/{theirs}/api-keys")).await;
+    assert_eq!(status, StatusCode::OK, "list: {body}");
+    let theirs_view = serde_json::from_str::<Value>(&body).expect("json");
+    assert_eq!(theirs_view["items"].as_array().expect("items").len(), 1);
+    assert!(
+        theirs_view["items"][0]["revoked_at_unix_ms"].is_null(),
+        "the key the other principal could not reach was revoked anyway: {theirs_view}"
+    );
+}
+
+/// A well-formed principal id that names nothing is the uniform not-found.
+///
+/// Both halves matter and they fail differently. Without the existence check the LISTING would
+/// answer 200 with an empty array, which tells a caller "this principal exists and holds no
+/// keys" about a principal that does not exist; and the CREATE would reach the insert and come
+/// back as the foreign key's 500, which is an internal error for what is a caller mistake.
+#[tokio::test]
+async fn a_service_account_that_does_not_exist_is_the_uniform_not_found() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "sk3-tenant").await;
+    let scope = scope_of(&tenant, &environment);
+    // Well formed and in this scope, so nothing before the existence check refuses it.
+    let absent = ironauth_store::ServiceAccountId::generate(&Env::system(), &scope);
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/service-accounts/{absent}/api-keys"
+    );
+
+    let (status, _, body) = h.get(&base).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "listing an absent principal answered something other than not-found: {body}"
+    );
+
+    let (status, _, body) = h
+        .post(
+            &base,
+            "sk3-create",
+            &serde_json::json!({ "display_name": "orphan" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "minting a key for an absent principal answered something other than not-found: {body}"
+    );
+}

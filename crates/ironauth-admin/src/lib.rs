@@ -98,6 +98,7 @@ mod resource_types;
 mod response;
 mod routing_rules;
 mod secrets;
+mod service_account_keys;
 mod sessions;
 mod signing_algorithm;
 mod signing_interop;
@@ -514,6 +515,19 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate",
             post(api_keys::rotate_organization_api_key),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys",
+            axum::routing::get(service_account_keys::list_service_account_api_keys)
+                .post(service_account_keys::create_service_account_api_key),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}",
+            delete(service_account_keys::revoke_service_account_api_key),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}/rotate",
+            post(service_account_keys::rotate_service_account_api_key),
         )
         // Enterprise inbound routing (issue #96). The store and the data plane have
         // shipped since migration 0059; this is the first time an operator can reach it.
