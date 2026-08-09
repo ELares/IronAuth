@@ -46403,6 +46403,17 @@ async fn require_live_permission(
 /// one effective-role resolution already applies on the READ path, which is where it
 /// belongs (an unusable membership resolves to no roles rather than being un-editable
 /// by an administrator).
+///
+/// It deliberately does NOT filter `owner_kind` either, and that is the opposite call from
+/// the one the reads of [`ORG_MEMBERSHIP_SELECT_COLUMNS`] make. Those project a record that
+/// can only hold a user, so they exclude a service-account membership. This asks whether a
+/// membership id names a live membership of an organization, a question that has the same
+/// answer for either principal, and every caller attaches something keyed on the membership:
+/// a group binding, a direct role grant. Filtering here would make roles ungrantable to a
+/// service account, which is the thing issue #99 exists to allow.
+///
+/// Adding the filter for consistency with those reads fails the service-account half of
+/// `tests/permission_parity.rs`, which grants roles through exactly this path.
 async fn require_live_membership_in_org(
     tx: &mut Transaction<'_, Postgres>,
     scope: Scope,
