@@ -106,6 +106,27 @@ pub const OPAQUE_ACCESS_TOKEN_DELIMITER: char = '~';
 /// opaque token cannot be guessed or enumerated.
 const OPAQUE_ACCESS_TOKEN_BYTES: usize = 32;
 
+/// The actor behind an impersonated token (issue #101), shaped for RFC 8693 section 4.1.
+///
+/// The RFC defines `act` as a JSON object carrying at least `sub`, with further members
+/// allowed and a nested `act` for delegation chains. This emits `sub` plus the structured
+/// reason, which is the shape M13's token-exchange endpoint can consume unchanged rather than
+/// a shape it would have to be redesigned around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenActor<'a> {
+    /// The impersonating principal, emitted as `act.sub`.
+    pub subject: &'a str,
+    /// The structured reason, emitted as `act.reason_code`.
+    pub reason_code: &'a str,
+}
+
+impl TokenActor<'_> {
+    /// The `act` claim value.
+    fn to_claim(self) -> serde_json::Value {
+        json!({ "sub": self.subject, "reason_code": self.reason_code })
+    }
+}
+
 /// The reserved access-token claim names a per-client STATIC custom claim may NEVER
 /// set (issue #23). The client-credentials mint DROPS any custom claim whose name is
 /// in this set, so a per-client `custom_token_claims` config can never forge or
@@ -188,6 +209,13 @@ pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     // `pdp_required` marker and convince a resource server that a withheld set was
     // simply an empty one, which is a downgrade the resource server cannot detect.
     "permissions_status",
+    // The RFC 8693 section 4.1 actor claim (issue #101). Issuer-set only, and protected for a
+    // sharper reason than most of this list: `act` is the record of WHO is acting as the
+    // subject. A client that could self-assert it could name any impersonator it liked on a
+    // token it obtained honestly, which FORGES an audit trail rather than merely overstating
+    // an authorization. The reverse matters too: a client that could set `act` on an ordinary
+    // token could make a normal session look like somebody else impersonating it.
+    "act",
 ];
 
 /// The resolved target for an access token: the audience(s) it is minted for, the
@@ -390,6 +418,17 @@ pub struct MintRequest<'a> {
     /// resolved no org (a member-less user, a multi-org user who named none, or a
     /// machine token, which asserts no human org context); no claim is then emitted.
     pub org_id: Option<&'a str>,
+    /// The impersonation this session was established under (issue #101), emitted as the RFC
+    /// 8693 section 4.1 `act` claim. [`None`] on an ordinary session, and an ordinary session
+    /// must never carry the claim: `act` present is the assertion that somebody other than the
+    /// subject is driving, and a token saying so falsely is worse than one that omits it.
+    ///
+    /// Only the impersonator and the STRUCTURED reason are carried. The written justification
+    /// stays in the audit stream, which is where the criterion asks for it and where a reader
+    /// is authorized: a token is read by the client, by every resource server it reaches, and
+    /// by whatever logs them, and an operator's sentence about an incident does not belong in
+    /// all of those places.
+    pub actor: Option<TokenActor<'a>>,
     /// The subject's effective organization roles at THIS issuance (issue #97),
     /// emitted as the `roles` claim on the ACCESS TOKEN ONLY.
     ///
@@ -550,6 +589,14 @@ pub(crate) fn build_id_token_claims(
     // nonce: echoed EXACTLY when the request carried one, absent otherwise.
     if let Some(nonce) = request.nonce {
         claims["nonce"] = json!(nonce);
+    }
+
+    // act (RFC 8693 section 4.1, issue #101): present ONLY on a token minted for an
+    // impersonation session, absent on every ordinary one. The criterion states both halves,
+    // and the absent half is the one a test gets wrong by only ever checking a token it
+    // expected to carry the claim.
+    if let Some(actor) = request.actor {
+        claims["act"] = actor.to_claim();
     }
 
     // acr and amr: DERIVED from the recorded authentication event, never from a
@@ -1346,6 +1393,7 @@ mod tests {
         let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 1);
         let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
         MintRequest {
+            actor: None,
             scope,
             issuer: "https://issuer.test/t/x/e/y",
             subject,
@@ -1735,6 +1783,79 @@ mod tests {
     /// the test wrote it down.
     fn permission_set(slugs: &[&str]) -> BTreeSet<String> {
         slugs.iter().map(|slug| (*slug).to_owned()).collect()
+    }
+
+    /// The `act` claim is emitted for an impersonated token and for no other (issue #101).
+    ///
+    /// Both halves, because the criterion states both and the ABSENT half is the one a test
+    /// gets wrong: checking only a token that was supposed to carry the claim passes just as
+    /// well against an implementation that stamps `act` on everything, which would mark every
+    /// ordinary session as somebody impersonating its own user.
+    #[test]
+    fn the_act_claim_marks_an_impersonated_token_and_only_that() {
+        let ordinary = request("usr_abc", "pwd");
+        let claims = build_id_token_claims(&ordinary, 100, 200, "jti_a").expect("mint");
+        assert!(
+            claims.get("act").is_none(),
+            "an ordinary token carried an actor claim: {claims}"
+        );
+
+        let mut impersonated = request("usr_abc", "pwd");
+        impersonated.actor = Some(TokenActor {
+            subject: "adm_support_engineer",
+            reason_code: "support_ticket",
+        });
+        let claims = build_id_token_claims(&impersonated, 100, 200, "jti_b").expect("mint");
+        assert_eq!(
+            claims["act"],
+            json!({ "sub": "adm_support_engineer", "reason_code": "support_ticket" }),
+            "the actor claim must carry the impersonator and the structured reason"
+        );
+        assert_eq!(
+            claims["sub"], "usr_abc",
+            "the SUBJECT stays the impersonated user; `act` says who is driving, and swapping \
+             the two would make the token authorize the operator instead"
+        );
+    }
+
+    /// The written justification never reaches a token.
+    ///
+    /// `TokenActor` has no field for it, so this is a statement about the TYPE rather than
+    /// about a handler remembering to strip it. A token is read by the client, by every
+    /// resource server it is presented to, and by whatever logs them; the operator sentence
+    /// about an incident belongs in the audit stream, which is where the criterion puts it.
+    #[test]
+    fn the_written_justification_never_reaches_a_token() {
+        let mut impersonated = request("usr_abc", "pwd");
+        impersonated.actor = Some(TokenActor {
+            subject: "adm_support_engineer",
+            reason_code: "support_ticket",
+        });
+        let claims = build_id_token_claims(&impersonated, 100, 200, "jti_c").expect("mint");
+        let rendered = claims.to_string();
+        assert!(
+            !rendered.contains("Ticket"),
+            "no free text is carried, so nothing resembling one can appear: {rendered}"
+        );
+        let act = claims["act"].as_object().expect("act is an object");
+        assert_eq!(
+            act.len(),
+            2,
+            "the actor claim carries exactly `sub` and `reason_code`: {act:?}"
+        );
+    }
+
+    /// A client cannot self-assert `act`.
+    ///
+    /// The protected-claim list is the control, and this is what says `act` is on it. Without
+    /// it a client could name any impersonator it liked on a token it obtained honestly, which
+    /// forges an audit trail rather than merely overstating an authorization.
+    #[test]
+    fn a_client_cannot_self_assert_the_actor_claim() {
+        assert!(
+            PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&"act"),
+            "`act` must be issuer-set only"
+        );
     }
 
     #[test]
@@ -2221,6 +2342,10 @@ mod tests {
             "at_hash": "evil-at-hash",
             "c_hash": "evil-c-hash",
             "sid": "evil-session",
+            // The RFC 8693 actor claim (issue #101): a forged impersonator on a token the
+            // attacker obtained honestly, which is an audit forgery rather than a privilege
+            // claim, and the reason `act` is reserved.
+            "act": { "sub": "adm_victim", "reason_code": "forged" },
             // Organization context (issue #94): a machine token asserts no human org.
             "org_id": "org_evil",
             // Organization roles (issue #97): a machine token asserts no human
@@ -2280,6 +2405,7 @@ mod tests {
             "roles",
             "permissions",
             "permissions_status",
+            "act",
         ] {
             assert!(
                 claims.get(reserved_absent).is_none(),

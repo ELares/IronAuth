@@ -604,6 +604,7 @@ async fn mint_device_tokens(
         signer,
         entry.policy(),
         &MintRequest {
+            actor: None,
             scope,
             issuer: &issuer,
             subject: &subject,
