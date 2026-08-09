@@ -1849,6 +1849,22 @@ async fn refresh_token_grant(
         return Err(TokenError::InvalidGrant);
     }
 
+    // 4a-bis. Enforce the IMPERSONATION cap (issue #101) before minting anything.
+    //
+    // An impersonation LAPSE fires no session event, so the cascade that revokes a family when
+    // its session ends never runs for one. Without this an operator who impersonated a user
+    // for a justified ten minutes could keep refreshing indefinitely.
+    //
+    // Read off the FAMILY, not the session: a refresh holds a grant and may have no live
+    // session, offline families are designed to outlive theirs, and an RFC 8693 exchange will
+    // be in the same position. The bound was copied from the session when the family was
+    // minted, so it cannot be pushed out afterwards.
+    if let Some(impersonation) = resolution.impersonation.as_ref() {
+        if epoch_micros(state.now()) >= impersonation.expires_at_unix_micros {
+            return Err(TokenError::InvalidGrant);
+        }
+    }
+
     // 4b. Re-check the token subject's USER LIFECYCLE state (issue #52) before minting
     //     anything: a user blocked, disabled, or deleted AFTER a SURVIVING
     //     offline_access family was opened (issue #21) must not keep minting. Fail
@@ -2116,18 +2132,17 @@ async fn mint_refresh_access(
         signer,
         entry.policy(),
         &MintRequest {
-            // NOT wired, and deliberately so (issue #101). The refresh resolution carries
-            // no session reference, so setting `act` here would mean a fresh session read on
-            // the hot refresh path. The issue asks for the actor to be PERSISTED in a form
-            // M13's token exchange can consume, and the grant is where that belongs; doing it
-            // there fixes this path without the extra query and serves that bullet at once.
-            //
-            // The consequence while this is None is real and worth naming: an access token
-            // refreshed out of an impersonated session carries no `act`. The pin
-            // `a_refreshed_token_does_not_yet_carry_the_actor_claim` asserts exactly that, so
-            // the slice that persists the actor has to flip it rather than quietly finding it
-            // already true.
-            actor: None,
+            // The `act` claim rides the FAMILY (issue #101), copied from the session when
+            // the family was minted. The bound checked earlier means a family past its cap
+            // never reaches here, so a token carrying this claim is one the impersonation
+            // still authorizes.
+            actor: resolution
+                .impersonation
+                .as_ref()
+                .map(|imp| tokens::TokenActor {
+                    subject: &imp.impersonator,
+                    reason_code: &imp.reason_code,
+                }),
             scope,
             issuer: &issuer,
             subject: &subject,

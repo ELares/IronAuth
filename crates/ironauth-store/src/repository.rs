@@ -13055,6 +13055,21 @@ fn is_well_formed_https_uri(uri: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
 }
 
+/// The impersonation a refresh family was minted under (issue #101).
+///
+/// Deliberately narrower than [`SessionImpersonation`]: no written justification. That text
+/// lives on the session and in the audit stream, and the only fields that need to travel with
+/// a family are the two that become the `act` claim plus the bound that stops it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FamilyImpersonation {
+    /// The impersonating principal, which becomes `act.sub`.
+    pub impersonator: String,
+    /// The structured reason, which becomes `act.reason_code`.
+    pub reason_code: String,
+    /// When the impersonation must stop, in microseconds since the Unix epoch.
+    pub expires_at_unix_micros: i64,
+}
+
 /// The live state of a presented refresh token, resolved from its digest (issue
 /// #21). The token endpoint reads this to decide the rotation policy and to mint
 /// the refreshed access token; the authoritative single-use and reuse decision is
@@ -13099,6 +13114,14 @@ pub struct RefreshTokenResolution {
     pub family_absolute_expires_at_unix_micros: i64,
     /// Whether this token has already been rotated away from (superseded).
     pub rotated: bool,
+    /// The impersonation this family was minted under (issue #101), absent on an ordinary one.
+    ///
+    /// Copied from the session when the family was created, not read back from it: a refresh
+    /// holds a grant and not necessarily a live session, and an RFC 8693 exchange will be in
+    /// the same position. The caller must refuse a refresh past
+    /// [`FamilyImpersonation::expires_at_unix_micros`]; an impersonation LAPSE fires no session
+    /// event, so nothing else stops one.
+    pub impersonation: Option<FamilyImpersonation>,
     /// Whether the family and its grant are both live (not revoked). A revoked
     /// family or grant makes every token in it inactive.
     pub active: bool,
@@ -13304,6 +13327,9 @@ impl RefreshRepo<'_> {
              f.auth_time AS auth_time, f.offline AS offline, f.dpop_jkt AS dpop_jkt, \
              g.granted_resources AS granted_resources, g.org_id AS org_id, \
              (EXTRACT(EPOCH FROM f.absolute_expires_at) * 1000000)::bigint AS abs_us, \
+             f.impersonator AS impersonator, \
+             f.impersonation_reason_code AS impersonation_reason_code, \
+             (EXTRACT(EPOCH FROM f.impersonation_expires_at) * 1000000)::bigint AS imp_us, \
              (f.revoked_at IS NULL) AS family_live, (g.revoked_at IS NULL) AS grant_live \
              FROM refresh_tokens rt \
              JOIN refresh_families f ON f.id = rt.family_id \
@@ -13475,11 +13501,16 @@ impl ActingRefreshRepo<'_> {
             "INSERT INTO refresh_families \
              (id, tenant_id, environment_id, grant_id, subject, client_id, scope, \
               auth_methods, auth_time, session_ref, offline, created_at, absolute_expires_at, \
-              dpop_jkt) \
+              dpop_jkt, \
+              impersonator, impersonation_reason_code, impersonation_expires_at) \
              SELECT $1, $2, $3, $4, $5, $6, $7, $8, $13, g.session_ref, $9, \
                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, \
-                    TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, $14 \
+                    TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, $14, \
+                    imp.impersonator, imp.impersonation_reason_code, \
+                    imp.impersonation_expires_at \
              FROM grants g \
+             LEFT JOIN sessions imp ON imp.id = g.session_ref \
+              AND imp.tenant_id = $2 AND imp.environment_id = $3 \
              WHERE g.id = $4 AND g.tenant_id = $2 AND g.environment_id = $3 \
              AND ($9 OR g.session_ref IS NULL OR EXISTS ( \
                  SELECT 1 FROM sessions s \
@@ -14132,6 +14163,14 @@ fn refresh_resolution_from_row(
         idle_expires_at_unix_micros: row.get("idle_us"),
         family_absolute_expires_at_unix_micros: row.get("abs_us"),
         rotated: row.get("rotated"),
+        // All three or none, by 0129's arc CHECK, so the impersonator decides.
+        impersonation: row
+            .get::<Option<String>, _>("impersonator")
+            .map(|impersonator| FamilyImpersonation {
+                impersonator,
+                reason_code: row.get("impersonation_reason_code"),
+                expires_at_unix_micros: row.get("imp_us"),
+            }),
         active: row.get::<bool, _>("family_live") && row.get::<bool, _>("grant_live"),
         dpop_jkt: row.get("dpop_jkt"),
         org_id: row.get::<Option<String>, _>("org_id"),

@@ -1458,33 +1458,21 @@ async fn a_code_exchange_from_an_impersonation_session_mints_the_actor_claim() {
     );
 }
 
-/// A REFRESHED access token does not yet carry `act` (issue #101), pinned deliberately.
+/// A REFRESHED access token carries `act` too (issue #101), and a refresh past the cap fails.
 ///
-/// The refresh resolution carries no session reference, so wiring it would mean a fresh
-/// session read on the hot refresh path. The issue asks instead for the actor to be PERSISTED
-/// in a form M13's token exchange can consume, and the grant is where that belongs.
+/// This replaces a pin that asserted the opposite. The claim now rides the FAMILY, copied from
+/// the session when the family was minted, so the refresh path needs no session read.
 ///
-/// This pin exists so that slice has to FLIP an assertion rather than quietly discover it was
-/// already true. The gap it records is real: an access token refreshed out of an impersonated
-/// session presently carries no actor.
+/// The second half is the one that was a live hole rather than a missing feature. An
+/// impersonation LAPSE fires no session event, so the cascade that revokes a family when its
+/// session ends never runs for one: before this, an operator who impersonated a user for a
+/// justified ten minutes could keep refreshing indefinitely.
 #[tokio::test]
-async fn a_refreshed_token_does_not_yet_carry_the_actor_claim() {
+async fn a_refreshed_token_carries_the_actor_and_stops_at_the_cap() {
     let harness = Harness::start().await;
     let client_id = harness.client_id().to_string();
     let (subject, cookie) = consenting_subject(&harness, &client_id).await;
-    sqlx::query(
-        "UPDATE sessions SET impersonator = $1, impersonation_reason_code = $2, \
-                impersonation_reason_text = $3, impersonation_started_at = now(), \
-                impersonation_expires_at = now() + INTERVAL '30 minutes' \
-         WHERE subject = $4 AND revoked_at IS NULL AND ended_at IS NULL",
-    )
-    .bind("adm_support_engineer")
-    .bind("support_ticket")
-    .bind("Ticket 4417")
-    .bind(&subject)
-    .execute(harness.db().owner_pool())
-    .await
-    .expect("plant the impersonation");
+    plant_impersonation(&harness, &subject, "30 minutes").await;
 
     let code = authorize_to_code(&harness, &client_id, &[], &cookie).await;
     let (_, at_claims, refresh_token) = exchange(&harness, &client_id, &code).await;
@@ -1493,9 +1481,74 @@ async fn a_refreshed_token_does_not_yet_carry_the_actor_claim() {
         "the code exchange carries the actor, so the refresh below is the only variable"
     );
     let (refreshed, _) = refresh(&harness, &client_id, &refresh_token).await;
+    assert_eq!(
+        refreshed["act"],
+        serde_json::json!({ "sub": "adm_support_engineer", "reason_code": "support_ticket" }),
+        "a refreshed access token names the same impersonator: {refreshed}"
+    );
+
+    // Now a family whose impersonation has ALREADY lapsed. Its session is untouched and its
+    // own absolute expiry is far away, so nothing but the cap can refuse the refresh.
+    let (other_subject, other_cookie) = consenting_subject(&harness, &client_id).await;
+    plant_impersonation(&harness, &other_subject, "30 minutes").await;
+    let code = authorize_to_code(&harness, &client_id, &[], &other_cookie).await;
+    let (_, _, lapsing) = exchange(&harness, &client_id, &code).await;
+    // Push the FAMILY's bound behind the HARNESS clock, which is deterministic at the epoch
+    // rather than at wall time; `now()` here would be decades ahead of it and lapse nothing.
+    // The session is deliberately left alone: this is the state a real lapse reaches, where no
+    // session event ever fired.
+    let lapsed = sqlx::query(
+        "UPDATE refresh_families \
+         SET impersonation_expires_at = TIMESTAMPTZ 'epoch' - INTERVAL '1 minute' \
+         WHERE impersonator IS NOT NULL",
+    )
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("lapse the family bound");
+    assert_eq!(
+        lapsed.rows_affected(),
+        2,
+        "both impersonated families exist and were lapsed"
+    );
+    let (status, _, body) = harness
+        .token(&form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &lapsing),
+            ("client_id", &client_id),
+        ]))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a refresh past the impersonation cap must fail: {body}"
+    );
     assert!(
-        refreshed.get("act").is_none(),
-        "PIN, not an endorsement: the refresh path has no session reference yet, so it mints \
-         no actor. The slice that persists the actor onto the grant must flip this: {refreshed}"
+        body.contains("invalid_grant"),
+        "and it fails as invalid_grant rather than something a client would retry: {body}"
+    );
+}
+
+/// Make the live session of `subject` an impersonation lasting `window`.
+///
+/// Planted directly because no start ENDPOINT exists yet; it goes away when one lands. The
+/// five columns move together or not at all, which migration 0128 enforces.
+async fn plant_impersonation(harness: &Harness, subject: &str, window: &str) {
+    let updated = sqlx::query(&format!(
+        "UPDATE sessions SET impersonator = $1, impersonation_reason_code = $2, \
+                impersonation_reason_text = $3, impersonation_started_at = now(), \
+                impersonation_expires_at = now() + INTERVAL '{window}' \
+         WHERE subject = $4 AND revoked_at IS NULL AND ended_at IS NULL"
+    ))
+    .bind("adm_support_engineer")
+    .bind("support_ticket")
+    .bind("Ticket 4417: reproducing the checkout failure as the user.")
+    .bind(subject)
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("plant the impersonation on the live session");
+    assert_eq!(
+        updated.rows_affected(),
+        1,
+        "exactly one live session belongs to this subject, so the plant is unambiguous"
     );
 }
