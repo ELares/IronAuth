@@ -1064,6 +1064,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0128_impersonation_sessions.sql"),
         },
+        Migration {
+            version: 129,
+            name: "impersonated_refresh_families",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0129_impersonated_refresh_families.sql"),
+        },
     ]
 }
 
