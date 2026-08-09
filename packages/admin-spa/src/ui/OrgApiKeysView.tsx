@@ -5,14 +5,16 @@
 // A PANEL of the organization detail view, because a key belongs to an organization
 // and the list is meaningless without one selected.
 //
-// READ ONLY, and that is a deliberate first slice rather than an unfinished one. The
-// create control has a requirement no other panel here has: the key is returned
-// exactly once, so the panel would have to hold it as display-once state that a
-// reload destroys. Shipping the listing first gives an operator the thing they most
-// need during an incident, which is to see what exists and what was already revoked.
+// It creates, rotates and revokes as well as listing. The comment here once said READ
+// ONLY, describing a first slice that the controls below had already outgrown, which is
+// how a doc comment becomes the least reliable thing in a file.
+//
+// The create and rotate controls have a requirement no other panel here has: the key is
+// returned exactly once, so the panel holds it as display-once state. See the note on
+// `issued` for the exact rule, which is narrower than "a reload clears it".
 //
 // It carries NO key material by construction: the listing endpoint has no digest to
-// return, and `OrgApiKeyView` has no field for one. A management surface that showed
+// return, and `ApiKeyView` has no field for one. A management surface that showed
 // verifiers would hand a credential-equivalent to everyone allowed to LOOK, which is
 // a strictly larger set than those allowed to USE.
 //
@@ -22,7 +24,7 @@
 
 import { useState } from "preact/hooks";
 import {
-  type OrgApiKeyView,
+  type ApiKeyView,
   createOrgApiKey,
   fetchOrgApiKeys,
   revokeOrgApiKey,
@@ -37,7 +39,7 @@ export function OrgApiKeysPanel({
   environmentId,
   organizationId,
 }: OrgScope) {
-  const { state, reload } = useAsyncResource<OrgApiKeyView[]>(
+  const { state, reload } = useAsyncResource<ApiKeyView[]>(
     () => fetchOrgApiKeys(tenantId, environmentId, organizationId),
     [tenantId, environmentId, organizationId],
   );
@@ -229,7 +231,7 @@ export function OrgApiKeysPanel({
 // Revoked wins over expired: a key that was revoked and then passed its expiry is
 // revoked, and reporting the expiry would suggest it lapsed on its own rather than
 // that somebody killed it.
-export function describe(key: OrgApiKeyView): string {
+export function describe(key: ApiKeyView): string {
   if (key.revoked_at_unix_ms !== undefined && key.revoked_at_unix_ms !== null) {
     return `Revoked ${formatWhen(key.revoked_at_unix_ms)}`;
   }
