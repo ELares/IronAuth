@@ -21421,6 +21421,23 @@ pub struct SessionFleetFilter<'a> {
     pub client_id: Option<&'a str>,
 }
 
+/// The columns every fleet read projects.
+///
+/// Shared by the by-id read and the listing, which carried byte-identical lists until the
+/// impersonation columns had to be added to both. Two copies of a projection feeding ONE
+/// decoder is a drift waiting to happen: add a column to one and the other decodes a row that
+/// does not have it.
+const SESSION_FLEET_COLUMNS: &str = "id, subject, auth_methods, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM last_seen_at) * 1000000)::bigint AS last_seen_us, \
+     (EXTRACT(EPOCH FROM idle_expires_at) * 1000000)::bigint AS idle_us, \
+     (EXTRACT(EPOCH FROM absolute_expires_at) * 1000000)::bigint AS abs_us, \
+     (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us, \
+     (EXTRACT(EPOCH FROM ended_at) * 1000000)::bigint AS ended_us, \
+     (EXTRACT(EPOCH FROM impersonation_expires_at) * 1000000)::bigint AS imp_us, \
+     end_cause, superseded_by, user_agent, peer_ip, \
+     impersonator, impersonation_reason_code, impersonation_reason_text";
+
 /// A session as the management fleet-ops surface reports it (issue #32): the
 /// searchable metadata and the full lifecycle state, so an operator can inspect a
 /// live, revoked, rotated, or ended session. Every timestamp is microseconds since
@@ -21455,6 +21472,14 @@ pub struct SessionSummary {
     /// The recorded peer IP: present only when the OFF-BY-DEFAULT peer-IP binding
     /// knob was enabled when the session was established.
     pub peer_ip: Option<String>,
+    /// The impersonation this session was started under (issue #101), absent on an ordinary
+    /// session. Its presence is the FLAG the fleet surface renders.
+    ///
+    /// Unlike [`SessionRecord::impersonation`], this reports the impersonation whether or not
+    /// it has lapsed, because the fleet surface reports revoked and ended sessions too. An
+    /// operator reviewing what happened needs to see that a session WAS an impersonation; the
+    /// auth read path is the one that must refuse a lapsed one.
+    pub impersonation: Option<SessionImpersonation>,
 }
 
 /// The read-only session fleet-ops repository (issue #32): list and inspect sessions
@@ -21490,18 +21515,11 @@ impl SessionFleetRepo<'_> {
             return Ok(None);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        let row = sqlx::query(
-            "SELECT id, subject, auth_methods, \
-             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
-             (EXTRACT(EPOCH FROM last_seen_at) * 1000000)::bigint AS last_seen_us, \
-             (EXTRACT(EPOCH FROM idle_expires_at) * 1000000)::bigint AS idle_us, \
-             (EXTRACT(EPOCH FROM absolute_expires_at) * 1000000)::bigint AS abs_us, \
-             (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us, \
-             (EXTRACT(EPOCH FROM ended_at) * 1000000)::bigint AS ended_us, \
-             end_cause, superseded_by, user_agent, peer_ip \
+        let row = sqlx::query(&format!(
+            "SELECT {SESSION_FLEET_COLUMNS} \
              FROM sessions \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
-        )
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3"
+        ))
         .bind(id.to_string())
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -21526,15 +21544,8 @@ impl SessionFleetRepo<'_> {
     ) -> Result<Vec<SessionSummary>, StoreError> {
         let (after_micros, after_id) = split_cursor(after);
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        let rows = sqlx::query(
-            "SELECT id, subject, auth_methods, \
-             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
-             (EXTRACT(EPOCH FROM last_seen_at) * 1000000)::bigint AS last_seen_us, \
-             (EXTRACT(EPOCH FROM idle_expires_at) * 1000000)::bigint AS idle_us, \
-             (EXTRACT(EPOCH FROM absolute_expires_at) * 1000000)::bigint AS abs_us, \
-             (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us, \
-             (EXTRACT(EPOCH FROM ended_at) * 1000000)::bigint AS ended_us, \
-             end_cause, superseded_by, user_agent, peer_ip \
+        let rows = sqlx::query(&format!(
+            "SELECT {SESSION_FLEET_COLUMNS} \
              FROM sessions \
              WHERE tenant_id = $1 AND environment_id = $2 \
              AND ($5::text IS NULL OR subject = $5) \
@@ -21546,8 +21557,8 @@ impl SessionFleetRepo<'_> {
                   AND cs.client_id = $6)) \
              AND ($3::bigint IS NULL OR (created_at, id) > \
                   (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
-             ORDER BY created_at, id LIMIT $7",
-        )
+             ORDER BY created_at, id LIMIT $7"
+        ))
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(after_micros)
@@ -21578,6 +21589,15 @@ fn session_summary_from_row(row: &PgRow) -> SessionSummary {
         superseded_by: row.get("superseded_by"),
         user_agent: row.get("user_agent"),
         peer_ip: row.get("peer_ip"),
+        // All five columns or none, by 0128's arc CHECK, so the impersonator decides.
+        impersonation: row
+            .get::<Option<String>, _>("impersonator")
+            .map(|impersonator| SessionImpersonation {
+                impersonator,
+                reason_code: row.get("impersonation_reason_code"),
+                reason_text: row.get("impersonation_reason_text"),
+                expires_at_unix_micros: row.get("imp_us"),
+            }),
     }
 }
 
