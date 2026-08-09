@@ -19,8 +19,9 @@
 //! test; it is the shape of `EFFECTIVE_CLOSURE_CTE`, whose closure arm keys off a membership
 //! and has never known what the membership binds.
 //!
-//! A service-account membership is inserted through the engine because nothing writes one yet.
-//! When that write path lands, [`Principal::bind`] is the single place this file changes.
+//! Both arms of [`Principal::bind`] now go through the repository. Nothing in this file
+//! reaches the engine, so a scenario passing for a service account is a statement about the
+//! product and not about what a test could plant.
 
 use std::collections::BTreeSet;
 
@@ -28,9 +29,10 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, NewMembership, NewOrgGroup, NewOrgGroupMember, NewOrgGroupRole,
-    NewOrgMembershipRole, NewOrgRole, NewOrgRolePermission, NewPermission, OrgGroupId,
-    OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
-    OrgRolePermissionId, OrganizationId, PermissionId, Scope, ServiceAccountId, UserId,
+    NewOrgMembershipRole, NewOrgRole, NewOrgRolePermission, NewPermission,
+    NewServiceAccountMembership, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId,
+    OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId, PermissionId, Scope,
+    ServiceAccountId, UserId,
 };
 
 const AT: i64 = 1_000;
@@ -106,9 +108,8 @@ impl Principal {
 
     /// Bind the principal into `org` and return the membership id every later step keys off.
     ///
-    /// The user arm goes through the repository. The service-account arm inserts through the
-    /// engine, because no write path exists for one yet; when it lands this arm is the single
-    /// place that changes, and nothing below it moves.
+    /// Both arms go through the repository, and through the same revive-or-insert primitive
+    /// underneath it, which is why every step after this one is shared.
     async fn bind(
         &self,
         db: &TestDatabase,
@@ -138,20 +139,22 @@ impl Principal {
                     .expect("create the user membership");
             }
             Self::ServiceAccount(principal) => {
-                sqlx::query(
-                    "INSERT INTO org_memberships \
-                     (id, tenant_id, environment_id, organization_id, service_account_id, \
-                      owner_kind) \
-                     VALUES ($1, $2, $3, $4, $5, 'service_account')",
-                )
-                .bind(id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(org.to_string())
-                .bind(principal.to_string())
-                .execute(db.owner_pool())
-                .await
-                .expect("insert the service-account membership");
+                db.control_store()
+                    .scoped(scope)
+                    .acting(db.test_actor(env), CorrelationId::generate(env))
+                    .org_memberships()
+                    .create_for_service_account(
+                        env,
+                        NewServiceAccountMembership {
+                            id: &id,
+                            organization_id: org,
+                            service_account_id: principal,
+                            metadata: None,
+                        },
+                        AT,
+                    )
+                    .await
+                    .expect("create the service-account membership");
             }
         }
         id

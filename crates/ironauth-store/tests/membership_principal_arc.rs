@@ -708,3 +708,234 @@ async fn insert_service_account_membership(
     .execute(db.owner_pool())
     .await
 }
+
+/// The service-account membership surface round-trips, and refuses the other kind's id.
+///
+/// `get` and `get_service_account` are mirror images: each renders one principal and each must
+/// refuse the other's row rather than render it with a missing field. Only one direction was
+/// asserted before this; a fence tested in one direction is the shape of the bug it is meant to
+/// stop.
+#[tokio::test]
+async fn the_service_account_membership_surface_round_trips_and_refuses_a_user_row() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "human@example.test").await;
+    let org = ironauth_store::OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org, now_micros(&env), "acme", None)
+        .await
+        .expect("create org");
+    let human = ironauth_store::OrgMembershipId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_memberships()
+        .create(
+            &env,
+            ironauth_store::NewMembership {
+                id: &human,
+                organization_id: &org,
+                user_id: &user,
+                metadata: None,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("create the user membership");
+    let principal = mint_principal(&db, &env, scope, "a machine client").await;
+    let created = create_machine_membership(&db, &env, scope, &org, &principal).await;
+
+    let fetched = db
+        .control_store()
+        .management()
+        .org_memberships(scope)
+        .get_service_account(&created.id)
+        .await
+        .expect("read it back");
+    assert_eq!(fetched, created, "the read agrees with the write");
+    assert_eq!(fetched.service_account_id, principal);
+    assert_eq!(fetched.state, "active");
+
+    let machines = db
+        .control_store()
+        .management()
+        .org_memberships(scope)
+        .list_service_accounts_for_org(&org, 50, None)
+        .await
+        .expect("list the machines");
+    let ids: Vec<String> = machines.iter().map(|row| row.id.to_string()).collect();
+    assert_eq!(
+        ids,
+        vec![created.id.to_string()],
+        "the machine list holds the machine and not the human beside it"
+    );
+
+    let wrong_kind = db
+        .control_store()
+        .management()
+        .org_memberships(scope)
+        .get_service_account(&human)
+        .await;
+    assert!(
+        matches!(wrong_kind, Err(ironauth_store::StoreError::NotFound)),
+        "a USER membership id must not resolve on the service-account surface, got {wrong_kind:?}"
+    );
+}
+
+/// A second live membership is a typed conflict, and a removed one REVIVES stripped.
+///
+/// The revive is the half worth writing down. A revived membership keeps its original id, so
+/// without the attachment cascade an administrator could remove a compromised machine and hand
+/// its roles straight back by adding it again. The user path makes that decision and this
+/// asserts the service-account path makes the same one, through the same primitive.
+#[tokio::test]
+async fn re_adding_a_removed_service_account_revives_it_without_its_old_authority() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = ironauth_store::OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org, now_micros(&env), "acme", None)
+        .await
+        .expect("create org");
+    let role = grant_reader_role(&db, &env, scope, &org).await;
+    let principal = mint_principal(&db, &env, scope, "a machine client").await;
+    let first = create_machine_membership(&db, &env, scope, &org, &principal).await;
+
+    let duplicate = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_memberships()
+        .create_for_service_account(
+            &env,
+            ironauth_store::NewServiceAccountMembership {
+                id: &ironauth_store::OrgMembershipId::generate(&env, &scope),
+                organization_id: &org,
+                service_account_id: &principal,
+                metadata: None,
+            },
+            now_micros(&env),
+        )
+        .await;
+    assert!(
+        matches!(duplicate, Err(ironauth_store::StoreError::Conflict)),
+        "a second LIVE membership is the typed conflict, not a duplicate row: {duplicate:?}"
+    );
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_membership_roles(scope)
+        .assign(
+            &env,
+            ironauth_store::NewOrgMembershipRole {
+                id: &ironauth_store::OrgMembershipRoleId::generate(&env, &scope),
+                organization_id: &org,
+                membership_id: &first.id,
+                role_id: &role,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("grant the role");
+    assert!(
+        !permissions_of(&db, scope, &org, &principal)
+            .await
+            .is_empty(),
+        "held before the removal, so the assertion after the revive is a difference"
+    );
+
+    // Soft-deleted through the ENGINE, deliberately. The repository's `remove` revokes
+    // attachments on its own way out, so re-adding after it would find nothing to strip and
+    // this test would pass whether or not the create path cascades at all. A row soft-deleted
+    // by some other path is the case the create-path cascade exists for, and it is the only
+    // way to put the question to it.
+    sqlx::query("UPDATE org_memberships SET deleted_at = now() WHERE id = $1")
+        .bind(first.id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("soft delete the membership without cascading");
+    let revived = create_machine_membership(&db, &env, scope, &org, &principal).await;
+    assert_eq!(
+        revived.id, first.id,
+        "the removed row is REVIVED, keeping its id, rather than a second row being inserted"
+    );
+    assert!(
+        permissions_of(&db, scope, &org, &principal)
+            .await
+            .is_empty(),
+        "the revive strips the roles the old row held; re-adding is not a way to restore them"
+    );
+}
+
+async fn mint_principal(
+    db: &TestDatabase,
+    env: &ironauth_env::Env,
+    scope: Scope,
+    label: &str,
+) -> ironauth_store::ServiceAccountId {
+    let client = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .clients()
+        .create(env, label)
+        .await
+        .expect("create client");
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .service_accounts()
+        .ensure(env, &client)
+        .await
+        .expect("mint the principal")
+}
+
+async fn create_machine_membership(
+    db: &TestDatabase,
+    env: &ironauth_env::Env,
+    scope: Scope,
+    org: &ironauth_store::OrganizationId,
+    principal: &ironauth_store::ServiceAccountId,
+) -> ironauth_store::ServiceAccountMembershipRecord {
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_memberships()
+        .create_for_service_account(
+            env,
+            ironauth_store::NewServiceAccountMembership {
+                id: &ironauth_store::OrgMembershipId::generate(env, &scope),
+                organization_id: org,
+                service_account_id: principal,
+                metadata: None,
+            },
+            now_micros(env),
+        )
+        .await
+        .expect("create the service-account membership")
+}
+
+async fn permissions_of(
+    db: &TestDatabase,
+    scope: Scope,
+    org: &ironauth_store::OrganizationId,
+    principal: &ironauth_store::ServiceAccountId,
+) -> std::collections::BTreeSet<String> {
+    db.control_store()
+        .management()
+        .org_groups(scope)
+        .effective_permissions_for_service_account(org, principal, 8)
+        .await
+        .expect("resolve")
+}
