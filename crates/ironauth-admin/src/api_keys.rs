@@ -6,8 +6,8 @@
 //!
 //! No digest and no plaintext, and that is a property of the types rather than a rule the
 //! handler follows. `ApiKeyRecord` has no digest field, so there is nothing here to leak even
-//! by accident, and the plaintext exists only in a creation response that this module does not
-//! yet serve.
+//! by accident, and the plaintext appears in exactly one place, the 201 of a create or a
+//! rotate, which is a different response type from the one a listing renders.
 //!
 //! A management surface that returned verifiers would hand a credential-equivalent to every
 //! caller allowed to LOOK, which is a strictly larger set than those allowed to USE.
@@ -117,9 +117,9 @@ pub async fn list_organization_api_keys(
     Ok(json(StatusCode::OK, body_string))
 }
 
-/// Render one record. Shared so a second listing endpoint cannot drift into exposing a
-/// different set of fields for the same object.
-fn view_of(record: ironauth_store::ApiKeyRecord) -> ApiKeyView {
+/// Render one record. Shared with the service-account key surface so a second listing endpoint
+/// cannot drift into exposing a different set of fields for the same object.
+pub(crate) fn view_of(record: ironauth_store::ApiKeyRecord) -> ApiKeyView {
     ApiKeyView {
         id: record.id.to_string(),
         display_name: record.display_name,

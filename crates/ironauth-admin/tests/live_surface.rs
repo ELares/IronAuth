@@ -311,6 +311,10 @@ struct Fixture {
     /// an id that never resolved (issue #102).
     project_grant: String,
     api_key: String,
+    /// A real `sva_` principal, so the service-account key cases address a live owner rather
+    /// than an id that never resolved (issue #99).
+    service_account: String,
+    sa_api_key: String,
     connector: String,
     webhook_endpoint: String,
     family: String,
@@ -706,6 +710,32 @@ impl Fixture {
 
         let actor = h.test_actor(&env);
 
+        // A service account, and one key on it. The principal is minted through the store
+        // because it has no create route of its own: it is minted for a CLIENT, the way the
+        // client-credentials grant does it at first issuance.
+        let service_account = h
+            .store()
+            .scoped(scope)
+            .acting(actor, CorrelationId::generate(&env))
+            .service_accounts()
+            .ensure(
+                &env,
+                &ironauth_store::ClientId::parse_in_scope(&client, &scope).expect("client id"),
+            )
+            .await
+            .expect("mint the service-account principal")
+            .to_string();
+        let sa_base = format!("{base}/service-accounts/{service_account}/api-keys");
+        let (status, _, body) = h
+            .post(
+                &sa_base,
+                "seed-sa-api-key",
+                &serde_json::json!({ "display_name": "sweep machine key" }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "create sa api key: {body}");
+        let sa_api_key = field(&body, "/id", "seed sa api key");
+
         // A remembered CONSENT from the seeded user to the seeded client, so
         // `listUserConsents` answers with a ROW. The read half of the soft-deleted
         // contract below compares the BODY for this case, and an empty 200 is not an
@@ -1044,6 +1074,8 @@ impl Fixture {
             routing_rule,
             project_grant,
             api_key,
+            service_account,
+            sa_api_key,
             doomed_tenant,
             doomed_environment,
             operator,
@@ -1097,6 +1129,8 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         routing_rule,
         project_grant,
         api_key,
+        service_account,
+        sa_api_key,
         connector,
         webhook_endpoint,
         family,
@@ -1126,6 +1160,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
     } = f;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
     let org_base = format!("{base}/organizations/{organization}");
+    let sa_base = format!("{base}/service-accounts/{service_account}/api-keys");
     let role_ref = serde_json::json!({ "role_id": role });
     let ban = serde_json::json!({
         "subject_kind": "ip", "subject": "203.0.113.7", "auth_path": "password"
@@ -1910,6 +1945,33 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{org_base}/api-keys/{api_key}"),
         ),
+        // The service-account surface, same four shapes. Not nested under an organization:
+        // `service_accounts` has no organization column, so the path addresses the
+        // environment directly.
+        Case::json(
+            "service_account_keys.createServiceAccountApiKey",
+            "POST",
+            sa_base.clone(),
+            &serde_json::json!({ "display_name": "sweep machine key" }),
+        ),
+        Case::empty(
+            "service_account_keys.listServiceAccountApiKeys",
+            "GET",
+            sa_base.clone(),
+        ),
+        Case::empty(
+            "service_account_keys.rotateServiceAccountApiKey",
+            "POST",
+            format!("{sa_base}/{sa_api_key}/rotate"),
+        ),
+        // After rotate, as on the organization surface: the handle is already revoked, which
+        // is a 404 at a live environment, and the pair with the deleted-environment refusal
+        // is what the sweep compares.
+        Case::empty(
+            "service_account_keys.revokeServiceAccountApiKey",
+            "DELETE",
+            format!("{sa_base}/{sa_api_key}"),
+        ),
         Case::empty(
             "project_grants.listProjectGrants",
             "GET",
@@ -2317,6 +2379,8 @@ fn every_documented_operation_is_driven_by_a_case() {
         doomed_environment: "env_1".to_owned(),
         operator: "opr_0".to_owned(),
         client: "cli_0".to_owned(),
+        service_account: "sva_0".to_owned(),
+        sa_api_key: "akey_0".to_owned(),
         org_connection: "ocn_0".to_owned(),
         routing_rule: "rrl_0".to_owned(),
         project_grant: "pgt_0".to_owned(),

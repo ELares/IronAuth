@@ -889,3 +889,231 @@ async fn a_read_only_credential_can_list_api_keys_and_cannot_mint_or_kill_one() 
         "the refused revoke revoked it anyway: {listed}"
     );
 }
+
+/// A read-only credential may LIST a service account's keys and may not mint, rotate or
+/// revoke one, and the refusals NAME `management.write_credentials` (issue #99, criterion 6).
+///
+/// The sibling of `a_read_only_credential_can_list_api_keys_and_cannot_mint_or_kill_one`, and
+/// it exists for the reason that one gives: `management_permissions.rs` is a text scan and can
+/// only see THAT a handler demands a permission, never WHICH. A downgrade of these three to
+/// `Read` would satisfy every pin in that file. This is what refuses it.
+///
+/// The listing is checked in both directions for the same reason. That it succeeds under
+/// `management.read` says the route does not silently demand more; that it is refused to a
+/// credential holding only `management.write_credentials`, naming `management.read`, says it
+/// demands that specific one rather than merely something.
+#[tokio::test]
+async fn a_read_only_credential_cannot_mint_or_kill_a_service_accounts_key() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "sak-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "sak-mint").await;
+
+    // The principal, and one key on it, seeded while the credential is still unrestricted.
+    // A service account is minted for a client and has no create route of its own, so this
+    // reaches the store the way the client-credentials grant does.
+    let env = ironauth_env::Env::system();
+    let scope = ironauth_store::Scope::new(
+        ironauth_store::TenantId::parse(&tenant).expect("tenant id"),
+        ironauth_store::EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let actor = ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env));
+    let client = h
+        .db()
+        .store()
+        .scoped(scope)
+        .acting(actor, ironauth_store::CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "a machine client")
+        .await
+        .expect("create the client");
+    let principal = h
+        .db()
+        .store()
+        .scoped(scope)
+        .acting(actor, ironauth_store::CorrelationId::generate(&env))
+        .service_accounts()
+        .ensure(&env, &client)
+        .await
+        .expect("mint the principal");
+
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/service-accounts/{principal}/api-keys"
+    );
+    let (status, _, body) = h
+        .post(
+            &base,
+            "sak-seed",
+            &serde_json::json!({ "display_name": "seed" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed key: {body}");
+    let seeded = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    assert_read_only_is_refused_every_write(&h, &base, &secret, &seeded).await;
+
+    // And the other direction on the listing: a credential holding only the WRITE authority
+    // is refused the read, naming the permission the classification records for it.
+    let (write_id, write_secret) = mint_key(&h, &tenant, &environment, "sak-write").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &write_id,
+        &["management.write_credentials"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&base, &write_secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write-only credential LISTED the keys: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the listing's refusal does not name management.read: {body}"
+    );
+}
+
+/// The read-only half, split out because the fixture above and these four probes together
+/// exceed the function-length lint, and the probes are the part worth reading.
+async fn assert_read_only_is_refused_every_write(
+    h: &Harness,
+    base: &str,
+    secret: &str,
+    seeded: &str,
+) {
+    let (status, _, body) = h.get_as(base, secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted key was refused the listing it holds: {body}"
+    );
+
+    let (status, _, body) = h
+        .post_as(
+            base,
+            secret,
+            "sak-denied-create",
+            &serde_json::json!({ "display_name": "should not exist" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential MINTED a service-account key: {body}"
+    );
+    assert!(
+        body.contains("management.write_credentials"),
+        "the refusal does not name write_credentials, so the handler may demand a different \
+         permission than the classification records: {body}"
+    );
+
+    let (status, _, body) = h
+        .post_as(
+            &format!("{base}/{seeded}/rotate"),
+            secret,
+            "sak-denied-rotate",
+            "",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential ROTATED a service-account key: {body}"
+    );
+    assert!(body.contains("management.write_credentials"), "{body}");
+
+    let (status, _, body) = h.delete_as(&format!("{base}/{seeded}"), secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential REVOKED a service-account key: {body}"
+    );
+    assert!(body.contains("management.write_credentials"), "{body}");
+}
+
+/// A credential confined to one organization may not touch a service account's keys.
+///
+/// Issue #99. Confinement bounds a credential to ONE organization. A service account belongs
+/// to the environment and may be a member of several organizations or none, so there is no
+/// organization for the confinement to be checked against. The route fails CLOSED rather than
+/// allowing the request because nothing contradicted it, which is the direction that matters:
+/// the key minted here authenticates as a principal whose memberships the confined credential
+/// was never granted.
+#[tokio::test]
+async fn a_confined_credential_cannot_reach_a_service_accounts_keys() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "cfk-tenant").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "cfk-mint").await;
+
+    let (status, _, body) = h
+        .post(
+            &format!("{base}/organizations"),
+            "cfk-org",
+            &serde_json::json!({ "display_name": "Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let env = ironauth_env::Env::system();
+    let scope = ironauth_store::Scope::new(
+        ironauth_store::TenantId::parse(&tenant).expect("tenant id"),
+        ironauth_store::EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let actor = ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env));
+    let client = h
+        .db()
+        .store()
+        .scoped(scope)
+        .acting(actor, ironauth_store::CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "a machine client")
+        .await
+        .expect("create the client");
+    let principal = h
+        .db()
+        .store()
+        .scoped(scope)
+        .acting(actor, ironauth_store::CorrelationId::generate(&env))
+        .service_accounts()
+        .ensure(&env, &client)
+        .await
+        .expect("mint the principal");
+    let keys = format!("{base}/service-accounts/{principal}/api-keys");
+
+    // Unconfined, the credential reaches it. This is what makes the refusal below a statement
+    // about confinement rather than about the route being broken for everyone.
+    let (status, _, body) = h.get_as(&keys, &secret).await;
+    assert_eq!(status, StatusCode::OK, "before confinement: {body}");
+
+    confine(&h, &tenant, &environment, &key_id, &org).await;
+
+    let (status, _, body) = h.get_as(&keys, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a confined credential LISTED a service account's keys: {body}"
+    );
+    let (status, _, body) = h
+        .post_as(
+            &keys,
+            &secret,
+            "cfk-denied",
+            &serde_json::json!({ "display_name": "should not exist" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a confined credential MINTED a service-account key: {body}"
+    );
+}

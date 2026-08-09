@@ -287,6 +287,19 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         "rotateOrganizationApiKey",
         ManagementPermission::WriteCredentials,
     ),
+    (
+        "createServiceAccountApiKey",
+        ManagementPermission::WriteCredentials,
+    ),
+    ("listServiceAccountApiKeys", ManagementPermission::Read),
+    (
+        "revokeServiceAccountApiKey",
+        ManagementPermission::WriteCredentials,
+    ),
+    (
+        "rotateServiceAccountApiKey",
+        ManagementPermission::WriteCredentials,
+    ),
     ("listProjectGrants", ManagementPermission::Read),
     (
         "withdrawProjectGrant",
@@ -501,6 +514,13 @@ const PERMISSION_PROVEN: &[&str] = &[
     "createOrganizationApiKey",
     "revokeOrganizationApiKey",
     "rotateOrganizationApiKey",
+    // Proven in `a_read_only_credential_cannot_mint_or_kill_a_service_accounts_key`. The
+    // listing is here too, and only here: that test checks it in BOTH directions, so a
+    // downgrade of the read to "any permission" is refused as well as an upgrade of it.
+    "createServiceAccountApiKey",
+    "listServiceAccountApiKeys",
+    "revokeServiceAccountApiKey",
+    "rotateServiceAccountApiKey",
 ];
 
 /// Not every unproven operation CAN be proven the same way.
@@ -535,7 +555,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        147,
+        151,
         "the classified set changed size; update the unproven count below with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -549,6 +569,10 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
 /// differs from what was built.
 const ADMIN_SOURCES: &[(&str, &str)] = &[
     ("api_keys.rs", include_str!("../src/api_keys.rs")),
+    (
+        "service_account_keys.rs",
+        include_str!("../src/service_account_keys.rs"),
+    ),
     ("users.rs", include_str!("../src/users.rs")),
     ("organizations.rs", include_str!("../src/organizations.rs")),
     ("memberships.rs", include_str!("../src/memberships.rs")),

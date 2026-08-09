@@ -1079,6 +1079,28 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/organizations/{org}/api-keys"),
             body: Some("{\"display_name\":\"absent\"}".to_owned()),
         },
+        // The service-account surface is NOT nested under an organization, so its cases
+        // address the environment directly. The principal id is a literal that names nothing;
+        // the point of the sweep is that the absent ENVIRONMENT is refused before the path
+        // gets far enough for that to matter.
+        Case {
+            label: "service_account_keys.createServiceAccountApiKey",
+            method: "POST",
+            path: format!("{base}/service-accounts/sva_absent/api-keys"),
+            body: Some("{\"display_name\":\"absent\"}".to_owned()),
+        },
+        Case {
+            label: "service_account_keys.rotateServiceAccountApiKey",
+            method: "POST",
+            path: format!("{base}/service-accounts/sva_absent/api-keys/akey_absent/rotate"),
+            body: None,
+        },
+        Case {
+            label: "service_account_keys.revokeServiceAccountApiKey",
+            method: "DELETE",
+            path: format!("{base}/service-accounts/sva_absent/api-keys/akey_absent"),
+            body: None,
+        },
         Case {
             label: "project_grants.createProjectGrant",
             method: "POST",
