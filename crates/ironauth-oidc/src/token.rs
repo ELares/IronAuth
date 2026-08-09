@@ -1115,6 +1115,7 @@ async fn mint_tokens(
         signer,
         entry.policy(),
         &MintRequest {
+            actor: None,
             scope,
             issuer: &issuer,
             subject: &subject,
@@ -2086,6 +2087,7 @@ async fn mint_refresh_access(
         signer,
         entry.policy(),
         &MintRequest {
+            actor: None,
             scope,
             issuer: &issuer,
             subject: &subject,

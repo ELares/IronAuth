@@ -947,6 +947,7 @@ async fn mint_front_channel_id_token(
         front_channel_id_token_claims(state, scope, resolved).await
     };
     let request = MintRequest {
+        actor: None,
         scope,
         issuer: iss,
         subject: &subject,

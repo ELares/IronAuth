@@ -669,6 +669,7 @@ async fn mint_assertion(
         .then_some(session.auth_time_unix_micros);
     let extra_claims = serde_json::Map::new();
     let request = MintRequest {
+        actor: None,
         scope,
         issuer: &issuer,
         subject: public_subject,
