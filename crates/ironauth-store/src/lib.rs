@@ -64,6 +64,7 @@ pub mod flow;
 pub mod flow_version;
 mod id;
 pub mod identifier;
+pub mod impersonation;
 pub mod interchange;
 pub mod locale_bundle;
 mod migrate;

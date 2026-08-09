@@ -51,6 +51,7 @@ async fn create_session(
             &id,
             prior,
             NewSession {
+                impersonation: None,
                 subject,
                 auth_methods: "pwd",
                 auth_time_micros: 0,
@@ -659,6 +660,7 @@ async fn a_rotation_and_its_audit_row_commit_together_or_not_at_all() {
             &fresh,
             Some(&prior),
             NewSession {
+                impersonation: None,
                 subject: &subject,
                 auth_methods: "pwd",
                 auth_time_micros: 0,
@@ -1059,6 +1061,7 @@ async fn an_active_session_slides_its_idle_window_while_an_idle_one_dies_at_the_
                 id,
                 None,
                 NewSession {
+                    impersonation: None,
                     subject: &subject,
                     auth_methods: "pwd",
                     auth_time_micros: 0,
@@ -1135,6 +1138,7 @@ async fn a_slide_never_resurrects_a_revoked_session() {
             &session,
             None,
             NewSession {
+                impersonation: None,
                 subject: &subject,
                 auth_methods: "pwd",
                 auth_time_micros: 0,

@@ -727,6 +727,7 @@ async fn create_live_session(
             &id,
             None,
             NewSession {
+                impersonation: None,
                 subject,
                 auth_methods: "pwd",
                 auth_time_micros: 0,

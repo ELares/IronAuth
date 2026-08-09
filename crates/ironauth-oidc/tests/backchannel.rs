@@ -160,6 +160,7 @@ async fn create_session(store: &Store, env: &Env, scope: Scope, subject: &str) -
             &id,
             None,
             NewSession {
+                impersonation: None,
                 subject,
                 auth_methods: "pwd",
                 auth_time_micros: 0,

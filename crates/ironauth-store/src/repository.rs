@@ -101,6 +101,7 @@ use crate::id::{
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
 };
+use crate::impersonation::Impersonation;
 use crate::locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
@@ -18267,14 +18268,23 @@ impl ActingSessionRepo<'_> {
                     "INSERT INTO sessions \
                      (id, tenant_id, environment_id, subject, auth_methods, auth_time, \
                       expires_at, idle_expires_at, absolute_expires_at, last_seen_at, \
-                      user_agent, peer_ip) \
+                      user_agent, peer_ip, \
+                      impersonator, impersonation_reason_code, impersonation_reason_text, \
+                      impersonation_started_at, impersonation_expires_at) \
                      VALUES ($1, $2, $3, $4, $5, \
                              TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
                              TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
                              TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
                              TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
                              TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
-                             $10, $11)",
+                             $10, $11, \
+                             $12, $13, $14, \
+                             CASE WHEN $15::bigint IS NULL THEN NULL ELSE \
+                                  TIMESTAMPTZ 'epoch' + ($15::text || ' microseconds')::interval \
+                             END, \
+                             CASE WHEN $16::bigint IS NULL THEN NULL ELSE \
+                                  TIMESTAMPTZ 'epoch' + ($16::text || ' microseconds')::interval \
+                             END)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -18287,6 +18297,19 @@ impl ActingSessionRepo<'_> {
                 .bind(now_micros)
                 .bind(params.user_agent)
                 .bind(params.peer_ip)
+                .bind(params.impersonation.map(|value| value.impersonator()))
+                .bind(params.impersonation.map(|value| value.reason_code()))
+                .bind(params.impersonation.map(|value| value.reason_text()))
+                .bind(
+                    params
+                        .impersonation
+                        .map(|value| value.started_at_unix_micros()),
+                )
+                .bind(
+                    params
+                        .impersonation
+                        .map(|value| value.expires_at_unix_micros()),
+                )
                 .execute(&mut **tx)
                 .await?;
                 if let (Some(prior_id), Some(prior_text)) = (prior, &prior_text) {
@@ -20835,6 +20858,14 @@ pub struct NewSession<'a> {
     /// The peer IP the session was established from: the peer-IP binding input,
     /// recorded ONLY when that OFF-BY-DEFAULT knob is enabled ([`None`] otherwise).
     pub peer_ip: Option<&'a str>,
+    /// The impersonation this session carries, absent on an ordinary session (issue #101).
+    ///
+    /// [`Impersonation`] can only be built through its validating constructor, so a value
+    /// here has already satisfied every rule 0128 enforces. That is why this field is the
+    /// whole of the impersonation input rather than five loose fields: five would let a
+    /// caller fill in some and reach the CHECK with the rest missing, turning a typed
+    /// refusal into a database error.
+    pub impersonation: Option<Impersonation<'a>>,
 }
 
 /// Why a session ended (issue #32): the value recorded in `sessions.end_cause` and
