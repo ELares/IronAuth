@@ -608,3 +608,265 @@ async fn the_tag_is_separated_by_field_scope_and_column() {
          comparing the two columns"
     );
 }
+
+/// Create and drive a `BackfillLoginIndex` job to completion, returning the final job.
+async fn backfill(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    to_version: i32,
+    batch_limit: i64,
+) -> ironauth_store::TraitMigrationJob {
+    let repo = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env));
+    let job_id = repo
+        .trait_migration_jobs()
+        .create(
+            env,
+            ironauth_store::NewTraitMigrationJob {
+                kind: ironauth_store::TraitJobKind::BackfillLoginIndex,
+                from_version: to_version,
+                to_version,
+                transform_json: None,
+            },
+            NOW_MICROS,
+            ironauth_store::TraitMigrationStart {
+                first_batch_payload: &json!({}),
+                idempotency: None,
+            },
+        )
+        .await
+        .expect("create the backfill job");
+
+    // Drive to a terminal status. Bounded so a job that never terminates fails the test
+    // rather than hanging it.
+    let mut job = repo
+        .trait_migration_jobs()
+        .advance(env, &job_id, batch_limit)
+        .await
+        .expect("advance the backfill");
+    for _ in 0..50 {
+        if job.status.is_terminal() {
+            break;
+        }
+        job = repo
+            .trait_migration_jobs()
+            .advance(env, &job_id, batch_limit)
+            .await
+            .expect("advance the backfill");
+    }
+    assert!(
+        job.status.is_terminal(),
+        "the backfill did not terminate within the bound: {:?}",
+        job.status
+    );
+    job
+}
+
+/// Issue #624 point 2: a backfill makes a NEWLY annotated field resolve users who have not
+/// written traits since the annotation changed.
+///
+/// This is the whole reason the job exists. The index is maintained on every trait write, so
+/// the population it cannot reach is the people who never write again, and without a sweep
+/// an operator who annotates a field publishes a login route that works for nobody who
+/// already existed.
+#[tokio::test]
+async fn a_backfill_makes_a_newly_annotated_field_resolve_existing_users() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x9a);
+    let scope = db.seed_scope(&env).await;
+    activate(&db, &env, scope, &schema_with_annotated_handle()).await;
+
+    let user = create_user(&db, &env, scope, "u1@x.test", None).await;
+    let other = create_user(&db, &env, scope, "u2@x.test", None).await;
+    set_traits(
+        &db,
+        &env,
+        scope,
+        &user,
+        &json!({"handle": "hh", "nickname": "nn"}).to_string(),
+    )
+    .await;
+    set_traits(
+        &db,
+        &env,
+        scope,
+        &other,
+        &json!({"handle": "other-hh", "nickname": "other-nn"}).to_string(),
+    )
+    .await;
+
+    // Move the annotation. Neither user writes again.
+    let v2 = activate(&db, &env, scope, &schema_with_annotated_nickname()).await;
+    assert_eq!(
+        resolve(&db, scope, "nickname", "nn").await,
+        None,
+        "before the backfill the newly annotated field resolves nobody"
+    );
+
+    let job = backfill(&db, &env, scope, v2, 100).await;
+    assert_eq!(
+        job.status,
+        ironauth_store::TraitJobStatus::Completed,
+        "the backfill must complete: it validates nothing, so there is nothing to fail on"
+    );
+    assert_eq!(job.processed_count, 2, "both identities were swept");
+
+    assert_eq!(
+        resolve(&db, scope, "nickname", "nn").await,
+        Some(user),
+        "after the backfill the newly annotated field resolves its holder"
+    );
+    assert_eq!(
+        resolve(&db, scope, "nickname", "other-nn").await,
+        Some(other),
+        "and it resolves the user who never wrote either, which is the population the \
+         backfill exists for"
+    );
+    assert_eq!(
+        resolve(&db, scope, "handle", "hh").await,
+        None,
+        "the UN-annotated field must stop resolving after the sweep, or a login route the \
+         schema no longer declares stays open indefinitely"
+    );
+}
+
+/// The backfill is RESUMABLE and IDEMPOTENT: a batch size of one still finishes, and running
+/// it twice changes nothing.
+///
+/// A sweep that double-inserted would make every user ambiguous with themselves and refuse
+/// them all, which is a worse outcome than not running it.
+#[tokio::test]
+async fn the_backfill_resumes_across_batches_and_re_running_it_changes_nothing() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x9b);
+    let scope = db.seed_scope(&env).await;
+    activate(&db, &env, scope, &schema_with_annotated_handle()).await;
+
+    let mut users = Vec::new();
+    for n in 0..5 {
+        let user = create_user(&db, &env, scope, &format!("u{n}@x.test"), None).await;
+        set_traits(
+            &db,
+            &env,
+            scope,
+            &user,
+            &json!({ "handle": format!("h{n}") }).to_string(),
+        )
+        .await;
+        users.push(user);
+    }
+    let v2 = activate(&db, &env, scope, &schema_with_annotated_nickname()).await;
+    let v3 = activate(&db, &env, scope, &schema_with_annotated_handle()).await;
+    let _ = v2;
+
+    // ONE record per batch, so the run must resume from its cursor four times.
+    let job = backfill(&db, &env, scope, v3, 1).await;
+    assert_eq!(
+        job.processed_count, 5,
+        "every identity was swept across batches"
+    );
+
+    for (n, user) in users.iter().enumerate() {
+        assert_eq!(
+            resolve(&db, scope, "handle", &format!("h{n}")).await,
+            Some(*user),
+            "u{n} must resolve after a resumed backfill"
+        );
+    }
+
+    // A SECOND sweep must leave every one of them resolving, not make them ambiguous with
+    // themselves.
+    backfill(&db, &env, scope, v3, 100).await;
+    for (n, user) in users.iter().enumerate() {
+        assert_eq!(
+            resolve(&db, scope, "handle", &format!("h{n}")).await,
+            Some(*user),
+            "u{n} stopped resolving after a SECOND backfill, so the sweep is not idempotent \
+             and every user it touched twice is now ambiguous with themselves"
+        );
+    }
+}
+
+/// The backfill indexes an identity whose traits FAIL the active schema.
+///
+/// A `Migrate` would refuse that record and a `DryRun` would report it. The backfill does
+/// neither: it reindexes what is stored. Those identities are the ones an operator most
+/// needs to keep reachable while they fix the data.
+///
+/// # Why the fixture empties the index by hand
+///
+/// The obvious fixture (create the identity, then annotate the field) is UNREACHABLE. The
+/// activation cutover gate revalidates every stored identity against the candidate schema
+/// and refuses with `CutoverBlocked`, so a scope holding an invalid document cannot activate
+/// anything at all until it is fixed. Measured, not assumed: that fixture failed here.
+///
+/// So the state under test is the OTHER one the backfill exists for, and it is the real
+/// initial condition rather than a synthetic one. Migration 0131 adds an EMPTY table to a
+/// live deployment: on the morning it ships, every existing identity has traits and no index
+/// rows, whatever their documents say. Deleting the rows reproduces exactly that, and the
+/// question is whether the sweep reaches an identity whose document does not validate.
+#[tokio::test]
+async fn the_backfill_indexes_an_identity_whose_traits_fail_the_active_schema() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x9c);
+    let scope = db.seed_scope(&env).await;
+
+    let strict = json!({
+        "type": "object",
+        "properties": {
+            "handle": {"type": "string", "x-ironauth": {"identifier": true}},
+            "mandatory": {"type": "string"}
+        },
+        "required": ["mandatory"]
+    })
+    .to_string();
+    let version = activate(&db, &env, scope, &strict).await;
+
+    // `admin_create` applies the visibility class but does not VALIDATE, so this writes a
+    // document the active schema refuses.
+    let user = create_user(
+        &db,
+        &env,
+        scope,
+        "stranded@x.test",
+        Some(&json!({"handle": "stranded"}).to_string()),
+    )
+    .await;
+    let compiled = ironauth_store::TraitSchema::compile(&strict).expect("the schema compiles");
+    assert!(
+        !compiled.validate(&json!({"handle": "stranded"})).is_empty(),
+        "the fixture document must FAIL the active schema, or this test is the ordinary \
+         case wearing a different name"
+    );
+
+    // The pre-migration state: traits present, index empty.
+    sqlx::query("DELETE FROM user_trait_login_index WHERE tenant_id = $1 AND environment_id = $2")
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("empty the index");
+    assert_eq!(
+        resolve(&db, scope, "handle", "stranded").await,
+        None,
+        "the fixture must start un-indexed, or the backfill's contribution is invisible"
+    );
+
+    let job = backfill(&db, &env, scope, version, 100).await;
+    assert_eq!(
+        job.status,
+        ironauth_store::TraitJobStatus::Completed,
+        "the backfill validates nothing, so an invalid document is not a failure for it"
+    );
+    assert_eq!(job.failure_count, 0);
+    assert_eq!(
+        resolve(&db, scope, "handle", "stranded").await,
+        Some(user),
+        "an identity whose document fails the active schema was SKIPPED by the sweep, so \
+         the account that most needs to stay reachable while an operator fixes the data is \
+         the one the backfill leaves unable to log in"
+    );
+}

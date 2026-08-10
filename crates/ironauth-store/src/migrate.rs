@@ -1082,6 +1082,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0131_user_trait_login_index.sql"),
         },
+        Migration {
+            version: 132,
+            name: "backfill_login_index_job_kind",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0132_backfill_login_index_job_kind.sql"),
+        },
     ]
 }
 

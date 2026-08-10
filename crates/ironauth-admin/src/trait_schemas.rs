@@ -526,7 +526,11 @@ mod tests {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateTraitMigrationRequest {
     /// `dry_run` validates every identity against the target version and writes nothing;
-    /// `migrate` transforms and writes.
+    /// `migrate` transforms and writes; `backfill_login_index` (issue #624) rebuilds the
+    /// annotated-trait login index from the traits already stored, touching no traits
+    /// document and validating nothing. Run the last one after annotating a new field as a
+    /// login identifier: the index is maintained on every trait WRITE, so without a sweep
+    /// the new route works for nobody who does not happen to write again.
     pub kind: String,
     /// The schema version identities are migrated or validated FROM.
     pub from_version: i32,
@@ -552,7 +556,7 @@ pub struct RecordFailureView {
 pub struct TraitMigrationJobView {
     /// The `tmj_` identifier.
     pub id: String,
-    /// `dry_run` or `migrate`.
+    /// `dry_run`, `migrate`, or `backfill_login_index`.
     pub kind: String,
     /// The version migrated FROM.
     pub from_version: i32,
@@ -660,8 +664,11 @@ pub async fn create_trait_migration_job(
     crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: CreateTraitMigrationRequest = parse_json(&body)?;
-    let kind = ironauth_store::TraitJobKind::from_wire(&request.kind)
-        .ok_or_else(|| ApiError::BadRequest("kind must be one of dry_run | migrate".to_owned()))?;
+    let kind = ironauth_store::TraitJobKind::from_wire(&request.kind).ok_or_else(|| {
+        ApiError::BadRequest(
+            "kind must be one of dry_run | migrate | backfill_login_index".to_owned(),
+        )
+    })?;
     // Serialized here rather than passed through, so a transform that is not a JSON ARRAY
     // is refused at the edge with a precise message instead of reaching the store's parse.
     let transform = match &request.transform {

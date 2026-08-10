@@ -53647,6 +53647,17 @@ pub enum TraitJobKind {
     DryRun,
     /// Transform (declarative field mapping) and re-validate, writing the result.
     Migrate,
+    /// Rebuild the annotated-trait LOGIN INDEX from the traits already stored (issue #624),
+    /// touching no traits document.
+    ///
+    /// The index is maintained on every trait write, so this exists for the users who do
+    /// NOT write: annotating a new field as a login identifier leaves the index empty for
+    /// every existing identity, and without a sweep those people can never log in through
+    /// the field their operator just published. It is the third kind rather than a flag on
+    /// `Migrate` because it VALIDATES NOTHING and TRANSFORMS NOTHING: a document that no
+    /// longer satisfies the active schema still has to be indexed, or the accounts most in
+    /// need of the operator's attention are the ones silently left out.
+    BackfillLoginIndex,
 }
 
 impl TraitJobKind {
@@ -53656,6 +53667,7 @@ impl TraitJobKind {
         match self {
             TraitJobKind::DryRun => "dry_run",
             TraitJobKind::Migrate => "migrate",
+            TraitJobKind::BackfillLoginIndex => "backfill_login_index",
         }
     }
 
@@ -53665,6 +53677,7 @@ impl TraitJobKind {
         match value {
             "dry_run" => Some(TraitJobKind::DryRun),
             "migrate" => Some(TraitJobKind::Migrate),
+            "backfill_login_index" => Some(TraitJobKind::BackfillLoginIndex),
             _ => None,
         }
     }
@@ -54547,7 +54560,9 @@ impl ActingTraitMigrationJobRepo<'_> {
                     .fetch_one(&mut **tx)
                     .await?
                     .get("c"),
-                    TraitJobKind::DryRun => sqlx::query(
+                    // The denominator matches the SELECTION above for both of these: every
+                    // identity holding traits, whatever schema version it sits on.
+                    TraitJobKind::DryRun | TraitJobKind::BackfillLoginIndex => sqlx::query(
                         "SELECT count(*) AS c FROM users \
                          WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
                          AND traits_sealed IS NOT NULL",
@@ -54768,6 +54783,27 @@ async fn run_advance_batch(
     for row in &rows {
         let subject: String = row.get("id");
         let traits = open_user_traits(tx, p.scope, p.master, row).await?;
+        // The BACKFILL neither transforms nor validates. It reindexes what is already
+        // stored, so a document that fails the active schema is still indexed: those
+        // identities are the ones an operator most needs to stay reachable, and dropping
+        // them here would make the sweep quietly incomplete in exactly the population a
+        // dry run already told the operator about.
+        if matches!(p.kind, TraitJobKind::BackfillLoginIndex) {
+            rewrite_trait_login_index(
+                tx,
+                p.master,
+                p.scope,
+                &subject,
+                p.to_version,
+                &p.target.annotations().login_identifiers,
+                &traits,
+            )
+            .await?;
+            state.migrated += 1;
+            state.processed += 1;
+            state.cursor = Some(subject);
+            continue;
+        }
         let candidate = if matches!(p.kind, TraitJobKind::Migrate) {
             crate::trait_schema::apply_transform(p.ops, &traits)
         } else {
@@ -54846,7 +54882,11 @@ async fn select_candidate_identities(
             .fetch_all(&mut **tx)
             .await?
         }
-        TraitJobKind::DryRun => {
+        // Both of these sweep EVERY identity holding traits, whatever version it is on.
+        // For the backfill that is the whole point: an identity stranded on an old schema
+        // still holds a value in the newly annotated field, and skipping it is exactly the
+        // silent lock-out issue #624 point 3 is about.
+        TraitJobKind::DryRun | TraitJobKind::BackfillLoginIndex => {
             sqlx::query(
                 "SELECT id, traits_sealed, traits_dek_version FROM users \
                  WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
