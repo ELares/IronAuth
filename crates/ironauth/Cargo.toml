@@ -65,6 +65,9 @@ otlp = ["ironauth-server/otlp"]
 testing = ["ironauth-store/testing", "ironauth-admin/testing"]
 
 [dev-dependencies]
+# The hermetic fetcher seam (issue #674). Test builds only, so no production
+# binary can construct a fetcher that skips the OS trust store.
+ironauth-fetch = { workspace = true, features = ["test-harness"] }
 # The step-up-policy CLI integration test (issue #72) stands up a throwaway database
 # (the store test-support harness), seeds a scope, drives the compiled `ironauth`
 # binary as a subprocess against it, and reads the written policy back through the same

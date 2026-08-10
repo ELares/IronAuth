@@ -26,6 +26,9 @@ ironauth-jose.workspace = true
 ironauth-fetch.workspace = true
 
 [dev-dependencies]
+# The hermetic fetcher seam (issue #674). Test builds only, so no production
+# binary can construct a fetcher that skips the OS trust store.
+ironauth-fetch = { workspace = true, features = ["test-harness"] }
 # The trait is async (the external driver awaits an outbound call), so the tests
 # drive it on a minimal tokio runtime. The external-seam test routes through the
 # fetcher, which arms a timer and a socket even though a blocked destination

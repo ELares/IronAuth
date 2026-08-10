@@ -1200,20 +1200,27 @@ async fn build_oidc_plane(
     })
 }
 
-/// Build the generic OIDC upstream federation runtime (issue #75, PR B) from
-/// `oidc.federation`, or [`None`] when federation is disabled (the default).
+/// The federation runtime over an injected fetcher builder (issues #75 and #674).
 ///
-/// When enabled, the runtime gets its OWN SSRF-hardened outbound fetcher (every federation
-/// outbound -- discovery, JWKS, token exchange -- rides `ironauth-fetch`, never an ad hoc
-/// client) and the configured discovery / JWKS cache TTLs, read against the same env clock
-/// so they advance deterministically (the runtime reads the application clock at call time
-/// through the state). A fetcher-setup failure logs and yields [`None`] (federation then
-/// stays a uniform not-found rather than mounting a broken surface).
-fn build_federation_runtime(cfg: &OidcConfig) -> Option<Arc<FederationRuntime>> {
+/// The seam exists so a test can assert the DECISION the config flag controls without the host
+/// trust store deciding the outcome for it. Before it, an enabled config on a machine whose
+/// keychain refused produced `None`, and the test read that as "the flag did not build a
+/// runtime" while the log line naming the real cause scrolled past in a gate log thousands of
+/// lines long.
+///
+/// Production passes the real builder, so the fail-closed behaviour is unchanged: a fetcher
+/// that cannot be built still means federation is not mounted, loudly.
+fn build_federation_runtime_with<F>(
+    cfg: &OidcConfig,
+    build_fetcher: F,
+) -> Option<Arc<FederationRuntime>>
+where
+    F: FnOnce() -> Result<ironauth_fetch::Fetcher, ironauth_fetch::TlsSetupError>,
+{
     if !cfg.federation.enabled {
         return None;
     }
-    let fetcher = match ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default()) {
+    let fetcher = match build_fetcher() {
         Ok(fetcher) => Arc::new(fetcher),
         Err(error) => {
             tracing::error!(
@@ -3925,16 +3932,37 @@ mod tests {
         // federation is disabled, so no runtime is built (the /federation routes 404).
         let default = config("");
         assert!(
-            build_federation_runtime(&default.oidc).is_none(),
+            build_federation_runtime_with(&default.oidc, || Ok(
+                ironauth_fetch::Fetcher::for_tests(ironauth_fetch::FetchLimits::default())
+            ))
+            .is_none(),
             "federation is off by default, so the boot path installs no runtime"
         );
 
         // When `oidc.federation.enabled` is set, the boot path builds a runtime, which is
         // then installed on the OidcState via with_federation so the routes go live.
+        // Through the SEAM with a hermetic fetcher (issue #674). What this asserts is that the
+        // config flag decides; the host trust store must not get a vote. Reading it made this
+        // test fail on a machine whose keychain was refusing, reported as "the flag did not
+        // build a runtime", which is not what had happened.
         let enabled = config("[oidc.federation]\nenabled = true\n");
         assert!(
-            build_federation_runtime(&enabled.oidc).is_some(),
+            build_federation_runtime_with(&enabled.oidc, || Ok(
+                ironauth_fetch::Fetcher::for_tests(ironauth_fetch::FetchLimits::default())
+            ))
+            .is_some(),
             "an enabled federation config builds the runtime the boot path installs"
+        );
+
+        // The fail-closed half, which the seam makes testable for the first time: a fetcher
+        // that cannot be built leaves federation UNMOUNTED rather than mounted with a broken
+        // outbound path.
+        assert!(
+            build_federation_runtime_with(&enabled.oidc, || Err(
+                ironauth_fetch::TlsSetupError::NoTrustRoots { causes: Vec::new() }
+            ))
+            .is_none(),
+            "a fetcher that cannot be built must leave federation unmounted"
         );
     }
 

@@ -236,6 +236,7 @@ pub use migration::{
     HookVerdict, LAZY_MIGRATION_BREAKER_STATE, LAZY_MIGRATION_BREAKER_TRANSITIONS_TOTAL,
     LAZY_MIGRATION_HOOK_LATENCY_SECONDS, LAZY_MIGRATION_HOOK_TOTAL, LAZY_MIGRATION_MIGRATED_TOTAL,
     LazyMigrationHook, WebhookVerifier, build_from_config as build_lazy_migration_hook,
+    build_from_config_with as build_lazy_migration_hook_with,
     describe_metrics as describe_lazy_migration_metrics,
 };
 pub use password::{

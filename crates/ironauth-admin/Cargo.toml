@@ -93,6 +93,9 @@ default = []
 testing = ["ironauth-store/testing"]
 
 [dev-dependencies]
+# The hermetic fetcher seam (issue #674). Test builds only, so no production
+# binary can construct a fetcher that skips the OS trust store.
+ironauth-fetch = { workspace = true, features = ["test-harness"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = { workspace = true, features = ["util"] }
 # The exit-export round-trip test (issue #58) drives the real streaming import

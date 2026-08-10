@@ -539,9 +539,12 @@ impl Harness {
             ironauth_oidc::JwksCacheWindow::clamped(300),
             db.store().clone(),
         ));
-        let fetcher = std::sync::Arc::new(
-            ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default()).expect("fetcher"),
-        );
+        // Hermetic (issue #674). The harness needs a fetcher to EXIST; no test in it
+        // reaches a public host, and reading the OS trust store made every admin test
+        // fail when that API started refusing.
+        let fetcher = std::sync::Arc::new(ironauth_fetch::Fetcher::for_tests(
+            ironauth_fetch::FetchLimits::default(),
+        ));
         let keys = std::sync::Arc::new(ironauth_oidc::FederationKeyResolver::new(
             std::sync::Arc::clone(&fetcher),
             std::time::Duration::from_secs(300),

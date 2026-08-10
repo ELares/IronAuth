@@ -839,6 +839,28 @@ pub fn build_from_config(
     config: &LazyMigrationConfig,
     env: &Env,
 ) -> Option<Arc<LazyMigrationHook>> {
+    build_from_config_with(config, env, Fetcher::new)
+}
+
+/// The lazy-migration hook over an injected fetcher builder (issues #75 and #674).
+///
+/// The seam exists so a WIRING test can assert that the hook reaches both planes without the
+/// host trust store deciding whether it exists. Before it, a machine whose keychain refused
+/// produced `None` here, and the boot-wiring test reported "the OIDC data plane must hold the
+/// configured `migration_hook`, not the default", which names neither TLS nor the real
+/// cause.
+///
+/// Production passes `Fetcher::new`, so the fail-closed behaviour is unchanged: a hook whose
+/// fetcher cannot be built is not armed, and says so.
+#[must_use]
+pub fn build_from_config_with<F>(
+    config: &LazyMigrationConfig,
+    env: &Env,
+    build_fetcher: F,
+) -> Option<Arc<LazyMigrationHook>>
+where
+    F: FnOnce(FetchLimits) -> Result<Fetcher, ironauth_fetch::TlsSetupError>,
+{
     if !config.enabled {
         return None;
     }
@@ -864,7 +886,7 @@ pub fn build_from_config(
         total_timeout: timeout,
         ..FetchLimits::default()
     };
-    let fetcher = match Fetcher::new(limits) {
+    let fetcher = match build_fetcher(limits) {
         Ok(fetcher) => Arc::new(fetcher),
         Err(error) => {
             tracing::error!(%error, "cannot build the lazy-migration fetcher; the hook is not armed");

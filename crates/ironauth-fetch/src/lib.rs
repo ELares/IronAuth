@@ -390,6 +390,29 @@ impl Fetcher {
         })
     }
 
+    /// Build a fetcher for TESTS, trusting only an embedded self-signed root (issue #674).
+    ///
+    /// Identical to [`Fetcher::new`] except for where the trust anchors come from, so every
+    /// SSRF guard, cap, resolver and dialer behaves exactly as in production. What it does not
+    /// do is read the host keychain, which is what coupled unrelated tests across three crates
+    /// to a machine-level condition and made the gate fail about half the time.
+    ///
+    /// Use it wherever a test needs a fetcher to EXIST rather than to reach a public host. A
+    /// test that genuinely verifies a public certificate chain must not use this, and would
+    /// have to be an integration test against a real endpoint anyway.
+    ///
+    /// Reachable only under `test-harness`, so no production build can construct one.
+    #[cfg(feature = "test-harness")]
+    #[must_use]
+    pub fn for_tests(limits: FetchLimits) -> Self {
+        Self {
+            limits,
+            tls: connect::test_tls_config(),
+            resolver: Arc::new(SystemResolver),
+            dialer: Arc::new(SystemDialer),
+        }
+    }
+
     /// Perform one outbound fetch.
     ///
     /// Parses and scheme-checks the URL, resolves and validates the
