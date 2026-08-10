@@ -287,6 +287,13 @@ pub struct AuthenticatedSession {
     /// The recorded authentication method tokens (space-separated RFC 8176
     /// values), the single source `amr` and the achieved `acr` derive from.
     pub auth_methods: String,
+    /// The impersonation this session was started under (issue #101), absent on an ordinary
+    /// session.
+    ///
+    /// Carried here rather than looked up per handler so the policy layer has it: what an
+    /// impersonated principal may do is decided in one place, and a handler that never
+    /// mentions impersonation still inherits the decision.
+    pub impersonation: Option<ironauth_store::SessionImpersonation>,
 }
 
 /// Resolve the session cookie on `headers` to an authenticated session within
@@ -344,6 +351,7 @@ pub async fn resolve_session(
         subject: record.subject,
         auth_time_unix_micros: record.auth_time_unix_micros,
         auth_methods: record.auth_methods,
+        impersonation: record.impersonation,
     })
 }
 
@@ -377,6 +385,7 @@ pub(crate) async fn resolve_established_session(
         subject: record.subject,
         auth_time_unix_micros: record.auth_time_unix_micros,
         auth_methods: record.auth_methods,
+        impersonation: record.impersonation,
     })
 }
 
