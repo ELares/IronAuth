@@ -1057,6 +1057,15 @@ pub enum Action {
     /// An API key or personal access token was REVOKED (issue #99). The row targets the
     /// `akey_` handle.
     ApiKeyRevoked,
+    /// An impersonation was AUTHORIZED (issue #101): the control plane issued a single-use
+    /// authorization after checking the permission and the justification. The row targets the
+    /// `imp_` authorization.
+    ///
+    /// Distinct from [`Action::ImpersonationStarted`], and the distinction is the point: an
+    /// authorization may be issued and never redeemed. Collapsing the two would record an
+    /// impersonation that never happened, which is exactly as misleading as missing one that
+    /// did.
+    ImpersonationAuthorized,
     /// An IMPERSONATION was STARTED (issue #101). The row targets the `ses_` session, which
     /// is what links the justification to everything the impersonator subsequently did, and
     /// its detail carries the impersonator, the structured reason, the written justification
@@ -1509,6 +1518,7 @@ impl Action {
             Action::ClientOwningOrganizationSet => "client.owning_organization.set",
             Action::ApiKeyCreated => "api_key.created",
             Action::ApiKeyRevoked => "api_key.revoked",
+            Action::ImpersonationAuthorized => "impersonation.authorized",
             Action::ImpersonationStarted => "impersonation.started",
             Action::ImpersonationEnded => "impersonation.ended",
             Action::AdminPrivilegeElevated => "admin.privilege.elevated",

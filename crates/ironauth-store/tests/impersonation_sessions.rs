@@ -1113,3 +1113,311 @@ async fn table_wide_privileges(db: &TestDatabase, grantee: &str) -> Vec<String> 
     held.sort();
     held
 }
+
+/// Issue an authorization through the control plane, for the redemption tests below.
+async fn issue_authorization(
+    db: &TestDatabase,
+    env: &ironauth_env::Env,
+    scope: Scope,
+    user: &ironauth_store::UserId,
+    window_micros: i64,
+) -> ironauth_store::ImpersonationAuthorizationId {
+    use ironauth_store::impersonation::Impersonation;
+    let id = ironauth_store::ImpersonationAuthorizationId::generate(env, &scope);
+    let act = Impersonation::start(
+        "adm_support_engineer",
+        "support_ticket",
+        "Ticket 4417: reproducing the checkout failure as the user.",
+        now_micros(env),
+        window_micros,
+    )
+    .expect("justified");
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .impersonation_authorizations()
+        .issue(
+            env,
+            ironauth_store::NewImpersonationAuthorization {
+                id: &id,
+                user_id: user,
+                impersonation: act,
+            },
+        )
+        .await
+        .expect("issue the authorization");
+    id
+}
+
+/// Redemption turns an authorization into a flagged session, exactly once.
+///
+/// The single-use guard lives in the UPDATE's own `redeemed_at IS NULL` clause rather than in
+/// a read-then-write, so this also covers the case two concurrent redemptions would hit: the
+/// second finds no unspent row and is the uniform not-found.
+#[tokio::test]
+async fn an_authorization_redeems_into_a_flagged_session_exactly_once() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "target@example.test").await;
+    let id = issue_authorization(&db, &env, scope, &user, 30 * MINUTE_MICROS).await;
+    let now = now_micros(&env);
+
+    let redeemed = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .redeem(&env, &id, now)
+        .await
+        .expect("the first redemption succeeds");
+    assert_eq!(redeemed.user_id, user);
+
+    // The session it produced is a real, flagged, capped one.
+    let record = db
+        .store()
+        .scoped(scope)
+        .sessions()
+        .get(&redeemed.session_id, now, 0)
+        .await
+        .expect("read")
+        .expect("the redeemed session is live");
+    let carried = record.impersonation.expect("it is flagged");
+    assert_eq!(carried.impersonator, "adm_support_engineer");
+    assert_eq!(carried.reason_code, "support_ticket");
+    assert_eq!(
+        record.subject,
+        user.to_string(),
+        "the session belongs to the TARGET, not the operator"
+    );
+    assert_eq!(
+        carried.expires_at_unix_micros,
+        redeemed.expires_at_unix_micros
+    );
+
+    // The session's OWN expiry is the impersonation's, not merely longer than it. A longer one
+    // would be inert, because the read refuses past the bound either way, but it would read to
+    // anyone inspecting the row as though the impersonation had longer to run than it does.
+    let (idle_us, abs_us): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT (EXTRACT(EPOCH FROM idle_expires_at) * 1000000)::bigint, \
+                (EXTRACT(EPOCH FROM absolute_expires_at) * 1000000)::bigint \
+         FROM sessions WHERE id = $1",
+    )
+    .bind(redeemed.session_id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the session row");
+    assert_eq!(
+        (idle_us, abs_us),
+        (
+            Some(redeemed.expires_at_unix_micros),
+            Some(redeemed.expires_at_unix_micros)
+        ),
+        "the session must not claim to outlive the impersonation that created it"
+    );
+
+    // Spent. A second redemption finds no unspent row.
+    let again = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .redeem(&env, &id, now)
+        .await;
+    assert!(
+        matches!(again, Err(ironauth_store::StoreError::NotFound)),
+        "an authorization is single use: {again:?}"
+    );
+}
+
+/// An authorization that lapsed before anyone redeemed it is refused.
+///
+/// The cap bounds how long an impersonation may LAST; this bounds redeeming one that expired
+/// while nobody was looking. Without it an operator could hold an authorization issued this
+/// morning and spend it tonight, with a session capped from the ORIGINAL start and therefore
+/// already dead, which is a confusing failure instead of a clear refusal.
+#[tokio::test]
+async fn an_expired_authorization_cannot_be_redeemed() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "target@example.test").await;
+    let id = issue_authorization(&db, &env, scope, &user, 10 * MINUTE_MICROS).await;
+
+    let refused = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .redeem(&env, &id, now_micros(&env) + 11 * MINUTE_MICROS)
+        .await;
+    assert!(
+        matches!(refused, Err(ironauth_store::StoreError::NotFound)),
+        "a lapsed authorization must not redeem: {refused:?}"
+    );
+
+    // And it is still unspent, so the refusal did not burn it.
+    let redeemed_at: Option<i64> = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM redeemed_at) * 1000000)::bigint \
+         FROM impersonation_authorizations WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read it back");
+    assert_eq!(
+        redeemed_at, None,
+        "a refused redemption must leave the authorization unspent"
+    );
+}
+
+/// Issuing is the control plane's, redeeming is the app plane's, and the DATABASE says so.
+///
+/// The grants are asserted elsewhere from the catalogue; this drives the actual calls, because
+/// a grant that is correct and a code path that uses the wrong pool are different failures and
+/// only one of them shows up in `information_schema`.
+#[tokio::test]
+async fn the_wrong_plane_cannot_issue_or_redeem() {
+    use ironauth_store::impersonation::Impersonation;
+
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "target@example.test").await;
+    let id = ironauth_store::ImpersonationAuthorizationId::generate(&env, &scope);
+    let act = Impersonation::start(
+        "adm_support_engineer",
+        "support_ticket",
+        "Ticket 4417",
+        now_micros(&env),
+        30 * MINUTE_MICROS,
+    )
+    .expect("justified");
+
+    // The APP plane may not issue: it holds SELECT and the two redemption columns, no INSERT.
+    let issued_by_app = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .issue(
+            &env,
+            ironauth_store::NewImpersonationAuthorization {
+                id: &id,
+                user_id: &user,
+                impersonation: act,
+            },
+        )
+        .await;
+    assert!(
+        issued_by_app.is_err(),
+        "the app plane must not be able to issue an authorization: {issued_by_app:?}"
+    );
+
+    // The CONTROL plane may not redeem: redeeming creates a session, which is the app
+    // plane's alone, and it holds no UPDATE here to stamp one spent either.
+    let real = issue_authorization(&db, &env, scope, &user, 30 * MINUTE_MICROS).await;
+    let redeemed_by_control = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .redeem(&env, &real, now_micros(&env))
+        .await;
+    assert!(
+        redeemed_by_control.is_err(),
+        "the control plane must not be able to redeem: {redeemed_by_control:?}"
+    );
+}
+
+/// Register a user, so an authorization names a real target.
+async fn seed_user(
+    db: &TestDatabase,
+    env: &ironauth_env::Env,
+    scope: Scope,
+    handle: &str,
+) -> ironauth_store::UserId {
+    let id = ironauth_store::UserId::generate(env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .users()
+        .register_passwordless(env, &id, handle)
+        .await
+        .expect("register user");
+    id
+}
+
+/// The AUTHORIZED event carries the justification, and is distinct from the STARTED one.
+///
+/// This exists because the first version of `issue` built the detail and dropped it:
+/// `write_audited` has no way to pass one, so the row was written with an empty detail and
+/// nothing failed. An authorization event with no justification records that somebody was
+/// allowed to impersonate and not why, which is the half an auditor actually needs.
+///
+/// The two events are asserted as a pair because their separation is deliberate. An
+/// authorization may be issued and never redeemed; collapsing them would log an impersonation
+/// that never happened.
+#[tokio::test]
+async fn authorizing_audits_the_justification_and_starting_is_a_separate_event() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "target@example.test").await;
+    let id = issue_authorization(&db, &env, scope, &user, 30 * MINUTE_MICROS).await;
+
+    let (target, detail): (String, String) = sqlx::query_as(
+        "SELECT target_id, detail FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'impersonation.authorized'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("exactly one authorization event");
+    assert_eq!(target, id.to_string(), "it targets the authorization");
+    let detail: serde_json::Value = serde_json::from_str(&detail).expect("detail is JSON");
+    assert_eq!(detail["impersonator"], "adm_support_engineer");
+    assert_eq!(detail["reason_code"], "support_ticket");
+    assert_eq!(
+        detail["reason_text"], "Ticket 4417: reproducing the checkout failure as the user.",
+        "the written justification is recorded at AUTHORIZATION time, not only at start"
+    );
+    assert_eq!(detail["user_id"], user.to_string());
+
+    // Issuing alone starts nothing.
+    let started: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'impersonation.started'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count");
+    assert_eq!(
+        started, 0,
+        "an authorization that was never redeemed must not log an impersonation that never \
+         happened"
+    );
+
+    // Redeeming produces the start event, targeting the SESSION rather than the authorization.
+    let redeemed = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .redeem(&env, &id, now_micros(&env))
+        .await
+        .expect("redeem");
+    let start_target: String = sqlx::query_scalar(
+        "SELECT target_id FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'impersonation.started'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("exactly one start event");
+    assert_eq!(start_target, redeemed.session_id.to_string());
+}
