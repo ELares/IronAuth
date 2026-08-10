@@ -96,6 +96,37 @@ use ironauth_jose::MasterKey;
 use ironauth_oidc::{FederationRuntime, JwksCacheWindow, LazyMigrationHook, OidcState};
 use ironauth_server::{ServerError, SiteContext};
 
+/// How the boot path builds an outbound fetcher, and the ONE place tests differ (issue #674).
+///
+/// Production reads the OS trust store, which is right: an outbound fetcher that trusts
+/// nothing would fail every https handshake, and failing at startup beats failing at first
+/// use.
+///
+/// The WIRING tests must not. They assert that a value the config declares reaches both
+/// planes, and coupling that to the host keychain made them report a TLS failure as "the
+/// plane does not hold the configured value", which names neither the cause nor the file it
+/// is in. When the trust-settings API on this machine began refusing, that is exactly what
+/// happened and it took a bisect to see it was not a code change.
+#[cfg(not(test))]
+fn outbound_fetcher(
+    limits: ironauth_fetch::FetchLimits,
+) -> Result<ironauth_fetch::Fetcher, ironauth_fetch::TlsSetupError> {
+    ironauth_fetch::Fetcher::new(limits)
+}
+
+/// The hermetic counterpart. See [`outbound_fetcher`].
+///
+/// The `Result` is never `Err` and must stay: this has to be substitutable for the production
+/// signature, and a version that could not fail would let a caller stop handling the failure
+/// that production still has.
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
+fn outbound_fetcher(
+    limits: ironauth_fetch::FetchLimits,
+) -> Result<ironauth_fetch::Fetcher, ironauth_fetch::TlsSetupError> {
+    Ok(ironauth_fetch::Fetcher::for_tests(limits))
+}
+
 /// Everything [`SharedPlaneInputs::capture`] resolves the declared values FROM.
 ///
 /// One struct rather than a positional argument list, so a declaration's resolver names
@@ -370,9 +401,10 @@ shared_plane_inputs! {
         // path is then unchanged.
         migration_hook: Option<Arc<LazyMigrationHook>> = |source: &CaptureSource<'_>| {
             Ok(if source.config.oidc.enabled {
-                ironauth_oidc::build_lazy_migration_hook(
+                ironauth_oidc::build_lazy_migration_hook_with(
                     &source.config.oidc.lazy_migration,
                     source.env,
+                    outbound_fetcher,
                 )
             } else {
                 None
@@ -384,7 +416,9 @@ shared_plane_inputs! {
         // only when OIDC is mounted and federation is enabled; otherwise `None`.
         federation_runtime: Option<Arc<FederationRuntime>> = |source: &CaptureSource<'_>| {
             Ok(if source.config.oidc.enabled {
-                crate::build_federation_runtime(&source.config.oidc)
+                crate::build_federation_runtime_with(&source.config.oidc, || {
+                    outbound_fetcher(ironauth_fetch::FetchLimits::default())
+                })
             } else {
                 None
             })

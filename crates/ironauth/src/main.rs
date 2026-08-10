@@ -1200,21 +1200,6 @@ async fn build_oidc_plane(
     })
 }
 
-/// Build the generic OIDC upstream federation runtime (issue #75, PR B) from
-/// `oidc.federation`, or [`None`] when federation is disabled (the default).
-///
-/// When enabled, the runtime gets its OWN SSRF-hardened outbound fetcher (every federation
-/// outbound -- discovery, JWKS, token exchange -- rides `ironauth-fetch`, never an ad hoc
-/// client) and the configured discovery / JWKS cache TTLs, read against the same env clock
-/// so they advance deterministically (the runtime reads the application clock at call time
-/// through the state). A fetcher-setup failure logs and yields [`None`] (federation then
-/// stays a uniform not-found rather than mounting a broken surface).
-fn build_federation_runtime(cfg: &OidcConfig) -> Option<Arc<FederationRuntime>> {
-    build_federation_runtime_with(cfg, || {
-        ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default())
-    })
-}
-
 /// The federation runtime over an injected fetcher builder (issues #75 and #674).
 ///
 /// The seam exists so a test can assert the DECISION the config flag controls without the host
@@ -3947,7 +3932,10 @@ mod tests {
         // federation is disabled, so no runtime is built (the /federation routes 404).
         let default = config("");
         assert!(
-            build_federation_runtime(&default.oidc).is_none(),
+            build_federation_runtime_with(&default.oidc, || Ok(
+                ironauth_fetch::Fetcher::for_tests(ironauth_fetch::FetchLimits::default())
+            ))
+            .is_none(),
             "federation is off by default, so the boot path installs no runtime"
         );
 
