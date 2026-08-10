@@ -24,7 +24,7 @@ base64.workspace = true
 bcrypt = "0.19"
 cipher = "0.4"
 ctr = "0.9"
-password-hash = "0.5"
+password-hash = "0.6"
 pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
 scrypt = "0.11"
 sha-crypt = "0.6"
