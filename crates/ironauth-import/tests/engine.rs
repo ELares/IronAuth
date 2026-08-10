@@ -144,19 +144,42 @@ async fn streaming_import_of_mixed_schemes_creates_every_user() {
     lines.push(record_line("pbkdf2@x.test", &pbkdf2_hash("pw")));
     lines.push(record_line("argon2@x.test", &argon2_hash("pw")));
     lines.push(record_line("firebase@x.test", &firebase_hash_vector()));
+    // SHA-crypt and the LDAP digests (issue #55, criterion 3). These are the POSITIVE
+    // control for the two schemes added last: the out-of-bounds sweep below refuses a
+    // SHA-crypt record, but `Unrecognized` is also a refusal, so without a record that
+    // IMPORTS this file could not tell "bounded correctly" from "not supported at all".
+    lines.push(record_line(
+        "shacrypt5@x.test",
+        "$5$saltstring$5B8vYYiY.CVt1RlTTf8KbXBH3hsxY/GNooZaBBGWEc5",
+    ));
+    lines.push(record_line(
+        "shacrypt6@x.test",
+        "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJuesI68u4OTLi\
+BFdcbYEdFCoEOfaS35inz1",
+    ));
+    lines.push(record_line(
+        "ldap-sha@x.test",
+        "{SHA}q/eq1kOINtvlJqojGr3i0O73TUI=",
+    ));
+    lines.push(record_line(
+        "ldap-ssha512@x.test",
+        "{SSHA512}JodACNxpTAd0DIaHvcP5uCTsFi8Ofk8+LKZP7HPwd1qWYfjZOyY7mLbLRdPMXheod9+qp\
+NFl7/Jgi5pTlPu+dWEtbmluZXRlZW4tYnl0ZS1zbHQ=",
+    ));
     // A credential-less record (no hash) is valid too.
     lines.push(r#"{"identifier":"no-cred@x.test"}"#.to_owned());
     // A blank separator line is skipped, not counted.
     lines.push(String::new());
 
-    // 25 bcrypt + scrypt + pbkdf2 + argon2 + firebase + one credential-less = 30.
-    let expected: u64 = 30;
+    // 25 bcrypt + scrypt + pbkdf2 + argon2 + firebase + 2 sha-crypt + 2 ldap
+    // + one credential-less = 34.
+    let expected: u64 = 34;
     let (report, _outcomes) = run_import(&db, &env, scope, lines).await;
     assert_eq!(report.processed, expected, "blank line not counted");
     assert_eq!(report.succeeded, expected);
     assert_eq!(report.failed, 0);
     assert_eq!(report.skipped, 0);
-    assert_eq!(count_users(&db, scope).await, 30);
+    assert_eq!(count_users(&db, scope).await, 34);
 }
 
 #[tokio::test]
@@ -1352,4 +1375,91 @@ async fn an_imported_totp_enrollment_verifies_against_the_original_authenticator
         Some(41),
         "the consumed step was not restored, so the last pre-migration code is replayable"
     );
+}
+
+/// Issue #55 criterion 4: an out-of-bounds cost is rejected with a PER-RECORD error
+/// naming that record, for every scheme that has a bound, and the good records around
+/// it still import.
+///
+/// `a_bad_record_does_not_abort_the_batch` already drives one over-cost bcrypt record,
+/// but it asserts COUNTS and throws the outcomes away. A count says two records failed;
+/// it does not say which, or why, and an engine that attributed every failure to the
+/// same key or reported an empty reason would satisfy it. The criterion is about the
+/// per-record report, so this reads the report.
+///
+/// One record per bounded parameter, rather than one representative. The bounds are
+/// enforced by a different arm of `ForeignHash::parse` per scheme, and a sweep over one
+/// scheme says nothing about the arms it did not enter.
+#[tokio::test]
+async fn every_out_of_bounds_cost_is_a_per_record_failure_naming_that_record() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x71);
+    let scope = db.seed_scope(&env).await;
+
+    // Each entry is (login handle, a hash whose cost is one step outside the bound).
+    let over_bounds = [
+        ("bcrypt-dos@x.test", format!("$2b$31${}", "a".repeat(53))),
+        (
+            "scrypt-dos@x.test",
+            "$scrypt$ln=21,r=8,p=1$c2FsdHNhbHQ$aGFzaGhhc2g".to_owned(),
+        ),
+        (
+            "pbkdf2-dos@x.test",
+            "$pbkdf2-sha256$i=10000001$c2FsdHNhbHQ$aGFzaGhhc2g".to_owned(),
+        ),
+        (
+            "argon2-dos@x.test",
+            "$argon2id$v=19$m=4194305,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo".to_owned(),
+        ),
+        (
+            "shacrypt-dos@x.test",
+            "$6$rounds=1000001$saltstring$x".to_owned(),
+        ),
+    ];
+
+    let mut lines = vec![record_line("before@x.test", &bcrypt_hash("pw"))];
+    for (identifier, hash) in &over_bounds {
+        lines.push(record_line(identifier, hash));
+    }
+    lines.push(record_line("after@x.test", &bcrypt_hash("pw")));
+
+    let (report, outcomes) = run_import(&db, &env, scope, lines).await;
+
+    let expected_failures = over_bounds.len() as u64;
+    assert_eq!(report.processed, expected_failures + 2);
+    assert_eq!(
+        report.failed, expected_failures,
+        "every out-of-bounds record must fail, and only those: {outcomes:?}"
+    );
+    assert_eq!(
+        report.succeeded, 2,
+        "the good records on either side of the failures still import"
+    );
+
+    // The attribution: one failure per bad record, keyed to THAT record.
+    let failures: Vec<(String, String)> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            RecordOutcome::Failed(error) => Some((error.key.clone(), error.reason.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures.len() as u64, expected_failures, "{outcomes:?}");
+    for (identifier, _) in &over_bounds {
+        let found = failures
+            .iter()
+            .find(|(key, _)| key == identifier)
+            .unwrap_or_else(|| {
+                panic!("no failure was reported against {identifier}: {failures:?}")
+            });
+        assert!(
+            !found.1.trim().is_empty(),
+            "{identifier} failed with an EMPTY reason, so the report says a record was \
+             dropped and nothing about why: {failures:?}"
+        );
+    }
+
+    // Nothing was silently dropped: the two good records are the two users, and the
+    // rejected ones left no partial row behind.
+    assert_eq!(count_users(&db, scope).await, 2);
 }

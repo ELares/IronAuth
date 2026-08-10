@@ -43,7 +43,7 @@ repository = "https://github.com/ELares/IronAuth"
 
 [workspace.dependencies]
 ironauth-env = { path = "crates/ironauth-env", version = "0.1.0" }
-ironauth-hash-scheme = { path = "crates/ironauth-hash-scheme", version = "0.1.0" }
+ironauth-hash-scheme = { path = "crates/ironauth-hash-scheme", version = "0.2.0" }
 ironauth-config = { path = "crates/ironauth-config", version = "0.1.0" }
 ironauth-connector = { path = "crates/ironauth-connector", version = "0.1.0" }
 ironauth-server = { path = "crates/ironauth-server", version = "0.1.0" }

@@ -20,6 +20,15 @@ It depends on **no** `ironauth-*` crate, and that is deliberate rather than inci
 | scrypt | `$scrypt$` (PHC string) |
 | PBKDF2 | `$pbkdf2-sha256$`, `$pbkdf2-sha512$` (PHC string) |
 | Firebase | modified scrypt, with the project's base64 signer key and salt separator |
+| SHA-crypt | `$5$` (SHA-256), `$6$` (SHA-512), with the optional `rounds=` |
+| LDAP / RFC 2307 | `{SHA}`, `{SSHA}`, `{SHA256}`, `{SSHA256}`, `{SHA512}`, `{SSHA512}` |
+
+The LDAP digests carry no cost parameter at all, and that is the reason
+`Scheme::rehash_is_urgent` exists. They are one unsalted or lightly salted digest pass,
+so there is nothing to bound and nothing an import check can do to make a stolen row
+expensive to attack; the only fix is to stop storing them, which means rehashing on the
+first successful login rather than eventually. The MD5 LDAP schemes (`{MD5}`, `{SMD5}`)
+are deliberately NOT recognized.
 
 The four bcrypt variants are listed separately because they are not interchangeable
 prefixes: `$2x$` exists to reproduce a bug in a specific PHP implementation, and treating it
