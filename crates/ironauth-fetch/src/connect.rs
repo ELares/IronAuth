@@ -281,7 +281,19 @@ pub(crate) fn build_tls_config() -> Result<Arc<ClientConfig>, TlsSetupError> {
         let _ = roots.add(cert);
     }
     if roots.is_empty() {
-        return Err(TlsSetupError::NoTrustRoots);
+        // Carry WHY. `load_native_certs` reports per-domain failures and the previous version
+        // discarded them, so an empty store and an unreadable one were the same message. They
+        // are not the same problem: one is a machine with no certificates, the other is a
+        // machine whose trust-settings API is refusing, which is what a sandboxed or
+        // restricted host looks like. Issue #674 cost six gate runs and a hand-applied patch
+        // to learn something already sitting in this value.
+        return Err(TlsSetupError::NoTrustRoots {
+            causes: loaded
+                .errors
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+        });
     }
     let config = client_config_with_roots(roots)?;
     Ok(Arc::new(config))
@@ -298,10 +310,18 @@ fn client_config_with_roots(roots: RootCertStore) -> Result<ClientConfig, TlsSet
     Ok(config)
 }
 
-/// A TLS client configuration with an EMPTY trust store, for tests that exercise
-/// the connector over plaintext `http` and therefore never complete a
-/// handshake. It never fails and never loads the OS store, keeping tests
-/// hermetic.
+/// A TLS client configuration with an EMPTY trust store, for tests that never complete a
+/// handshake. It never fails and never loads the OS store, keeping tests hermetic.
+///
+/// Also what [`crate::Fetcher::for_tests`] uses (issue #674). Every test that built a real
+/// fetcher was coupled to the host keychain, and when that API began refusing, three unrelated
+/// crates failed with three different-looking errors. None of them needed a root: they assert
+/// SSRF refusals, route shapes, and that a config flag builds a runtime, and not one completes
+/// a handshake to a public host.
+///
+/// An empty store is exactly right for that. `rustls` accepts it; only `build_tls_config`
+/// rejects it, and rightly, because a PRODUCTION fetcher with no roots would fail every https
+/// handshake and should say so at startup rather than at first use.
 #[cfg(feature = "test-harness")]
 pub(crate) fn test_tls_config() -> Arc<ClientConfig> {
     let config = client_config_with_roots(RootCertStore::empty())
@@ -310,11 +330,15 @@ pub(crate) fn test_tls_config() -> Arc<ClientConfig> {
 }
 
 /// Why the TLS client configuration could not be built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TlsSetupError {
     /// The OS trust store produced no usable root certificates.
-    NoTrustRoots,
+    NoTrustRoots {
+        /// What the platform said, one entry per trust-settings domain that failed. Empty
+        /// when the store genuinely holds no usable roots.
+        causes: Vec<String>,
+    },
     /// The crypto provider rejected the default protocol versions.
     Provider,
 }
@@ -322,9 +346,16 @@ pub enum TlsSetupError {
 impl std::fmt::Display for TlsSetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TlsSetupError::NoTrustRoots => {
+            TlsSetupError::NoTrustRoots { causes } if causes.is_empty() => {
                 f.write_str("no usable root certificates in the OS trust store")
             }
+            // The distinction a reader needs: the store was not merely empty, reading it
+            // FAILED, and the platform said why.
+            TlsSetupError::NoTrustRoots { causes } => write!(
+                f,
+                "could not read the OS trust store ({})",
+                causes.join("; ")
+            ),
             TlsSetupError::Provider => {
                 f.write_str("the TLS crypto provider rejected the default protocol versions")
             }
@@ -333,3 +364,39 @@ impl std::fmt::Display for TlsSetupError {
 }
 
 impl std::error::Error for TlsSetupError {}
+
+#[cfg(test)]
+mod trust_root_diagnostic_tests {
+    use super::TlsSetupError;
+
+    /// `NoTrustRoots` distinguishes an EMPTY store from an UNREADABLE one.
+    ///
+    /// The two are different problems with the same old message, and telling them apart was
+    /// worth six gate runs and a hand-applied patch on issue #674: a machine with no
+    /// certificates needs certificates, a machine whose trust-settings API is refusing needs
+    /// something else entirely. The platform already says which; the code used to drop it.
+    #[test]
+    fn no_trust_roots_says_whether_the_store_was_empty_or_unreadable() {
+        let empty = TlsSetupError::NoTrustRoots { causes: Vec::new() };
+        assert_eq!(
+            empty.to_string(),
+            "no usable root certificates in the OS trust store"
+        );
+
+        let unreadable = TlsSetupError::NoTrustRoots {
+            causes: vec![
+                "failed to load user trust settings: I/O error".to_owned(),
+                "failed to load system trust settings: I/O error".to_owned(),
+            ],
+        };
+        let rendered = unreadable.to_string();
+        assert!(
+            rendered.contains("could not read"),
+            "an unreadable store must not report as an empty one: {rendered}"
+        );
+        assert!(
+            rendered.contains("user trust settings") && rendered.contains("system trust settings"),
+            "every domain the platform named must survive into the message: {rendered}"
+        );
+    }
+}

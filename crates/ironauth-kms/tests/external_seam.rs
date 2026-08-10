@@ -17,7 +17,9 @@ use ironauth_jose::{Aad, Kek, Sealed};
 use ironauth_kms::{HttpKmsProvider, KmsError, KmsProvider, KmsProviderKind};
 
 fn fetcher() -> Arc<Fetcher> {
-    Arc::new(Fetcher::new(FetchLimits::default()).expect("build the SSRF-hardened fetcher"))
+    // Hermetic (issue #674): these assert SSRF REFUSALS and never complete a handshake, so
+    // reading the host trust store bought nothing and coupled them to the machine.
+    Arc::new(Fetcher::for_tests(FetchLimits::default()))
 }
 
 fn kek_aad() -> Aad {
