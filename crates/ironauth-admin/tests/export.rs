@@ -114,7 +114,13 @@ async fn full_export_reimports_into_a_fresh_instance_with_logins_working() {
             foreign_password_hash: Some(&bcrypt_hash),
             foreign_password_algo: Some("bcrypt"),
             traits: Some(NewUserTraits {
-                traits_json: r#"{"department":"engineering"}"#,
+                // ARRAYS and NESTED OBJECTS, not a flat string (issue #53 criterion 4:
+                // "arrays and nested objects in traits round-trip through create, PATCH,
+                // and export"). A flat scalar survives any serializer; the shapes that do
+                // not are a list, a list of objects, an empty list, and a null inside one,
+                // so the fixture carries all four. Kratos had arrays in traits broken from
+                // 2022, which is the precedent this criterion exists against.
+                traits_json: r#"{"department":"engineering","phones":[{"number":"+15550000001","label":"work"},{"number":"+15550000002","label":null}],"tags":[],"address":{"city":"Rivendell","geo":{"lat":1.5,"lon":-2.25}}}"#,
                 schema_version: Some(3),
                 visibility: TraitWriteVisibility::Admin,
             }),
@@ -222,8 +228,19 @@ async fn full_export_reimports_into_a_fresh_instance_with_logins_working() {
     assert_eq!(schema_version, 3, "the source schema version is preserved");
     assert_eq!(
         traits,
-        serde_json::json!({"department": "engineering"}),
-        "traits round-trip verbatim"
+        serde_json::json!({
+            "department": "engineering",
+            "phones": [
+                {"number": "+15550000001", "label": "work"},
+                {"number": "+15550000002", "label": null}
+            ],
+            "tags": [],
+            "address": {"city": "Rivendell", "geo": {"lat": 1.5, "lon": -2.25}}
+        }),
+        "traits round-trip verbatim, arrays and nesting included. Compared as a whole \
+         document rather than field by field: a partial comparison passes for an export \
+         that dropped a key nobody named, and an empty array and a null inside an object \
+         are exactly the values a lossy re-serialization discards"
     );
 
     // Bob's external id round-tripped (resolvable by the blind index in the new scope).
