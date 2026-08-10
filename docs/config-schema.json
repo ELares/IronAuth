@@ -64,6 +64,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "max_authzen_batch": {
+          "default": 1000,
+          "description": "The largest `AuthZEN` batch the policy decision point will evaluate in one\nrequest (issue #100).\n\nIt lives on `[admin]` and not on `[organizations]` even though it bounds a walk\nover organizations, because `[organizations]` is a SHARED section: every key of it\nis installed on the OIDC data plane too, and that plane has no `AuthZEN` surface. A\nkey there that only one plane reads is a key the other holds and never uses.\n\nA batch entry is not free: each one resolves its own organization and walks\nthe group closure, and the organization is resolved PER ENTRY because a batch\nmay span organizations. So the cost of one request is linear in the entry\ncount, and without a bound a single body turns into as many database round\ntrips as fit in it.\n\nThe bound is on the COUNT and not on the body size, because the body size\nsays nothing about the work: an entry that inherits every shared default is\ntwo bytes of JSON and a full resolution.\n\nA request over the bound is REFUSED rather than truncated. Truncating would\nreturn a short decision list indistinguishable from `deny_on_first_deny`\nstopping early, and a policy enforcement point would read the missing entries\nas never evaluated when in fact they were never sent.\n\nDefault [`MANAGEMENT_DEFAULT_MAX_AUTHZEN_BATCH`]; config load REJECTS a\nvalue above [`MANAGEMENT_MAX_AUTHZEN_BATCH_CEILING`]. `0` disables the\nbatch endpoint for every non-empty request, which is a valid posture for a\ndeployment that wants single evaluations only, and never means \"unlimited\".",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "max_page_size": {
           "default": 200,
           "description": "The largest page a list endpoint will return, regardless of a larger\ncaller-supplied `limit`. A ceiling that bounds any one response so a\ncaller cannot request an unbounded scan. Config load rejects a value above\nthe management list hard cap (1000).",
@@ -2540,6 +2547,7 @@
         "bootstrap_operator_token": null,
         "control_database_url": null,
         "default_page_size": 50,
+        "max_authzen_batch": 1000,
         "max_page_size": 200,
         "offboarding_retention_secs": 2592000,
         "sudo_mode_enabled": false,

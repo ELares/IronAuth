@@ -76,6 +76,16 @@ use crate::views::{
                                            in M10 (an immutable slug an authorization decision \
                                            keys on, plus a mutable label); what it grants is \
                                            issue #98. Uncapped in number by covenant"),
+        (name = "authzen", description = "The AuthZEN Authorization API 1.0 policy \
+                                         decision point (issue #100): runtime authorization \
+                                         checks answered from IronAuth's OWN organizations, \
+                                         groups, roles and permissions, over the same \
+                                         resolution the token claims are built from. NOT a \
+                                         Zanzibar engine: relationship-based authorization \
+                                         is an explicit non-goal and integrates through \
+                                         seams instead. The Search APIs are deferred and the \
+                                         discovery document says so rather than omitting \
+                                         them"),
         (name = "permissions", description = "The permission vocabulary (issue #98): the named \
                                              API capabilities an ENVIRONMENT defines. Scoped to \
                                              the environment and NOT to an organization, because \

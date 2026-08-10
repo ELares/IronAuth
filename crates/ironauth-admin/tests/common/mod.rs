@@ -186,6 +186,27 @@ impl Harness {
         }
     }
 
+    /// A router whose `AuthZEN` batch bound is `max_authzen_batch` (issue #100).
+    pub async fn start_with_authzen_batch(default_page_size: u32, max_authzen_batch: u32) -> Self {
+        let mut db = TestDatabase::start().await;
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            max_authzen_batch,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds");
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+            txt: None,
+        }
+    }
     /// Start a fresh database and router with an explicit organization group nesting
     /// bound (issue #97), so a test can drive the depth refusal with a handful of
     /// groups instead of the shipped default's nine.

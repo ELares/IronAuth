@@ -174,6 +174,10 @@ struct Inner {
     // behaves like a default deployment. Bounds tree DEPTH only; nothing counted is
     // capped.
     max_group_depth: u32,
+
+    // The AuthZEN batch bound (issue #100), installed on the boot path from
+    // `organizations.max_authzen_batch` and read by the batch evaluation handler.
+    max_authzen_batch: u32,
     outbox_visibility_timeout_secs: u64,
     // The deployment-wide login-identifier uniqueness policy (issue #54), installed by
     // the boot path from the top-level `[identifiers]` section and passed to every
@@ -300,6 +304,11 @@ impl AdminState {
         // configured max above the cap; clamping here is defense in depth for a
         // state built directly (for example in a test).
         let hard_cap = u32::try_from(MANAGEMENT_LIST_HARD_CAP).unwrap_or(u32::MAX);
+        // Clamped here as well as at config load, exactly as the page size is: a bound
+        // whose only enforcement is at parse time is one a directly built state can exceed.
+        let max_authzen_batch = config
+            .max_authzen_batch
+            .min(ironauth_config::MANAGEMENT_MAX_AUTHZEN_BATCH_CEILING);
         let max_page_size = config.max_page_size.max(1).min(hard_cap);
         let default_page_size = config.default_page_size.max(1).min(max_page_size);
         Ok(Self {
@@ -318,6 +327,7 @@ impl AdminState {
                 migration_hook: None,
                 federation: None,
                 max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
+                max_authzen_batch,
                 outbox_visibility_timeout_secs: ironauth_config::OutboxConfig::default()
                     .visibility_timeout_secs,
                 identifier_uniqueness: UniquenessMode::EnvironmentWide,
@@ -642,6 +652,12 @@ impl AdminState {
     #[must_use]
     pub fn max_group_depth(&self) -> u32 {
         self.inner.max_group_depth
+    }
+
+    /// The configured `AuthZEN` batch bound (issue #100), from `admin.max_authzen_batch`.
+    #[must_use]
+    pub fn max_authzen_batch(&self) -> u32 {
+        self.inner.max_authzen_batch
     }
 
     /// Install the deployment-wide login-identifier uniqueness policy (issue #54).

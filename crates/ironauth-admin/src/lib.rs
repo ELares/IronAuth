@@ -538,7 +538,7 @@ pub fn management_router(state: AdminState) -> Router {
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/.well-known/authzen-configuration",
-            axum::routing::get(authzen::get_authzen_configuration),
+            get(authzen::get_authzen_configuration),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluation",

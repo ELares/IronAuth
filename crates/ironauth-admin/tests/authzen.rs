@@ -919,3 +919,82 @@ async fn every_decision_agrees_with_the_resolution_the_token_claims_are_built_fr
         );
     }
 }
+
+/// A batch over `admin.max_authzen_batch` is REFUSED, not truncated, and the bound is
+/// read from configuration rather than baked in.
+///
+/// Truncation is the failure this asserts against. A short decision list is exactly what
+/// `deny_on_first_deny` produces, so an endpoint that silently dropped the tail would hand a
+/// policy enforcement point a response it would read as "the rest were denied" when in fact
+/// they were never evaluated. The refusal is checked BEFORE any entry is evaluated, which is
+/// the point of the bound: it exists to stop the work, not to trim the answer.
+#[tokio::test]
+async fn a_batch_over_the_configured_bound_is_refused_rather_than_truncated() {
+    let h = Harness::start_with_authzen_batch(50, 2).await;
+    let f = Fixture::build(&h).await;
+    let path = format!("{}/access/v1/evaluations", f.base());
+    let request = |count: usize| {
+        json!({
+            "subject": { "type": "user", "id": f.user },
+            "resource": { "type": GRANTED_TYPE },
+            "action": { "name": GRANTED_ACTION },
+            "context": { "organization_id": f.granted },
+            "evaluations": vec![json!({}); count],
+        })
+        .to_string()
+    };
+
+    // At the bound, every entry is evaluated.
+    let (status, _, body) = h.post(&path, "cap-at", &request(2)).await;
+    assert_eq!(status, StatusCode::OK, "a batch AT the bound: {body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("json")["evaluations"]
+            .as_array()
+            .expect("array")
+            .len(),
+        2,
+        "the bound is inclusive, or an operator setting 2 gets 1"
+    );
+
+    // One over, and the whole request is refused.
+    let (status, _, body) = h.post(&path, "cap-over", &request(3)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a batch OVER the bound must be refused, never truncated: a short list is \
+         indistinguishable from deny_on_first_deny stopping early: {body}"
+    );
+    assert!(
+        body.contains("batch_too_large"),
+        "the refusal must name the rule so a PEP author can act on it: {body}"
+    );
+    assert!(
+        !body.contains("\"evaluations\""),
+        "a refusal must carry NO decisions, or a caller reads a partial answer as the \
+         answer: {body}"
+    );
+
+    // The default deployment evaluates a batch this size without complaint, so the refusal
+    // above is the CONFIGURED bound and not a constant this test happened to exceed.
+    let d = Harness::start(50).await;
+    let g = Fixture::build(&d).await;
+    let (status, _, body) = d
+        .post(
+            &format!("{}/access/v1/evaluations", g.base()),
+            "cap-default",
+            &json!({
+                "subject": { "type": "user", "id": g.user },
+                "resource": { "type": GRANTED_TYPE },
+                "action": { "name": GRANTED_ACTION },
+                "context": { "organization_id": g.granted },
+                "evaluations": vec![json!({}); 3],
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the shipped default must not refuse three evaluations: {body}"
+    );
+}

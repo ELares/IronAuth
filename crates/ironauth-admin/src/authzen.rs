@@ -201,7 +201,7 @@ pub struct AuthzenConfiguration {
     get,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/.well-known/authzen-configuration",
     operation_id = "getAuthzenConfiguration",
-    tag = "org-roles",
+    tag = "authzen",
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier")
@@ -246,7 +246,7 @@ pub async fn get_authzen_configuration(
     post,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluation",
     operation_id = "authzenEvaluation",
-    tag = "org-roles",
+    tag = "authzen",
     request_body = AuthzenEvaluationRequest,
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
@@ -308,7 +308,7 @@ pub async fn authzen_evaluation(
     post,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluations",
     operation_id = "authzenEvaluations",
-    tag = "org-roles",
+    tag = "authzen",
     request_body = AuthzenEvaluationsRequest,
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
@@ -338,6 +338,20 @@ pub async fn authzen_evaluations(
     require_live_environment(&state, &scope).await?;
     let request: AuthzenEvaluationsRequest = parse_json(&body)?;
 
+    // The bound BEFORE the loop and before the allocation. Refused rather than truncated:
+    // a short decision list is indistinguishable from `deny_on_first_deny` stopping early,
+    // so a truncating endpoint would tell a PEP that entries were denied when they were
+    // never sent to it. See `admin.max_authzen_batch`.
+    let limit = state.max_authzen_batch() as usize;
+    if request.evaluations.len() > limit {
+        return Err(bad(
+            "batch_too_large",
+            &format!(
+                "this deployment evaluates at most {limit} evaluations per request; split \
+                 the batch"
+            ),
+        ));
+    }
     let mut decisions = Vec::with_capacity(request.evaluations.len());
     for item in &request.evaluations {
         let subject = item
