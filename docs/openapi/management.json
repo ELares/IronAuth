@@ -872,6 +872,81 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/.well-known/authzen-configuration": {
+      "get": {
+        "tags": [
+          "authzen"
+        ],
+        "operationId": "getAuthzenConfiguration",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The PDP metadata for this environment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthzenConfiguration"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans": {
       "get": {
         "tags": [
@@ -1170,6 +1245,196 @@
           },
           "422": {
             "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluation": {
+      "post": {
+        "tags": [
+          "authzen"
+        ],
+        "operationId": "authzenEvaluation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthzenEvaluationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The decision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthzenDecision"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, an unknown subject type, or no context.organization_id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is soft-deleted, or the organization is not a live row of this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluations": {
+      "post": {
+        "tags": [
+          "authzen"
+        ],
+        "operationId": "authzenEvaluations",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthzenEvaluationsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The decisions, in request order, shorter than the request when deny_on_first_deny stopped it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthzenDecisions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, an entry missing a required field after defaults, an unknown subject type, or no organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is soft-deleted, or the organization is not a live row of this scope",
             "content": {
               "application/json": {
                 "schema": {
@@ -21769,6 +22034,264 @@
           }
         }
       },
+      "AuthzenAction": {
+        "type": "object",
+        "description": "The `AuthZEN` action: what is being done.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The action name, the second half of the permission slug."
+          }
+        }
+      },
+      "AuthzenBatchItem": {
+        "type": "object",
+        "description": "One entry in a batch, with every field optional so it can inherit a default.",
+        "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AuthzenAction",
+                "description": "Overrides the shared action."
+              }
+            ]
+          },
+          "context": {
+            "description": "Overrides the shared context."
+          },
+          "resource": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AuthzenResource",
+                "description": "Overrides the shared resource."
+              }
+            ]
+          },
+          "subject": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AuthzenSubject",
+                "description": "Overrides the shared subject."
+              }
+            ]
+          }
+        }
+      },
+      "AuthzenConfiguration": {
+        "type": "object",
+        "description": "The `PDP` discovery document.",
+        "required": [
+          "policy_decision_point",
+          "access_evaluation_endpoint",
+          "access_evaluations_endpoint"
+        ],
+        "properties": {
+          "access_evaluation_endpoint": {
+            "type": "string",
+            "description": "The single Access Evaluation endpoint."
+          },
+          "access_evaluations_endpoint": {
+            "type": "string",
+            "description": "The batch Access Evaluations endpoint."
+          },
+          "action_search_endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Deferred, as above."
+          },
+          "policy_decision_point": {
+            "type": "string",
+            "description": "The `PDP` root these endpoints hang off."
+          },
+          "resource_search_endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Deferred, as above."
+          },
+          "subject_search_endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Search APIs are deferred (issue #100), so the document says so rather than omitting\nthem: a `PEP` that discovers no key cannot tell \"not supported\" from \"older document\"."
+          }
+        }
+      },
+      "AuthzenDecision": {
+        "type": "object",
+        "description": "One evaluation decision.",
+        "required": [
+          "decision"
+        ],
+        "properties": {
+          "decision": {
+            "type": "boolean",
+            "description": "Whether the subject holds the mapped permission in the named organization."
+          }
+        }
+      },
+      "AuthzenDecisions": {
+        "type": "object",
+        "description": "A batch of decisions.",
+        "required": [
+          "evaluations"
+        ],
+        "properties": {
+          "evaluations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuthzenDecision"
+            },
+            "description": "One decision per evaluation performed, in request order. Shorter than the request when\n`deny_on_first_deny` stopped it early."
+          }
+        }
+      },
+      "AuthzenEvaluationRequest": {
+        "type": "object",
+        "description": "One evaluation request.",
+        "required": [
+          "subject",
+          "resource",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/AuthzenAction",
+            "description": "What they are doing."
+          },
+          "context": {
+            "description": "Free-form context. `IronAuth` reads exactly one key, `organization_id`."
+          },
+          "resource": {
+            "$ref": "#/components/schemas/AuthzenResource",
+            "description": "What they are reaching."
+          },
+          "subject": {
+            "$ref": "#/components/schemas/AuthzenSubject",
+            "description": "Who is asking."
+          }
+        }
+      },
+      "AuthzenEvaluationsRequest": {
+        "type": "object",
+        "description": "A batch of evaluations.",
+        "required": [
+          "evaluations"
+        ],
+        "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AuthzenAction",
+                "description": "Shared action default."
+              }
+            ]
+          },
+          "context": {
+            "description": "Shared context default."
+          },
+          "evaluations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuthzenBatchItem"
+            },
+            "description": "The evaluations, each overriding the defaults above where it names a value."
+          },
+          "options": {
+            "$ref": "#/components/schemas/AuthzenOptions",
+            "description": "Evaluation options."
+          },
+          "resource": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AuthzenResource",
+                "description": "Shared resource default."
+              }
+            ]
+          },
+          "subject": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AuthzenSubject",
+                "description": "Defaults shared by every entry, so a caller need not repeat the subject."
+              }
+            ]
+          }
+        }
+      },
+      "AuthzenOptions": {
+        "type": "object",
+        "description": "Batch evaluation options.",
+        "properties": {
+          "deny_on_first_deny": {
+            "type": "boolean",
+            "description": "Stop at the first `false` and return the decisions so far.\n\nThe remaining entries are ABSENT rather than reported as denied. A caller that received\n`false` for an evaluation nothing performed could not tell a real deny from an early\nexit, and would cache the wrong answer."
+          }
+        }
+      },
+      "AuthzenResource": {
+        "type": "object",
+        "description": "The `AuthZEN` resource: what is being reached.",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The instance identifier. Accepted because `AuthZEN` 1.0 defines it and a `PEP` will\nsend it, and NOT consulted: `IronAuth` grants permissions per organization, not per\ninstance, so a decision that varied by instance would be answering a question this\nmodel cannot decide.\n\nThe allow is the honest spelling of that. Reading the field into a discard to quiet the\nlint would read like the value participates in something."
+          },
+          "type": {
+            "type": "string",
+            "description": "The resource type, the first half of the permission slug."
+          }
+        }
+      },
+      "AuthzenSubject": {
+        "type": "object",
+        "description": "The `AuthZEN` subject: who is asking.",
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The `usr_` or `sva_` identifier, matching the declared type."
+          },
+          "type": {
+            "type": "string",
+            "description": "`user` or `service_account`. Any other type is refused rather than treated as a user."
+          }
+        }
+      },
       "AutoLinkPostureView": {
         "type": "object",
         "description": "An environment's stored account-linking posture.",
@@ -28201,6 +28724,10 @@
     {
       "name": "org-roles",
       "description": "Organization roles (issue #97): first-class, per-organization named roles. A role is a NAME only in M10 (an immutable slug an authorization decision keys on, plus a mutable label); what it grants is issue #98. Uncapped in number by covenant"
+    },
+    {
+      "name": "authzen",
+      "description": "The AuthZEN Authorization API 1.0 policy decision point (issue #100): runtime authorization checks answered from IronAuth's OWN organizations, groups, roles and permissions, over the same resolution the token claims are built from. NOT a Zanzibar engine: relationship-based authorization is an explicit non-goal and integrates through seams instead. The Search APIs are deferred and the discovery document says so rather than omitting them"
     },
     {
       "name": "permissions",

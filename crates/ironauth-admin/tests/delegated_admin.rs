@@ -1419,3 +1419,85 @@ async fn assert_each_missing_justification_names_its_rule(h: &Harness, route: &s
         );
     }
 }
+
+/// Every `AuthZEN` endpoint demands `management.read`, and unauthenticated evaluation is never
+/// served (issue #100).
+///
+/// The issue states that last part as a requirement, so it is asserted rather than assumed: a
+/// PDP that answers without a credential hands an attacker a permission oracle for every
+/// subject in the environment.
+///
+/// The positive half matters as much. A credential holding a WRITE but not `management.read`
+/// must be refused, which is what says the endpoints demand that specific permission rather
+/// than merely some permission; the classification pin cannot see the difference.
+#[tokio::test]
+async fn the_authzen_endpoints_demand_read_and_never_answer_unauthenticated() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "az-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "az-mint").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let evaluation = format!("{base}/access/v1/evaluation");
+    let evaluations = format!("{base}/access/v1/evaluations");
+    let discovery = format!("{base}/.well-known/authzen-configuration");
+
+    // Read-granted: the discovery document is served and names the two endpoints.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&discovery, &secret).await;
+    assert_eq!(status, StatusCode::OK, "discovery under read: {body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(document["access_evaluation_endpoint"], evaluation);
+    assert_eq!(document["access_evaluations_endpoint"], evaluations);
+    assert!(
+        document["subject_search_endpoint"].is_null(),
+        "the search APIs are deferred and the document must SAY so rather than omit the key, \
+         or a PEP cannot tell `not supported` from `older document`: {body}"
+    );
+
+    // A credential holding a write but not read is refused all three.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    for (label, response) in [
+        ("discovery", h.get_as(&discovery, &secret).await),
+        (
+            "evaluation",
+            h.post_as(&evaluation, &secret, "az-1", "{}").await,
+        ),
+        (
+            "evaluations",
+            h.post_as(&evaluations, &secret, "az-2", "{}").await,
+        ),
+    ] {
+        let (status, _, body) = response;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{label} answered a credential without management.read: {body}"
+        );
+        assert!(
+            body.contains("management.read"),
+            "{label} must name the permission it wanted: {body}"
+        );
+    }
+
+    // And with no credential at all. `get_as` with an EMPTY bearer is the unauthenticated
+    // case; `get` carries the harness operator token and would prove nothing.
+    let (status, _, body) = h.get_as(&discovery, "").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "discovery answered an unauthenticated caller: {body}"
+    );
+    let (status, _, body) = h.post_unauthenticated(&evaluation, "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "evaluation answered an unauthenticated caller, which is a permission oracle for \
+         every subject in the environment: {body}"
+    );
+}

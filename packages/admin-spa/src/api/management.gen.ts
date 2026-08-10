@@ -147,6 +147,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/.well-known/authzen-configuration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getAuthzenConfiguration"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans": {
         parameters: {
             query?: never;
@@ -176,6 +192,38 @@ export interface paths {
         put?: never;
         /** Lift a credential-abuse ban. */
         post: operations["liftBan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["authzenEvaluation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["authzenEvaluations"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3026,6 +3074,106 @@ export interface components {
              *     reads.
              */
             reason_text: string;
+        };
+        /** @description The `AuthZEN` action: what is being done. */
+        AuthzenAction: {
+            /** @description The action name, the second half of the permission slug. */
+            name: string;
+        };
+        /** @description One entry in a batch, with every field optional so it can inherit a default. */
+        AuthzenBatchItem: {
+            action?: null | components["schemas"]["AuthzenAction"];
+            /** @description Overrides the shared context. */
+            context?: unknown;
+            resource?: null | components["schemas"]["AuthzenResource"];
+            subject?: null | components["schemas"]["AuthzenSubject"];
+        };
+        /** @description The `PDP` discovery document. */
+        AuthzenConfiguration: {
+            /** @description The single Access Evaluation endpoint. */
+            access_evaluation_endpoint: string;
+            /** @description The batch Access Evaluations endpoint. */
+            access_evaluations_endpoint: string;
+            /** @description Deferred, as above. */
+            action_search_endpoint?: string | null;
+            /** @description The `PDP` root these endpoints hang off. */
+            policy_decision_point: string;
+            /** @description Deferred, as above. */
+            resource_search_endpoint?: string | null;
+            /**
+             * @description Search APIs are deferred (issue #100), so the document says so rather than omitting
+             *     them: a `PEP` that discovers no key cannot tell "not supported" from "older document".
+             */
+            subject_search_endpoint?: string | null;
+        };
+        /** @description One evaluation decision. */
+        AuthzenDecision: {
+            /** @description Whether the subject holds the mapped permission in the named organization. */
+            decision: boolean;
+        };
+        /** @description A batch of decisions. */
+        AuthzenDecisions: {
+            /**
+             * @description One decision per evaluation performed, in request order. Shorter than the request when
+             *     `deny_on_first_deny` stopped it early.
+             */
+            evaluations: components["schemas"]["AuthzenDecision"][];
+        };
+        /** @description One evaluation request. */
+        AuthzenEvaluationRequest: {
+            /** @description What they are doing. */
+            action: components["schemas"]["AuthzenAction"];
+            /** @description Free-form context. `IronAuth` reads exactly one key, `organization_id`. */
+            context?: unknown;
+            /** @description What they are reaching. */
+            resource: components["schemas"]["AuthzenResource"];
+            /** @description Who is asking. */
+            subject: components["schemas"]["AuthzenSubject"];
+        };
+        /** @description A batch of evaluations. */
+        AuthzenEvaluationsRequest: {
+            action?: null | components["schemas"]["AuthzenAction"];
+            /** @description Shared context default. */
+            context?: unknown;
+            /** @description The evaluations, each overriding the defaults above where it names a value. */
+            evaluations: components["schemas"]["AuthzenBatchItem"][];
+            /** @description Evaluation options. */
+            options?: components["schemas"]["AuthzenOptions"];
+            resource?: null | components["schemas"]["AuthzenResource"];
+            subject?: null | components["schemas"]["AuthzenSubject"];
+        };
+        /** @description Batch evaluation options. */
+        AuthzenOptions: {
+            /**
+             * @description Stop at the first `false` and return the decisions so far.
+             *
+             *     The remaining entries are ABSENT rather than reported as denied. A caller that received
+             *     `false` for an evaluation nothing performed could not tell a real deny from an early
+             *     exit, and would cache the wrong answer.
+             */
+            deny_on_first_deny?: boolean;
+        };
+        /** @description The `AuthZEN` resource: what is being reached. */
+        AuthzenResource: {
+            /**
+             * @description The instance identifier. Accepted because `AuthZEN` 1.0 defines it and a `PEP` will
+             *     send it, and NOT consulted: `IronAuth` grants permissions per organization, not per
+             *     instance, so a decision that varied by instance would be answering a question this
+             *     model cannot decide.
+             *
+             *     The allow is the honest spelling of that. Reading the field into a discard to quiet the
+             *     lint would read like the value participates in something.
+             */
+            id?: string | null;
+            /** @description The resource type, the first half of the permission slug. */
+            type: string;
+        };
+        /** @description The `AuthZEN` subject: who is asking. */
+        AuthzenSubject: {
+            /** @description The `usr_` or `sva_` identifier, matching the declared type. */
+            id: string;
+            /** @description `user` or `service_account`. Any other type is refused rather than treated as a user. */
+            type: string;
         };
         /** @description An environment's stored account-linking posture. */
         AutoLinkPostureView: {
@@ -7753,6 +7901,58 @@ export interface operations {
             };
         };
     };
+    getAuthzenConfiguration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The PDP metadata for this environment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthzenConfiguration"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     listBans: {
         parameters: {
             query?: never;
@@ -7959,6 +8159,136 @@ export interface operations {
             };
             /** @description Idempotency-Key reused with a different request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    authzenEvaluation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthzenEvaluationRequest"];
+            };
+        };
+        responses: {
+            /** @description The decision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthzenDecision"];
+                };
+            };
+            /** @description Malformed request, an unknown subject type, or no context.organization_id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is soft-deleted, or the organization is not a live row of this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    authzenEvaluations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthzenEvaluationsRequest"];
+            };
+        };
+        responses: {
+            /** @description The decisions, in request order, shorter than the request when deny_on_first_deny stopped it */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthzenDecisions"];
+                };
+            };
+            /** @description Malformed request, an entry missing a required field after defaults, an unknown subject type, or no organization */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is soft-deleted, or the organization is not a live row of this scope */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

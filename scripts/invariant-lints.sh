@@ -80,6 +80,26 @@ scan time-via-env 'SystemTime::now|Instant::now' 2
 scan entropy-via-env 'getrandom::|(^|[^A-Za-z0-9_])rand::|rand_core::' 1
 scan typ-via-declaration '(\.|::)\s*with_typ\s*\(' 11
 
+# Rule fetcher-in-integration-tests: no integration test constructs a REAL `Fetcher`.
+#
+#   `Fetcher::new` loads the HOST's trust store. On macOS that intermittently answers
+#   `errSecIO` for all three trust-settings domains, and construction then fails with
+#   `NoTrustRoots`, so a suite that never touches the network still fails on a developer
+#   machine and passes on CI. Six surfaces did exactly that. `Fetcher::for_tests` takes the
+#   same limits and a hermetic trust config, so the failure cannot depend on the host.
+#
+#   Integration tests only. A `src` call site IS the production path and must stay `new`; a
+#   unit test inside a `src` file cannot be told apart from its module by a text scan, and
+#   the rule says what it can prove rather than pretending to a reach it does not have.
+fetcher_hits=$(grep -rn --include='*.rs' -E 'Fetcher::new[[:space:]]*\(' crates/*/tests 2>/dev/null || true)
+if [ -n "$fetcher_hits" ]; then
+  echo "invariant-lints: rule 'fetcher-in-integration-tests' violated:"
+  echo "$fetcher_hits"
+  echo "  Use Fetcher::for_tests (feature test-harness) so the suite does not read the"
+  echo "  host trust store and fail with NoTrustRoots on a machine with a flaky one."
+  fail=1
+fi
+
 # Rule session-mint-registry: every call site of `interaction::establish_session`, the ONE
 #   function that mints a primary session (and carries the issue #80/#52 account-lifecycle
 #   fence), is pinned in docs/design/session-mint-sites.txt and justified in

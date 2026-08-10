@@ -1630,6 +1630,22 @@ impl Default for DatabaseConfig {
 /// two together). Config load rejects an `admin.max_page_size` above it.
 pub const MANAGEMENT_LIST_HARD_CAP: u32 = 1000;
 
+/// The default largest `AuthZEN` batch the policy decision point will evaluate in one
+/// request (issue #100). Every entry costs an organization resolution and a group-closure
+/// walk, so an unbounded batch turns ONE request into as many database round trips as fit
+/// in a request body: the amplification is the reason a bound exists at all, and it is why
+/// the bound is on the COUNT rather than on the body size, which says nothing about the work.
+///
+/// 1000 is far above what a policy enforcement point rendering one page asks for and far
+/// below what makes a single request expensive. A caller that genuinely needs more splits
+/// the batch, which is also what keeps one slow entry from holding the rest.
+pub const MANAGEMENT_DEFAULT_MAX_AUTHZEN_BATCH: u32 = 1000;
+
+/// The hard ceiling on `admin.max_authzen_batch` (issue #100). Config load refuses
+/// any larger value, for the reason the default exists: the setting bounds work per request,
+/// and a bound an operator can raise without limit is not one.
+pub const MANAGEMENT_MAX_AUTHZEN_BATCH_CEILING: u32 = 10_000;
+
 /// Management API settings (issue #11).
 ///
 /// The management API is the OpenAPI-first control plane on the management port.
@@ -1758,6 +1774,35 @@ pub struct AdminConfig {
     /// are avoided by running the backfill from one replica.
     #[serde(default)]
     pub backfill_signing_algorithms_on_start: bool,
+
+    /// The largest `AuthZEN` batch the policy decision point will evaluate in one
+    /// request (issue #100).
+    ///
+    /// It lives on `[admin]` and not on `[organizations]` even though it bounds a walk
+    /// over organizations, because `[organizations]` is a SHARED section: every key of it
+    /// is installed on the OIDC data plane too, and that plane has no `AuthZEN` surface. A
+    /// key there that only one plane reads is a key the other holds and never uses.
+    ///
+    /// A batch entry is not free: each one resolves its own organization and walks
+    /// the group closure, and the organization is resolved PER ENTRY because a batch
+    /// may span organizations. So the cost of one request is linear in the entry
+    /// count, and without a bound a single body turns into as many database round
+    /// trips as fit in it.
+    ///
+    /// The bound is on the COUNT and not on the body size, because the body size
+    /// says nothing about the work: an entry that inherits every shared default is
+    /// two bytes of JSON and a full resolution.
+    ///
+    /// A request over the bound is REFUSED rather than truncated. Truncating would
+    /// return a short decision list indistinguishable from `deny_on_first_deny`
+    /// stopping early, and a policy enforcement point would read the missing entries
+    /// as never evaluated when in fact they were never sent.
+    ///
+    /// Default [`MANAGEMENT_DEFAULT_MAX_AUTHZEN_BATCH`]; config load REJECTS a
+    /// value above [`MANAGEMENT_MAX_AUTHZEN_BATCH_CEILING`]. `0` disables the
+    /// batch endpoint for every non-empty request, which is a valid posture for a
+    /// deployment that wants single evaluations only, and never means "unlimited".
+    pub max_authzen_batch: u32,
 }
 
 /// The default admin sudo re-authentication freshness window: ten minutes (issue #73).
@@ -1782,6 +1827,7 @@ impl Default for AdminConfig {
             sudo_mode_enabled: false,
             sudo_mode_window_secs: default_sudo_mode_window_secs(),
             backfill_signing_algorithms_on_start: false,
+            max_authzen_batch: MANAGEMENT_DEFAULT_MAX_AUTHZEN_BATCH,
         }
     }
 }
@@ -4857,17 +4903,12 @@ impl Config {
     ///
     /// [`ConfigError::Invalid`] if `admin.max_page_size` exceeds the management
     /// list hard cap (a larger cap would let the store's has-next sentinel be
-    /// clamped away, hiding the last page).
+    /// clamped away, hiding the last page), or if `admin.max_authzen_batch`
+    /// exceeds its ceiling (a bound an operator can raise without limit is not
+    /// one), or for any of the other per-section rules below.
     fn validate(&self) -> Result<(), ConfigError> {
         check_byok_unconsumed(&self.byok)?;
-        if self.admin.max_page_size > MANAGEMENT_LIST_HARD_CAP {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "admin.max_page_size ({}) must not exceed the management list hard cap ({MANAGEMENT_LIST_HARD_CAP})",
-                    self.admin.max_page_size
-                ),
-            });
-        }
+        validate_admin(&self.admin)?;
         check_oidc_lifetime(
             "oidc.authorization_code_ttl_secs",
             self.oidc.authorization_code_ttl_secs,
@@ -5046,6 +5087,30 @@ fn validate_organizations(organizations: &OrganizationsConfig) -> Result<(), Con
                 "organizations.max_group_depth ({}) must not exceed \
                  {ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING}",
                 organizations.max_group_depth
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate the management API settings, extracted from [`Config::validate`] for the
+/// reason `validate_organizations` was: one section's rules read as a unit, and the
+/// combined function grew past the crate's length lint when the second rule landed.
+fn validate_admin(admin: &AdminConfig) -> Result<(), ConfigError> {
+    if admin.max_authzen_batch > MANAGEMENT_MAX_AUTHZEN_BATCH_CEILING {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "admin.max_authzen_batch ({}) must not exceed \
+                 {MANAGEMENT_MAX_AUTHZEN_BATCH_CEILING}",
+                admin.max_authzen_batch
+            ),
+        });
+    }
+    if admin.max_page_size > MANAGEMENT_LIST_HARD_CAP {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "admin.max_page_size ({}) must not exceed the management list hard cap ({MANAGEMENT_LIST_HARD_CAP})",
+                admin.max_page_size
             ),
         });
     }

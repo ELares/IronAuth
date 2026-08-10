@@ -1019,6 +1019,41 @@ fn impersonation_cases(base: &str) -> Vec<Case> {
     }]
 }
 
+/// The `AuthZEN` PDP's two evaluation endpoints (issue #100).
+///
+/// They are POSTs that decide rather than write, but the property this file is about is the
+/// one they share with every write: an absent environment must be refused by `resolve_scope`
+/// before anything downstream runs. Both bodies are well formed and name an organization, so a
+/// pass here is the SCOPE refusing and not the handler's own 400 for a malformed request.
+fn authzen_cases(base: &str) -> Vec<Case> {
+    let body = |batch: bool| {
+        let mut request = serde_json::json!({
+            "subject": { "type": "user", "id": "usr_absent" },
+            "resource": { "type": "billing.invoice" },
+            "action": { "name": "read" },
+            "context": { "organization_id": "org_absent" },
+        });
+        if batch {
+            request["evaluations"] = serde_json::json!([{}]);
+        }
+        Some(request.to_string())
+    };
+    vec![
+        Case {
+            label: "authzen.authzenEvaluation",
+            method: "POST",
+            path: format!("{base}/access/v1/evaluation"),
+            body: body(false),
+        },
+        Case {
+            label: "authzen.authzenEvaluations",
+            method: "POST",
+            path: format!("{base}/access/v1/evaluations"),
+            body: body(true),
+        },
+    ]
+}
+
 fn personal_access_token_cases(base: &str) -> Vec<Case> {
     vec![
         Case {
@@ -1211,6 +1246,7 @@ fn all_cases(tenant: &str, environment: &str) -> Vec<Case> {
     cases.extend(org_membership_cases(&base, &ids));
     cases.extend(personal_access_token_cases(&base));
     cases.extend(impersonation_cases(&base));
+    cases.extend(authzen_cases(&base));
     cases.extend(org_role_cases(&base, &ids));
     cases
 }

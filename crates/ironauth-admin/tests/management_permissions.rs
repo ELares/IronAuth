@@ -293,6 +293,9 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ),
     ("listServiceAccountApiKeys", ManagementPermission::Read),
     ("getClientServiceAccount", ManagementPermission::Read),
+    ("getAuthzenConfiguration", ManagementPermission::Read),
+    ("authzenEvaluation", ManagementPermission::Read),
+    ("authzenEvaluations", ManagementPermission::Read),
     (
         "authorizeUserImpersonation",
         ManagementPermission::Impersonate,
@@ -551,6 +554,11 @@ const PERMISSION_PROVEN: &[&str] = &[
     // Proven in `only_a_credential_holding_impersonate_can_authorize_one`, which drives a
     // credential holding every OTHER permission and asserts the refusal names this one.
     "authorizeUserImpersonation",
+    // Proven in `the_authzen_endpoints_demand_read_and_never_answer_unauthenticated`, which
+    // drives a credential holding a WRITE but not read and asserts each refusal names read.
+    "getAuthzenConfiguration",
+    "authzenEvaluation",
+    "authzenEvaluations",
 ];
 
 /// Not every unproven operation CAN be proven the same way.
@@ -585,7 +593,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        157,
+        160,
         "the classified set changed size; update the unproven count below with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -608,6 +616,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
         include_str!("../src/personal_access_tokens.rs"),
     ),
     ("impersonation.rs", include_str!("../src/impersonation.rs")),
+    ("authzen.rs", include_str!("../src/authzen.rs")),
     ("users.rs", include_str!("../src/users.rs")),
     ("organizations.rs", include_str!("../src/organizations.rs")),
     ("memberships.rs", include_str!("../src/memberships.rs")),

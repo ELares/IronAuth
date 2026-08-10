@@ -43,6 +43,7 @@
 
 mod api_keys;
 mod auth;
+mod authzen;
 mod backfill;
 mod bans;
 mod brand_assets;
@@ -534,6 +535,18 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}/rotate",
             post(service_account_keys::rotate_service_account_api_key),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/.well-known/authzen-configuration",
+            get(authzen::get_authzen_configuration),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluation",
+            post(authzen::authzen_evaluation),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluations",
+            post(authzen::authzen_evaluations),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/impersonation",
