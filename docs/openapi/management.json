@@ -18878,6 +18878,110 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/impersonation": {
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "operationId": "authorizeUserImpersonation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The user to be impersonated",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthorizeImpersonationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Authorized. The handle is redeemed once for a flagged, capped session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImpersonationAuthorized"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, or a justification that is missing, blank, or a duration past the 60 minute cap. The error code names the rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope, or the credential does not hold management.impersonate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The user is not a live row of this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens": {
       "get": {
         "tags": [
@@ -21639,6 +21743,32 @@
           }
         }
       },
+      "AuthorizeImpersonationRequest": {
+        "type": "object",
+        "description": "The authorize request.",
+        "required": [
+          "reason_code",
+          "reason_text"
+        ],
+        "properties": {
+          "duration_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How long the impersonation may last, in seconds. Absent means the full cap.\n\nA value ABOVE the cap is refused rather than clamped. Silently shortening it would tell\nan operator their sixty-first minute was granted."
+          },
+          "reason_code": {
+            "type": "string",
+            "description": "The structured reason, from the operator's vocabulary. Required."
+          },
+          "reason_text": {
+            "type": "string",
+            "description": "The written justification. Required, and required to be more than blank: a category\nalone answers \"what kind\" and not \"why this user, right now\", which is what an auditor\nreads."
+          }
+        }
+      },
       "AutoLinkPostureView": {
         "type": "object",
         "description": "An environment's stored account-linking posture.",
@@ -23727,6 +23857,30 @@
           "verified": {
             "type": "boolean",
             "description": "Whether this identifier has been verified."
+          }
+        }
+      },
+      "ImpersonationAuthorized": {
+        "type": "object",
+        "description": "What authorizing an impersonation answers.",
+        "required": [
+          "authorization_id",
+          "user_id",
+          "expires_at_unix_ms"
+        ],
+        "properties": {
+          "authorization_id": {
+            "type": "string",
+            "description": "The `imp_` handle, redeemed ONCE on the app plane for the flagged session."
+          },
+          "expires_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the impersonation must stop, in milliseconds since the epoch. The redeemed\nsession inherits this, and nothing extends it."
+          },
+          "user_id": {
+            "type": "string",
+            "description": "The user this authorizes acting as."
           }
         }
       },

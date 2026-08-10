@@ -46,16 +46,29 @@ pub enum ManagementPermission {
     /// write: a key that can mint keys can escalate to anything, so it must be grantable on
     /// its own rather than riding along with ordinary configuration authority.
     WriteCredentials,
+    /// Authorize an impersonation: let an operator act as an end user (issue #101).
+    ///
+    /// Its OWN permission, granted by no persona by default, for the reason
+    /// [`ManagementPermission::WriteCredentials`] is separate. A credential that can authorize
+    /// an impersonation can reach anything any user of the environment can reach, so it
+    /// escalates past every other write here rather than sitting alongside them.
+    ///
+    /// The issue names impersonation a prerequisite for the help-desk persona. It is
+    /// deliberately not folded INTO that persona: doing so would hand the capability to every
+    /// existing help-desk credential the moment this shipped, which is a silent escalation of
+    /// credentials already in the field. An operator who wants it grants it.
+    Impersonate,
 }
 
 impl ManagementPermission {
     /// Every permission, which is what a pin counts and what a parser sweeps.
-    pub const ALL: [ManagementPermission; 5] = [
+    pub const ALL: [ManagementPermission; 6] = [
         ManagementPermission::Read,
         ManagementPermission::WriteConfig,
         ManagementPermission::WriteUsers,
         ManagementPermission::WriteOrganizations,
         ManagementPermission::WriteCredentials,
+        ManagementPermission::Impersonate,
     ];
 
     /// The stable persistence slug. Exhaustive with no wildcard, so a variant added without a
@@ -68,6 +81,7 @@ impl ManagementPermission {
             ManagementPermission::WriteUsers => "management.write_users",
             ManagementPermission::WriteOrganizations => "management.write_organizations",
             ManagementPermission::WriteCredentials => "management.write_credentials",
+            ManagementPermission::Impersonate => "management.impersonate",
         }
     }
 
@@ -801,6 +815,27 @@ mod persona_tests {
                 everything,
                 "persona {} grants every permission, which is what an unrestricted credential \
                  already is",
+                persona.as_slug()
+            );
+        }
+    }
+
+    /// NO persona grants impersonation (issue #101).
+    ///
+    /// The issue names impersonation a prerequisite for the help-desk persona, which is
+    /// exactly why this is asserted rather than assumed. Folding it into that persona would
+    /// hand the capability to every help-desk credential ALREADY IN THE FIELD the moment the
+    /// feature shipped, silently and without anyone granting anything.
+    ///
+    /// Driven over every persona rather than over help desk alone, so a persona added later
+    /// cannot pick it up unnoticed.
+    #[test]
+    fn no_persona_grants_impersonation() {
+        for persona in ManagementPersona::ALL {
+            assert!(
+                !persona.grants().holds(ManagementPermission::Impersonate),
+                "persona {} grants impersonation, which escalates past every other write on \
+                 this surface and must be granted deliberately",
                 persona.as_slug()
             );
         }

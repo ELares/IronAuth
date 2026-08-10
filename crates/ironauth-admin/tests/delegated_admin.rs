@@ -1267,3 +1267,155 @@ async fn a_confined_credential_cannot_reach_a_users_personal_access_tokens() {
         "a confined credential MINTED a personal access token: {body}"
     );
 }
+
+/// ONLY a credential holding `management.impersonate` may authorize one (issue #101,
+/// criterion 6), and a request without a typed justification is refused by CODE (criterion 3).
+///
+/// The permission half drives a credential holding every OTHER permission, not merely a
+/// read-only one. That is the distinction that matters: impersonation escalates past every
+/// write on this surface, so a credential that may edit users, configuration, organizations
+/// and even credentials must still be refused. A test using a read-only key would pass against
+/// an implementation that had folded impersonation into `WriteUsers`.
+///
+/// The justification half asserts the ERROR CODE rather than the status, because criterion 3
+/// asks for a typed error. A 400 saying "bad request" tells an operator to guess.
+#[tokio::test]
+async fn only_a_credential_holding_impersonate_can_authorize_one() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "imp-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "imp-mint").await;
+    let user = seed_pat_user(&h, &tenant, &environment, "imp-user@example.test").await;
+    let route =
+        format!("/v1/tenants/{tenant}/environments/{environment}/users/{user}/impersonation");
+    let justified = serde_json::json!({
+        "reason_code": "support_ticket",
+        "reason_text": "Ticket 4417: reproducing the checkout failure as the user.",
+    })
+    .to_string();
+
+    // Everything EXCEPT impersonate.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &[
+            "management.read",
+            "management.write_config",
+            "management.write_users",
+            "management.write_organizations",
+            "management.write_credentials",
+        ],
+    )
+    .await;
+    let (status, _, body) = h.post_as(&route, &secret, "imp-denied", &justified).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a credential holding every other permission AUTHORIZED an impersonation: {body}"
+    );
+    assert!(
+        body.contains("management.impersonate"),
+        "the refusal must name the impersonation permission, or the handler may be demanding \
+         something else entirely: {body}"
+    );
+
+    // Granted, it works.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.impersonate"],
+    )
+    .await;
+    let (status, _, body) = h.post_as(&route, &secret, "imp-ok", &justified).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the permission alone is enough to authorize one: {body}"
+    );
+    let authorized: Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        authorized["authorization_id"]
+            .as_str()
+            .expect("id")
+            .starts_with("imp_"),
+        "the handle is an impersonation authorization: {body}"
+    );
+
+    assert_each_missing_justification_names_its_rule(&h, &route, &secret).await;
+
+    // A well-formed user id that names nobody is the uniform not-found. Without the existence
+    // check the authorization would name nobody, and the failure would surface at REDEMPTION
+    // as a foreign-key error on a plane that did not make the mistake.
+    let absent = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/users/{}/impersonation",
+        ironauth_store::UserId::generate(
+            &ironauth_env::Env::system(),
+            &ironauth_store::Scope::new(
+                ironauth_store::TenantId::parse(&tenant).expect("tenant"),
+                ironauth_store::EnvironmentId::parse(&environment).expect("environment"),
+            ),
+        )
+    );
+    let (status, _, body) = h.post_as(&absent, &secret, "imp-absent", &justified).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "authorizing against a user who does not exist must be the uniform not-found: {body}"
+    );
+}
+
+/// The typed refusals, split out because the fixture above and these probes together exceed
+/// the function-length lint.
+///
+/// Each case asserts the CODE, so a handler that collapsed every failure into one refusal
+/// fails here rather than reading as correct.
+async fn assert_each_missing_justification_names_its_rule(h: &Harness, route: &str, secret: &str) {
+    for (label, body, code) in [
+        (
+            "no reason code",
+            serde_json::json!({ "reason_code": "", "reason_text": "Ticket 4417" }),
+            "reason_code_required",
+        ),
+        (
+            "no written justification",
+            serde_json::json!({ "reason_code": "support_ticket", "reason_text": "" }),
+            "reason_text_required",
+        ),
+        (
+            "whitespace passing for a justification",
+            serde_json::json!({ "reason_code": "support_ticket", "reason_text": "\t\n " }),
+            "reason_text_required",
+        ),
+        (
+            "sixty-one minutes",
+            serde_json::json!({
+                "reason_code": "support_ticket",
+                "reason_text": "Ticket 4417",
+                "duration_seconds": 3661,
+            }),
+            "impersonation_cap_exceeded",
+        ),
+    ] {
+        let (status, _, response) = h
+            .post_as(
+                route,
+                secret,
+                &format!("imp-{code}-{label}"),
+                &body.to_string(),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label} was accepted: {response}"
+        );
+        assert!(
+            response.contains(code),
+            "{label} must be refused as `{code}` so an operator is told WHICH rule they broke, \
+             got: {response}"
+        );
+    }
+}

@@ -282,6 +282,7 @@ use crate::views::{
         crate::service_account_keys::create_service_account_api_key,
         crate::service_account_keys::revoke_service_account_api_key,
         crate::service_account_keys::rotate_service_account_api_key,
+        crate::impersonation::authorize_user_impersonation,
         crate::personal_access_tokens::list_user_personal_access_tokens,
         crate::personal_access_tokens::create_user_personal_access_token,
         crate::personal_access_tokens::revoke_user_personal_access_token,

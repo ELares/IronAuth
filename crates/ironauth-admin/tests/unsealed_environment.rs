@@ -127,6 +127,16 @@ struct Case {
 /// The personal-access-token cases (issue #99). Their own function because `cases` had
 /// outgrown the length lint, and because they are the only family here that is a sub-resource
 /// with its own handle rather than a property of the user.
+fn impersonation_cases() -> Vec<Case> {
+    vec![Case {
+        operation_id: "authorizeUserImpersonation",
+        method: "POST",
+        suffix: "/impersonation".to_owned(),
+        body: Some(r#"{"reason_code":"support_ticket","reason_text":"sweep"}"#),
+        expect: Expect::UniformNotFound,
+    }]
+}
+
 fn personal_access_token_cases() -> Vec<Case> {
     vec![
         // Personal access tokens (issue #99). An absent user must answer the same not-found
@@ -269,6 +279,7 @@ fn cases(client: &str) -> Vec<Case> {
     ]
     .into_iter()
     .chain(personal_access_token_cases())
+    .chain(impersonation_cases())
     .collect()
 }
 

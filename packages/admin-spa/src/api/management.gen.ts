@@ -2480,6 +2480,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/impersonation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["authorizeUserImpersonation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens": {
         parameters: {
             query?: never;
@@ -2991,6 +3007,25 @@ export interface components {
              * @example prm_...
              */
             permission_id: string;
+        };
+        /** @description The authorize request. */
+        AuthorizeImpersonationRequest: {
+            /**
+             * Format: int64
+             * @description How long the impersonation may last, in seconds. Absent means the full cap.
+             *
+             *     A value ABOVE the cap is refused rather than clamped. Silently shortening it would tell
+             *     an operator their sixty-first minute was granted.
+             */
+            duration_seconds?: number | null;
+            /** @description The structured reason, from the operator's vocabulary. Required. */
+            reason_code: string;
+            /**
+             * @description The written justification. Required, and required to be more than blank: a category
+             *     alone answers "what kind" and not "why this user, right now", which is what an auditor
+             *     reads.
+             */
+            reason_text: string;
         };
         /** @description An environment's stored account-linking posture. */
         AutoLinkPostureView: {
@@ -4282,6 +4317,19 @@ export interface components {
             value: string;
             /** @description Whether this identifier has been verified. */
             verified: boolean;
+        };
+        /** @description What authorizing an impersonation answers. */
+        ImpersonationAuthorized: {
+            /** @description The `imp_` handle, redeemed ONCE on the app plane for the flagged session. */
+            authorization_id: string;
+            /**
+             * Format: int64
+             * @description When the impersonation must stop, in milliseconds since the epoch. The redeemed
+             *     session inherits this, and nothing extends it.
+             */
+            expires_at_unix_ms: number;
+            /** @description The user this authorizes acting as. */
+            user_id: string;
         };
         /**
          * @description The handle a bulk-import job answers with (issue #55).
@@ -19408,6 +19456,73 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, in another scope, or owned by a different user). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    authorizeUserImpersonation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The user to be impersonated */
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthorizeImpersonationRequest"];
+            };
+        };
+        responses: {
+            /** @description Authorized. The handle is redeemed once for a flagged, capped session */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImpersonationAuthorized"];
+                };
+            };
+            /** @description Malformed request, or a justification that is missing, blank, or a duration past the 60 minute cap. The error code names the rule */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope, or the credential does not hold management.impersonate */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The user is not a live row of this scope */
             404: {
                 headers: {
                     [name: string]: unknown;

@@ -62,6 +62,7 @@ mod flow_versions;
 mod hash;
 mod idempotency;
 mod identifiers;
+mod impersonation;
 mod imports;
 mod input;
 mod invitations;
@@ -533,6 +534,10 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}/rotate",
             post(service_account_keys::rotate_service_account_api_key),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/impersonation",
+            post(impersonation::authorize_user_impersonation),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens",
