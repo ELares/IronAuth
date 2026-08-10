@@ -384,6 +384,33 @@ async fn add_email(harness: &Harness, subject: &UserId, raw: &str, verified: boo
         .expect("add email identifier");
 }
 
+/// The PHONE counterpart of [`add_email`], for the verification-annotation tests: those
+/// need an account holding a verified identifier of BOTH kinds so that narrowing to one is
+/// observable as the other going quiet.
+async fn add_phone(harness: &Harness, subject: &UserId, raw: &str, verified: bool) {
+    let env = harness.env().clone();
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .user_identifiers()
+        .add(
+            &env,
+            NewUserIdentifier {
+                id: &ironauth_store::UserIdentifierId::generate(&env, &harness.scope()),
+                user_id: subject,
+                identifier_type: IdentifierType::Phone,
+                raw,
+                verified,
+                mode: UniquenessMode::EnvironmentWide,
+                org: None,
+            },
+            None,
+        )
+        .await
+        .expect("add phone identifier");
+}
+
 fn encode(value: &str) -> String {
     let mut out = String::new();
     for &byte in value.as_bytes() {
@@ -1282,5 +1309,252 @@ async fn a_flexible_identifier_still_wins_and_can_still_auto_link() {
         1,
         "a VERIFIED flexible identifier still auto-links; the legacy fallback must not \
          shadow it into the interstitial"
+    );
+}
+
+/// Activate a schema whose verification-address annotations name exactly `kinds`.
+///
+/// An empty slice activates a schema with the same shape and NO annotation, which is the
+/// control: it is what every deployment that never wrote one has.
+async fn activate_verification_schema(harness: &Harness, kinds: &[&str]) {
+    let mut properties = serde_json::Map::new();
+    properties.insert("name".to_owned(), json!({"type": "string"}));
+    for kind in kinds {
+        properties.insert(
+            format!("{kind}_address"),
+            json!({"type": "string", "x-ironauth": {"verification": kind}}),
+        );
+    }
+    let schema = json!({ "type": "object", "properties": properties }).to_string();
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let repo = harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env));
+    let (_, version) = repo
+        .trait_schemas()
+        .create_version(&env, &schema, 1_000_000)
+        .await
+        .expect("create schema version");
+    repo.trait_schemas()
+        .activate_version(&env, version)
+        .await
+        .expect("activate schema version");
+    // The annotation really parsed. A fixture whose `x-ironauth` block was silently ignored
+    // would make the narrowing assertions below pass for the wrong reason.
+    let compiled =
+        ironauth_store::trait_schema::TraitSchema::compile(&schema).expect("schema compiles");
+    assert_eq!(
+        compiled.annotations().verification_addresses.len(),
+        kinds.len(),
+        "the fixture must annotate exactly {kinds:?}"
+    );
+}
+
+/// Issue #53 criterion 2, the VERIFICATION-ADDRESS half: the annotation drives which kinds
+/// receive the account-link alert.
+///
+/// Before this the annotation was parsed into `TraitAnnotations`, echoed by the admin
+/// schema-introspection view, and read by nothing. An operator could declare their
+/// verification addresses, see the declaration returned by the API, and have the flow ignore
+/// it: the store-ships-surface-never-mounts shape, which is worse than an unimplemented
+/// feature because the surface asserts the control exists.
+///
+/// Three schemas over the SAME account, which holds a verified email AND a verified phone.
+/// The account is identical in all three, so the difference in who is alerted is the
+/// annotation and nothing else.
+#[tokio::test]
+async fn the_verification_annotation_narrows_which_kinds_are_alerted() {
+    for (label, kinds, expect_email, expect_phone) in [
+        ("no annotation at all", &[][..], true, true),
+        ("email only", &["email"][..], true, false),
+        ("phone only", &["phone"][..], false, true),
+        ("both", &["email", "phone"][..], true, true),
+    ] {
+        let mut harness = Harness::start().await;
+        let sender = Arc::new(RecordingSender::default());
+        harness.install_verification_sender(sender.clone());
+        if !kinds.is_empty() {
+            activate_verification_schema(&harness, kinds).await;
+        }
+
+        let subject = subject_id(&harness, &harness.seed_user("owner-acct", "pw").await);
+        add_email(&harness, &subject, "owner@example.test", true).await;
+        add_phone(&harness, &subject, "+15550000001", true).await;
+        let link = create_link(&harness, &subject, "cnr_test", "fed:1").await;
+        let (_id, cookie) = harness
+            .session_with_id(&subject.to_string(), "pwd", 0)
+            .await;
+
+        let status = post_account(
+            oidc_router(harness.state().clone()),
+            &harness,
+            "linked-identities/remove",
+            Some(&cookie),
+            &json!({"link_id": link.to_string()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{label}: the unlink succeeds");
+
+        let alerted = sender.unlinked();
+        assert_eq!(
+            alerted.contains(&"owner@example.test".to_owned()),
+            expect_email,
+            "{label}: the EMAIL recipient was wrong. An annotation that narrows nothing is \
+             a control the API advertises and the flow ignores; one that narrows everything \
+             silently stops security notices going out: {alerted:?}"
+        );
+        assert_eq!(
+            alerted.contains(&"+15550000001".to_owned()),
+            expect_phone,
+            "{label}: the PHONE recipient was wrong: {alerted:?}"
+        );
+    }
+}
+
+/// An annotated verification address held only as a TRAIT never receives an alert.
+///
+/// The annotation selects among PROVEN recipients and can never introduce one. A trait value
+/// is unverified by construction, so alerting it would let whoever can write a trait point
+/// this account's security notices anywhere they like. Asserted because the narrowing above
+/// reads as "the annotation decides the recipients", and the obvious next step from there is
+/// the wrong one.
+#[tokio::test]
+async fn an_annotated_address_held_only_as_a_trait_is_never_alerted() {
+    let mut harness = Harness::start().await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    activate_verification_schema(&harness, &["email"]).await;
+
+    let subject = subject_id(&harness, &harness.seed_user("owner-acct", "pw").await);
+    add_email(&harness, &subject, "verified@example.test", true).await;
+    // The trait carries a DIFFERENT address, annotated as a verification address.
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(
+            harness.db().test_actor(harness.env()),
+            CorrelationId::generate(harness.env()),
+        )
+        .users()
+        .set_traits(
+            harness.env(),
+            &subject,
+            &json!({"email_address": "attacker@example.test"}).to_string(),
+        )
+        .await
+        .expect("set traits");
+
+    let link = create_link(&harness, &subject, "cnr_test", "fed:1").await;
+    let (_id, cookie) = harness
+        .session_with_id(&subject.to_string(), "pwd", 0)
+        .await;
+    let status = post_account(
+        oidc_router(harness.state().clone()),
+        &harness,
+        "linked-identities/remove",
+        Some(&cookie),
+        &json!({"link_id": link.to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        sender.unlinked(),
+        vec!["verified@example.test".to_owned()],
+        "the alert must go to the VERIFIED identifier and to nothing else; an unverified \
+         trait address receiving it is a redirect anyone who can write a trait controls"
+    );
+}
+
+/// An UNVERIFIED identifier of an ANNOTATED kind is still never alerted.
+///
+/// The annotation narrows a set of proven recipients; it does not promote anything into it.
+/// Without this the narrowing tests above pass for an implementation that dropped the
+/// `verified` filter, because every identifier they seed is verified.
+#[tokio::test]
+async fn an_unverified_identifier_of_an_annotated_kind_is_never_alerted() {
+    let mut harness = Harness::start().await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    activate_verification_schema(&harness, &["email"]).await;
+
+    let subject = subject_id(&harness, &harness.seed_user("owner-acct", "pw").await);
+    add_email(&harness, &subject, "verified@example.test", true).await;
+    add_email(&harness, &subject, "unverified@example.test", false).await;
+
+    let link = create_link(&harness, &subject, "cnr_test", "fed:1").await;
+    let (_id, cookie) = harness
+        .session_with_id(&subject.to_string(), "pwd", 0)
+        .await;
+    let status = post_account(
+        oidc_router(harness.state().clone()),
+        &harness,
+        "linked-identities/remove",
+        Some(&cookie),
+        &json!({"link_id": link.to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        sender.unlinked(),
+        vec!["verified@example.test".to_owned()],
+        "an UNVERIFIED address of the annotated kind received a security notice; the \
+         annotation selects among proven recipients and must never promote one"
+    );
+}
+
+/// A stored schema that will not COMPILE permits both kinds rather than silencing alerts.
+///
+/// An uncompilable schema is a persistence corruption, not a caller fault, and it must not
+/// suppress the notice that tells an account owner their login identifiers changed. The row
+/// is planted through the owner pool because `create_version` validates: no supported path
+/// can store one, which is exactly why the fallback would otherwise never be exercised.
+#[tokio::test]
+async fn a_schema_that_will_not_compile_still_alerts_every_kind() {
+    let mut harness = Harness::start().await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    // A valid schema annotating EMAIL only, so a working read would silence the phone.
+    activate_verification_schema(&harness, &["email"]).await;
+
+    // Corrupt the active row's schema so it no longer compiles.
+    sqlx::query(
+        "UPDATE trait_schemas SET schema_json = $1 \
+         WHERE tenant_id = $2 AND environment_id = $3 AND status = 'active'",
+    )
+    .bind("{\"type\": 12345}")
+    .bind(harness.scope().tenant().to_string())
+    .bind(harness.scope().environment().to_string())
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("corrupt the active schema");
+
+    let subject = subject_id(&harness, &harness.seed_user("owner-acct", "pw").await);
+    add_email(&harness, &subject, "owner@example.test", true).await;
+    add_phone(&harness, &subject, "+15550000001", true).await;
+    let link = create_link(&harness, &subject, "cnr_test", "fed:1").await;
+    let (_id, cookie) = harness
+        .session_with_id(&subject.to_string(), "pwd", 0)
+        .await;
+    let status = post_account(
+        oidc_router(harness.state().clone()),
+        &harness,
+        "linked-identities/remove",
+        Some(&cookie),
+        &json!({"link_id": link.to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let alerted = sender.unlinked();
+    assert!(
+        alerted.contains(&"owner@example.test".to_owned())
+            && alerted.contains(&"+15550000001".to_owned()),
+        "a corrupt schema narrowed the alert set; a persistence fault must not suppress the \
+         notice that tells an owner their login identifiers changed: {alerted:?}"
     );
 }

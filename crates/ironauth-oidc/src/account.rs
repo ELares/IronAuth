@@ -1606,15 +1606,29 @@ pub(crate) async fn notify_link_channels(
         .list_for_user(subject)
         .await
         .unwrap_or_default();
+    // The `verification` annotation (issue #53) NARROWS which kinds are alerted, exactly as
+    // `recovery` narrows the recovery channels. Before this it was parsed into
+    // `TraitAnnotations`, echoed by the admin schema-introspection view, and read by nothing:
+    // an operator could declare their verification addresses, see the declaration returned by
+    // the API, and have this path ignore it completely. That is the
+    // store-ships-surface-never-mounts shape, and it is worse than an unimplemented feature
+    // because the surface asserts the control exists.
+    let permitted = annotated_verification_kinds(state, scope).await;
     let mut count = 0;
     for identifier in identifiers {
         if !identifier.verified {
             continue;
         }
-        if matches!(
-            identifier.identifier_type,
-            IdentifierType::Email | IdentifierType::Phone
-        ) {
+        // Only ever a VERIFIED identifier. The annotation selects among proven recipients and
+        // can never introduce one: a trait value is unverified by construction, so alerting
+        // it would let whoever can write a trait point this account's security notices
+        // anywhere they like.
+        let kind_allowed = match identifier.identifier_type {
+            IdentifierType::Email => permitted.email,
+            IdentifierType::Phone => permitted.phone,
+            IdentifierType::Username => false,
+        };
+        if kind_allowed {
             // A verified, resolved channel (a known recipient), so the alert goes out;
             // anti-enumeration suppression is decided earlier at existence lookup.
             state.dispatch_verification(scope, purpose, &identifier.raw, true);
@@ -1622,6 +1636,44 @@ pub(crate) async fn notify_link_channels(
         }
     }
     count
+}
+
+/// Which address KINDS the scope's active schema annotates as verification addresses.
+///
+/// Mirrors `recovery::annotated_recovery_channels`, including the direction it can move in:
+/// it only ever NARROWS. A schema that annotates nothing, no active schema at all, or a
+/// schema that will not compile all permit both kinds, which is what every deployment did
+/// before this read anything. Getting that backwards would be severe in the quiet way: a
+/// deployment that never wrote an annotation would silently stop sending link alerts, and
+/// nobody notices an alert that was not sent.
+///
+/// A read fault is likewise permissive. This path tells an account owner that their login
+/// identifiers changed, so failing it closed would suppress the warning, which is the
+/// opposite of safe.
+struct VerificationKinds {
+    email: bool,
+    phone: bool,
+}
+
+async fn annotated_verification_kinds(state: &OidcState, scope: Scope) -> VerificationKinds {
+    let both = VerificationKinds {
+        email: true,
+        phone: true,
+    };
+    let Ok(Some(active)) = state.store().scoped(scope).trait_schemas().active().await else {
+        return both;
+    };
+    let Ok(schema) = ironauth_store::trait_schema::TraitSchema::compile(&active.schema_json) else {
+        return both;
+    };
+    let annotated = schema.annotations().verification_addresses;
+    if annotated.is_empty() {
+        return both;
+    }
+    VerificationKinds {
+        email: annotated.iter().any(|(_, kind)| kind == "email"),
+        phone: annotated.iter().any(|(_, kind)| kind == "phone"),
+    }
 }
 
 /// Whether a fleet session summary is an ACTIVE session (the account UI lists only
