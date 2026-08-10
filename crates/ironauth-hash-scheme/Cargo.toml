@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 [package]
 name = "ironauth-hash-scheme"
-version = "0.1.0"
+version = "0.2.0"
 description = "Algorithm-tagged verification of foreign password hashes (bcrypt, Argon2, scrypt, PBKDF2, Firebase modified scrypt), with import-time cost bounds"
 edition.workspace = true
 rust-version.workspace = true
@@ -27,5 +27,7 @@ ctr = "0.9"
 password-hash = "0.5"
 pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
 scrypt = "0.11"
+sha-crypt = "0.6"
+sha1.workspace = true
 sha2.workspace = true
 subtle = "2"

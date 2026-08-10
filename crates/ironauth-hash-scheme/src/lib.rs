@@ -33,6 +33,21 @@
 //! | [`Scheme::Pbkdf2`]         | `$pbkdf2-sha256$` / `$pbkdf2-sha512$`     |
 //! | [`Scheme::Argon2`]         | `$argon2i$` / `$argon2d$` / `$argon2id$` |
 //! | [`Scheme::FirebaseScrypt`] | `$fbscrypt$` (canonical, see below)      |
+//! | [`Scheme::ShaCrypt`]       | `$5$` (SHA-256) / `$6$` (SHA-512)        |
+//! | [`Scheme::Ldap`]           | `{SHA}` / `{SSHA}` / `{SHA256}` / ...     |
+//!
+//! # Two schemes with no cost to bound, and why that is the dangerous case
+//!
+//! Every bound in this crate exists because an attacker-supplied cost turns a later
+//! login into a denial-of-service vector. The LDAP schemes invert that: `{SHA}` and
+//! its relatives are a SINGLE unsalted or lightly salted digest pass, so they verify
+//! in microseconds and there is no cost parameter to reject. The hazard is not that
+//! verification is slow, it is that the stored hash is nearly free to attack offline.
+//! So this crate recognizes them (a user who cannot be verified cannot be migrated at
+//! all) and [`Scheme::rehash_is_urgent`] reports which schemes must not survive a
+//! first successful login. `{MD5}` and `{SMD5}` are deliberately NOT recognized: MD5
+//! is not in the issue's list and accepting it would be adding a scheme nothing asked
+//! for on the strength of it being easy.
 //!
 //! Firebase's modified scrypt is not self-describing in the wild (its
 //! account-wide signer key, salt separator, and cost live outside the per-user
@@ -80,6 +95,14 @@ pub const MAX_ARGON2_PARALLELISM: u32 = 16;
 pub const MAX_FIREBASE_MEM_COST: u32 = 20;
 /// The documented maximum Firebase modified-scrypt rounds (`r`) accepted at import.
 pub const MAX_FIREBASE_ROUNDS: u32 = 16;
+/// The documented maximum SHA-crypt `rounds=` accepted at import. glibc permits up to
+/// 999999999, which is minutes of CPU for ONE verification and therefore exactly the
+/// vector the bounds exist for. A million rounds is already far beyond any deployment
+/// that expects to serve logins.
+pub const MAX_SHA_CRYPT_ROUNDS: u32 = 1_000_000;
+/// The minimum SHA-crypt `rounds=` glibc itself accepts; below it the string is
+/// malformed rather than merely cheap.
+pub const MIN_SHA_CRYPT_ROUNDS: u32 = 1_000;
 
 /// The scrypt-derived-key length Firebase's modified scrypt uses; the first 32
 /// bytes key the AES-256-CTR pass.
@@ -104,9 +127,35 @@ pub enum Scheme {
     /// Firebase's modified scrypt (scrypt key derivation followed by AES-256-CTR
     /// over the account signer key), in this crate's canonical `$fbscrypt$` form.
     FirebaseScrypt,
+    /// SHA-crypt, the glibc modular-crypt scheme: `$5$` (SHA-256) and `$6$`
+    /// (SHA-512), with the optional `rounds=` parameter. One variant rather than two
+    /// because the two share a format, a bound and a verify path; the digest width is
+    /// carried in the string, which is where dispatch already reads it from.
+    ShaCrypt,
+    /// The LDAP/RFC 2307 digest schemes: `{SHA}`, `{SSHA}`, `{SHA256}`, `{SSHA256}`,
+    /// `{SHA512}`, `{SSHA512}`. Salted (`{S...}`) forms append the salt to the digest
+    /// inside the base64 payload. They carry NO cost parameter; see the module note.
+    Ldap,
 }
 
 impl Scheme {
+    /// Every variant, in declaration order.
+    ///
+    /// A slice rather than something each test writes out for itself. Two tests in
+    /// this file sweep every scheme, and a hand-written list beside an enum is the
+    /// shape where a variant added later is simply absent from the sweep and nothing
+    /// says so. Adding a variant without extending this array is a compile error,
+    /// because the length is declared.
+    pub const ALL: [Scheme; 7] = [
+        Scheme::Bcrypt,
+        Scheme::Scrypt,
+        Scheme::Pbkdf2,
+        Scheme::Argon2,
+        Scheme::FirebaseScrypt,
+        Scheme::ShaCrypt,
+        Scheme::Ldap,
+    ];
+
     /// The stable, non-secret algorithm tag stored alongside the hash and used for
     /// dispatch and metrics.
     #[must_use]
@@ -117,6 +166,8 @@ impl Scheme {
             Scheme::Pbkdf2 => "pbkdf2",
             Scheme::Argon2 => "argon2",
             Scheme::FirebaseScrypt => "firebase-scrypt",
+            Scheme::ShaCrypt => "sha-crypt",
+            Scheme::Ldap => "ldap-digest",
         }
     }
 
@@ -130,8 +181,25 @@ impl Scheme {
             "pbkdf2" => Some(Scheme::Pbkdf2),
             "argon2" => Some(Scheme::Argon2),
             "firebase-scrypt" => Some(Scheme::FirebaseScrypt),
+            "sha-crypt" => Some(Scheme::ShaCrypt),
+            "ldap-digest" => Some(Scheme::Ldap),
             _ => None,
         }
+    }
+
+    /// Whether a first successful login against this scheme must REPLACE the stored
+    /// hash rather than merely be allowed to succeed.
+    ///
+    /// Every scheme here is a foreign hash and every one of them is meant to be
+    /// rehashed to Argon2id eventually. This names the ones where leaving the old
+    /// hash in place is a standing exposure rather than a deferred cleanup: the LDAP
+    /// digests are one unsalted or lightly salted pass, so a stolen row is attacked
+    /// at the speed of a raw digest and no import bound can change that. A caller
+    /// that rehashes everything is correct and can ignore this; one that rehashes
+    /// lazily must not ignore it for these.
+    #[must_use]
+    pub fn rehash_is_urgent(self) -> bool {
+        matches!(self, Scheme::Ldap)
     }
 }
 
@@ -197,6 +265,12 @@ impl ForeignHash {
             Scheme::FirebaseScrypt => {
                 parse_firebase(stored)?;
             }
+            Scheme::ShaCrypt => bounds_sha_crypt(stored)?,
+            // No cost parameter to bound; what CAN fail is the payload, so the parse
+            // runs here and a malformed one is refused at import rather than at login.
+            Scheme::Ldap => {
+                parse_ldap(stored)?;
+            }
         }
         Ok(Self {
             scheme,
@@ -237,6 +311,11 @@ impl ForeignHash {
                 Ok(fb) => fb.verify(password),
                 Err(_) => false,
             },
+            Scheme::ShaCrypt => sha_crypt_verify(password, &self.stored),
+            Scheme::Ldap => match parse_ldap(&self.stored) {
+                Ok(ldap) => ldap.verify(password),
+                Err(_) => false,
+            },
         }
     }
 }
@@ -266,8 +345,180 @@ fn detect(stored: &str) -> Option<Scheme> {
         Some(Scheme::Argon2)
     } else if stored.starts_with("$fbscrypt$") {
         Some(Scheme::FirebaseScrypt)
+    } else if stored.starts_with("$5$") || stored.starts_with("$6$") {
+        Some(Scheme::ShaCrypt)
+    } else if ldap_variant(stored).is_some() {
+        Some(Scheme::Ldap)
     } else {
         None
+    }
+}
+
+/// Bounds-check a SHA-crypt string: the optional `rounds=` field must sit inside the
+/// documented window.
+///
+/// The parameter is OPTIONAL in the format (`$6$salt$hash` means the glibc default of
+/// 5000), so its ABSENCE is accepted rather than treated as a malformed string. Only a
+/// present-and-unparseable field is malformed; an omitted one is the common case and
+/// rejecting it would refuse most real `/etc/shadow` rows.
+fn bounds_sha_crypt(stored: &str) -> Result<(), HashError> {
+    // `$6$rounds=5000$salt$hash`: field 2 carries the parameter when present.
+    let Some(field) = stored.split('$').nth(2) else {
+        return Err(HashError::Malformed);
+    };
+    let Some(rounds) = field.strip_prefix("rounds=") else {
+        // No `rounds=`, so the scheme default applies and there is nothing to bound.
+        // The payload itself is validated by the verify path, which fails closed.
+        return Ok(());
+    };
+    let rounds: u32 = rounds.parse().map_err(|_| HashError::Malformed)?;
+    if rounds > MAX_SHA_CRYPT_ROUNDS {
+        return Err(HashError::OutOfBounds("sha-crypt rounds"));
+    }
+    if rounds < MIN_SHA_CRYPT_ROUNDS {
+        return Err(HashError::OutOfBounds("sha-crypt rounds"));
+    }
+    Ok(())
+}
+
+/// Verify a SHA-crypt string, failing closed on any decode failure.
+///
+/// SHA-crypt is Modular Crypt Format and not PHC, so this cannot go through the
+/// `phc_verify` helper the other schemes share: `sha-crypt` brings its own, newer
+/// `password_hash`, and its `PasswordVerifier` is implemented over MCF rather than
+/// over the PHC `PasswordHash` this file's other verifiers take. The `str` impl is
+/// used deliberately; it parses the MCF string with the same code the typed impls
+/// delegate to, and taking it avoids a second `password-hash` in the manifest whose
+/// only purpose would be to turn on a feature.
+///
+/// `ShaCrypt::default()` is not a choice of digest. The algorithm is read from the
+/// string's own `$5$`/`$6$` id inside `verify_password`, so a `$5$` hash is verified
+/// as SHA-256 whatever this receiver was built with.
+fn sha_crypt_verify(password: &[u8], stored: &str) -> bool {
+    use sha_crypt::password_hash::PasswordVerifier as _;
+
+    sha_crypt::ShaCrypt::default()
+        .verify_password(password, stored)
+        .is_ok()
+}
+
+/// One parsed LDAP/RFC 2307 digest: the digest bytes and, for a salted variant, the
+/// salt that was appended to the password before hashing.
+struct LdapHash {
+    variant: LdapVariant,
+    digest: Vec<u8>,
+    salt: Vec<u8>,
+}
+
+/// Which LDAP digest a string declares, and whether it is salted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LdapVariant {
+    Sha1 { salted: bool },
+    Sha256 { salted: bool },
+    Sha512 { salted: bool },
+}
+
+impl LdapVariant {
+    /// The digest width in bytes, which is also where the salt begins in a salted
+    /// payload. Read from the VARIANT and never from the payload length: taking it
+    /// from the payload would let a truncated blob redefine where the salt starts and
+    /// verify against a shorter digest than the scheme specifies.
+    fn digest_len(self) -> usize {
+        match self {
+            LdapVariant::Sha1 { .. } => 20,
+            LdapVariant::Sha256 { .. } => 32,
+            LdapVariant::Sha512 { .. } => 64,
+        }
+    }
+
+    fn salted(self) -> bool {
+        match self {
+            LdapVariant::Sha1 { salted }
+            | LdapVariant::Sha256 { salted }
+            | LdapVariant::Sha512 { salted } => salted,
+        }
+    }
+}
+
+/// The declared variant and the base64 payload, or [`None`] when the string carries no
+/// recognized LDAP prefix.
+///
+/// The order of this table is NOT load-bearing, and saying so is the point: the tags
+/// look like they overlap (`{SSHA}` and `{SSHA256}` share four characters) but the
+/// CLOSING BRACE terminates every one of them, so `{SSHA}` does not prefix
+/// `{SSHA256}...` and no ordering can confuse the two. A comment claiming the order
+/// protects against that would describe a hazard this format does not have, and the
+/// next author would preserve an ordering for a reason that was never true.
+fn ldap_variant(stored: &str) -> Option<(LdapVariant, &str)> {
+    const PREFIXES: &[(&str, LdapVariant)] = &[
+        ("{SSHA256}", LdapVariant::Sha256 { salted: true }),
+        ("{SSHA512}", LdapVariant::Sha512 { salted: true }),
+        ("{SHA256}", LdapVariant::Sha256 { salted: false }),
+        ("{SHA512}", LdapVariant::Sha512 { salted: false }),
+        ("{SSHA}", LdapVariant::Sha1 { salted: true }),
+        ("{SHA}", LdapVariant::Sha1 { salted: false }),
+    ];
+    PREFIXES
+        .iter()
+        .find_map(|(prefix, variant)| stored.strip_prefix(prefix).map(|rest| (*variant, rest)))
+}
+
+/// Parse an LDAP digest string into its digest and salt.
+fn parse_ldap(stored: &str) -> Result<LdapHash, HashError> {
+    let (variant, payload) = ldap_variant(stored).ok_or(HashError::Unrecognized)?;
+    let raw = B64.decode(payload).map_err(|_| HashError::Malformed)?;
+    let width = variant.digest_len();
+    if variant.salted() {
+        // A salted payload is digest || salt, so anything at or below the digest width
+        // carries no salt and is not the scheme it claims to be. Refused at import: a
+        // login-time failure would look like a wrong password.
+        if raw.len() <= width {
+            return Err(HashError::Malformed);
+        }
+        let (digest, salt) = raw.split_at(width);
+        Ok(LdapHash {
+            variant,
+            digest: digest.to_vec(),
+            salt: salt.to_vec(),
+        })
+    } else {
+        if raw.len() != width {
+            return Err(HashError::Malformed);
+        }
+        Ok(LdapHash {
+            variant,
+            digest: raw,
+            salt: Vec::new(),
+        })
+    }
+}
+
+impl LdapHash {
+    /// Recompute the digest over `password || salt` and compare in constant time.
+    fn verify(&self, password: &[u8]) -> bool {
+        use sha1::Digest as _;
+
+        let computed: Vec<u8> = match self.variant {
+            LdapVariant::Sha1 { .. } => {
+                let mut hasher = sha1::Sha1::new();
+                hasher.update(password);
+                hasher.update(&self.salt);
+                hasher.finalize().to_vec()
+            }
+            LdapVariant::Sha256 { .. } => {
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(password);
+                hasher.update(&self.salt);
+                hasher.finalize().to_vec()
+            }
+            LdapVariant::Sha512 { .. } => {
+                let mut hasher = sha2::Sha512::new();
+                hasher.update(password);
+                hasher.update(&self.salt);
+                hasher.finalize().to_vec()
+            }
+        };
+        computed.ct_eq(&self.digest).into()
     }
 }
 
@@ -602,18 +853,197 @@ mod tests {
         );
     }
 
+    /// The published SHA-crypt specification vectors (Drepper), asserted as CONSTANTS
+    /// rather than round-tripped through this crate's own hasher.
+    ///
+    /// A round-trip would prove only that the implementation agrees with itself. These
+    /// strings come from the specification that defines the algorithm, so a passing
+    /// assertion is two independent sources agreeing about the same bytes.
+    #[test]
+    fn sha_crypt_published_known_answer_vectors() {
+        for (stored, password) in [
+            (
+                "$5$saltstring$5B8vYYiY.CVt1RlTTf8KbXBH3hsxY/GNooZaBBGWEc5",
+                "Hello world!",
+            ),
+            (
+                "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJue\
+                 sI68u4OTLiBFdcbYEdFCoEOfaS35inz1",
+                "Hello world!",
+            ),
+            (
+                "$5$rounds=10000$saltstringsaltst$3xv.VbSHBb41AL9AvLeujZkZRBAwqFMz2.op\
+                 qey6IcA",
+                "Hello world!",
+            ),
+        ] {
+            let stored: String = stored.split_whitespace().collect();
+            assert_kat(&stored, password, Scheme::ShaCrypt);
+        }
+    }
+
+    /// The `rounds=` bound, at both ends and in its absence.
+    ///
+    /// Absence is the case worth stating: `$6$salt$hash` is the common `/etc/shadow`
+    /// shape and means the scheme default, so treating a missing parameter as
+    /// malformed would refuse most real rows.
+    #[test]
+    fn sha_crypt_rounds_out_of_bounds_is_rejected_and_absence_is_not() {
+        let over = format!(
+            "$6$rounds={}$saltstring$x",
+            u64::from(MAX_SHA_CRYPT_ROUNDS) + 1
+        );
+        assert_eq!(
+            ForeignHash::parse(&over),
+            Err(HashError::OutOfBounds("sha-crypt rounds")),
+            "a rounds count above the documented bound is minutes of CPU per login"
+        );
+        let under = format!("$6$rounds={}$saltstring$x", MIN_SHA_CRYPT_ROUNDS - 1);
+        assert_eq!(
+            ForeignHash::parse(&under),
+            Err(HashError::OutOfBounds("sha-crypt rounds")),
+            "below the scheme minimum the string is not a SHA-crypt hash"
+        );
+        let at = format!("$6$rounds={MAX_SHA_CRYPT_ROUNDS}$saltstring$x");
+        assert!(
+            ForeignHash::parse(&at).is_ok(),
+            "the bound is inclusive, or an operator's documented maximum is off by one"
+        );
+        assert!(
+            ForeignHash::parse("$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl").is_ok(),
+            "an omitted rounds= means the scheme default and must not be malformed"
+        );
+    }
+
+    /// Every LDAP variant, salted and unsalted, against vectors computed OUTSIDE this
+    /// crate (Python `hashlib` and `base64`) so the assertion is not the implementation
+    /// checked against itself.
+    ///
+    /// Each salted variant uses a salt of a DIFFERENT length (2, 10 and 19 bytes), and
+    /// none of them is 8. That is not decoration. The first version of these fixtures
+    /// used one 8-byte salt everywhere, and 8 happens to equal `payload_len` minus the
+    /// SHA-1 digest width, so an implementation taking the width from the PAYLOAD
+    /// rather than from the variant passed every case. A mutation sweep found it. With
+    /// three different lengths no single arithmetic mistake is right for all of them.
+    #[test]
+    fn ldap_digest_known_answer_vectors() {
+        const PASSWORD: &str = "correct horse battery staple";
+        for stored in [
+            "{SHA}q/eq1kOINtvlJqojGr3i0O73TUI=",
+            "{SSHA}fg1cZ6fA9NAz+kgbHLCBGNDXIa5zMw==",
+            "{SHA256}xLvLH77JnWW/WdhcjLYu4tuWPw/hBvSD2a+nO9Tjmoo=",
+            "{SSHA256}rbpZpvJNNYAP5+B0oYnh/gRwFDNi7tgUQ5ydDWrE1vdzYWx0LTEzY2hy",
+            "{SHA512}vl73Z52Iq5qQRfYmflX15XhLS4zXZLXNhVpSRPkcYmlTzUbEPXZohz/W7707IhJJ\
+             MVWAAxljRyoHh4H+BG5irg==",
+            "{SSHA512}JodACNxpTAd0DIaHvcP5uCTsFi8Ofk8+LKZP7HPwd1qWYfjZOyY7mLbLRdPMXheo\
+             d9+qpNFl7/Jgi5pTlPu+dWEtbmluZXRlZW4tYnl0ZS1zbHQ=",
+        ] {
+            let stored: String = stored.split_whitespace().collect();
+            assert_kat(&stored, PASSWORD, Scheme::Ldap);
+        }
+    }
+
+    /// Each variant is read as ITSELF, and the digest boundary comes from the variant.
+    ///
+    /// The tags look like they overlap, and they do not: the closing brace terminates
+    /// each one, so `{SSHA}` cannot prefix `{SSHA256}`. What this pins is the property
+    /// that genuinely can break, which is where the SALT begins. The widths asserted
+    /// here are the scheme's digest widths and the three payloads exceed them by three
+    /// different amounts, so a boundary computed from the payload length is wrong for
+    /// at least two of the three.
+    #[test]
+    fn each_ldap_variant_is_read_as_itself_with_the_scheme_digest_width() {
+        for (stored, digest, salt) in [
+            ("{SSHA}fg1cZ6fA9NAz+kgbHLCBGNDXIa5zMw==", 20, 2),
+            (
+                "{SSHA256}rbpZpvJNNYAP5+B0oYnh/gRwFDNi7tgUQ5ydDWrE1vdzYWx0LTEzY2hy",
+                32,
+                10,
+            ),
+            (
+                "{SSHA512}JodACNxpTAd0DIaHvcP5uCTsFi8Ofk8+LKZP7HPwd1qWYfjZOyY7mLbLRdPM\
+                 Xheod9+qpNFl7/Jgi5pTlPu+dWEtbmluZXRlZW4tYnl0ZS1zbHQ=",
+                64,
+                19,
+            ),
+        ] {
+            let stored: String = stored.split_whitespace().collect();
+            let parsed = parse_ldap(&stored).expect("the fixture parses");
+            assert_eq!(
+                (parsed.digest.len(), parsed.salt.len()),
+                (digest, salt),
+                "{stored} split at the wrong boundary"
+            );
+        }
+    }
+
+    /// A salted payload no longer than its digest carries no salt, and is refused at
+    /// IMPORT rather than failing at login where it would look like a wrong password.
+    #[test]
+    fn a_truncated_salted_ldap_payload_is_malformed_not_a_wrong_password() {
+        // A bare 20-byte SHA-1 digest labelled as SALTED SHA-1.
+        let bare = "{SSHA}q/eq1kOINtvlJqojGr3i0O73TUI=";
+        assert_eq!(ForeignHash::parse(bare), Err(HashError::Malformed));
+        // An unsalted variant whose payload is the wrong WIDTH is malformed too.
+        let wrong_width = "{SHA}q/eq1kOINtvlJqojGr3i0O73TUIAAA==";
+        assert_eq!(ForeignHash::parse(wrong_width), Err(HashError::Malformed));
+    }
+
+    /// The MD5 LDAP schemes are deliberately unrecognized, and this is the assertion
+    /// that says so rather than a comment claiming it.
+    #[test]
+    fn the_md5_ldap_schemes_are_not_recognized() {
+        for stored in [
+            "{MD5}X03MO1qnZdYdgyfeuILPmQ==",
+            "{SMD5}X03MO1qnZdYdgyfeuILPmXNhbHQ=",
+        ] {
+            assert_eq!(
+                ForeignHash::parse(stored),
+                Err(HashError::Unrecognized),
+                "{stored} is not in the issue's scheme list and is not accepted on the \
+                 strength of being easy to add"
+            );
+        }
+    }
+
+    /// The LDAP digests, and only they, are reported as urgent to rehash.
+    ///
+    /// Asserted over EVERY variant rather than the two that make the point, so a
+    /// scheme added later cannot inherit `false` by never being listed here.
+    #[test]
+    fn only_the_unsalted_digest_schemes_are_urgent_to_rehash() {
+        let urgent: Vec<&str> = Scheme::ALL
+            .iter()
+            .filter(|scheme| scheme.rehash_is_urgent())
+            .map(|scheme| scheme.tag())
+            .collect();
+        assert_eq!(
+            urgent,
+            vec!["ldap-digest"],
+            "the urgent set is stated over EVERY scheme, so a variant added later \
+             cannot inherit `false` by never being listed"
+        );
+    }
+
     #[test]
     fn scheme_tag_round_trips() {
-        for scheme in [
-            Scheme::Bcrypt,
-            Scheme::Scrypt,
-            Scheme::Pbkdf2,
-            Scheme::Argon2,
-            Scheme::FirebaseScrypt,
-        ] {
-            assert_eq!(Scheme::from_tag(scheme.tag()), Some(scheme));
+        for scheme in Scheme::ALL {
+            assert_eq!(
+                Scheme::from_tag(scheme.tag()),
+                Some(scheme),
+                "{} does not round-trip through its tag, so a stored row of that \
+                 scheme cannot be dispatched after a restart",
+                scheme.tag()
+            );
         }
         assert_eq!(Scheme::from_tag("md5"), None);
+        // Every tag distinct: two schemes sharing one would round-trip individually
+        // and still dispatch the second as the first.
+        let mut tags: Vec<&str> = Scheme::ALL.iter().map(|s| s.tag()).collect();
+        tags.sort_unstable();
+        let count = tags.len();
+        tags.dedup();
+        assert_eq!(tags.len(), count, "two schemes share an algorithm tag");
     }
 }
 
