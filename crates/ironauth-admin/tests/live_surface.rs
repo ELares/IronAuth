@@ -2015,6 +2015,17 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{pat_base}/{pat}"),
         ),
+        // Authorizing an impersonation (issue #101). An environment-scoped write, so the
+        // soft-deleted sweep must refuse it too.
+        Case::json(
+            "impersonation.authorizeUserImpersonation",
+            "POST",
+            format!("{base}/users/{user}/impersonation"),
+            &serde_json::json!({
+                "reason_code": "support_ticket",
+                "reason_text": "sweep impersonation",
+            }),
+        ),
         Case::empty(
             "project_grants.listProjectGrants",
             "GET",

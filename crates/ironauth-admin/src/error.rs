@@ -181,6 +181,12 @@ pub enum ApiError {
         /// The maximum authentication age, in seconds, the mutation requires.
         max_age: u64,
     },
+    /// An impersonation request broke one of its rules (issue #101).
+    ///
+    /// Carries the store's own [`ImpersonationRejection`] rather than a message, so the wire
+    /// code an operator branches on is the SAME value the validation produced. Flattening it
+    /// to a string here would make the handler a second opinion about which rule was broken.
+    ImpersonationRejected(ironauth_store::impersonation::ImpersonationRejection),
     /// An unexpected internal failure. Renders 500; never leaks detail.
     Internal,
 }
@@ -189,7 +195,7 @@ impl ApiError {
     /// The HTTP status this error renders to.
     fn status(&self) -> StatusCode {
         match self {
-            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::BadRequest(_) | ApiError::ImpersonationRejected(_) => StatusCode::BAD_REQUEST,
             // A missing credential and the RFC 9470 step-up challenge are both 401 (the
             // challenge carries its requirement in the WWW-Authenticate header and body).
             ApiError::Unauthorized(_) | ApiError::ReauthRequired { .. } => StatusCode::UNAUTHORIZED,
@@ -210,6 +216,9 @@ impl ApiError {
     fn body(&self) -> ErrorBody {
         match self {
             ApiError::BadRequest(message) => ErrorBody::plain("bad_request", message.clone()),
+            ApiError::ImpersonationRejected(rejection) => {
+                ErrorBody::plain(rejection.code(), rejection.message().to_owned())
+            }
             ApiError::NotConfigured(message) => ErrorBody::plain("not_configured", message.clone()),
             ApiError::UpstreamUnavailable(message) => {
                 ErrorBody::plain("upstream_unavailable", message.clone())
