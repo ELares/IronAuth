@@ -3929,7 +3929,11 @@ export interface components {
             from_version: number;
             /**
              * @description `dry_run` validates every identity against the target version and writes nothing;
-             *     `migrate` transforms and writes.
+             *     `migrate` transforms and writes; `backfill_login_index` (issue #624) rebuilds the
+             *     annotated-trait login index from the traits already stored, touching no traits
+             *     document and validating nothing. Run the last one after annotating a new field as a
+             *     login identifier: the index is maintained on every trait WRITE, so without a sweep
+             *     the new route works for nobody who does not happen to write again.
              */
             kind: string;
             /**
@@ -6718,7 +6722,7 @@ export interface components {
             from_version: number;
             /** @description The `tmj_` identifier. */
             id: string;
-            /** @description `dry_run` or `migrate`. */
+            /** @description `dry_run`, `migrate`, or `backfill_login_index`. */
             kind: string;
             /**
              * Format: int64

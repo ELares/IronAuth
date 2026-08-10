@@ -23446,7 +23446,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`dry_run` validates every identity against the target version and writes nothing;\n`migrate` transforms and writes."
+            "description": "`dry_run` validates every identity against the target version and writes nothing;\n`migrate` transforms and writes; `backfill_login_index` (issue #624) rebuilds the\nannotated-trait login index from the traits already stored, touching no traits\ndocument and validating nothing. Run the last one after annotating a new field as a\nlogin identifier: the index is maintained on every trait WRITE, so without a sweep\nthe new route works for nobody who does not happen to write again."
           },
           "to_version": {
             "type": "integer",
@@ -27953,7 +27953,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`dry_run` or `migrate`."
+            "description": "`dry_run`, `migrate`, or `backfill_login_index`."
           },
           "migrated_count": {
             "type": "integer",
