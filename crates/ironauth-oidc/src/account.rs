@@ -76,13 +76,66 @@ struct Account {
     session_id: SessionId,
     auth_time_unix_micros: i64,
     auth_methods: String,
+    /// The impersonation the session was started under (issue #101), absent on an ordinary
+    /// one. Read by the policy layer, never by a handler.
+    impersonation: Option<ironauth_store::SessionImpersonation>,
 }
 
-/// Resolve the scope from the path and the session cookie to an authenticated
-/// account, or return the response to send instead (a uniform `404` for a malformed
-/// scope, a `401` for no or an invalid session, a `401` for a subject that is not a
-/// parseable user id of this scope).
+/// Authenticate the caller for an operation an IMPERSONATOR MAY NOT perform (issue #101,
+/// criterion 5).
+///
+/// This is the default entry point and the constrained one, deliberately. A route added later
+/// that reaches for the obvious name inherits the constraint without its author knowing
+/// impersonation exists, which is the whole of the criterion: enforcement lives here and not
+/// in each controller. The Casdoor lesson the issue cites is what happens when it is the other
+/// way round, and a forgotten check in one handler opens a hole.
+///
+/// Reads that an impersonator SHOULD perform call
+/// [`authenticate_permitting_impersonation`] and name themselves in doing so. Support
+/// impersonation exists so an operator can see what the user sees; it does not exist so they
+/// can change the user's credentials, revoke their sessions, or unlink their identities, none
+/// of which the user consented to and all of which are indistinguishable, afterwards, from the
+/// user having done it themselves.
 async fn authenticate(
+    state: &OidcState,
+    tenant_id: &str,
+    environment_id: &str,
+    headers: &HeaderMap,
+) -> Result<Account, Response> {
+    let account =
+        authenticate_permitting_impersonation(state, tenant_id, environment_id, headers).await?;
+    if account.impersonation.is_some() {
+        return Err(impersonation_forbidden());
+    }
+    Ok(account)
+}
+
+/// The refusal an impersonated caller gets on a constrained operation.
+///
+/// Names the constraint rather than returning a bare 403: an operator who is impersonating
+/// knows they are, and telling them WHY is the difference between a bug report and a
+/// correctly-understood guardrail.
+fn impersonation_forbidden() -> Response {
+    json_response(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "impersonation_forbidden",
+            "error_description": "This operation cannot be performed while impersonating a \
+                                  user; it changes the account in ways only its owner may \
+                                  authorize.",
+        }),
+    )
+}
+
+/// Authenticate the caller for an operation an impersonator MAY perform.
+///
+/// The exception, and it is named at the call site so choosing it is visible in review.
+///
+/// Resolves the scope from the path and the session cookie to an authenticated account, or
+/// returns the response to send instead (a uniform `404` for a malformed scope, a `401` for no
+/// or an invalid session, a `401` for a subject that is not a parseable user id of this
+/// scope).
+async fn authenticate_permitting_impersonation(
     state: &OidcState,
     tenant_id: &str,
     environment_id: &str,
@@ -106,6 +159,7 @@ async fn authenticate(
         session_id: session.session_id,
         auth_time_unix_micros: session.auth_time_unix_micros,
         auth_methods: session.auth_methods,
+        impersonation: session.impersonation,
     })
 }
 
@@ -200,10 +254,13 @@ pub async fn list_sessions(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
-    };
+    let account =
+        match authenticate_permitting_impersonation(&state, &tenant_id, &environment_id, &headers)
+            .await
+        {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
     let now_micros = epoch_micros(state.now());
     let listed = state
         .store()
@@ -353,10 +410,13 @@ pub async fn list_consents(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
-    };
+    let account =
+        match authenticate_permitting_impersonation(&state, &tenant_id, &environment_id, &headers)
+            .await
+        {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
     let listed = state
         .store()
         .scoped(account.scope)
@@ -486,10 +546,13 @@ pub async fn list_trusted_devices(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
-    };
+    let account =
+        match authenticate_permitting_impersonation(&state, &tenant_id, &environment_id, &headers)
+            .await
+        {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
     if !state.trusted_devices_enabled() {
         return json_response(StatusCode::OK, json!({ "trusted_devices": [] }));
     }
@@ -643,10 +706,13 @@ pub async fn list_credentials(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
-    };
+    let account =
+        match authenticate_permitting_impersonation(&state, &tenant_id, &environment_id, &headers)
+            .await
+        {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
     let listed = state
         .store()
         .scoped(account.scope)
@@ -1359,10 +1425,13 @@ pub async fn list_linked_identities(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
-    };
+    let account =
+        match authenticate_permitting_impersonation(&state, &tenant_id, &environment_id, &headers)
+            .await
+        {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
     let listed = state
         .store()
         .scoped(account.scope)

@@ -529,3 +529,157 @@ async fn unauthenticated_and_wrong_scope_requests_are_rejected() {
     let (status, _body) = get(&harness, &sessions, Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+/// Plant an impersonation on a live session, as the redemption path would.
+///
+/// Direct because the redemption endpoint is a separate slice; the five columns move together
+/// or not at all, which migration 0128 enforces, so this writes all five.
+async fn impersonate(harness: &Harness, session: &SessionId) {
+    let updated = sqlx::query(
+        "UPDATE sessions SET impersonator = $1, impersonation_reason_code = $2, \
+                impersonation_reason_text = $3, impersonation_started_at = now(), \
+                impersonation_expires_at = now() + INTERVAL '30 minutes' \
+         WHERE id = $4",
+    )
+    .bind("adm_support_engineer")
+    .bind("support_ticket")
+    .bind("Ticket 4417: reproducing the checkout failure as the user.")
+    .bind(session.to_string())
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("plant the impersonation");
+    assert_eq!(
+        updated.rows_affected(),
+        1,
+        "the plant must reach the session"
+    );
+}
+
+/// An impersonator may READ the account and may not CHANGE it (issue #101, criterion 5).
+///
+/// The reads are asserted alongside the refusals on purpose. Support impersonation exists so an
+/// operator can see what the user sees; a gate that refused everything would satisfy "the
+/// constraint is enforced" while making the feature useless, and only the pairing tells the
+/// two apart.
+#[tokio::test]
+async fn an_impersonator_may_read_the_account_and_may_not_change_it() {
+    let harness = Harness::start().await;
+    let ada = harness
+        .seed_user("ada@example.test", "correct horse battery")
+        .await;
+    let (session, cookie) = harness.session_with_id(&ada, "pwd", 0).await;
+    let base = base(&harness);
+
+    // Before impersonation the very same calls work, so the refusals below are a DIFFERENCE
+    // rather than the default state of a session that could never do anything.
+    let (status, _) = get(&harness, &format!("{base}/sessions"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK, "an ordinary session reads");
+    let (status, _) = post_json(
+        &harness,
+        &format!("{base}/sessions/revoke-others"),
+        Some(&cookie),
+        &json!({}),
+        &[],
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an ordinary session is not refused this write"
+    );
+
+    impersonate(&harness, &session).await;
+
+    for path in [
+        "/sessions",
+        "/consents",
+        "/trusted-devices",
+        "/credentials",
+        "/linked-identities",
+    ] {
+        let (status, body) = get(&harness, &format!("{base}{path}"), Some(&cookie)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an impersonator must still be able to READ {path}, which is what support \
+             impersonation is for: {body}"
+        );
+    }
+
+    let (status, body) = post_json(
+        &harness,
+        &format!("{base}/sessions/revoke-others"),
+        Some(&cookie),
+        &json!({}),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an impersonator must not revoke the user's other sessions: {body}"
+    );
+    assert_eq!(
+        body["error"], "impersonation_forbidden",
+        "the refusal names the constraint rather than being a bare 403: {body}"
+    );
+}
+
+/// THE CANARY (issue #101, criterion 5).
+///
+/// `revoke_consent` is driven here as a route whose handler contains no impersonation-specific
+/// code whatsoever: it calls `authenticate`, the ordinary entry point, and nothing else. It is
+/// refused under impersonation anyway, because the constraint lives in that function rather
+/// than in the handler.
+///
+/// That is the property the criterion asks for, and the reason the DEFAULT name is the
+/// constrained one. A route added next year by someone who has never heard of impersonation
+/// will reach for `authenticate`, and inherit this. The alternative, which the issue cites
+/// Casdoor for, is a check per controller and a hole wherever one was forgotten.
+///
+/// If this test ever fails because a new handler needs the permitting variant, that is the
+/// design working: the exception has to be typed out, and typing it out is what puts it in
+/// front of a reviewer.
+#[tokio::test]
+async fn a_route_with_no_impersonation_code_still_inherits_the_constraint() {
+    let harness = Harness::start().await;
+    let ada = harness
+        .seed_user("ada@example.test", "correct horse battery")
+        .await;
+    let (session, cookie) = harness.session_with_id(&ada, "pwd", 0).await;
+    let base = base(&harness);
+    let path = format!("{base}/consents/revoke");
+
+    // Unimpersonated it is not refused for this reason: whatever it answers, it is not the
+    // impersonation refusal. Without this the assertion below could pass on a route that is
+    // simply broken.
+    let (status, body) = post_json(
+        &harness,
+        &path,
+        Some(&cookie),
+        &json!({ "client_id": "cli_absent" }),
+        &[],
+    )
+    .await;
+    assert_ne!(
+        body["error"], "impersonation_forbidden",
+        "an ordinary session must not meet the impersonation gate: {status} {body}"
+    );
+
+    impersonate(&harness, &session).await;
+
+    let (status, body) = post_json(
+        &harness,
+        &path,
+        Some(&cookie),
+        &json!({ "client_id": "cli_absent" }),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the canary route inherited no constraint: {body}"
+    );
+    assert_eq!(body["error"], "impersonation_forbidden", "{body}");
+}
