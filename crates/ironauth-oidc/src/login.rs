@@ -497,6 +497,110 @@ async fn federation_route_redirect(
     Some(interaction::redirect(&location))
 }
 
+/// Resolve a login submission to a user through the login handle OR any trait field the
+/// active schema annotates as a login identifier (issue #624).
+///
+/// # Why every lookup runs, always
+///
+/// The obvious shape is to try the handle and fall back to the traits only on a miss. That
+/// makes a PRESENT handle cost one query and an ABSENT one cost `1 + n`, which is a timing
+/// oracle for whether a submitted string is somebody's login handle: exactly the property
+/// this path already goes out of its way to preserve, which is why the throttle runs AFTER a
+/// uniform-cost lookup rather than before it. So every configured lookup is performed on
+/// every attempt and the result is chosen afterwards. The cost is bounded by the schema's
+/// annotation count, which an operator sets and which is typically zero or one.
+///
+/// # Precedence, and when it refuses
+///
+/// The login HANDLE wins. It is the identifier with a uniqueness policy behind it, and
+/// adding a trait annotation must not change who an existing handle resolves to.
+///
+/// Among traits, two annotated fields resolving DIFFERENT users is refused, for the reason a
+/// single field's ambiguity is refused one layer down: choosing between them would let
+/// whoever can set a trait be handed somebody else's account. Resolving the SAME user twice
+/// is not ambiguity and resolves normally.
+///
+/// A scope with no active schema, a schema annotating nothing, or a schema that will not
+/// compile all behave exactly as they did before this existed: the handle lookup alone
+/// decides. A compile fault is a persistence corruption rather than a caller fault, and it
+/// must not take the ordinary login path down with it.
+async fn resolve_login_subject(
+    state: &OidcState,
+    scope: ironauth_store::Scope,
+    identifier: &str,
+) -> Result<Option<ironauth_store::UserRecord>, ironauth_store::StoreError> {
+    let by_handle = state
+        .store()
+        .scoped(scope)
+        .users()
+        .by_identifier(identifier)
+        .await;
+
+    let annotated = annotated_login_fields(state, scope).await;
+    if annotated.is_empty() {
+        return by_handle;
+    }
+
+    let mut by_trait: Option<ironauth_store::UserRecord> = None;
+    let mut ambiguous = false;
+    for field in &annotated {
+        // Every field is queried even once one has matched, so the number of queries does
+        // not depend on WHICH field matched or on whether any did.
+        let found = state
+            .store()
+            .scoped(scope)
+            .users()
+            .by_annotated_trait(field, identifier)
+            .await;
+        let Ok(Some(record)) = found else {
+            continue;
+        };
+        match &by_trait {
+            Some(existing) if existing.id != record.id => ambiguous = true,
+            Some(_) => {}
+            None => by_trait = Some(record),
+        }
+    }
+
+    match by_handle {
+        Ok(Some(record)) => Ok(Some(record)),
+        Ok(None) if ambiguous => Ok(None),
+        Ok(None) => Ok(by_trait),
+        // A handle-lookup FAULT is returned as the fault it is rather than papered over with
+        // a trait hit: turning a database failure into a successful login through a second
+        // route would be the wrong kind of resilient.
+        Err(error) => Err(error),
+    }
+}
+
+/// The trait fields the scope's ACTIVE schema annotates as login identifiers.
+///
+/// Empty for a scope with no active schema, a schema that annotates none, or a schema that
+/// fails to compile. Each of those means "the handle lookup alone decides", which is the
+/// behaviour every deployment had before this feature and therefore the safe absence. That
+/// safety is structural rather than tested: the function returns a `Vec`, an empty one skips
+/// the trait branch entirely, and there is no value it could return that would REFUSE a
+/// login the handle already resolved. A mutation sweep confirmed there is no edit to this
+/// function that breaks the no-schema case, which is why no test claims to cover it.
+///
+/// This list is also NOT the thing that stops an unannotated field resolving. The INDEX only
+/// ever holds rows for annotated fields (`rewrite_trait_login_index` in `ironauth-store`
+/// filters at write time), so a field named here that the schema does not annotate simply
+/// matches nothing. Adding a bogus field to this list is measurably inert. The property is
+/// pinned where it is enforced, in `ironauth-store`'s `trait_login_index.rs`, by the
+/// mutation that indexes every field; this list is a second filter over an already-filtered
+/// table and is kept because reading annotations here is what makes the query count depend
+/// on the SCHEMA rather than on the submitted value.
+async fn annotated_login_fields(state: &OidcState, scope: ironauth_store::Scope) -> Vec<String> {
+    let Ok(Some(active)) = state.store().scoped(scope).trait_schemas().active().await else {
+        return Vec::new();
+    };
+    let Ok(schema) = ironauth_store::trait_schema::TraitSchema::compile(&active.schema_json) else {
+        return Vec::new();
+    };
+    schema.annotations().login_identifiers
+}
+
 /// `POST /login`: verify the password and, on success, establish a session and
 /// resume the authorization request.
 // The linear flow (parse, CSRF, lookup, regulate, verify, session, per-arm failure
@@ -543,12 +647,7 @@ pub async fn login_post(
     // The environment-kind chrome (issue #42) for a re-rendered failure page.
     let banner = state.environment_banner(&resume.scope).await;
 
-    let lookup = state
-        .store()
-        .scoped(resume.scope)
-        .users()
-        .by_identifier(identifier)
-        .await;
+    let lookup = resolve_login_subject(&state, resume.scope, identifier).await;
 
     // Credential-abuse regulation (issue #64), keyed on the CANONICAL identifier (the
     // #54 seam) and the non-forgeable resolved peer IP (the #31 lesson), on the PASSWORD

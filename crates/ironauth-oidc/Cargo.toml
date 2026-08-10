@@ -364,6 +364,11 @@ name = "abuse_defenses"
 path = "tests/abuse_defenses.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "trait_login"
+path = "tests/trait_login.rs"
+required-features = ["testing"]
+
 # Registration abuse defenses (issue #80): the offline self-contained proof-of-work
 # challenge (a naive bot loop blocked with ZERO third-party calls; single-use, expiring,
 # context-bound), the disposable-domain block/flag with anti-enumeration uniformity, and the
