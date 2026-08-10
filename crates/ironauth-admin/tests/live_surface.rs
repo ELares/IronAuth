@@ -2071,6 +2071,38 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{org_base}/roles/{role}/permissions"),
         ),
+        // The AuthZEN PDP (issue #100). The two evaluation bodies name the REAL organization
+        // and a REAL user, so they reach `effective_permissions` rather than stopping at the
+        // handler's own 400 for a missing `context.organization_id`, which would pass this
+        // sweep while saying nothing about the grant the resolution needs.
+        Case::empty(
+            "authzen.getAuthzenConfiguration",
+            "GET",
+            format!("{base}/.well-known/authzen-configuration"),
+        ),
+        Case::json(
+            "authzen.authzenEvaluation",
+            "POST",
+            format!("{base}/access/v1/evaluation"),
+            &serde_json::json!({
+                "subject": { "type": "user", "id": user },
+                "resource": { "type": "billing.invoice" },
+                "action": { "name": "read" },
+                "context": { "organization_id": organization },
+            }),
+        ),
+        Case::json(
+            "authzen.authzenEvaluations",
+            "POST",
+            format!("{base}/access/v1/evaluations"),
+            &serde_json::json!({
+                "subject": { "type": "user", "id": user },
+                "resource": { "type": "billing.invoice" },
+                "action": { "name": "read" },
+                "context": { "organization_id": organization },
+                "evaluations": [{}],
+            }),
+        ),
         Case::json(
             "org_role_permissions.assignOrgRolePermission",
             "POST",

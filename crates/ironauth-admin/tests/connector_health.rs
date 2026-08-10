@@ -33,8 +33,14 @@ fn connector_body(slug: &str) -> String {
 
 /// A real federation runtime (its fetcher is never used: the test only touches the
 /// in-memory health registry, never the network).
+///
+/// `for_tests` rather than `new`, and not because the fetcher is unused. `new` reads the
+/// MACHINE's trust store, which on macOS intermittently answers `errSecIO` for all three
+/// settings domains and fails construction, so this file failed on a machine and passed on
+/// CI for reasons that had nothing to do with connector health. A test that reads the host's
+/// trust store is measuring the host.
 fn runtime() -> Arc<FederationRuntime> {
-    let fetcher = Arc::new(Fetcher::new(FetchLimits::default()).expect("fetcher"));
+    let fetcher = Arc::new(Fetcher::for_tests(FetchLimits::default()));
     let keys = Arc::new(FederationKeyResolver::new(
         Arc::clone(&fetcher),
         Duration::from_secs(300),
