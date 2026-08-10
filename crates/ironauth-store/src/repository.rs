@@ -14884,7 +14884,21 @@ async fn insert_admin_user_row(
     .execute(&mut **tx)
     .await;
     match result {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // The annotated-trait login index for a CREATE (issue #624). Same transaction as
+            // the row, for the reason the update seam states: an index written afterwards has
+            // a window in which a user who was just created cannot log in with the value they
+            // were created with.
+            //
+            // The schema is read here rather than threaded in, because a create carries only
+            // the version the SOURCE recorded and the annotations that matter are the ACTIVE
+            // schema's. A create with no schema version, or in a scope with no active schema,
+            // indexes nothing: there is no annotation set to consult, so there is no
+            // annotated field, and a login through this route simply does not resolve until
+            // the backfill runs.
+            index_traits_on_create(tx, master, scope, &id.to_string(), spec.traits).await?;
+            Ok(())
+        }
         Err(error) if is_unique_violation(&error) => {
             if unique_violation_constraint(&error) == Some(USERS_ID_CONSTRAINT) {
                 Err(id_collision)
@@ -14939,12 +14953,11 @@ impl UserRepo<'_> {
         // A soft-deleted user (a tombstone) never resolves as a login account: the
         // `deleted_at IS NULL` filter reads it as absent, so a deleted user cannot
         // authenticate exactly as an unknown one cannot.
-        let row = sqlx::query(
-            "SELECT id, identifier_sealed, password_hash, pii_dek_version, state, \
-             foreign_password_hash, foreign_password_algo FROM users \
-             WHERE identifier_bidx = $1 AND tenant_id = $2 AND environment_id = $3 \
-             AND deleted_at IS NULL",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {LOGIN_USER_COLUMNS} FROM users \
+                 WHERE identifier_bidx = $1 AND tenant_id = $2 AND environment_id = $3 \
+                 AND deleted_at IS NULL"
+        ))
         .bind(bidx.into_bytes())
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -14954,27 +14967,69 @@ impl UserRepo<'_> {
             tx.commit().await?;
             return Ok(None);
         };
-        let id_text: String = row.get("id");
-        let id = UserId::parse_in_scope(&id_text, &self.scope)?;
-        let dek_version: i32 = row.get("pii_dek_version");
-        let sealed: Vec<u8> = row.get("identifier_sealed");
-        let state =
-            UserState::from_wire(&row.get::<String, _>("state")).ok_or(StoreError::Encryption)?;
-        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
-        let plaintext = dek.open(
-            &user_pii_seal_aad(self.scope, USER_IDENTIFIER_PURPOSE, dek_version),
-            &Sealed::from_bytes(sealed)?,
-        )?;
+        let record = decode_login_user_row(&mut tx, self.scope, master, &row).await?;
         tx.commit().await?;
-        let identifier = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
-        Ok(Some(UserRecord {
-            id,
-            identifier,
-            password_hash: row.get("password_hash"),
-            state,
-            foreign_password_hash: row.get("foreign_password_hash"),
-            foreign_password_algo: row.get("foreign_password_algo"),
-        }))
+        Ok(Some(record))
+    }
+
+    /// Resolve a user by an ANNOTATED login-identifier trait value (issue #624).
+    ///
+    /// Returns the same shape as [`ScopedStore::by_identifier`] and is meant to be
+    /// indistinguishable from it: an unknown value, an unannotated field, a soft-deleted
+    /// holder, and an AMBIGUOUS value all return `Ok(None)`, so the caller has one failure
+    /// to render and no way to tell a prober which of those happened.
+    ///
+    /// # Ambiguity REFUSES rather than picks
+    ///
+    /// Two live users holding the same annotated value resolve to NEITHER. `user_identifiers`
+    /// can rely on a uniqueness constraint because `UniquenessMode` is a declared policy on
+    /// that surface; traits carry no such policy, so two users sharing a value is reachable
+    /// through ordinary writes. Picking one would be an account-takeover primitive: set the
+    /// value, be chosen, receive the other account's login. The index is deliberately not
+    /// unique so that this refusal happens HERE, at the read, rather than as a failed profile
+    /// update on the second user at a time nobody can connect to a login problem.
+    ///
+    /// The query therefore asks for TWO rows and refuses on the second, rather than using
+    /// `fetch_optional` and silently taking the first of many.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed value cannot be
+    /// authenticated; [`StoreError::Database`] on a persistence failure.
+    pub async fn by_annotated_trait(
+        &self,
+        field: &str,
+        value: &str,
+    ) -> Result<Option<UserRecord>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let hex = blind_index_hex(&user_trait_login_blind_index(
+            master, self.scope, field, value,
+        ));
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // LIMIT 2, not 1. One row resolves; two rows is the ambiguity above and must refuse.
+        // A `LIMIT 1` here would read as correct and quietly pick whichever row the planner
+        // returned first.
+        let rows = sqlx::query(&format!(
+            "SELECT {LOGIN_USER_COLUMNS} FROM user_trait_login_index i \
+                 JOIN users ON users.id = i.user_id \
+                 WHERE i.tenant_id = $1 AND i.environment_id = $2 \
+                 AND i.field = $3 AND i.blind_index = $4 \
+                 AND users.deleted_at IS NULL \
+                 LIMIT 2"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(field)
+        .bind(hex)
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows.len() != 1 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let record = decode_login_user_row(&mut tx, self.scope, master, &rows[0]).await?;
+        tx.commit().await?;
+        Ok(Some(record))
     }
 
     /// Whether a LIVE user is currently QUARANTINED (issue #82, PR 2): a fraud-review-queue
@@ -15921,6 +15976,29 @@ impl ActingUserRepo<'_> {
                     // a user row nor an audit row.
                     Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
                     Err(error) => return Err(error.into()),
+                }
+                // The annotated-trait login index for a REGISTRATION (issue #624). The
+                // registration path already validated against the ACTIVE schema, so the
+                // annotations it validated under are the ones to index by, and the version it
+                // carries is that schema's.
+                if let Some(carried) = traits {
+                    if let Ok(value) =
+                        serde_json::from_str::<serde_json::Value>(carried.traits_json)
+                    {
+                        if let Some(active) = active_trait_schema_in_tx(tx, scope).await? {
+                            let schema = TraitSchema::compile(&active.schema_json)?;
+                            rewrite_trait_login_index(
+                                tx,
+                                master,
+                                scope,
+                                &id.to_string(),
+                                carried.schema_version,
+                                &schema.annotations().login_identifiers,
+                                &value,
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 // A quarantined signup (issue #82, PR 2) opens its review-queue case in the
                 // SAME transaction as the account INSERT and its `user.register` audit row,
@@ -48581,6 +48659,22 @@ const USER_PII_SEAL_LABEL: &str = "ironauth.envelope.user-pii.v1";
 /// The AAD label domain-separating the `users.identifier` blind index from every
 /// other keyed derivation.
 const USER_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.user-identifier-bidx.v1";
+/// The AAD label domain-separating a `user_trait_login_index.blind_index` (an annotated
+/// login-identifier TRAIT value, issue #624) from every other keyed derivation.
+///
+/// A separate label from `USER_IDENTIFIER_BIDX_LABEL`, and the reason is worth stating
+/// exactly rather than generously. Sharing the label ALONE would not collide the two tags
+/// today, because the trait AAD also binds the FIELD and the identifier AAD does not, so the
+/// inputs differ regardless; a mutation sweep confirmed that sharing the label changes no
+/// stored byte. What would collide them is sharing the label AND dropping the field, and
+/// that combination IS caught, because the two tags would then be equal for the same string
+/// and a holder of a database dump could confirm that a trait value is also somebody's login
+/// handle.
+///
+/// The distinct label is kept as defence in depth against exactly that: it means the
+/// separation survives a future change to the AAD's other components rather than depending
+/// on one of them.
+const USER_TRAIT_LOGIN_BIDX_LABEL: &str = "ironauth.bidx.user-trait-login.v1";
 /// The AAD label domain-separating a `risk_signals.subject_bidx` (the raw external
 /// subject a third-party risk source asserted, issue #82) from every other keyed
 /// derivation, so a risk-signal subject index never collides with a login-handle index.
@@ -48888,6 +48982,193 @@ fn user_identifier_bidx_aad(scope: Scope, identifier: &str) -> Aad {
         .text(&scope.environment().to_string())
         .field(identifier.as_bytes())
         .build()
+}
+
+/// The associated data binding a `user_trait_login_index` row (issue #624) to its scope,
+/// the trait FIELD, and the canonical value.
+///
+/// The field, the tenant and the environment are all bound in, and it is worth being exact
+/// about what that buys, because the LOOKUP already filters on all three: no query can reach
+/// a row of another field or another scope whatever the tag is. A mutation sweep confirmed
+/// that removing any of these bindings changes no lookup result.
+///
+/// What they buy is that the TAG ITSELF carries no cross-context meaning. Equal tags in a
+/// database dump would say "these two users hold the same value" ACROSS fields, scopes, and
+/// (via the distinct label) across the `users.identifier_bidx` column. That is a correlation
+/// an operator with read access to a backup should not get for free, and it is the property
+/// `the_tag_is_separated_by_field_scope_and_column` asserts directly on the stored bytes,
+/// because no behavioural test can see it.
+fn user_trait_login_bidx_aad(scope: Scope, field: &str, canonical: &str) -> Aad {
+    Aad::builder()
+        .text(USER_TRAIT_LOGIN_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(field)
+        .field(canonical.as_bytes())
+        .build()
+}
+
+/// Index a freshly created identity's annotated traits (issue #624).
+///
+/// Shared by both create seams so they cannot index differently. Reads the scope's ACTIVE
+/// schema for the annotation set: a create carries whatever version its SOURCE recorded,
+/// which for an import is a foreign system's, and indexing under those annotations would
+/// index fields this deployment never declared to be login identifiers.
+///
+/// A scope with no active schema indexes nothing and is NOT an error. Users are creatable
+/// before a trait schema exists, and failing the create would make the index a precondition
+/// for user creation rather than a consequence of it.
+async fn index_traits_on_create(
+    tx: &mut Transaction<'_, Postgres>,
+    master: &MasterKey,
+    scope: Scope,
+    user_id: &str,
+    traits: Option<NewUserTraits<'_>>,
+) -> Result<(), StoreError> {
+    let Some(carried) = traits else {
+        return Ok(());
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(carried.traits_json) else {
+        return Ok(());
+    };
+    let Some(active) = active_trait_schema_in_tx(tx, scope).await? else {
+        return Ok(());
+    };
+    let schema = TraitSchema::compile(&active.schema_json)?;
+    rewrite_trait_login_index(
+        tx,
+        master,
+        scope,
+        user_id,
+        active.version,
+        &schema.annotations().login_identifiers,
+        &value,
+    )
+    .await
+}
+
+/// The columns a login resolution reads from `users`.
+///
+/// One constant rather than two copies of the list. `by_identifier` and
+/// `by_annotated_trait` must return the SAME record for the same user or a login that
+/// succeeded through one route and failed through the other would be a difference nothing
+/// explains, and two hand-written SELECT lists is how they would drift.
+const LOGIN_USER_COLUMNS: &str = "id, identifier_sealed, password_hash, pii_dek_version, \
+     state, foreign_password_hash, foreign_password_algo";
+
+/// Decode one `users` row selected with [`LOGIN_USER_COLUMNS`] into a [`UserRecord`],
+/// unsealing the identifier under the row's own DEK version.
+async fn decode_login_user_row(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    row: &PgRow,
+) -> Result<UserRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id = UserId::parse_in_scope(&id_text, &scope)?;
+    let dek_version: i32 = row.get("pii_dek_version");
+    let sealed: Vec<u8> = row.get("identifier_sealed");
+    let state =
+        UserState::from_wire(&row.get::<String, _>("state")).ok_or(StoreError::Encryption)?;
+    let dek = fetch_dek_by_version(tx, scope, master, dek_version).await?;
+    let plaintext = dek.open(
+        &user_pii_seal_aad(scope, USER_IDENTIFIER_PURPOSE, dek_version),
+        &Sealed::from_bytes(sealed)?,
+    )?;
+    let identifier = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
+    Ok(UserRecord {
+        id,
+        identifier,
+        password_hash: row.get("password_hash"),
+        state,
+        foreign_password_hash: row.get("foreign_password_hash"),
+        foreign_password_algo: row.get("foreign_password_algo"),
+    })
+}
+
+/// The deterministic blind index for an annotated trait value in `scope` under `master`.
+///
+/// The value is canonicalized through [`canonicalize_identifier`], the SAME entry point
+/// `user_identifiers` routes through, because the two surfaces resolve the same kind of
+/// thing and a login that succeeded through one spelling and failed through the other
+/// would be the disagreement this index exists to remove. `Username` is the kind: it
+/// case-folds and strips whitespace without imposing an email or E.164 SHAPE, and a trait
+/// annotated as a login identifier is not required to be either.
+fn user_trait_login_blind_index(
+    master: &MasterKey,
+    scope: Scope,
+    field: &str,
+    raw: &str,
+) -> BlindIndex {
+    let canonical = canonicalize_identifier(IdentifierType::Username, raw);
+    master.blind_index(&user_trait_login_bidx_aad(scope, field, canonical.as_str()))
+}
+
+/// Rewrite one identity's annotated-trait index rows to match `traits` under `schema`.
+///
+/// Called from EVERY seam that persists traits, in the SAME transaction as the trait write.
+/// A delete-then-insert rather than an upsert, because the table holds no UPDATE grant: a
+/// changed value is a different row, and the delete is what stops the OLD value continuing
+/// to resolve the user after they change it.
+///
+/// Only fields the schema annotates as login identifiers are indexed. A field that stops
+/// being annotated loses its rows on this identity's next trait write, and the backfill job
+/// is what sweeps the ones that never write again.
+///
+/// Non-string values are skipped rather than stringified. A number or an object has no
+/// canonical login spelling, and indexing `serde_json`'s rendering of one would make the
+/// tag depend on a serializer rather than on the value.
+async fn rewrite_trait_login_index(
+    tx: &mut Transaction<'_, Postgres>,
+    master: &MasterKey,
+    scope: Scope,
+    user_id: &str,
+    schema_version: i32,
+    annotated: &[String],
+    traits: &serde_json::Value,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "DELETE FROM user_trait_login_index \
+         WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    for field in annotated {
+        let Some(raw) = traits.get(field).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        // An empty or whitespace-only value canonicalizes to the empty string, which every
+        // such user would share. Indexing it would make them all ambiguous with each other
+        // and refuse every one of them; skipping means the field simply does not resolve
+        // that user, which is the honest answer for a value that is not there.
+        let index = user_trait_login_blind_index(master, scope, field, raw);
+        let hex = blind_index_hex(&index);
+        if canonicalize_identifier(IdentifierType::Username, raw)
+            .as_str()
+            .is_empty()
+        {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO user_trait_login_index \
+             (tenant_id, environment_id, field, blind_index, user_id, schema_version) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(field)
+        .bind(hex)
+        .bind(user_id)
+        .bind(schema_version)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 /// The deterministic blind index for `identifier` in `scope` under `master`, the
@@ -54610,6 +54891,24 @@ async fn write_migrated_traits(
     .bind(p.scope.environment().to_string())
     .execute(&mut **tx)
     .await?;
+    // A trait MIGRATION rewrites the document, so it rewrites the index with it (issue
+    // #624). This is the seam that would otherwise leave the index describing the
+    // pre-migration values: the transform can rename or re-case an annotated field's value,
+    // and an index still holding the old tag resolves a login the current document does not
+    // support.
+    // `target` IS the schema being migrated to, so its annotations are the ones the
+    // rewritten document must be indexed under.
+    let annotated = p.target.annotations().login_identifiers;
+    rewrite_trait_login_index(
+        tx,
+        p.master,
+        p.scope,
+        subject,
+        p.to_version,
+        &annotated,
+        traits,
+    )
+    .await?;
     Ok(())
 }
 
@@ -54964,6 +55263,20 @@ impl ActingUserRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // The annotated-trait login index, in the SAME transaction as the trait it
+                // indexes (issue #624). A separate transaction would leave a window where
+                // the value a user just set does not resolve them, and a crash inside that
+                // window would leave it never resolving them.
+                rewrite_trait_login_index(
+                    tx,
+                    master,
+                    scope,
+                    &id.to_string(),
+                    schema_version,
+                    &schema.annotations().login_identifiers,
+                    &value,
+                )
+                .await?;
                 Ok(schema_version)
             },
             false,

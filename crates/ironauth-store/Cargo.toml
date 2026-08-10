@@ -500,6 +500,11 @@ name = "traits"
 path = "tests/traits.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "trait_login_index"
+path = "tests/trait_login_index.rs"
+required-features = ["testing"]
+
 # Migrations as an invariant-checked state machine (issue #59). Needs a real database.
 [[test]]
 name = "migration_state_machine"
