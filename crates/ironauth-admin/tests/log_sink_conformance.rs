@@ -14,7 +14,8 @@
 use std::sync::Arc;
 
 use ironauth_admin::log_shipper::{
-    DatadogSink, HttpLogSink, LogSink, SinkOutcome, SplunkHecSink, datadog_body, splunk_body,
+    DatadogSink, HttpLogSink, LogSink, S3LogSink, SinkOutcome, SplunkHecSink, datadog_body,
+    splunk_body,
 };
 use ironauth_store::log_stream::{LogStreamRecord, SinkType, StreamHealth, StreamSource};
 use serde_json::{Value, json};
@@ -35,6 +36,10 @@ fn sinks() -> Vec<(SinkType, Arc<dyn LogSink>)> {
         (SinkType::Http, Arc::new(HttpLogSink::new(fetcher()))),
         (SinkType::Datadog, Arc::new(DatadogSink::new(fetcher()))),
         (SinkType::SplunkHec, Arc::new(SplunkHecSink::new(fetcher()))),
+        (
+            SinkType::S3,
+            Arc::new(S3LogSink::new(fetcher(), ironauth_env::Env::system())),
+        ),
     ]
 }
 
@@ -51,6 +56,23 @@ fn stream(sink_type: SinkType, sink_config: Value) -> LogStreamRecord {
         active: true,
         cursor: None,
         health: StreamHealth::default(),
+    }
+}
+
+/// A `sink_config` that satisfies THIS sink's shape requirements.
+///
+/// Per sink, because a shared fixture makes the credential assertions pass for the wrong
+/// reason: S3 needs a bucket as well as an endpoint, so with an endpoint-only config it
+/// refuses for the missing bucket before it ever looks at the credential, and the test
+/// would report the credential rule as enforced without having exercised it.
+fn complete_config(sink_type: SinkType) -> Value {
+    match sink_type {
+        SinkType::S3 => json!({
+            "endpoint": "https://s3.example",
+            "bucket": "audit",
+            "region": "us-east-1",
+        }),
+        _ => json!({ "endpoint": "https://sink.example/in" }),
     }
 }
 
@@ -101,7 +123,7 @@ async fn a_vendor_sink_refuses_without_a_credential() {
             // a missing credential is not on its own a misconfiguration.
             continue;
         }
-        let configured = stream(sink_type, json!({"endpoint": "https://sink.example/in"}));
+        let configured = stream(sink_type, complete_config(sink_type));
         let outcome = sink.deliver(&configured, None, &events()).await;
         match outcome {
             SinkOutcome::Rejected(reason) => assert!(
@@ -137,7 +159,7 @@ async fn no_sink_leaks_the_credential_into_its_reason() {
         for credential in [CANARY.to_string(), unsendable.clone()] {
             // Both shapes: a stream that cannot resolve an endpoint, and one that can and
             // so reaches the transport, since the reason is built on both paths.
-            for config in [json!({}), json!({"endpoint": "https://sink.invalid/in"})] {
+            for config in [json!({}), complete_config(sink_type)] {
                 let configured = stream(sink_type, config);
                 let outcome = sink
                     .deliver(&configured, Some(credential.as_str()), &events())

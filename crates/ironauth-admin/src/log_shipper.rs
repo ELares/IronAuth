@@ -678,3 +678,243 @@ impl Drop for LogShipper {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
+
+/// The S3-compatible object-store sink.
+///
+/// One PUT per batch, keyed by stream and cursor position, signed with AWS `SigV4`.
+///
+/// # The key is derived from the batch, not from a clock
+///
+/// `<prefix>/<stream id>/<last audit id>.json`. Delivery is at least once, so the same
+/// batch can be PUT twice; a key derived from the batch means the retry overwrites its own
+/// object rather than creating a second copy of the same events. A timestamped key would
+/// turn every retry into a duplicate object that a downstream consumer has to deduplicate.
+pub struct S3LogSink {
+    fetcher: Arc<ironauth_fetch::Fetcher>,
+    /// The clock seam, so the signing timestamp is deterministic under test.
+    env: Env,
+}
+
+impl S3LogSink {
+    /// Ship through `fetcher`, timestamping from `env`'s clock.
+    #[must_use]
+    pub fn new(fetcher: Arc<ironauth_fetch::Fetcher>, env: Env) -> Self {
+        Self { fetcher, env }
+    }
+}
+
+impl LogSink for S3LogSink {
+    fn sink_type(&self) -> SinkType {
+        SinkType::S3
+    }
+
+    fn deliver<'a>(
+        &'a self,
+        stream: &'a LogStreamRecord,
+        credential: Option<&'a str>,
+        events: &'a [Value],
+    ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
+        let fetcher = Arc::clone(&self.fetcher);
+        let endpoint = configured_endpoint(stream).map(str::to_owned);
+        let region = stream
+            .sink_config
+            .get("region")
+            .and_then(Value::as_str)
+            .unwrap_or("us-east-1")
+            .to_owned();
+        let bucket = stream
+            .sink_config
+            .get("bucket")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let prefix = stream
+            .sink_config
+            .get("prefix")
+            .and_then(Value::as_str)
+            .unwrap_or("ironauth")
+            .trim_matches('/')
+            .to_owned();
+        let credential = credential.map(str::to_owned);
+        let stream_id = stream.id.clone();
+        // The last event's id names the object, so a retry of the same batch overwrites
+        // rather than duplicating.
+        let last = events
+            .last()
+            .and_then(|event| event["uid"].as_str())
+            .unwrap_or("empty")
+            .to_owned();
+        let body = serde_json::to_string(events).unwrap_or_else(|_| "[]".to_string());
+        let now = self.env.clock().now_utc();
+        Box::pin(async move {
+            let (Some(endpoint), Some(bucket)) = (endpoint, bucket) else {
+                return SinkOutcome::Rejected(
+                    "sink_config needs both an `endpoint` and a `bucket`".to_string(),
+                );
+            };
+            // `<access key>:<secret>`, the same shape every S3 tool takes.
+            let Some((access_key, secret)) = credential
+                .as_deref()
+                .and_then(|credential| credential.split_once(':'))
+            else {
+                return SinkOutcome::Rejected(
+                    "the s3 sink needs an `<access key id>:<secret access key>` credential; \
+                     set credential_secret_name"
+                        .to_string(),
+                );
+            };
+
+            let Some((date, timestamp)) = sigv4_timestamps(now) else {
+                return SinkOutcome::Rejected("the signing clock is before the epoch".to_string());
+            };
+            let host = endpoint
+                .split("://")
+                .nth(1)
+                .unwrap_or(&endpoint)
+                .trim_end_matches('/')
+                .to_owned();
+            let path = format!("/{bucket}/{prefix}/{stream_id}/{last}.json");
+            let payload_hash = crate::sigv4::sha256_hex(body.as_bytes());
+            let canonical = crate::sigv4::CanonicalRequest {
+                method: "PUT",
+                path: &path,
+                headers: vec![
+                    ("host".to_string(), host.clone()),
+                    ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+                    ("x-amz-date".to_string(), timestamp.clone()),
+                ],
+                payload_hash: &payload_hash,
+            };
+            let scope = crate::sigv4::credential_scope(&date, &region, "s3");
+            let to_sign = crate::sigv4::string_to_sign(&timestamp, &scope, &canonical.render());
+            let signature = crate::sigv4::sign(secret, &date, &region, "s3", &to_sign);
+            let authorization = crate::sigv4::authorization_header(
+                access_key,
+                &scope,
+                &canonical.signed_headers(),
+                &signature,
+            );
+
+            post_object(
+                &fetcher,
+                format!("{}{path}", endpoint.trim_end_matches('/')),
+                vec![
+                    ("x-amz-content-sha256", payload_hash),
+                    ("x-amz-date", timestamp),
+                    ("authorization", authorization),
+                ],
+                body,
+            )
+            .await
+        })
+    }
+}
+
+/// `(yyyymmdd, yyyymmddThhmmssZ)` for a signing instant.
+///
+/// Derived from the passed instant rather than read from a clock here, so a test can pin
+/// it. Returns [`None`] before the epoch, which cannot happen in practice and is refused
+/// rather than wrapped into a signature that would be rejected for an unrelated reason.
+fn sigv4_timestamps(at: std::time::SystemTime) -> Option<(String, String)> {
+    let secs = at
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let days = secs / 86_400;
+    let (year, month, day) = civil_from_days(i64::try_from(days).ok()?);
+    let rest = secs % 86_400;
+    let (hour, minute, second) = (rest / 3600, (rest % 3600) / 60, rest % 60);
+    Some((
+        format!("{year:04}{month:02}{day:02}"),
+        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
+    ))
+}
+
+/// Days since the epoch to a civil date, by Howard Hinnant's algorithm.
+///
+/// Written out rather than pulled in, because the only alternative in this tree is a date
+/// crate this crate does not otherwise need, and `SigV4` wants nothing beyond `yyyymmdd`.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (
+        year,
+        u32::try_from(m).unwrap_or(1),
+        u32::try_from(d).unwrap_or(1),
+    )
+}
+
+/// PUT `body` to `url`, mapping the outcome exactly as [`post_json`] does.
+async fn post_object(
+    fetcher: &ironauth_fetch::Fetcher,
+    url: String,
+    headers: Vec<(&'static str, String)>,
+    body: String,
+) -> SinkOutcome {
+    let mut request = ironauth_fetch::FetchRequest::new(
+        ironauth_fetch::FetchPurpose::LogStreamDelivery,
+        http::Method::PUT,
+        url,
+    )
+    .header(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    )
+    .body(body);
+    for (name, value) in headers {
+        let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) else {
+            return SinkOutcome::Rejected("a required header could not be encoded".to_string());
+        };
+        request = request.header(name, value);
+    }
+    match fetcher.fetch(request).await {
+        Ok(response) if response.status().is_success() => SinkOutcome::Accepted,
+        Ok(response) => {
+            SinkOutcome::Rejected(format!("sink answered {}", response.status().as_u16()))
+        }
+        Err(ironauth_fetch::FetchError::Blocked) => {
+            SinkOutcome::Rejected("the outbound policy refused the configured endpoint".to_string())
+        }
+        Err(ironauth_fetch::FetchError::Timeout) => {
+            SinkOutcome::Rejected("the sink timed out".to_string())
+        }
+        Err(_) => SinkOutcome::Rejected("the sink could not be reached".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod s3_tests {
+    use super::*;
+
+    #[test]
+    fn the_signing_timestamps_render_the_expected_civil_date() {
+        // 2024-01-02T03:04:05Z.
+        let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_704_164_645);
+        let (date, timestamp) = sigv4_timestamps(at).expect("after the epoch");
+        assert_eq!(date, "20240102");
+        assert_eq!(timestamp, "20240102T030405Z");
+        assert!(
+            timestamp.starts_with(&date),
+            "the two must agree, or the credential scope and the x-amz-date disagree and \
+             the signature is rejected: {date} {timestamp}"
+        );
+    }
+
+    #[test]
+    fn the_epoch_itself_renders_as_1970() {
+        let (date, timestamp) =
+            sigv4_timestamps(std::time::SystemTime::UNIX_EPOCH).expect("the epoch");
+        assert_eq!(date, "19700101");
+        assert_eq!(timestamp, "19700101T000000Z");
+    }
+}

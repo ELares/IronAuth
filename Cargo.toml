@@ -185,6 +185,10 @@ rand_chacha = "0.3"
 # deny.toml sets multiple-versions = "warn", so that duplication is accepted
 # rather than silent; it resolves when sqlx moves to the 0.11 line.
 sha2 = "0.11"
+# HMAC-SHA256 for AWS SigV4 (issue #110). RustCrypto, the same family as sha2 above;
+# hand-rolling HMAC in an identity product is not an acceptable alternative even though
+# the construction is short.
+hmac = "0.13"
 # SHA-1 for the HIBP k-anonymity breached-password screening (crates/ironauth-screening,
 # issue #63). HIBP's range API keys on the SHA-1 of the password; this is NOT a
 # password hash (Argon2id owns that, issue #62), only the range lookup key, computed
