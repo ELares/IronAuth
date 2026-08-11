@@ -315,6 +315,9 @@ pub async fn create_org_role(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to the organization this role belongs to (issue #110),
+        // so a per-organization SIEM stream can select it.
+        .in_organization(org_id)
         .org_roles(scope)
         .create(
             state.env(),

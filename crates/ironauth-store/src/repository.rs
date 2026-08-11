@@ -38821,6 +38821,17 @@ pub struct ActingManagementStore<'a> {
 }
 
 impl<'a> ActingManagementStore<'a> {
+    /// Attribute every audit row written through this store to `organization` (issue
+    /// #110), the management-plane peer of [`ActingStore::in_organization`].
+    ///
+    /// The management plane is where most organization-scoped mutations happen, so this
+    /// is the arm that actually closes the attribution gap.
+    #[must_use]
+    pub fn in_organization(mut self, organization: crate::id::OrganizationId) -> Self {
+        self.acting = self.acting.in_organization(organization);
+        self
+    }
+
     /// The mutating tenant repository under `operator`.
     #[must_use]
     pub fn tenants(&self, operator: OperatorId) -> ActingTenantRepo<'a> {
