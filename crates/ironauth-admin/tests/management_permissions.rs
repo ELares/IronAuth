@@ -221,6 +221,10 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // SIEM log streams (issue #110). A READ: the status surface exposes delivery health
     // and the NAME of the sink credential, never its value.
     ("listLogStreams", ManagementPermission::Read),
+    // The configuration writes are `write_config`, the same class the webhook endpoint
+    // registration uses: both name an outbound destination the server will send to.
+    ("createLogStream", ManagementPermission::WriteConfig),
+    ("deleteLogStream", ManagementPermission::WriteConfig),
     ("listWebhookEndpoints", ManagementPermission::Read),
     ("listWebhookDeliveryAttempts", ManagementPermission::Read),
     ("listWebhookDeadLetters", ManagementPermission::Read),
@@ -561,6 +565,9 @@ const PERMISSION_PROVEN: &[&str] = &[
     // which drives it in BOTH directions: served under read, refused with the required
     // permission named under a different one.
     "listLogStreams",
+    // Proven in the same test, which drives all three in both directions.
+    "createLogStream",
+    "deleteLogStream",
     // Proven in `the_authzen_endpoints_demand_read_and_never_answer_unauthenticated`, which
     // drives a credential holding a WRITE but not read and asserts each refusal names read.
     "getAuthzenConfiguration",
@@ -600,7 +607,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        161,
+        163,
         "the classified set changed size; update the unproven count below with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

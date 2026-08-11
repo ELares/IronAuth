@@ -36947,6 +36947,12 @@ pub struct ChainEntry {
 /// A new log stream, as the management plane configures one.
 #[derive(Debug, Clone)]
 pub struct NewLogStream<'a> {
+    /// The identifier to use, or `None` to generate one.
+    ///
+    /// Supplied by a caller that must know the id BEFORE the write, because its response
+    /// body carries it and that body is stored as the idempotency record in the same
+    /// transaction.
+    pub id: Option<&'a str>,
     /// The operator's label. Never secret.
     pub description: &'a str,
     /// Which audit stream(s) to ship.
@@ -37086,9 +37092,17 @@ impl LogStreamRepo<'_> {
     ///
     /// [`StoreError`] on a persistence fault, including the permission failure a
     /// data-plane caller gets: only the control plane may create a stream.
-    pub async fn create(&self, env: &Env, new: &NewLogStream<'_>) -> Result<String, StoreError> {
+    pub async fn create(
+        &self,
+        env: &Env,
+        new: &NewLogStream<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<String, StoreError> {
         let scope = self.scope;
-        let id = crate::id::LogStreamId::generate(env, &scope).to_string();
+        let id = new.id.map_or_else(
+            || crate::id::LogStreamId::generate(env, &scope).to_string(),
+            str::to_owned,
+        );
         let mut tx = begin_scoped(self.store, scope).await?;
         sqlx::query(
             "INSERT INTO log_streams \
@@ -37108,8 +37122,48 @@ impl LogStreamRepo<'_> {
         .bind(new.organization_id)
         .execute(&mut *tx)
         .await?;
+        // In the SAME transaction as the create. A crash between the two would leave a
+        // stream configured with no idempotency record, and the client's retry would
+        // configure a SECOND stream shipping the same events to the same sink.
+        insert_idempotency(&mut tx, idempotency).await?;
         tx.commit().await?;
         Ok(id)
+    }
+
+    /// Remove a configured stream and every dead letter it recorded.
+    ///
+    /// The dead letters go WITH it. They name a stream that no longer exists otherwise,
+    /// and an outstanding entry nothing can replay is worse than none: it reports a gap an
+    /// operator has no way to close.
+    ///
+    /// Removing an absent stream is a no-op success, so DELETE stays idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault, including the permission failure a
+    /// data-plane caller gets: only the control plane may remove a stream.
+    pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "DELETE FROM log_stream_dead_letters \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM log_streams WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Every ACTIVE stream in this scope.

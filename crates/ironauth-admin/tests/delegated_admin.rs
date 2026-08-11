@@ -1477,6 +1477,52 @@ async fn the_log_stream_status_read_demands_read_and_never_answers_unauthenticat
         StatusCode::UNAUTHORIZED,
         "log streams answered an unauthenticated caller: {body}"
     );
+
+    // The CONFIGURATION writes are a different permission from the read, and both
+    // directions matter for each. `management.read` must NOT be enough to configure a
+    // stream: a read-only credential that could point an audit export at a destination of
+    // its choosing would make the read/write split meaningless.
+    let create_body = serde_json::json!({
+        "source": "both",
+        "sink_type": "http",
+        "sink_config": {"endpoint": "https://sink.example/in"},
+    })
+    .to_string();
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.post_as(&streams, &secret, "lgs-1", &create_body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential must not configure a log stream: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal must name the permission it wanted: {body}"
+    );
+    let absent = format!("{streams}/lgs_absent");
+    let (status, _, body) = h.delete_as(&absent, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential must not remove a log stream: {body}"
+    );
+
+    // And write_config is served, so the refusal above is the permission talking rather
+    // than the route being broken.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h.post_as(&streams, &secret, "lgs-2", &create_body).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "write_config must be able to configure a stream: {body}"
+    );
 }
 
 /// Every `AuthZEN` endpoint demands `management.read`, and unauthenticated evaluation is never

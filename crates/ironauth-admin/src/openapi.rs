@@ -425,6 +425,8 @@ use crate::views::{
         crate::step_up_policies::set_step_up_policy,
         crate::step_up_policies::remove_step_up_policy,
         crate::log_streams::list_log_streams,
+        crate::log_streams::create_log_stream,
+        crate::log_streams::delete_log_stream,
         crate::webhook_endpoints::list_webhook_endpoints,
         crate::webhook_endpoints::create_webhook_endpoint,
         crate::webhook_endpoints::rotate_webhook_endpoint_secret,

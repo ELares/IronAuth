@@ -109,6 +109,7 @@ fn operation_ids_are_the_stable_set() {
             "createFlowVersion",
             "createIdentityImport",
             "createInvitation",
+            "createLogStream",
             "createManagementKey",
             "createMembership",
             "createOrgGroup",
@@ -132,6 +133,7 @@ fn operation_ids_are_the_stable_set() {
             "deleteConnector",
             "deleteEnvironment",
             "deleteLocale",
+            "deleteLogStream",
             "deleteManagementKey",
             "deleteMembership",
             "deleteOrgGroup",
@@ -487,6 +489,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}",
@@ -630,6 +633,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions/{version}/pin",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/abandon",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
@@ -790,7 +794,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        222,
+        224,
         "the documented route count is pinned"
     );
 

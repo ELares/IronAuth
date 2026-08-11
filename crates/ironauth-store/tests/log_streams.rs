@@ -18,6 +18,7 @@ use ironauth_store::test_support::TestDatabase;
 
 fn new_stream() -> NewLogStream<'static> {
     NewLogStream {
+        id: None,
         description: "ship everything to the collector",
         source: StreamSource::Both,
         sink_type: SinkType::Http,
@@ -38,7 +39,7 @@ async fn a_configured_stream_round_trips_and_starts_healthy_with_no_cursor() {
         .control_store()
         .scoped(scope)
         .log_streams()
-        .create(&env, &new_stream())
+        .create(&env, &new_stream(), None)
         .await
         .expect("configure a stream");
     assert!(
@@ -87,7 +88,7 @@ async fn an_empty_filter_survives_the_round_trip_as_empty() {
     db.control_store()
         .scoped(scope)
         .log_streams()
-        .create(&env, &parked)
+        .create(&env, &parked, None)
         .await
         .expect("configure a parked stream");
 
@@ -117,7 +118,7 @@ async fn success_and_failure_move_the_cursor_and_the_health_the_way_status_repor
         .control_store()
         .scoped(scope)
         .log_streams()
-        .create(&env, &new_stream())
+        .create(&env, &new_stream(), None)
         .await
         .expect("configure");
 
@@ -184,7 +185,7 @@ async fn the_data_plane_cannot_create_a_stream() {
         .store()
         .scoped(scope)
         .log_streams()
-        .create(&env, &new_stream())
+        .create(&env, &new_stream(), None)
         .await;
     let error = format!(
         "{:?}",
@@ -214,13 +215,13 @@ async fn a_per_organization_stream_round_trips_its_organization() {
     db.control_store()
         .scoped(scope)
         .log_streams()
-        .create(&env, &scoped_stream)
+        .create(&env, &scoped_stream, None)
         .await
         .expect("configure a per-organization stream");
     db.control_store()
         .scoped(scope)
         .log_streams()
-        .create(&env, &new_stream())
+        .create(&env, &new_stream(), None)
         .await
         .expect("configure an environment-wide stream");
 

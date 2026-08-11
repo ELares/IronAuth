@@ -28,7 +28,14 @@ PROVIDER_DIR="terraform-provider-ironauth/internal/provider"
 
 # The ratchet. LOWER it in the same change that adds a resource; raising it needs a
 # reason in the diff, which is the point of it being a number in a file.
-UNCOVERED_CEILING=20
+#
+# RAISED 20 -> 21 for `createLogStream` (issue #110), and the reason is that the resource
+# is genuinely new surface rather than coverage slipping: the log stream configuration API
+# did not exist before this change, so the denominator grew. A Terraform resource for it
+# belongs with the rest of the provider work and is not something to bolt on inside the
+# API's own change; doing that would mean shipping a provider resource with no acceptance
+# test alongside it.
+UNCOVERED_CEILING=21
 
 python3 - "$SPEC" "$PROVIDER_DIR" "$UNCOVERED_CEILING" <<'PY'
 import collections, json, pathlib, re, sys

@@ -1083,8 +1083,26 @@ export interface paths {
         /** List the environment's SIEM log streams and their delivery health. */
         get: operations["listLogStreams"];
         put?: never;
-        post?: never;
+        /** Configure a SIEM log stream. */
+        post: operations["createLogStream"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove a SIEM log stream. */
+        delete: operations["deleteLogStream"];
         options?: never;
         head?: never;
         patch?: never;
@@ -3787,6 +3805,23 @@ export interface components {
              */
             org_context?: string | null;
         };
+        /** @description The body of a create request. */
+        CreateLogStreamRequest: {
+            /** @description The NAME of the environment secret holding the sink credential. */
+            credential_secret_name?: string | null;
+            /** @description A human label. Never secret. */
+            description?: string | null;
+            /** @description Ship only these action wire strings. Absent means all; empty ships none. */
+            event_type_filter?: string[] | null;
+            /** @description Scope the stream to one organization. Absent means environment-wide. */
+            organization_id?: string | null;
+            /** @description Sink shape: endpoint, and for S3 a bucket and region. NEVER a credential. */
+            sink_config?: unknown;
+            /** @description `http`, `s3`, `datadog`, or `splunk_hec`. */
+            sink_type: string;
+            /** @description `admin_action`, `authentication`, or `both`. */
+            source: string;
+        };
         /** @description The body to mint a management API key in a `(tenant, environment)` scope. */
         CreateManagementKeyRequest: {
             /**
@@ -4715,6 +4750,11 @@ export interface components {
             is_env_default: boolean;
             /** @description The BCP47 language tag (the per-environment natural key). */
             locale: string;
+        };
+        /** @description The created stream. */
+        LogStreamCreated: {
+            /** @description The `lgs_` identifier. */
+            id: string;
         };
         /** @description The environment's configured streams. */
         LogStreamList: {
@@ -12514,6 +12554,135 @@ export interface operations {
                 };
             };
             /** @description The environment is absent */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createLogStream: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateLogStreamRequest"];
+            };
+        };
+        responses: {
+            /** @description The configured stream */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogStreamCreated"];
+                };
+            };
+            /** @description Malformed request, or an unknown source or sink type */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteLogStream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The log stream identifier */
+                stream_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stream is gone */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
             404: {
                 headers: {
                     [name: string]: unknown;

@@ -7773,6 +7773,197 @@
             "bearer": []
           }
         ]
+      },
+      "post": {
+        "tags": [
+          "log-streams"
+        ],
+        "summary": "Configure a SIEM log stream.",
+        "operationId": "createLogStream",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateLogStreamRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The configured stream",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogStreamCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, or an unknown source or sink type",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}": {
+      "delete": {
+        "tags": [
+          "log-streams"
+        ],
+        "summary": "Remove a SIEM log stream.",
+        "operationId": "deleteLogStream",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream_id",
+            "in": "path",
+            "description": "The log stream identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The stream is gone"
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
@@ -23289,6 +23480,59 @@
           }
         }
       },
+      "CreateLogStreamRequest": {
+        "type": "object",
+        "description": "The body of a create request.",
+        "required": [
+          "source",
+          "sink_type"
+        ],
+        "properties": {
+          "credential_secret_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The NAME of the environment secret holding the sink credential."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A human label. Never secret."
+          },
+          "event_type_filter": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Ship only these action wire strings. Absent means all; empty ships none."
+          },
+          "organization_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Scope the stream to one organization. Absent means environment-wide."
+          },
+          "sink_config": {
+            "description": "Sink shape: endpoint, and for S3 a bucket and region. NEVER a credential."
+          },
+          "sink_type": {
+            "type": "string",
+            "description": "`http`, `s3`, `datadog`, or `splunk_hec`."
+          },
+          "source": {
+            "type": "string",
+            "description": "`admin_action`, `authentication`, or `both`."
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateManagementKeyRequest": {
         "type": "object",
         "description": "The body to mint a management API key in a `(tenant, environment)` scope.",
@@ -24820,6 +25064,19 @@
           "locale": {
             "type": "string",
             "description": "The BCP47 language tag (the per-environment natural key)."
+          }
+        }
+      },
+      "LogStreamCreated": {
+        "type": "object",
+        "description": "The created stream.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The `lgs_` identifier."
           }
         }
       },

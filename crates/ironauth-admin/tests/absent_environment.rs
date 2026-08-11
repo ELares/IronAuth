@@ -256,6 +256,31 @@ impl Ids {
     }
 }
 
+/// The SIEM log stream configuration writes (issue #110).
+fn log_stream_cases(base: &str) -> Vec<Case> {
+    vec![
+        Case {
+            label: "log_streams.createLogStream",
+            method: "POST",
+            path: format!("{base}/log-streams"),
+            body: Some(
+                serde_json::json!({
+                    "source": "both",
+                    "sink_type": "http",
+                    "sink_config": {"endpoint": "https://sink.example/in"},
+                })
+                .to_string(),
+            ),
+        },
+        Case {
+            label: "log_streams.deleteLogStream",
+            method: "DELETE",
+            path: format!("{base}/log-streams/lgs_absent"),
+            body: None,
+        },
+    ]
+}
+
 /// The credential-abuse and sudo-elevation writes: the two that hang off nothing but
 /// the environment itself.
 fn abuse_and_sudo_cases(base: &str) -> Vec<Case> {
@@ -1235,6 +1260,7 @@ fn all_cases(tenant: &str, environment: &str) -> Vec<Case> {
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
     let ids = Ids::mint(tenant, environment);
     let mut cases = abuse_and_sudo_cases(&base);
+    cases.extend(log_stream_cases(&base));
     cases.extend(client_cases(&base, &ids));
     cases.extend(secret_cases(&base));
     cases.extend(posture_cases(&base, &ids));
