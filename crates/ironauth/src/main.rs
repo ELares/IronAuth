@@ -53,7 +53,8 @@ use ironauth_store::{
 };
 
 use ironauth_admin::log_shipper::{
-    DatadogSink, HttpLogSink, LogShipper, LogSink, S3LogSink, SplunkHecSink,
+    DatadogSink, HttpLogSink, LogShipper, LogShipperObserver, LogSink, S3LogSink, SplunkHecSink,
+    StreamObservation,
 };
 
 use crate::shared_config::SharedPlaneInputs;
@@ -2753,6 +2754,53 @@ async fn spawn_trait_migration_pools(inputs: TraitMigrationInputs) -> Vec<Outbox
     pools
 }
 
+/// Publishes each shipping pass as gauges.
+///
+/// Aggregated to (sink type, status) HERE rather than in the shipper, because that is the
+/// step that keeps cardinality bounded and it belongs next to the exporter. A gauge per
+/// stream id would be unbounded on a multi-tenant deployment.
+struct MetricsShipperObserver;
+
+impl LogShipperObserver for MetricsShipperObserver {
+    fn observed(&self, streams: &[StreamObservation]) {
+        use std::collections::BTreeMap;
+
+        let mut by_state: BTreeMap<(&'static str, &'static str), f64> = BTreeMap::new();
+        let mut dead_letters: BTreeMap<&'static str, f64> = BTreeMap::new();
+        for stream in streams {
+            let sink = stream.sink_type.as_str();
+            let status = match stream.status {
+                ironauth_store::log_stream::StreamStatus::Healthy => "healthy",
+                ironauth_store::log_stream::StreamStatus::Degraded => "degraded",
+                ironauth_store::log_stream::StreamStatus::Failing => "failing",
+            };
+            *by_state.entry((sink, status)).or_default() += 1.0;
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a dead-letter count is far below the f64 integer range, and a \
+                          gauge is f64"
+            )]
+            let outstanding = stream.outstanding_dead_letters as f64;
+            *dead_letters.entry(sink).or_default() += outstanding;
+        }
+        for ((sink, status), count) in by_state {
+            metrics::gauge!(
+                ironauth_server::metrics::LOG_STREAMS,
+                "sink_type" => sink,
+                "status" => status,
+            )
+            .set(count);
+        }
+        for (sink, count) in dead_letters {
+            metrics::gauge!(
+                ironauth_server::metrics::LOG_STREAM_DEAD_LETTERS,
+                "sink_type" => sink,
+            )
+            .set(count);
+        }
+    }
+}
+
 /// What the SIEM log stream shipper (issue #110) needs, captured before `config` moves
 /// into the server.
 struct LogShipperInputs {
@@ -2827,11 +2875,13 @@ async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
         Arc::new(S3LogSink::new(fetcher, env.clone())),
     ];
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer: Arc<dyn LogShipperObserver> = Arc::new(MetricsShipperObserver);
     let shipper = LogShipper::spawn(
         data_store,
         env,
         scopes,
         sinks,
+        observer,
         std::time::Duration::from_secs(log_streams.interval_secs),
     );
     tracing::info!(

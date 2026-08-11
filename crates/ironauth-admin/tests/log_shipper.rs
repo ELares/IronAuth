@@ -613,3 +613,40 @@ async fn a_refused_replay_leaves_the_dead_letter_outstanding() {
         "a refused replay must NOT clear the dead letter"
     );
 }
+
+/// The metrics observation reports each stream's sink type, status and outstanding gap.
+///
+/// Checked through `observe` rather than through the exporter, because what a wrong
+/// implementation gets wrong is the DATA (a stream counted under the wrong status, or a
+/// dead-letter gap reported as zero), not the gauge call.
+#[tokio::test]
+async fn the_metrics_observation_reports_status_and_the_outstanding_gap() {
+    use ironauth_admin::log_shipper::{DEAD_LETTER_AFTER, observe};
+    use ironauth_store::log_stream::StreamStatus;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    configure(&db, &env, scope, StreamSource::Both, SinkType::Http, None).await;
+    seed_admin(&db, &env, scope, 1, "observed").await;
+
+    // Healthy before anything fails.
+    let before = observe(db.store(), scope).await.expect("observe");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].sink_type, SinkType::Http);
+    assert_eq!(before[0].status, StreamStatus::Healthy);
+    assert_eq!(before[0].outstanding_dead_letters, 0);
+
+    // Fail it into a dead letter.
+    let failing: Vec<Arc<dyn LogSink>> = vec![RecordingSink::new(SinkType::Http, false)];
+    for _ in 0..DEAD_LETTER_AFTER {
+        ship_once(db.store(), &env, scope, &failing)
+            .await
+            .expect("ship");
+    }
+    let after = observe(db.store(), scope).await.expect("observe");
+    assert_eq!(
+        after[0].outstanding_dead_letters, 1,
+        "the export gap must be visible as a number, not only as a status: {after:?}"
+    );
+}
