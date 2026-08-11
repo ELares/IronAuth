@@ -587,3 +587,81 @@ impl LogSink for SplunkHecSink {
         })
     }
 }
+
+/// The background task that ships every configured stream on an interval.
+///
+/// Modelled on the audit retention sweeper (issue #109) and for the same reason: a pass
+/// that fails must not stop the next one, and shutdown must not wait out a whole interval.
+pub struct LogShipper {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LogShipper {
+    /// Spawn the shipper. Returns immediately; it runs until
+    /// [`shutdown`](LogShipper::shutdown) is awaited or it is dropped.
+    #[must_use]
+    pub fn spawn(
+        store: Store,
+        env: Env,
+        scopes: Arc<dyn ironauth_store::outbox::ScopeSource>,
+        sinks: Vec<Arc<dyn LogSink>>,
+        interval: std::time::Duration,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_stop = Arc::clone(&stop);
+        let handle = tokio::spawn(async move {
+            while !task_stop.load(Ordering::Relaxed) {
+                match scopes.scopes().await {
+                    Ok(resolved) => {
+                        for scope in resolved {
+                            // Checked BETWEEN scopes, so a shutdown is bounded by one
+                            // scope's bounded pass rather than by the whole sweep.
+                            if task_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            // A per-stream failure is already recorded on its own row by
+                            // `ship_once`; only a failure to LIST reaches here.
+                            if let Err(error) = ship_once(&store, &env, scope, &sinks).await {
+                                tracing::error!(
+                                    %error,
+                                    "a log stream shipping pass could not read its streams"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "log stream shipping could not enumerate scopes");
+                    }
+                }
+                let mut slept = std::time::Duration::ZERO;
+                while slept < interval && !task_stop.load(Ordering::Relaxed) {
+                    let slice =
+                        std::time::Duration::from_millis(200).min(interval.saturating_sub(slept));
+                    tokio::time::sleep(slice).await;
+                    slept += slice;
+                }
+            }
+        });
+        Self {
+            handle: Some(handle),
+            stop,
+        }
+    }
+
+    /// Stop the shipper and wait for the in-flight pass to finish.
+    pub async fn shutdown(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for LogShipper {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}

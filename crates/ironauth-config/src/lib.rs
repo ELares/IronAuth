@@ -213,6 +213,14 @@ pub struct Config {
     /// requirement onto the long one or the long storage bill onto the short one.
     pub audit_retention: AuditRetentionConfig,
 
+    /// SIEM log stream shipping (issue #110): whether THIS process ships configured
+    /// streams to their sinks, and how often.
+    ///
+    /// Separate from `[webhooks]` on purpose. That gates the tenant-facing event
+    /// deliverer; this gates the operator-facing audit export, and a deployment routinely
+    /// wants one without the other.
+    pub log_streams: LogStreamsConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -464,6 +472,39 @@ pub struct OutboxConfig {
     /// series, rather than an absent one that looks exactly like a dead process to
     /// whatever alerts on it.
     pub metrics_sample_interval_secs: u64,
+}
+
+/// SIEM log stream shipping settings (issue #110).
+///
+/// OFF by default, like every other background worker here: no mandatory background
+/// infrastructure. A deployment that never opens this section ships nothing, and its
+/// configured streams simply do not advance rather than losing events, because the cursor
+/// is durable and the audit rows stay where they are.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct LogStreamsConfig {
+    /// Whether THIS process ships configured log streams. OFF by default.
+    ///
+    /// Turning it off does not stop streams being configured or audit rows being written;
+    /// it stops them being SHIPPED by this process. That separation is what lets a
+    /// deployment run its shippers on dedicated nodes.
+    pub shipping_enabled: bool,
+
+    /// Seconds between shipping passes.
+    ///
+    /// A pass is bounded, so a stream far behind catches up over several passes rather
+    /// than holding a sink for an unbounded time. The default trades export latency for
+    /// a small, predictable read rate against the audit table.
+    pub interval_secs: u64,
+}
+
+impl Default for LogStreamsConfig {
+    fn default() -> Self {
+        Self {
+            shipping_enabled: false,
+            interval_secs: 60,
+        }
+    }
 }
 
 /// Audit retention settings (issue #109).
