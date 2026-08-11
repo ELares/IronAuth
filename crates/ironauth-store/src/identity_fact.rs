@@ -245,6 +245,86 @@ pub fn to_tuple_change(fact: &IdentityFact) -> TupleChange {
     }
 }
 
+/// The tuple state a consumer should hold after applying an ordered run of facts.
+///
+/// A sync consumer is not a `for` loop over `to_tuple_change`. Two things make it more than
+/// that, and both are the kind of thing a demo gets wrong quietly:
+///
+/// * A run can contain an ADD and its REMOVE. Applying both to a real FGA is two round trips
+///   to reach a state one round trip could have reached, and on a bulk backfill that is the
+///   difference between minutes and hours.
+/// * A `user_deleted` in the run makes every earlier tuple for that user irrelevant. A
+///   consumer that wrote them first and deleted them after would briefly GRANT access to a
+///   deleted user, which is visible to anyone checking during the window.
+///
+/// So this folds a run into the minimal set of writes and deletes, in the order the facts
+/// arrived. Deleting whole subjects is reported separately because no tuple list expresses
+/// it; see [`TupleChange::DeleteAllFor`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SyncPlan {
+    /// Tuples to write, in first-seen order.
+    pub writes: Vec<Tuple>,
+    /// Tuples to delete, in first-seen order.
+    pub deletes: Vec<Tuple>,
+    /// Subjects whose every tuple must be removed, in first-seen order.
+    pub purges: Vec<String>,
+}
+
+/// Fold an ORDERED run of facts into the minimal tuple operations.
+///
+/// `facts` must already be in feed order WITHIN each ordering group; this does not sort,
+/// because it cannot: the feed's order is the only source of truth about what happened, and
+/// a consumer that re-sorted would be inventing one.
+///
+/// # Panics
+///
+/// Never.
+#[must_use]
+pub fn plan(facts: &[IdentityFact]) -> SyncPlan {
+    let mut writes: Vec<Tuple> = Vec::new();
+    let mut deletes: Vec<Tuple> = Vec::new();
+    let mut purges: Vec<String> = Vec::new();
+
+    for fact in facts {
+        match to_tuple_change(fact) {
+            TupleChange::Write(tuples) => {
+                for tuple in tuples {
+                    // A write after a delete of the same tuple is a re-grant, so the earlier
+                    // delete is dropped rather than both being sent. Order matters: the LAST
+                    // statement about a tuple is the true one.
+                    deletes.retain(|existing| existing != &tuple);
+                    if !writes.contains(&tuple) {
+                        writes.push(tuple);
+                    }
+                }
+            }
+            TupleChange::Delete(tuples) => {
+                for tuple in tuples {
+                    writes.retain(|existing| existing != &tuple);
+                    if !deletes.contains(&tuple) {
+                        deletes.push(tuple);
+                    }
+                }
+            }
+            TupleChange::DeleteAllFor { user } => {
+                // Everything queued for this subject is now moot: the purge subsumes it.
+                // Dropping the queued writes is what stops the consumer briefly granting
+                // access to a deleted user.
+                writes.retain(|tuple| tuple.user != user);
+                deletes.retain(|tuple| tuple.user != user);
+                if !purges.contains(&user) {
+                    purges.push(user);
+                }
+            }
+        }
+    }
+    SyncPlan {
+        writes,
+        deletes,
+        purges,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +537,145 @@ mod tests {
             },
             "a delete that named specific tuples would leave every tuple it did not name"
         );
+    }
+
+    /// A run containing an ADD and its REMOVE collapses to the REMOVE alone.
+    ///
+    /// The naive consumer writes then deletes: two round trips to reach a state one reaches,
+    /// and on a bulk backfill that is the difference between minutes and hours.
+    #[test]
+    fn an_add_followed_by_its_removal_collapses_to_the_removal() {
+        let plan = plan(&[
+            IdentityFact::MembershipAdded {
+                user_id: "usr_1".to_owned(),
+                organization_id: "org_1".to_owned(),
+                membership_id: "omb_1".to_owned(),
+            },
+            IdentityFact::MembershipRemoved {
+                user_id: "usr_1".to_owned(),
+                organization_id: "org_1".to_owned(),
+                membership_id: "omb_1".to_owned(),
+            },
+        ]);
+        assert!(plan.writes.is_empty(), "the write was superseded: {plan:?}");
+        assert_eq!(plan.deletes.len(), 1, "{plan:?}");
+    }
+
+    /// A REMOVE followed by a re-ADD collapses to the WRITE alone.
+    ///
+    /// The last statement about a tuple is the true one, so order decides which survives.
+    /// Getting this backwards revokes access the feed says was restored, which is the
+    /// failure a user reports as "I was removed from the team and adding me back did
+    /// nothing".
+    #[test]
+    fn a_removal_followed_by_a_re_add_collapses_to_the_write() {
+        let plan = plan(&[
+            IdentityFact::MembershipRemoved {
+                user_id: "usr_1".to_owned(),
+                organization_id: "org_1".to_owned(),
+                membership_id: "omb_1".to_owned(),
+            },
+            IdentityFact::MembershipAdded {
+                user_id: "usr_1".to_owned(),
+                organization_id: "org_1".to_owned(),
+                membership_id: "omb_1".to_owned(),
+            },
+        ]);
+        assert!(
+            plan.deletes.is_empty(),
+            "the delete was superseded: {plan:?}"
+        );
+        assert_eq!(plan.writes.len(), 1, "{plan:?}");
+    }
+
+    /// A user delete SUBSUMES everything queued for that user, and only that user.
+    ///
+    /// A consumer that wrote the earlier tuples and purged afterwards would briefly GRANT
+    /// access to a deleted user, and the window is visible to anyone checking during it.
+    /// The "only that user" half is what stops a delete taking a bystander's access with it.
+    #[test]
+    fn a_user_delete_subsumes_that_users_queued_tuples_and_no_one_elses() {
+        let plan = plan(&[
+            IdentityFact::MembershipAdded {
+                user_id: "usr_1".to_owned(),
+                organization_id: "org_1".to_owned(),
+                membership_id: "omb_1".to_owned(),
+            },
+            IdentityFact::MembershipAdded {
+                user_id: "usr_2".to_owned(),
+                organization_id: "org_1".to_owned(),
+                membership_id: "omb_2".to_owned(),
+            },
+            IdentityFact::UserDeleted {
+                user_id: "usr_1".to_owned(),
+            },
+        ]);
+        assert_eq!(
+            plan.purges,
+            vec!["user:usr_1".to_owned()],
+            "the deleted user must be purged: {plan:?}"
+        );
+        assert_eq!(
+            plan.writes,
+            vec![Tuple {
+                user: "user:usr_2".to_owned(),
+                relation: "member".to_owned(),
+                object: "organization:org_1".to_owned(),
+            }],
+            "the deleted user's queued write must be dropped and the OTHER user's kept; \
+             writing then purging grants a deleted user access for the width of the window, \
+             and purging too broadly revokes a bystander: {plan:?}"
+        );
+    }
+
+    /// A repeated fact is idempotent: the plan holds one operation, not N.
+    #[test]
+    fn a_repeated_fact_does_not_repeat_the_operation() {
+        let add = IdentityFact::MembershipAdded {
+            user_id: "usr_1".to_owned(),
+            organization_id: "org_1".to_owned(),
+            membership_id: "omb_1".to_owned(),
+        };
+        let plan = plan(&[add.clone(), add.clone(), add]);
+        assert_eq!(plan.writes.len(), 1, "{plan:?}");
+    }
+
+    /// A membership removal does NOT drop another membership's role tuple in the same
+    /// organization.
+    ///
+    /// The two are different subjects (`user:` versus `membership:`), and a planner that
+    /// matched on the organization or on the tuple's object would revoke a colleague's role
+    /// when somebody left the team.
+    #[test]
+    fn removing_one_membership_leaves_another_memberships_role_alone() {
+        let plan = plan(&[
+            IdentityFact::RoleAssigned {
+                membership_id: "omb_2".to_owned(),
+                organization_id: "org_1".to_owned(),
+                role_slug: "editor".to_owned(),
+            },
+            IdentityFact::MembershipRemoved {
+                user_id: "usr_1".to_owned(),
+                organization_id: "org_1".to_owned(),
+                membership_id: "omb_1".to_owned(),
+            },
+        ]);
+        assert_eq!(
+            plan.writes,
+            vec![Tuple {
+                user: "membership:omb_2".to_owned(),
+                relation: "editor".to_owned(),
+                object: "organization:org_1".to_owned(),
+            }],
+            "one member leaving revoked another member's role: {plan:?}"
+        );
+        assert_eq!(plan.deletes.len(), 1, "{plan:?}");
+    }
+
+    /// An empty run plans nothing, which is the case a scheduled sync hits most often.
+    #[test]
+    fn an_empty_run_plans_nothing() {
+        assert_eq!(plan(&[]), SyncPlan::default());
     }
 
     /// The committed golden fixture is exactly what this contract emits.
