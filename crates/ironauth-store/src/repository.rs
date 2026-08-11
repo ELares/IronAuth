@@ -37046,6 +37046,40 @@ impl LogStreamRepo<'_> {
         Ok(out)
     }
 
+    /// Open the sink credential a stream names, or [`None`] when it names none.
+    ///
+    /// Lives HERE rather than in the shipper because the master key does not leave this
+    /// crate: `Store::master_key` is gated on the `testing` feature precisely so the
+    /// production surface has no way to hand the platform key to a caller. A sink that
+    /// resolved its own credential would need that key, which would put the ability to
+    /// open every environment secret behind every sink implementation, including ones a
+    /// deployment adds itself.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] when this handle carries no master key, or when the
+    /// stored ciphertext cannot be opened; [`StoreError::NotFound`] when the stream names
+    /// a secret that does not exist. A stream that NAMES a credential and cannot open it
+    /// is an error rather than an empty credential: delivering without it would present
+    /// an unauthenticated batch of the environment's audit trail to the sink.
+    pub async fn open_credential(
+        &self,
+        stream: &crate::log_stream::LogStreamRecord,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(name) = stream.credential_secret_name.as_deref() else {
+            return Ok(None);
+        };
+        let Some(master) = self.store.master() else {
+            return Err(StoreError::Encryption);
+        };
+        let scoped = self.store.scoped(self.scope);
+        let opened = scoped
+            .environment_secrets()
+            .open_value(master, name)
+            .await?;
+        Ok(Some(opened))
+    }
+
     /// Advance `id`'s cursor and record a successful delivery.
     ///
     /// The cursor and the success are written TOGETHER on purpose: recording delivery

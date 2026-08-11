@@ -660,6 +660,13 @@ name = "log_shipper"
 path = "tests/log_shipper.rs"
 required-features = ["testing"]
 
+# The shared sink conformance suite (issue #110): every sink behind the common interface is
+# held to the same properties from one table, so a sink added later is covered by
+# construction. No database and no socket.
+[[test]]
+name = "log_sink_conformance"
+path = "tests/log_sink_conformance.rs"
+
 # The two per-client / per-environment security postures the data plane enforced and
 # nothing could set (issues #27, #78): the PAR requirement and the account-linking
 # posture. Needs a real database.
