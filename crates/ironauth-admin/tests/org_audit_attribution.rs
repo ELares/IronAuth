@@ -31,16 +31,28 @@ use std::collections::BTreeSet;
 
 /// Operations whose handler attributes its audit row to the organization in its path.
 ///
-/// EMPTY today. #706 shipped the column and the seam; adoption is the follow-on, and this
-/// list is where it becomes visible.
-const ORG_ATTRIBUTED: &[&str] = &[];
+/// #706 shipped the column and the seam; this list is where adoption becomes visible.
+const ORG_ATTRIBUTED: &[&str] = &[
+    // The first adopter, and the proof the ratchet falls rather than only rising.
+    "createOrgRole",
+];
 
 /// How many organization-scoped operations do NOT yet attribute their audit rows.
 ///
-/// This may only FALL. It is 40 because #706 landed the seam and no handler calls it yet.
+/// This may only FALL. It was 40 when #706 landed the seam with no adopters.
 /// Lower it in the same change that adopts the seam; the test below fails if you adopt
 /// without lowering, so the number cannot go stale.
-const UNATTRIBUTED_CEILING: usize = 40;
+const UNATTRIBUTED_CEILING: usize = 39;
+
+/// Where each attributed operation's handler lives, so the claim can be CHECKED.
+///
+/// Without this, `ORG_ATTRIBUTED` is a list of assertions nobody verifies, and the ceiling
+/// falls by editing a constant. The check is per FILE, which is coarse: it proves the
+/// module calls the seam, not that this particular handler does. That is the same
+/// granularity `ADMIN_SOURCES` uses elsewhere in this crate, and it is honest about what
+/// it catches, which is a list padded with a module that never adopted the seam at all.
+const ATTRIBUTED_SOURCES: &[(&str, &str)] =
+    &[("createOrgRole", include_str!("../src/org_roles.rs"))];
 
 /// Every operation whose documented path is scoped to an organization.
 fn org_scoped_operations() -> BTreeSet<String> {
@@ -84,6 +96,25 @@ fn the_organization_attribution_gap_is_counted_and_may_only_fall() {
             org_scoped.contains(*attributed),
             "`{attributed}` is listed as attributing its audit row to an organization, but \
              it is not an organization-scoped operation in the committed spec"
+        );
+    }
+
+    // Every claim is checked against the source that is supposed to back it.
+    for operation in ORG_ATTRIBUTED {
+        let source = ATTRIBUTED_SOURCES
+            .iter()
+            .find(|(name, _)| name == operation)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{operation}` is listed as attributed but has no entry in \
+                     ATTRIBUTED_SOURCES, so the claim is unverifiable"
+                )
+            })
+            .1;
+        assert!(
+            source.contains(".in_organization("),
+            "`{operation}` is listed as attributed but its module never calls \
+             `.in_organization(..)`, so its audit rows carry no organization"
         );
     }
 
