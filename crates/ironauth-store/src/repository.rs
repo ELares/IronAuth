@@ -537,6 +537,15 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The per-stream audit tamper-evidence chain (issue #109).
+    #[must_use]
+    pub fn audit_chain(&self) -> AuditChainRepo<'a> {
+        AuditChainRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The durable session-ended outbox drain for this scope (issue #35): the seam the
     /// back-channel logout worker (#34) and the external webhooks (M11) consume the
     /// session-ended fan-out off. Off the audited path (drain bookkeeping, like the
@@ -36830,6 +36839,436 @@ async fn insert_audit_row<T: AuditTarget>(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+// ===========================================================================
+// The audit tamper-evidence chain (issue #109).
+//
+// One hash chain per (tenant, environment, stream), stored in `audit_chain`.
+// Both tables are append-only, so sealing INSERTs an entry rather than
+// UPDATEing the row it seals; see migration 0135 for why that distinction is
+// the whole point.
+
+/// One `audit_log` row, in the exact shape the chain commits to.
+///
+/// Every field here is immutable once written. `occurred_micros` is derived from
+/// the stored `timestamptz` by the SAME SQL expression on the sealing path and
+/// the verifying path, so the two agree by construction rather than by both
+/// happening to round the same way.
+#[derive(Debug, Clone)]
+pub struct ChainedAuditRow {
+    /// The audit row's id.
+    pub audit_id: String,
+    /// The action's wire string.
+    pub action: String,
+    /// The acting principal's kind and id.
+    pub actor_kind: String,
+    /// The acting principal's id.
+    pub actor_id: String,
+    /// The target's typed-prefix kind.
+    pub target_kind: String,
+    /// The target's id.
+    pub target_id: String,
+    /// The originating request.
+    pub correlation_id: String,
+    /// Event time, microseconds since the epoch.
+    pub occurred_micros: i64,
+    /// The optional operator-safe detail dimension.
+    pub detail: Option<String>,
+}
+
+impl ChainedAuditRow {
+    /// The canonical JSON this row is hashed as.
+    ///
+    /// Field names are fixed and the value is serialized by `serde_json`, so two
+    /// runs over the same row produce identical bytes. Adding a field here is a
+    /// BREAKING change to every existing chain: every entry sealed under the old
+    /// shape would fail to recompute. A new field therefore needs a version tag
+    /// carried on the entry, not a quiet addition.
+    #[must_use]
+    pub fn canonical(&self) -> serde_json::Value {
+        serde_json::json!({
+            "audit_id": self.audit_id,
+            "action": self.action,
+            "actor_kind": self.actor_kind,
+            "actor_id": self.actor_id,
+            "target_kind": self.target_kind,
+            "target_id": self.target_id,
+            "correlation_id": self.correlation_id,
+            "occurred_micros": self.occurred_micros,
+            "detail": self.detail,
+        })
+    }
+}
+
+/// One sealed position in a chain.
+#[derive(Debug, Clone)]
+pub struct ChainEntry {
+    /// Position, dense from 1.
+    pub seq: i64,
+    /// The audit row this entry seals.
+    pub audit_id: String,
+    /// The previous entry's `record_hash`, empty at seq 1.
+    pub prev_hash: String,
+    /// `chain_link(prev_hash, row.canonical())`.
+    pub record_hash: String,
+}
+
+/// What one sealing pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealReport {
+    /// How many rows were sealed.
+    pub sealed: u64,
+    /// The chain's head position after the pass.
+    pub head_seq: i64,
+}
+
+/// Check `entries` against `rows`, reporting the first fault. Pure, so the whole
+/// verification is unit testable without a database.
+///
+/// Separated from [`AuditChainRepo::verify`] on purpose: the interesting cases are
+/// the corrupted ones, and constructing those against a live append-only table means
+/// bypassing the very grants that make it append-only.
+///
+/// # Errors
+///
+/// [`ChainFault`] naming the FIRST position that does not check out. This is a verdict,
+/// not a fault in the caller: a chain that fails to verify is the answer the caller asked
+/// for, which is why it is an `Err` here and an `Ok(Err(..))` at the database boundary.
+pub fn verify_chain_entries(
+    entries: &[ChainEntry],
+    rows: &BTreeMap<String, ChainedAuditRow>,
+) -> Result<ChainVerified, ChainFault> {
+    let first_seq = entries.first().map_or(1, |first| first.seq);
+    let mut expected_prev: Option<&str> = None;
+    let mut sealed: BTreeSet<&str> = BTreeSet::new();
+
+    for (expected_seq, entry) in (first_seq..).zip(entries.iter()) {
+        if entry.seq != expected_seq {
+            return Err(ChainFault::Position {
+                expected: expected_seq,
+                found: entry.seq,
+            });
+        }
+        // The first entry examined may be mid-chain after a retention prune, so its
+        // `prev_hash` commits to an entry that is legitimately gone. Continuity is
+        // checked from the second entry onward.
+        //
+        // Written as a nested `if` rather than a let-chain: let-chains need Rust 1.88
+        // and this crate's MSRV is 1.85.
+        if let Some(previous) = expected_prev {
+            if entry.prev_hash != previous {
+                return Err(ChainFault::Link { seq: entry.seq });
+            }
+        }
+        let Some(row) = rows.get(&entry.audit_id) else {
+            return Err(ChainFault::MissingRow {
+                seq: entry.seq,
+                audit_id: entry.audit_id.clone(),
+            });
+        };
+        if crate::ocsf::chain_link(&entry.prev_hash, &row.canonical()) != entry.record_hash {
+            return Err(ChainFault::Tampered {
+                seq: entry.seq,
+                audit_id: entry.audit_id.clone(),
+            });
+        }
+        sealed.insert(entry.audit_id.as_str());
+        expected_prev = Some(entry.record_hash.as_str());
+    }
+
+    // Completeness, bounded to the SEALED RANGE. Without this check, inserting a row
+    // into the past is invisible: it breaks no link, because no entry commits to it.
+    //
+    // The bound is what makes the check usable at all. Sealing runs behind the writers,
+    // so at any instant the newest rows are legitimately unsealed; comparing against
+    // every row would report `Unchained` for ordinary recent traffic and the check would
+    // have to be switched off, which is the same as not having it. The watermark is the
+    // (occurred_micros, audit_id) of the last sealed row, ordered exactly as the sealer
+    // orders its scan, so "older than the watermark and unsealed" means the row appeared
+    // in a range the sealer has already passed.
+    let watermark = entries
+        .last()
+        .and_then(|entry| rows.get(&entry.audit_id))
+        .map(|row| (row.occurred_micros, row.audit_id.as_str()));
+    if let Some(watermark) = watermark {
+        for (id, row) in rows {
+            if sealed.contains(id.as_str()) {
+                continue;
+            }
+            if (row.occurred_micros, row.audit_id.as_str()) < watermark {
+                return Err(ChainFault::Unchained {
+                    audit_id: id.clone(),
+                });
+            }
+        }
+    }
+    Ok(ChainVerified {
+        entries: entries.len(),
+    })
+}
+
+/// Why a chain failed to verify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainFault {
+    /// Positions are not dense from 1: an entry was removed from the middle, or
+    /// two chains were interleaved.
+    Position {
+        /// The position expected at this point in the walk.
+        expected: i64,
+        /// The position actually found.
+        found: i64,
+    },
+    /// An entry's `prev_hash` is not the previous entry's `record_hash`, so the
+    /// entries do not form one history.
+    Link {
+        /// Where the discontinuity is.
+        seq: i64,
+    },
+    /// The audit row an entry seals is GONE, so its link cannot be recomputed.
+    /// This is what a deletion looks like.
+    MissingRow {
+        /// Where the missing row was sealed.
+        seq: i64,
+        /// The audit row that is no longer present.
+        audit_id: String,
+    },
+    /// The audit row is present but hashes to something else, so it was
+    /// MODIFIED after it was sealed.
+    Tampered {
+        /// Where the modified row was sealed.
+        seq: i64,
+        /// The audit row whose content changed.
+        audit_id: String,
+    },
+    /// An audit row exists in the sealed range with no chain entry, so it was
+    /// INSERTED after the fact.
+    Unchained {
+        /// The audit row nothing seals.
+        audit_id: String,
+    },
+}
+
+/// A chain that verified, and how much of it there was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainVerified {
+    /// How many entries were checked.
+    pub entries: usize,
+}
+
+/// The per-stream audit chain.
+pub struct AuditChainRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AuditChainRepo<'_> {
+    /// Seal up to `limit` not-yet-chained rows of `stream`, oldest first.
+    ///
+    /// Idempotent by construction: `audit_chain_audit_id_idx` makes a second seal of
+    /// the same row a unique violation, and `audit_chain_position_idx` makes two
+    /// sealers racing on one chain unable to both commit a position, so the loser
+    /// fails and retries against the winner's head instead of forking the history.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn seal_pending(
+        &self,
+        env: &Env,
+        stream: &str,
+        limit: i64,
+    ) -> Result<SealReport, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+
+        // The head, and the lock that serializes sealers on THIS chain. Taking the
+        // head with FOR UPDATE would lock a row that may not exist yet (an empty
+        // chain), so the unique index is what actually prevents a fork; this read is
+        // only to find where to continue from.
+        let head = sqlx::query(
+            "SELECT seq, record_hash FROM audit_chain \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3 \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (mut seq, mut prev) = match head {
+            Some(row) => (
+                row.get::<i64, _>("seq"),
+                row.get::<String, _>("record_hash"),
+            ),
+            None => (0_i64, String::new()),
+        };
+
+        let rows = sqlx::query(
+            "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
+                    correlation_id, detail, \
+                    (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros \
+             FROM audit_log \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3 \
+               AND id NOT IN ( \
+                   SELECT audit_id FROM audit_chain \
+                   WHERE tenant_id = $1 AND environment_id = $2 \
+               ) \
+             ORDER BY occurred_at, id LIMIT $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let sealed_at = epoch_micros(env.clock().now_utc());
+        let mut sealed = 0_u64;
+        for row in rows {
+            let record = ChainedAuditRow {
+                audit_id: row.get("id"),
+                action: row.get("action"),
+                actor_kind: row.get("actor_kind"),
+                actor_id: row.get("actor_id"),
+                target_kind: row.get("target_kind"),
+                target_id: row.get("target_id"),
+                correlation_id: row.get("correlation_id"),
+                occurred_micros: row.get("occurred_micros"),
+                detail: row.get("detail"),
+            };
+            let record_hash = crate::ocsf::chain_link(&prev, &record.canonical());
+            seq += 1;
+            sqlx::query(
+                "INSERT INTO audit_chain \
+                 (id, tenant_id, environment_id, stream, seq, audit_id, prev_hash, \
+                  record_hash, sealed_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                         TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+            )
+            .bind(format!("acn_{record_hash}"))
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(stream)
+            .bind(seq)
+            .bind(&record.audit_id)
+            .bind(&prev)
+            .bind(&record_hash)
+            .bind(sealed_at)
+            .execute(&mut *tx)
+            .await?;
+            prev = record_hash;
+            sealed += 1;
+        }
+        tx.commit().await?;
+        Ok(SealReport {
+            sealed,
+            head_seq: seq,
+        })
+    }
+
+    /// Every sealed entry of `stream`, in position order.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn entries(&self, stream: &str) -> Result<Vec<ChainEntry>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT seq, audit_id, prev_hash, record_hash FROM audit_chain \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3 \
+             ORDER BY seq",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ChainEntry {
+                seq: row.get("seq"),
+                audit_id: row.get("audit_id"),
+                prev_hash: row.get("prev_hash"),
+                record_hash: row.get("record_hash"),
+            })
+            .collect())
+    }
+
+    /// Verify `stream`'s chain end to end, reporting the FIRST fault.
+    ///
+    /// Checks four things, and each corresponds to one way the trail can be attacked:
+    /// positions are dense (a middle entry removed), links are continuous (two
+    /// histories spliced), every sealed row is present and rehashes to its stored
+    /// digest (deleted or modified), and every audit row in the sealed range has an
+    /// entry (inserted after the fact).
+    ///
+    /// A chain whose PREFIX was pruned by retention still verifies: positions are
+    /// checked for density from the first entry present, not from 1. What this cannot
+    /// detect is a truncated SUFFIX, which leaves a shorter but internally consistent
+    /// chain; that needs a head digest held outside this database.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault. A chain that does not verify is
+    /// `Ok(Err(fault))`, not an error: failing to verify is an ANSWER, and a caller
+    /// that conflates it with a database outage would report tampering on a dropped
+    /// connection.
+    pub async fn verify(
+        &self,
+        stream: &str,
+    ) -> Result<Result<ChainVerified, ChainFault>, StoreError> {
+        let entries = self.entries(stream).await?;
+        let rows = self.sealed_rows(stream).await?;
+        Ok(verify_chain_entries(&entries, &rows))
+    }
+
+    /// The sealed rows of `stream`, keyed by audit id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn sealed_rows(
+        &self,
+        stream: &str,
+    ) -> Result<BTreeMap<String, ChainedAuditRow>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
+                    correlation_id, detail, \
+                    (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros \
+             FROM audit_log \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let id: String = row.get("id");
+            out.insert(
+                id.clone(),
+                ChainedAuditRow {
+                    audit_id: id,
+                    action: row.get("action"),
+                    actor_kind: row.get("actor_kind"),
+                    actor_id: row.get("actor_id"),
+                    target_kind: row.get("target_kind"),
+                    target_id: row.get("target_id"),
+                    correlation_id: row.get("correlation_id"),
+                    occurred_micros: row.get("occurred_micros"),
+                    detail: row.get("detail"),
+                },
+            );
+        }
+        Ok(out)
+    }
 }
 
 /// Microseconds since the Unix epoch for a wall-clock instant. Negative for
