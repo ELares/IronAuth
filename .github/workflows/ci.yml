@@ -247,6 +247,12 @@ jobs:
         run: |
           scripts/journey-schema.sh
           git diff --exit-code docs/journey-schema.json
+      - name: terraform provider coverage (generated from the OpenAPI document)
+        # Issue #51 criterion 6: a new promotable API resource cannot land without provider
+        # coverage, enforced as a RATCHET on the uncovered count rather than as a demand for
+        # completeness, which would simply get disabled. Pure python, so it belongs in this
+        # lane rather than in the Node or Go jobs.
+        run: scripts/provider-coverage.sh
       - name: reference app bindings freshness (generated from the published contract)
         # The reference app's TypeScript types, its schema derived validation
         # constants, and its numeric id to copy map are GENERATED from
