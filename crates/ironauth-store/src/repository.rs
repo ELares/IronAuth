@@ -37463,6 +37463,74 @@ impl AuditChainRepo<'_> {
         })
     }
 
+    /// The next `limit` rows of `stream` strictly after `cursor`, oldest first.
+    ///
+    /// Ordered by `(occurred_at, id)`, the SAME total order the sealer walks and the same
+    /// pair a log stream's cursor stores. That agreement is what makes "everything before
+    /// this point has shipped" true rather than approximately true: ordering by
+    /// `occurred_at` alone would let two rows sharing a microsecond straddle the cursor,
+    /// and one of them would be shipped twice or not at all depending on which side it
+    /// landed on.
+    ///
+    /// `None` starts at the oldest retained row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn rows_after(
+        &self,
+        stream: &str,
+        cursor: Option<(i64, &str)>,
+        limit: i64,
+    ) -> Result<Vec<ChainedAuditRow>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // The row-value comparison is what makes the pair a single position. Written as
+        // `occurred_at >= $x AND id > $y` it would drop every row of a later microsecond
+        // whose id sorts below the cursor's.
+        let (cursor_micros, cursor_id) = match cursor {
+            Some((micros, id)) => (Some(micros), Some(id)),
+            None => (None, None),
+        };
+        let rows = sqlx::query(
+            "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
+                    correlation_id, detail, \
+                    (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros \
+             FROM audit_log \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3 \
+               AND ( \
+                   $4::bigint IS NULL \
+                   OR (occurred_at, id) > \
+                      ((TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval), \
+                       $5::text) \
+               ) \
+             ORDER BY occurred_at, id LIMIT $6",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream)
+        .bind(cursor_micros)
+        .bind(cursor_id)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ChainedAuditRow {
+                audit_id: row.get("id"),
+                action: row.get("action"),
+                actor_kind: row.get("actor_kind"),
+                actor_id: row.get("actor_id"),
+                target_kind: row.get("target_kind"),
+                target_id: row.get("target_id"),
+                correlation_id: row.get("correlation_id"),
+                occurred_micros: row.get("occurred_micros"),
+                detail: row.get("detail"),
+            })
+            .collect())
+    }
+
     /// Every sealed entry of `stream`, in position order.
     ///
     /// # Errors

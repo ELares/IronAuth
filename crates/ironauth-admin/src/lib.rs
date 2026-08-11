@@ -69,6 +69,11 @@ mod input;
 mod invitations;
 mod keys;
 mod locales;
+
+/// SIEM log stream delivery (issue #110): the sink interface, the HTTP sink, and the
+/// shipper that reads audit rows forward from each stream's cursor. Public because the
+/// binary wires the shipper and a deployment may add its own sink.
+pub mod log_shipper;
 mod mds3_health;
 mod memberships;
 mod migration;

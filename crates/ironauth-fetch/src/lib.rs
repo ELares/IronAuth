@@ -126,6 +126,13 @@ pub enum FetchPurpose {
     ClientMetadata,
     /// Delivering a webhook to a tenant-configured target.
     WebhookDelivery,
+    /// Shipping a batch of audit events to an operator-configured SIEM sink
+    /// (issue #110). Distinct from [`FetchPurpose::WebhookDelivery`] because the
+    /// two answer to different operators and carry different payloads: a webhook
+    /// is one tenant-facing event, a log stream batch is the environment's audit
+    /// trail, and a policy or a rate limit that is right for one is not
+    /// automatically right for the other.
+    LogStreamDelivery,
     /// Fetching a client `logo_uri` for a consent page.
     Logo,
     /// Talking to an ACME certificate authority (RFC 8555) for a custom domain
@@ -203,6 +210,7 @@ impl FetchPurpose {
             FetchPurpose::SectorIdentifier => "sector_identifier",
             FetchPurpose::ClientMetadata => "client_metadata",
             FetchPurpose::WebhookDelivery => "webhook_delivery",
+            FetchPurpose::LogStreamDelivery => "log_stream_delivery",
             FetchPurpose::Logo => "logo",
             FetchPurpose::AcmeDirectory => "acme_directory",
             FetchPurpose::KmsRequest => "kms_request",
