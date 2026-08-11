@@ -52,7 +52,9 @@ use ironauth_store::{
     },
 };
 
-use ironauth_admin::log_shipper::{DatadogSink, HttpLogSink, LogShipper, LogSink, SplunkHecSink};
+use ironauth_admin::log_shipper::{
+    DatadogSink, HttpLogSink, LogShipper, LogSink, S3LogSink, SplunkHecSink,
+};
 
 use crate::shared_config::SharedPlaneInputs;
 
@@ -2821,7 +2823,8 @@ async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
     let sinks: Vec<Arc<dyn LogSink>> = vec![
         Arc::new(HttpLogSink::new(Arc::clone(&fetcher))),
         Arc::new(DatadogSink::new(Arc::clone(&fetcher))),
-        Arc::new(SplunkHecSink::new(fetcher)),
+        Arc::new(SplunkHecSink::new(Arc::clone(&fetcher))),
+        Arc::new(S3LogSink::new(fetcher, env.clone())),
     ];
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
     let shipper = LogShipper::spawn(

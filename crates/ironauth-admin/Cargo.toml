@@ -72,6 +72,7 @@ base64.workspace = true
 # SHA-256 for management-key hashing and the Idempotency-Key request fingerprint.
 # Pure Rust, permissive, already in the tree via ironauth-store; no new crate.
 sha2.workspace = true
+hmac.workspace = true
 tracing.workspace = true
 # The in-admin Argon2id tuning probe (issue #62) spends real CPU, so it runs on a
 # blocking thread (spawn_blocking) rather than inline on the async request thread,

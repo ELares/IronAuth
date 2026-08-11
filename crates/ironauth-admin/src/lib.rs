@@ -74,6 +74,7 @@ mod locales;
 /// shipper that reads audit rows forward from each stream's cursor. Public because the
 /// binary wires the shipper and a deployment may add its own sink.
 pub mod log_shipper;
+
 mod log_streams;
 mod mds3_health;
 mod memberships;
@@ -113,6 +114,8 @@ mod signing_algorithm;
 mod signing_interop;
 mod signup_forms;
 mod signup_quarantine;
+/// AWS SigV4 signing for the S3 log sink (issue #110).
+pub mod sigv4;
 mod sms_otp;
 mod state;
 mod step_up_policies;
