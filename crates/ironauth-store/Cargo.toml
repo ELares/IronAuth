@@ -102,6 +102,12 @@ trybuild.workspace = true
 # label a binding and to demonstrate that revoking a customer root fails closed.
 # A dev-dependency only: the production store graph does not depend on it.
 ironauth-kms.workspace = true
+# The OpenFGA tuple-sync demo (issue #100, criterion 5) talks to an operator-supplied FGA,
+# which is outbound traffic like any other, so the demo uses the SSRF-hardened fetcher a real
+# consumer would. A dev-dependency only: the production store graph makes no network calls
+# and must not gain the ability to.
+ironauth-fetch = { workspace = true, features = ["test-harness"] }
+axum = { workspace = true, default-features = false }
 
 # RLS integration test: a low-privilege session cannot read another tenant's
 # rows even with the app-layer filter bypassed. Needs a real database
@@ -503,6 +509,13 @@ required-features = ["testing"]
 [[test]]
 name = "trait_login_index"
 path = "tests/trait_login_index.rs"
+required-features = ["testing"]
+
+# The OpenFGA tuple-sync demo (issue #100, criterion 5). SKIPS unless OPENFGA_URL is set,
+# the same shape the DATABASE_URL suites use.
+[[test]]
+name = "openfga_sync_demo"
+path = "tests/openfga_sync_demo.rs"
 required-features = ["testing"]
 
 # Migrations as an invariant-checked state machine (issue #59). Needs a real database.
