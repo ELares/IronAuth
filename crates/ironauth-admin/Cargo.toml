@@ -96,8 +96,14 @@ testing = ["ironauth-store/testing"]
 # The hermetic fetcher seam (issue #674). Test builds only, so no production
 # binary can construct a fetcher that skips the OS trust store.
 ironauth-fetch = { workspace = true, features = ["test-harness"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 tower = { workspace = true, features = ["util"] }
+# `axum::serve` needs axum's own tokio server, which the PRODUCTION dependency
+# deliberately leaves off: this crate hands a Router to the binary and never listens. The
+# Terraform acceptance tests (issue #51) need a real socket, because `tofu` runs the
+# provider as a separate process making real HTTP calls, so the feature is enabled here and
+# only here. Dev-dependencies are absent from a production build of this crate.
+axum = { workspace = true, features = ["tokio", "http1"] }
 # The exit-export round-trip test (issue #58) drives the real streaming import
 # engine to re-import an export into a fresh scope, and seeds users carrying real
 # native Argon2id and foreign bcrypt hashes so the round-trip covers both a native
@@ -155,6 +161,12 @@ required-features = ["testing"]
 [[test]]
 name = "authzen"
 path = "tests/authzen.rs"
+required-features = ["testing"]
+
+# Terraform provider acceptance tests (issue #51). SKIP unless `tofu` and `go` are present.
+[[test]]
+name = "terraform_provider"
+path = "tests/terraform_provider.rs"
 required-features = ["testing"]
 
 [[test]]

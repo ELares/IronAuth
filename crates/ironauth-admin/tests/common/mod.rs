@@ -931,6 +931,27 @@ impl Harness {
         ClientId::generate(&Env::system(), &scope).to_string()
     }
 
+    /// Serve this harness's router on a real TCP port, returning the bound address and a
+    /// join handle whose drop stops the server.
+    ///
+    /// Every other test drives the router through `oneshot`, which is faster and needs no
+    /// socket. The Terraform acceptance tests cannot: `tofu` runs the provider as a separate
+    /// PROCESS over gRPC and the provider makes real HTTP calls, so there has to be a real
+    /// listener for it to reach.
+    ///
+    /// Port 0 lets the OS choose, so concurrent tests never collide on a fixed port.
+    pub async fn serve_on_a_port(&self) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("binding an ephemeral port");
+        let addr = listener.local_addr().expect("the bound address");
+        let router = self.router.clone();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (addr, handle)
+    }
+
     /// Drive one request through the router, returning status, headers, and body.
     pub async fn send(&self, request: Request<Body>) -> (StatusCode, HeaderMap, String) {
         let response = self
