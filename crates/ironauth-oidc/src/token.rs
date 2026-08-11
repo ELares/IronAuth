@@ -334,7 +334,13 @@ async fn authorization_code_grant(
     //    default (scope claims are served from UserInfo); the extra claims are the
     //    `claims`-parameter id_token member and, only under the non-conform
     //    conformIdTokenClaims override, the scope-derived claims (issue #15).
-    let extra_claims = id_token_extra_claims(state, scope, &bindings).await;
+    let mut extra_claims = id_token_extra_claims(state, scope, &bindings).await;
+    //    Plus the claims an external policy decision point or FGA contributes (issue #100).
+    //    Merged HERE and not inside `id_token_extra_claims`, because that function returns
+    //    early when the client asked for no `claims` member: these claims are the
+    //    OPERATOR's configuration, not the client's request, and a client that asks for
+    //    nothing must still receive them.
+    merge_enriched_claims(state, scope, &bindings, &mut extra_claims).await;
     let minted = mint_tokens(
         state,
         scope,
@@ -1364,6 +1370,48 @@ async fn id_token_extra_claims(
         std::collections::BTreeSet::new()
     };
     assemble_claims(&bag, &granted, claims_request.id_token())
+}
+
+/// Merge the claims-enrichment hook's contribution into the ID token's extra-claims bag
+/// (issue #100).
+///
+/// # It can only fill EMPTY names
+///
+/// A contributed claim whose name is already present is DROPPED, not merged and not
+/// overwritten. Two fences already stand in front of this (config load refuses to allowlist
+/// a reserved name, and the hook filters the response against the allowlist), and this is
+/// the third and the only one that can see the assembled token: it is what stops an
+/// enrichment service replacing a claim the `claims` parameter or the scope mapping just
+/// resolved, which neither of the other two knows about.
+///
+/// # Fail-open, deliberately
+///
+/// No hook installed, or a hook that contributes nothing, leaves the bag exactly as it was
+/// and the token is issued. The hook itself never returns an error; see its module note for
+/// why an FGA outage must not take every login down with it.
+async fn merge_enriched_claims(
+    state: &OidcState,
+    scope: Scope,
+    bindings: &CodeBindings,
+    extra_claims: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(hook) = state.claims_enrichment_hook() else {
+        return;
+    };
+    let contributed = hook
+        .enrich(scope, &bindings.subject, &bindings.client_id)
+        .await;
+    for (name, value) in contributed {
+        if extra_claims.contains_key(&name) {
+            tracing::warn!(
+                claim = %name,
+                "the claims-enrichment hook returned a claim that is already present; \
+                 keeping the value IronAuth resolved"
+            );
+            continue;
+        }
+        extra_claims.insert(name, value);
+    }
 }
 
 /// Build the `200 OK` token response (RFC 6749 5.1) from the pre-minted tokens,

@@ -259,6 +259,53 @@
         }
       ]
     },
+    "ClaimsEnrichmentConfig": {
+      "additionalProperties": false,
+      "description": "The claims-enrichment hook (issue #100): an outbound call at TOKEN ISSUANCE that asks an\nexternal policy decision point or fine-grained-authorization service for extra claims and\nmerges them into the token.\n\nThis is the seam the `AuthZEN` work is explicitly built around. `IronAuth` answers what it\nalready indexes and deliberately does NOT ship a Zanzibar engine; a deployment whose\nauthorization model needs relationships runs `OpenFGA`, `SpiceDB` or `Cerbos` and points\nthis hook at it. The blessed architecture is coarse claims plus a fine `PDP`, and this is\nthe coarse half learning what the fine half knows.\n\n# It can only ADD, and only names it was told about\n\nA returned claim whose name is not in `allowed_claims` is DROPPED, and a returned claim\nthat collides with one `IronAuth` itself minted is dropped too. An enrichment hook that\ncould overwrite `sub`, `aud`, `exp` or the permissions claim would not be an enrichment\nhook, it would be a token forgery endpoint, and the deployment that trusts an FGA to\nanswer a relationship question has not thereby decided to let it choose subjects.\n\n# It fails OPEN, and that direction is the safe one here\n\nA hook that errors, times out, or answers malformed JSON contributes NOTHING and the\ntoken is issued without the extra claims. Failing closed would take every login in the\ndeployment down with the FGA, and the claims this adds are ADDITIVE: their absence is\nfewer permissions, never more. A relying party that requires an enriched claim to\nauthorize still refuses without it, which is the correct outcome and one it already\nimplements.",
+      "properties": {
+        "allowed_claims": {
+          "default": [],
+          "description": "The claim names this hook is permitted to contribute. A response naming anything\nelse is dropped, silently from the caller's point of view and with a warning on the\nobservability plane.\n\nThere is no wildcard and there is deliberately no way to write one. An allowlist a\ndeployment can turn off is one that gets turned off, and the failure mode is a token\ncarrying whatever an external service decided to put in it. An empty list (the\ndefault) means the hook contributes nothing, so arming `enabled` without naming\nclaims is inert rather than dangerous.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether the hook is armed. False (the default) leaves issuance unchanged: no\noutbound call is made and no token gains a claim. When true, `endpoint` MUST be set\n(config load rejects an enabled hook with no endpoint).",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "The enrichment endpoint (an https URL). Outbound and routed through the\nSSRF-hardened fetcher, so a loopback or otherwise internal target is refused exactly\nlike any other blocked destination, and a plaintext `http` target is refused. Unset\nwhen disabled; REQUIRED (and https) when enabled.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The shared bearer secret presented as `Authorization: Bearer <secret>`, so the\nenrichment service can authenticate `IronAuth`. Use the `file`/`env` secret\nindirection, never a literal, outside dev mode."
+        },
+        "timeout_secs": {
+          "default": 2,
+          "description": "The per-call timeout in seconds. Must be at least 1 and at most\n[`OIDC_MAX_CLAIMS_ENRICHMENT_TIMEOUT_SECS`], which is deliberately tighter than the\nlazy-migration ceiling because this call sits on the issuance path.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ClientAssertionAudience": {
       "description": "The audience an inbound JWT client assertion (`private_key_jwt` /\n`client_secret_jwt`, issue #25) must be addressed to (RFC 7523 section 3, OIDC\nCore section 9). This is the SHARED audience knob the JWT bearer grant (#26)\nreuses: both surfaces validate an assertion's `aud` through it.\n\nThe default accepts the token-endpoint URL OR the per-environment issuer, which\nis the interoperable choice: real client libraries disagree on which they place\nin `aud`. The strict mode accepts ONLY the issuer, per rfc7523bis and FAPI 2.0,\nwhich reject a token-endpoint-audienced assertion.",
       "oneOf": [
@@ -770,6 +817,17 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "claims_enrichment": {
+          "$ref": "#/$defs/ClaimsEnrichmentConfig",
+          "default": {
+            "allowed_claims": [],
+            "enabled": false,
+            "endpoint": null,
+            "secret": null,
+            "timeout_secs": 2
+          },
+          "description": "The claims-enrichment hook (issue #100): the seam an external `PDP` or FGA merges\nextra claims through at token issuance. Disabled by default."
         },
         "client_assertion_audience": {
           "$ref": "#/$defs/ClientAssertionAudience",
@@ -2649,6 +2707,13 @@
         "authorization_code_ttl_secs": 60,
         "backchannel_logout_enabled": false,
         "backchannel_logout_request_timeout_secs": 10,
+        "claims_enrichment": {
+          "allowed_claims": [],
+          "enabled": false,
+          "endpoint": null,
+          "secret": null,
+          "timeout_secs": 2
+        },
         "client_assertion_audience": "token_endpoint_or_issuer",
         "client_assertion_max_skew_secs": 60,
         "client_credentials_default_audience": "client_id",

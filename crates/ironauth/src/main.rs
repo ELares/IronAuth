@@ -1097,6 +1097,34 @@ async fn build_oidc_plane(
 
     let org_provisioning = connect_org_provisioning(config).await;
 
+    // The claims-enrichment hook (issue #100): the seam an external policy decision point
+    // or FGA merges extra token claims through at issuance.
+    //
+    // Built HERE and not through `shared_plane_inputs!` for the reason `[identifiers]` is:
+    // it reaches ONE plane. Only the data plane mints tokens, so the management plane has
+    // nothing to hand this to, and a shared carrier would make AdminState hold a field it
+    // never reads. The boot-wiring guard rejects exactly that, correctly.
+    // A fetcher that will not build is a TLS trust-store fault, which must not take the
+    // whole OIDC plane down: it disables the hook and issuance carries on without the extra
+    // claims, which is the same fail-open direction the hook itself takes.
+    let claims_enrichment_hook =
+        match crate::shared_config::outbound_fetcher(ironauth_fetch::FetchLimits::default()) {
+            Ok(fetcher) => ironauth_oidc::enrichment::ClaimsEnrichmentHook::from_config(
+                &config.oidc.claims_enrichment,
+                std::sync::Arc::new(fetcher),
+            )
+            .map(std::sync::Arc::new),
+            Err(error) => {
+                if config.oidc.claims_enrichment.enabled {
+                    tracing::warn!(
+                        %error,
+                        "the claims-enrichment hook is enabled but its outbound fetcher could \
+                         not be built; tokens are issued without the enriched claims"
+                    );
+                }
+                None
+            }
+        };
     let state = OidcState::new(store, env, registry, oidc_config, issuer_base)
         .with_org_provisioning(org_provisioning)
         .with_global_token_revocation_enabled(surfaces.global_revocation)
@@ -1126,6 +1154,12 @@ async fn build_oidc_plane(
         // SMS gateway. A production deployment installs its own `SmsSender` here. SMS OTP
         // is off by default, so this stub is inert until a tenant explicitly enables SMS.
         .with_sms_sender(std::sync::Arc::new(ironauth_oidc::LoggingSmsSender));
+    // Installed after the chain because it is CONDITIONAL: a disabled hook, or one whose
+    // allowlist is empty, resolves to `None` and issuance is byte-for-byte unchanged.
+    let state = match &claims_enrichment_hook {
+        Some(hook) => state.with_claims_enrichment_hook(std::sync::Arc::clone(hook)),
+        None => state,
+    };
     // Everything that reaches BOTH planes (issue #414): the two config sections that
     // live outside `[oidc]` because both planes consume them (the `[organizations]`
     // group nesting bound, issue #97, which bounds the ancestor walk the mint-path

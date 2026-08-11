@@ -108,7 +108,7 @@ use ironauth_server::{ServerError, SiteContext};
 /// is in. When the trust-settings API on this machine began refusing, that is exactly what
 /// happened and it took a bisect to see it was not a code change.
 #[cfg(not(test))]
-fn outbound_fetcher(
+pub(crate) fn outbound_fetcher(
     limits: ironauth_fetch::FetchLimits,
 ) -> Result<ironauth_fetch::Fetcher, ironauth_fetch::TlsSetupError> {
     ironauth_fetch::Fetcher::new(limits)
@@ -121,7 +121,7 @@ fn outbound_fetcher(
 /// that production still has.
 #[cfg(test)]
 #[allow(clippy::unnecessary_wraps)]
-fn outbound_fetcher(
+pub(crate) fn outbound_fetcher(
     limits: ironauth_fetch::FetchLimits,
 ) -> Result<ironauth_fetch::Fetcher, ironauth_fetch::TlsSetupError> {
     Ok(ironauth_fetch::Fetcher::for_tests(limits))

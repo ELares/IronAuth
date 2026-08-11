@@ -94,6 +94,7 @@ mod discovery;
 mod disposable;
 mod dpop;
 mod email_otp;
+pub mod enrichment;
 mod error;
 pub mod factor_downgrade;
 mod fedcm;
