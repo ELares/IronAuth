@@ -36970,6 +36970,116 @@ pub struct LogStreamRepo<'a> {
 }
 
 impl LogStreamRepo<'_> {
+    /// Record a dead-lettered batch RANGE for `stream_id`, returning its id.
+    ///
+    /// The events are not copied. They are still in `audit_log`, and this row says which
+    /// ones went undelivered and why, so a replay re-reads the range from the log rather
+    /// than from a stored copy. A stored copy could deliver a stale rendering of an event,
+    /// and it would make this table scale with the size of the failure.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn dead_letter(
+        &self,
+        env: &Env,
+        stream_id: &str,
+        range: (i64, &str, i64, &str),
+        event_count: i32,
+        last_error: &str,
+    ) -> Result<String, StoreError> {
+        let scope = self.scope;
+        let id = format!("lsd_{}", crate::id::LogStreamId::generate(env, &scope));
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "INSERT INTO log_stream_dead_letters \
+             (id, tenant_id, environment_id, stream_id, from_occurred_at, from_audit_id, \
+              to_occurred_at, to_audit_id, event_count, last_error, dead_lettered_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, $6, \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, $8, \
+                     $9, $10, \
+                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+        )
+        .bind(&id)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream_id)
+        .bind(range.0)
+        .bind(range.1)
+        .bind(range.2)
+        .bind(range.3)
+        .bind(event_count)
+        .bind(last_error)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Every dead letter for `stream_id` that has not been replayed, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn outstanding_dead_letters(
+        &self,
+        stream_id: &str,
+    ) -> Result<Vec<crate::log_stream::DeadLetter>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, event_count, last_error, from_audit_id, to_audit_id, \
+                    (EXTRACT(EPOCH FROM from_occurred_at) * 1000000)::bigint AS from_micros, \
+                    (EXTRACT(EPOCH FROM to_occurred_at) * 1000000)::bigint AS to_micros \
+             FROM log_stream_dead_letters \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
+               AND replayed_at IS NULL \
+             ORDER BY dead_lettered_at, id",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::log_stream::DeadLetter {
+                id: row.get("id"),
+                from: (row.get("from_micros"), row.get("from_audit_id")),
+                to: (row.get("to_micros"), row.get("to_audit_id")),
+                event_count: row.get("event_count"),
+                last_error: row.get("last_error"),
+            })
+            .collect())
+    }
+
+    /// Mark `id` replayed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn mark_replayed(&self, env: &Env, id: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "UPDATE log_stream_dead_letters SET replayed_at = \
+                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
     /// Configure a new stream, returning its id.
     ///
     /// # Errors
