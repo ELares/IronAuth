@@ -149,7 +149,7 @@ pub use id::{
     FlowVersionId, FlowVersionKind, FlowVersionPinId, FlowVersionPinKind, GrantId, GrantKind,
     HumanId, HumanKind, IdParseError, ImpersonationAuthorizationId, InitialAccessTokenId,
     InitialAccessTokenKind, InvitationId, InvitationKind, IssuedTokenId, IssuedTokenKind, KekId,
-    KekKind, LevelId, LevelKind, LocaleBundleId, LocaleBundleKind, MagicLinkTokenId,
+    KekKind, LevelId, LevelKind, LocaleBundleId, LocaleBundleKind, LogStreamId, MagicLinkTokenId,
     MagicLinkTokenKind, ManagementKeyId, ManagementKeyKind, MigrationRunId, MigrationRunKind,
     MigrationRunRecordId, MigrationRunRecordKind, NotInScope, OperatorId, OperatorKind,
     OrgAuthPolicyId, OrgAuthPolicyKind, OrgConnectionId, OrgConnectionKind, OrgGroupId,

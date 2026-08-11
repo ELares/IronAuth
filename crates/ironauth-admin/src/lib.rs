@@ -1056,7 +1056,12 @@ pub fn management_router(state: AdminState) -> Router {
         // Standard Webhooks endpoint registration (issue #105).
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams",
-            axum::routing::get(log_streams::list_log_streams),
+            axum::routing::get(log_streams::list_log_streams)
+                .post(log_streams::create_log_stream),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}",
+            axum::routing::delete(log_streams::delete_log_stream),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",

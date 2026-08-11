@@ -112,6 +112,7 @@ async fn configure_for_org(
         .create(
             env,
             &NewLogStream {
+                id: None,
                 description: "test stream",
                 source,
                 sink_type,
@@ -120,6 +121,7 @@ async fn configure_for_org(
                 event_type_filter: filter,
                 organization_id,
             },
+            None,
         )
         .await
         .expect("configure a stream")

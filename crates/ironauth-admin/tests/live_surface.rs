@@ -1246,6 +1246,18 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/log-streams"),
         ),
+        Case::json(
+            "log_streams.createLogStream",
+            "POST",
+            format!("{base}/log-streams"),
+            &serde_json::json!({"source": "both", "sink_type": "http",
+                               "sink_config": {"endpoint": "https://sink.example/in"}}),
+        ),
+        Case::empty(
+            "log_streams.deleteLogStream",
+            "DELETE",
+            format!("{base}/log-streams/lgs_absent"),
+        ),
         Case::empty(
             "webhook_endpoints.listWebhookEndpoints",
             "GET",

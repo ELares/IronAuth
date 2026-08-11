@@ -18,16 +18,18 @@
 //! reflected body would surface.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
-use ironauth_store::log_stream::{LogStreamRecord, StreamStatus};
-use serde::Serialize;
+use ironauth_store::log_stream::{LogStreamRecord, SinkType, StreamSource, StreamStatus};
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
-use crate::org_context::resolve_scope;
-use crate::response::json;
+use crate::idempotency;
+use crate::input::parse_json;
+use crate::org_context::{require_live_environment, resolve_scope};
+use crate::response::{json, no_content};
 use crate::state::AdminState;
 
 /// One configured stream, as an operator reads it.
@@ -154,7 +156,7 @@ pub async fn list_log_streams(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironauth_store::log_stream::{SinkType, StreamHealth, StreamSource};
+    use ironauth_store::log_stream::StreamHealth;
 
     /// A value that must never appear in a status read.
     const CANARY: &str = "canary-secret-do-not-log-8f2a1c";
@@ -251,4 +253,174 @@ mod tests {
             "a stream that has shipped nothing must not report a position"
         );
     }
+}
+
+/// The body of a create request.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateLogStreamRequest {
+    /// A human label. Never secret.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `admin_action`, `authentication`, or `both`.
+    pub source: String,
+    /// `http`, `s3`, `datadog`, or `splunk_hec`.
+    pub sink_type: String,
+    /// Sink shape: endpoint, and for S3 a bucket and region. NEVER a credential.
+    #[serde(default)]
+    pub sink_config: Option<serde_json::Value>,
+    /// The NAME of the environment secret holding the sink credential.
+    #[serde(default)]
+    pub credential_secret_name: Option<String>,
+    /// Ship only these action wire strings. Absent means all; empty ships none.
+    #[serde(default)]
+    pub event_type_filter: Option<Vec<String>>,
+    /// Scope the stream to one organization. Absent means environment-wide.
+    #[serde(default)]
+    pub organization_id: Option<String>,
+}
+
+/// The created stream.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LogStreamCreated {
+    /// The `lgs_` identifier.
+    pub id: String,
+}
+
+/// Configure a SIEM log stream.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams",
+    operation_id = "createLogStream",
+    tag = "log-streams",
+    request_body = CreateLogStreamRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 201, description = "The configured stream", body = LogStreamCreated),
+        (status = 400, description = "Malformed request, or an unknown source or sink type", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn create_log_stream(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+    require_live_environment(&state, &scope).await?;
+
+    let request: CreateLogStreamRequest = parse_json(&body)?;
+    // Parsed HERE rather than left to the CHECK constraint, so an unknown value is a 400
+    // naming what was wrong instead of a 500 from a constraint violation.
+    let source = StreamSource::from_wire(&request.source).ok_or_else(|| {
+        ApiError::BadRequest("source must be admin_action, authentication, or both".to_owned())
+    })?;
+    let sink_type = SinkType::from_wire(&request.sink_type).ok_or_else(|| {
+        ApiError::BadRequest("sink_type must be http, s3, datadog, or splunk_hec".to_owned())
+    })?;
+    let sink_config = request.sink_config.unwrap_or_else(|| serde_json::json!({}));
+    // A credential must be NAMED, never inlined. Refusing here keeps the one rule the
+    // whole design rests on at the boundary: this table never holds a secret.
+    if sink_config.get("credential").is_some() || sink_config.get("secret").is_some() {
+        return Err(ApiError::BadRequest(
+            "sink_config must not carry a credential; name an environment secret with \
+             credential_secret_name"
+                .to_owned(),
+        ));
+    }
+
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    let id = ironauth_store::LogStreamId::generate(state.env(), &scope).to_string();
+    let body_string = serde_json::to_string(&LogStreamCreated { id: id.clone() })
+        .map_err(|_| ApiError::Internal)?;
+    state
+        .store()
+        .scoped(scope)
+        .log_streams()
+        .create(
+            state.env(),
+            &ironauth_store::NewLogStream {
+                id: Some(&id),
+                description: request.description.as_deref().unwrap_or_default(),
+                source,
+                sink_type,
+                sink_config,
+                credential_secret_name: request.credential_secret_name.as_deref(),
+                event_type_filter: request.event_type_filter,
+                organization_id: request.organization_id.as_deref(),
+            },
+            Some(ironauth_store::IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 201,
+                response_body: &body_string,
+            }),
+        )
+        .await?;
+    Ok(json(StatusCode::CREATED, body_string))
+}
+
+/// Remove a SIEM log stream.
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}",
+    operation_id = "deleteLogStream",
+    tag = "log-streams",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("stream_id" = String, Path, description = "The log stream identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "The stream is gone"),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody)
+    )
+)]
+pub async fn delete_log_stream(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, stream_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+    require_live_environment(&state, &scope).await?;
+
+    // No Idempotency-Key: removing an absent stream is a no-op success, so DELETE is
+    // idempotent on its own.
+    state
+        .store()
+        .scoped(scope)
+        .log_streams()
+        .delete(&stream_id)
+        .await?;
+    Ok(no_content())
 }
