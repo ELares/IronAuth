@@ -282,3 +282,281 @@ async fn the_two_streams_chain_independently() {
             .is_ok()
     );
 }
+
+// ===========================================================================
+// Per-stream retention (issue #109).
+
+/// A cutoff far in the future, so every existing row falls before it.
+const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
+
+/// Create a live SSO session, which writes an authentication-stream audit row.
+async fn create_session(db: &TestDatabase, env: &Env, scope: ironauth_store::Scope) {
+    let id = ironauth_store::SessionId::generate(env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .sessions()
+        .rotate(
+            env,
+            &id,
+            None,
+            ironauth_store::NewSession {
+                impersonation: None,
+                subject: "usr_retention_probe",
+                auth_methods: "pwd",
+                auth_time_micros: 0,
+                idle_expires_micros: FAR_FUTURE_MICROS,
+                absolute_expires_micros: FAR_FUTURE_MICROS,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("rotate a session");
+}
+
+/// Write `count` admin-stream rows and return the scope they landed in.
+async fn seed_admin_rows(db: &TestDatabase, env: &Env, scope: ironauth_store::Scope, count: usize) {
+    for index in 0..count {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(env), CorrelationId::generate(env))
+            .clients()
+            .create(env, &format!("retain-{index}"))
+            .await
+            .expect("create a client");
+    }
+}
+
+#[tokio::test]
+async fn pruning_a_prefix_leaves_a_chain_that_still_verifies() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    seed_admin_rows(&db, &env, scope, 4).await;
+
+    let scoped = db.store().scoped(scope);
+    let chain = scoped.audit_chain();
+    assert_eq!(
+        chain
+            .seal_pending(&env, ADMIN, 100)
+            .await
+            .expect("seal")
+            .sealed,
+        4
+    );
+    assert!(chain.verify(ADMIN).await.expect("verify").is_ok());
+
+    // Prune the two oldest, through the retention role: the only one that can.
+    let retention = db.audit_retention_store().scoped(scope);
+    let report = retention
+        .audit_chain()
+        .prune_before(ADMIN, FAR_FUTURE_MICROS, 2)
+        .await
+        .expect("prune");
+    assert_eq!(report.rows_removed, 2, "exactly the batch limit is removed");
+    assert_eq!(
+        report.entries_removed, 2,
+        "each pruned row takes its chain entry with it"
+    );
+
+    // The retained tail still verifies. Pruning is not tampering.
+    let verified = chain
+        .verify(ADMIN)
+        .await
+        .expect("verify runs")
+        .expect("a pruned prefix must not read as an attack");
+    assert_eq!(verified.entries, 2, "two entries survive");
+    let entries = chain.entries(ADMIN).await.expect("entries");
+    assert_eq!(
+        entries[0].seq, 3,
+        "the surviving chain starts where the prune stopped, not renumbered to 1"
+    );
+}
+
+#[tokio::test]
+async fn the_two_streams_are_pruned_independently() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    seed_admin_rows(&db, &env, scope, 2).await;
+    create_session(&db, &env, scope).await;
+
+    let before = db.store().scoped(scope);
+    let authn_before = before
+        .audit_chain()
+        .sealed_rows("authentication")
+        .await
+        .expect("read")
+        .len();
+    assert!(authn_before > 0, "the session write must have left a row");
+
+    // Prune EVERYTHING from the admin stream.
+    let retention = db.audit_retention_store().scoped(scope);
+    let removed = retention
+        .audit_chain()
+        .prune_before(ADMIN, FAR_FUTURE_MICROS, 1_000)
+        .await
+        .expect("prune admin");
+    assert!(removed.rows_removed >= 2, "the admin rows are gone");
+
+    // The authentication stream is untouched. This is the whole point of the split:
+    // one window may be short and the other long without either disturbing the other.
+    let after = db.store().scoped(scope);
+    assert_eq!(
+        after
+            .audit_chain()
+            .sealed_rows("authentication")
+            .await
+            .expect("read")
+            .len(),
+        authn_before,
+        "pruning the admin stream must not remove an authentication row"
+    );
+    assert_eq!(
+        after
+            .audit_chain()
+            .sealed_rows(ADMIN)
+            .await
+            .expect("read")
+            .len(),
+        0,
+        "and the admin stream really was emptied"
+    );
+}
+
+/// The application role cannot delete an audit row, and that is what makes the
+/// retention role meaningful rather than decorative.
+#[tokio::test]
+async fn only_the_retention_role_can_remove_an_audit_row() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    seed_admin_rows(&db, &env, scope, 1).await;
+
+    let app = db.store().scoped(scope);
+    let refused = app
+        .audit_chain()
+        .prune_before(ADMIN, FAR_FUTURE_MICROS, 10)
+        .await;
+    let error = format!(
+        "{:?}",
+        refused.expect_err("the data-plane role must not prune")
+    );
+    assert!(
+        error.contains("permission denied"),
+        "the refusal must come from the GRANT, not from a broken query: {error}"
+    );
+
+    // The same call through the retention role succeeds, so the refusal above is the
+    // GRANT talking and not a broken query.
+    let allowed = db
+        .audit_retention_store()
+        .scoped(scope)
+        .audit_chain()
+        .prune_before(ADMIN, FAR_FUTURE_MICROS, 10)
+        .await
+        .expect("the retention role may prune");
+    assert!(allowed.rows_removed >= 1);
+}
+
+/// The retention role cannot WRITE an audit row.
+///
+/// This is the property that separates it from the argument migration 0102 made for
+/// the outbox. A role holding both INSERT and DELETE could remove a row and write a
+/// replacement, which is exactly the tampering the log exists to make evident.
+#[tokio::test]
+async fn the_retention_role_cannot_write_an_audit_row() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let refused = db
+        .audit_retention_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "should-not-write")
+        .await;
+    let error = format!(
+        "{:?}",
+        refused.expect_err("the retention role must not write an audit row")
+    );
+    assert!(
+        error.contains("permission denied"),
+        "the refusal must come from the missing GRANT, not from an absent master key or \
+         some other unrelated fault: {error}"
+    );
+}
+
+/// The reaper honours a window per stream, and a stream with no window is untouched.
+///
+/// Driven through [`AuditReaper`] rather than through `prune_before` directly, because
+/// the mapping from two configured windows onto two streams is the part that can be
+/// wired backwards, and a test that calls the prune itself would never see it.
+#[tokio::test]
+async fn the_reaper_sweeps_one_stream_and_leaves_the_other_forever() {
+    use ironauth_store::audit_retention::{AuditReaper, AuditRetentionSettings};
+    use std::time::Duration;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    seed_admin_rows(&db, &env, scope, 3).await;
+    create_session(&db, &env, scope).await;
+
+    let reaper = AuditReaper::new(
+        db.audit_retention_store().clone(),
+        env.clone(),
+        AuditRetentionSettings {
+            // Zero window: everything already written is older than the cutoff.
+            admin_action: Some(Duration::ZERO),
+            // None is FOREVER, not "immediately", which is the distinction that keeps an
+            // operator who enables the sweeper before choosing a window from erasing the
+            // trail.
+            authentication: None,
+            batch: 1_000,
+        },
+    );
+
+    let before_authn = db
+        .store()
+        .scoped(scope)
+        .audit_chain()
+        .sealed_rows("authentication")
+        .await
+        .expect("read")
+        .len();
+    assert!(before_authn > 0, "the session write must have left a row");
+
+    let stats = reaper.reap_once(scope).await.expect("reap");
+    assert!(
+        stats.admin_action_removed >= 3,
+        "the swept stream loses its rows: {stats:?}"
+    );
+    assert_eq!(
+        stats.authentication_removed, 0,
+        "a stream with no window must not be swept: {stats:?}"
+    );
+
+    let scoped = db.store().scoped(scope);
+    assert_eq!(
+        scoped
+            .audit_chain()
+            .sealed_rows(ADMIN)
+            .await
+            .expect("read")
+            .len(),
+        0
+    );
+    assert_eq!(
+        scoped
+            .audit_chain()
+            .sealed_rows("authentication")
+            .await
+            .expect("read")
+            .len(),
+        before_authn,
+        "the unswept stream is exactly as it was"
+    );
+}

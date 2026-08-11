@@ -36914,6 +36914,17 @@ pub struct ChainEntry {
     pub record_hash: String,
 }
 
+/// What one retention pass removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Audit rows removed.
+    pub rows_removed: u64,
+    /// Chain entries removed with them. Lower than `rows_removed` when the prune
+    /// reached rows the sealer had not sealed yet, which is ordinary rather than a
+    /// fault: an unsealed row is committed to by nothing.
+    pub entries_removed: u64,
+}
+
 /// What one sealing pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealReport {
@@ -37167,6 +37178,80 @@ impl AuditChainRepo<'_> {
         })
     }
 
+    /// Remove the oldest rows of `stream` that fall at or before `cutoff_micros`,
+    /// at most `limit` of them, together with the chain entries that seal them.
+    ///
+    /// Deletes a PREFIX. Rows are chosen in the sealer's own order (`occurred_at`, then
+    /// `id`), so what is left is a contiguous tail and the surviving chain stays dense
+    /// from wherever the prune stopped. Removing an arbitrary interior row instead would
+    /// leave a gap that verification cannot distinguish from an attack.
+    ///
+    /// The chain entry goes in the SAME transaction as the row it seals. An audit row
+    /// removed without its entry reads as [`ChainFault::MissingRow`], which is what a
+    /// deletion attack looks like, so a retention pass that half committed would make the
+    /// trail permanently unverifiable.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault. In particular a caller connected as a role
+    /// without DELETE on these tables fails here rather than silently pruning nothing:
+    /// only `ironauth_audit_retention` holds that grant (migration 0136).
+    pub async fn prune_before(
+        &self,
+        stream: &str,
+        cutoff_micros: i64,
+        limit: i64,
+    ) -> Result<PruneReport, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM audit_log \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3 \
+               AND occurred_at <= \
+                   (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             ORDER BY occurred_at, id LIMIT $5",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream)
+        .bind(cutoff_micros)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        if ids.is_empty() {
+            tx.commit().await?;
+            return Ok(PruneReport {
+                rows_removed: 0,
+                entries_removed: 0,
+            });
+        }
+        let entries_removed = sqlx::query(
+            "DELETE FROM audit_chain \
+             WHERE tenant_id = $1 AND environment_id = $2 AND audit_id = ANY($3)",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let rows_removed = sqlx::query(
+            "DELETE FROM audit_log \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = ANY($3)",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(PruneReport {
+            rows_removed,
+            entries_removed,
+        })
+    }
+
     /// Every sealed entry of `stream`, in position order.
     ///
     /// # Errors
@@ -37278,6 +37363,13 @@ impl AuditChainRepo<'_> {
 /// SAME clock seam every instant in the queue is written from. A second conversion there
 /// would be a second place for the epoch mapping to be got wrong, against rows this one
 /// wrote.
+/// [`epoch_micros`] for callers outside this module, so the audit retention sweeper
+/// derives its cutoff from the SAME clock seam every row it deletes was written from.
+#[must_use]
+pub fn epoch_micros_public(at: SystemTime) -> i64 {
+    epoch_micros(at)
+}
+
 pub(crate) fn epoch_micros(at: SystemTime) -> i64 {
     match at.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(delta) => i64::try_from(delta.as_micros()).unwrap_or(i64::MAX),
