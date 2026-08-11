@@ -254,6 +254,17 @@ pub enum StoreError {
     /// [`NotFound`]: StoreError::NotFound
     /// [`Conflict`]: StoreError::Conflict
     OrgAuthPolicyInvalid(Vec<crate::org_policy::AuthPolicyError>),
+    /// An audit action maps to no OCSF class, so the row it would write belongs to no
+    /// audit stream (issue #109). Carries the action's wire string.
+    ///
+    /// A SERVER fault, not a caller one: the caller asked for an ordinary mutation and
+    /// the classification gap is ours. It surfaces as [`StoreErrorWire::Internal`] so
+    /// the wire answer never names an internal table's vocabulary.
+    ///
+    /// Unreachable in a build whose `ocsf` exhaustiveness test passes. It exists so the
+    /// gap FAILS the write rather than committing a mutation whose audit row would sit
+    /// outside both retention policies and both exports.
+    AuditUnclassified(&'static str),
 }
 
 /// The WIRE CLASS a [`StoreError`] must be answered with.
@@ -345,7 +356,9 @@ impl StoreError {
             StoreError::Database(_)
             | StoreError::Migration(_)
             | StoreError::Encryption
-            | StoreError::InvitationMintCollision => StoreErrorWire::Internal,
+            | StoreError::InvitationMintCollision
+            // Our classification gap, not the caller's request. See the variant's doc.
+            | StoreError::AuditUnclassified(_) => StoreErrorWire::Internal,
             StoreError::IdempotencyConflict => StoreErrorWire::IdempotencyRace,
             // Collisions. A uniqueness violation is the obvious one; a migration-run edge
             // the state machine forbids is the less obvious one, and it belongs here
@@ -429,6 +442,11 @@ impl fmt::Display for StoreError {
                 "the requested parent would nest groups at least {attempted} levels deep, \
                  exceeding the configured maximum of {max}"
             ),
+            StoreError::AuditUnclassified(action) => write!(
+                f,
+                "the audit action `{action}` maps to no OCSF class, so it belongs to no \
+                 audit stream"
+            ),
             StoreError::OrgAuthPolicyInvalid(errors) => {
                 // Every carried error is value free, so naming them all is safe and
                 // is what makes the refusal actionable in ONE round trip. The list is
@@ -471,7 +489,8 @@ impl std::error::Error for StoreError {
             | StoreError::OrgGroupDepthExceeded { .. }
             // The carried refusals are a LIST, so there is no single source to
             // return; every one of them is already rendered by the Display arm.
-            | StoreError::OrgAuthPolicyInvalid(_) => None,
+            | StoreError::OrgAuthPolicyInvalid(_)
+            | StoreError::AuditUnclassified(_) => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
             StoreError::SchemaMalformed(source) => Some(source),

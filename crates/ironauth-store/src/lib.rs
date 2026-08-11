@@ -70,6 +70,7 @@ pub mod impersonation;
 pub mod interchange;
 pub mod locale_bundle;
 mod migrate;
+pub mod ocsf;
 pub mod org_policy;
 pub mod org_provisioning;
 pub mod outbox;

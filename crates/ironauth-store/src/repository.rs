@@ -36800,12 +36800,20 @@ async fn insert_audit_row<T: AuditTarget>(
     // since the epoch and reconstructed exactly as a timestamptz in SQL.
     let occurred_micros = epoch_micros(spec.env.clock().now_utc());
     let actor = spec.acting.actor();
+    // The OCSF class decides the stream (issue #109). An action nothing classifies is
+    // REFUSED here rather than stored: a row whose stream is unknown belongs to neither
+    // retention policy and appears in neither export, so accepting it would drop the event
+    // from the trail while reporting success. `ocsf`'s exhaustiveness test means this arm
+    // cannot be reached by any action that exists, which is exactly why it is cheap to keep.
+    let Some(class) = crate::ocsf::class_for(spec.action) else {
+        return Err(StoreError::AuditUnclassified(spec.action.as_str()));
+    };
     sqlx::query(
         "INSERT INTO audit_log \
          (id, tenant_id, environment_id, action, actor_kind, actor_id, \
-          target_kind, target_id, correlation_id, occurred_at, detail) \
+          target_kind, target_id, correlation_id, occurred_at, detail, stream) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, $11)",
+                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, $11, $12)",
     )
     .bind(audit_id.to_string())
     .bind(spec.scope.tenant().to_string())
@@ -36818,6 +36826,7 @@ async fn insert_audit_row<T: AuditTarget>(
     .bind(spec.acting.correlation().to_string())
     .bind(occurred_micros)
     .bind(detail)
+    .bind(class.stream().as_str())
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -327,6 +327,14 @@ name = "atomicity"
 path = "tests/atomicity.rs"
 required-features = ["testing"]
 
+# Audit stream separation (issue #109): the OCSF classification reaches storage, an admin
+# mutation and an authentication mutation land in different streams, and the CHECK refuses
+# a third value. Needs a real database.
+[[test]]
+name = "audit_stream"
+path = "tests/audit_stream.rs"
+required-features = ["testing"]
+
 # Server-side config promotion (issue #44): diff/plan/apply over a real database.
 # The transactional apply (drift guard, idempotency, atomic rollback, audited),
 # plan fail-closed on a missing reference, per-target reference resolution, and
