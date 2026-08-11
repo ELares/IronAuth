@@ -146,6 +146,25 @@ impl WebhookFanoutConsumer {
             .ok_or_else(|| ConsumerError::permanent("envelope_missing_type"))?
             .to_owned();
 
+        // Validate against the CATALOG (issue #108) before a single delivery is created.
+        //
+        // PERMANENT, never retryable: no number of retries turns an unregistered type into
+        // a registered one or fixes a payload that violates its schema. Retrying would burn
+        // the budget and land the same event in every endpoint's dead letters.
+        //
+        // Here rather than at the producer, because this is the ONE choke point every
+        // event passes through on the way out. A check at each producer is a check the next
+        // producer forgets, and the failure of that omission is an event on the wire that
+        // no consumer can parse.
+        if let Err(error) = ironauth_store::event_catalog::validate_event(&message.payload) {
+            tracing::error!(
+                event_type = %event_type,
+                ?error,
+                "an event failed catalog validation and was not delivered to any endpoint"
+            );
+            return Err(ConsumerError::permanent("event_failed_catalog_validation"));
+        }
+
         let scoped = self.store.scoped(scope);
         let endpoints = scoped
             .webhook_endpoints()

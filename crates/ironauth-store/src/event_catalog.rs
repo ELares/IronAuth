@@ -2,28 +2,30 @@
 
 //! The typed, versioned event catalog (issue #108).
 //!
-//! # The registry is DERIVED, not hand written
+//! # The catalog is the EVENT vocabulary, which is not the audit vocabulary
 //!
-//! Every event type comes from [`crate::audit::Action`]'s own `as_str` body, scanned out of
-//! this crate's source exactly as the uniqueness test in `audit.rs` does. That note says why
-//! the scan and not a list: `Action` has no `ALL` to iterate, so a hand-maintained catalog
-//! would drift from the actions the code actually emits, and the drift is invisible because
-//! nothing compares them. Deriving both from one source makes the comparison automatic.
+//! The first version of this module derived the registry from `Action::as_str`, the audit
+//! action list, and that was WRONG in a way only the delivery path could show: the audit
+//! action is `user.create` and the event on the wire is `user.created`. Wiring catalog
+//! validation into the webhook fan-out turned every real delivery red, which is how the
+//! mistake surfaced.
+//!
+//! They are different vocabularies on purpose, and the distinction is the same one
+//! [`crate::identity_fact`] draws. An audit action records what an ACTOR DID
+//! (`operator X created a user`). An event records what BECAME TRUE (`a user now exists`).
+//! A consumer wants the second, and deriving one from the other means inventing a mapping
+//! nobody validated.
+//!
+//! So the registry is the list of types PRODUCERS actually emit, declared here beside their
+//! schemas. That makes the count small and honest rather than large and fictional: issue
+//! #108 asks for 100+ types, and reaching it means writing ~100 producers, not renaming an
+//! audit list.
 //!
 //! # What a registered event promises
 //!
-//! Every type carries a PAYLOAD SCHEMA VERSION and a JSON Schema. Two of those schemas are
-//! real contracts today and the rest are explicit placeholders, which is a distinction this
-//! module refuses to blur:
-//!
-//! * A SPECIFIED payload has a schema naming its fields. A consumer can code against it.
-//! * An UNSPECIFIED payload has `{"type": "object"}` and says so in
-//!   [`RegisteredEvent::payload_specified`]. It is not a contract, it is an admission, and
-//!   [`UNSPECIFIED_CEILING`] ratchets the count down so the admission cannot grow.
-//!
-//! Writing 232 invented schemas to make a criterion read as satisfied would be worse than
-//! either: a consumer would code against a contract nobody had thought about, and the first
-//! real payload would break it.
+//! Every type carries a payload schema version and a JSON Schema naming its fields. There
+//! are no placeholders here: a type is in this registry because something emits it, and
+//! anything that emits an event knows what it puts in the payload.
 //!
 //! # Versioning
 //!
@@ -35,9 +37,6 @@
 use serde_json::{Value, json};
 
 use crate::trait_schema::TraitSchema;
-
-/// The audit source the event types are scanned out of.
-const AUDIT_SOURCE: &str = include_str!("audit.rs");
 
 /// The envelope every event carries, on the push path and the pull path alike (issue #108).
 ///
@@ -68,15 +67,22 @@ pub fn envelope_schema() -> Value {
     })
 }
 
-/// The payload schemas that are REAL contracts, as `(event type, version, schema)`.
+/// Every event type a producer emits, with its payload contract.
 ///
-/// Adding one here is what moves a type from admitted-unspecified to specified, and the
-/// ceiling below must come down in the same change.
-const SPECIFIED_PAYLOADS: &[(&str, u32, &str)] = &[
-    (
-        "user.create",
-        1,
-        r#"{
+/// `(wire type, payload version, payload JSON Schema)`.
+///
+/// ONE type today, because one producer exists. `user.updated` and `user.deleted` appear as
+/// subscription FILTER strings in the webhook surface and nothing emits them, so they are
+/// deliberately absent: a registry entry for an event no producer sends is a contract a
+/// consumer would wait on forever, which is the same fiction as an invented payload schema.
+///
+/// Adding a producer means adding a row here in the same change. The fan-out validates every
+/// envelope against this registry and REFUSES an unregistered type permanently, so a new
+/// event cannot reach the wire uncatalogued: the enforcement is the delivery path itself.
+const REGISTERED: &[(&str, u32, &str)] = &[(
+    "user.created",
+    1,
+    r#"{
             "type": "object",
             "properties": {
                 "user_id": {"type": "string", "minLength": 1},
@@ -84,32 +90,14 @@ const SPECIFIED_PAYLOADS: &[(&str, u32, &str)] = &[
             },
             "required": ["user_id", "state"]
         }"#,
-    ),
-    (
-        "user.delete",
-        1,
-        r#"{
-            "type": "object",
-            "properties": {
-                "user_id": {"type": "string", "minLength": 1}
-            },
-            "required": ["user_id"]
-        }"#,
-    ),
-];
+)];
 
-/// How many registered types may still lack a real payload contract.
+/// The number of event types issue #108 asks the catalog to reach before it closes.
 ///
-/// A RATCHET, the shape `scripts/provider-coverage.sh` and `test-registration.sh` use: it may
-/// only come down. Demanding all 232 today would be a gate somebody disables; letting the
-/// number drift up would make the admission meaningless.
-pub const UNSPECIFIED_CEILING: usize = 230;
-
-/// The floor on registered types, so a scan that silently read nothing cannot pass.
-///
-/// Issue #108 asks for at least 100. The scan finds 232 today; the floor is the criterion's
-/// number rather than today's, so ordinary churn does not trip it but a broken scan does.
-pub const MINIMUM_REGISTERED_TYPES: usize = 100;
+/// Stated as a constant the tests read so the gap is a NUMBER somebody can see rather than a
+/// sentence in an issue. Reaching it means writing producers; see the module note on why it
+/// cannot be reached by renaming the audit list.
+pub const TARGET_REGISTERED_TYPES: usize = 100;
 
 /// One registered event type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,75 +110,35 @@ pub struct RegisteredEvent {
     pub payload_version: u32,
     /// The payload JSON Schema, as text.
     pub payload_schema: String,
-    /// Whether the schema is a real contract or the explicit placeholder.
-    pub payload_specified: bool,
 }
 
-/// Every event type the code can emit, scanned from [`crate::audit::Action`].
-///
-/// # Panics
-///
-/// If the scan cannot find the `as_str` body, which means the function was renamed or
-/// reflowed. Panicking is right: a catalog built from a scan that read nothing would be an
-/// empty catalog that passed every count it was not given a floor for.
+/// Every registered event type, sorted.
 #[must_use]
 pub fn event_types() -> Vec<String> {
-    // Assembled from fragments so this scanner never matches its own source line, the same
-    // guard the uniqueness test in `audit.rs` uses and for the same reason.
-    let needle = concat!("pub fn ", "as_str(&self) -> &'static str {");
-    let body = AUDIT_SOURCE
-        .split_once(needle)
-        .map(|(_, rest)| rest)
-        .expect("the as_str body is readable");
-    let body = body
-        .split_once("\n    }\n")
-        .map(|(inside, _)| inside)
-        .expect("the as_str body is terminated");
-
-    let mut out = Vec::new();
-    let mut rest = body;
-    while let Some(start) = rest.find('"') {
-        rest = &rest[start + 1..];
-        let Some(end) = rest.find('"') else { break };
-        let literal = &rest[..end];
-        rest = &rest[end + 1..];
-        if !literal.is_empty() {
-            out.push(literal.to_owned());
-        }
-    }
+    let mut out: Vec<String> = REGISTERED
+        .iter()
+        .map(|(wire, _, _)| (*wire).to_owned())
+        .collect();
     out.sort_unstable();
-    out.dedup();
     out
 }
 
-/// The full registry: every scanned type with its schema.
+/// The full registry.
 #[must_use]
 pub fn registry() -> Vec<RegisteredEvent> {
-    event_types()
-        .into_iter()
-        .map(|wire| {
-            let domain = wire
+    let mut out: Vec<RegisteredEvent> = REGISTERED
+        .iter()
+        .map(|(wire, version, schema)| RegisteredEvent {
+            wire: (*wire).to_owned(),
+            domain: wire
                 .split_once('.')
-                .map_or_else(|| wire.clone(), |(head, _)| head.to_owned());
-            match SPECIFIED_PAYLOADS.iter().find(|(name, _, _)| *name == wire) {
-                Some((_, version, schema)) => RegisteredEvent {
-                    wire,
-                    domain,
-                    payload_version: *version,
-                    payload_schema: (*schema).to_owned(),
-                    payload_specified: true,
-                },
-                None => RegisteredEvent {
-                    wire,
-                    domain,
-                    payload_version: 1,
-                    // Explicitly permissive, and flagged. See the module note.
-                    payload_schema: r#"{"type": "object"}"#.to_owned(),
-                    payload_specified: false,
-                },
-            }
+                .map_or_else(|| (*wire).to_owned(), |(head, _)| head.to_owned()),
+            payload_version: *version,
+            payload_schema: (*schema).to_owned(),
         })
-        .collect()
+        .collect();
+    out.sort_by(|a, b| a.wire.cmp(&b.wire));
+    out
 }
 
 /// Look one type up.
@@ -297,7 +245,6 @@ pub fn catalog_document() -> Value {
                 "type": entry.wire,
                 "domain": entry.domain,
                 "payload_schema_version": entry.payload_version,
-                "payload_specified": entry.payload_specified,
                 "payload_schema": serde_json::from_str::<Value>(&entry.payload_schema)
                     .unwrap_or(json!({})),
             })
@@ -313,19 +260,16 @@ pub fn catalog_document() -> Value {
 mod tests {
     use super::*;
 
-    /// The scan finds a plausible number of types, well past the criterion's floor.
+    /// The registry is non-empty, its types are distinct, and the distance to issue #108's
+    /// target is stated rather than implied.
     ///
-    /// The floor is what stops a scan that silently read NOTHING from passing: an empty
-    /// registry satisfies "every registered schema compiles" and "no duplicates" perfectly.
+    /// The gap is an assertion so it cannot be forgotten: 100+ types is reached by writing
+    /// PRODUCERS, and this fails loudly the day somebody believes it was reached by
+    /// renaming something.
     #[test]
-    fn the_scan_finds_at_least_the_floor_and_the_types_are_distinct() {
+    fn the_registry_is_non_empty_distinct_and_reports_its_distance_to_the_target() {
         let types = event_types();
-        assert!(
-            types.len() >= MINIMUM_REGISTERED_TYPES,
-            "the scan found {} event types, below the floor of {MINIMUM_REGISTERED_TYPES}; \
-             a scan that read nothing would otherwise pass every other test here",
-            types.len()
-        );
+        assert!(!types.is_empty(), "the registry is empty");
         let mut sorted = types.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -334,18 +278,43 @@ mod tests {
             types.len(),
             "two event types share a wire string"
         );
+        assert!(
+            types.len() < TARGET_REGISTERED_TYPES,
+            "the registry reached {} types, at or past issue #108's target of \
+             {TARGET_REGISTERED_TYPES}. Raise or retire TARGET_REGISTERED_TYPES and say so \
+             in the issue: the target is a reminder that the catalog is incomplete, and a \
+             reminder nobody updates is a reminder that lies.",
+            types.len()
+        );
     }
 
-    /// The registry covers EVERY scanned type, with no extras.
+    /// Every registered type is a dotted, `snake_case` token in the PAST TENSE.
     ///
-    /// Both directions. A missing type is an event nothing can validate; an extra one is a
-    /// catalog entry for something the code cannot emit, which a consumer would wait for
-    /// forever.
+    /// The past tense is the vocabulary rule that keeps this list from drifting back into
+    /// the audit vocabulary, which is imperative (`user.create`). Asserted rather than
+    /// documented, because that drift is the defect this module was born from.
     #[test]
-    fn the_registry_covers_exactly_the_scanned_types() {
-        let scanned = event_types();
-        let registered: Vec<String> = registry().into_iter().map(|entry| entry.wire).collect();
-        assert_eq!(registered, scanned);
+    fn every_registered_type_is_a_dotted_past_tense_token() {
+        for wire in event_types() {
+            let (domain, rest) = wire
+                .split_once('.')
+                .unwrap_or_else(|| panic!("`{wire}` is not a dotted token"));
+            assert!(
+                !domain.is_empty() && !rest.is_empty(),
+                "`{wire}` has an empty segment"
+            );
+            assert!(
+                wire.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_'),
+                "`{wire}` is not a snake_case dotted token"
+            );
+            assert!(
+                rest.ends_with("ed"),
+                "`{wire}` is not past tense. An event records what BECAME TRUE; the \
+                 imperative form is the AUDIT vocabulary, and conflating the two is the \
+                 defect this rule exists to prevent."
+            );
+        }
     }
 
     /// Every registered payload schema COMPILES, and so does the envelope schema.
@@ -354,7 +323,7 @@ mod tests {
     /// that type into a panic on the delivery path.
     #[test]
     fn every_registered_schema_compiles() {
-        TraitSchema::compile(&envelope_schema().to_string()).expect("the envelope schema compiles");
+        TraitSchema::compile(&envelope_schema().to_string()).expect("the envelope compiles");
         for entry in registry() {
             TraitSchema::compile(&entry.payload_schema).unwrap_or_else(|error| {
                 panic!(
@@ -365,45 +334,10 @@ mod tests {
         }
     }
 
-    /// The unspecified count is at or under the ceiling, and the ceiling ratchets.
-    #[test]
-    fn the_unspecified_payload_count_is_within_the_ratchet() {
-        let unspecified = registry()
-            .into_iter()
-            .filter(|entry| !entry.payload_specified)
-            .count();
-        assert!(
-            unspecified <= UNSPECIFIED_CEILING,
-            "{unspecified} event types lack a payload contract, above the ceiling of \
-             {UNSPECIFIED_CEILING}: a new event type landed without one"
-        );
-        assert!(
-            unspecified >= UNSPECIFIED_CEILING,
-            "only {unspecified} types are unspecified, below the ceiling of \
-             {UNSPECIFIED_CEILING}. Lower UNSPECIFIED_CEILING to {unspecified} so the gain \
-             is locked in; a ratchet that is never tightened is a ceiling nobody notices"
-        );
-    }
-
-    /// Every SPECIFIED payload names a type the registry actually carries.
-    ///
-    /// A schema for a type that does not exist is a contract nothing can ever satisfy, and
-    /// it silently costs the ratchet a slot.
-    #[test]
-    fn every_specified_payload_names_a_real_event_type() {
-        let scanned = event_types();
-        for (wire, _, _) in SPECIFIED_PAYLOADS {
-            assert!(
-                scanned.iter().any(|found| found == wire),
-                "`{wire}` has a payload schema but is not an event type the code emits"
-            );
-        }
-    }
-
     fn good_envelope() -> Value {
         json!({
             "id": "evt_1",
-            "type": "user.create",
+            "type": "user.created",
             "payload_schema_version": 1,
             "occurred_at_unix_ms": 1_700_000_000_000_i64,
             "tenant_id": "ten_1",
@@ -420,8 +354,8 @@ mod tests {
 
     /// EVERY required envelope field is required, one at a time.
     ///
-    /// Asserted per field rather than once, because a schema that required only `id` would
-    /// pass a single happy-path test and let every other field go missing.
+    /// Asserted per field rather than once, because a schema requiring only `id` would pass
+    /// a single happy-path test while every other field went missing.
     #[test]
     fn removing_any_required_envelope_field_is_refused() {
         for field in [
@@ -446,8 +380,8 @@ mod tests {
         }
     }
 
-    /// An UNREGISTERED type is refused by name. This is the check that makes "emitting an
-    /// unregistered event fails the build" enforceable.
+    /// An UNREGISTERED type is refused by name, which is what makes "emitting an
+    /// unregistered event fails" enforceable at the delivery choke point.
     #[test]
     fn an_unregistered_event_type_is_refused() {
         let mut envelope = good_envelope();
@@ -460,15 +394,31 @@ mod tests {
         );
     }
 
-    /// A payload that violates its registered schema is refused, and the error names the
-    /// type so an operator knows which producer to look at.
+    /// An AUDIT action string is not an event type, and is refused as unregistered.
+    ///
+    /// The specific confusion that produced the first version of this module, pinned so it
+    /// cannot come back quietly.
+    #[test]
+    fn an_audit_action_string_is_not_an_event_type() {
+        let mut envelope = good_envelope();
+        envelope["type"] = json!("user.create");
+        assert!(
+            matches!(
+                validate_event(&envelope),
+                Err(CatalogError::UnregisteredType(_))
+            ),
+            "`user.create` is the AUDIT vocabulary; the event is `user.created`"
+        );
+    }
+
+    /// A payload that violates its registered schema is refused, naming the type.
     #[test]
     fn a_payload_violating_its_registered_schema_is_refused() {
         let mut envelope = good_envelope();
         envelope["payload"] = json!({"user_id": "usr_1"});
         match validate_event(&envelope) {
             Err(CatalogError::Payload { wire, failures }) => {
-                assert_eq!(wire, "user.create");
+                assert_eq!(wire, "user.created");
                 assert!(!failures.is_empty(), "the refusal must say what failed");
             }
             other => panic!("expected a payload refusal, got {other:?}"),
@@ -476,10 +426,7 @@ mod tests {
     }
 
     /// A version the registry does not emit is refused rather than validated against
-    /// whatever schema happens to be current.
-    ///
-    /// This is the versioning policy's enforcement point: a consumer pinning version 1 must
-    /// not silently receive version 2's shape.
+    /// whatever schema is current: the versioning policy's enforcement point.
     #[test]
     fn a_declared_version_the_registry_does_not_emit_is_refused() {
         let mut envelope = good_envelope();
@@ -487,32 +434,10 @@ mod tests {
         assert_eq!(
             validate_event(&envelope),
             Err(CatalogError::VersionMismatch {
-                wire: "user.create".to_owned(),
+                wire: "user.created".to_owned(),
                 declared: 2,
                 registered: 1,
             })
-        );
-    }
-
-    /// An UNSPECIFIED type accepts any object payload, and still refuses a non-object.
-    ///
-    /// The placeholder is permissive on purpose, but it is a schema rather than an absence:
-    /// a payload that is not an object at all is still wrong.
-    #[test]
-    fn an_unspecified_type_accepts_an_object_and_refuses_a_non_object() {
-        let unspecified = registry()
-            .into_iter()
-            .find(|entry| !entry.payload_specified)
-            .expect("at least one type is unspecified today");
-        let mut envelope = good_envelope();
-        envelope["type"] = json!(unspecified.wire);
-        envelope["payload"] = json!({"anything": true});
-        assert_eq!(validate_event(&envelope), Ok(()));
-
-        envelope["payload"] = json!("not an object");
-        assert!(
-            validate_event(&envelope).is_err(),
-            "the placeholder still requires an object payload"
         );
     }
 
