@@ -1100,6 +1100,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Migrate,
             sql: include_str!("../migrations/0134_audit_stream_backfill.sql"),
         },
+        Migration {
+            version: 135,
+            name: "audit_chain",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0135_audit_chain.sql"),
+        },
     ]
 }
 

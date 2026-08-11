@@ -310,6 +310,10 @@ pub use repository::{
     WEBHOOK_EVENT_CONSUMER, WEBHOOK_REPLAY_CONSUMER, WebhookDeliveryAttemptRepo,
     WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,
 };
+pub use repository::{
+    AuditChainRepo, ChainEntry, ChainFault, ChainVerified, ChainedAuditRow, SealReport,
+    verify_chain_entries,
+};
 /// The testing-only atomicity probes (issue #247): the seams at which a test can force
 /// the joined invitation create and the joined recovery approve to fail INSIDE their one
 /// transaction. Present only under the `testing` feature, so a production build carries

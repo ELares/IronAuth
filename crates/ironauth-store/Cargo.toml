@@ -335,6 +335,13 @@ name = "audit_stream"
 path = "tests/audit_stream.rs"
 required-features = ["testing"]
 
+# Per-stream audit tamper evidence (issue #109): the pure chain checker over corrupted
+# chains, plus the sealer against real rows. Needs a real database for the second half.
+[[test]]
+name = "audit_chain"
+path = "tests/audit_chain.rs"
+required-features = ["testing"]
+
 # Server-side config promotion (issue #44): diff/plan/apply over a real database.
 # The transactional apply (drift guard, idempotency, atomic rollback, audited),
 # plan fail-closed on a missing reference, per-target reference resolution, and
