@@ -349,6 +349,10 @@ pub struct OidcState {
     // identifier is the uniform failure and no outbound call is made), so the many
     // DB-only OIDC tests and a deployment with no legacy store are unaffected.
     migration_hook: Option<Arc<crate::migration::LazyMigrationHook>>,
+
+    // The claims-enrichment hook (issue #100): the seam an external PDP or FGA merges
+    // extra claims through at issuance. `None` (the default) leaves issuance unchanged.
+    claims_enrichment_hook: Option<Arc<crate::enrichment::ClaimsEnrichmentHook>>,
     // The dedicated, admission-controlled Argon2id hashing pool (issue #62). Kept
     // OUTSIDE `Inner` and installed by the boot path (built from [password_hashing]
     // config, sharing the SAME quota enforcer as the request path so hashing
@@ -930,6 +934,7 @@ impl OidcState {
             token_claims: TokenClaimsConfig::default(),
             quota: None,
             migration_hook: None,
+            claims_enrichment_hook: None,
             hashing_pool: None,
             custom_journey_source: None,
             dpop_replay: Arc::new(crate::dpop::DpopReplayCache::new()),
@@ -1429,6 +1434,23 @@ impl OidcState {
     #[must_use]
     pub fn migration_hook(&self) -> Option<&Arc<crate::migration::LazyMigrationHook>> {
         self.migration_hook.as_ref()
+    }
+
+    /// Install the claims-enrichment hook (issue #100). Absent by default, which leaves
+    /// token issuance byte-for-byte as it was before this existed.
+    #[must_use]
+    pub fn with_claims_enrichment_hook(
+        mut self,
+        hook: Arc<crate::enrichment::ClaimsEnrichmentHook>,
+    ) -> Self {
+        self.claims_enrichment_hook = Some(hook);
+        self
+    }
+
+    /// The installed claims-enrichment hook, if any (issue #100).
+    #[must_use]
+    pub fn claims_enrichment_hook(&self) -> Option<&Arc<crate::enrichment::ClaimsEnrichmentHook>> {
+        self.claims_enrichment_hook.as_ref()
     }
 
     /// Charge one request against the tenant and environment request-rate quota

@@ -2565,6 +2565,10 @@ pub struct OidcConfig {
     /// claims a property the code does not have is worse than no comment.
     pub lazy_migration: LazyMigrationConfig,
 
+    /// The claims-enrichment hook (issue #100): the seam an external `PDP` or FGA merges
+    /// extra claims through at token issuance. Disabled by default.
+    pub claims_enrichment: ClaimsEnrichmentConfig,
+
     /// Generic OIDC UPSTREAM federation (issue #75, PR B): turn a declarative connector
     /// into an inbound federated login with zero per-provider code. OFF by default (the
     /// `/federation` routes stay a uniform not-found), so an existing deployment is
@@ -3057,6 +3061,7 @@ impl Default for OidcConfig {
             backchannel_logout_enabled: false,
             backchannel_logout_request_timeout_secs: 10,
             lazy_migration: LazyMigrationConfig::default(),
+            claims_enrichment: ClaimsEnrichmentConfig::default(),
             federation: FederationConfig::default(),
             fedcm: FedcmConfig::default(),
             webauthn_enabled: true,
@@ -3124,6 +3129,97 @@ impl Default for OidcConfig {
 /// logins then fail fast with the uniform error. A value beyond thirty seconds is
 /// almost always a misconfiguration, so config load rejects it.
 pub const OIDC_MAX_LAZY_MIGRATION_TIMEOUT_SECS: u64 = 30;
+
+/// The largest per-call timeout for the claims-enrichment hook (issue #100), in seconds.
+///
+/// Deliberately TIGHTER than the lazy-migration ceiling. That hook runs once, on an unknown
+/// identifier; this one runs on the TOKEN ISSUANCE path, which every refresh and every code
+/// exchange goes through, so a slow policy decision point is felt by every logged-in user at
+/// once rather than by the few people migrating.
+pub const OIDC_MAX_CLAIMS_ENRICHMENT_TIMEOUT_SECS: u64 = 5;
+
+/// The most claims a single enrichment response may contribute (issue #100).
+///
+/// The bound is on the COUNT and not on the response size, for the reason the `AuthZEN` batch
+/// bound is: a claim is cheap to send and expensive to carry, since every one of them rides
+/// in every token this subject is issued from now on. The token-size budget (issue #98) is
+/// the backstop that refuses an over-large token; this is what stops a misbehaving FGA
+/// pushing a thousand claims into that budget in the first place.
+pub const OIDC_MAX_ENRICHED_CLAIMS: usize = 32;
+
+/// The claims-enrichment hook (issue #100): an outbound call at TOKEN ISSUANCE that asks an
+/// external policy decision point or fine-grained-authorization service for extra claims and
+/// merges them into the token.
+///
+/// This is the seam the `AuthZEN` work is explicitly built around. `IronAuth` answers what it
+/// already indexes and deliberately does NOT ship a Zanzibar engine; a deployment whose
+/// authorization model needs relationships runs `OpenFGA`, `SpiceDB` or `Cerbos` and points
+/// this hook at it. The blessed architecture is coarse claims plus a fine `PDP`, and this is
+/// the coarse half learning what the fine half knows.
+///
+/// # It can only ADD, and only names it was told about
+///
+/// A returned claim whose name is not in `allowed_claims` is DROPPED, and a returned claim
+/// that collides with one `IronAuth` itself minted is dropped too. An enrichment hook that
+/// could overwrite `sub`, `aud`, `exp` or the permissions claim would not be an enrichment
+/// hook, it would be a token forgery endpoint, and the deployment that trusts an FGA to
+/// answer a relationship question has not thereby decided to let it choose subjects.
+///
+/// # It fails OPEN, and that direction is the safe one here
+///
+/// A hook that errors, times out, or answers malformed JSON contributes NOTHING and the
+/// token is issued without the extra claims. Failing closed would take every login in the
+/// deployment down with the FGA, and the claims this adds are ADDITIVE: their absence is
+/// fewer permissions, never more. A relying party that requires an enriched claim to
+/// authorize still refuses without it, which is the correct outcome and one it already
+/// implements.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClaimsEnrichmentConfig {
+    /// Whether the hook is armed. False (the default) leaves issuance unchanged: no
+    /// outbound call is made and no token gains a claim. When true, `endpoint` MUST be set
+    /// (config load rejects an enabled hook with no endpoint).
+    pub enabled: bool,
+
+    /// The enrichment endpoint (an https URL). Outbound and routed through the
+    /// SSRF-hardened fetcher, so a loopback or otherwise internal target is refused exactly
+    /// like any other blocked destination, and a plaintext `http` target is refused. Unset
+    /// when disabled; REQUIRED (and https) when enabled.
+    pub endpoint: Option<String>,
+
+    /// The shared bearer secret presented as `Authorization: Bearer <secret>`, so the
+    /// enrichment service can authenticate `IronAuth`. Use the `file`/`env` secret
+    /// indirection, never a literal, outside dev mode.
+    pub secret: Option<Secret>,
+
+    /// The per-call timeout in seconds. Must be at least 1 and at most
+    /// [`OIDC_MAX_CLAIMS_ENRICHMENT_TIMEOUT_SECS`], which is deliberately tighter than the
+    /// lazy-migration ceiling because this call sits on the issuance path.
+    pub timeout_secs: u64,
+
+    /// The claim names this hook is permitted to contribute. A response naming anything
+    /// else is dropped, silently from the caller's point of view and with a warning on the
+    /// observability plane.
+    ///
+    /// There is no wildcard and there is deliberately no way to write one. An allowlist a
+    /// deployment can turn off is one that gets turned off, and the failure mode is a token
+    /// carrying whatever an external service decided to put in it. An empty list (the
+    /// default) means the hook contributes nothing, so arming `enabled` without naming
+    /// claims is inert rather than dangerous.
+    pub allowed_claims: Vec<String>,
+}
+
+impl Default for ClaimsEnrichmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            secret: None,
+            timeout_secs: 2,
+            allowed_claims: Vec::new(),
+        }
+    }
+}
 
 /// The INBOUND lazy-migration hook settings (issue #56).
 ///
@@ -4988,6 +5084,7 @@ impl Config {
         validate_device_authorization(&self.oidc)?;
         validate_backchannel_logout(&self.oidc)?;
         validate_lazy_migration(&self.oidc)?;
+        validate_claims_enrichment(&self.oidc)?;
         validate_federation(&self.oidc)?;
         validate_regulation(&self.oidc)?;
         validate_risk(&self.oidc)?;
@@ -6407,6 +6504,113 @@ fn uri_host(url: &str) -> Option<String> {
         .ok()
         .and_then(|uri| uri.host().map(str::to_owned))
 }
+
+/// Validate the claims-enrichment hook (issue #100).
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] if the hook is enabled without a well-formed absolute https
+/// endpoint, the timeout is zero or above [`OIDC_MAX_CLAIMS_ENRICHMENT_TIMEOUT_SECS`], the
+/// allowlist exceeds [`OIDC_MAX_ENRICHED_CLAIMS`], or it names a claim `IronAuth` mints
+/// itself.
+fn validate_claims_enrichment(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    let hook = &oidc.claims_enrichment;
+    if hook.enabled {
+        match hook.endpoint.as_deref() {
+            None => {
+                return Err(ConfigError::Invalid {
+                    message: "oidc.claims_enrichment.endpoint must be set when \
+                              oidc.claims_enrichment.enabled is true"
+                        .to_owned(),
+                });
+            }
+            Some(endpoint) if !is_well_formed_https_endpoint(endpoint) => {
+                return Err(ConfigError::Invalid {
+                    message: "oidc.claims_enrichment.endpoint must be a well-formed absolute \
+                              https URL with a host (a plaintext http target or a malformed \
+                              URL is refused; the hook rides the SSRF-hardened fetcher)"
+                        .to_owned(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    if hook.timeout_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.claims_enrichment.timeout_secs must be at least 1 second".to_owned(),
+        });
+    }
+    if hook.timeout_secs > OIDC_MAX_CLAIMS_ENRICHMENT_TIMEOUT_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.claims_enrichment.timeout_secs ({}) must not exceed \
+                 {OIDC_MAX_CLAIMS_ENRICHMENT_TIMEOUT_SECS} seconds; this hook sits on the \
+                 token-issuance path, so a slow policy decision point is felt by every \
+                 logged-in user rather than by a few",
+                hook.timeout_secs
+            ),
+        });
+    }
+    if hook.allowed_claims.len() > OIDC_MAX_ENRICHED_CLAIMS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.claims_enrichment.allowed_claims names {} claims; at most \
+                 {OIDC_MAX_ENRICHED_CLAIMS} are permitted, because every one of them rides \
+                 in every token this subject is issued",
+                hook.allowed_claims.len()
+            ),
+        });
+    }
+    // A reserved name is refused at LOAD rather than dropped at runtime. Dropping it works
+    // and says nothing: an operator who allowlists `sub` has misunderstood what this hook
+    // is, and finding out at boot is far better than finding out never.
+    for name in &hook.allowed_claims {
+        if RESERVED_ENRICHMENT_CLAIMS.contains(&name.as_str()) {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.claims_enrichment.allowed_claims names the reserved claim \
+                     `{name}`; the enrichment hook may ADD claims and may never replace one \
+                     IronAuth mints, or an external service could choose the subject, the \
+                     audience, the expiry, or the permission set"
+                ),
+            });
+        }
+        if name.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                message: "oidc.claims_enrichment.allowed_claims names an empty claim".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The claim names the enrichment hook may never contribute, whatever the allowlist says.
+///
+/// Everything `IronAuth` mints as part of the token's IDENTITY or its VALIDITY, plus the
+/// authorization claims it resolves itself. The hook exists to answer what `IronAuth` does
+/// not index; a name on this list is one it does.
+pub const RESERVED_ENRICHMENT_CLAIMS: &[&str] = &[
+    "acr",
+    "amr",
+    "aud",
+    "auth_time",
+    "azp",
+    "client_id",
+    "cnf",
+    "exp",
+    "iat",
+    "iss",
+    "jti",
+    "nbf",
+    "nonce",
+    "org_id",
+    "permissions",
+    "roles",
+    "scope",
+    "sid",
+    "sub",
+    "typ",
+];
 
 /// Validate the inbound lazy-migration hook settings (issue #56), kept out of
 /// [`Config::validate`] so each stays within the readable-length lint.

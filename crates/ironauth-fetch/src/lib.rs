@@ -115,6 +115,10 @@ pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum FetchPurpose {
     /// Fetching a client's `jwks_uri` (DCR and signature verification).
     JwksUri,
+    /// Asking an external policy decision point or fine-grained-authorization service for
+    /// extra token claims at issuance (issue #100). Outbound to an operator-supplied URL,
+    /// so it rides the same SSRF-hardened path as every other outbound fetch.
+    ClaimsEnrichment,
     /// Fetching a client's `sector_identifier_uri` for pairwise subject
     /// validation.
     SectorIdentifier,
@@ -195,6 +199,7 @@ impl FetchPurpose {
     pub const fn label(self) -> &'static str {
         match self {
             FetchPurpose::JwksUri => "jwks_uri",
+            FetchPurpose::ClaimsEnrichment => "claims_enrichment",
             FetchPurpose::SectorIdentifier => "sector_identifier",
             FetchPurpose::ClientMetadata => "client_metadata",
             FetchPurpose::WebhookDelivery => "webhook_delivery",
