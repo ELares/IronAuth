@@ -1420,6 +1420,65 @@ async fn assert_each_missing_justification_names_its_rule(h: &Harness, route: &s
     }
 }
 
+/// The log stream status read demands `management.read` in BOTH directions.
+///
+/// Both directions matter and only one of them is the obvious one. A credential holding a
+/// DIFFERENT permission must be refused with the required one NAMED, and a credential
+/// holding read must be served: without the second half, downgrading the route to "any
+/// permission" would still pass, and the classification would be a comment rather than a
+/// control.
+///
+/// The status surface reports where each export is up to and why it is failing, which is
+/// operational intelligence about an environment's audit pipeline. It is a read, not a
+/// public one.
+#[tokio::test]
+async fn the_log_stream_status_read_demands_read_and_never_answers_unauthenticated() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "lgs-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "lgs-mint").await;
+    let streams = format!("/v1/tenants/{tenant}/environments/{environment}/log-streams");
+
+    // Read-granted: served.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&streams, &secret).await;
+    assert_eq!(status, StatusCode::OK, "log streams under read: {body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        document["items"].is_array(),
+        "the listing must answer with its items array even when empty: {body}"
+    );
+
+    // A credential holding a WRITE but not read is refused, and the refusal names what it
+    // wanted.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&streams, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "log streams answered a credential without management.read: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the refusal must name the permission it wanted: {body}"
+    );
+
+    // And with no credential at all. An EMPTY bearer is the unauthenticated case; the
+    // harness operator token would prove nothing.
+    let (status, _, body) = h.get_as(&streams, "").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "log streams answered an unauthenticated caller: {body}"
+    );
+}
+
 /// Every `AuthZEN` endpoint demands `management.read`, and unauthenticated evaluation is never
 /// served (issue #100).
 ///

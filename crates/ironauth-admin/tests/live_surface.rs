@@ -1240,6 +1240,12 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/queues"),
         ),
+        // ---- SIEM log streams (issue #110) ----
+        Case::empty(
+            "log_streams.listLogStreams",
+            "GET",
+            format!("{base}/log-streams"),
+        ),
         Case::empty(
             "webhook_endpoints.listWebhookEndpoints",
             "GET",

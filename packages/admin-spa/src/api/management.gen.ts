@@ -1073,6 +1073,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the environment's SIEM log streams and their delivery health. */
+        get: operations["listLogStreams"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
         parameters: {
             query?: never;
@@ -4698,6 +4715,60 @@ export interface components {
             is_env_default: boolean;
             /** @description The BCP47 language tag (the per-environment natural key). */
             locale: string;
+        };
+        /** @description The environment's configured streams. */
+        LogStreamList: {
+            /** @description The streams, ordered by identifier. */
+            items: components["schemas"]["LogStreamView"][];
+        };
+        /** @description One configured stream, as an operator reads it. */
+        LogStreamView: {
+            /** @description Whether the shipper picks this stream up. */
+            active: boolean;
+            /**
+             * Format: int32
+             * @description Consecutive delivery failures with no success in between.
+             */
+            consecutive_failures: number;
+            /** @description The NAME of the environment secret holding the sink credential, never its value. */
+            credential_secret_name?: string | null;
+            /**
+             * @description The audit row this stream has shipped up to, or absent if it has shipped nothing.
+             *
+             *     This is the LAG answer in the only form that is honest without a second query: an
+             *     operator comparing it to the newest audit row sees how far behind the stream is.
+             */
+            cursor_audit_id?: string | null;
+            /** @description The operator's label. */
+            description: string;
+            /**
+             * @description The action wire strings this ships, or absent for every action in `source`.
+             *
+             *     An EMPTY list is not the same as absent: it ships nothing, which is how a stream is
+             *     parked without losing its cursor. The two must stay distinguishable here or an
+             *     operator cannot tell a parked stream from a firehose.
+             */
+            event_type_filter?: string[] | null;
+            /** @description The `lgs_` identifier. */
+            id: string;
+            /** @description The last failure, operator-safe. Never a sink's response body. */
+            last_error?: string | null;
+            /**
+             * Format: int64
+             * @description When a delivery last failed, epoch microseconds.
+             */
+            last_error_at_unix_micros?: number | null;
+            /**
+             * Format: int64
+             * @description When a delivery last succeeded, epoch microseconds.
+             */
+            last_success_at_unix_micros?: number | null;
+            /** @description Where it ships to: `http`, `s3`, `datadog`, or `splunk_hec`. */
+            sink_type: string;
+            /** @description Which audit stream(s) this ships: `admin_action`, `authentication`, or `both`. */
+            source: string;
+            /** @description `healthy`, `degraded`, or `failing`, from the consecutive-failure run. */
+            status: string;
         };
         /**
          * @description The result of minting a management API key.
@@ -12389,6 +12460,58 @@ export interface operations {
                 };
             };
             /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listLogStreams: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The environment's log streams and their health */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogStreamList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent */
             404: {
                 headers: {
                     [name: string]: unknown;

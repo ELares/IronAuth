@@ -74,6 +74,7 @@ mod locales;
 /// shipper that reads audit rows forward from each stream's cursor. Public because the
 /// binary wires the shipper and a deployment may add its own sink.
 pub mod log_shipper;
+mod log_streams;
 mod mds3_health;
 mod memberships;
 mod migration;
@@ -1050,6 +1051,10 @@ pub fn management_router(state: AdminState) -> Router {
             axum::routing::get(queues::list_queue_depths),
         )
         // Standard Webhooks endpoint registration (issue #105).
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams",
+            axum::routing::get(log_streams::list_log_streams),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
             post(webhook_endpoints::create_webhook_endpoint)
