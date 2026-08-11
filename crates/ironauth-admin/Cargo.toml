@@ -652,6 +652,14 @@ name = "webhook_delivery"
 path = "tests/webhook_delivery.rs"
 required-features = ["testing"]
 
+# SIEM log stream shipping (issue #110): the real shipper against real audit rows with a
+# recording sink, covering cursor advance, at-least-once redelivery, and per-stream
+# isolation. Needs a real database.
+[[test]]
+name = "log_shipper"
+path = "tests/log_shipper.rs"
+required-features = ["testing"]
+
 # The two per-client / per-environment security postures the data plane enforced and
 # nothing could set (issues #27, #78): the PAR requirement and the account-linking
 # posture. Needs a real database.

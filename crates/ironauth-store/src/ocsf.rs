@@ -347,6 +347,55 @@ pub fn ocsf_event(
     Some(event)
 }
 
+/// Build the OCSF event for a STORED audit row, from its wire strings.
+///
+/// The typed [`ocsf_event`] is for a record being written, where the caller holds an
+/// [`Action`] and an [`ActorRef`]. A reader of `audit_log` holds neither: it has the
+/// strings that were persisted, and re-parsing them back into typed values would make a
+/// row a NEWER build wrote unreadable by an older one rather than merely unclassifiable.
+///
+/// Returns [`None`] when the action classifies as nothing, which is exactly that
+/// rolled-back-binary case. Skipping such a row is the only safe answer: shipping it under
+/// a guessed class files it under the wrong dashboard in someone's SIEM.
+///
+/// The two builders must not drift, so a test asserts they agree field for field on a
+/// record expressible both ways.
+#[must_use]
+pub fn ocsf_event_from_wire(
+    action_wire: &str,
+    actor_kind: &str,
+    actor_id: &str,
+    tenant_id: &str,
+    environment_id: &str,
+    occurred_at_unix_ms: i64,
+    target: Option<&str>,
+) -> Option<Value> {
+    let class = class_for_wire(action_wire)?;
+    let mut event = json!({
+        "class_uid": class.uid(),
+        "class_name": class.name(),
+        "category_uid": 3,
+        "category_name": "Identity & Access Management",
+        "activity_name": action_wire,
+        "time": occurred_at_unix_ms,
+        "actor": {"user": {"uid": actor_id, "type": actor_kind}},
+        "metadata": {
+            "product": {"name": "IronAuth", "vendor_name": "IronAuth"},
+            "version": "1.1.0",
+        },
+        "cloud": {
+            "provider": "ironauth",
+            "account": {"uid": tenant_id},
+            "org": {"uid": environment_id},
+        },
+        "stream": class.stream().as_str(),
+    });
+    if let Some(target) = target {
+        event["resources"] = json!([{"uid": target}]);
+    }
+    Some(event)
+}
+
 /// One link of a per-stream hash chain.
 ///
 /// `previous` is the previous record's digest, or the empty string for the first record. The
@@ -777,6 +826,42 @@ mod tests {
         assert!(
             uids.iter().all(|u| (3001..=3005).contains(u)),
             "every class must be an OCSF IAM class: {uids:?}"
+        );
+    }
+
+    /// The typed and wire event builders must not drift.
+    ///
+    /// Two builders for one shape is a duplication that rots silently: a field added to
+    /// one is simply absent from the other's output, and the consumer that notices is a
+    /// customer's SIEM. They are compared field for field on a record expressible both
+    /// ways.
+    #[test]
+    fn the_typed_and_wire_event_builders_agree() {
+        let env = Env::system();
+        let actor = ActorRef::Service(ServiceId::generate(&env));
+        let typed = ocsf_event(
+            Action::ClientCreate,
+            actor,
+            "ten_1",
+            "env_1",
+            1_700_000_000_000,
+            Some("cli_1"),
+        )
+        .expect("client.create classifies");
+        let from_wire = ocsf_event_from_wire(
+            Action::ClientCreate.as_str(),
+            actor.kind_str(),
+            &actor.id_string(),
+            "ten_1",
+            "env_1",
+            1_700_000_000_000,
+            Some("cli_1"),
+        )
+        .expect("client.create classifies");
+        assert_eq!(
+            typed, from_wire,
+            "the two builders must produce identical events, or a reader and a writer \
+             describe the same audit row differently"
         );
     }
 
