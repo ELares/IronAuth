@@ -93,7 +93,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "tls-rustls-ring-native-roots",
     "postgres",
 ] }
-base64 = "0.22"
+base64 = "0.23"
 # The vetted allowlist HTML sanitizer (crates/ironauth-oidc, issue #86): the security
 # core of safe branding rich text. Built on html5ever, it parses to a DOM and reserializes
 # ONLY an explicit allowlist of tags and attributes, so the Casdoor class of stored XSS is
