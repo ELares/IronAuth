@@ -1415,3 +1415,85 @@ async fn an_endpoint_receives_only_the_event_types_it_subscribed_to() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+/// An event whose type is not in the catalog never reaches an endpoint (issue #108).
+///
+/// The fan-out is the ONE choke point every event passes through on the way out, so the
+/// check lives there rather than at each producer: a check per producer is a check the next
+/// producer forgets, and the cost of forgetting is an event on the wire no consumer can
+/// parse.
+///
+/// The refusal is PERMANENT rather than retryable, and that is the half worth asserting. No
+/// number of retries turns an unregistered type into a registered one; retrying would burn
+/// the budget and land the same event in every endpoint's dead letters.
+#[tokio::test]
+async fn an_event_outside_the_catalog_is_refused_permanently_and_reaches_no_endpoint() {
+    use ironauth_admin::events::WebhookFanoutConsumer;
+    use ironauth_store::{NewOutboxMessage, WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_EVENT_CONSUMER};
+    use std::time::Duration;
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "cat-tenant").await;
+    let (_endpoint, _secret, _base) = register(&h, &tenant, &environment).await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let store = h.store().clone();
+
+    // An envelope of the right SHAPE carrying a type nothing registers. Shape-valid on
+    // purpose: a malformed envelope is already refused for a different reason, and this
+    // must fail on REGISTRATION rather than on parsing.
+    let envelope = serde_json::json!({
+        "id": "evt_uncatalogued",
+        "type": "user.invented_by_nobody",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1_700_000_000_000_i64,
+        "tenant_id": tenant,
+        "environment_id": environment,
+        "payload": {"user_id": "usr_1"}
+    });
+    store
+        .scoped(scope)
+        .outbox()
+        .enqueue(
+            &env,
+            &NewOutboxMessage {
+                consumer: WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: "evt_uncatalogued",
+                ordering_key: "usr_1",
+                payload: envelope,
+            },
+        )
+        .await
+        .expect("enqueue the uncatalogued event");
+
+    let events = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_EVENT_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim the event");
+    assert_eq!(events.len(), 1, "the event was enqueued");
+
+    let error = WebhookFanoutConsumer::new(store.clone())
+        .handle(&env, scope, &events[0])
+        .await
+        .expect_err("an uncatalogued event must be refused");
+    assert!(
+        !error.is_retryable(),
+        "the refusal must be PERMANENT: retrying cannot register a type, and it would burn \
+         the retry budget and dead-letter the same event at every endpoint"
+    );
+
+    let deliveries = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim deliveries");
+    assert!(
+        deliveries.is_empty(),
+        "an uncatalogued event created {} delivery attempt(s); nothing may be queued for an \
+         event no consumer could parse",
+        deliveries.len()
+    );
+}
