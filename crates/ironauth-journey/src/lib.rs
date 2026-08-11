@@ -38,6 +38,7 @@ mod compile;
 mod eval;
 pub mod replay;
 mod schema;
+mod shipped;
 mod subflow;
 mod template;
 mod validate;
@@ -54,6 +55,9 @@ pub use eval::{
     typecheck_predicate,
 };
 pub use schema::journey_object_schema;
+pub use shipped::{
+    Resolution, SHIPPED, ShippedJourney, resolve, shipped_journey, shipped_journeys,
+};
 pub use subflow::{
     BUILTIN_MFA_STEP_UP, MAX_COMPOSED_STEPS, builtin_subflows, compose, compose_builtin,
 };
