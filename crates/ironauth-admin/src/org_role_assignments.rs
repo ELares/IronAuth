@@ -287,6 +287,8 @@ pub async fn assign_org_group_role(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_group_roles(scope)
         .assign(
             state.env(),
@@ -444,6 +446,8 @@ pub async fn unassign_org_group_role(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_group_roles(scope)
         .unassign(state.env(), &org_id, &assignment.id)
         .await?;
@@ -542,6 +546,8 @@ pub async fn assign_org_membership_role(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_membership_roles(scope)
         .assign(
             state.env(),
@@ -696,6 +702,8 @@ pub async fn unassign_org_membership_role(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_membership_roles(scope)
         .unassign(state.env(), &org_id, &assignment.id)
         .await?;

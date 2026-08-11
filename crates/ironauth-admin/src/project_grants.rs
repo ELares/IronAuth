@@ -187,6 +187,8 @@ pub async fn create_project_grant(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .project_grants(scope)
         .create(
             state.env(),

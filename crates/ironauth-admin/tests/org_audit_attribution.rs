@@ -34,27 +34,42 @@ use std::collections::BTreeSet;
 /// #706 shipped the column and the seam; this list is where adoption becomes visible.
 const ORG_ATTRIBUTED: &[&str] = &[
     "addOrgGroupMember",
+    "assignOrgGroupRole",
+    "assignOrgMembershipRole",
+    "assignOrgRolePermission",
     "clearOrgDefaultRole",
     "createMembership",
     "createOrgGroup",
     "createOrgRole",
+    "createOrganizationApiKey",
+    "createProjectGrant",
     "deleteMembership",
     "deleteOrgGroup",
     "deleteOrgRole",
     "removeOrgGroupMember",
+    "revokeOrganizationApiKey",
+    "rotateOrganizationApiKey",
     "setOrgDefaultRole",
     "setOrgGroupParent",
+    "unassignOrgGroupRole",
+    "unassignOrgMembershipRole",
+    "unassignOrgRolePermission",
     "updateOrgGroup",
     "updateOrgRole",
 ];
 
-/// How many organization-scoped operations do NOT yet attribute their audit rows.
+/// How many organization-scoped WRITE operations do not yet attribute their audit rows.
 ///
-/// This may only FALL. It was 40 when #706 landed the seam with no adopters, and is now
-/// 27: the organization role, group, group-member and membership surfaces adopted it.
-/// Lower it in the same change that adopts the seam; the test below fails if you adopt
-/// without lowering, so the number cannot go stale.
-const UNATTRIBUTED_CEILING: usize = 27;
+/// This may only FALL. It counts writes only: a read produces no audit row, so it has
+/// nothing to attribute, and an earlier version of this counter included reads, which put
+/// a floor under the number and made zero unreachable.
+///
+/// 4 of 27 remain, all of them operations acting ON an organization rather than within it
+/// (delete, disable, enable, and the project-grant withdrawal). Those resolve their target
+/// differently, because an organization being disabled or deleted is by definition not one
+/// `resolve_live_org` will return, so they need their own handling rather than the same
+/// one-line adoption.
+const UNATTRIBUTED_CEILING: usize = 4;
 
 /// Where each attributed operation's handler lives, so the claim can be CHECKED.
 ///
@@ -64,6 +79,18 @@ const UNATTRIBUTED_CEILING: usize = 27;
 /// granularity `ADMIN_SOURCES` uses elsewhere in this crate, and it is honest about what
 /// it catches, which is a list padded with a module that never adopted the seam at all.
 const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
+    (
+        "createOrganizationApiKey",
+        include_str!("../src/api_keys.rs"),
+    ),
+    (
+        "revokeOrganizationApiKey",
+        include_str!("../src/api_keys.rs"),
+    ),
+    (
+        "rotateOrganizationApiKey",
+        include_str!("../src/api_keys.rs"),
+    ),
     ("createMembership", include_str!("../src/memberships.rs")),
     ("deleteMembership", include_str!("../src/memberships.rs")),
     (
@@ -78,11 +105,39 @@ const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
     ("deleteOrgGroup", include_str!("../src/org_groups.rs")),
     ("setOrgGroupParent", include_str!("../src/org_groups.rs")),
     ("updateOrgGroup", include_str!("../src/org_groups.rs")),
+    (
+        "assignOrgGroupRole",
+        include_str!("../src/org_role_assignments.rs"),
+    ),
+    (
+        "assignOrgMembershipRole",
+        include_str!("../src/org_role_assignments.rs"),
+    ),
+    (
+        "unassignOrgGroupRole",
+        include_str!("../src/org_role_assignments.rs"),
+    ),
+    (
+        "unassignOrgMembershipRole",
+        include_str!("../src/org_role_assignments.rs"),
+    ),
+    (
+        "assignOrgRolePermission",
+        include_str!("../src/org_role_permissions.rs"),
+    ),
+    (
+        "unassignOrgRolePermission",
+        include_str!("../src/org_role_permissions.rs"),
+    ),
     ("clearOrgDefaultRole", include_str!("../src/org_roles.rs")),
     ("createOrgRole", include_str!("../src/org_roles.rs")),
     ("deleteOrgRole", include_str!("../src/org_roles.rs")),
     ("setOrgDefaultRole", include_str!("../src/org_roles.rs")),
     ("updateOrgRole", include_str!("../src/org_roles.rs")),
+    (
+        "createProjectGrant",
+        include_str!("../src/project_grants.rs"),
+    ),
 ];
 
 /// Every operation whose documented path is scoped to an organization.
@@ -97,7 +152,14 @@ fn org_scoped_operations() -> BTreeSet<String> {
             continue;
         }
         let operations = item.as_object().expect("a path item is an object");
-        for operation in operations.values() {
+        for (method, operation) in operations {
+            // WRITES only. A read writes no audit row, so it has nothing to attribute and
+            // counting it inflates the gap with operations that can never close it. The
+            // first version of this counter included reads, which made a ceiling of zero
+            // unreachable and the number meaningless as a measure of progress.
+            if method.eq_ignore_ascii_case("get") {
+                continue;
+            }
             if let Some(id) = operation.get("operationId").and_then(|id| id.as_str()) {
                 found.insert(id.to_string());
             }
@@ -114,9 +176,9 @@ fn the_organization_attribution_gap_is_counted_and_may_only_fall() {
     // Anti-vacuity: a spec that failed to parse into anything, or a path filter that
     // matched nothing, would make every assertion below trivially true.
     assert!(
-        org_scoped.len() >= 30,
-        "found only {} organization-scoped operations, which means the scan is broken \
-         rather than the surface having shrunk that far",
+        org_scoped.len() >= 20,
+        "found only {} organization-scoped WRITE operations, which means the scan is \
+         broken rather than the surface having shrunk that far",
         org_scoped.len()
     );
 
