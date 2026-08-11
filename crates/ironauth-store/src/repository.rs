@@ -1340,6 +1340,19 @@ pub struct ActingStore<'a> {
 }
 
 impl<'a> ActingStore<'a> {
+    /// Attribute every audit row written through this store to `organization` (issue
+    /// #110).
+    ///
+    /// Call this ONLY where the caller has established that the mutation is that
+    /// organization's event. Per-organization SIEM streams select on the recorded value,
+    /// so a wrong attribution delivers the row to another customer's SIEM and the
+    /// delivery SUCCEEDS, which means nothing downstream reports it.
+    #[must_use]
+    pub fn in_organization(mut self, organization: crate::id::OrganizationId) -> Self {
+        self.acting = self.acting.in_organization(organization);
+        self
+    }
+
     /// The mutating organization-membership repository for this scope and actor.
     ///
     /// Exposed on the DATA plane because migration 0084 grants `ironauth_app`
@@ -36829,9 +36842,11 @@ async fn insert_audit_row<T: AuditTarget>(
     sqlx::query(
         "INSERT INTO audit_log \
          (id, tenant_id, environment_id, action, actor_kind, actor_id, \
-          target_kind, target_id, correlation_id, occurred_at, detail, stream) \
+          target_kind, target_id, correlation_id, occurred_at, detail, stream, \
+          organization_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, $11, $12)",
+                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, $11, $12, \
+                 $13)",
     )
     .bind(audit_id.to_string())
     .bind(spec.scope.tenant().to_string())
@@ -36845,6 +36860,9 @@ async fn insert_audit_row<T: AuditTarget>(
     .bind(occurred_micros)
     .bind(detail)
     .bind(class.stream().as_str())
+    // NULL where the caller established no organization, which is most mutations. See
+    // `ActingContext::in_organization`.
+    .bind(spec.acting.organization().map(|id| id.to_string()))
     .execute(&mut **tx)
     .await?;
     Ok(())

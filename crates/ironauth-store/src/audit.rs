@@ -1592,13 +1592,48 @@ impl fmt::Display for Action {
 pub struct ActingContext {
     actor: ActorRef,
     correlation: CorrelationId,
+    organization: Option<crate::id::OrganizationId>,
 }
 
 impl ActingContext {
     /// Bind an actor and a correlation id into an acting context.
+    ///
+    /// Carries NO organization. That is the honest default: most mutations belong to no
+    /// organization at all, and a context that guessed one would attribute a tenant-level
+    /// change to whichever organization happened to be in scope.
     #[must_use]
     pub fn new(actor: ActorRef, correlation: CorrelationId) -> Self {
-        Self { actor, correlation }
+        Self {
+            actor,
+            correlation,
+            organization: None,
+        }
+    }
+
+    /// Attribute every audit row written under this context to `organization`.
+    ///
+    /// Set ONLY where the caller has established that the mutation is that organization's
+    /// event (issue #110). Per-organization SIEM streams select on this, so attributing a
+    /// row to the wrong organization delivers it to the wrong customer's SIEM, and that
+    /// failure is silent: the delivery succeeds.
+    ///
+    /// The TYPED id, not a string: an `OrganizationId` embeds its (tenant, environment),
+    /// so an id from another scope cannot be attached here at all. A string would let a
+    /// caller attribute a row to an organization that does not exist in this environment,
+    /// and the resulting stream would deliver it to whoever owns that id elsewhere.
+    #[must_use]
+    pub fn in_organization(mut self, organization: crate::id::OrganizationId) -> Self {
+        self.organization = Some(organization);
+        self
+    }
+
+    /// The organization this action belongs to, if it belongs to one.
+    ///
+    /// [`None`] means "not an organization's event", which is a FACT rather than missing
+    /// data: a per-org stream must not match it.
+    #[must_use]
+    pub fn organization(&self) -> Option<crate::id::OrganizationId> {
+        self.organization
     }
 
     /// The acting principal.
