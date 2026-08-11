@@ -1156,7 +1156,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bcrypt",
  "bytes",
  "http",
@@ -1264,7 +1264,7 @@ version = "0.2.0"
 dependencies = [
  "aes",
  "argon2",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bcrypt",
  "cipher 0.4.4",
  "ctr",
@@ -1283,7 +1283,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "argon2",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bcrypt",
  "ctr",
  "ironauth-env",
@@ -1306,7 +1306,7 @@ name = "ironauth-importers"
 version = "0.1.0"
 dependencies = [
  "argon2",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bcrypt",
  "ironauth-env",
  "ironauth-import",
@@ -1323,7 +1323,7 @@ dependencies = [
 name = "ironauth-jose"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.0",
  "ironauth-env",
  "p256",
  "ring",
@@ -1359,7 +1359,7 @@ dependencies = [
  "ammonia",
  "argon2",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "ciborium",
  "http",
  "http-body-util",
@@ -1436,7 +1436,7 @@ name = "ironauth-store"
 version = "0.1.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "caseless",
  "ironauth-env",
  "ironauth-fetch",
@@ -1457,7 +1457,7 @@ dependencies = [
 name = "ironauth-webauthn"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.0",
  "ciborium",
  "ironauth-jose",
  "serde",
