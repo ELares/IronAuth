@@ -42,6 +42,15 @@ pub fn sha256_hex(payload: &[u8]) -> String {
     hex(&hasher.finalize())
 }
 
+/// HMAC-SHA256 of `data` under `key`, lowercase hex.
+///
+/// Shared with the signed log stream (issue #110) so there is one HMAC in this crate and
+/// one place its correctness is pinned against RFC 4231.
+#[must_use]
+pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    hex(&hmac(key, data))
+}
+
 /// HMAC-SHA256.
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac =
