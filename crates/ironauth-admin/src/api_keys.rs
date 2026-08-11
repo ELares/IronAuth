@@ -244,6 +244,8 @@ pub async fn create_organization_api_key(
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .api_keys()
         .create(
             state.env(),
@@ -344,6 +346,8 @@ pub async fn revoke_organization_api_key(
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .api_keys()
         .revoke(state.env(), &id, state.now_unix_micros())
         .await;
@@ -458,6 +462,8 @@ pub async fn rotate_organization_api_key(
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .api_keys()
         .rotate(
             state.env(),

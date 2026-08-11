@@ -439,6 +439,8 @@ pub async fn assign_org_role_permission(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_role_permissions(scope)
         .assign(
             state.env(),
@@ -613,6 +615,8 @@ pub async fn unassign_org_role_permission(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_role_permissions(scope)
         .unassign(state.env(), &org_id, &mapping.id)
         .await?;
