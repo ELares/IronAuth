@@ -56,6 +56,11 @@ scripts/admin-spa-route-audit.sh
 echo "==> reference app bindings freshness (generated from the published contract)"
 scripts/reference-app-bindings.sh
 
+echo "==> terraform provider coverage (generated from the OpenAPI document)"
+# Issue #51 criterion 6. A pure python lane over the committed spec, so it needs neither Go
+# nor tofu and runs everywhere.
+scripts/provider-coverage.sh
+
 echo "==> SDK check() middleware (issue #100, criterion 6)"
 # The uniform authorization `check()`: one call resolving via token claims, via IronAuth's
 # AuthZEN PDP, or via a customer PDP, by configuration. It is a fail-CLOSED authorization
