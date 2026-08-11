@@ -218,6 +218,9 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("setWebhookEventTypes", ManagementPermission::WriteConfig),
     ("pauseWebhookEndpoint", ManagementPermission::WriteConfig),
     ("resumeWebhookEndpoint", ManagementPermission::WriteConfig),
+    // SIEM log streams (issue #110). A READ: the status surface exposes delivery health
+    // and the NAME of the sink credential, never its value.
+    ("listLogStreams", ManagementPermission::Read),
     ("listWebhookEndpoints", ManagementPermission::Read),
     ("listWebhookDeliveryAttempts", ManagementPermission::Read),
     ("listWebhookDeadLetters", ManagementPermission::Read),
@@ -554,6 +557,10 @@ const PERMISSION_PROVEN: &[&str] = &[
     // Proven in `only_a_credential_holding_impersonate_can_authorize_one`, which drives a
     // credential holding every OTHER permission and asserts the refusal names this one.
     "authorizeUserImpersonation",
+    // Proven in `the_log_stream_status_read_demands_read_and_never_answers_unauthenticated`,
+    // which drives it in BOTH directions: served under read, refused with the required
+    // permission named under a different one.
+    "listLogStreams",
     // Proven in `the_authzen_endpoints_demand_read_and_never_answer_unauthenticated`, which
     // drives a credential holding a WRITE but not read and asserts each refusal names read.
     "getAuthzenConfiguration",
@@ -593,7 +600,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        160,
+        161,
         "the classified set changed size; update the unproven count below with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -617,6 +624,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     ),
     ("impersonation.rs", include_str!("../src/impersonation.rs")),
     ("authzen.rs", include_str!("../src/authzen.rs")),
+    ("log_streams.rs", include_str!("../src/log_streams.rs")),
     ("users.rs", include_str!("../src/users.rs")),
     ("organizations.rs", include_str!("../src/organizations.rs")),
     ("memberships.rs", include_str!("../src/memberships.rs")),

@@ -7699,6 +7699,82 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams": {
+      "get": {
+        "tags": [
+          "log-streams"
+        ],
+        "summary": "List the environment's SIEM log streams and their delivery health.",
+        "operationId": "listLogStreams",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The environment's log streams and their health",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogStreamList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
       "get": {
         "tags": [
@@ -24744,6 +24820,113 @@
           "locale": {
             "type": "string",
             "description": "The BCP47 language tag (the per-environment natural key)."
+          }
+        }
+      },
+      "LogStreamList": {
+        "type": "object",
+        "description": "The environment's configured streams.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogStreamView"
+            },
+            "description": "The streams, ordered by identifier."
+          }
+        }
+      },
+      "LogStreamView": {
+        "type": "object",
+        "description": "One configured stream, as an operator reads it.",
+        "required": [
+          "id",
+          "description",
+          "source",
+          "sink_type",
+          "active",
+          "status",
+          "consecutive_failures"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Whether the shipper picks this stream up."
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive delivery failures with no success in between."
+          },
+          "credential_secret_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The NAME of the environment secret holding the sink credential, never its value."
+          },
+          "cursor_audit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The audit row this stream has shipped up to, or absent if it has shipped nothing.\n\nThis is the LAG answer in the only form that is honest without a second query: an\noperator comparing it to the newest audit row sees how far behind the stream is."
+          },
+          "description": {
+            "type": "string",
+            "description": "The operator's label."
+          },
+          "event_type_filter": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The action wire strings this ships, or absent for every action in `source`.\n\nAn EMPTY list is not the same as absent: it ships nothing, which is how a stream is\nparked without losing its cursor. The two must stay distinguishable here or an\noperator cannot tell a parked stream from a firehose."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `lgs_` identifier."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last failure, operator-safe. Never a sink's response body."
+          },
+          "last_error_at_unix_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When a delivery last failed, epoch microseconds."
+          },
+          "last_success_at_unix_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When a delivery last succeeded, epoch microseconds."
+          },
+          "sink_type": {
+            "type": "string",
+            "description": "Where it ships to: `http`, `s3`, `datadog`, or `splunk_hec`."
+          },
+          "source": {
+            "type": "string",
+            "description": "Which audit stream(s) this ships: `admin_action`, `authentication`, or `both`."
+          },
+          "status": {
+            "type": "string",
+            "description": "`healthy`, `degraded`, or `failing`, from the consecutive-failure run."
           }
         }
       },
