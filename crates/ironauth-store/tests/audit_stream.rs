@@ -177,3 +177,67 @@ async fn the_stream_column_refuses_a_value_that_is_neither_stream() {
             .unwrap_or_else(|error| panic!("`{}` must be accepted: {error}", stream.as_str()));
     }
 }
+
+/// The organization dimension (issue #110) records what the acting context established,
+/// and NULL otherwise.
+///
+/// NULL is a fact, not missing data: it means "not an organization's event". A per-org
+/// stream matching NULL rows would deliver a tenant-level configuration change to every
+/// organization's SIEM, which is the leak the column exists to prevent.
+#[tokio::test]
+async fn an_audit_row_records_the_acting_organization_and_null_when_there_is_none() {
+    use ironauth_store::OrganizationId;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = OrganizationId::generate(&env, &scope);
+
+    // Attributed.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .in_organization(organization)
+        .clients()
+        .create(&env, "org-attributed")
+        .await
+        .expect("create a client in an organization");
+    // Unattributed: the ordinary path, which must stay NULL.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "not-attributed")
+        .await
+        .expect("create a client with no organization");
+
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query("SELECT target_id, organization_id FROM audit_log ORDER BY occurred_at, id")
+            .fetch_all(db.owner_pool())
+            .await
+            .expect("read audit rows")
+            .into_iter()
+            .map(|row| (row.get("target_id"), row.get("organization_id")))
+            .collect();
+
+    let attributed: Vec<&Option<String>> = rows
+        .iter()
+        .filter(|(_, org)| org.is_some())
+        .map(|(_, org)| org)
+        .collect();
+    assert_eq!(
+        attributed.len(),
+        1,
+        "exactly the attributed write carries an organization: {rows:?}"
+    );
+    assert_eq!(
+        attributed[0].as_deref(),
+        Some(organization.to_string().as_str()),
+        "and it carries the one the acting context established"
+    );
+    assert!(
+        rows.iter().any(|(_, org)| org.is_none()),
+        "the unattributed write must stay NULL rather than inheriting the other's org: \
+         {rows:?}"
+    );
+}
