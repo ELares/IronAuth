@@ -148,6 +148,8 @@ pub async fn create_membership(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_memberships(scope)
         .create(
             state.env(),
@@ -296,6 +298,8 @@ pub async fn delete_membership(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_memberships(scope)
         .remove(state.env(), &id)
         .await?;

@@ -309,6 +309,8 @@ pub async fn create_org_group(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_groups(scope)
         .create(
             state.env(),
@@ -515,6 +517,8 @@ pub async fn update_org_group(
             .store()
             .management()
             .acting(actor, CorrelationId::generate(state.env()))
+            // Attribute the audit row to this organization (issue #110).
+            .in_organization(org_id)
             .org_groups(scope)
             .update(
                 state.env(),
@@ -600,6 +604,8 @@ pub async fn set_org_group_parent(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_groups(scope)
         .reparent(
             state.env(),
@@ -668,6 +674,8 @@ pub async fn delete_org_group(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_groups(scope)
         .delete(state.env(), &org_id, &id)
         .await?;
