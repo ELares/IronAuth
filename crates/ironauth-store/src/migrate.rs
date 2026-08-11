@@ -1124,6 +1124,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0138_audit_organization.sql"),
         },
+        Migration {
+            version: 139,
+            name: "log_stream_organization",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0139_log_stream_organization.sql"),
+        },
     ]
 }
 

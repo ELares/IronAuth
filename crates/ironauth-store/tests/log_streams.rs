@@ -24,6 +24,7 @@ fn new_stream() -> NewLogStream<'static> {
         sink_config: serde_json::json!({ "endpoint": "https://collector.example/ingest" }),
         credential_secret_name: Some("collector_token"),
         event_type_filter: None,
+        organization_id: None,
     }
 }
 
@@ -192,5 +193,59 @@ async fn the_data_plane_cannot_create_a_stream() {
     assert!(
         error.contains("permission denied"),
         "the refusal must come from the GRANT, not from a broken query: {error}"
+    );
+}
+
+/// A per-organization stream round-trips its organization, and an environment-wide one
+/// stays absent.
+///
+/// The two must stay distinguishable in storage: absent means the whole environment, and a
+/// per-org stream read back as environment-wide would start shipping every organization's
+/// events to one customer's SIEM.
+#[tokio::test]
+async fn a_per_organization_stream_round_trips_its_organization() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = ironauth_store::OrganizationId::generate(&env, &scope).to_string();
+
+    let mut scoped_stream = new_stream();
+    scoped_stream.organization_id = Some(&organization);
+    db.control_store()
+        .scoped(scope)
+        .log_streams()
+        .create(&env, &scoped_stream)
+        .await
+        .expect("configure a per-organization stream");
+    db.control_store()
+        .scoped(scope)
+        .log_streams()
+        .create(&env, &new_stream())
+        .await
+        .expect("configure an environment-wide stream");
+
+    let streams = db
+        .store()
+        .scoped(scope)
+        .log_streams()
+        .list_active()
+        .await
+        .expect("list");
+    assert_eq!(streams.len(), 2);
+    let scoped: Vec<&String> = streams
+        .iter()
+        .filter_map(|stream| stream.organization_id.as_ref())
+        .collect();
+    assert_eq!(
+        scoped,
+        vec![&organization],
+        "exactly one stream is organization-scoped, and it names the right one"
+    );
+    assert!(
+        streams
+            .iter()
+            .any(|stream| stream.organization_id.is_none()),
+        "the environment-wide stream must stay unscoped rather than inheriting the other's \
+         organization"
     );
 }

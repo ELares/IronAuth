@@ -24916,6 +24916,13 @@
             "format": "int64",
             "description": "When a delivery last succeeded, epoch microseconds."
           },
+          "organization_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The organization this stream is scoped to, or absent for the whole environment."
+          },
           "sink_type": {
             "type": "string",
             "description": "Where it ships to: `http`, `s3`, `datadog`, or `splunk_hec`."
