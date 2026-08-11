@@ -56,6 +56,26 @@ scripts/admin-spa-route-audit.sh
 echo "==> reference app bindings freshness (generated from the published contract)"
 scripts/reference-app-bindings.sh
 
+echo "==> SDK check() middleware (issue #100, criterion 6)"
+# The uniform authorization `check()`: one call resolving via token claims, via IronAuth's
+# AuthZEN PDP, or via a customer PDP, by configuration. It is a fail-CLOSED authorization
+# primitive, so its tests are the kind worth running on every gate.
+#
+# It lives in its OWN package rather than in the reference app because route-audit.sh
+# forbids that app from performing a network call outside `api.ts` or naming a URL outside
+# `endpoints.ts`, which is exactly what an SDK calling an operator-configured PDP does. The
+# lint caught that and was right; see packages/ironauth-sdk/README.md.
+#
+# Same precondition shape as the admin-SPA lane, and the same reason: the runner is the LOCAL
+# `tsc`, so testing for a global one would skip a check the tree can actually run. The skip
+# names the command that removes it.
+if [ -x packages/ironauth-sdk/node_modules/.bin/tsc ]; then
+    (cd packages/ironauth-sdk && npm test --silent)
+else
+    echo "sdk check(): SKIPPED, packages/ironauth-sdk dependencies are not installed."
+    echo "             Run: (cd packages/ironauth-sdk && npm install)  [CI runs this check]"
+fi
+
 echo "==> journey transcript replay"
 scripts/journey-replay.sh
 

@@ -372,6 +372,17 @@ jobs:
       - name: build (vite, content hashed external assets)
         working-directory: packages/admin-spa
         run: npm run build
+      - name: sdk install (locked, from package-lock.json)
+        working-directory: packages/ironauth-sdk
+        run: npm ci --no-audit --no-fund
+      - name: SDK check() middleware (issue #100, criterion 6)
+        # The uniform authorization `check()`: one call resolving via token claims, via
+        # IronAuth's AuthZEN PDP, or via a customer PDP, by configuration. It is a
+        # fail-CLOSED authorization primitive, so every failure shape has a test that
+        # requires a DENY. Runs in THIS job because it is the one with a Node toolchain;
+        # the reference-app bindings freshness check is a pure python lane and has none.
+        working-directory: packages/ironauth-sdk
+        run: npm test
       - name: embed freshness (committed embed vs a fresh vite build)
         # Rebuilds the console and fails if the committed embed under
         # crates/ironauth-admin-ui/embedded/ drifts, so a plain cargo build (no
