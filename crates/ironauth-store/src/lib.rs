@@ -70,6 +70,7 @@ pub mod identity_fact;
 pub mod impersonation;
 pub mod interchange;
 pub mod locale_bundle;
+pub mod log_stream;
 mod migrate;
 pub mod ocsf;
 pub mod org_policy;
@@ -312,8 +313,8 @@ pub use repository::{
     WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,
 };
 pub use repository::{
-    AuditChainRepo, ChainEntry, ChainFault, ChainVerified, ChainedAuditRow, PruneReport,
-    SealReport, verify_chain_entries,
+    AuditChainRepo, ChainEntry, ChainFault, ChainVerified, ChainedAuditRow, LogStreamRepo,
+    NewLogStream, PruneReport, SealReport, verify_chain_entries,
 };
 /// The testing-only atomicity probes (issue #247): the seams at which a test can force
 /// the joined invitation create and the joined recovery approve to fail INSIDE their one

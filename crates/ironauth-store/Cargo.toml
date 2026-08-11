@@ -342,6 +342,13 @@ name = "audit_chain"
 path = "tests/audit_chain.rs"
 required-features = ["testing"]
 
+# SIEM log stream configuration (issue #110): round-trip, health transitions, cursor
+# advance, and the data plane's inability to configure a stream. Needs a real database.
+[[test]]
+name = "log_streams"
+path = "tests/log_streams.rs"
+required-features = ["testing"]
+
 # Server-side config promotion (issue #44): diff/plan/apply over a real database.
 # The transactional apply (drift guard, idempotency, atomic rollback, audited),
 # plan fail-closed on a missing reference, per-target reference resolution, and
