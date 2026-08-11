@@ -54,9 +54,14 @@ pub trait LogSink: Send + Sync {
     fn sink_type(&self) -> SinkType;
 
     /// Ship `events` for `stream`, returning what the destination said.
+    ///
+    /// `credential` is the RESOLVED secret value the stream named, opened by the shipper.
+    /// Sinks never resolve it themselves: one resolution path means one place that can
+    /// leak it, and a sink that took a secret NAME would have to hold the master key.
     fn deliver<'a>(
         &'a self,
         stream: &'a LogStreamRecord,
+        credential: Option<&'a str>,
         events: &'a [Value],
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>>;
 }
@@ -206,7 +211,11 @@ async fn ship_stream(
         return Ok(0);
     }
 
-    match sink.deliver(stream, &events).await {
+    // Resolved ONCE, here, and handed to the sink as a value. A sink that took a name
+    // would need the master key, which would put the ability to open every environment
+    // secret behind every sink implementation including ones a deployment adds itself.
+    let credential = resolve_credential(store, scope, stream).await?;
+    match sink.deliver(stream, credential.as_deref(), &events).await {
         SinkOutcome::Accepted => {
             let accepted = u64::try_from(events.len()).unwrap_or(u64::MAX);
             scoped
@@ -226,6 +235,33 @@ async fn ship_stream(
     }
 }
 
+/// Open the secret a stream names, or [`None`] when it names none.
+///
+/// A stream that NAMES a credential and cannot open it is an ERROR, not an empty
+/// credential: delivering without it would present an unauthenticated batch to the sink,
+/// which either rejects it (noise) or accepts it (an audit trail arriving somewhere with
+/// no proof of who sent it).
+async fn resolve_credential(
+    store: &Store,
+    scope: Scope,
+    stream: &LogStreamRecord,
+) -> Result<Option<String>, ShipError> {
+    let Some(opened) = store
+        .scoped(scope)
+        .log_streams()
+        .open_credential(stream)
+        .await?
+    else {
+        return Ok(None);
+    };
+    // A credential that is not UTF-8 cannot go in a header, and guessing an encoding
+    // would send a mangled token that the sink rejects for reasons an operator cannot
+    // see from here.
+    String::from_utf8(opened)
+        .map(Some)
+        .map_err(|_| ShipError::CredentialNotText)
+}
+
 /// Why one stream could not be shipped.
 ///
 /// Every variant renders to an OPERATOR-SAFE reason, deliberately coarse: the reason is
@@ -237,6 +273,8 @@ enum ShipError {
     NoSink(&'static str),
     /// A persistence fault.
     Store(StoreError),
+    /// The named credential is not UTF-8, so it cannot be presented in a header.
+    CredentialNotText,
 }
 
 impl From<StoreError> for ShipError {
@@ -259,6 +297,8 @@ impl ShipError {
                 "a persistence fault interrupted the pass".to_string()
             }
             ShipError::Store(other) => format!("the pass could not run: {other}"),
+            // Says the SHAPE is wrong and nothing about the value.
+            ShipError::CredentialNotText => "the named credential is not valid UTF-8".to_string(),
         }
     }
 }
@@ -295,6 +335,7 @@ impl LogSink for HttpLogSink {
     fn deliver<'a>(
         &'a self,
         stream: &'a LogStreamRecord,
+        _credential: Option<&'a str>,
         events: &'a [Value],
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let fetcher = Arc::clone(&self.fetcher);
@@ -333,6 +374,216 @@ impl LogSink for HttpLogSink {
                 }
                 Err(_) => SinkOutcome::Rejected("the sink could not be reached".to_string()),
             }
+        })
+    }
+}
+
+// ===========================================================================
+// The vendor adapters (issue #110).
+//
+// Both are HTTPS POSTs that differ in three ways only: the header the credential goes in,
+// the path appended to the configured endpoint, and the body shape. They therefore share
+// one POST helper rather than each restating the fetch, the status mapping and the
+// operator-safe error rendering, which is where three copies would drift.
+
+/// POST `body` to `url` with `headers`, mapping the outcome the same way for every sink.
+///
+/// Shared on purpose: a per-sink copy of this is three places for the status boundary to be
+/// written differently and three places for a response body to leak into a stored reason.
+async fn post_json(
+    fetcher: &ironauth_fetch::Fetcher,
+    url: String,
+    headers: Vec<(&'static str, String)>,
+    body: String,
+) -> SinkOutcome {
+    let mut request = ironauth_fetch::FetchRequest::new(
+        ironauth_fetch::FetchPurpose::LogStreamDelivery,
+        http::Method::POST,
+        url,
+    )
+    .header(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    )
+    .body(body);
+    for (name, value) in headers {
+        // A header value that will not encode means the batch cannot be presented
+        // correctly. Sending it WITHOUT the header would deliver the environment's audit
+        // trail unauthenticated, so refusing is the only safe answer.
+        let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) else {
+            return SinkOutcome::Rejected("a required header could not be encoded".to_string());
+        };
+        request = request.header(name, value);
+    }
+    match fetcher.fetch(request).await {
+        Ok(response) if response.status().is_success() => SinkOutcome::Accepted,
+        Ok(response) => {
+            SinkOutcome::Rejected(format!("sink answered {}", response.status().as_u16()))
+        }
+        Err(ironauth_fetch::FetchError::Blocked) => {
+            SinkOutcome::Rejected("the outbound policy refused the configured endpoint".to_string())
+        }
+        Err(ironauth_fetch::FetchError::Timeout) => {
+            SinkOutcome::Rejected("the sink timed out".to_string())
+        }
+        Err(_) => SinkOutcome::Rejected("the sink could not be reached".to_string()),
+    }
+}
+
+/// The endpoint a stream's `sink_config` names, if it names a usable one.
+fn configured_endpoint(stream: &LogStreamRecord) -> Option<&str> {
+    stream.sink_config.get("endpoint")?.as_str()
+}
+
+/// The Datadog intake body: a JSON ARRAY of envelopes carrying the OCSF event whole.
+///
+/// Pure so the shape is testable without a socket. The shape is the part that is easy to
+/// get wrong and impossible to notice: a malformed body is a 400 from a vendor, which
+/// looks exactly like a credential problem in the stored reason.
+#[must_use]
+pub fn datadog_body(events: &[Value]) -> String {
+    let payload: Vec<Value> = events
+        .iter()
+        .map(|event| {
+            json!({
+                "ddsource": "ironauth",
+                "service": "ironauth",
+                "message": event,
+            })
+        })
+        .collect();
+    serde_json::to_string(&payload).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// The Splunk HEC body: NEWLINE-DELIMITED event objects, NOT a JSON array.
+///
+/// HEC parses a concatenated stream of objects and REJECTS a JSON array. Sending an array
+/// is the natural mistake, it is what every other sink here wants, and it fails as an
+/// opaque 400.
+#[must_use]
+pub fn splunk_body(events: &[Value], index: Option<&str>) -> String {
+    events
+        .iter()
+        .map(|event| {
+            let mut envelope = json!({ "sourcetype": "ironauth:ocsf", "event": event });
+            if let (Some(index), Some(object)) = (index, envelope.as_object_mut()) {
+                object.insert("index".to_string(), json!(index));
+            }
+            serde_json::to_string(&envelope).unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The Datadog logs intake adapter.
+///
+/// Datadog authenticates with the API key in `DD-API-KEY` and takes a JSON array of log
+/// objects. The OCSF event is carried whole under `message`, and the envelope around it
+/// gives Datadog the `ddsource` and `service` it indexes on.
+pub struct DatadogSink {
+    fetcher: Arc<ironauth_fetch::Fetcher>,
+}
+
+impl DatadogSink {
+    /// Ship through `fetcher`.
+    #[must_use]
+    pub fn new(fetcher: Arc<ironauth_fetch::Fetcher>) -> Self {
+        Self { fetcher }
+    }
+}
+
+impl LogSink for DatadogSink {
+    fn sink_type(&self) -> SinkType {
+        SinkType::Datadog
+    }
+
+    fn deliver<'a>(
+        &'a self,
+        stream: &'a LogStreamRecord,
+        credential: Option<&'a str>,
+        events: &'a [Value],
+    ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
+        let fetcher = Arc::clone(&self.fetcher);
+        let endpoint = configured_endpoint(stream).map(str::to_owned);
+        let credential = credential.map(str::to_owned);
+        let body = datadog_body(events);
+        Box::pin(async move {
+            let Some(endpoint) = endpoint else {
+                return SinkOutcome::Rejected(
+                    "sink_config carries no `endpoint` string".to_string(),
+                );
+            };
+            let Some(credential) = credential else {
+                // Datadog rejects an unauthenticated intake, so sending anyway would burn
+                // a retry budget on a request that cannot succeed.
+                return SinkOutcome::Rejected(
+                    "the datadog sink needs an API key; set credential_secret_name".to_string(),
+                );
+            };
+            post_json(&fetcher, endpoint, vec![("dd-api-key", credential)], body).await
+        })
+    }
+}
+
+/// The Splunk HTTP Event Collector adapter.
+///
+/// HEC authenticates with `Authorization: Splunk <token>` and takes NEWLINE-DELIMITED
+/// event objects rather than a JSON array. That is not a stylistic difference: HEC parses
+/// a concatenated stream of objects, and sending it a JSON array is rejected.
+pub struct SplunkHecSink {
+    fetcher: Arc<ironauth_fetch::Fetcher>,
+}
+
+impl SplunkHecSink {
+    /// Ship through `fetcher`.
+    #[must_use]
+    pub fn new(fetcher: Arc<ironauth_fetch::Fetcher>) -> Self {
+        Self { fetcher }
+    }
+}
+
+impl LogSink for SplunkHecSink {
+    fn sink_type(&self) -> SinkType {
+        SinkType::SplunkHec
+    }
+
+    fn deliver<'a>(
+        &'a self,
+        stream: &'a LogStreamRecord,
+        credential: Option<&'a str>,
+        events: &'a [Value],
+    ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
+        let fetcher = Arc::clone(&self.fetcher);
+        let endpoint = configured_endpoint(stream).map(str::to_owned);
+        let credential = credential.map(str::to_owned);
+        // An optional index, which HEC takes per event rather than per request.
+        let index = stream
+            .sink_config
+            .get("index")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let body = splunk_body(events, index.as_deref());
+        Box::pin(async move {
+            let Some(endpoint) = endpoint else {
+                return SinkOutcome::Rejected(
+                    "sink_config carries no `endpoint` string".to_string(),
+                );
+            };
+            let Some(credential) = credential else {
+                return SinkOutcome::Rejected(
+                    "the splunk_hec sink needs a token; set credential_secret_name".to_string(),
+                );
+            };
+            post_json(
+                &fetcher,
+                endpoint,
+                vec![("authorization", format!("Splunk {credential}"))],
+                body,
+            )
+            .await
         })
     }
 }
