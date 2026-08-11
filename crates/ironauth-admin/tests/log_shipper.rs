@@ -93,6 +93,19 @@ async fn configure(
     sink_type: SinkType,
     filter: Option<Vec<String>>,
 ) -> String {
+    configure_for_org(db, env, scope, source, sink_type, filter, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn configure_for_org(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    source: StreamSource,
+    sink_type: SinkType,
+    filter: Option<Vec<String>>,
+    organization_id: Option<&str>,
+) -> String {
     db.control_store()
         .scoped(scope)
         .log_streams()
@@ -105,6 +118,7 @@ async fn configure(
                 sink_config: serde_json::json!({ "endpoint": "https://sink.example/in" }),
                 credential_secret_name: None,
                 event_type_filter: filter,
+                organization_id,
             },
         )
         .await
@@ -386,5 +400,82 @@ async fn a_stream_with_no_sink_implementation_records_why() {
             .is_some_and(|error| error.contains("s3")),
         "a stream that can never ship must name the reason: {:?}",
         recorded.last_error
+    );
+}
+
+/// A per-organization stream delivers ONLY that organization's events.
+///
+/// The adversarial half is what makes this worth writing: a second organization's events
+/// and an unattributed environment-level event are both present, and neither may appear.
+/// Cross-org leakage here does not fail anywhere: the delivery SUCCEEDS, and the operator
+/// who finds out is the one receiving another customer's audit trail.
+#[tokio::test]
+async fn a_per_organization_stream_never_ships_another_organizations_events() {
+    use ironauth_store::OrganizationId;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let ours = OrganizationId::generate(&env, &scope);
+    let theirs = OrganizationId::generate(&env, &scope);
+
+    let id = configure_for_org(
+        &db,
+        &env,
+        scope,
+        StreamSource::Both,
+        SinkType::Http,
+        None,
+        Some(&ours.to_string()),
+    )
+    .await;
+
+    // Ours, theirs, and one belonging to NO organization.
+    for (label, org) in [
+        ("ours", Some(ours)),
+        ("theirs", Some(theirs)),
+        ("neither", None),
+    ] {
+        let acting = db
+            .store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env));
+        let acting = match org {
+            Some(org) => acting.in_organization(org),
+            None => acting,
+        };
+        acting
+            .clients()
+            .create(&env, &format!("client-{label}"))
+            .await
+            .expect("create a client");
+    }
+
+    let sink = RecordingSink::new(SinkType::Http, true);
+    let sinks: Vec<Arc<dyn LogSink>> = vec![sink.clone()];
+    ship_once(db.store(), &env, scope, &sinks)
+        .await
+        .expect("ship");
+
+    let events = sink.events();
+    assert!(!events.is_empty(), "our organization's event must ship");
+    for event in &events {
+        let target = event["resources"][0]["uid"].as_str().unwrap_or_default();
+        assert!(
+            !target.is_empty(),
+            "every shipped event names its target: {event:?}"
+        );
+    }
+    // The decisive assertion: exactly one audit row was ours, so exactly one ships.
+    assert_eq!(
+        events.len(),
+        1,
+        "a per-organization stream shipped {} events when only ONE belonged to it. The \
+         other organization's event and the unattributed one must never appear: {events:?}",
+        events.len()
+    );
+    assert_eq!(
+        health(db.store(), scope, &id).await.status(),
+        ironauth_store::log_stream::StreamStatus::Healthy
     );
 }

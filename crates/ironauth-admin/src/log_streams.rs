@@ -49,6 +49,8 @@ pub struct LogStreamView {
     /// parked without losing its cursor. The two must stay distinguishable here or an
     /// operator cannot tell a parked stream from a firehose.
     pub event_type_filter: Option<Vec<String>>,
+    /// The organization this stream is scoped to, or absent for the whole environment.
+    pub organization_id: Option<String>,
     /// Whether the shipper picks this stream up.
     pub active: bool,
     /// `healthy`, `degraded`, or `failing`, from the consecutive-failure run.
@@ -97,6 +99,7 @@ pub fn into_view(record: LogStreamRecord) -> LogStreamView {
         sink_type: record.sink_type.as_str().to_string(),
         credential_secret_name: record.credential_secret_name,
         event_type_filter: record.event_type_filter,
+        organization_id: record.organization_id,
         active: record.active,
         status: status_wire(record.health.status()).to_string(),
         consecutive_failures: record.health.consecutive_failures,
@@ -167,6 +170,7 @@ mod tests {
             sink_config: serde_json::json!({"endpoint": "https://sink.example/in"}),
             credential_secret_name: Some("collector_token".to_string()),
             event_type_filter: None,
+            organization_id: None,
             active: true,
             cursor: Some((1_700_000_000_000_000, "aud_7".to_string())),
             health: StreamHealth {

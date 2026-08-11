@@ -164,7 +164,20 @@ async fn ship_stream(
         if !stream.source.carries(audit_stream) {
             continue;
         }
-        candidates.extend(chain.rows_after(audit_stream, cursor, SHIP_BATCH).await?);
+        candidates.extend(
+            chain
+                .rows_after(
+                    audit_stream,
+                    cursor,
+                    SHIP_BATCH,
+                    // A per-organization stream filters in SQL rather than in the loop
+                    // below. Filtering here is what makes the isolation a property of the
+                    // QUERY: a row belonging to another organization is never read, so no
+                    // later mistake in this function can put it in a batch.
+                    stream.organization_id.as_deref(),
+                )
+                .await?,
+        );
     }
     // Reading two streams separately means the union is not ordered. It has to be, or
     // the cursor would advance past rows of the other stream that were never shipped.

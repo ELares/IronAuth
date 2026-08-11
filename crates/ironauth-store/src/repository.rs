@@ -36957,6 +36957,8 @@ pub struct NewLogStream<'a> {
     pub sink_config: serde_json::Value,
     /// The environment-scoped secret holding the sink credential, by NAME.
     pub credential_secret_name: Option<&'a str>,
+    /// Ship only this organization's events, or `None` for the whole environment.
+    pub organization_id: Option<&'a str>,
     /// Ship only these action wire strings. `None` is every action in `source`.
     pub event_type_filter: Option<Vec<String>>,
 }
@@ -36981,8 +36983,8 @@ impl LogStreamRepo<'_> {
         sqlx::query(
             "INSERT INTO log_streams \
              (id, tenant_id, environment_id, description, source, sink_type, \
-              sink_config, credential_secret_name, event_type_filter) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+              sink_config, credential_secret_name, event_type_filter, organization_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(&id)
         .bind(scope.tenant().to_string())
@@ -36993,6 +36995,7 @@ impl LogStreamRepo<'_> {
         .bind(&new.sink_config)
         .bind(new.credential_secret_name)
         .bind(new.event_type_filter.as_deref())
+        .bind(new.organization_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -37014,7 +37017,7 @@ impl LogStreamRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         let rows = sqlx::query(
             "SELECT id, description, source, sink_type, sink_config, \
-                    credential_secret_name, event_type_filter, active, \
+                    credential_secret_name, event_type_filter, active, organization_id, \
                     cursor_audit_id, last_error, consecutive_failures, \
                     (EXTRACT(EPOCH FROM cursor_occurred_at) * 1000000)::bigint \
                         AS cursor_micros, \
@@ -37051,6 +37054,7 @@ impl LogStreamRepo<'_> {
                 sink_config: row.get("sink_config"),
                 credential_secret_name: row.get("credential_secret_name"),
                 event_type_filter: row.get("event_type_filter"),
+                organization_id: row.get("organization_id"),
                 active: row.get("active"),
                 cursor: cursor_micros.zip(cursor_audit_id),
                 health: crate::log_stream::StreamHealth {
@@ -37534,6 +37538,7 @@ impl AuditChainRepo<'_> {
         stream: &str,
         cursor: Option<(i64, &str)>,
         limit: i64,
+        organization: Option<&str>,
     ) -> Result<Vec<ChainedAuditRow>, StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
@@ -37556,6 +37561,7 @@ impl AuditChainRepo<'_> {
                       ((TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval), \
                        $5::text) \
                ) \
+               AND ($7::text IS NULL OR organization_id = $7::text) \
              ORDER BY occurred_at, id LIMIT $6",
         )
         .bind(scope.tenant().to_string())
@@ -37564,6 +37570,10 @@ impl AuditChainRepo<'_> {
         .bind(cursor_micros)
         .bind(cursor_id)
         .bind(limit)
+        // Equality, so a row with a NULL organization never matches a per-org stream:
+        // `NULL = 'org_x'` is NULL, not true. A row that belongs to no organization is
+        // not this organization's event, and shipping it would be the cross-org leak.
+        .bind(organization)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;

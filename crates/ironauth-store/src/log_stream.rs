@@ -136,6 +136,12 @@ pub struct LogStreamRecord {
     /// Ship only these action wire strings. [`None`] is every action in `source`;
     /// `Some(empty)` is none of them.
     pub event_type_filter: Option<Vec<String>>,
+    /// Ship only this organization's events, or [`None`] for the whole environment.
+    ///
+    /// Matched by EQUALITY against the audit row's organization. A row with no
+    /// organization is not an organization's event, so a per-org stream never matches it,
+    /// which falls out of equality rather than needing a special case.
+    pub organization_id: Option<String>,
     /// Whether the shipper picks this stream up.
     pub active: bool,
     /// The cursor: everything at or before this `(occurred_micros, audit_id)` has
@@ -228,6 +234,7 @@ mod tests {
             sink_config: serde_json::json!({}),
             credential_secret_name: None,
             event_type_filter: None,
+            organization_id: None,
             active: true,
             cursor: None,
             health: StreamHealth::default(),

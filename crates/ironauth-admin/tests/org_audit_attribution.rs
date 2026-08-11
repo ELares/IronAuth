@@ -258,15 +258,27 @@ fn the_organization_attribution_gap_is_counted_and_may_only_fall() {
     );
 }
 
-/// Per-organization SIEM streams stay unavailable while the gap is total.
+/// Per-organization SIEM streams stay unavailable while NOTHING is attributed.
 ///
-/// This is the guard that matters. `log_streams` deliberately has no organization column
-/// yet (migration 0137 says why), and it must not gain one while every audit row is NULL:
-/// such a stream would match nothing, deliver nothing, and report healthy, and the operator
-/// would conclude their organization had no admin activity.
+/// This is the guard that enforced the ordering. `log_streams` could not gain an
+/// organization column while every audit row was NULL: such a stream would match nothing,
+/// deliver nothing, and report healthy, and the operator would conclude their organization
+/// had no admin activity.
+///
+/// The ordering held. 0138 added the dimension, the writes adopted it, and only then did
+/// 0139 add the column. The guard stays because the condition it protects is permanent: if
+/// attribution were ever removed wholesale, offering per-org streams would become a lie
+/// again.
 #[test]
 fn per_org_streams_are_not_offered_while_no_audit_row_is_attributed() {
-    let migration = include_str!("../../ironauth-store/migrations/0137_log_streams.sql");
+    // BOTH migrations, because the column can arrive in either. Checking only the table's
+    // CREATE would pass vacuously the moment a later ALTER adds it, which is exactly what
+    // 0139 does.
+    let migration = concat!(
+        include_str!("../../ironauth-store/migrations/0137_log_streams.sql"),
+        "\n",
+        include_str!("../../ironauth-store/migrations/0139_log_stream_organization.sql"),
+    );
     // COMMENT LINES STRIPPED FIRST. 0137's prose explains at length why it carries no
     // organization column, so a plain `contains` matches that explanation and reports a
     // column that does not exist. The first version of this guard did exactly that: a

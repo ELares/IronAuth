@@ -47,6 +47,7 @@ fn stream(sink_type: SinkType, sink_config: Value) -> LogStreamRecord {
         sink_config,
         credential_secret_name: None,
         event_type_filter: None,
+        organization_id: None,
         active: true,
         cursor: None,
         health: StreamHealth::default(),

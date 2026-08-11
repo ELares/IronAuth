@@ -4763,6 +4763,8 @@ export interface components {
              * @description When a delivery last succeeded, epoch microseconds.
              */
             last_success_at_unix_micros?: number | null;
+            /** @description The organization this stream is scoped to, or absent for the whole environment. */
+            organization_id?: string | null;
             /** @description Where it ships to: `http`, `s3`, `datadog`, or `splunk_hec`. */
             sink_type: string;
             /** @description Which audit stream(s) this ships: `admin_action`, `authentication`, or `both`. */

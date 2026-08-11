@@ -1,0 +1,22 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Per-organization SIEM log streams (issue #110).
+--
+-- 0137 deliberately shipped WITHOUT this column and said why: per-org streams
+-- need an organization dimension on the audit row, and there was none. A stream
+-- configured then would have shipped nothing while reporting healthy.
+--
+-- That dimension exists now (0138) and every organization-scoped write populates
+-- it, so the knob can be honoured. A test enforced the ordering: it refused this
+-- column while no audit row was attributed, which is why this arrives after the
+-- attribution rather than beside it.
+--
+-- NULL means ENVIRONMENT-WIDE, which is the existing behaviour and the default.
+-- A non-NULL value ships only that organization's events, matched by equality on
+-- the audit row's organization_id. Rows with a NULL organization are NOT an
+-- organization's events, so a per-org stream must never match them: that is the
+-- cross-tenant leak this whole line of work exists to prevent, and it falls out
+-- of equality rather than needing a special case, because NULL = NULL is not true
+-- in SQL.
+
+ALTER TABLE log_streams ADD COLUMN organization_id text;
