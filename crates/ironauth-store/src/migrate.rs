@@ -1106,6 +1106,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0135_audit_chain.sql"),
         },
+        Migration {
+            version: 136,
+            name: "audit_retention_role",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0136_audit_retention_role.sql"),
+        },
     ]
 }
 

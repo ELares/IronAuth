@@ -203,6 +203,16 @@ pub struct Config {
     /// next consumer needing.
     pub webhooks: WebhooksConfig,
 
+    /// Audit retention (issue #109): the per-stream windows, and whether THIS process
+    /// sweeps to them.
+    ///
+    /// Separate windows per stream is the point rather than a convenience. The admin
+    /// trail answers "who changed this configuration", which a compliance regime usually
+    /// wants kept for years, and the authentication trail answers "who signed in", which
+    /// is high volume and usually wanted for months. One window forces the short
+    /// requirement onto the long one or the long storage bill onto the short one.
+    pub audit_retention: AuditRetentionConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -454,6 +464,71 @@ pub struct OutboxConfig {
     /// series, rather than an absent one that looks exactly like a dead process to
     /// whatever alerts on it.
     pub metrics_sample_interval_secs: u64,
+}
+
+/// Audit retention settings (issue #109).
+///
+/// OFF by default and off again without a DSN, so a deployment that never opens this
+/// section deletes nothing. That default direction is deliberate: the failure mode of
+/// retention being off is a larger table, and the failure mode of it being on by
+/// accident is a destroyed audit trail. Only one of those is recoverable.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuditRetentionConfig {
+    /// Whether THIS process sweeps expired audit rows. OFF by default.
+    ///
+    /// Enabling it is not sufficient on its own: `database_url` must also name the
+    /// retention role, because no other role can delete an audit row.
+    pub enabled: bool,
+
+    /// The connection for the `ironauth_audit_retention` role (migration 0136), which
+    /// is the ONLY role granted DELETE on `audit_log` and `audit_chain`.
+    ///
+    /// A separate DSN rather than a reuse of `[database].url` or
+    /// `admin.control_database_url`, and for the reason 0136 gives: both of those roles
+    /// hold INSERT on the audit tables, and a role that can write and remove an audit
+    /// row can erase one and put another in its place. Sweeping through either of them
+    /// would collapse the separation the migration exists to create.
+    ///
+    /// [`None`] disables the sweep however `enabled` is set.
+    pub database_url: Option<Secret>,
+
+    /// How long an ADMIN-ACTION row is kept, in seconds. `0` means keep forever.
+    ///
+    /// Defaults to forever. See the section note on why the default direction is to
+    /// retain rather than to delete.
+    pub admin_action_retention_secs: u64,
+
+    /// How long an AUTHENTICATION row is kept, in seconds. `0` means keep forever.
+    ///
+    /// Independent of `admin_action_retention_secs`: that independence is the whole
+    /// reason the two streams are separated at all.
+    pub authentication_retention_secs: u64,
+
+    /// The most rows one pass removes from one stream in one scope.
+    ///
+    /// Bounded so a first sweep over a long-neglected table cannot take a lock for
+    /// minutes; the sweep simply runs again and catches up over several passes.
+    pub batch: i64,
+
+    /// Seconds between sweeps.
+    pub interval_secs: u64,
+}
+
+impl Default for AuditRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            database_url: None,
+            // FOREVER, not "immediately". A zero that meant "delete everything now"
+            // would make an operator who enables the sweeper before choosing a window
+            // destroy the trail with one line of config.
+            admin_action_retention_secs: 0,
+            authentication_retention_secs: 0,
+            batch: 1_000,
+            interval_secs: 60 * 60,
+        }
+    }
 }
 
 /// Outbound webhook delivery settings (issue #105).

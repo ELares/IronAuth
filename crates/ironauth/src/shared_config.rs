@@ -593,6 +593,16 @@ mod tests {
     /// must state rather than one they can omit.
     const PLANE_LOCAL_KEYS: &[(&str, Reach, &str)] = &[
         (
+            "audit_retention",
+            Reach::OnePlaneOrNoState,
+            "consumed once at boot to build the audit retention sweeper (issue #109), a \
+             background task that owns its own two connections and answers no request. \
+             Neither plane state holds it: it deliberately runs on the retention role, \
+             which is the one role granted DELETE on the audit tables and granted INSERT \
+             on nothing, so handing it to a plane would widen exactly the credential \
+             migration 0136 exists to keep narrow.",
+        ),
+        (
             "dev_mode",
             Reach::OnePlaneOrNoState,
             "a scalar, not a section: it relaxes the literal-secret warning at load and \

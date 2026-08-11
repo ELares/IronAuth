@@ -189,6 +189,57 @@
       },
       "type": "object"
     },
+    "AuditRetentionConfig": {
+      "additionalProperties": false,
+      "description": "Audit retention settings (issue #109).\n\nOFF by default and off again without a DSN, so a deployment that never opens this\nsection deletes nothing. That default direction is deliberate: the failure mode of\nretention being off is a larger table, and the failure mode of it being on by\naccident is a destroyed audit trail. Only one of those is recoverable.",
+      "properties": {
+        "admin_action_retention_secs": {
+          "default": 0,
+          "description": "How long an ADMIN-ACTION row is kept, in seconds. `0` means keep forever.\n\nDefaults to forever. See the section note on why the default direction is to\nretain rather than to delete.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "authentication_retention_secs": {
+          "default": 0,
+          "description": "How long an AUTHENTICATION row is kept, in seconds. `0` means keep forever.\n\nIndependent of `admin_action_retention_secs`: that independence is the whole\nreason the two streams are separated at all.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "batch": {
+          "default": 1000,
+          "description": "The most rows one pass removes from one stream in one scope.\n\nBounded so a first sweep over a long-neglected table cannot take a lock for\nminutes; the sweep simply runs again and catches up over several passes.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "database_url": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The connection for the `ironauth_audit_retention` role (migration 0136), which\nis the ONLY role granted DELETE on `audit_log` and `audit_chain`.\n\nA separate DSN rather than a reuse of `[database].url` or\n`admin.control_database_url`, and for the reason 0136 gives: both of those roles\nhold INSERT on the audit tables, and a role that can write and remove an audit\nrow can erase one and put another in its place. Sweeping through either of them\nwould collapse the separation the migration exists to create.\n\n[`None`] disables the sweep however `enabled` is set."
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether THIS process sweeps expired audit rows. OFF by default.\n\nEnabling it is not sufficient on its own: `database_url` must also name the\nretention role, because no other role can delete an audit row.",
+          "type": "boolean"
+        },
+        "interval_secs": {
+          "default": 3600,
+          "description": "Seconds between sweeps.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "AutoLinkPosture": {
       "description": "The posture governing whether a federated login may AUTO-LINK into a pre-existing\nlocal account (issue #78). The default is the most conservative one: a federated\nlogin NEVER silently merges into a pre-existing local account. An operator opts into\nverified-to-verified auto-linking per environment.\n\nThis is one structural floor of the guarded linking subsystem: even under\n`VerifiedToVerified` an auto-link fires only when the FULL trust decision table\nagrees (a verified local email, an upstream `email_verified`, and a trusted\nconnector), so the \"unverified local\" and \"untrusted upstream\" cells are unreachable\nTWICE OVER (once by this posture, once by the trust table). Under `Off` (the default)\nno arm of the trust table can return `AutoLink` at all.\n\nFORK B (issue #78): the intended tenancy grain is PER ENVIRONMENT. In PR 1 this ships\nas the deployment default; the per-environment override the pure trust decision\nconsumes is threaded by the PR 2 wiring (the decision function takes the posture as an\ninput, so its source is the caller's concern).",
       "oneOf": [
@@ -2624,6 +2675,18 @@
         "operator_subjects": []
       },
       "description": "Admin console SPA settings (issue #90): the in-process serving of the\nPreact admin console on the public plane under `/admin`. Off by default:\nPR1 ships the serving skeleton (a static shell over the public management\nAPI, no auth yet), so a default deployment mounts nothing and every\n`/admin` path is a uniform 404. A later change flips the default on once\nthe console is functional."
+    },
+    "audit_retention": {
+      "$ref": "#/$defs/AuditRetentionConfig",
+      "default": {
+        "admin_action_retention_secs": 0,
+        "authentication_retention_secs": 0,
+        "batch": 1000,
+        "database_url": null,
+        "enabled": false,
+        "interval_secs": 3600
+      },
+      "description": "Audit retention (issue #109): the per-stream windows, and whether THIS process\nsweeps to them.\n\nSeparate windows per stream is the point rather than a convenience. The admin\ntrail answers \"who changed this configuration\", which a compliance regime usually\nwants kept for years, and the authentication trail answers \"who signed in\", which\nis high volume and usually wanted for months. One window forces the short\nrequirement onto the long one or the long storage bill onto the short one."
     },
     "byok": {
       "$ref": "#/$defs/ByokConfig",

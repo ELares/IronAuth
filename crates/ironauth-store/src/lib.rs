@@ -50,6 +50,7 @@
 pub mod abuse;
 pub mod api_key;
 pub mod audit;
+pub mod audit_retention;
 pub mod brand;
 pub mod classification;
 pub mod client_admin_grant;
@@ -311,8 +312,8 @@ pub use repository::{
     WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,
 };
 pub use repository::{
-    AuditChainRepo, ChainEntry, ChainFault, ChainVerified, ChainedAuditRow, SealReport,
-    verify_chain_entries,
+    AuditChainRepo, ChainEntry, ChainFault, ChainVerified, ChainedAuditRow, PruneReport,
+    SealReport, verify_chain_entries,
 };
 /// The testing-only atomicity probes (issue #247): the seams at which a test can force
 /// the joined invitation create and the joined recovery approve to fail INSIDE their one

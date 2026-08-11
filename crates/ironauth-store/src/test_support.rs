@@ -63,6 +63,12 @@ const APP_ROLE: &str = "ironauth_app";
 /// superuser and never a table owner, so forced row-level security applies.
 const CONTROL_ROLE: &str = "ironauth_control";
 
+/// The audit RETENTION role (issue #109). Holds SELECT and DELETE on `audit_log`
+/// and `audit_chain` and nothing else anywhere, and deliberately holds no INSERT
+/// on either: a role that could both write and remove an audit row could erase a
+/// row and replace it, which is the tampering the log exists to make evident.
+const AUDIT_RETENTION_ROLE: &str = "ironauth_audit_retention";
+
 /// A fresh, isolated database plus the handles the isolation tests need.
 ///
 /// Cloning shares the same throwaway database and the same pools (every pool handle is
@@ -83,6 +89,9 @@ pub struct TestDatabase {
     control_pool: PgPool,
     store: Store,
     control_store: Store,
+    /// The audit RETENTION handle (issue #109), authenticating as the third
+    /// credential class: it can remove an audit row and cannot write one.
+    audit_retention_store: Store,
     /// The data-plane connection URL, kept so a test can open a BRAND-NEW pool against
     /// the SAME database and rebuild its process-level state from nothing: the
     /// rolling-restart simulation (issue #32 AC 1).
@@ -91,6 +100,8 @@ pub struct TestDatabase {
     /// concurrency test needs a WIDER control-plane pool than the default one so its
     /// storm actually overlaps rather than queueing on connections.
     control_url: String,
+    /// The audit retention connection URL, kept for the same reason as `app_url`.
+    audit_retention_url: String,
     /// The platform envelope master key (issue #48), shared across every data-plane
     /// handle this database hands out (including a simulated restart), so encrypted
     /// PII sealed by one handle reads back through another. Deterministic (a fixed
@@ -133,6 +144,7 @@ impl TestDatabase {
         // roles are provisioned the same race-safe way.
         provision_role(&owner_pool, APP_ROLE).await;
         provision_role(&owner_pool, CONTROL_ROLE).await;
+        provision_role(&owner_pool, AUDIT_RETENTION_ROLE).await;
 
         // Apply the schema (tables, forced RLS, policies, and the grants to the
         // roles provisioned above) as the owner.
@@ -170,6 +182,23 @@ impl TestDatabase {
         // substrate. Without the key those paths fail closed (never plaintext).
         let control_store = Store::from_pool(control_pool.clone()).with_master_key(master.clone());
 
+        // The audit retention handle, a third credential class that can remove an
+        // audit row and cannot write one.
+        let audit_retention_url = format!(
+            "postgres://{AUDIT_RETENTION_ROLE}:{AUDIT_RETENTION_ROLE}@{host}:{port}/{db_name}"
+        );
+        // LAZY, and capped at two connections. Every test database builds one of these,
+        // but only the handful of retention tests ever uses one, and an eager pool per
+        // database exhausted the server's connection limit: fourteen unrelated OIDC tests
+        // failed with `PoolTimedOut` the first time this was wired eagerly.
+        let audit_retention_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&audit_retention_url)
+            .expect("build the lazy audit retention pool");
+        // No master key: this role never touches a PII path, and handing it one
+        // would widen a credential whose entire point is being narrow.
+        let audit_retention_store = Store::from_pool(audit_retention_pool);
+
         Self {
             seed_operator: None,
             owner_pool,
@@ -177,8 +206,10 @@ impl TestDatabase {
             control_pool,
             store,
             control_store,
+            audit_retention_store,
             app_url,
             control_url,
+            audit_retention_url,
             master,
         }
     }
@@ -327,6 +358,21 @@ impl TestDatabase {
     #[must_use]
     pub fn control_url(&self) -> &str {
         &self.control_url
+    }
+
+    /// The audit RETENTION connection URL (`ironauth_audit_retention` role) for THIS
+    /// throwaway database (issue #109).
+    #[must_use]
+    pub fn audit_retention_url(&self) -> &str {
+        &self.audit_retention_url
+    }
+
+    /// A [`Store`] on the audit retention role. Use this for a retention sweep, so a
+    /// test exercises the role separation production relies on rather than sweeping as
+    /// the owner and proving nothing about the grants.
+    #[must_use]
+    pub fn audit_retention_store(&self) -> &Store {
+        &self.audit_retention_store
     }
 
     /// A throwaway human actor for tests that need to perform a write. Writes

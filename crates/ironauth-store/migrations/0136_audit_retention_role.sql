@@ -1,0 +1,63 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The audit retention role (issue #109).
+--
+-- Per-stream retention needs something that can remove an audit row, and nothing
+-- in the system can: 0002 and 0003 give `ironauth_app` and `ironauth_control`
+-- SELECT and INSERT on `audit_log` and withhold UPDATE and DELETE from both.
+-- That is the append-only guarantee, and retention must not be the thing that
+-- quietly dissolves it.
+--
+-- ---------------------------------------------------------------------------
+-- WHY A THIRD ROLE RATHER THAN A GRANT TO ONE OF THE TWO
+--
+-- 0102 granted DELETE on `outbox_messages` to `ironauth_control` and justified it
+-- with a separation argument: the role that can retire a row holds no UPDATE, so
+-- it is structurally incapable of having been the role that marked the row
+-- terminal. Erasing the evidence and creating it require two different roles.
+--
+-- That argument does NOT transfer here, and reusing it would be the mistake.
+-- Both existing roles hold INSERT on `audit_log`. A role with INSERT and DELETE
+-- can remove a row and write a replacement, which is exactly the tampering the
+-- audit log exists to make evident. So the DELETE goes to a role that holds no
+-- INSERT on either audit table, and the two roles that write audit rows keep no
+-- way to remove one. Erasing and rewriting stay two roles apart, which is the
+-- property 0102 was actually protecting.
+--
+-- ---------------------------------------------------------------------------
+-- WHAT BOUNDS WHICH ROWS IT MAY DELETE
+--
+-- Postgres has no row-scoped DELETE privilege, so the grant is table-wide and the
+-- bounds come from elsewhere, exactly as they do in 0102:
+--
+--   (a) ROW-LEVEL SECURITY. Both tables ENABLE and FORCE it and neither isolation
+--       policy carries a `TO` clause, so both apply to this role as they do to the
+--       others. On a connection that never bound a scope, `current_setting` returns
+--       NULL, `tenant_id = NULL` is NULL rather than true, and an unscoped DELETE
+--       removes zero rows rather than every row.
+--   (b) THE CUTOFF PREDICATE in the sweeper, which is the only caller.
+--
+-- The chain interaction is deliberate. Removing an audit row without removing the
+-- chain entry that seals it would leave an entry whose link cannot be recomputed,
+-- which is indistinguishable from tampering. The sweeper removes the chain prefix
+-- and the rows it covers together, and verification checks position density from
+-- the first entry present, so a pruned prefix verifies and is not mistaken for an
+-- attack.
+--
+-- ---------------------------------------------------------------------------
+-- Like 0001 and 0003, this migration GRANTs to the role but NEVER creates it and
+-- NEVER sets a password: a CREATE ROLE ... PASSWORD literal in a public repository
+-- hands every reader a working credential. The role is provisioned out of band, in
+-- production by the operator and in tests by the harness. If it is absent when this
+-- runs these GRANTs fail loudly, which is the same fail-closed contract 0003 set.
+-- An operator upgrading past this migration creates the role first.
+--
+-- Retention itself stays OFF until an operator also supplies the role's DSN, so a
+-- deployment that provisions the role and configures nothing else deletes nothing.
+
+GRANT USAGE ON SCHEMA public TO ironauth_audit_retention;
+
+-- SELECT so the sweeper can find the cutoff boundary and count what it removed,
+-- DELETE so it can remove it. No INSERT and no UPDATE, on purpose: see above.
+GRANT SELECT, DELETE ON audit_log TO ironauth_audit_retention;
+GRANT SELECT, DELETE ON audit_chain TO ironauth_audit_retention;

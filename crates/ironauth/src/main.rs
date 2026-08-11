@@ -41,6 +41,10 @@ use ironauth_store::{
     AbuseBanId, AbuseSubject, AbuseSubjectKind, ActorRef, AuthPath, ClientId, CorrelationId,
     EnvironmentId, NewBan, RetryPolicy, SESSION_ENDED_CONSUMER, Scope, ServiceId, Store,
     StoreError, TenantId,
+    audit_retention::{
+        AuditReapStats, AuditReaper, AuditRetentionObserver, AuditRetentionSettings,
+        AuditRetentionSweeper,
+    },
     outbox::{
         ConsumerRegistry, ControlPlaneScopes, DrainStats, OutboxConsumer, OutboxObserver,
         OutboxReaper, OutboxWorker, OutboxWorkerPool, RetentionObserver, RetentionSettings,
@@ -284,6 +288,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // gated on the consumer switch would be missing from the deployment where the table
         // grows fastest. The only switch is `outbox.reap_enabled`, which defaults ON.
         let retention_inputs = retention_sweeper_inputs(&config, &env);
+        let audit_retention_inputs = audit_retention_inputs(&config, &env);
         let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
         let trait_migration = trait_migration_inputs(&config, &env);
@@ -404,6 +409,10 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // named where they are decided: `outbox.reap_enabled` in `retention_sweeper_inputs`
         // and a missing control-plane DSN in `start_retention_sweeper`. BOUND rather than
         // detached, so the shutdown below can await it.
+        let audit_retention_sweeper = match audit_retention_inputs {
+            Some(inputs) => start_audit_retention_sweeper(inputs).await,
+            None => None,
+        };
         let retention_sweeper = if let Some(inputs) = retention_inputs {
             start_retention_sweeper(inputs).await
         } else {
@@ -448,6 +457,9 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // way through: the delete is bounded and idempotent, and the rows this pass did not
         // reach are still there for the next boot.
         if let Some(sweeper) = retention_sweeper {
+            sweeper.shutdown().await;
+        }
+        if let Some(sweeper) = audit_retention_sweeper {
             sweeper.shutdown().await;
         }
         // Stopped last: it reads the same table the pools and the reaper write, and a
@@ -2727,6 +2739,171 @@ async fn spawn_trait_migration_pools(inputs: TraitMigrationInputs) -> Vec<Outbox
         "trait migration jobs started on the outbox consumer pools"
     );
     pools
+}
+
+/// What the audit retention sweeper (issue #109) needs, captured before `config` moves
+/// into the server.
+struct AuditRetentionInputs {
+    /// The `[audit_retention]` section, whose two windows this sweeper runs to.
+    audit: ironauth_config::AuditRetentionConfig,
+    /// The CONTROL-plane DSN, used ONLY to enumerate scopes: listing environments is a
+    /// control-plane read and the retention role cannot do it.
+    control_dsn: Option<String>,
+    /// The RETENTION role's DSN, used only to delete. Separate from the control DSN on
+    /// purpose: see migration 0136. A role that can both write and remove an audit row
+    /// could erase one and write a replacement.
+    retention_dsn: Option<String>,
+    /// The environment seam (deterministic clock and entropy).
+    env: Env,
+}
+
+/// Capture the audit retention sweeper's inputs, or `None` when it is switched off.
+fn audit_retention_inputs(config: &Config, env: &Env) -> Option<AuditRetentionInputs> {
+    if !config.audit_retention.enabled {
+        return None;
+    }
+    let retention_dsn = match &config.audit_retention.database_url {
+        Some(secret) => match secret.resolve() {
+            Ok(dsn) => Some(dsn.expose().to_owned()),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "audit retention NOT running: cannot resolve \
+                     audit_retention.database_url"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    Some(AuditRetentionInputs {
+        audit: config.audit_retention.clone(),
+        control_dsn: select_control_dsn(config),
+        retention_dsn,
+        env: env.clone(),
+    })
+}
+
+/// Start the audit retention sweeper, returning the RUNNING sweeper so the caller can shut
+/// it down, or `None` when it could not be started.
+///
+/// Every early return says WHAT is not running and WHY, because the failure this guards
+/// against is a silent one: nothing errors, the audit tables simply keep growing, and the
+/// first symptom is a disk.
+async fn start_audit_retention_sweeper(
+    inputs: AuditRetentionInputs,
+) -> Option<AuditRetentionSweeper> {
+    let AuditRetentionInputs {
+        audit,
+        control_dsn,
+        retention_dsn,
+        env,
+    } = inputs;
+
+    let Some(retention_dsn) = retention_dsn else {
+        tracing::error!(
+            "audit retention NOT running: no retention DSN (set \
+             audit_retention.database_url). Only the ironauth_audit_retention role is \
+             granted DELETE on audit_log and audit_chain, and it is deliberately the only \
+             role NOT granted INSERT on them, so no other connection can be substituted."
+        );
+        return None;
+    };
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "audit retention NOT running: no control-plane DSN (set \
+             admin.control_database_url). Scopes are enumerated from `environments`, \
+             which only the control role may read."
+        );
+        return None;
+    };
+    if audit.admin_action_retention_secs == 0 && audit.authentication_retention_secs == 0 {
+        tracing::warn!(
+            "audit retention is enabled but BOTH windows are 0, which means keep forever; \
+             nothing will be deleted. Set audit_retention.admin_action_retention_secs or \
+             audit_retention.authentication_retention_secs to a nonzero number of seconds."
+        );
+    }
+
+    let retention_store = match Store::connect(&retention_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "audit retention NOT running: retention connect failed");
+            return None;
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "audit retention NOT running: control-plane connect failed, so scopes \
+                 cannot be enumerated"
+            );
+            return None;
+        }
+    };
+
+    let settings = AuditRetentionSettings {
+        admin_action: window(audit.admin_action_retention_secs),
+        authentication: window(audit.authentication_retention_secs),
+        batch: audit.batch,
+    };
+    let reaper = AuditReaper::new(retention_store, env, settings);
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer: Arc<dyn AuditRetentionObserver> = Arc::new(TracingAuditRetentionObserver);
+    let sweeper = AuditRetentionSweeper::spawn(
+        reaper,
+        scopes,
+        observer,
+        std::time::Duration::from_secs(audit.interval_secs),
+    );
+    tracing::info!(
+        admin_action_retention_secs = audit.admin_action_retention_secs,
+        authentication_retention_secs = audit.authentication_retention_secs,
+        batch = audit.batch,
+        interval_secs = audit.interval_secs,
+        "audit retention started; a window of 0 means that stream is kept FOREVER"
+    );
+    Some(sweeper)
+}
+
+/// A retention window in seconds as a [`Duration`], where `0` is FOREVER rather than
+/// "immediately". See the config section for why that direction is the safe one.
+fn window(secs: u64) -> Option<std::time::Duration> {
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// Reports each audit retention pass through `tracing`.
+struct TracingAuditRetentionObserver;
+
+impl AuditRetentionObserver for TracingAuditRetentionObserver {
+    fn pass_completed(&self, _scope: Scope, stats: AuditReapStats) {
+        if stats.admin_action_removed > 0 || stats.authentication_removed > 0 {
+            tracing::info!(
+                admin_action_removed = stats.admin_action_removed,
+                authentication_removed = stats.authentication_removed,
+                saturated = stats.saturated,
+                "audit retention pass removed rows"
+            );
+        }
+    }
+
+    fn pass_failed(&self, _scope: Scope, error: &StoreError) {
+        tracing::error!(
+            %error,
+            "audit retention pass FAILED for a scope; if this says permission denied, the \
+             configured audit_retention.database_url is not the ironauth_audit_retention role"
+        );
+    }
+
+    fn enumeration_failed(&self, error: &StoreError) {
+        tracing::error!(%error, "audit retention could not enumerate scopes");
+    }
 }
 
 /// Choose the control-plane database DSN for the management store (D2).
