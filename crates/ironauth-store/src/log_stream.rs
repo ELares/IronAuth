@@ -118,6 +118,21 @@ impl SinkType {
     }
 }
 
+/// A batch a stream could not deliver, recorded as a RANGE rather than as a copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetter {
+    /// The `lsd_` identifier.
+    pub id: String,
+    /// The inclusive start, in cursor order.
+    pub from: (i64, String),
+    /// The inclusive end, in cursor order.
+    pub to: (i64, String),
+    /// How many events the failed batch carried.
+    pub event_count: i32,
+    /// The failure that ended the retry run. Operator-safe.
+    pub last_error: String,
+}
+
 /// One configured stream.
 #[derive(Debug, Clone)]
 pub struct LogStreamRecord {

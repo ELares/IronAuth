@@ -479,3 +479,135 @@ async fn a_per_organization_stream_never_ships_another_organizations_events() {
         ironauth_store::log_stream::StreamStatus::Healthy
     );
 }
+
+/// A permanently failing sink accumulates a dead letter, stops blocking, and recovers via
+/// replay.
+///
+/// The head-of-line half is the point. Without dead-lettering, a batch the sink refuses
+/// forever is retried forever from the same position and every LATER event stops reaching
+/// the SIEM, so the operator loses the whole export rather than one batch.
+#[tokio::test]
+async fn a_permanently_failing_batch_dead_letters_stops_blocking_and_replays() {
+    use ironauth_admin::log_shipper::{DEAD_LETTER_AFTER, replay_dead_letters};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = configure(&db, &env, scope, StreamSource::Both, SinkType::Http, None).await;
+    seed_admin(&db, &env, scope, 2, "poison").await;
+
+    // Fail until the run reaches the dead-letter threshold.
+    let dead_sink = RecordingSink::new(SinkType::Http, false);
+    let failing: Vec<Arc<dyn LogSink>> = vec![dead_sink.clone()];
+    for _ in 0..DEAD_LETTER_AFTER {
+        ship_once(db.store(), &env, scope, &failing)
+            .await
+            .expect("ship");
+    }
+
+    let outstanding = db
+        .store()
+        .scoped(scope)
+        .log_streams()
+        .outstanding_dead_letters(&id)
+        .await
+        .expect("read dead letters");
+    assert_eq!(
+        outstanding.len(),
+        1,
+        "the refused batch must be recorded exactly once: {outstanding:?}"
+    );
+    assert!(outstanding[0].event_count >= 2);
+    assert_eq!(outstanding[0].last_error, "the double refuses");
+
+    // The stream is no longer stuck, and the cursor really MOVED PAST the poisoned batch.
+    //
+    // Asserting only that something ships is not enough: a healthy sink would re-deliver
+    // the poisoned batch successfully and that assertion would pass with the cursor still
+    // parked. A mutation that dead-lettered WITHOUT advancing survived exactly that. So
+    // the count is exact: only the newly written event may ship.
+    let poisoned = dead_sink.events().len();
+    assert!(poisoned >= 2, "the failing sink saw the batch: {poisoned}");
+    seed_admin(&db, &env, scope, 1, "after-poison").await;
+    let healthy = RecordingSink::new(SinkType::Http, true);
+    let recovered: Vec<Arc<dyn LogSink>> = vec![healthy.clone()];
+    let shipped = ship_once(db.store(), &env, scope, &recovered)
+        .await
+        .expect("ship");
+    assert_eq!(
+        shipped, 1,
+        "exactly the ONE event written after the dead letter may ship. More means the \
+         cursor never advanced and the poisoned batch is being re-delivered; head-of-line \
+         blocking is the failure this exists to prevent"
+    );
+
+    // Replay delivers the set-aside range and clears it.
+    let replay_sink = RecordingSink::new(SinkType::Http, true);
+    let replay: Vec<Arc<dyn LogSink>> = vec![replay_sink.clone()];
+    let count = replay_dead_letters(db.store(), &env, scope, &id, &replay)
+        .await
+        .expect("replay");
+    assert!(
+        count >= 2,
+        "the dead-lettered events are re-delivered: {count}"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .log_streams()
+            .outstanding_dead_letters(&id)
+            .await
+            .expect("read")
+            .is_empty(),
+        "a replayed dead letter must clear"
+    );
+}
+
+/// A replay that the sink REFUSES leaves the dead letter outstanding.
+///
+/// Marking it replayed anyway would erase the record of the gap, which is the one thing
+/// the table exists to keep.
+#[tokio::test]
+async fn a_refused_replay_leaves_the_dead_letter_outstanding() {
+    use ironauth_admin::log_shipper::{DEAD_LETTER_AFTER, replay_dead_letters};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = configure(&db, &env, scope, StreamSource::Both, SinkType::Http, None).await;
+    seed_admin(&db, &env, scope, 1, "still-broken").await;
+
+    let dead_sink = RecordingSink::new(SinkType::Http, false);
+    let failing: Vec<Arc<dyn LogSink>> = vec![dead_sink.clone()];
+    for _ in 0..DEAD_LETTER_AFTER {
+        ship_once(db.store(), &env, scope, &failing)
+            .await
+            .expect("ship");
+    }
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .log_streams()
+            .outstanding_dead_letters(&id)
+            .await
+            .expect("read")
+            .len(),
+        1
+    );
+
+    let count = replay_dead_letters(db.store(), &env, scope, &id, &failing)
+        .await
+        .expect("replay runs");
+    assert_eq!(count, 0, "a refused replay delivers nothing");
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .log_streams()
+            .outstanding_dead_letters(&id)
+            .await
+            .expect("read")
+            .len(),
+        1,
+        "a refused replay must NOT clear the dead letter"
+    );
+}

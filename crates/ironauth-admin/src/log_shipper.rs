@@ -33,6 +33,16 @@ use serde_json::{Value, json};
 /// patience for an unbounded time; it simply catches up over several passes.
 pub const SHIP_BATCH: i64 = 500;
 
+/// Consecutive failures after which a batch is DEAD-LETTERED and the cursor advances past
+/// it.
+///
+/// A cursor pipeline has no other way out of head-of-line blocking: a batch the sink
+/// refuses forever is otherwise retried forever from the same position, and every later
+/// event stops reaching the SIEM. The threshold matches the `FAILING` health boundary, so
+/// a stream is reported as failing before anything is set aside, and an operator who is
+/// watching has the same warning the number gives them.
+pub const DEAD_LETTER_AFTER: i32 = ironauth_store::log_stream::FAILING_AFTER;
+
 /// What ONE delivery attempt to a sink produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinkOutcome {
@@ -128,6 +138,107 @@ pub async fn ship_once(
         }
     }
     Ok(shipped)
+}
+
+/// Re-ship every outstanding dead letter for `stream_id`, marking each replayed only when
+/// the sink accepts it.
+///
+/// Reads the range back from `audit_log` rather than from a stored copy, so a replay
+/// delivers the events as they are, and a range whose rows retention has since removed
+/// simply replays fewer events rather than failing.
+///
+/// Marked replayed ONLY on acceptance. A replay that failed and was marked anyway would
+/// erase the record of the gap, which is the one thing this table exists to keep.
+///
+/// # Errors
+///
+/// [`StoreError`] when the dead letters cannot be read or the mark cannot be written.
+pub async fn replay_dead_letters(
+    store: &Store,
+    env: &Env,
+    scope: Scope,
+    stream_id: &str,
+    sinks: &[Arc<dyn LogSink>],
+) -> Result<u64, StoreError> {
+    let scoped = store.scoped(scope);
+    let Some(stream) = scoped
+        .log_streams()
+        .list_active()
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.id == stream_id)
+    else {
+        return Ok(0);
+    };
+    let Some(sink) = sinks
+        .iter()
+        .find(|sink| sink.sink_type() == stream.sink_type)
+    else {
+        return Ok(0);
+    };
+    let credential = scoped
+        .log_streams()
+        .open_credential(&stream)
+        .await?
+        .and_then(|opened| String::from_utf8(opened).ok());
+
+    let mut replayed = 0_u64;
+    for dead in scoped
+        .log_streams()
+        .outstanding_dead_letters(stream_id)
+        .await?
+    {
+        let chain = scoped.audit_chain();
+        // Read from just BEFORE the range start, since `rows_after` is exclusive and the
+        // recorded range is inclusive at both ends.
+        let cursor = predecessor_of(&dead.from);
+        let mut events = Vec::new();
+        for audit_stream in ["admin_action", "authentication"] {
+            if !stream.source.carries(audit_stream) {
+                continue;
+            }
+            for row in chain
+                .rows_after(
+                    audit_stream,
+                    Some((cursor.0, cursor.1.as_str())),
+                    SHIP_BATCH,
+                    stream.organization_id.as_deref(),
+                )
+                .await?
+            {
+                if (row.occurred_micros, row.audit_id.as_str()) > (dead.to.0, dead.to.1.as_str()) {
+                    break;
+                }
+                if let Some(event) = render(&row, scope) {
+                    events.push(event);
+                }
+            }
+        }
+        if events.is_empty() {
+            // Nothing left to send: retention removed the range. Mark it replayed rather
+            // than leaving an entry that can never clear.
+            scoped.log_streams().mark_replayed(env, &dead.id).await?;
+            continue;
+        }
+        if matches!(
+            sink.deliver(&stream, credential.as_deref(), &events).await,
+            SinkOutcome::Accepted
+        ) {
+            scoped.log_streams().mark_replayed(env, &dead.id).await?;
+            replayed += u64::try_from(events.len()).unwrap_or(0);
+        }
+    }
+    Ok(replayed)
+}
+
+/// The cursor position immediately BEFORE `at`, so an exclusive read includes `at`.
+///
+/// The audit id sorts as text, and the empty string sorts below every id, so pairing the
+/// same instant with an empty id is strictly less than `at` and greater than everything at
+/// an earlier instant. Subtracting a microsecond instead would skip any row that shares the
+/// instant and sorts below `at`.
+fn predecessor_of(at: &(i64, String)) -> (i64, String) {
+    (at.0, String::new())
 }
 
 /// Ship ONE stream once, returning how many events the sink accepted.
@@ -238,10 +349,43 @@ async fn ship_stream(
             Ok(accepted)
         }
         SinkOutcome::Rejected(reason) => {
-            // The cursor is NOT advanced, so the batch is retried from the same place.
             scoped
                 .log_streams()
                 .record_failure(env, &stream.id, &reason)
+                .await?;
+            // One MORE than the run recorded before this pass, since the read above
+            // predates it.
+            let failures = stream.health.consecutive_failures.saturating_add(1);
+            if failures < DEAD_LETTER_AFTER {
+                // The cursor is NOT advanced, so the batch is retried from the same place.
+                return Ok(0);
+            }
+            // The run is over. Record the RANGE and advance past it, because a batch the
+            // sink refuses forever would otherwise be retried forever from the same
+            // position and every LATER event would never reach the SIEM. Losing sight of
+            // this batch is bad; losing sight of everything after it is worse.
+            // The range spans the batch: first considered row to last. A single-point
+            // range would replay one event and report the whole batch recovered.
+            let first = candidates.first().map_or_else(
+                || position.clone(),
+                |row| (row.occurred_micros, row.audit_id.clone()),
+            );
+            // Recorded BEFORE the cursor advances, and with `?`, so a dead letter that
+            // cannot be written stops the advance. Advancing anyway would drop the batch
+            // with no record of it existing.
+            scoped
+                .log_streams()
+                .dead_letter(
+                    env,
+                    &stream.id,
+                    (first.0, &first.1, position.0, &position.1),
+                    i32::try_from(events.len()).unwrap_or(i32::MAX),
+                    &reason,
+                )
+                .await?;
+            scoped
+                .log_streams()
+                .record_success(env, &stream.id, (position.0, &position.1))
                 .await?;
             Ok(0)
         }
