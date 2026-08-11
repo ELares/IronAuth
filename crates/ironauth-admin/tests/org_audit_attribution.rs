@@ -56,20 +56,30 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "unassignOrgRolePermission",
     "updateOrgGroup",
     "updateOrgRole",
+    "deleteOrganization",
+    "disableOrganization",
+    "enableOrganization",
+    "withdrawProjectGrant",
 ];
 
 /// How many organization-scoped WRITE operations do not yet attribute their audit rows.
 ///
-/// This may only FALL. It counts writes only: a read produces no audit row, so it has
-/// nothing to attribute, and an earlier version of this counter included reads, which put
-/// a floor under the number and made zero unreachable.
+/// ZERO. Every organization-scoped write now names its organization on the audit row.
 ///
-/// 4 of 27 remain, all of them operations acting ON an organization rather than within it
-/// (delete, disable, enable, and the project-grant withdrawal). Those resolve their target
-/// differently, because an organization being disabled or deleted is by definition not one
-/// `resolve_live_org` will return, so they need their own handling rather than the same
-/// one-line adoption.
-const UNATTRIBUTED_CEILING: usize = 4;
+/// It may only rise back through this constant, so an org-scoped write added later
+/// without attribution fails here rather than silently shipping an event a per-org SIEM
+/// stream will never deliver.
+///
+/// It counts writes only: a read produces no audit row, so it has nothing to attribute,
+/// and an earlier version of this counter included reads, which put a floor under the
+/// number and made zero unreachable.
+///
+/// A note on an earlier claim, corrected: the organization delete, disable, enable and
+/// project-grant withdrawal were once described here as unable to take the same adoption
+/// because a disabled or deleted organization is not one `resolve_live_org` returns. That
+/// was wrong. All four resolve through it exactly as the others do; they simply bind the
+/// result to `id`, which is why a scan keyed on `org_id` missed them.
+const UNATTRIBUTED_CEILING: usize = 0;
 
 /// Where each attributed operation's handler lives, so the claim can be CHECKED.
 ///
@@ -136,6 +146,22 @@ const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
     ("updateOrgRole", include_str!("../src/org_roles.rs")),
     (
         "createProjectGrant",
+        include_str!("../src/project_grants.rs"),
+    ),
+    (
+        "deleteOrganization",
+        include_str!("../src/organizations.rs"),
+    ),
+    (
+        "disableOrganization",
+        include_str!("../src/organizations.rs"),
+    ),
+    (
+        "enableOrganization",
+        include_str!("../src/organizations.rs"),
+    ),
+    (
+        "withdrawProjectGrant",
         include_str!("../src/project_grants.rs"),
     ),
 ];
@@ -214,23 +240,20 @@ fn the_organization_attribution_gap_is_counted_and_may_only_fall() {
     let attributed: BTreeSet<String> = ORG_ATTRIBUTED.iter().map(|id| (*id).to_string()).collect();
     let unattributed: Vec<&String> = org_scoped.difference(&attributed).collect();
 
-    assert!(
-        unattributed.len() <= UNATTRIBUTED_CEILING,
-        "the number of organization-scoped operations whose audit row does NOT name its \
-         organization rose to {}. It may only fall. Call \
-         `ActingStore::in_organization(..)` on the handler's acting store, then list the \
-         operation in ORG_ATTRIBUTED. Unattributed: {unattributed:?}",
-        unattributed.len()
-    );
-
     // The other direction: adopting the seam without lowering the ceiling leaves a number
     // that no longer describes anything.
+    // ONE exact assertion rather than a `<=` plus an `==`. At a ceiling of zero the
+    // inequality is vacuous (a length is never below zero), and clippy says so. Exact
+    // equality already fails in both directions: a new unattributed write raises the count
+    // above the constant, and lowering the count without lowering the constant fails too.
     assert_eq!(
         unattributed.len(),
         UNATTRIBUTED_CEILING,
-        "the gap improved to {} but UNATTRIBUTED_CEILING still says {UNATTRIBUTED_CEILING}. \
-         Lower it in the same change, or the next reader cannot tell a real gap from a \
-         stale one",
+        "the organization-attribution count is {} but UNATTRIBUTED_CEILING says \
+         {UNATTRIBUTED_CEILING}. If it ROSE, an organization-scoped write was added \
+         without calling `ActingStore::in_organization(..)`, and its events will never \
+         reach a per-organization stream. If it FELL, lower the constant in the same \
+         change. Unattributed: {unattributed:?}",
         unattributed.len()
     );
 }

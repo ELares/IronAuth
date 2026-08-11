@@ -350,6 +350,8 @@ pub async fn delete_organization(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(id)
         .organizations(scope)
         .delete(state.env(), &id)
         .await?;
@@ -433,6 +435,11 @@ async fn set_organization_state(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110). In the SHARED body,
+        // for the reason the permission check is here: two copies of one rule is one
+        // place to forget it, and enable and disable must not disagree about whose event
+        // this is.
+        .in_organization(id)
         .organizations(scope)
         .set_state(
             state.env(),

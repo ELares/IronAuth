@@ -306,7 +306,7 @@ pub async fn withdraw_project_grant(
     require_vendor(&principal)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
-    let _org_id = resolve_live_org(
+    let org_id = resolve_live_org(
         &state,
         &principal,
         scope,
@@ -326,6 +326,8 @@ pub async fn withdraw_project_grant(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .project_grants(scope)
         .withdraw(state.env(), &id, now_micros, None)
         .await;
