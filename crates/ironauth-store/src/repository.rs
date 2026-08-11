@@ -537,6 +537,15 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// SIEM log stream configuration (issue #110).
+    #[must_use]
+    pub fn log_streams(&self) -> LogStreamRepo<'a> {
+        LogStreamRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The per-stream audit tamper-evidence chain (issue #109).
     #[must_use]
     pub fn audit_chain(&self) -> AuditChainRepo<'a> {
@@ -36912,6 +36921,208 @@ pub struct ChainEntry {
     pub prev_hash: String,
     /// `chain_link(prev_hash, row.canonical())`.
     pub record_hash: String,
+}
+
+// ===========================================================================
+// SIEM log streams (issue #110).
+
+/// A new log stream, as the management plane configures one.
+#[derive(Debug, Clone)]
+pub struct NewLogStream<'a> {
+    /// The operator's label. Never secret.
+    pub description: &'a str,
+    /// Which audit stream(s) to ship.
+    pub source: crate::log_stream::StreamSource,
+    /// Where to ship them.
+    pub sink_type: crate::log_stream::SinkType,
+    /// Sink shape: endpoint, region, bucket, index. NEVER a credential.
+    pub sink_config: serde_json::Value,
+    /// The environment-scoped secret holding the sink credential, by NAME.
+    pub credential_secret_name: Option<&'a str>,
+    /// Ship only these action wire strings. `None` is every action in `source`.
+    pub event_type_filter: Option<Vec<String>>,
+}
+
+/// Log stream configuration.
+pub struct LogStreamRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl LogStreamRepo<'_> {
+    /// Configure a new stream, returning its id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault, including the permission failure a
+    /// data-plane caller gets: only the control plane may create a stream.
+    pub async fn create(&self, env: &Env, new: &NewLogStream<'_>) -> Result<String, StoreError> {
+        let scope = self.scope;
+        let id = crate::id::LogStreamId::generate(env, &scope).to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "INSERT INTO log_streams \
+             (id, tenant_id, environment_id, description, source, sink_type, \
+              sink_config, credential_secret_name, event_type_filter) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(&id)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(new.description)
+        .bind(new.source.as_str())
+        .bind(new.sink_type.as_str())
+        .bind(&new.sink_config)
+        .bind(new.credential_secret_name)
+        .bind(new.event_type_filter.as_deref())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Every ACTIVE stream in this scope.
+    ///
+    /// A row whose stored `source` or `sink_type` this build does not recognize is
+    /// SKIPPED rather than guessed at. The CHECK constraints make that unreachable for a
+    /// matched build, but a rolled-back binary reading a row a newer one wrote must not
+    /// invent a classification and ship somewhere the operator did not configure.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn list_active(&self) -> Result<Vec<crate::log_stream::LogStreamRecord>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, description, source, sink_type, sink_config, \
+                    credential_secret_name, event_type_filter, active, \
+                    cursor_audit_id, last_error, consecutive_failures, \
+                    (EXTRACT(EPOCH FROM cursor_occurred_at) * 1000000)::bigint \
+                        AS cursor_micros, \
+                    (EXTRACT(EPOCH FROM last_success_at) * 1000000)::bigint \
+                        AS last_success_micros, \
+                    (EXTRACT(EPOCH FROM last_error_at) * 1000000)::bigint \
+                        AS last_error_micros \
+             FROM log_streams \
+             WHERE tenant_id = $1 AND environment_id = $2 AND active \
+             ORDER BY id",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = Vec::new();
+        for row in rows {
+            let source: String = row.get("source");
+            let sink_type: String = row.get("sink_type");
+            let (Some(source), Some(sink_type)) = (
+                crate::log_stream::StreamSource::from_wire(&source),
+                crate::log_stream::SinkType::from_wire(&sink_type),
+            ) else {
+                continue;
+            };
+            let cursor_micros: Option<i64> = row.get("cursor_micros");
+            let cursor_audit_id: Option<String> = row.get("cursor_audit_id");
+            out.push(crate::log_stream::LogStreamRecord {
+                id: row.get("id"),
+                description: row.get("description"),
+                source,
+                sink_type,
+                sink_config: row.get("sink_config"),
+                credential_secret_name: row.get("credential_secret_name"),
+                event_type_filter: row.get("event_type_filter"),
+                active: row.get("active"),
+                cursor: cursor_micros.zip(cursor_audit_id),
+                health: crate::log_stream::StreamHealth {
+                    last_success_micros: row.get("last_success_micros"),
+                    last_error_micros: row.get("last_error_micros"),
+                    last_error: row.get("last_error"),
+                    consecutive_failures: row.get("consecutive_failures"),
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// Advance `id`'s cursor and record a successful delivery.
+    ///
+    /// The cursor and the success are written TOGETHER on purpose: recording delivery
+    /// without advancing would reship the batch forever, and advancing without recording
+    /// would report a stream as never having delivered while it silently worked.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn record_success(
+        &self,
+        env: &Env,
+        id: &str,
+        cursor: (i64, &str),
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "UPDATE log_streams SET \
+                cursor_occurred_at = \
+                    (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval), \
+                cursor_audit_id = $5, \
+                last_success_at = \
+                    (TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval), \
+                last_error = NULL, \
+                consecutive_failures = 0 \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id)
+        .bind(cursor.0)
+        .bind(cursor.1)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record a failed delivery, extending the consecutive-failure run.
+    ///
+    /// Does NOT advance the cursor: the batch is retried. `reason` must be
+    /// operator-safe (a status and a cause, never a response body, which would carry
+    /// back whatever the sink echoed).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn record_failure(
+        &self,
+        env: &Env,
+        id: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "UPDATE log_streams SET \
+                last_error_at = \
+                    (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval), \
+                last_error = $5, \
+                consecutive_failures = consecutive_failures + 1 \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id)
+        .bind(now)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// What one retention pass removed.

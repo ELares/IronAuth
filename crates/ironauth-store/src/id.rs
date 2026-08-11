@@ -724,6 +724,17 @@ impl ScopedKind for ConnectorKind {
     const PREFIX: &'static str = "cnr";
 }
 
+/// Marker for a configured SIEM log stream (`lgs_`), one shipping instruction per sink
+/// (issue #110). A tenant-scoped resource: the id embeds its (tenant, environment), so a
+/// stream configured in one scope parses as a uniform not-found under another. NOT
+/// promotable: a stream names a sink credential and carries a delivery cursor, neither of
+/// which means anything in another environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LogStreamKind;
+impl ScopedKind for LogStreamKind {
+    const PREFIX: &'static str = "lgs";
+}
+
 /// Marker for a registered Standard Webhooks delivery endpoint (`whe_`), one POST target
 /// per environment (issue #105). A tenant-scoped resource: the id embeds its (tenant,
 /// environment), so an endpoint registered in one scope parses as a uniform not-found
@@ -1674,6 +1685,9 @@ pub type ConsentId = ScopedId<ConsentKind>;
 /// inbound-federation upstream definition per environment (issue #75). The prefix
 /// is `cnr` (distinct from consent's `con`).
 pub type ConnectorId = ScopedId<ConnectorKind>;
+
+/// A configured SIEM log stream (issue #110).
+pub type LogStreamId = ScopedId<LogStreamKind>;
 
 /// A registered webhook delivery endpoint (issue #105).
 pub type WebhookEndpointId = ScopedId<WebhookEndpointKind>;
