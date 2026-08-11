@@ -33,16 +33,28 @@ use std::collections::BTreeSet;
 ///
 /// #706 shipped the column and the seam; this list is where adoption becomes visible.
 const ORG_ATTRIBUTED: &[&str] = &[
-    // The first adopter, and the proof the ratchet falls rather than only rising.
+    "addOrgGroupMember",
+    "clearOrgDefaultRole",
+    "createMembership",
+    "createOrgGroup",
     "createOrgRole",
+    "deleteMembership",
+    "deleteOrgGroup",
+    "deleteOrgRole",
+    "removeOrgGroupMember",
+    "setOrgDefaultRole",
+    "setOrgGroupParent",
+    "updateOrgGroup",
+    "updateOrgRole",
 ];
 
 /// How many organization-scoped operations do NOT yet attribute their audit rows.
 ///
-/// This may only FALL. It was 40 when #706 landed the seam with no adopters.
+/// This may only FALL. It was 40 when #706 landed the seam with no adopters, and is now
+/// 27: the organization role, group, group-member and membership surfaces adopted it.
 /// Lower it in the same change that adopts the seam; the test below fails if you adopt
 /// without lowering, so the number cannot go stale.
-const UNATTRIBUTED_CEILING: usize = 39;
+const UNATTRIBUTED_CEILING: usize = 27;
 
 /// Where each attributed operation's handler lives, so the claim can be CHECKED.
 ///
@@ -51,8 +63,27 @@ const UNATTRIBUTED_CEILING: usize = 39;
 /// module calls the seam, not that this particular handler does. That is the same
 /// granularity `ADMIN_SOURCES` uses elsewhere in this crate, and it is honest about what
 /// it catches, which is a list padded with a module that never adopted the seam at all.
-const ATTRIBUTED_SOURCES: &[(&str, &str)] =
-    &[("createOrgRole", include_str!("../src/org_roles.rs"))];
+const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
+    ("createMembership", include_str!("../src/memberships.rs")),
+    ("deleteMembership", include_str!("../src/memberships.rs")),
+    (
+        "addOrgGroupMember",
+        include_str!("../src/org_group_members.rs"),
+    ),
+    (
+        "removeOrgGroupMember",
+        include_str!("../src/org_group_members.rs"),
+    ),
+    ("createOrgGroup", include_str!("../src/org_groups.rs")),
+    ("deleteOrgGroup", include_str!("../src/org_groups.rs")),
+    ("setOrgGroupParent", include_str!("../src/org_groups.rs")),
+    ("updateOrgGroup", include_str!("../src/org_groups.rs")),
+    ("clearOrgDefaultRole", include_str!("../src/org_roles.rs")),
+    ("createOrgRole", include_str!("../src/org_roles.rs")),
+    ("deleteOrgRole", include_str!("../src/org_roles.rs")),
+    ("setOrgDefaultRole", include_str!("../src/org_roles.rs")),
+    ("updateOrgRole", include_str!("../src/org_roles.rs")),
+];
 
 /// Every operation whose documented path is scoped to an organization.
 fn org_scoped_operations() -> BTreeSet<String> {

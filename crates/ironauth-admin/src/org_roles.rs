@@ -515,6 +515,8 @@ pub async fn update_org_role(
             .store()
             .management()
             .acting(actor, CorrelationId::generate(state.env()))
+            // Attribute the audit row to this organization (issue #110).
+            .in_organization(org_id)
             .org_roles(scope)
             .update(
                 state.env(),
@@ -582,6 +584,8 @@ pub async fn delete_org_role(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_roles(scope)
         .delete(state.env(), &record.id)
         .await?;
@@ -649,6 +653,8 @@ pub async fn set_org_default_role(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_roles(scope)
         .set_default(state.env(), &org_id, &role)
         .await;
@@ -721,6 +727,8 @@ pub async fn clear_org_default_role(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
         .org_roles(scope)
         .clear_default(state.env(), &org_id)
         .await?;
