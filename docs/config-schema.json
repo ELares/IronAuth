@@ -813,6 +813,25 @@
         }
       ]
     },
+    "LogStreamsConfig": {
+      "additionalProperties": false,
+      "description": "SIEM log stream shipping settings (issue #110).\n\nOFF by default, like every other background worker here: no mandatory background\ninfrastructure. A deployment that never opens this section ships nothing, and its\nconfigured streams simply do not advance rather than losing events, because the cursor\nis durable and the audit rows stay where they are.",
+      "properties": {
+        "interval_secs": {
+          "default": 60,
+          "description": "Seconds between shipping passes.\n\nA pass is bounded, so a stream far behind catches up over several passes rather\nthan holding a sink for an unbounded time. The default trades export latency for\na small, predictable read rate against the audit table.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "shipping_enabled": {
+          "default": false,
+          "description": "Whether THIS process ships configured log streams. OFF by default.\n\nTurning it off does not stop streams being configured or audit rows being written;\nit stops them being SHIPPED by this process. That separation is what lets a\ndeployment run its shippers on dedicated nodes.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "OidcConfig": {
       "additionalProperties": false,
       "description": "OIDC provider settings (issue #12).\n\nThe public authorization and token endpoints. Lifetimes are configurable (the\ntunability principle) with safe defaults, never a baked-in one-way choice: the\nauthorization code is short-lived and single-use, the access token a little\nlonger. Mounting is opt-in so the default (and database-free) boot is\nunchanged.",
@@ -2747,6 +2766,14 @@
         "uniqueness": "environment_wide"
       },
       "description": "Flexible-identifier settings (issue #54): the per-environment uniqueness\npolicy for typed login identifiers. Safe default: environment-wide uniqueness."
+    },
+    "log_streams": {
+      "$ref": "#/$defs/LogStreamsConfig",
+      "default": {
+        "interval_secs": 60,
+        "shipping_enabled": false
+      },
+      "description": "SIEM log stream shipping (issue #110): whether THIS process ships configured\nstreams to their sinks, and how often.\n\nSeparate from `[webhooks]` on purpose. That gates the tenant-facing event\ndeliverer; this gates the operator-facing audit export, and a deployment routinely\nwants one without the other."
     },
     "oidc": {
       "$ref": "#/$defs/OidcConfig",

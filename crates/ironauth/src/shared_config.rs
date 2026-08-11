@@ -593,6 +593,15 @@ mod tests {
     /// must state rather than one they can omit.
     const PLANE_LOCAL_KEYS: &[(&str, Reach, &str)] = &[
         (
+            "log_streams",
+            Reach::OnePlaneOrNoState,
+            "consumed once at boot to build the SIEM log stream shipper (issue #110), a \
+             background task that answers no request. Neither plane state holds it: the \
+             shipper reads audit rows and writes only a stream's cursor and health \
+             columns, and handing the section to a plane would suggest a request path \
+             can ship, which none does.",
+        ),
+        (
             "audit_retention",
             Reach::OnePlaneOrNoState,
             "consumed once at boot to build the audit retention sweeper (issue #109), a \

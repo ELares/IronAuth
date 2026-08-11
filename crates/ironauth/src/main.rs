@@ -52,6 +52,8 @@ use ironauth_store::{
     },
 };
 
+use ironauth_admin::log_shipper::{DatadogSink, HttpLogSink, LogShipper, LogSink, SplunkHecSink};
+
 use crate::shared_config::SharedPlaneInputs;
 
 /// The config sections both planes must receive identically (issue #414).
@@ -289,6 +291,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // grows fastest. The only switch is `outbox.reap_enabled`, which defaults ON.
         let retention_inputs = retention_sweeper_inputs(&config, &env);
         let audit_retention_inputs = audit_retention_inputs(&config, &env);
+        let log_shipper_inputs = log_shipper_inputs(&config, &env);
         let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
         let trait_migration = trait_migration_inputs(&config, &env);
@@ -409,6 +412,10 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // named where they are decided: `outbox.reap_enabled` in `retention_sweeper_inputs`
         // and a missing control-plane DSN in `start_retention_sweeper`. BOUND rather than
         // detached, so the shutdown below can await it.
+        let log_shipper = match log_shipper_inputs {
+            Some(inputs) => start_log_shipper(inputs).await,
+            None => None,
+        };
         let audit_retention_sweeper = match audit_retention_inputs {
             Some(inputs) => start_audit_retention_sweeper(inputs).await,
             None => None,
@@ -461,6 +468,9 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
         if let Some(sweeper) = audit_retention_sweeper {
             sweeper.shutdown().await;
+        }
+        if let Some(shipper) = log_shipper {
+            shipper.shutdown().await;
         }
         // Stopped last: it reads the same table the pools and the reaper write, and a
         // sample racing their shutdown would publish a reading of a queue mid-drain.
@@ -2739,6 +2749,93 @@ async fn spawn_trait_migration_pools(inputs: TraitMigrationInputs) -> Vec<Outbox
         "trait migration jobs started on the outbox consumer pools"
     );
     pools
+}
+
+/// What the SIEM log stream shipper (issue #110) needs, captured before `config` moves
+/// into the server.
+struct LogShipperInputs {
+    /// The `[log_streams]` section.
+    log_streams: ironauth_config::LogStreamsConfig,
+    /// The DATA-plane DSN. The shipper reads audit rows and advances a stream's cursor
+    /// and health, which is exactly the column-scoped grant 0137 gives `ironauth_app`.
+    data_dsn: Option<String>,
+    /// The CONTROL-plane DSN, used only to enumerate scopes: listing environments is a
+    /// control-plane read the data role cannot do.
+    control_dsn: Option<String>,
+    /// The environment seam (deterministic clock and entropy).
+    env: Env,
+}
+
+/// Capture the shipper's inputs, or `None` when shipping is switched off.
+fn log_shipper_inputs(config: &Config, env: &Env) -> Option<LogShipperInputs> {
+    if !config.log_streams.shipping_enabled {
+        return None;
+    }
+    Some(LogShipperInputs {
+        log_streams: config.log_streams.clone(),
+        data_dsn: Some(config.database.url.expose().to_owned()),
+        control_dsn: select_control_dsn(config),
+        env: env.clone(),
+    })
+}
+
+/// Start the SIEM log stream shipper, or `None` when it could not be started.
+///
+/// Every early return says WHAT is not running and WHY. A silent absence here means a
+/// configured export quietly stops advancing, and the operator's first symptom is a gap in
+/// their SIEM rather than an error anywhere.
+async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
+    let LogShipperInputs {
+        log_streams,
+        data_dsn,
+        control_dsn,
+        env,
+    } = inputs;
+
+    let (Some(data_dsn), Some(control_dsn)) = (data_dsn, control_dsn) else {
+        tracing::error!(
+            "log stream shipping NOT running: it needs BOTH a data-plane DSN (to read \
+             audit rows and advance a stream's cursor) and a control-plane DSN (to \
+             enumerate scopes, which only the control role may read). Configured streams \
+             will not advance."
+        );
+        return None;
+    };
+    let (Ok(data_store), Ok(control_store)) = (
+        Store::connect(&data_dsn).await,
+        Store::connect(&control_dsn).await,
+    ) else {
+        tracing::error!("log stream shipping NOT running: a database connect failed");
+        return None;
+    };
+    let fetcher = match ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default()) {
+        Ok(fetcher) => Arc::new(fetcher),
+        Err(error) => {
+            tracing::error!(%error, "log stream shipping NOT running: TLS setup failed");
+            return None;
+        }
+    };
+
+    // Every sink this build implements. A stream configured for one that is absent
+    // records that it cannot ship rather than failing silently.
+    let sinks: Vec<Arc<dyn LogSink>> = vec![
+        Arc::new(HttpLogSink::new(Arc::clone(&fetcher))),
+        Arc::new(DatadogSink::new(Arc::clone(&fetcher))),
+        Arc::new(SplunkHecSink::new(fetcher)),
+    ];
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let shipper = LogShipper::spawn(
+        data_store,
+        env,
+        scopes,
+        sinks,
+        std::time::Duration::from_secs(log_streams.interval_secs),
+    );
+    tracing::info!(
+        interval_secs = log_streams.interval_secs,
+        "SIEM log stream shipping started"
+    );
+    Some(shipper)
 }
 
 /// What the audit retention sweeper (issue #109) needs, captured before `config` moves
