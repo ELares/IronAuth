@@ -59,6 +59,7 @@ pub mod email_otp;
 pub mod environment;
 mod error;
 pub mod esv;
+pub mod event_catalog;
 pub mod federation_state;
 pub mod flow;
 pub mod flow_version;
