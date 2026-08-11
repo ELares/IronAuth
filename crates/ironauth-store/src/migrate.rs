@@ -1088,6 +1088,18 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0132_backfill_login_index_job_kind.sql"),
         },
+        Migration {
+            version: 133,
+            name: "audit_stream",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0133_audit_stream.sql"),
+        },
+        Migration {
+            version: 134,
+            name: "audit_stream_backfill",
+            phase: Phase::Migrate,
+            sql: include_str!("../migrations/0134_audit_stream_backfill.sql"),
+        },
     ]
 }
 

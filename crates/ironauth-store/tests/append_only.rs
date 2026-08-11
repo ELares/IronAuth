@@ -97,8 +97,8 @@ async fn app_role_may_select_and_insert_but_never_update_or_delete_audit_rows() 
         let result = sqlx::query(
             "INSERT INTO audit_log \
              (id, tenant_id, environment_id, action, actor_kind, actor_id, \
-              target_kind, target_id, correlation_id, occurred_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())",
+              target_kind, target_id, correlation_id, occurred_at, stream) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10)",
         )
         .bind(AuditId::generate(&env, &scope).to_string())
         .bind(&tenant)
@@ -109,6 +109,8 @@ async fn app_role_may_select_and_insert_but_never_update_or_delete_audit_rows() 
         .bind("cli")
         .bind(target.to_string())
         .bind(CorrelationId::generate(&env).to_string())
+        // `client.create` is Entity Management, whose stream is the admin one (issue #109).
+        .bind("admin_action")
         .execute(&mut *tx)
         .await;
         assert!(
