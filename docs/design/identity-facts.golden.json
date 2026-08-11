@@ -1,0 +1,58 @@
+[
+  {
+    "fact": {
+      "fact": "user_created",
+      "user_id": "usr_1"
+    },
+    "ordering_group": "usr_1",
+    "is_removal": false
+  },
+  {
+    "fact": {
+      "fact": "user_deleted",
+      "user_id": "usr_1"
+    },
+    "ordering_group": "usr_1",
+    "is_removal": true
+  },
+  {
+    "fact": {
+      "fact": "membership_added",
+      "user_id": "usr_1",
+      "organization_id": "org_1",
+      "membership_id": "omb_1"
+    },
+    "ordering_group": "usr_1",
+    "is_removal": false
+  },
+  {
+    "fact": {
+      "fact": "membership_removed",
+      "user_id": "usr_1",
+      "organization_id": "org_1",
+      "membership_id": "omb_1"
+    },
+    "ordering_group": "usr_1",
+    "is_removal": true
+  },
+  {
+    "fact": {
+      "fact": "role_assigned",
+      "membership_id": "omb_1",
+      "organization_id": "org_1",
+      "role_slug": "editor"
+    },
+    "ordering_group": "omb_1",
+    "is_removal": false
+  },
+  {
+    "fact": {
+      "fact": "role_unassigned",
+      "membership_id": "omb_1",
+      "organization_id": "org_1",
+      "role_slug": "editor"
+    },
+    "ordering_group": "omb_1",
+    "is_removal": true
+  }
+]
