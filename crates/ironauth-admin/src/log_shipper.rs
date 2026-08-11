@@ -745,6 +745,57 @@ impl LogSink for SplunkHecSink {
     }
 }
 
+/// One stream's state at the end of a pass, for the metrics surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamObservation {
+    /// Which sink this stream ships to.
+    pub sink_type: SinkType,
+    /// Its coarse delivery status.
+    pub status: ironauth_store::log_stream::StreamStatus,
+    /// Outstanding dead letters: batches set aside and not yet replayed.
+    pub outstanding_dead_letters: u64,
+}
+
+/// Told what each shipping pass saw, so the BINARY can emit metrics.
+///
+/// An observer rather than a metrics call here, matching the outbox and retention
+/// sweepers: this crate takes no metrics dependency, and the aggregation that keeps
+/// cardinality bounded belongs with the exporter.
+pub trait LogShipperObserver: Send + Sync {
+    /// Every active stream in one scope, at the end of a pass over it.
+    fn observed(&self, streams: &[StreamObservation]);
+}
+
+/// An observer that says nothing, for tests and for a deployment with no exporter.
+pub struct SilentShipperObserver;
+
+impl LogShipperObserver for SilentShipperObserver {
+    fn observed(&self, _streams: &[StreamObservation]) {}
+}
+
+/// Collect the observation for every active stream in `scope`.
+///
+/// # Errors
+///
+/// [`StoreError`] when the streams cannot be listed.
+pub async fn observe(store: &Store, scope: Scope) -> Result<Vec<StreamObservation>, StoreError> {
+    let scoped = store.scoped(scope);
+    let mut out = Vec::new();
+    for stream in scoped.log_streams().list_active().await? {
+        let outstanding = scoped
+            .log_streams()
+            .outstanding_dead_letters(&stream.id)
+            .await?
+            .len();
+        out.push(StreamObservation {
+            sink_type: stream.sink_type,
+            status: stream.health.status(),
+            outstanding_dead_letters: u64::try_from(outstanding).unwrap_or(u64::MAX),
+        });
+    }
+    Ok(out)
+}
+
 /// The background task that ships every configured stream on an interval.
 ///
 /// Modelled on the audit retention sweeper (issue #109) and for the same reason: a pass
@@ -763,6 +814,7 @@ impl LogShipper {
         env: Env,
         scopes: Arc<dyn ironauth_store::outbox::ScopeSource>,
         sinks: Vec<Arc<dyn LogSink>>,
+        observer: Arc<dyn LogShipperObserver>,
         interval: std::time::Duration,
     ) -> Self {
         use std::sync::atomic::Ordering;
@@ -786,6 +838,16 @@ impl LogShipper {
                                     %error,
                                     "a log stream shipping pass could not read its streams"
                                 );
+                                continue;
+                            }
+                            // Observed AFTER the pass, so the status reflects what this
+                            // pass did rather than what the previous one left behind.
+                            match observe(&store, scope).await {
+                                Ok(streams) => observer.observed(&streams),
+                                Err(error) => tracing::error!(
+                                    %error,
+                                    "a log stream pass could not be observed for metrics"
+                                ),
                             }
                         }
                     }

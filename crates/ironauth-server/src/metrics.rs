@@ -49,6 +49,22 @@ pub const OUTBOX_DEPTH: &str = "ironauth_outbox_depth";
 /// and is not counted here, because it is waiting by design rather than for want of a worker.
 pub const OUTBOX_OLDEST_READY_AGE_SECONDS: &str = "ironauth_outbox_oldest_ready_age_seconds";
 
+/// Configured SIEM log streams, labeled by `sink_type` and `status` (`healthy`,
+/// `degraded`, `failing`), summed across every scope the shipper swept (issue #110).
+///
+/// Labeled by SINK TYPE and STATUS only, never by stream id, tenant or environment, for
+/// the reason spelled out on the outbox series above: an operator-created stream id is
+/// unbounded, and an unbounded label on a multi-tenant deployment is how a Prometheus
+/// instance falls over. Four sink types by three statuses is twelve series no matter how
+/// many streams exist. The per-stream detail is not lost; it is on the authenticated
+/// `GET .../log-streams` surface, which can afford it.
+pub const LOG_STREAMS: &str = "ironauth_log_streams";
+/// Outstanding dead-lettered batches, labeled by `sink_type`, summed across scopes.
+///
+/// Outstanding means set aside and not yet replayed, so this is the size of the export
+/// gap an operator has not yet closed. It falls when a replay succeeds.
+pub const LOG_STREAM_DEAD_LETTERS: &str = "ironauth_log_stream_dead_letters";
+
 /// The `outcome` label values of [`OUTBOX_MESSAGES_TOTAL`], which together partition every
 /// message a drain pass finished with.
 pub const OUTBOX_OUTCOMES: [&str; 4] = ["completed", "retried", "dead_lettered", "lease_lost"];
@@ -123,6 +139,14 @@ fn describe() {
         OUTBOX_OLDEST_READY_AGE_SECONDS,
         metrics::Unit::Seconds,
         "How long the oldest ready outbox message has been overdue, by consumer"
+    );
+    metrics::describe_gauge!(
+        LOG_STREAMS,
+        "Configured SIEM log streams summed across scopes, by sink type and status"
+    );
+    metrics::describe_gauge!(
+        LOG_STREAM_DEAD_LETTERS,
+        "Outstanding dead-lettered log stream batches summed across scopes, by sink type"
     );
 }
 
