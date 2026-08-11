@@ -1062,3 +1062,196 @@ mod s3_tests {
         assert_eq!(timestamp, "19700101T000000Z");
     }
 }
+
+// ===========================================================================
+// The signed security-event stream (issue #110, exploratory slice).
+//
+// EXPLORATORY under the feature maturity ladder. It is off unless a stream names a signing
+// secret, and the full productization (SSF/CAEP transmitter) is M14's, not this.
+
+/// The header carrying the batch signature: `v1=<lowercase hex>`.
+pub const HEADER_SIGNATURE: &str = "x-ironauth-signature";
+/// The header carrying the batch's position, so a consumer can order and deduplicate.
+pub const HEADER_SEQUENCE: &str = "x-ironauth-sequence";
+
+/// What a consumer must be given to verify a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedBatch {
+    /// The exact bytes that were signed and sent.
+    pub body: String,
+    /// `v1=<hex>`.
+    pub signature: String,
+    /// The last audit id in the batch: this batch's position in the stream's order.
+    pub sequence: String,
+}
+
+/// Sign `body` for `sequence` under `secret`.
+///
+/// The SEQUENCE is inside the signed input, not merely alongside it. Signing the body alone
+/// would let an attacker who can reorder deliveries replay an older batch under a newer
+/// position, and the signature would still verify: the consumer would accept stale events
+/// as current. Binding the two means a batch verifies only at the position it was sent for.
+#[must_use]
+pub fn sign_batch(secret: &str, sequence: &str, body: &str) -> SignedBatch {
+    let signed_input = format!("{sequence}.{body}");
+    let digest = crate::sigv4::hmac_sha256_hex(secret.as_bytes(), signed_input.as_bytes());
+    SignedBatch {
+        body: body.to_string(),
+        signature: format!("v1={digest}"),
+        sequence: sequence.to_string(),
+    }
+}
+
+/// Why a consumer refused a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyFailure {
+    /// The signature header is not `v1=<hex>`.
+    Malformed,
+    /// The signature does not match the body and sequence under this secret.
+    BadSignature,
+    /// The batch's position is not after the last one accepted.
+    OutOfOrder,
+}
+
+/// The reference consumer: verify `batch` under `secret`, given the last accepted sequence.
+///
+/// This IS the published sample consumer the issue asks for, kept in the same crate as the
+/// signer so the two cannot drift. A sample that lived in documentation would be a second
+/// implementation nobody compiles.
+///
+/// # Errors
+///
+/// [`VerifyFailure`] naming which check failed.
+pub fn verify_batch(
+    secret: &str,
+    last_accepted: Option<&str>,
+    batch: &SignedBatch,
+) -> Result<(), VerifyFailure> {
+    let Some(offered) = batch.signature.strip_prefix("v1=") else {
+        return Err(VerifyFailure::Malformed);
+    };
+    if offered.is_empty() || !offered.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(VerifyFailure::Malformed);
+    }
+    let expected = sign_batch(secret, &batch.sequence, &batch.body);
+    let Some(expected_hex) = expected.signature.strip_prefix("v1=") else {
+        return Err(VerifyFailure::Malformed);
+    };
+    // Constant-time: a byte-by-byte early exit leaks how much of a forged signature was
+    // right, which is enough to build one a byte at a time.
+    if !constant_time_eq(offered.as_bytes(), expected_hex.as_bytes()) {
+        return Err(VerifyFailure::BadSignature);
+    }
+    // Ordering, checked AFTER the signature. Checking it first would answer a question
+    // about the stream's position to a caller who has not proven they hold the secret.
+    if let Some(last) = last_accepted {
+        if batch.sequence.as_str() <= last {
+            return Err(VerifyFailure::OutOfOrder);
+        }
+    }
+    Ok(())
+}
+
+/// Whether two byte strings are equal, in time independent of where they differ.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
+#[cfg(test)]
+mod signed_stream_tests {
+    use super::*;
+
+    const SECRET: &str = "stream-signing-secret";
+
+    fn batch() -> SignedBatch {
+        sign_batch(SECRET, "aud_10", r#"[{"uid":"aud_10"}]"#)
+    }
+
+    #[test]
+    fn the_sample_consumer_accepts_what_the_signer_produced() {
+        assert_eq!(verify_batch(SECRET, None, &batch()), Ok(()));
+        assert_eq!(verify_batch(SECRET, Some("aud_09"), &batch()), Ok(()));
+    }
+
+    #[test]
+    fn a_tampered_body_is_refused() {
+        let mut tampered = batch();
+        tampered.body = r#"[{"uid":"aud_10","injected":true}]"#.to_string();
+        assert_eq!(
+            verify_batch(SECRET, None, &tampered),
+            Err(VerifyFailure::BadSignature)
+        );
+    }
+
+    /// The sequence is INSIDE the signed input, so a batch cannot be replayed at a
+    /// different position.
+    ///
+    /// Signing the body alone would let anyone who can reorder deliveries present an old
+    /// batch under a newer sequence, and it would verify. The consumer would accept stale
+    /// events as current, which is exactly what a signed audit stream must prevent.
+    #[test]
+    fn a_batch_cannot_be_replayed_under_a_different_sequence() {
+        let mut moved = batch();
+        moved.sequence = "aud_99".to_string();
+        assert_eq!(
+            verify_batch(SECRET, None, &moved),
+            Err(VerifyFailure::BadSignature),
+            "moving a batch to another position must break the signature, not merely the \
+             ordering check"
+        );
+    }
+
+    #[test]
+    fn a_batch_at_or_before_the_last_accepted_position_is_out_of_order() {
+        assert_eq!(
+            verify_batch(SECRET, Some("aud_10"), &batch()),
+            Err(VerifyFailure::OutOfOrder),
+            "the same position twice is a replay, not progress"
+        );
+        assert_eq!(
+            verify_batch(SECRET, Some("aud_11"), &batch()),
+            Err(VerifyFailure::OutOfOrder)
+        );
+    }
+
+    #[test]
+    fn another_secret_does_not_verify() {
+        assert_eq!(
+            verify_batch("someone-elses-secret", None, &batch()),
+            Err(VerifyFailure::BadSignature)
+        );
+    }
+
+    #[test]
+    fn a_malformed_signature_header_is_refused_before_anything_else() {
+        for offered in ["", "abc", "v2=abcd", "v1=", "v1=nothex"] {
+            let mut malformed = batch();
+            malformed.signature = offered.to_string();
+            assert_eq!(
+                verify_batch(SECRET, None, &malformed),
+                Err(VerifyFailure::Malformed),
+                "`{offered}` must be refused as malformed"
+            );
+        }
+    }
+
+    /// The ordering answer is only given to a caller who proved they hold the secret.
+    #[test]
+    fn a_bad_signature_is_reported_even_when_the_order_is_also_wrong() {
+        let mut both = batch();
+        both.body = "[]".to_string();
+        assert_eq!(
+            verify_batch(SECRET, Some("aud_99"), &both),
+            Err(VerifyFailure::BadSignature),
+            "the signature is checked first, so ordering is never answered to an \
+             unauthenticated caller"
+        );
+    }
+}
