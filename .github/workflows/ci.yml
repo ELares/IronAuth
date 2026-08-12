@@ -422,6 +422,99 @@ jobs:
   # job drives the merge-gate profile subset and FAILS CLOSED: run-conformance.sh
   # exits non-zero if the runner is missing, if the selection is empty, if the
   # selector crashed, or on any non-PASS module. It cannot be vacuously green.
+  sdk-runtimes:
+    # The five-runtime portability matrix the SDK core exists for (issue #115).
+    #
+    # The package's whole premise is that one core runs unmodified on Node, Deno, Bun,
+    # Cloudflare Workers and Vercel Edge. A `node:` import compiles, passes every test on
+    # Node, and fails ONLY on the runtimes nobody runs the suite on, so the premise has to
+    # be executed rather than asserted. `scripts/gate.sh` runs the Node lane locally; this
+    # job is the other four.
+    #
+    # Workers and Vercel Edge are covered by workerd, which is the actual Workers runtime
+    # rather than a shim: `vercel dev` needs an account and a deployment, and a lane that
+    # cannot run on a fork's PR is a lane that quietly never runs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: install (locked)
+        working-directory: packages/ironauth-sdk
+        run: npm ci --no-audit --no-fund
+      - name: build once, run everywhere
+        # Compiled ONCE and executed by each runtime, so every lane runs identical
+        # JavaScript. Compiling per runtime would let a lane pass against different output.
+        working-directory: packages/ironauth-sdk
+        run: npx tsc
+      - name: node (full suite, plus the shared portability checks)
+        working-directory: packages/ironauth-sdk
+        run: |
+          set -euo pipefail
+          node --test "dist/**/*.test.js"
+          node workers/run-checks.mjs | tee /tmp/node.json
+          grep -q '"count":7' /tmp/node.json
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: deno
+        working-directory: packages/ironauth-sdk
+        # The shared checks, NOT `deno test dist/`. Deno's runner does not collect
+        # `node:test` cases, so pointing it at the compiled suite runs ZERO tests and exits
+        # 0: a lane that passes by running nothing is worse than no lane.
+        #
+        # No `--allow-net`, so a module that reached the network on import would fail here.
+        run: |
+          set -euo pipefail
+          deno run --allow-read --allow-env workers/run-checks.mjs | tee /tmp/deno.json
+          # The lane must PROVE it ran. A runtime whose entry point silently does nothing
+          # exits 0, and a green step that executed no checks is the failure this whole
+          # matrix exists to avoid.
+          grep -q '"count":7' /tmp/deno.json
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: bun
+        working-directory: packages/ironauth-sdk
+        # The shared checks, for the same reason as the Deno lane.
+        run: |
+          set -euo pipefail
+          bun run workers/run-checks.mjs | tee /tmp/bun.json
+          grep -q '"count":7' /tmp/bun.json
+      - name: workerd (cloudflare workers, and the vercel edge runtime by proxy)
+        working-directory: packages/ironauth-sdk/workers
+        # Run INSIDE workerd, the real Workers runtime, not under Node with a shim. That
+        # distinction is the entire value of this lane: executing the smoke under Node
+        # would re-run what the Node lane already covers and prove nothing about Workers.
+        #
+        # `wrangler dev --local` starts workerd; the smoke imports every portable module,
+        # so a `node:` specifier fails at module load and the fetch never answers 200.
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4 dev --local --port 8787 &
+          worker=$!
+          trap 'kill "$worker" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8787/ >/tmp/smoke.json 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          cat /tmp/smoke.json
+          # Fail on a body that does not say ok, INCLUDING an empty one: a worker that
+          # never started would otherwise leave an empty file and pass a looser check.
+          node -e '
+            const fs = require("node:fs");
+            const raw = fs.readFileSync("/tmp/smoke.json", "utf8");
+            if (raw.trim() === "") { throw new Error("workerd never answered"); }
+            const body = JSON.parse(raw);
+            if (!body.ok) { throw new Error("failed in workerd: " + body.failed.join(", ")); }
+            if (body.count !== 7) { throw new Error("wrong check count: " + body.count); }
+            if (body.short) { throw new Error("the worker reported a short run"); }
+          '
+
+
   conformance-live:
     name: OIDF conformance live suite (advisory until provisioned; NOT a gate)
     runs-on: ubuntu-latest

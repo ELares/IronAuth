@@ -1,0 +1,7 @@
+# The portability smoke worker (issue #115). Not a deployed worker: it exists so CI can
+# execute the SDK core inside the real Workers runtime.
+name = "ironauth-sdk-portability-smoke"
+main = "smoke.mjs"
+compatibility_date = "2025-01-01"
+# Ed25519 via WebCrypto, which is what the DPoP core signs with.
+compatibility_flags = ["nodejs_compat_v2"]
