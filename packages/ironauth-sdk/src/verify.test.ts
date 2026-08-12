@@ -99,6 +99,54 @@ test('a well-formed token from a published key verifies', async () => {
   assert.equal(verified.header.kid, 'k1');
 });
 
+/**
+ * RS256 verification, via WebCrypto only.
+ *
+ * The issue asks for Ed25519 AND RS256 to both work with no Node crypto, and until now only
+ * Ed25519 was exercised: `algorithmParameters` listed RS256 and nothing proved the mapping
+ * was right. A wrong hash or a wrong import algorithm there fails only at runtime, for the
+ * deployments that configured RS256.
+ */
+test('an RS256 token verifies through WebCrypto alone', async () => {
+  const pair = (await crypto.subtle.generateKey(
+    {
+      name: 'RSASSA-PKCS1-v1_5',
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: 'SHA-256',
+    },
+    true,
+    ['sign', 'verify'],
+  )) as CryptoKeyPair;
+  const exported = await crypto.subtle.exportKey('jwk', pair.publicKey);
+  const jwk = { kty: exported.kty, n: exported.n, e: exported.e, kid: 'rsa-1', alg: 'RS256' };
+  const server = jwksServer([jwk]);
+
+  const input = `${encode({ alg: 'RS256', kid: 'rsa-1' })}.${encode(goodClaims())}`;
+  const signature = await crypto.subtle.sign(
+    { name: 'RSASSA-PKCS1-v1_5' },
+    pair.privateKey,
+    new TextEncoder().encode(input),
+  );
+  const token = `${input}.${base64url(new Uint8Array(signature))}`;
+
+  const verified = await verifyToken(token, cacheOf(server, () => NOW), {
+    ...options,
+    algorithms: ['RS256'],
+  });
+  assert.equal(verified.header.alg, 'RS256');
+  assert.equal(verified.claims.iss, ISSUER);
+
+  // And a tampered RS256 payload still fails, so the success above is the signature
+  // verifying rather than the check being skipped for this algorithm.
+  const [header, , sig] = token.split('.');
+  const forged = `${header}.${encode(goodClaims({ sub: 'attacker' }))}.${sig}`;
+  await assert.rejects(
+    () => verifyToken(forged, cacheOf(server, () => NOW), { ...options, algorithms: ['RS256'] }),
+    (error: VerifyError) => error.reason === 'bad_signature',
+  );
+});
+
 test('a tampered payload fails the signature', async () => {
   const key = await signingKey('k1');
   const server = jwksServer([key.jwk]);
