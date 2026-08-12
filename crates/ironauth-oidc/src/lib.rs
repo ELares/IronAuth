@@ -80,6 +80,9 @@ mod backchannel;
 pub mod branding;
 mod broker_overlay;
 mod challenge;
+/// Client ID Metadata Document hardening (issue #128): the pure rules a URL `client_id`
+/// and its fetched document must satisfy before either is trusted.
+pub mod cimd;
 mod claims_request;
 mod client_auth;
 mod client_credentials;
