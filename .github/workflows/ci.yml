@@ -451,8 +451,10 @@ jobs:
       - name: node (full suite, plus the shared portability checks)
         working-directory: packages/ironauth-sdk
         run: |
+          set -euo pipefail
           node --test "dist/**/*.test.js"
-          node workers/run-checks.mjs
+          node workers/run-checks.mjs | tee /tmp/node.json
+          grep -q '"count":7' /tmp/node.json
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -463,14 +465,23 @@ jobs:
         # 0: a lane that passes by running nothing is worse than no lane.
         #
         # No `--allow-net`, so a module that reached the network on import would fail here.
-        run: deno run --allow-read --allow-env workers/run-checks.mjs
+        run: |
+          set -euo pipefail
+          deno run --allow-read --allow-env workers/run-checks.mjs | tee /tmp/deno.json
+          # The lane must PROVE it ran. A runtime whose entry point silently does nothing
+          # exits 0, and a green step that executed no checks is the failure this whole
+          # matrix exists to avoid.
+          grep -q '"count":7' /tmp/deno.json
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
       - name: bun
         working-directory: packages/ironauth-sdk
         # The shared checks, for the same reason as the Deno lane.
-        run: bun run workers/run-checks.mjs
+        run: |
+          set -euo pipefail
+          bun run workers/run-checks.mjs | tee /tmp/bun.json
+          grep -q '"count":7' /tmp/bun.json
       - name: workerd (cloudflare workers, and the vercel edge runtime by proxy)
         working-directory: packages/ironauth-sdk/workers
         # Run INSIDE workerd, the real Workers runtime, not under Node with a shim. That
@@ -499,7 +510,8 @@ jobs:
             if (raw.trim() === "") { throw new Error("workerd never answered"); }
             const body = JSON.parse(raw);
             if (!body.ok) { throw new Error("failed in workerd: " + body.failed.join(", ")); }
-            if (body.count < 6) { throw new Error("too few checks ran: " + body.count); }
+            if (body.count !== 7) { throw new Error("wrong check count: " + body.count); }
+            if (body.short) { throw new Error("the worker reported a short run"); }
           '
 
 
