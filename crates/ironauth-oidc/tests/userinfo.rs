@@ -219,12 +219,26 @@ async fn conform_override_copies_scope_claims_into_the_id_token() {
 }
 
 #[tokio::test]
-async fn a_missing_token_is_401_with_a_bare_bearer_challenge() {
+async fn a_missing_token_is_401_with_both_scheme_challenges() {
     let harness = Harness::start().await;
     let (status, headers, _) = userinfo(&harness, "GET", None, None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let www = challenge(&headers).expect("challenge");
-    assert_eq!(www, "Bearer realm=\"ironauth\"");
+    // BOTH schemes, per RFC 9449 7.1. Advertising Bearer alone tells a DPoP-capable
+    // client this server does not do DPoP, and it will go on presenting bearer tokens to
+    // a server that would have sender-constrained them.
+    assert!(
+        www.contains("Bearer realm=\"ironauth\""),
+        "the bearer challenge must stay: {www}"
+    );
+    assert!(
+        www.contains("DPoP realm=\"ironauth\""),
+        "the DPoP challenge must be offered alongside it: {www}"
+    );
+    assert!(
+        www.contains("algs=\"EdDSA ES256\""),
+        "a client must learn which proof algorithms are accepted before minting one: {www}"
+    );
     assert!(
         !www.contains("error="),
         "a missing token names no error code"

@@ -86,6 +86,12 @@ use crate::tokens::{OPAQUE_ACCESS_TOKEN_DELIMITER, OPAQUE_ACCESS_TOKEN_PREFIX};
 /// The realm named in every `WWW-Authenticate` challenge.
 const REALM: &str = "ironauth";
 
+/// The proof algorithms advertised in a `DPoP` challenge (RFC 9449 section 5).
+///
+/// Space delimited, as the `algs` parameter requires. Stated so a client knows what will
+/// be accepted before minting a proof rather than discovering it from a second refusal.
+const DPOP_CHALLENGE_ALGS: &str = "EdDSA ES256";
+
 /// The scope `UserInfo` requires the access token to carry (OIDC Core 5.3.1): a
 /// token issued without `openid` is not a `UserInfo` credential.
 const REQUIRED_SCOPE: &str = "openid";
@@ -624,15 +630,27 @@ impl IntoResponse for UserInfoError {
         // The challenge values are fixed server constants (no reflected input), so
         // building the header from them cannot inject.
         let (status, challenge) = match self {
+            // BOTH schemes, per RFC 9449 7.1. A caller that presented no token, or a
+            // token that failed for a reason unrelated to DPoP, learns from this header
+            // that the server accepts DPoP at all. Advertising Bearer alone tells a
+            // DPoP-capable client the opposite, and it will keep presenting bearer
+            // tokens to a server that would have sender-constrained them.
+            //
+            // `algs` is the DPoP challenge parameter RFC 9449 defines, so a client knows
+            // which proof algorithms will be accepted before it mints one.
             UserInfoError::MissingToken => (
                 StatusCode::UNAUTHORIZED,
-                Some(format!("Bearer realm=\"{REALM}\"")),
+                Some(format!(
+                    "Bearer realm=\"{REALM}\", DPoP realm=\"{REALM}\", \
+                     algs=\"{DPOP_CHALLENGE_ALGS}\""
+                )),
             ),
             UserInfoError::InvalidToken => (
                 StatusCode::UNAUTHORIZED,
                 Some(format!(
                     "Bearer realm=\"{REALM}\", error=\"invalid_token\", \
-                     error_description=\"the access token is invalid, expired, or revoked\""
+                     error_description=\"the access token is invalid, expired, or revoked\", \
+                     DPoP realm=\"{REALM}\", algs=\"{DPOP_CHALLENGE_ALGS}\""
                 )),
             ),
             // RFC 9449 7.1: a DPoP failure carries the DPoP-scheme challenge so a
@@ -814,18 +832,27 @@ mod tests {
                 .get(header::WWW_AUTHENTICATE)
                 .map(|v| v.to_str().unwrap().to_owned())
         };
-        // A missing token carries a bare Bearer challenge with NO error code.
+        // A missing token carries BOTH scheme challenges and NO error code. Both,
+        // because a caller that presented nothing has to learn this server accepts DPoP;
+        // advertising Bearer alone tells a DPoP-capable client the opposite and it goes
+        // on presenting bearer tokens to a server that would have bound them.
         let missing = www(UserInfoError::MissingToken).expect("challenge");
-        assert_eq!(missing, "Bearer realm=\"ironauth\"");
+        assert_eq!(
+            missing,
+            "Bearer realm=\"ironauth\", DPoP realm=\"ironauth\", algs=\"EdDSA ES256\""
+        );
         assert!(
             !missing.contains("error="),
             "missing token names no error code"
         );
 
+        // An invalid token names the error AND still offers DPoP, since the failure may
+        // have nothing to do with the presentation scheme.
+        let invalid = www(UserInfoError::InvalidToken).unwrap();
+        assert!(invalid.contains("error=\"invalid_token\""));
         assert!(
-            www(UserInfoError::InvalidToken)
-                .unwrap()
-                .contains("error=\"invalid_token\"")
+            invalid.contains("Bearer realm=") && invalid.contains("DPoP realm="),
+            "both schemes stay on an invalid token: {invalid}"
         );
 
         // A DPoP failure is the uniform invalid_token but advertises the DPoP scheme
