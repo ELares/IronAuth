@@ -529,6 +529,11 @@ impl LogSink for HttpLogSink {
                 Err(ironauth_fetch::FetchError::Timeout) => {
                     SinkOutcome::Rejected("the sink timed out".to_string())
                 }
+                Err(ironauth_fetch::FetchError::SchemeNotAllowed) => SinkOutcome::Rejected(
+                    "the endpoint must be https; a plaintext http sink would export the \
+                     audit trail in cleartext"
+                        .to_string(),
+                ),
                 Err(_) => SinkOutcome::Rejected("the sink could not be reached".to_string()),
             }
         })
@@ -586,6 +591,15 @@ async fn post_json(
         Err(ironauth_fetch::FetchError::Timeout) => {
             SinkOutcome::Rejected("the sink timed out".to_string())
         }
+        // Named specifically, because it is a CONFIGURATION mistake and the generic
+        // "could not be reached" sends an operator looking at their network. An audit
+        // export must not travel in cleartext, so an `http://` endpoint is refused before
+        // a socket is opened, and the reason has to say which of those two happened.
+        Err(ironauth_fetch::FetchError::SchemeNotAllowed) => SinkOutcome::Rejected(
+            "the endpoint must be https; a plaintext http sink would export the audit \
+             trail in cleartext"
+                .to_string(),
+        ),
         Err(_) => SinkOutcome::Rejected("the sink could not be reached".to_string()),
     }
 }
@@ -1094,6 +1108,11 @@ async fn post_object(
         Err(ironauth_fetch::FetchError::Timeout) => {
             SinkOutcome::Rejected("the sink timed out".to_string())
         }
+        Err(ironauth_fetch::FetchError::SchemeNotAllowed) => SinkOutcome::Rejected(
+            "the endpoint must be https; a plaintext http sink would export the audit \
+             trail in cleartext"
+                .to_string(),
+        ),
         Err(_) => SinkOutcome::Rejected("the sink could not be reached".to_string()),
     }
 }

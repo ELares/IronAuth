@@ -668,6 +668,13 @@ required-features = ["testing"]
 name = "log_sink_conformance"
 path = "tests/log_sink_conformance.rs"
 
+# End-to-end log sink delivery against a REAL loopback HTTP receiver (issue #110): the
+# request line, headers and body a collector actually receives, through the real
+# SSRF-hardened fetcher. No database.
+[[test]]
+name = "log_sink_end_to_end"
+path = "tests/log_sink_end_to_end.rs"
+
 # The organization-attribution coverage ratchet (issue #110): how many org-scoped
 # operations do not yet name their organization on the audit row. Fails in BOTH
 # directions so the number cannot go stale. No database.
