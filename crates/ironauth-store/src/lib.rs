@@ -73,6 +73,7 @@ pub mod locale_bundle;
 pub mod log_stream;
 pub mod message_delivery;
 pub mod message_failover;
+pub mod message_feedback;
 pub mod message_http_channel;
 pub mod message_hygiene;
 pub mod message_mime;
