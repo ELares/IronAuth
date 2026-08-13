@@ -244,6 +244,17 @@ export async function verifyToken(
     throw new VerifyError('malformed', 'the header or claims are not JSON');
   }
 
+  // RFC 7515 section 4.1.11: `crit` lists header parameters the recipient MUST understand. This
+  // verifier implements NO extensions, so any `crit` at all is unsupported and the token is
+  // invalid. Ignoring it is the dangerous reading: an attacker could mark a security-relevant
+  // header as critical and have it silently skipped by the very check meant to honour it.
+  //
+  // Checked BEFORE the key lookup, for the same reason the algorithm is: a token nobody can
+  // verify must not cost an upstream fetch.
+  if ('crit' in header) {
+    throw new VerifyError('malformed', 'the header declares an unsupported crit extension');
+  }
+
   // FIRST, before a key is looked up. A token naming `none` must never reach key
   // resolution, and one naming an algorithm the issuer does not publish must not cause an
   // upstream fetch either.

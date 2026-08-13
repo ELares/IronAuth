@@ -95,6 +95,18 @@
       "why": "no published key matches; a verifier may refetch once but must not fall back to a guess"
     },
     {
+      "name": "embedded_jwk_key_injection",
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImVkMjU1MTktMSIsImp3ayI6eyJrdHkiOiJPS1AiLCJjcnYiOiJFZDI1NTE5IiwieCI6IkY4M1NFbVNWZ0tNQkxZQ29aZkNQREhWR0RHVm9YVmZ5eFJac0duUFBZUUUifX0.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlL3QvdG50X3ZlY3RvcnMvZS9lbnZfdmVjdG9ycyIsImF1ZCI6ImNsaV92ZWN0b3JzIiwic3ViIjoidXNyX2FkbWluIiwiaWF0IjoxNzk5OTk5OTQwLCJuYmYiOjE3OTk5OTk5NDAsImV4cCI6MTgwMDAwMzYwMH0.a_pz5IZCogJHY2KnYbKEJEe5L1hJBf-gZ-Zbmx06MrIbY_jcF0zb0xzDzisnG3AedT-Yor1Lz7nKxi6c1MlQBA",
+      "expect": "bad_signature",
+      "why": "the header carries the attacker key that signed it while naming a published kid: a verifier trusting the embedded jwk accepts a token minted by anyone, which is the single most damaging JOSE implementation error there is"
+    },
+    {
+      "name": "unknown_crit_header",
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImVkMjU1MTktMSIsImNyaXQiOlsiaXJvbmF1dGgtbm90LWEtcmVhbC1leHRlbnNpb24iXX0.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlL3QvdG50X3ZlY3RvcnMvZS9lbnZfdmVjdG9ycyIsImF1ZCI6ImNsaV92ZWN0b3JzIiwic3ViIjoidXNyX3ZlY3RvcnMiLCJpYXQiOjE3OTk5OTk5NDAsIm5iZiI6MTc5OTk5OTk0MCwiZXhwIjoxODAwMDAzNjAwfQ.T-JvZub20KGdmVuCUaFpkAc3Tjl5HdZmfM2Rl4YETenwCi9mFhUVVmDJMWDnv5VEANzqVdhd-eEc5v39OkDFBw",
+      "expect": "malformed",
+      "why": "RFC 7515 4.1.11: an unrecognised `crit` extension must be refused, never ignored"
+    },
+    {
       "name": "wrong_issuer",
       "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImVkMjU1MTktMSJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlL3QvdG50X3ZlY3RvcnMvZS9lbnZfb3RoZXIiLCJhdWQiOiJjbGlfdmVjdG9ycyIsInN1YiI6InVzcl92ZWN0b3JzIiwiaWF0IjoxNzk5OTk5OTQwLCJuYmYiOjE3OTk5OTk5NDAsImV4cCI6MTgwMDAwMzYwMH0.093vZcZI0Br3M0M5XFupdwuqcf7a-BJjW0175vUXxxWbsi_7F5b47MVOybDfReziG5gPwK1eOTdKjB7sHtGdCA",
       "expect": "wrong_issuer",

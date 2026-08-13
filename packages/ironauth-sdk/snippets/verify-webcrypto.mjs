@@ -180,6 +180,14 @@ export function createVerifier({
       throw new VerifyError('malformed', 'the header or claims are not JSON');
     }
 
+    // RFC 7515 section 4.1.11: `crit` lists header parameters the recipient MUST understand.
+    // This verifier implements NO extensions, so any `crit` is unsupported and the token is
+    // invalid. Ignoring it lets an attacker mark a security-relevant header as critical and
+    // have it silently skipped. Checked before the key lookup, like the algorithm.
+    if ('crit' in header) {
+      throw new VerifyError('malformed', 'the header declares an unsupported crit extension');
+    }
+
     // FIRST, before any key lookup. A token naming `none` must never reach key resolution, and
     // one naming an algorithm the issuer does not publish must not cause an upstream fetch.
     const alg = typeof header.alg === 'string' ? header.alg : '';

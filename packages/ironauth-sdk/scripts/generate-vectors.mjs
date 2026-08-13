@@ -287,6 +287,59 @@ vector(
 );
 
 // ---------------------------------------------------------------------------------------------
+// Header injection. Attacks that arrive as a well-formed, correctly signed token.
+// ---------------------------------------------------------------------------------------------
+
+/** An Ed25519 key the ATTACKER holds. Never published, and never trusted. */
+const ATTACKER_PRIVATE = {
+  crv: 'Ed25519',
+  d: 'RCoJ8bYWTBpBtBUCzR0y_v3Jm5f-i1YSAg_hVPqfSbA',
+  x: 'F83SEmSVgKMBLYCoZfCPDHVGDGVoXVfyxRZsGnPPYQE',
+  kty: 'OKP',
+};
+
+vector(
+  'embedded_jwk_key_injection',
+  mint(
+    {
+      alg: 'EdDSA',
+      typ: 'JWT',
+      // Names a key the issuer really publishes, so kid resolution "succeeds"...
+      kid: 'ed25519-1',
+      // ...while the header ALSO carries the attacker's own public key. A verifier that
+      // resolves the key from the header rather than from the published set validates this
+      // perfectly, because the token is genuinely signed by the key it carries.
+      jwk: { kty: 'OKP', crv: 'Ed25519', x: ATTACKER_PRIVATE.x },
+    },
+    baseClaims({ sub: 'usr_admin' }),
+    ATTACKER_PRIVATE,
+  ),
+  'bad_signature',
+  'the header carries the attacker key that signed it while naming a published kid: a verifier ' +
+    'trusting the embedded jwk accepts a token minted by anyone, which is the single most ' +
+    'damaging JOSE implementation error there is',
+);
+
+vector(
+  'unknown_crit_header',
+  mint(
+    {
+      alg: 'EdDSA',
+      typ: 'JWT',
+      kid: 'ed25519-1',
+      // RFC 7515 section 4.1.11: a `crit` naming an extension the verifier does not understand
+      // MUST cause rejection. Ignoring it lets an attacker mark a security-relevant header as
+      // critical and have it silently skipped.
+      crit: ['ironauth-not-a-real-extension'],
+    },
+    baseClaims(),
+    ED25519_PRIVATE,
+  ),
+  'malformed',
+  'RFC 7515 4.1.11: an unrecognised `crit` extension must be refused, never ignored',
+);
+
+// ---------------------------------------------------------------------------------------------
 // Claim discipline.
 // ---------------------------------------------------------------------------------------------
 
