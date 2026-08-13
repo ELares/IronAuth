@@ -71,6 +71,7 @@ pub mod impersonation;
 pub mod interchange;
 pub mod locale_bundle;
 pub mod log_stream;
+pub mod message_mime;
 pub mod message_render;
 pub mod message_template;
 mod migrate;
