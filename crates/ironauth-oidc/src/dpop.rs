@@ -27,7 +27,25 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
+use axum::http::HeaderMap;
+use ironauth_store::Scope;
+
 use crate::state::OidcState;
+
+/// The `DPoP` request header carrying the proof (RFC 9449 section 4). `HeaderMap`
+/// lookups are case-insensitive, so this matches any header-name casing.
+///
+/// This is the ONE definition. Every endpoint that reads a proof (`/token`,
+/// `/userinfo`, the authorization challenge endpoint) imports it from here, so the
+/// three cannot drift onto different header names.
+pub(crate) const DPOP_HEADER: &str = "dpop";
+
+/// The `htm` value a `DPoP` proof must carry on a `GET` (RFC 9449 uses the uppercase
+/// HTTP method token, compared case-sensitively by the core).
+pub(crate) const DPOP_HTM_GET: &str = "GET";
+
+/// The `htm` value a `DPoP` proof must carry on a `POST`.
+pub(crate) const DPOP_HTM_POST: &str = "POST";
 
 /// How far in the past a `DPoP` proof's `iat` may be and still be fresh (RFC 9449
 /// section 4.3, the freshness window). Passed to the core as `iat_leeway`.
@@ -186,6 +204,46 @@ pub fn normalized_htu_for_userinfo(state: &OidcState) -> String {
     format!("{}/userinfo", state.issuer_base().trim_end_matches('/'))
 }
 
+/// The normalized `htu` a `DPoP` proof presented at the Authorization Challenge
+/// Endpoint must match (RFC 9449 section 4.3, issue #368).
+///
+/// UNLIKE the token endpoint and `userinfo`, this endpoint is scope-routed UNDER the
+/// per-environment issuer (`{issuer}/authorize-challenge`), because the browserless
+/// login it drives runs inside one environment's flow engine and there is no code or
+/// access token to carry the scope. So the correct `htu` here IS the per-environment
+/// URL, which is the opposite of the PR2 lesson and is the reason this is its own
+/// function rather than a parameter on one of the others.
+///
+/// It must equal the `authorization_challenge_endpoint` discovery advertises, which
+/// is the URL a compliant client reads and POSTs to; a parity test pins the two, so
+/// the two literals cannot drift apart unnoticed.
+pub(crate) fn normalized_htu_for_challenge(state: &OidcState, scope: Scope) -> String {
+    format!("{}/authorize-challenge", state.issuer_for(&scope))
+}
+
+/// Read the SOLE `DPoP` proof header off a request.
+///
+/// RFC 9449 section 4.1 permits EXACTLY ONE `DPoP` header, so:
+/// - `Ok(None)`: no header at all. Whether that is acceptable is the CALLER's rule,
+///   not this function's (the token endpoint falls through to bearer, a bound
+///   refresh family or a bound `auth_session` refuses).
+/// - `Ok(Some(proof))`: exactly one header, and it is valid text.
+/// - `Err(())`: more than one header, or a header whose bytes are not valid text.
+///   Both are malformed; the caller maps them to its own uniform rejection.
+///
+/// The returned `&str` borrows from `headers`, so no proof bytes are copied on the
+/// way to the validator.
+pub(crate) fn sole_dpop_proof(headers: &HeaderMap) -> Result<Option<&str>, ()> {
+    let mut proofs = headers.get_all(DPOP_HEADER).iter();
+    let Some(first) = proofs.next() else {
+        return Ok(None);
+    };
+    if proofs.next().is_some() {
+        return Err(());
+    }
+    first.to_str().map(Some).map_err(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DPOP_IAT_LEEWAY, DPOP_IAT_SKEW, DpopReplayCache};
@@ -314,5 +372,47 @@ mod tests {
         // The endpoint passes these to the core; the replay TTL spans both.
         assert_eq!(DPOP_IAT_LEEWAY, Duration::from_secs(60));
         assert_eq!(DPOP_IAT_SKEW, Duration::from_secs(5));
+    }
+
+    /// RFC 9449 section 4.1 permits EXACTLY ONE `DPoP` header. The three outcomes are
+    /// distinct because the callers treat them differently, so each is pinned here
+    /// rather than only where one endpoint happens to exercise it.
+    #[test]
+    fn the_sole_proof_reader_separates_absent_present_and_malformed() {
+        use super::sole_dpop_proof;
+        use axum::http::{HeaderMap, HeaderValue};
+
+        // Absent: the caller decides whether that is allowed, so it is Ok(None), not an error.
+        assert_eq!(sole_dpop_proof(&HeaderMap::new()), Ok(None));
+
+        // Exactly one, readable: the borrowed proof text comes back verbatim.
+        let mut one = HeaderMap::new();
+        one.insert("dpop", HeaderValue::from_static("a.b.c"));
+        assert_eq!(sole_dpop_proof(&one), Ok(Some("a.b.c")));
+
+        // Header names are matched case-insensitively by the map, so a client sending the
+        // RFC's `DPoP` casing is found by the lowercase constant.
+        let mut cased = HeaderMap::new();
+        cased.insert(
+            axum::http::HeaderName::from_static("dpop"),
+            HeaderValue::from_static("cased"),
+        );
+        assert_eq!(sole_dpop_proof(&cased), Ok(Some("cased")));
+
+        // Two headers: malformed, and NOT "take the first one", which would let an
+        // attacker append a header a proxy or the server disagreed about.
+        let mut two = HeaderMap::new();
+        two.append("dpop", HeaderValue::from_static("first"));
+        two.append("dpop", HeaderValue::from_static("second"));
+        assert_eq!(sole_dpop_proof(&two), Err(()));
+
+        // One header whose bytes are not text: malformed, never silently dropped to None
+        // (which would read as "no proof presented" and fall through to the bearer path).
+        let mut opaque = HeaderMap::new();
+        opaque.insert(
+            "dpop",
+            HeaderValue::from_bytes(&[0xFF, 0xFE]).expect("bytes"),
+        );
+        assert_eq!(sole_dpop_proof(&opaque), Err(()));
     }
 }

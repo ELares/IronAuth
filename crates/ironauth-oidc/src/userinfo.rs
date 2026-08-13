@@ -78,7 +78,10 @@ use ironauth_store::{AccessTokenResolution, IssuedTokenId, Scope};
 use serde_json::{Map, Value};
 
 use crate::claims_request::ClaimsRequest;
-use crate::dpop::PresentedScheme;
+// The `DPoP` proof header and the `htm` method tokens are defined ONCE in
+// `crate::dpop` and shared with `/token` and the authorization challenge endpoint, so
+// the three readers cannot drift onto different literals.
+use crate::dpop::{DPOP_HEADER, DPOP_HTM_GET, DPOP_HTM_POST, PresentedScheme};
 use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::state::OidcState;
 use crate::tokens::{OPAQUE_ACCESS_TOKEN_DELIMITER, OPAQUE_ACCESS_TOKEN_PREFIX};
@@ -95,17 +98,6 @@ const DPOP_CHALLENGE_ALGS: &str = "EdDSA ES256";
 /// The scope `UserInfo` requires the access token to carry (OIDC Core 5.3.1): a
 /// token issued without `openid` is not a `UserInfo` credential.
 const REQUIRED_SCOPE: &str = "openid";
-
-/// The `DPoP` request header carrying the proof (RFC 9449). `HeaderMap` lookups are
-/// case-insensitive, so this matches any header-name casing.
-const DPOP_HEADER: &str = "dpop";
-
-/// The `htm` value a `DPoP` proof must carry for a `GET /userinfo` (RFC 9449 uses the
-/// uppercase HTTP method token).
-const DPOP_HTM_GET: &str = "GET";
-
-/// The `htm` value a `DPoP` proof must carry for a `POST /userinfo`.
-const DPOP_HTM_POST: &str = "POST";
 
 /// A defensive cap on the raw token size before the unverified `jti` peek. The
 /// hardened verify path caps again; this bounds the cheap pre-parse.
