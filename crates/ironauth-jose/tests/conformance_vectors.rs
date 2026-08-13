@@ -62,21 +62,34 @@ fn b64(value: &str) -> Vec<u8> {
         .expect("base64url")
 }
 
-/// The Ed25519 trusted keys published in the corpus JWKS.
+/// The trusted keys published in the corpus JWKS that this verifier can represent.
 ///
-/// The ES256 key is skipped because there is no P-256 constructor; the `es256` vectors are
-/// handled by the algorithm allowlist instead, which is the honest way to express "this
-/// implementation does not do that".
+/// Ed25519 AND RSA. The ES256 key is skipped because there is no P-256 constructor; those
+/// vectors are handled by the algorithm allowlist instead, which is the honest way to express
+/// "this implementation does not do that".
+///
+/// The RSA key matters more than it looks. Without it the only vector both languages ACCEPT is
+/// the Ed25519 one, so the cross-language agreement would rest on a single algorithm and a
+/// verifier that had broken RSA entirely would still pass this suite.
 fn trusted_keys(corpus: &Value) -> Vec<TrustedKey> {
     corpus["jwks"]["keys"]
         .as_array()
         .expect("a key array")
         .iter()
-        .filter(|key| key["kty"] == "OKP" && key["crv"] == "Ed25519")
-        .map(|key| {
+        .filter_map(|key| {
             let kid = key["kid"].as_str().map(str::to_owned);
-            let x = key["x"].as_str().expect("an x coordinate");
-            TrustedKey::ed25519(kid, &b64(x)).expect("a valid Ed25519 key")
+            match key["kty"].as_str() {
+                Some("OKP") if key["crv"] == "Ed25519" => {
+                    let x = key["x"].as_str().expect("an x coordinate");
+                    Some(TrustedKey::ed25519(kid, &b64(x)).expect("a valid Ed25519 key"))
+                }
+                Some("RSA") => {
+                    let n = key["n"].as_str().expect("a modulus");
+                    let e = key["e"].as_str().expect("an exponent");
+                    Some(TrustedKey::rsa(kid, &b64(n), &b64(e)).expect("a valid RSA key"))
+                }
+                _ => None,
+            }
         })
         .collect()
 }
@@ -177,10 +190,11 @@ fn the_rust_verifier_agrees_with_the_conformance_corpus() {
     let audience = corpus["audience"].as_str().expect("an audience");
     let clock = ManualClock::new(SystemTime::UNIX_EPOCH + Duration::from_secs(now));
 
-    // EdDSA only: this verifier has no P-256 key type, so ES256 is genuinely not allowed here
-    // rather than merely untested.
+    // EdDSA and RS256: this verifier has no P-256 key type, so ES256 is genuinely not allowed
+    // here rather than merely untested. RS256 IS supported, and including it means the
+    // cross-language agreement rests on two algorithms rather than one.
     let policy = VerificationPolicy::new(
-        vec![JwsAlgorithm::EdDsa],
+        vec![JwsAlgorithm::EdDsa, JwsAlgorithm::Rs256],
         trusted_keys(&corpus),
         issuer,
         audience,

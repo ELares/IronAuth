@@ -5,7 +5,8 @@
   "audience": "cli_vectors",
   "algorithms": [
     "EdDSA",
-    "ES256"
+    "ES256",
+    "RS256"
   ],
   "algorithmsEddsaOnly": [
     "EdDSA"
@@ -24,6 +25,12 @@
         "x": "m7xOvG92h-OQN-KA6ftI-6pJmxbRsXSfosv7N_aMTfk",
         "y": "cddtFHcRRcW9rTGQQ56sTEgYRPBWQqVfzkbob3ZXlT8",
         "kid": "es256-1"
+      },
+      {
+        "kty": "RSA",
+        "n": "uRAlOVIju8R1E-j2U0730q3q0lQlJ9aB0l-QPkn-YtryolFz6Sf3BWeSWeHwcpeLpwZQXwil3YCs-eypJcOm15CUCTRDP1Yqqwte7DJxwgg3zZBP7nhaVwnhBiXPkB-Bovaj4ec97Q2sgA5uRU_o_e5tqbOvf6dr2GApFM_M0eS3f7JqVItNgYVeYY6kcZVV1RqVQ6PzNlOSbLKYDgNyzDcItB6x9mZAM2KZoeghUdPo2jV1j9ozV26PGPVsLqWHfkel4SbXkmOdMucr0TXOktfQHcR4viOj4Tjoot1RDa3-fwhWTWLhGN3k8Kku__jlFieltvWfGH_U2nJ-4ygRRQ",
+        "e": "AQAB",
+        "kid": "rsa-1"
       },
       {
         "kty": "OKP",
@@ -45,6 +52,12 @@
       "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImVzMjU2LTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlL3QvdG50X3ZlY3RvcnMvZS9lbnZfdmVjdG9ycyIsImF1ZCI6ImNsaV92ZWN0b3JzIiwic3ViIjoidXNyX3ZlY3RvcnMiLCJpYXQiOjE3OTk5OTk5NDAsIm5iZiI6MTc5OTk5OTk0MCwiZXhwIjoxODAwMDAzNjAwfQ.0WpR5-Q9wSdeRt67tpytwckcQNQ9sdXbE-2f3iDJDpAvrca4pfQv_Bayn9CuhjICC0ntzMFYpLUHvupzK7Lgbw",
       "expect": "accept",
       "why": "the documented interop escape hatch for consumers that cannot verify EdDSA"
+    },
+    {
+      "name": "valid_rs256",
+      "token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYS0xIn0.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlL3QvdG50X3ZlY3RvcnMvZS9lbnZfdmVjdG9ycyIsImF1ZCI6ImNsaV92ZWN0b3JzIiwic3ViIjoidXNyX3ZlY3RvcnMiLCJpYXQiOjE3OTk5OTk5NDAsIm5iZiI6MTc5OTk5OTk0MCwiZXhwIjoxODAwMDAzNjAwfQ.VFZucc8Tv452TC1iJcHQw2mF-y12ZghVE9N1r2MKuwYsW8WNHYHUbDflBzESvymrk8RnD9zw5CJJyz-TK6TDE6B1S8pIWrpFp5TiltF0X9ruMGH6kfijB-bJ3mUDup_6h_-YmlsATVVGBjn_Rc7j31qe-ecXRReF3YXP7LeSjPdAFxJU_WOn0XLQ0uGLr1Y4G04Z1jPuZfNrqsAtvtBSjiY-jcTp_ApUwuCHpUTWYATGKzm96n9riagyXbIrr5-bqe7qkc4x2NJ_JZAZ57YOBwT8F5kHtetTSzkjcbnO-WyK7tSotYqeW2tib-Aa4f-hERAkz6_CpT7gSfegVkCQcQ",
+      "expect": "accept",
+      "why": "the one accepted vector BOTH language implementations verify: Rust has no P-256 key type, so ES256 can only ever be an allowlist refusal there, and without this the cross-language agreement would rest on EdDSA alone"
     },
     {
       "name": "valid_audience_array",
