@@ -1095,6 +1095,18 @@ name = "dpop_userinfo"
 path = "tests/dpop_userinfo.rs"
 required-features = ["testing"]
 
+# DPoP DEVICE BINDING of the authorization challenge endpoint's auth_session (RFC 9449, issue #368,
+# draft-ietf-oauth-first-party-apps-03 "the auth_session SHOULD be device-bound"): a proof on the FRESH
+# request binds the session to its key and every later resume must re-prove the SAME key, so a stolen
+# auth_session alone no longer drives the login; no proof leaves the session unbound and unchanged, and
+# an unbound session never consults the header so a proof cannot bind it after the fact; every resume
+# refusal is byte-identical to the stale-handle rejection (no oracle), while a fresh-request refusal is
+# the granular invalid_dpop_proof rather than a silent downgrade. Over a real database (DATABASE_URL).
+[[test]]
+name = "dpop_challenge"
+path = "tests/dpop_challenge.rs"
+required-features = ["testing"]
+
 # The DURABLE organization token context (issue #94, PR-B1): the organization parameter
 # binds a live-and-active org onto the session and both tokens (org_id claim), a
 # single-org subject auto-selects, a multi-org subject with no parameter gets none, a

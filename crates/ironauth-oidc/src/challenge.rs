@@ -42,11 +42,26 @@
 //! `regulate_before` that already runs inside [`drive`] (the login password verify and the second
 //! factor OTP verify).
 //!
-//! Residual SHOULD (deferred): `DPoP` / sender constraint. Binding the `auth_session` to a `DPoP`
-//! proof and sender constraining the browserless code is net new work (only the shared RFC 7800
-//! `cnf` plumbing exists today, at `ironauth-jose/src/cnf.rs`, with the binding seam at
-//! `ironauth-jose/src/seams.rs`); it is the future insertion point and is tracked as a follow-up
-//! rather than shipped here.
+//! PR5 scope (issue #368): DEVICE BINDING of the `auth_session`, the first of the two
+//! draft-ietf-oauth-first-party-apps-03 sender-constraint SHOULDs. A client that presents a `DPoP`
+//! proof (RFC 9449) on its FRESH request has the proof key's RFC 7638 thumbprint stashed alongside
+//! the immutable OAuth params, and EVERY later resume hop must then present a fresh, non-replayed
+//! proof for that SAME key. A stolen `auth_session` is therefore no longer sufficient to drive the
+//! login: the thief also needs the private key, which never leaves the device.
+//!
+//! The binding is OPPORTUNISTIC at creation and MANDATORY thereafter, the same asymmetry the
+//! refresh grant uses (`token::enforce_refresh_dpop`): a client that presents no proof gets the
+//! pre-#368 unbound bearer handle unchanged, and a session created unbound can never be bound
+//! after the fact by a later proof (which would let a handle thief lock the legitimate client out
+//! by binding it to their own key). See [`resolve_challenge_dpop_binding`] and
+//! [`enforce_challenge_dpop`].
+//!
+//! Residual SHOULD (still deferred): sender constraining the MINTED CODE and the tokens it
+//! redeems. Freezing the bound `jkt` onto the browserless code so `/token` requires the same key
+//! at redemption needs a new `authorization_codes` column and a `CodeBindings` member, so it is
+//! its own change on top of this one. Until it lands, the code a bound session mints is redeemed
+//! under the token endpoint's ordinary OPPORTUNISTIC rule: a client that presents a proof at
+//! `/token` gets sender-constrained tokens, and one that presents none gets bearer tokens.
 //!
 //! The security crux (PR2):
 //! - The OAuth params (`client_id`, `scope`, `code_challenge`, `code_challenge_method`) are
@@ -76,6 +91,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use ironauth_jose::{DpopExpectations, validate_dpop_proof};
 use ironauth_store::{ClientId, ClientRecord, FlowId, Scope};
 
 use crate::authorize::{
@@ -121,6 +137,23 @@ struct ChallengeParams {
     /// The presented PKCE `code_challenge_method`, or [`None`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     code_challenge_method: Option<String>,
+    /// The RFC 7638 thumbprint (`jkt`) of the `DPoP` proof key this `auth_session` is
+    /// DEVICE-BOUND to (issue #368, the draft SHOULD), or [`None`] for an UNBOUND
+    /// session whose handle is a plain bearer credential.
+    ///
+    /// Written ONCE, on the fresh request, from a proof the client presented there. It
+    /// rides the same write-once `transient_payload` as the OAuth params, so it is
+    /// structurally immutable across resumption rounds for exactly the same reason
+    /// they are: no resume body can introduce, change, or clear it.
+    ///
+    /// It is safe to deploy over sessions already in flight: a row stashed by the previous
+    /// binary carries no `dpop_jkt` member and parses back as [`None`], so its resumes keep
+    /// working unbound rather than failing closed against a key that was never presented.
+    /// That comes from `Option`'s own serde handling, which reads an absent member as
+    /// [`None`]; the `default` below is redundant here and is kept only to match the sibling
+    /// fields. Measured, not assumed: removing it leaves the deploy-safety test green.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dpop_jkt: Option<String>,
 }
 
 /// The `transient_payload` envelope carrying the challenge params (issue #93, PR2), namespaced
@@ -387,6 +420,16 @@ pub async fn authorize_challenge(
         return response;
     }
 
+    // Device binding (issue #368): a client that presents a `DPoP` proof here binds the
+    // `auth_session` it is about to receive to that proof key, so a stolen handle cannot be
+    // resumed without the private key. Opportunistic: no proof means an unbound session, exactly
+    // as before. After the rate-limit cap (signature verification is not spent on shed traffic)
+    // and before the flow exists (a bad proof leaves no half-driven row).
+    let dpop_jkt = match resolve_challenge_dpop_binding(&state, scope, &headers) {
+        Ok(jkt) => jkt,
+        Err(response) => return response,
+    };
+
     // The immutable OAuth params the code binds to, stashed into the flow's WRITE ONCE
     // `transient_payload` so a later resume can source them WITHOUT trusting the resume body.
     let params = ChallengeParams {
@@ -394,6 +437,7 @@ pub async fn authorize_challenge(
         scope: scope_param,
         code_challenge: code_challenge.map(str::to_owned),
         code_challenge_method,
+        dpop_jkt,
     };
     let Ok(transient) = serde_json::to_value(ChallengeTransient {
         challenge: params.clone(),
@@ -600,6 +644,15 @@ async fn resume_challenge(
         return response;
     }
 
+    // Device binding (issue #368): a session BOUND at creation may only be resumed by a fresh
+    // proof for the SAME key. An UNBOUND session ignores the header entirely, so a proof can never
+    // bind a session after the fact. Before `drive`, so a refusal spends neither the rotating
+    // submit token nor the in-flow credential budget.
+    if let Err(response) = enforce_challenge_dpop(state, scope, headers, params.dpop_jkt.as_deref())
+    {
+        return response;
+    }
+
     let submission = Submission {
         node_values,
         transient_payload: None,
@@ -637,6 +690,159 @@ async fn resume_challenge(
         // is the correct total-match projection.
         Continuation::Redirect { .. } | Continuation::ConsentDecision { .. } => redirect_to_web(),
     }
+}
+
+/// Validate a `DPoP` proof presented on a FRESH challenge request and return the proof-key
+/// thumbprint to device-bind the `auth_session` to (issue #368,
+/// draft-ietf-oauth-first-party-apps-03: "the `auth_session` SHOULD be device-bound").
+///
+/// Binding is OPPORTUNISTIC, exactly as at the token endpoint's code exchange: with NO `DPoP`
+/// header this returns `Ok(None)` and the session is an unbound bearer handle, byte-identical to
+/// the pre-#368 endpoint. With a proof present it is validated against this endpoint's
+/// expectations and its `(jkt, jti)` recorded, and the thumbprint is stashed so every later
+/// resume must re-prove possession of the SAME key.
+///
+/// A present-but-invalid proof is `400 invalid_dpop_proof` (RFC 9449 section 5), NEVER a silent
+/// downgrade to an unbound session: a client that asked for sender constraining must not be
+/// quietly given a handle without it. Unlike the resume path below, a granular code is safe here
+/// because a fresh request has no server-side secret to probe: the client is being told about the
+/// proof it just minted itself.
+///
+/// This runs AFTER the rate-limit cap (so proof-signature verification is not spent on traffic the
+/// cap is already shedding) and BEFORE the flow is created (so a bad proof never leaves a
+/// half-driven flow row behind).
+// `Response` is a large `Err` payload, but returning one is how every guard in this module
+// reports a refusal, and the sibling `enforce_client_auth_parity` escapes the lint only by
+// being `async`. Boxing here would make these two the odd ones out for no runtime gain.
+#[allow(clippy::result_large_err)]
+fn resolve_challenge_dpop_binding(
+    state: &OidcState,
+    scope: Scope,
+    headers: &HeaderMap,
+) -> Result<Option<String>, Response> {
+    let Ok(presented) = crate::dpop::sole_dpop_proof(headers) else {
+        // More than one DPoP header, or bytes that are not text. Both are malformed.
+        tracing::warn!("rejecting a challenge request that carried a malformed DPoP header");
+        return Err(invalid_dpop_proof());
+    };
+    let Some(proof_jws) = presented else {
+        // The unbound path: no proof, no binding, and the header is never consulted again.
+        return Ok(None);
+    };
+    let proof = validate_challenge_proof(state, scope, proof_jws).ok_or_else(|| {
+        tracing::warn!("rejecting an invalid DPoP proof on a fresh challenge request");
+        invalid_dpop_proof()
+    })?;
+    Ok(Some(proof))
+}
+
+/// Enforce the `auth_session`'s device binding on a RESUME hop (issue #368).
+///
+/// The asymmetry with [`resolve_challenge_dpop_binding`] is deliberate and mirrors the refresh
+/// grant's (`token::enforce_refresh_dpop`):
+///
+/// - `bound_jkt` is [`None`] (an UNBOUND session): the `DPoP` header is NOT consulted at all and
+///   the hop proceeds. A proof can therefore never RETROACTIVELY bind a session whose earlier hops
+///   were unbound, which would otherwise let an attacker who stole the handle bind it to their own
+///   key and lock the legitimate client out of its own login.
+/// - `bound_jkt` is [`Some`]: a valid, non-replayed proof for EXACTLY that key is REQUIRED. An
+///   absent header, a proof for a different key, a stale `iat`, a wrong `htm`/`htu`, and a
+///   replayed `jti` are all refused. This is the theft resistance the binding exists for: a stolen
+///   `auth_session` alone no longer resumes the login.
+///
+/// Every refusal is the SAME uniform [`invalid_auth_session`] the endpoint already returns for a
+/// stale, tampered, or completed handle, and deliberately NOT the granular `invalid_dpop_proof`
+/// used on the fresh path. A granular code here would be an oracle: it would confirm to a holder
+/// of a stolen handle that the handle is live and merely key-bound, which for a PUBLIC client is
+/// otherwise indistinguishable from a handle that expired. The legitimate client needs no such
+/// signal, because it knows whether it bound a key.
+///
+/// This runs BEFORE [`drive`], so a rejected hop neither spends the rotating submit token nor
+/// consumes the flow's in-flow credential budget.
+// `Response` is a large `Err` payload, but returning one is how every guard in this module
+// reports a refusal, and the sibling `enforce_client_auth_parity` escapes the lint only by
+// being `async`. Boxing here would make these two the odd ones out for no runtime gain.
+#[allow(clippy::result_large_err)]
+fn enforce_challenge_dpop(
+    state: &OidcState,
+    scope: Scope,
+    headers: &HeaderMap,
+    bound_jkt: Option<&str>,
+) -> Result<(), Response> {
+    let Some(bound_jkt) = bound_jkt else {
+        // Unbound session: do not consult the header, and never bind after the fact.
+        return Ok(());
+    };
+    let Ok(Some(proof_jws)) = crate::dpop::sole_dpop_proof(headers) else {
+        // Absent, duplicated, or non-text: a bound session requires exactly one readable proof.
+        tracing::warn!("rejecting a resume of a DPoP-bound auth_session with no usable proof");
+        return Err(invalid_auth_session());
+    };
+    let Some(presented_jkt) = validate_challenge_proof(state, scope, proof_jws) else {
+        tracing::warn!("rejecting an invalid DPoP proof on a challenge resume hop");
+        return Err(invalid_auth_session());
+    };
+    // Constant-time is unnecessary: both thumbprints are PUBLIC values (a jkt is derived from a
+    // public key the proof itself carries in clear), so a timing side channel discloses nothing an
+    // attacker cannot already compute.
+    if presented_jkt != bound_jkt {
+        tracing::warn!("rejecting a challenge resume whose DPoP key is not the bound key");
+        return Err(invalid_auth_session());
+    }
+    Ok(())
+}
+
+/// Validate one `DPoP` proof against the challenge endpoint's expectations and the `jti` replay
+/// cache, returning its RFC 7638 thumbprint on success and [`None`] on ANY failure (issue #368).
+///
+/// The single place the endpoint's proof rules live, so the fresh and resume paths cannot enforce
+/// different ones: `htm = POST`, the `htu` of the scope-routed challenge endpoint, the shared
+/// freshness window, and no `ath`/`nonce` (there is no access token in play here, and the server
+/// issues no `DPoP-Nonce`; the core correctly ignores an unexpected one).
+///
+/// Returning a bare [`None`] rather than the granular [`ironauth_jose::DpopError`] is what lets
+/// the two callers pick their own response without either of them being able to leak which check
+/// failed; the granular variant is logged here, server-side only.
+fn validate_challenge_proof(state: &OidcState, scope: Scope, proof_jws: &str) -> Option<String> {
+    let now = state.now();
+    let htu = crate::dpop::normalized_htu_for_challenge(state, scope);
+    let expected = DpopExpectations {
+        htm: crate::dpop::DPOP_HTM_POST,
+        htu: &htu,
+        iat_leeway: crate::dpop::DPOP_IAT_LEEWAY,
+        iat_skew: crate::dpop::DPOP_IAT_SKEW,
+        ath: None,
+        nonce: None,
+    };
+    let proof = validate_dpop_proof(proof_jws, &expected, now)
+        .map_err(|error| {
+            tracing::warn!(%error, "a DPoP proof failed validation at the challenge endpoint");
+        })
+        .ok()?;
+    // Replay: a (jkt, jti) already recorded inside the freshness window is refused. Sharing the
+    // token endpoint's cache is correct rather than merely convenient, because the key space is
+    // (jkt, jti) and a proof is bound to one htu: a proof minted for the challenge endpoint cannot
+    // pass at /token anyway, so the two endpoints can only ever collide on a genuine replay.
+    if !state
+        .dpop_replay()
+        .check_and_record(&proof.jkt, &proof.jti, now)
+    {
+        tracing::warn!("rejecting a replayed DPoP proof jti at the challenge endpoint");
+        return None;
+    }
+    Some(proof.jkt)
+}
+
+/// The RFC 9449 section 5 rejection for a present-but-invalid `DPoP` proof on a FRESH challenge
+/// request. Uniform across every proof defect (malformed, unverifiable, wrong `htm`/`htu`/`typ`,
+/// a stale or future `iat`, a missing or replayed `jti`, more than one header), so it names that a
+/// proof was refused without saying which check refused it.
+fn invalid_dpop_proof() -> Response {
+    error(
+        StatusCode::BAD_REQUEST,
+        "invalid_dpop_proof",
+        "the DPoP proof is invalid",
+    )
 }
 
 /// Enforce client-auth parity for a first-party challenge client (issue #93, PR4). The challenge
@@ -1361,6 +1567,7 @@ mod tests {
             scope: Some("openid profile".to_owned()),
             code_challenge: Some("abc".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
+            dpop_jkt: Some("thumbprint".to_owned()),
         };
         let payload = serde_json::to_string(&ChallengeTransient {
             challenge: params.clone(),
@@ -1371,6 +1578,33 @@ mod tests {
         assert_eq!(parsed.scope, params.scope);
         assert_eq!(parsed.code_challenge, params.code_challenge);
         assert_eq!(parsed.code_challenge_method, params.code_challenge_method);
+        assert_eq!(
+            parsed.dpop_jkt, params.dpop_jkt,
+            "the device binding must survive the stash, or every resume would read as unbound"
+        );
+    }
+
+    /// A stash written by a binary that predates issue #368 carries NO `dpop_jkt` member. It must
+    /// parse back as an UNBOUND session rather than failing, or a deploy would strand every
+    /// `auth_session` already in flight.
+    ///
+    /// The fixture is the LITERAL JSON the previous binary wrote rather than a re-serialization
+    /// of the current struct, so it keeps testing the real compatibility question even if the
+    /// struct's serialization changes later.
+    ///
+    /// What holds the property is `Option`'s serde handling, not the `#[serde(default)]` on the
+    /// field: a mutation removing that attribute leaves this test green, which is how the
+    /// attribute was found to be redundant rather than load-bearing.
+    #[test]
+    fn a_stash_from_before_the_device_binding_parses_as_unbound() {
+        let legacy = "{\"challenge\":{\"client_id\":\"cli_example\",\"scope\":\"openid\",\
+                      \"code_challenge\":\"abc\",\"code_challenge_method\":\"S256\"}}";
+        let parsed = parse_challenge_params(legacy).expect("a pre-#368 stash still parses");
+        assert_eq!(parsed.client_id, "cli_example");
+        assert_eq!(
+            parsed.dpop_jkt, None,
+            "an absent member is an unbound session, never a bound one"
+        );
     }
 
     #[test]

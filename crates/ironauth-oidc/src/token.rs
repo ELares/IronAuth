@@ -67,9 +67,13 @@ use serde::Deserialize;
 
 use crate::authn;
 use crate::claims_request::ClaimsRequest;
+// The `DPoP` proof header and the `POST` `htm` token are defined ONCE in `crate::dpop`
+// and shared with `/userinfo` and the authorization challenge endpoint, so the three
+// readers cannot drift onto different literals.
 use crate::client_auth::{
     self, AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod,
 };
+use crate::dpop::{DPOP_HEADER, DPOP_HTM_POST};
 use crate::error::TokenError;
 use crate::issuer::{IssuerEntry, IssuerResolution};
 use crate::permission_budget::{
@@ -99,14 +103,6 @@ const REFRESH_REUSE_TOTAL: &str = "ironauth_oidc_refresh_reuse_total";
 /// Core 11). Its presence in the granted scope makes the issued refresh-token
 /// family an OFFLINE family (issue #21).
 const OFFLINE_ACCESS_SCOPE: &str = "offline_access";
-
-/// The `DPoP` proof header (RFC 9449 section 4). Matched case-insensitively by the
-/// header map; RFC 9449 permits EXACTLY ONE, so more than one is rejected.
-const DPOP_HEADER: &str = "dpop";
-
-/// The `htm` (HTTP method) a token-endpoint `DPoP` proof must bind to: the token
-/// endpoint is always `POST` (RFC 9449 section 4.2, case-sensitive).
-const DPOP_HTM_POST: &str = "POST";
 
 /// The token-request parameters (form-encoded).
 ///
