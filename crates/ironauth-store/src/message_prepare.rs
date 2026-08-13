@@ -30,6 +30,7 @@ use std::collections::BTreeSet;
 
 use crate::message_hygiene::{BlockReason, dedup_key, normalize_recipient, suppression_check};
 use crate::message_mime::{MimeError, message_id, multipart_alternative};
+use crate::message_rate::{RateBudget, RateDecision, rate_decision};
 use crate::message_render::{RenderContext, RenderError, RenderMode, render, render_header};
 use crate::message_template::{Locale, TemplateCandidate, TemplateLevel, resolve_template};
 
@@ -38,6 +39,17 @@ use crate::message_template::{Locale, TemplateCandidate, TemplateLevel, resolve_
 pub enum PrepareError {
     /// Policy refused the send. Carries the reason so it can be recorded and queried.
     Blocked(BlockReason),
+    /// The per-recipient rate limit refused this send.
+    ///
+    /// Distinct from [`PrepareError::Blocked`] because the two are opposites in every way that
+    /// matters operationally: a suppression is PERMANENT and the caller should stop asking,
+    /// while this is TEMPORARY and carries the instant a retry could succeed. Folding them
+    /// together would have a caller either give up on a send that would work in a minute, or
+    /// retry forever one that never will.
+    RateLimited {
+        /// The epoch second at which this recipient's oldest counted send leaves the window.
+        retry_after_epoch_seconds: u64,
+    },
     /// No template exists at any level, so there is nothing to render.
     ///
     /// A programming error in practice: the caller is expected to include the shipped
@@ -99,6 +111,13 @@ pub struct PrepareRequest<'a> {
     pub suppressed_domains: &'a BTreeSet<String>,
     /// The dedup window this send falls in.
     pub window: u64,
+    /// Epoch-second timestamps of prior sends to this recipient, for the rate limit. Any order;
+    /// entries outside the budget window are ignored.
+    pub recent_sends: &'a [u64],
+    /// The per-recipient send budget.
+    pub rate_budget: RateBudget,
+    /// The evaluation instant in epoch seconds. Passed rather than read, so this stays pure.
+    pub now_epoch_seconds: u64,
     /// The unique local part for the `Message-ID`. The caller owns uniqueness; this crate
     /// holds no clock and no randomness.
     pub message_id_local: &'a str,
@@ -144,6 +163,26 @@ pub fn prepare_message(request: &PrepareRequest<'_>) -> Result<PreparedMessage, 
     let Some(recipient) = normalize_recipient(request.recipient) else {
         return Err(PrepareError::Blocked(BlockReason::AddressSuppressed));
     };
+
+    // The rate limit runs AFTER suppression and BEFORE anything is rendered.
+    //
+    // After suppression, because a suppressed recipient must not consume rate budget: they are
+    // never going to receive this, and letting a refused send count against the limit would let
+    // an attacker exhaust a victim's budget using addresses that were already blocked.
+    //
+    // Before rendering, for the same reason suppression is: a send that will not happen must
+    // not put user data through the renderer first.
+    if let RateDecision::Block {
+        retry_after_epoch_seconds,
+    } = rate_decision(
+        request.recent_sends,
+        request.now_epoch_seconds,
+        request.rate_budget,
+    ) {
+        return Err(PrepareError::RateLimited {
+            retry_after_epoch_seconds,
+        });
+    }
 
     let Some(resolved) = resolve_template(
         request.candidates,
@@ -197,8 +236,12 @@ mod tests {
 
     use super::{MessageBodies, PrepareError, PrepareRequest, prepare_message};
     use crate::message_hygiene::{BlockReason, dedup_key};
+    use crate::message_rate::RateBudget;
     use crate::message_render::RenderContext;
     use crate::message_template::{Locale, TemplateCandidate, TemplateLevel};
+
+    /// A fixed evaluation instant for the rate-limit fields.
+    const NOW: u64 = 1_800_000_000;
 
     fn candidate(level: TemplateLevel, locale: &str) -> TemplateCandidate {
         TemplateCandidate {
@@ -234,6 +277,9 @@ mod tests {
         values: RenderContext,
         suppressed_addresses: BTreeSet<String>,
         suppressed_domains: BTreeSet<String>,
+        recent_sends: Vec<u64>,
+        rate_budget: RateBudget,
+        now_epoch_seconds: u64,
     }
 
     impl Fixture {
@@ -248,6 +294,9 @@ mod tests {
                 values: values(&[("name", "Ada"), ("link", "https://example.test/v")]),
                 suppressed_addresses: BTreeSet::new(),
                 suppressed_domains: BTreeSet::new(),
+                recent_sends: Vec::new(),
+                rate_budget: RateBudget::new(3, 60),
+                now_epoch_seconds: NOW,
             }
         }
 
@@ -263,6 +312,9 @@ mod tests {
                 suppressed_addresses: &self.suppressed_addresses,
                 suppressed_domains: &self.suppressed_domains,
                 window: 42,
+                recent_sends: &self.recent_sends,
+                rate_budget: self.rate_budget,
+                now_epoch_seconds: self.now_epoch_seconds,
                 message_id_local: "msg_01ABC",
                 message_id_domain: "mail.example.test",
                 boundary: "ironauth-boundary-01",
@@ -413,6 +465,72 @@ mod tests {
             prepare_message(&request).unwrap_err(),
             PrepareError::NoTemplate
         );
+    }
+
+    /// A recipient over their budget is refused, with the instant a retry could succeed.
+    #[test]
+    fn a_rate_limited_recipient_is_refused_with_a_retry_instant() {
+        let mut fixture = Fixture::new();
+        let oldest = NOW - 30;
+        fixture.recent_sends = vec![oldest, NOW - 20, NOW - 10];
+        assert_eq!(
+            prepare_message(&fixture.request("ada@example.test")).unwrap_err(),
+            PrepareError::RateLimited {
+                retry_after_epoch_seconds: oldest + 60
+            },
+        );
+        // The control: one fewer prior send and the same request prepares, so the refusal is
+        // the budget and not something else in the fixture.
+        fixture.recent_sends = vec![NOW - 20, NOW - 10];
+        assert!(prepare_message(&fixture.request("ada@example.test")).is_ok());
+    }
+
+    /// A rate limit is TEMPORARY and a suppression is PERMANENT, so they are distinct errors.
+    ///
+    /// Folding them together would have a caller either give up on a send that would work in a
+    /// minute, or retry forever one that never will.
+    #[test]
+    fn a_rate_limit_is_not_reported_as_a_suppression() {
+        let mut fixture = Fixture::new();
+        fixture.recent_sends = vec![NOW - 30, NOW - 20, NOW - 10];
+        let error = prepare_message(&fixture.request("ada@example.test")).unwrap_err();
+        assert!(
+            matches!(error, PrepareError::RateLimited { .. }),
+            "expected a rate limit, got {error:?}"
+        );
+    }
+
+    /// Suppression is checked BEFORE the rate limit, so a suppressed recipient never consumes
+    /// budget.
+    ///
+    /// Otherwise an attacker could exhaust a victim's send budget using addresses that were
+    /// already blocked, and the victim's legitimate mail would be refused as rate limited.
+    #[test]
+    fn a_suppressed_recipient_does_not_consume_rate_budget() {
+        let mut fixture = Fixture::new();
+        fixture.suppressed_addresses = ["ada@example.test".to_owned()].into_iter().collect();
+        fixture.recent_sends = vec![NOW - 30, NOW - 20, NOW - 10];
+        assert_eq!(
+            prepare_message(&fixture.request("ada@example.test")).unwrap_err(),
+            PrepareError::Blocked(BlockReason::AddressSuppressed),
+            "the permanent reason must win, so the caller stops asking"
+        );
+    }
+
+    /// The rate limit runs BEFORE rendering, so a refused send never puts user data through the
+    /// renderer.
+    ///
+    /// The values here would FAIL the render (a missing placeholder). Getting the rate-limit
+    /// error rather than a render error is what proves the ordering.
+    #[test]
+    fn a_rate_limited_send_is_refused_before_anything_is_rendered() {
+        let mut fixture = Fixture::new();
+        fixture.recent_sends = vec![NOW - 30, NOW - 20, NOW - 10];
+        fixture.values = values(&[("name", "Ada")]);
+        assert!(matches!(
+            prepare_message(&fixture.request("ada@example.test")).unwrap_err(),
+            PrepareError::RateLimited { .. }
+        ));
     }
 
     #[test]
