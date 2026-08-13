@@ -11,6 +11,7 @@ import {
   generateProofKey,
   htu,
   nonceFrom,
+  type DpopClientError,
 } from './dpop.js';
 
 /*
@@ -221,7 +222,12 @@ test('a server that keeps demanding a nonce is not retried forever', { timeout: 
       },
     });
   };
-  await fetchWithProof(key, 'https://api.example/r', {}, send as typeof fetch);
+  // Exhausting the one retry is a TYPED failure rather than the raw 401 handed back: the
+  // request could not be made under DPoP at all, which is not an ordinary protocol answer.
+  await assert.rejects(
+    () => fetchWithProof(key, 'https://api.example/r', {}, send as typeof fetch),
+    (error: DpopClientError) => error.reason === 'nonce_retry_exhausted',
+  );
   assert.equal(
     calls,
     2,
@@ -239,7 +245,10 @@ test('a nonce demand with no nonce supplied is not retried', { timeout: 5_000 },
       headers: { 'WWW-Authenticate': 'DPoP error="use_dpop_nonce"' },
     });
   };
-  await fetchWithProof(key, 'https://api.example/r', {}, send as typeof fetch);
+  await assert.rejects(
+    () => fetchWithProof(key, 'https://api.example/r', {}, send as typeof fetch),
+    (error: DpopClientError) => error.reason === 'nonce_retry_exhausted',
+  );
   assert.equal(calls, 1, 'retrying without a nonce would send an identical proof');
 });
 

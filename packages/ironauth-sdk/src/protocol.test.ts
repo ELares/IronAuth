@@ -5,6 +5,9 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 
+import { generateProofKey } from './dpop.js';
+import { NonceCache } from './dpop-store.js';
+
 import {
   ProtocolError,
   authorizationUrl,
@@ -284,4 +287,140 @@ test('the portable modules import nothing Node-only', () => {
       );
     }
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// DPoP binding on the protocol calls (issue #134).
+// ---------------------------------------------------------------------------------------------
+
+/** Decode a compact JWS payload without verifying it: the tests only read what was sent. */
+function proofPayload(proof: string): Record<string, unknown> {
+  return JSON.parse(
+    atob(proof.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')),
+  ) as Record<string, unknown>;
+}
+
+test('the code exchange attaches a proof bound to the token endpoint', async () => {
+  const key = await generateProofKey();
+  const { calls, send } = responder(() => json({ access_token: 'at', token_type: 'DPoP' }));
+  await exchangeCode(
+    {
+      discovery: DISCOVERY,
+      clientId: 'cli_1',
+      redirectUri: 'https://app.example/cb',
+      code: 'c',
+      verifier: 'v',
+      dpop: { key },
+    },
+    send,
+  );
+  const proof = new Headers(calls[0].init?.headers).get('DPoP');
+  assert.ok(proof, 'a proof must be attached');
+  const payload = proofPayload(proof);
+  assert.equal(payload.htm, 'POST');
+  assert.equal(payload.htu, `${ISSUER}/token`);
+  assert.equal(
+    payload.ath,
+    undefined,
+    'there is no access token yet, so a proof carrying one would be malformed',
+  );
+});
+
+test('an absent binding leaves the request byte-identical to the bearer path', async () => {
+  const { calls, send } = responder(() => json({ access_token: 'at', token_type: 'Bearer' }));
+  await exchangeCode(
+    {
+      discovery: DISCOVERY,
+      clientId: 'cli_1',
+      redirectUri: 'https://app.example/cb',
+      code: 'c',
+      verifier: 'v',
+    },
+    send,
+  );
+  assert.equal(
+    new Headers(calls[0].init?.headers).get('DPoP'),
+    null,
+    'no binding means no proof, so the plain OAuth path is untouched',
+  );
+});
+
+test('refresh attaches a proof, which a bound family requires to rotate', async () => {
+  const key = await generateProofKey();
+  const { calls, send } = responder(() => json({ access_token: 'at2', token_type: 'DPoP' }));
+  await refresh(
+    { discovery: DISCOVERY, clientId: 'c', refreshToken: 'rt', dpop: { key } },
+    send,
+  );
+  const proof = new Headers(calls[0].init?.headers).get('DPoP');
+  assert.ok(proof);
+  assert.equal(proofPayload(proof).htu, `${ISSUER}/token`);
+});
+
+/**
+ * A bound UserInfo call presents `DPoP`, never `Bearer`, and the proof carries the token's
+ * `ath`.
+ *
+ * Both halves matter. Presenting a sender-constrained token as a bearer token is what the
+ * binding exists to prevent, and a proof without `ath` is one a resource server correctly
+ * refuses because nothing ties it to the token it arrived with.
+ */
+test('userinfo binds the proof to the exact token it presents', async () => {
+  const key = await generateProofKey();
+  const { calls, send } = responder(() => json({ sub: 'usr_1' }));
+  await userInfo(
+    { discovery: DISCOVERY, accessToken: 'the-token', tokenType: 'Bearer', dpop: { key } },
+    send,
+  );
+  const headers = new Headers(calls[0].init?.headers);
+  assert.equal(
+    headers.get('Authorization'),
+    'DPoP the-token',
+    'a binding overrides tokenType: Bearer would defeat the whole mechanism',
+  );
+  const payload = proofPayload(headers.get('DPoP') ?? '');
+  assert.equal(payload.htu, `${ISSUER}/userinfo`);
+  assert.equal(payload.htm, 'GET');
+  const expected = createHash('sha256').update('the-token').digest('base64url');
+  assert.equal(payload.ath, expected, 'ath is the SHA-256 of the presented token');
+});
+
+/**
+ * The nonce learned on one call is carried by the next.
+ *
+ * Without the shared cache each call relearns it from a challenge, so a compliant server costs
+ * two round trips per request forever. The assertion counts calls exactly, because "fewer"
+ * would still pass if the second call challenged again.
+ */
+test('a shared nonce cache spares later protocol calls the challenge', async () => {
+  const key = await generateProofKey();
+  const nonces = new NonceCache();
+  let calls = 0;
+  const send = (async (_input: string, init?: RequestInit): Promise<Response> => {
+    calls += 1;
+    const proof = new Headers(init?.headers).get('DPoP') ?? '';
+    if (proofPayload(proof).nonce === undefined) {
+      return new Response('{"error":"use_dpop_nonce"}', {
+        status: 400,
+        headers: { 'DPoP-Nonce': 'n1', 'Content-Type': 'application/json' },
+      });
+    }
+    return new Response('{"access_token":"at","token_type":"DPoP"}', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as unknown as typeof fetch;
+
+  const options = {
+    discovery: DISCOVERY,
+    clientId: 'c',
+    redirectUri: 'https://app.example/cb',
+    code: 'c',
+    verifier: 'v',
+    dpop: { key, nonces },
+  };
+  await exchangeCode(options, send);
+  assert.equal(calls, 2, 'the first call challenges and retries');
+  await exchangeCode(options, send);
+  assert.equal(calls, 3, 'the second carries the nonce up front: one request, no challenge');
 });

@@ -6,6 +6,7 @@ import test from 'node:test';
 import { createProof, fetchWithProof, generateProofKey } from './dpop.js';
 import {
   DpopClientError,
+  type DpopFailureReason,
   MemoryProofKeyStore,
   NonceCache,
   loadOrCreateProofKey,
@@ -195,17 +196,58 @@ test('without a cache every request pays the challenge again', async () => {
   assert.equal(calls, 4, 'two requests, each costing a challenge plus a retry');
 });
 
-/** The retry is bounded at one, so a server that keeps challenging cannot become a storm. */
-test('a server that always challenges gets exactly one retry', async () => {
+/**
+ * The retry is bounded at one, and exhausting it is a TYPED failure.
+ *
+ * Handing the caller the raw 400 would look like an ordinary protocol error, when what
+ * actually happened is that the request could not be made under DPoP at all.
+ */
+test('a server that always challenges gets one retry then a typed exhaustion', async () => {
   const key = await generateProofKey();
   let calls = 0;
   const send = (async (): Promise<Response> => {
     calls += 1;
     return new Response('{}', { status: 400, headers: { 'DPoP-Nonce': 'never-enough' } });
   }) as unknown as typeof fetch;
-  const response = await fetchWithProof(key, 'https://a.example/token', {}, send);
-  assert.equal(response.status, 400);
+  await assert.rejects(
+    () => fetchWithProof(key, 'https://a.example/token', {}, send),
+    (error: DpopClientError) => {
+      assert.equal(error.reason, 'nonce_retry_exhausted');
+      return true;
+    },
+  );
   assert.equal(calls, 2, 'the original plus ONE retry, never a loop');
+});
+
+/** A server that demands a nonce and supplies none is exhaustion on the first attempt. */
+test('a nonce demand with no nonce supplied is exhaustion, not a silent 400', async () => {
+  const key = await generateProofKey();
+  let calls = 0;
+  const send = (async (): Promise<Response> => {
+    calls += 1;
+    return new Response('{}', {
+      status: 401,
+      headers: { 'WWW-Authenticate': 'DPoP error="use_dpop_nonce"' },
+    });
+  }) as unknown as typeof fetch;
+  await assert.rejects(
+    () => fetchWithProof(key, 'https://a.example/token', {}, send),
+    (error: DpopClientError) => error.reason === 'nonce_retry_exhausted',
+  );
+  assert.equal(calls, 1, 'retrying an identical proof would get an identical answer');
+});
+
+/**
+ * Every declared failure reason must be REACHABLE.
+ *
+ * A reason nothing constructs reads as a handled case and is not one; this codebase has hit
+ * that dormant-surface defect before, so the set is pinned rather than trusted.
+ */
+test('the declared failure reasons are exactly the ones that can occur', () => {
+  const reachable: DpopFailureReason[] = ['storage_unavailable', 'nonce_retry_exhausted'];
+  for (const reason of reachable) {
+    assert.equal(new DpopClientError(reason).reason, reason);
+  }
 });
 
 test('a proof carries the nonce it was given', async () => {

@@ -31,28 +31,13 @@
  */
 
 import type { ProofKey } from './dpop.js';
-import { generateProofKey } from './dpop.js';
+import { DpopClientError, generateProofKey } from './dpop.js';
 
-/** Why a DPoP client operation failed. Distinct because the caller's response differs. */
-export type DpopFailureReason =
-  /** No keypair for this (client, environment) and none could be created. */
-  | 'missing_key'
-  /** The configured storage rejected a read or a write. */
-  | 'storage_unavailable'
-  /** The server demanded a nonce again after the one permitted retry. */
-  | 'nonce_retry_exhausted';
-
-/** A typed DPoP client failure. */
-export class DpopClientError extends Error {
-  /** Which failure this is. */
-  readonly reason: DpopFailureReason;
-
-  constructor(reason: DpopFailureReason, message?: string) {
-    super(message ?? reason);
-    this.name = 'DpopClientError';
-    this.reason = reason;
-  }
-}
+// The error type lives in `./dpop.js` so `fetchWithProof` can throw it without importing this
+// module back. Re-exported here because storage faults are raised from this file, so a caller
+// handling them should not have to know which module declares the class.
+export { DpopClientError } from './dpop.js';
+export type { DpopFailureReason } from './dpop.js';
 
 /**
  * Where a proof keypair lives between calls.

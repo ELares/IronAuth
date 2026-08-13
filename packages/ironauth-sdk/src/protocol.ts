@@ -21,6 +21,59 @@
  * and a core that picked one would be wrong in most of them.
  */
 
+import type { NonceMemory, ProofKey } from './dpop.js';
+import { fetchWithProof } from './dpop.js';
+
+/**
+ * The DPoP binding a call may carry (issue #134).
+ *
+ * Passing one makes the call sender-constrained: a proof is minted per request, the `DPoP`
+ * scheme replaces `Bearer` where a token is presented, and a `use_dpop_nonce` challenge is
+ * answered with exactly one retry.
+ *
+ * OPTIONAL on every function, and absent means byte-identical behaviour to before. That is
+ * deliberate rather than lazy: a public client SHOULD be bound, but this core cannot know
+ * whether the issuer supports DPoP, and silently minting proofs at an issuer that rejects
+ * unknown headers would break the plain OAuth path this package also has to serve.
+ */
+export interface DpopBinding {
+  /** The proof key, from `loadOrCreateProofKey` in `./dpop-store.js`. */
+  readonly key: ProofKey;
+  /**
+   * Where server-issued nonces are remembered across calls.
+   *
+   * Strongly recommended and still optional. Without it each call relearns the nonce from a
+   * challenge, so a compliant server costs two round trips per request forever.
+   */
+  readonly nonces?: NonceMemory;
+}
+
+/**
+ * `send`, wrapped to attach a DPoP proof when `dpop` is present.
+ *
+ * One wrapper for all three call sites, so the token endpoint, the refresh grant and UserInfo
+ * cannot drift into attaching proofs differently. `accessToken` is threaded through because a
+ * proof accompanying a token must carry that token's `ath`; omitting it on a resource call
+ * would produce a proof the resource server correctly refuses.
+ */
+function senderFor(
+  send: typeof fetch,
+  dpop: DpopBinding | undefined,
+  accessToken?: string,
+): typeof fetch {
+  if (dpop === undefined) {
+    return send;
+  }
+  return (async (input: string, init?: RequestInit): Promise<Response> =>
+    fetchWithProof(
+      dpop.key,
+      input,
+      { ...init, accessToken },
+      send,
+      dpop.nonces,
+    )) as unknown as typeof fetch;
+}
+
 /** What an issuer publishes at its discovery endpoint, narrowed to what is used here. */
 export interface DiscoveryDocument {
   readonly issuer: string;
@@ -204,6 +257,8 @@ export async function exchangeCode(
     redirectUri: string;
     code: string;
     verifier: string;
+    /** Bind the issued tokens to a DPoP key (issue #134). Absent means bearer, as before. */
+    dpop?: DpopBinding;
   },
   send: typeof fetch = fetch,
 ): Promise<TokenResponse> {
@@ -216,7 +271,9 @@ export async function exchangeCode(
       redirect_uri: options.redirectUri,
       code_verifier: options.verifier,
     },
-    send,
+    // No `ath` at the token endpoint: there is no access token in play yet, and a proof
+    // carrying the hash of a token that does not exist is simply malformed.
+    senderFor(send, options.dpop),
   );
 }
 
@@ -228,6 +285,14 @@ export async function refresh(
     refreshToken: string;
     /** Narrow the scope of the new token. Omitted means unchanged. */
     scope?: string;
+    /**
+     * The DPoP key the refresh family is bound to (issue #134).
+     *
+     * REQUIRED by the server for a bound family, not optional: a bound family refuses to
+     * rotate without a proof for its exact key, so omitting this on a family that was issued
+     * under DPoP fails the refresh rather than quietly returning a bearer token.
+     */
+    dpop?: DpopBinding;
   },
   send: typeof fetch = fetch,
 ): Promise<TokenResponse> {
@@ -239,7 +304,7 @@ export async function refresh(
   if (options.scope !== undefined) {
     form.scope = options.scope;
   }
-  return tokenRequest(options.discovery.token_endpoint, form, send);
+  return tokenRequest(options.discovery.token_endpoint, form, senderFor(send, options.dpop));
 }
 
 /**
@@ -254,8 +319,16 @@ export async function userInfo(
     discovery: Pick<DiscoveryDocument, 'userinfo_endpoint'>;
     accessToken: string;
     tokenType?: string;
-    /** Extra headers, for example a `DPoP` proof. */
+    /** Extra headers, for example a hand-built `DPoP` proof. */
     headers?: Record<string, string>;
+    /**
+     * Mint the proof automatically (issue #134), rather than passing one in `headers`.
+     *
+     * When present the proof carries this token's `ath` and the `Authorization` scheme becomes
+     * `DPoP`, both of which a resource server checks. Supplying `dpop` AND a hand-built `DPoP`
+     * header would be two answers to one question, so the minted one wins.
+     */
+    dpop?: DpopBinding;
   },
   send: typeof fetch = fetch,
 ): Promise<Record<string, unknown>> {
@@ -263,13 +336,26 @@ export async function userInfo(
   if (endpoint === undefined) {
     throw new ProtocolError('no_userinfo_endpoint', 'the issuer publishes none');
   }
-  const scheme = options.tokenType ?? 'Bearer';
-  const response = await send(endpoint, {
-    headers: {
-      ...options.headers,
-      Authorization: `${scheme} ${options.accessToken}`,
-      Accept: 'application/json',
-    },
+  const headers: Record<string, string> = {
+    ...options.headers,
+    Accept: 'application/json',
+  };
+  // The Authorization header is set HERE only on the unbound path, so `tokenType` is
+  // deliberately not consulted when bound: a sender-constrained token presented as `Bearer`
+  // is what the binding exists to prevent.
+  //
+  // What ENFORCES that is `fetchWithProof`, which sets the header to the `DPoP` scheme after
+  // this init is built and therefore always wins. Both halves are measured rather than
+  // assumed: changing the scheme inside `fetchWithProof` is caught by the suite, while
+  // removing the guard below is NOT, because the overwrite makes it unobservable. The guard
+  // is here to avoid a redundant write, not because correctness rests on it. An earlier
+  // version also computed a `scheme` the bound path never read, which a sweep exposed as
+  // dead code that looked like it decided something.
+  if (options.dpop === undefined) {
+    headers.Authorization = `${options.tokenType ?? 'Bearer'} ${options.accessToken}`;
+  }
+  const response = await senderFor(send, options.dpop, options.accessToken)(endpoint, {
+    headers,
   });
   if (!response.ok) {
     throw new ProtocolError('userinfo_failed', `the endpoint answered ${response.status}`);
