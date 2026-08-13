@@ -75,6 +75,7 @@ pub mod message_failover;
 pub mod message_hygiene;
 pub mod message_mime;
 pub mod message_prepare;
+pub mod message_rate;
 pub mod message_render;
 pub mod message_template;
 mod migrate;
