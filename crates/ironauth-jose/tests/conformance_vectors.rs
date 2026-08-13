@@ -103,6 +103,24 @@ fn acceptable(name: &str, expected: &str) -> &'static [RejectReason] {
     if name == "alg_none" {
         return &[RejectReason::AlgNone, RejectReason::MalformedStructure];
     }
+    // The second named exception, and the more interesting one.
+    //
+    // TypeScript refuses the embedded-JWK injection as `bad_signature`: it resolves the key
+    // from the published set, ignores the header's `jwk` entirely, and the attacker's signature
+    // then fails against the real key. Rust refuses it as `EmbeddedKeyInjection`, structurally,
+    // BEFORE any signature is checked, because a `jwk` in the header of a token verified
+    // against a trusted key set has no legitimate purpose.
+    //
+    // Rust's refusal is strictly STRONGER: it would still refuse even if an attacker somehow
+    // produced a signature that validated. Both are correct and the difference is worth
+    // recording rather than flattening, which is why this is a named exception listing both
+    // rather than `SignatureInvalid` being quietly widened everywhere.
+    if name == "embedded_jwk_key_injection" {
+        return &[
+            RejectReason::EmbeddedKeyInjection,
+            RejectReason::SignatureInvalid,
+        ];
+    }
     match expected {
         "malformed" => &[
             RejectReason::MalformedStructure,
@@ -111,6 +129,8 @@ fn acceptable(name: &str, expected: &str) -> &'static [RejectReason] {
             RejectReason::SegmentTooLarge,
             RejectReason::TokenTooLarge,
             RejectReason::ClaimsMalformed,
+            RejectReason::UnknownCrit,
+            RejectReason::MalformedCrit,
         ],
         // `alg: none` has its own Rust variant, which is more precise than the TypeScript
         // reason and still the same refusal.
