@@ -79,6 +79,7 @@ pub mod message_mime;
 pub mod message_prepare;
 pub mod message_rate;
 pub mod message_render;
+pub mod message_smtp_channel;
 pub mod message_template;
 mod migrate;
 pub mod ocsf;
