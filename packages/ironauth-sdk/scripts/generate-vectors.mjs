@@ -76,6 +76,32 @@ const ES256_PUBLIC = {
   kid: 'es256-1',
 };
 
+/**
+ * The RS256 key, for the vector BOTH the TypeScript and Rust verifiers can check.
+ *
+ * ES256 cannot fill that role: the Rust verifier has no P-256 constructor, so its ES256 vector
+ * is only ever exercised as an allowlist refusal. RSA is supported by both, and PKCS#1 v1.5
+ * signing is DETERMINISTIC, so unlike ES256 this vector regenerates byte-identically and needs
+ * no pinning.
+ */
+const RS256_PRIVATE = {
+  "kty": "RSA",
+  "n": "uRAlOVIju8R1E-j2U0730q3q0lQlJ9aB0l-QPkn-YtryolFz6Sf3BWeSWeHwcpeLpwZQXwil3YCs-eypJcOm15CUCTRDP1Yqqwte7DJxwgg3zZBP7nhaVwnhBiXPkB-Bovaj4ec97Q2sgA5uRU_o_e5tqbOvf6dr2GApFM_M0eS3f7JqVItNgYVeYY6kcZVV1RqVQ6PzNlOSbLKYDgNyzDcItB6x9mZAM2KZoeghUdPo2jV1j9ozV26PGPVsLqWHfkel4SbXkmOdMucr0TXOktfQHcR4viOj4Tjoot1RDa3-fwhWTWLhGN3k8Kku__jlFieltvWfGH_U2nJ-4ygRRQ",
+  "e": "AQAB",
+  "d": "BBSUDYh_GzPAtRis3bdfBXkqNUr_qrozEJVk08rD3iAfu256VMi5zJe1BWBS8ePfg2ZDPWUuawzcQ4JxVFDVC-m3KeDKHspilHTiueh-051kxZaJ_KMQstyX5o_M3MulCxfPEzsLBYAIrqYizkptw7OPHW_FzdW-Lf4oybmvNW2A96tY9Yw3onVvtpiOvnt0cnM-NvdzRcLnsiX_aJifJOcz04NWnkHeE4Q0aiBXoTAheTW6X6gu_RgeOgB8hdzvJQn9-KT6Hgp5sVHU5RQM5GXZ7LSzoAUp2yAczucepX_XLid34kWLXVZE6ZuRqD5DxUDxgcvoWNWQeFOHyVp-fQ",
+  "p": "4SczOMEU8srxv7aDN-AeMuwcMamYSDYaCQzGsiNX8NcAo7ri5ZeEEhOyf3HaEiXBgAB4luYMJ1wKKAlsoU4SQR2OTwlboWcO6-JItmCwLCaKdFKTqChQ21i1Qp0ik_BpnET1LvotzSDt6GqHOK235i5TBImqgdXObCBRFbM5Ug8",
+  "q": "0mrdr-la3KF7UWtlL3CnsQLqEyH9GSiWHJZdXFVRBgc4vtht6X833ifJoD29UPuSYYbKOxLw1V3gLrOjRh7bBj_stu3ywtVNTIuyy2EeWpfAomIFtKSQuT7_Ud4Oyy161FIN1P2P2YaeRS60yHguNswRFZ5tSACghlUl0ekx62s",
+  "dp": "W01aKBmkNRC3F9cbPv1TQbMde8YaSq4lwKW9rV9HuhJ13-9ZM2FN3Ua_i47Pr6w_23hVblu7cfqQ48tukbrnDCDAJKzWy4zPMDiC4_IxfrXiT2ltFzPCFjDS0ECIVRWYvhX4lyQ8joJb93O7gfBwMpd2ctCgpCXfn1k7iGE1TWE",
+  "dq": "bDmjBFOV9FzqPJpsVNYwqg7Brk2RDFufudxs8IzBO8SDH0XaYnqYlZ8JSW337as3Qwo9Ad1gGZ5LLDohBHPiW3iNnBkO_78OHwzLTWgKYLYk0mBwZtUtytnoIIeCPGaMAqChlKdGUa-3wAWh3mpR-sVDFEeEFcCcz_sDlM_IaTk",
+  "qi": "jOz19soZl-fhG0q7xge35UeizLyJPM6syvDQfJquP89Q2u-kPm1Lawp5BKscwoHQZ0nqmO8xWck3di2XR3BXpN0gtkjqhEiFrYfj2mslCoakHue1D0oUDniRrOtUFuUJvT2g1hzOYdsb7p0LmRfqmb2CPY3cuos-4r4UkT63TPc"
+};
+const RS256_PUBLIC = {
+  kty: 'RSA',
+  n: RS256_PRIVATE.n,
+  e: RS256_PRIVATE.e,
+  kid: 'rsa-1',
+};
+
 /** An Ed25519 key that is PUBLISHED but never signs anything, for the wrong-key case. */
 const ED25519_DECOY_PUBLIC = {
   kty: 'OKP',
@@ -141,6 +167,9 @@ function mint(header, claims, jwk) {
   let signature;
   if (header.alg === 'EdDSA') {
     signature = nodeSign(null, Buffer.from(signingInput, 'utf8'), key);
+  } else if (header.alg === 'RS256') {
+    // RSASSA-PKCS1-v1_5, which is what RS256 means and which is deterministic.
+    signature = nodeSign('RSA-SHA256', Buffer.from(signingInput, 'utf8'), key);
   } else {
     // ES256 needs the raw r||s form JOSE requires, not the DER the signer emits by default.
     const signer = createSign('SHA256');
@@ -188,6 +217,15 @@ vector(
   ES256_PINNED_TOKEN,
   'accept',
   'the documented interop escape hatch for consumers that cannot verify EdDSA',
+);
+
+vector(
+  'valid_rs256',
+  mint({ alg: 'RS256', typ: 'JWT', kid: 'rsa-1' }, baseClaims(), RS256_PRIVATE),
+  'accept',
+  'the one accepted vector BOTH language implementations verify: Rust has no P-256 key type, ' +
+    'so ES256 can only ever be an allowlist refusal there, and without this the cross-language ' +
+    'agreement would rest on EdDSA alone',
 );
 
 vector(
@@ -413,9 +451,9 @@ const corpus = {
   // The allow-list is the ISSUER's published set. `alg_not_published_by_the_issuer` is judged
   // against `algorithmsEddsaOnly` and everything else against `algorithms`, which is what makes
   // that case a test of the allow-list rather than of ES256 support.
-  algorithms: ['EdDSA', 'ES256'],
+  algorithms: ['EdDSA', 'ES256', 'RS256'],
   algorithmsEddsaOnly: ['EdDSA'],
-  jwks: { keys: [ED25519_PUBLIC, ES256_PUBLIC, ED25519_DECOY_PUBLIC] },
+  jwks: { keys: [ED25519_PUBLIC, ES256_PUBLIC, RS256_PUBLIC, ED25519_DECOY_PUBLIC] },
   cases,
 };
 
