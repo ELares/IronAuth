@@ -252,6 +252,12 @@ jobs:
         # both generated. A payload schema changed under an unchanged version surfaces here as
         # a diff, which is the registry compatibility check.
         run: scripts/event-catalog.sh
+      - name: JWT verification conformance corpus freshness (issue #118)
+        # The one corpus every verifier in issue #118 is judged against. It is deterministic,
+        # so a diff is always a real change; the failure this exists to catch is a REMOVED or
+        # weakened refusal vector, which would make every verifier go green on a token it
+        # should refuse.
+        run: scripts/verify-vectors.sh
       - name: terraform provider coverage (generated from the OpenAPI document)
         # Issue #51 criterion 6: a new promotable API resource cannot land without provider
         # coverage, enforced as a RATCHET on the uncovered count rather than as a demand for

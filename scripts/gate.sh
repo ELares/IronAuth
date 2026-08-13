@@ -62,6 +62,13 @@ echo "==> event catalog freshness (generated from the audit action registry)"
 # as a diff a reviewer reads: that diff IS the compatibility check.
 scripts/event-catalog.sh
 
+echo "==> JWT verification conformance corpus freshness (issue #118)"
+# The ONE corpus every verifier in issue #118 is judged against (the TS core today; the
+# Workers, Fastly, Lambda@Edge, Java and .NET verifiers as they land). Deterministic, so a
+# diff here is always a real change, and a REMOVED refusal vector is what this catches:
+# dropping the alg_none case would make every verifier go green on an unsigned token.
+scripts/verify-vectors.sh
+
 echo "==> terraform provider coverage (generated from the OpenAPI document)"
 # Issue #51 criterion 6. A pure python lane over the committed spec, so it needs neither Go
 # nor tofu and runs everywhere.
