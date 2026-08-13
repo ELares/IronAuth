@@ -100,6 +100,7 @@ pub mod snapshot;
 mod store;
 pub mod token_act_chain;
 pub mod token_exchange;
+pub mod token_type_negotiation;
 pub mod trait_schema;
 
 /// The reusable cross-tenant IDOR test harness. Present only under the
