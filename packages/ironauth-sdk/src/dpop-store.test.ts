@@ -4,8 +4,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createProof, fetchWithProof, generateProofKey } from './dpop.js';
+import { installFakeIndexedDb } from './indexeddb-fake.js';
 import {
   DpopClientError,
+  IndexedDbProofKeyStore,
+  indexedDbAvailable,
   type DpopFailureReason,
   MemoryProofKeyStore,
   NonceCache,
@@ -261,4 +264,130 @@ test('a proof carries the nonce it was given', async () => {
     atob(proof.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')),
   ) as { nonce?: string };
   assert.equal(payload.nonce, 'abc');
+});
+
+// ---------------------------------------------------------------------------------------------
+// The IndexedDB store (issue #134).
+//
+// This store shipped with NOTHING exercising it: no test, no runtime check, no caller. Code
+// nobody runs is code whose first execution happens in a browser belonging to someone else,
+// and the request-and-callback shape is exactly where a transposed onsuccess/onerror or a
+// missing onupgradeneeded hides.
+//
+// The fake is not a browser and the module says so. What it CAN prove is that the store's own
+// logic is correct: that it creates its object store, round-trips a non-extractable CryptoKey,
+// deletes, and turns every failure into a typed error rather than a hang. Persistence across a
+// real page reload stays owed on #134.
+// ---------------------------------------------------------------------------------------------
+
+test('the indexeddb store round-trips a key through its real code path', async () => {
+  const fake = installFakeIndexedDb();
+  try {
+    const store = new IndexedDbProofKeyStore('ironauth-test');
+    const slot = proofKeySlot('cli_1', 'env_prod');
+    assert.equal(await store.load(slot), undefined, 'an empty store holds nothing');
+
+    const key = await generateProofKey();
+    await store.save(slot, key);
+    const loaded = await store.load(slot);
+    assert.ok(loaded, 'the saved key must come back');
+    assert.equal(loaded.publicJwk.x, key.publicJwk.x);
+    assert.equal(
+      loaded.privateKey.extractable,
+      false,
+      'the CryptoKey is stored as an OBJECT, so it stays non-extractable across the round trip',
+    );
+
+    await store.remove(slot);
+    assert.equal(await store.load(slot), undefined, 'a removed key is gone');
+  } finally {
+    fake.uninstall();
+  }
+});
+
+/**
+ * The object store is created by the upgrade callback.
+ *
+ * A store that forgot `createObjectStore` would throw on its first transaction. Asserting the
+ * store exists in the backing database proves the upgrade path actually ran, rather than the
+ * fake having quietly provided it.
+ */
+test('the indexeddb store creates its object store on first open', async () => {
+  const fake = installFakeIndexedDb();
+  try {
+    const store = new IndexedDbProofKeyStore('ironauth-test');
+    await store.load(proofKeySlot('cli_1', 'env_prod'));
+    assert.ok(
+      fake.database.objectStoreNames.contains('proof-keys'),
+      'the upgrade callback must have created the object store',
+    );
+  } finally {
+    fake.uninstall();
+  }
+});
+
+/** A refused open is a typed error, not a hang. */
+test('an indexeddb that will not open surfaces a typed error', async () => {
+  const fake = installFakeIndexedDb('failing-open');
+  try {
+    const store = new IndexedDbProofKeyStore('ironauth-test');
+    await assert.rejects(
+      () => store.load(proofKeySlot('cli_1', 'env_prod')),
+      (error: DpopClientError) => error.reason === 'storage_unavailable',
+    );
+  } finally {
+    fake.uninstall();
+  }
+});
+
+/** A failing request is a typed error too, and it propagates through loadOrCreateProofKey. */
+test('a failing indexeddb request surfaces as storage_unavailable', async () => {
+  const fake = installFakeIndexedDb('failing-requests');
+  try {
+    const store = new IndexedDbProofKeyStore('ironauth-test');
+    await assert.rejects(
+      () => store.load(proofKeySlot('cli_1', 'env_prod')),
+      (error: DpopClientError) => error.reason === 'storage_unavailable',
+    );
+    // And through the helper, which must NOT fall back to a fresh in-memory key.
+    await assert.rejects(
+      () => loadOrCreateProofKey(store, 'cli_1', 'env_prod'),
+      (error: DpopClientError) => error.reason === 'storage_unavailable',
+    );
+  } finally {
+    fake.uninstall();
+  }
+});
+
+/**
+ * With no `indexedDB` global at all, the store reports storage_unavailable rather than throwing
+ * a raw TypeError.
+ *
+ * This is the edge-runtime case: the class must remain IMPORTABLE where the global does not
+ * exist, so a bundle shared between a browser and a worker still loads in both.
+ */
+test('the indexeddb store is importable and reports cleanly where the global is absent', async () => {
+  const holder = globalThis as { indexedDB?: unknown };
+  const previous = holder.indexedDB;
+  delete holder.indexedDB;
+  try {
+    assert.equal(indexedDbAvailable(), false);
+    const store = new IndexedDbProofKeyStore('ironauth-test');
+    await assert.rejects(
+      () => store.load('slot'),
+      (error: DpopClientError) => error.reason === 'storage_unavailable',
+    );
+  } finally {
+    if (previous !== undefined) holder.indexedDB = previous;
+  }
+});
+
+test('indexedDbAvailable reflects the global', () => {
+  const fake = installFakeIndexedDb();
+  try {
+    assert.equal(indexedDbAvailable(), true);
+  } finally {
+    fake.uninstall();
+  }
+  assert.equal(indexedDbAvailable(), false, 'and it goes back to false after uninstall');
 });
