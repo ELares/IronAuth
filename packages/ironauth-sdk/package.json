@@ -8,7 +8,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
-    "test": "tsc && node --test \"dist/**/*.test.js\" \"snippets/**/*.test.mjs\""
+    "test": "tsc && node --test \"dist/**/*.test.js\" \"snippets/**/*.test.mjs\"",
+    "bench": "tsc && node scripts/bench-verify.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
