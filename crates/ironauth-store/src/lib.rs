@@ -98,6 +98,7 @@ pub mod signup_form;
 pub mod sms_otp;
 pub mod snapshot;
 mod store;
+pub mod token_act_chain;
 pub mod token_exchange;
 pub mod trait_schema;
 
