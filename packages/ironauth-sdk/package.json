@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "test": "tsc && node --test \"dist/**/*.test.js\" \"snippets/**/*.test.mjs\"",
-    "bench": "tsc && node scripts/bench-verify.mjs"
+    "bench": "tsc && node scripts/bench-verify.mjs",
+    "test:browser": "tsc && node scripts/browser-reload-check.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
