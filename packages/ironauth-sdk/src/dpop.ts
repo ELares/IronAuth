@@ -22,6 +22,36 @@
  * belong to the server DPoP issue. This module owns the client half only.
  */
 
+/** Why a DPoP client operation failed. Distinct because the caller's response differs. */
+export type DpopFailureReason =
+  /** The configured storage rejected a read or a write. */
+  | 'storage_unavailable'
+  /** The server demanded a nonce again after the one permitted retry. */
+  | 'nonce_retry_exhausted';
+
+/**
+ * A typed DPoP client failure.
+ *
+ * Lives in this module rather than beside the store because {@link fetchWithProof} throws it
+ * and `./dpop-store.js` already imports this file; declaring it there and importing it back
+ * would make the pair circular.
+ *
+ * Only reasons that can ACTUALLY occur are listed. An earlier version also declared a
+ * `missing_key` that nothing ever constructed, which reads as a handled case and is not one.
+ * Key material that is absent is created on demand today, so that reason becomes real only
+ * when key rotation can invalidate a stored key, and it will be added with that.
+ */
+export class DpopClientError extends Error {
+  /** Which failure this is. */
+  readonly reason: DpopFailureReason;
+
+  constructor(reason: DpopFailureReason, message?: string) {
+    super(message ?? reason);
+    this.name = 'DpopClientError';
+    this.reason = reason;
+  }
+}
+
 /** The JOSE header type RFC 9449 section 4.2 requires on a proof. */
 const PROOF_TYP = 'dpop+jwt';
 
@@ -238,9 +268,22 @@ export async function fetchWithProof(
   }
   const nonce = nonceFrom(first);
   if (nonce === undefined) {
-    // The server asked for a nonce and did not supply one. Retrying would send an
-    // identical proof and get an identical answer.
-    return first;
+    // The server asked for a nonce and did not supply one. Retrying would send an identical
+    // proof and get an identical answer, so this is exhaustion on the first attempt.
+    throw new DpopClientError(
+      'nonce_retry_exhausted',
+      'the server demanded a nonce without supplying one',
+    );
   }
-  return attempt(nonce);
+  const second = await attempt(nonce);
+  if (demandsNonce(second)) {
+    // The nonce the server itself handed back was not accepted. Returning this response would
+    // hand the caller a 400 that looks like an ordinary protocol error, when what actually
+    // happened is that the request could not be made under DPoP at all.
+    throw new DpopClientError(
+      'nonce_retry_exhausted',
+      'the server rejected the nonce it issued',
+    );
+  }
+  return second;
 }
