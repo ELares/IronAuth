@@ -1136,6 +1136,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0140_log_stream_dead_letters.sql"),
         },
+        Migration {
+            version: 141,
+            name: "authorization_code_dpop",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0141_authorization_code_dpop.sql"),
+        },
     ]
 }
 

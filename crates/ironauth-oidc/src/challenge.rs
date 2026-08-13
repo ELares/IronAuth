@@ -1064,6 +1064,10 @@ async fn complete_challenge(
         consent_ref,
         code_challenge: params.code_challenge.as_deref(),
         code_challenge_method: params.code_challenge_method.as_deref(),
+        // The device binding (issue #368), sourced from the STASHED params like every other
+        // value here, never from the request that completed the login. A resume body cannot
+        // introduce, change, or clear it, so the code binds the key the login was driven with.
+        dpop_jkt: params.dpop_jkt.as_deref(),
     };
     match mint_challenge_code(state, scope, client_id, &context).await {
         Ok(authorization_code) => success(&ChallengeSuccess { authorization_code }),

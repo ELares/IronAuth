@@ -325,6 +325,13 @@ async fn authorization_code_grant(
     let dpop_confirmation = resolve_dpop_binding(state, headers)?;
     let dpop_jkt = dpop_confirmation.as_ref().map(Confirmation::value);
 
+    // 5h. A code that is itself SENDER-CONSTRAINED (issue #368) narrows 5g's opportunistic
+    //     rule to a mandatory one: the proof must be present and must be for the exact key
+    //     frozen onto the code. Only the browserless first-party challenge sets that
+    //     binding, and only from an `auth_session` that was device-bound, so this is a no-op
+    //     for every browser code and for an unbound browserless one.
+    enforce_code_dpop_binding(bindings.dpop_jkt.as_deref(), dpop_jkt)?;
+
     // 6. Mint (sign) the tokens BEFORE the consume, so a missing key or a signing
     //    failure fails closed without burning the code. The ID token stays lean by
     //    default (scope claims are served from UserInfo); the extra claims are the
@@ -537,6 +544,56 @@ fn resolve_dpop_binding(
         return Err(TokenError::InvalidDpopProof);
     }
     Ok(Some(Confirmation::Jkt(proof.jkt)))
+}
+
+/// Enforce a SENDER-CONSTRAINED authorization code's `DPoP` binding at redemption
+/// (RFC 9449, issue #368).
+///
+/// `code_jkt` is the thumbprint frozen onto the code at issuance
+/// (`authorization_codes.dpop_jkt`), or [`None`] for a code that is not key-bound.
+/// `presented_jkt` is what [`resolve_dpop_binding`] already validated off this request,
+/// so this function re-checks only the BINDING and never the proof: the proof's
+/// signature, `htm`, `htu`, freshness, and `jti` replay were all settled there, and
+/// duplicating any of it here would be a second answer to the same question.
+///
+/// The rule is the same narrowing the refresh grant applies
+/// ([`enforce_refresh_dpop`]): an unbound code keeps the opportunistic behavior, a
+/// bound code requires the matching key.
+///
+/// - `code_jkt` is [`None`]: unchanged. A presented proof still binds the issued
+///   tokens (that is 5g's job), and an absent one still yields bearer tokens.
+/// - `code_jkt` is [`Some`] and the presented key MATCHES: proceed, and the tokens
+///   bind to that same key.
+/// - `code_jkt` is [`Some`] and the proof is ABSENT or for another key: the uniform
+///   [`TokenError::InvalidDpopProof`].
+///
+/// Why the absent case matters most: without it, a code intercepted between the
+/// challenge response and the token request could be redeemed by anyone, for plain
+/// bearer tokens, and the device binding that protected every step of the login would
+/// have protected nothing at the one moment it was cashed in.
+///
+/// Comparing thumbprints in variable time is fine: a `jkt` is derived from a public
+/// key that the proof itself carries in clear, so a timing side channel discloses
+/// nothing an attacker cannot already compute.
+///
+/// Called BEFORE the code is consumed, so a refusal leaves the code live for the
+/// legitimate client's retry.
+fn enforce_code_dpop_binding(
+    code_jkt: Option<&str>,
+    presented_jkt: Option<&str>,
+) -> Result<(), TokenError> {
+    let Some(code_jkt) = code_jkt else {
+        return Ok(());
+    };
+    if presented_jkt == Some(code_jkt) {
+        return Ok(());
+    }
+    if presented_jkt.is_none() {
+        tracing::warn!("rejecting redemption of a DPoP-bound code presented with no proof");
+    } else {
+        tracing::warn!("rejecting redemption of a DPoP-bound code under a different proof key");
+    }
+    Err(TokenError::InvalidDpopProof)
 }
 
 /// Enforce a refresh-token family's `DPoP` binding (RFC 9449 section 5, issue #368

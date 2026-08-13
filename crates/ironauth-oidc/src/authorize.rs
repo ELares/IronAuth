@@ -743,6 +743,9 @@ async fn issue_code(
         consent_ref: consent_ref.as_deref(),
         claims_request: claims_canonical.as_deref(),
         granted_resources: &params.resources,
+        // A BROWSER code is not sender-constrained (issue #368). DPoP for the browser
+        // authorize path is its own decision, not a side effect of this one.
+        dpop_jkt: None,
     };
 
     // 7b. Single-use PAR consume at the moment of issuance (RFC 9126, issue #27).
@@ -2740,6 +2743,15 @@ struct Resolved<'a> {
     /// frozen onto the grant and code as the downscope ceiling. Empty when no
     /// resource was requested.
     granted_resources: &'a [String],
+    /// The RFC 9449 `DPoP` proof-key thumbprint the code is SENDER-CONSTRAINED to
+    /// (issue #368), or [`None`] for a code that is not key-bound.
+    ///
+    /// Only the browserless first-party challenge ever sets this, and only from an
+    /// `auth_session` that was itself device-bound. The BROWSER path sets [`None`]
+    /// EXPLICITLY rather than relying on a default, so binding a browser code to a
+    /// proof key later has to be a deliberate edit at that call site instead of
+    /// something that happens by accident when a field gains a default.
+    dpop_jkt: Option<&'a str>,
 }
 
 /// Why resolving the organization context refused or failed (issue #94, PR-B1).
@@ -2981,6 +2993,7 @@ async fn issue_code_core(
         consent_ref: resolved.consent_ref,
         claims_request: resolved.claims_request,
         granted_resources: resolved.granted_resources,
+        dpop_jkt: resolved.dpop_jkt,
         expires_at_micros: epoch_micros(expires_at),
         created_at_micros: epoch_micros(now),
     };
@@ -3031,6 +3044,13 @@ pub(crate) struct ChallengeCodeContext<'a> {
     pub code_challenge: Option<&'a str>,
     /// The presented PKCE `code_challenge_method`, or [`None`].
     pub code_challenge_method: Option<&'a str>,
+    /// The RFC 9449 `DPoP` proof-key thumbprint the completed login's `auth_session`
+    /// was device-bound to (issue #368 PR5), or [`None`] for an unbound session.
+    ///
+    /// Carried onto the code so the binding survives the one seam it could not reach
+    /// before: without it, a code minted from a key-bound login could still be
+    /// redeemed by anyone who intercepted it, with no proof at all.
+    pub dpop_jkt: Option<&'a str>,
 }
 
 /// Mint an authorization code for a completed first-party challenge (issue #93, Bet 3).
@@ -3100,6 +3120,8 @@ pub(crate) async fn mint_challenge_code(
         consent_ref: consent_ref.as_deref(),
         claims_request: None,
         granted_resources: &[],
+        // The device binding, carried from the auth_session onto the code (issue #368).
+        dpop_jkt: context.dpop_jkt,
     };
     // FORK A: a browserless code is bound to NO redirect_uri (the empty sentinel), so the token
     // endpoint accepts an absent presented redirect_uri and rejects a present one.

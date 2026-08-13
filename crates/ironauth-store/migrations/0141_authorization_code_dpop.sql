@@ -1,0 +1,35 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The authorization code's DPoP proof-key binding (RFC 9449, issue #368).
+--
+-- draft-ietf-oauth-first-party-apps-03 says tokens issued from a challenge SHOULD
+-- be sender-constrained. PR5 device-bound the browserless login's `auth_session` to
+-- a DPoP key, so the login itself can no longer be driven by a stolen handle. This
+-- column carries that binding across the one seam PR5 could not reach: the code.
+--
+-- Without it the binding ends at the mint. A code minted from a key-bound session is
+-- redeemed under the token endpoint's ordinary OPPORTUNISTIC rule, so a code
+-- intercepted between the challenge response and the token request could be redeemed
+-- by anyone, with no proof at all, for plain bearer tokens. The device binding would
+-- have protected every step of the login and then handed the result to whoever moved
+-- fastest.
+--
+-- NULLABLE, and permanently so rather than as a migration step. A browser
+-- authorization code and an unbound browserless code genuinely have no proof key.
+-- NULL means "this code is not key-bound", which is a fact about the code and not
+-- missing data, and the token endpoint reads it exactly that way: NULL keeps the
+-- pre-existing opportunistic behavior, a value makes a matching proof mandatory.
+--
+-- Expand phase: the previous binary never selects this column, so it ignores the
+-- value and keeps redeeming as before. That is what makes it safe to run ahead of
+-- the deploy. The consequence during a rolling upgrade is worth stating plainly
+-- rather than discovering: a code minted by a NEW replica carries a binding that an
+-- OLD replica will not enforce, so for the length of the rollout a bound code can
+-- still be redeemed without a proof. The window is one code lifetime and the
+-- alternative (enforcement before every replica can write the column) would refuse
+-- legitimate redemptions instead, which is the worse failure.
+--
+-- No index. The column is only ever read back by primary key, on the row the token
+-- endpoint already loads by id; nothing filters or joins on it.
+
+ALTER TABLE authorization_codes ADD COLUMN dpop_jkt text;
