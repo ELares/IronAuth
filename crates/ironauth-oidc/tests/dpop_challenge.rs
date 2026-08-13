@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use common::{Harness, form, json};
+use common::{Harness, form, json, send_through};
 use ironauth_env::Clock;
 use ironauth_jose::dpop_test_util::sign_proof;
 use ironauth_jose::{SigningKey, SigningPolicy};
@@ -145,6 +145,72 @@ async fn challenge_from(
         .expect("request builds");
     let (status, _headers, response) = harness.send(request).await;
     (status, response)
+}
+
+/// The token endpoint's `htu`: the DEPLOYMENT-ROOT `/token`, NOT the per-environment path the
+/// challenge endpoint uses. The two differ, and a proof minted for one is refused at the other,
+/// which is exactly the property the challenge suite relies on when it shares a replay cache.
+fn token_htu() -> String {
+    format!("{}/token", common::ISSUER_BASE)
+}
+
+/// `POST /token` with zero or more `DPoP` header values.
+async fn token_with_dpop(
+    harness: &Harness,
+    form_body: &str,
+    dpop_values: &[&str],
+) -> (StatusCode, String) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    for value in dpop_values {
+        builder = builder.header("DPoP", *value);
+    }
+    let request = builder
+        .body(Body::from(form_body.to_owned()))
+        .expect("request builds");
+    let (status, _headers, body) = send_through(harness.router(), request).await;
+    (status, body)
+}
+
+/// A fresh, well-formed proof for the TOKEN endpoint, signed by `key`.
+fn token_proof(harness: &Harness, key: &SigningKey, jti: &str) -> String {
+    sign_proof(key, "POST", &token_htu(), now_secs(harness), jti)
+}
+
+/// The redemption form for a browserless first-party code: no `redirect_uri`.
+fn redeem_form(code: &str, client_id: &str) -> String {
+    form(&[
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", client_id),
+    ])
+}
+
+/// Drive a complete bound login and return the minted code plus the key it is bound to.
+async fn bound_code(harness: &Harness, client_id: &str, key: &SigningKey) -> String {
+    let auth_session = first_hop(
+        harness,
+        client_id,
+        &[&fresh_proof(harness, key, "jti-mint-first")],
+    )
+    .await;
+    harness.clock().advance(Duration::from_secs(90));
+    let (status, body) = challenge_with_dpop(
+        harness,
+        &form(&[
+            ("auth_session", &auth_session),
+            ("otp", &totp_code(harness)),
+        ]),
+        &[&fresh_proof(harness, key, "jti-mint-resume")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the bound login mints: {body}");
+    json(&body)["authorization_code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a code: {body}"))
+        .to_owned()
 }
 
 /// The fresh first hop (identifier + password), returning the `auth_session` the step-up render
@@ -377,17 +443,127 @@ async fn a_bound_session_resumes_and_mints_with_the_same_key() {
         .unwrap_or_else(|| panic!("a code: {body}"))
         .to_owned();
 
-    // The code redeems at the ordinary token endpoint, so the device binding constrains the login
-    // WITHOUT changing the redemption contract this PR leaves alone.
-    let (status, _headers, response) = harness
-        .token(&form(&[
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("client_id", &client_id),
-        ]))
-        .await;
+    // The code redeems at the ordinary token endpoint under the SAME key. This assertion changed
+    // with the code-binding work: before it, this redemption carried no proof at all, because an
+    // unbound code was all the mint produced.
+    let (status, response) = token_with_dpop(
+        &harness,
+        &redeem_form(&code, &client_id),
+        &[&token_proof(&harness, &key, "jti-redeem")],
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "the code redeems: {response}");
     assert!(json(&response)["access_token"].is_string());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The minted code carries the binding (the second draft SHOULD).
+// ---------------------------------------------------------------------------------------------
+
+/// A code minted from a device-bound login is SENDER-CONSTRAINED: redeeming it without a proof is
+/// refused, and refused WITHOUT burning the code.
+///
+/// The no-proof case is the one that matters. Without it, a code intercepted between the challenge
+/// response and the token request could be cashed in by anyone, for plain bearer tokens, and the
+/// device binding that protected every step of the login would have protected nothing at the one
+/// moment it was worth stealing.
+///
+/// The successful redemption AFTER the refusal is not decoration: it proves the refusal rejected
+/// the presentation rather than consuming the one-time code, so a legitimate client that simply
+/// forgot its proof header can retry.
+#[tokio::test]
+async fn a_bound_code_is_refused_without_a_proof_and_survives_the_refusal() {
+    let (harness, client_id) = armed_mfa_harness().await;
+    let key = proof_key();
+    let code = bound_code(&harness, &client_id, &key).await;
+
+    let (status, body) = token_with_dpop(&harness, &redeem_form(&code, &client_id), &[]).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a bound code must not redeem bare: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_dpop_proof", "{body}");
+    assert!(
+        json(&body)["access_token"].is_null(),
+        "no token may be issued: {body}"
+    );
+
+    // The code is still live for the legitimate holder.
+    let (status, body) = token_with_dpop(
+        &harness,
+        &redeem_form(&code, &client_id),
+        &[&token_proof(&harness, &key, "jti-retry")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refusal must not have burned the code: {body}"
+    );
+    assert!(json(&body)["access_token"].is_string());
+}
+
+/// A bound code is refused under a DIFFERENT key, even though that proof is itself perfectly
+/// valid. A server that merely checked "is there a valid proof" would pass every other test here
+/// and fail this one.
+#[tokio::test]
+async fn a_bound_code_is_refused_under_a_different_key() {
+    let (harness, client_id) = armed_mfa_harness().await;
+    let key = proof_key();
+    let code = bound_code(&harness, &client_id, &key).await;
+
+    let thief = token_proof(&harness, &other_key(), "jti-thief-redeem");
+    let (status, body) =
+        token_with_dpop(&harness, &redeem_form(&code, &client_id), &[&thief]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(json(&body)["error"], "invalid_dpop_proof", "{body}");
+
+    let (status, body) = token_with_dpop(
+        &harness,
+        &redeem_form(&code, &client_id),
+        &[&token_proof(&harness, &key, "jti-owner-redeem")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the bound key still redeems, so the refusal was the key and not the code: {body}"
+    );
+}
+
+/// The compatibility floor: a code from an UNBOUND browserless login still redeems with no proof.
+///
+/// This is what keeps the binding opt-in end to end. Every native client that has not adopted `DPoP`
+/// must be unaffected by all of issue #368, and a code-side check written as "require a proof
+/// whenever the code came from the challenge endpoint" would break every one of them.
+#[tokio::test]
+async fn an_unbound_browserless_code_still_redeems_without_a_proof() {
+    let (harness, client_id) = armed_mfa_harness().await;
+    let auth_session = first_hop(&harness, &client_id, &[]).await;
+    harness.clock().advance(Duration::from_secs(90));
+    let (status, body) = challenge_with_dpop(
+        &harness,
+        &form(&[
+            ("auth_session", &auth_session),
+            ("otp", &totp_code(&harness)),
+        ]),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the unbound login mints: {body}");
+    let code = json(&body)["authorization_code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a code: {body}"))
+        .to_owned();
+
+    let (status, body) = token_with_dpop(&harness, &redeem_form(&code, &client_id), &[]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unbound code must redeem bare, exactly as before issue #368: {body}"
+    );
+    assert!(json(&body)["access_token"].is_string());
 }
 
 /// THE theft-resistance property: a stolen `auth_session` presented with NO proof does not resume

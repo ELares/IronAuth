@@ -153,6 +153,9 @@ async fn seed_family(
                 consent_ref: None,
                 claims_request: None,
                 granted_resources: &[],
+                // Not sender-constrained (issue #368): these fixtures predate the
+                // binding and exercise paths that never set it.
+                dpop_jkt: None,
                 expires_at_micros: FAR_FUTURE_MICROS,
                 created_at_micros: 0,
             },

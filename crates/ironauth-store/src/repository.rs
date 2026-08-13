@@ -8380,6 +8380,15 @@ pub struct IssueCode<'a> {
     /// slice means no resource was approved (the default-audience case) and is
     /// stored as NULL.
     pub granted_resources: &'a [String],
+    /// The RFC 9449 `DPoP` proof-key thumbprint (`jkt`) this code is SENDER-CONSTRAINED
+    /// to (issue #368), or [`None`] for an ordinary code that is not key-bound.
+    ///
+    /// Set only by the browserless first-party challenge, and only when the login's
+    /// `auth_session` was itself device-bound to that key. The token endpoint reads it
+    /// back and, when it is present, REQUIRES a matching proof before it will redeem:
+    /// that is what stops an intercepted code from being redeemed by whoever holds it.
+    /// [`None`] leaves redemption on the ordinary opportunistic rule, unchanged.
+    pub dpop_jkt: Option<&'a str>,
     /// The code's expiry, in microseconds since the Unix epoch (clock seam).
     pub expires_at_micros: i64,
     /// The code's creation time, in microseconds since the Unix epoch.
@@ -8463,6 +8472,15 @@ pub struct CodeBindings {
     /// session resolved no org (a member-less user, a multi-org user who named none,
     /// or a machine grant); no `org_id` claim is then emitted.
     pub org_id: Option<String>,
+    /// The RFC 9449 `DPoP` proof-key thumbprint (`jkt`) this code is SENDER-CONSTRAINED
+    /// to (issue #368), or [`None`] for a code that is not key-bound.
+    ///
+    /// When present, the token endpoint REQUIRES a `DPoP` proof for exactly this key
+    /// before redeeming: no proof, a proof for another key, or a replayed one are all
+    /// refused, and refused BEFORE the code is consumed so a legitimate retry still
+    /// works. [`None`] leaves the endpoint's ordinary opportunistic rule untouched, so
+    /// every browser code behaves exactly as it did before issue #368.
+    pub dpop_jkt: Option<String>,
 }
 
 impl fmt::Debug for CodeBindings {
@@ -8551,7 +8569,7 @@ impl AuthorizationRepo<'_> {
             "SELECT ac.grant_id, ac.client_id, ac.redirect_uri, ac.browserless, ac.nonce, \
              ac.code_challenge, \
              ac.code_challenge_method, ac.subject, ac.oauth_scope, ac.auth_methods, \
-             ac.claims_request, ac.granted_resources, \
+             ac.claims_request, ac.granted_resources, ac.dpop_jkt, \
              (EXTRACT(EPOCH FROM ac.auth_time) * 1000000)::bigint AS auth_time_us, \
              g.session_ref AS session_ref, g.org_id AS org_id \
              FROM authorization_codes ac \
@@ -8896,13 +8914,15 @@ impl ActingAuthorizationRepo<'_> {
                      (id, tenant_id, environment_id, grant_id, client_id, redirect_uri, \
                       browserless, nonce, \
                       code_challenge, code_challenge_method, subject, oauth_scope, auth_methods, \
-                      claims_request, granted_resources, auth_time, expires_at, created_at) \
+                      claims_request, granted_resources, dpop_jkt, \
+                      auth_time, expires_at, created_at) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                             CASE WHEN $16::bigint IS NULL THEN NULL \
+                             $16, \
+                             CASE WHEN $17::bigint IS NULL THEN NULL \
                                   ELSE TIMESTAMPTZ 'epoch' \
-                                       + ($16::text || ' microseconds')::interval END, \
-                             TIMESTAMPTZ 'epoch' + ($17::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($18::text || ' microseconds')::interval)",
+                                       + ($17::text || ' microseconds')::interval END, \
+                             TIMESTAMPTZ 'epoch' + ($18::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($19::text || ' microseconds')::interval)",
                 )
                 .bind(code.code_id.to_string())
                 .bind(scope.tenant().to_string())
@@ -8919,6 +8939,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(code.auth_methods)
                 .bind(code.claims_request)
                 .bind(granted_resources.as_deref())
+                .bind(code.dpop_jkt)
                 .bind(code.auth_time_micros)
                 .bind(code.expires_at_micros)
                 .bind(code.created_at_micros)
@@ -12959,6 +12980,9 @@ fn bindings_from_row(row: &PgRow, scope: &Scope) -> Result<CodeBindings, StoreEr
         ),
         session_ref: row.get::<Option<String>, _>("session_ref"),
         org_id: row.get::<Option<String>, _>("org_id"),
+        // Explicitly Option: the column is nullable for every browser code, and a
+        // non-Option decode would PANIC on the NULL rather than read "not key-bound".
+        dpop_jkt: row.get::<Option<String>, _>("dpop_jkt"),
     })
 }
 
