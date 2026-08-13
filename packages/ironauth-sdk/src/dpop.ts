@@ -176,17 +176,38 @@ export function demandsNonce(response: { status: number; headers: Headers }): bo
 }
 
 /**
+ * The nonce memory {@link fetchWithProof} consults, satisfied by `NonceCache` in
+ * `./dpop-store.ts`.
+ *
+ * Declared structurally here rather than imported, so the proof primitive does not depend on
+ * the module that stores things: `dpop-store.ts` already imports THIS file, and importing it
+ * back would make the pair circular.
+ */
+export interface NonceMemory {
+  /** The nonce last seen from `url`'s server, if any. */
+  get(url: string): string | undefined;
+  /** Record any `DPoP-Nonce` this response carried. */
+  observe(url: string, response: { headers: Headers }): void;
+}
+
+/**
  * Send `request` with a DPoP proof, retrying ONCE if the server demands a nonce.
  *
  * Exactly one retry. RFC 9449 has the server hand back the nonce it wants, so a second
  * failure is a server that will not be satisfied, and looping on it turns one client into a
  * request storm against an endpoint that is already unhappy.
+ *
+ * Pass `nonces` to remember what the server hands back. Without it the client relearns the
+ * nonce on every call, paying a challenge plus a retry (two round trips) for every single
+ * request against a server that is behaving exactly as RFC 9449 specifies. With it, the
+ * first request pays that cost once and the rest carry the nonce up front.
  */
 export async function fetchWithProof(
   key: ProofKey,
   input: string,
   init: RequestInit & { accessToken?: string } = {},
   send: typeof fetch = fetch,
+  nonces?: NonceMemory,
 ): Promise<Response> {
   const method = (init.method ?? 'GET').toUpperCase();
   const attempt = async (nonce?: string): Promise<Response> => {
@@ -203,10 +224,15 @@ export async function fetchWithProof(
       // token is what the whole mechanism exists to stop.
       headers.set('Authorization', `DPoP ${init.accessToken}`);
     }
-    return send(input, { ...init, method, headers });
+    const response = await send(input, { ...init, method, headers });
+    // Observe on EVERY response, not only challenges: a server may rotate the nonce on a
+    // success, and a client that only read it off failures would send the stale one next
+    // time and earn a challenge it had already been told how to avoid.
+    nonces?.observe(input, response);
+    return response;
   };
 
-  const first = await attempt();
+  const first = await attempt(nonces?.get(input));
   if (!demandsNonce(first)) {
     return first;
   }

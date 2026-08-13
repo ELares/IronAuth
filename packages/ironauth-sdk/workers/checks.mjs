@@ -16,6 +16,12 @@
 import { createProof, generateProofKey } from '../dist/dpop.js';
 import { authorizationUrl, generatePkce } from '../dist/protocol.js';
 import { maxAgeOf } from '../dist/verify.js';
+import {
+  MemoryProofKeyStore,
+  NonceCache,
+  loadOrCreateProofKey,
+  proofKeySlot,
+} from '../dist/dpop-store.js';
 
 /** Run every check, returning `{ ok, failed, count }`. */
 export async function runChecks() {
@@ -58,9 +64,40 @@ export async function runChecks() {
     maxAgeOf(new Headers({ 'Cache-Control': 'max-age=7' })) === 7,
   ]);
 
+  // Key persistence and the nonce cache (issue #134). Both are pure state with no Node
+  // dependency, so they must behave identically in every lane; the IndexedDB store is NOT
+  // exercised here because the global exists in browsers only, which is the whole reason
+  // the store is an interface with a memory default.
+  const store = new MemoryProofKeyStore();
+  const stored = await loadOrCreateProofKey(store, 'cli_1', 'env_prod');
+  const reloaded = await loadOrCreateProofKey(store, 'cli_1', 'env_prod');
+  checks.push(['a stored proof key is reused', stored.publicJwk.x === reloaded.publicJwk.x]);
+  checks.push([
+    'the reloaded private key is still non-extractable',
+    reloaded.privateKey.extractable === false,
+  ]);
+  const otherEnvironment = await loadOrCreateProofKey(store, 'cli_1', 'env_staging');
+  checks.push([
+    'a second environment gets its own key',
+    otherEnvironment.publicJwk.x !== stored.publicJwk.x,
+  ]);
+  checks.push([
+    'slot names cannot be made to collide',
+    proofKeySlot('a:b', 'c') !== proofKeySlot('a', 'b:c'),
+  ]);
+  const nonces = new NonceCache();
+  nonces.observe('https://a.example/token', {
+    headers: new Headers({ 'DPoP-Nonce': 'n1' }),
+  });
+  checks.push([
+    'a nonce is cached per origin',
+    nonces.get('https://a.example/userinfo') === 'n1' &&
+      nonces.get('https://b.example/token') === undefined,
+  ]);
+
   const failed = checks.filter(([, ok]) => !ok).map(([name]) => name);
   return { ok: failed.length === 0, failed, count: checks.length };
 }
 
 /** The number of checks a lane must observe. A lower count means checks were skipped. */
-export const EXPECTED_CHECKS = 7;
+export const EXPECTED_CHECKS = 12;
