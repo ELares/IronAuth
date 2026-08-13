@@ -134,6 +134,7 @@ mod pkce;
 mod policy_trace;
 pub mod pow;
 mod pow_gate;
+pub mod prm;
 mod probe;
 mod quota;
 mod recover;
