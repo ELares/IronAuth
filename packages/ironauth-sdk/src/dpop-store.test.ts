@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import { createProof, fetchWithProof, generateProofKey } from './dpop.js';
@@ -390,4 +391,109 @@ test('indexedDbAvailable reflects the global', () => {
     fake.uninstall();
   }
   assert.equal(indexedDbAvailable(), false, 'and it goes back to false after uninstall');
+});
+
+/**
+ * A page reload, simulated faithfully: a NEW store instance against the SAME database.
+ *
+ * That is exactly what a reload is from the store's point of view. The JavaScript context is
+ * discarded and rebuilt, so every in-memory field is gone, while IndexedDB persists. A test
+ * reusing one store instance proves only that a `Map` works; this proves the key is read back
+ * out of storage.
+ *
+ * Still not a browser, and issue #134 still owes real automation for that. What it forecloses
+ * is the failure this criterion is actually about: a client that mints a NEW key on every load
+ * and orphans every token bound to the previous one.
+ */
+test('a keypair survives a simulated page reload', async () => {
+  const fake = installFakeIndexedDb();
+  try {
+    const before = await loadOrCreateProofKey(
+      new IndexedDbProofKeyStore('ironauth-reload'),
+      'cli_1',
+      'env_prod',
+    );
+
+    // The reload: everything in memory is discarded. Only the database survives.
+    const after = await loadOrCreateProofKey(
+      new IndexedDbProofKeyStore('ironauth-reload'),
+      'cli_1',
+      'env_prod',
+    );
+
+    assert.equal(
+      after.publicJwk.x,
+      before.publicJwk.x,
+      'a new key after a reload orphans every token bound to the old one',
+    );
+    assert.equal(
+      after.privateKey.extractable,
+      false,
+      'and it is still non-extractable after coming back out of storage',
+    );
+    await assert.rejects(
+      () => crypto.subtle.exportKey('jwk', after.privateKey),
+      'no API path may extract it, reload or not',
+    );
+  } finally {
+    fake.uninstall();
+  }
+});
+
+/**
+ * The nonce challenge-retry on a PROTECTED RESOURCE, not just the token endpoint.
+ *
+ * Issue #134 criterion 3 names both surfaces, and they are not the same code path: a resource
+ * call carries an access token and therefore an `ath`, so the re-signed proof has to carry the
+ * nonce AND keep the correct `ath`. A retry that dropped the `ath` would be refused by the
+ * resource server for a reason that looks nothing like a nonce problem.
+ */
+test('a protected resource nonce challenge is retried exactly once, keeping ath', async () => {
+  const key = await generateProofKey();
+  const nonces = new NonceCache();
+  const proofs: Array<Record<string, unknown>> = [];
+  let challenged = false;
+  const send = (async (_input: string, init?: RequestInit): Promise<Response> => {
+    const proof = new Headers(init?.headers).get('DPoP') ?? '';
+    proofs.push(
+      JSON.parse(atob(proof.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))) as Record<
+        string,
+        unknown
+      >,
+    );
+    if (!challenged) {
+      challenged = true;
+      return new Response('', {
+        status: 401,
+        headers: {
+          'WWW-Authenticate': 'DPoP error="use_dpop_nonce"',
+          'DPoP-Nonce': 'resource-nonce',
+        },
+      });
+    }
+    return new Response('{"sub":"usr_1"}', { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const response = await fetchWithProof(
+    key,
+    'https://api.example/resource',
+    { accessToken: 'at-9' },
+    send,
+    nonces,
+  );
+  assert.equal(response.status, 200, 'the retry must succeed');
+  assert.equal(proofs.length, 2, 'exactly one retry, never a loop');
+
+  const expectedAth = createHash('sha256').update('at-9').digest('base64url');
+  assert.equal(proofs[0].nonce, undefined, 'the first proof had no nonce to carry');
+  assert.equal(proofs[1].nonce, 'resource-nonce', 'the retry carries the issued nonce');
+  for (const [index, proof] of proofs.entries()) {
+    assert.equal(
+      proof.ath,
+      expectedAth,
+      `proof ${index} must carry the ath of the presented token, nonce or not`,
+    );
+  }
+  // And the nonce is remembered for the next resource call on that origin.
+  assert.equal(nonces.get('https://api.example/other'), 'resource-nonce');
 });
