@@ -64,6 +64,7 @@ pub mod event_catalog;
 pub mod federation_state;
 pub mod flow;
 pub mod flow_version;
+pub mod grant_restriction;
 mod id;
 pub mod identifier;
 pub mod identity_fact;
