@@ -14,7 +14,7 @@
  */
 
 import { createProof, generateProofKey } from '../dist/dpop.js';
-import { authorizationUrl, generatePkce } from '../dist/protocol.js';
+import { authorizationUrl, exchangeCode, generatePkce, refresh, userInfo } from '../dist/protocol.js';
 import { maxAgeOf } from '../dist/verify.js';
 import {
   MemoryProofKeyStore,
@@ -95,9 +95,111 @@ export async function runChecks() {
       nonces.get('https://b.example/token') === undefined,
   ]);
 
+  // A COMPLETE DPoP flow (issue #134 criterion 1): code exchange, refresh, and a protected
+  // resource call, all with real proofs, against a fake server that enforces what a real one
+  // enforces. Every earlier check here proves a piece works in isolation; this proves the
+  // pieces work TOGETHER in a runtime with no Node, which is the criterion's actual wording
+  // and the thing no unit test on Node can answer.
+  const flowKey = await loadOrCreateProofKey(new MemoryProofKeyStore(), 'cli_flow', 'env_prod');
+  const flowNonces = new NonceCache();
+  const seen = { exchange: null, refresh: null, userinfo: null };
+
+  // The fake server demands a nonce on the FIRST request, exactly as RFC 9449 section 8
+  // permits, so the retry path is exercised in every runtime rather than only on Node.
+  let issuedNonce = false;
+  const flowServer = async (input, init) => {
+    const headers = new Headers(init?.headers);
+    const proof = headers.get('DPoP');
+    if (!proof) {
+      return new Response('{"error":"invalid_dpop_proof"}', {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    const payload = JSON.parse(
+      atob(proof.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')),
+    );
+    if (!issuedNonce) {
+      issuedNonce = true;
+      return new Response('{"error":"use_dpop_nonce"}', {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'DPoP-Nonce': 'n-1' },
+      });
+    }
+    const url = String(input);
+    if (url.endsWith('/token')) {
+      const body = new URLSearchParams(String(init?.body));
+      const grant = body.get('grant_type');
+      seen[grant === 'refresh_token' ? 'refresh' : 'exchange'] = payload;
+      return new Response(
+        JSON.stringify({ access_token: 'at-1', token_type: 'DPoP', refresh_token: 'rt-1' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    seen.userinfo = { payload, authorization: headers.get('Authorization') };
+    return new Response('{"sub":"usr_1"}', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  const discovery = {
+    token_endpoint: 'https://issuer.example/token',
+    userinfo_endpoint: 'https://issuer.example/userinfo',
+  };
+  const binding = { key: flowKey, nonces: flowNonces };
+
+  const exchanged = await exchangeCode(
+    {
+      discovery,
+      clientId: 'cli_flow',
+      redirectUri: 'https://app.example/cb',
+      code: 'the-code',
+      verifier: 'the-verifier',
+      dpop: binding,
+    },
+    flowServer,
+  );
+  checks.push(['dpop code exchange returns a bound token', exchanged.token_type === 'DPoP']);
+  checks.push([
+    'the exchange proof binds the token endpoint',
+    seen.exchange?.htu === 'https://issuer.example/token' && seen.exchange?.htm === 'POST',
+  ]);
+  checks.push([
+    'the exchange proof carries no ath',
+    seen.exchange?.ath === undefined,
+  ]);
+
+  const refreshed = await refresh(
+    { discovery, clientId: 'cli_flow', refreshToken: exchanged.refresh_token, dpop: binding },
+    flowServer,
+  );
+  checks.push(['dpop refresh succeeds', refreshed.access_token === 'at-1']);
+  checks.push([
+    'the refresh proof carries the cached nonce',
+    seen.refresh?.nonce === 'n-1',
+  ]);
+
+  const claims = await userInfo(
+    { discovery, accessToken: exchanged.access_token, dpop: binding },
+    flowServer,
+  );
+  checks.push(['dpop userinfo returns claims', claims.sub === 'usr_1']);
+  checks.push([
+    'the userinfo token is presented under the DPoP scheme',
+    seen.userinfo?.authorization === 'DPoP at-1',
+  ]);
+  // `ath` must be the SHA-256 of the presented token. Recomputed here with WebCrypto rather
+  // than copied from the SDK, so this is a cross-check and not the code agreeing with itself.
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('at-1'));
+  let binary = '';
+  for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte);
+  const expectedAth = btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  checks.push(['the userinfo proof ath matches the presented token', seen.userinfo?.payload?.ath === expectedAth]);
+
   const failed = checks.filter(([, ok]) => !ok).map(([name]) => name);
   return { ok: failed.length === 0, failed, count: checks.length };
 }
 
 /** The number of checks a lane must observe. A lower count means checks were skipped. */
-export const EXPECTED_CHECKS = 12;
+export const EXPECTED_CHECKS = 20;
