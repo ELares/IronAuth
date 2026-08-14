@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The IronBus-backed outbox backbone, verified against a real broker (issue #104).** The seam
+  landed with `PollOnly`; this is the second implementation, behind the optional `ironbus` feature.
+
+  - **Per-instance consumer groups, which is the opposite of the usual arrangement.** A shared group
+    means COMPETING consumers: the broker hands each message to exactly one member. For a work queue
+    that is the point; for a WAKE-UP it is exactly wrong, because every process must re-drain, and a
+    shared group would wake one and leave the rest asleep until their poll deadline. This is not
+    theoretical: it is what made the live-broker test fail while the reader thread was demonstrably
+    alive and subscribed.
+  - **The startup backlog is drained without signalling.** A fresh group starts at the beginning of
+    the stream, so the first pass replays every wake the deployment ever produced. Those say nothing
+    about the queue now. Only the first batch is treated as backlog, so the bias favours
+    over-signalling (one wasted re-drain) over under-signalling (a lost poll interval).
+  - **The blocking client stays off the runtime.** `ironbus-client` is blocking and thread-per-
+    connection; the connection lives on its own std thread and the async side is woken through a
+    `Notify`, so no runtime thread is ever parked in a socket read.
+  - **Every failure degrades to Postgres-only.** A produce that fails is dropped on purpose (the row
+    is committed; returning an error would let a broker outage fail a domain write), and a reader
+    that faults stands down so `wait` sleeps its deadline out, which is exactly `PollOnly`.
+
 - **The outbox gains an optional wake-up backbone, and `ironbus-client` is a declared dependency for
   the first time (issue #104).**
 

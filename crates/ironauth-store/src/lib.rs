@@ -88,6 +88,8 @@ pub mod ocsf;
 pub mod org_policy;
 pub mod org_provisioning;
 pub mod outbox;
+#[cfg(feature = "ironbus")]
+pub mod outbox_ironbus;
 pub mod pow_challenge;
 pub mod promotion;
 pub mod recovery;

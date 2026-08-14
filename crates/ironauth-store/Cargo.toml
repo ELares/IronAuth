@@ -79,7 +79,10 @@ serde.workspace = true
 # crate: sqlx already builds on `runtime-tokio` in this crate's graph and the two features
 # named here are a subset of what the server and the dev-dependency already enable, so
 # MSRV 1.85, the musl static lane, and cargo-deny are all unchanged.
-tokio = { workspace = true, features = ["rt", "time"] }
+# `macros` for `tokio::select!`: the outbox drain races its backbone wait against
+# shutdown, so a worker parked in a long wait still stops promptly (issue #104).
+# `sync` for the Notify that carries the shutdown wake.
+tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
 
 # The IronBus client (issue #104), OPTIONAL: the notification backbone for the outbox.
 # Postgres alone stays a complete supported mode, so a deployment that does not want the
@@ -119,6 +122,17 @@ axum = { workspace = true, default-features = false }
 # RLS integration test: a low-privilege session cannot read another tenant's
 # rows even with the app-layer filter bypassed. Needs a real database
 # (DATABASE_URL); see the crate docs and scripts/with-test-db.sh.
+# The IronBus-backed outbox backbone against a REAL broker (issue #104). Gated on IRONBUS_ADDR so a
+# lane without a broker SKIPS rather than fails, which is the dual-mode shape criterion 6 asks for:
+# the Postgres-only lane is the whole existing outbox suite, and this is the same drain with a bus
+# attached. Asserts only the backbone's narrow contract (a signal wakes the drain; an absent broker is
+# a clean error; the deadline is honoured when nothing arrives), because durability, ordering, and
+# retries are the outbox's own and unchanged in either mode.
+[[test]]
+name = "outbox_ironbus"
+path = "tests/outbox_ironbus.rs"
+required-features = ["testing", "ironbus"]
+
 [[test]]
 name = "idempotency_retention"
 path = "tests/idempotency_retention.rs"
