@@ -6,6 +6,43 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Server-issued `DPoP` nonces at the token endpoint (issue #124, RFC 9449 section 8).** The
+  challenge-retry flow did not exist: `token.rs` said so outright ("no server-issued DPoP-Nonce"),
+  which left one item of this issue's test matrix untestable rather than untested.
+
+  - **What it buys.** Without a nonce a proof's freshness rests entirely on the client's own `iat`
+    clock. An attacker holding a stolen proof has the whole freshness window to present it to a
+    server that has never seen it, and the `jti` replay cache cannot help, because to THAT server
+    it is not a replay. A nonce makes freshness the SERVER's assertion: a proof minted before the
+    challenge cannot echo a value the server had not yet handed out.
+
+  - **Off by default, deliberately.** `require_dpop_nonce` ships `false`. Turning it on costs every
+    `DPoP` client one extra round trip on its first request and breaks outright any client that does
+    not implement the retry, which is why RFC 9449 section 8 makes the nonce the server's option.
+    The default path is pinned by its own tests: no challenge is ever issued, and a nonce a client
+    volunteers unasked is ignored rather than refused.
+
+  - **`use_dpop_nonce` is a distinct error, and that is the point.** `invalid_dpop_proof` is uniform
+    precisely to deny an attacker an oracle. This one is an INSTRUCTION to a legitimate client, and
+    a client that cannot tell "retry with this nonce" from "your proof is bad" cannot implement the
+    retry at all. It discloses nothing: the nonce is a value the server hands out on request. An
+    ABSENT nonce and an UNRECOGNISED one are answered identically, so the response is still not an
+    oracle for which nonces an instance holds.
+
+  - **Not single use.** Section 8 lets a client keep using a nonce until the server challenges
+    again; consuming it on acceptance would force a challenge before every request, which is the
+    behavior section 8 exists to avoid. Proof replay stays the `jti` cache's job.
+
+  - **Per-instance, with the cost stated.** The store is bounded and per-process, exactly like the
+    `jti` replay cache, which is the scope this issue sets (cross-node concerns are M15's). Behind a
+    balancer with no affinity a client may be challenged more than once before it lands on the node
+    holding its nonce; it converges, at the cost of the extra round trips. A shared backend slots in
+    behind the same two methods without touching the endpoint.
+
+  - `DpopProof` now reports the `nonce` it verified. A caller that recognises its OWN nonces cannot
+    name the expected value in advance, and reading it from a signature-verified proof is the only
+    safe way to get it: the alternative is a second, unverified parse of the same JWS.
+
 - **`dpop_jkt` binds an authorization CODE to a `DPoP` key before the token request exists
   (issue #124, RFC 9449 section 10).** The parameter was not implemented on either delivery path:
   `authorize.rs` set the code's binding to `None` with a comment deferring the decision, and

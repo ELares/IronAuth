@@ -47,6 +47,13 @@ pub(crate) const DPOP_HTM_GET: &str = "GET";
 /// The `htm` value a `DPoP` proof must carry on a `POST`.
 pub(crate) const DPOP_HTM_POST: &str = "POST";
 
+/// The RFC 9449 section 8 response header carrying a server-issued nonce.
+///
+/// One definition, because both surfaces that challenge (the token endpoint's
+/// `use_dpop_nonce` error and a protected resource's `WWW-Authenticate`) must spell
+/// it identically or a client will not find the nonce it is told to echo.
+pub(crate) const DPOP_NONCE_HEADER: &str = "DPoP-Nonce";
+
 /// The RFC 6749 section 5.1 `token_type` of an UNBOUND access token: an ordinary
 /// bearer token (RFC 6750), presented as `Authorization: Bearer` with nothing else.
 ///
@@ -104,6 +111,136 @@ pub(crate) const DPOP_REPLAY_TTL: Duration =
 /// is O(1) amortized and dependency-free versus an LRU. A flood of distinct proof
 /// keys therefore cannot grow the cache without bound.
 const DPOP_REPLAY_CAP: usize = 4096;
+
+/// How long a server-issued `DPoP` nonce stays acceptable (RFC 9449 section 8).
+///
+/// Long enough that a client which pauses between the challenge and its retry still
+/// succeeds, short enough that a nonce captured from one exchange is not a durable
+/// credential. A nonce is single-purpose, not single-use: RFC 9449 section 8 lets a
+/// client keep using one until the server challenges again, so this is a rotation
+/// horizon rather than a per-request lifetime.
+pub(crate) const DPOP_NONCE_TTL: Duration = Duration::from_secs(300);
+
+/// An upper bound on the nonce store, flushed wholesale at the cap exactly as the
+/// replay cache is. A flush only forgets nonces whose holders get a fresh challenge
+/// on their next request, so the cost of hitting the cap is one extra round trip and
+/// never a failed exchange.
+const DPOP_NONCE_CAP: usize = 4096;
+
+/// The number of random bytes in a nonce, base64url encoded onto the wire.
+///
+/// RFC 9449 section 8 requires a nonce be unpredictable. 32 bytes is the same margin
+/// the rest of the platform mints opaque handles at, and the value is never a secret
+/// in the sense a key is: it is handed to the client in a response header.
+const DPOP_NONCE_BYTES: usize = 32;
+
+/// The server-issued `DPoP` nonce store (RFC 9449 section 8).
+///
+/// # What a nonce buys that `iat` and the replay cache do not
+///
+/// Without one, proof freshness rests entirely on the client's own clock: an attacker
+/// who obtains a proof has the whole `iat` window to present it to a server that has
+/// never seen it, and the replay cache cannot help, because to THAT server it is not
+/// a replay. A server-issued nonce makes freshness the SERVER's assertion instead: a
+/// proof is only acceptable if it echoes a value this server handed out, so a proof
+/// minted before the challenge cannot satisfy it at all.
+///
+/// # Per-instance, deliberately, and what that costs
+///
+/// Like [`DpopReplayCache`], this store is per-process. Behind a load balancer with
+/// no affinity, a client challenged by node A and retrying against node B is
+/// challenged again rather than served. That is a wasted round trip, not a failure:
+/// the retry carries B's nonce and succeeds, so the client converges. It only
+/// degrades if the balancer keeps moving a client mid-retry.
+///
+/// This matches the scope issue #124 sets for the replay cache, which routes
+/// cross-node concerns to M15. A shared backend (IronCache, or a keyed
+/// self-describing nonce needing no store at all) slots in behind this same pair of
+/// methods without touching either endpoint.
+pub struct DpopNonceStore {
+    // Interior-mutable behind the shared `Arc`, like the replay cache.
+    issued: RwLock<HashMap<String, SystemTime>>,
+    ttl: Duration,
+    cap: usize,
+}
+
+impl DpopNonceStore {
+    /// A fresh, empty store with the shipped TTL and cap.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            issued: RwLock::new(HashMap::new()),
+            ttl: DPOP_NONCE_TTL,
+            cap: DPOP_NONCE_CAP,
+        }
+    }
+
+    /// Mint a fresh nonce, record it as issued at `now`, and return it for the
+    /// `DPoP-Nonce` response header.
+    ///
+    /// Entropy comes from the environment seam, never a raw RNG.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal lock is poisoned.
+    pub fn issue(&self, entropy: &dyn ironauth_env::Entropy, now: SystemTime) -> String {
+        let mut bytes = [0_u8; DPOP_NONCE_BYTES];
+        entropy.fill_bytes(&mut bytes);
+        let nonce =
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes);
+        let mut guard = self
+            .issued
+            .write()
+            .expect("dpop nonce store lock is not poisoned");
+        if guard.len() >= self.cap && !guard.contains_key(&nonce) {
+            guard.clear();
+        }
+        guard.insert(nonce.clone(), now);
+        nonce
+    }
+
+    /// Whether `nonce` is one this instance issued and has not aged out at `now`.
+    ///
+    /// Read-only: a nonce is NOT consumed on acceptance. RFC 9449 section 8 lets a
+    /// client keep using a nonce until the server challenges for a new one, and
+    /// single-use here would force a challenge round trip before EVERY request,
+    /// which is the behavior section 8 explicitly describes as unnecessary. Replay of
+    /// a whole proof is already refused by the `jti` cache, which is the mechanism
+    /// that owns that job.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal lock is poisoned.
+    #[must_use]
+    pub fn is_acceptable(&self, nonce: &str, now: SystemTime) -> bool {
+        let guard = self
+            .issued
+            .read()
+            .expect("dpop nonce store lock is not poisoned");
+        guard
+            .get(nonce)
+            .is_some_and(|issued| now.duration_since(*issued).is_ok_and(|age| age < self.ttl))
+    }
+}
+
+impl Default for DpopNonceStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for DpopNonceStore {
+    /// Redacting: the issued nonces are live challenge values, and the count alone is
+    /// what a diagnostic needs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let outstanding = self.issued.read().map_or(0, |guard| guard.len());
+        f.debug_struct("DpopNonceStore")
+            .field("outstanding", &outstanding)
+            .field("ttl", &self.ttl)
+            .field("cap", &self.cap)
+            .finish()
+    }
+}
 
 /// The token endpoint's per-instance `DPoP` `jti`-replay cache (RFC 9449 section
 /// 11.1).

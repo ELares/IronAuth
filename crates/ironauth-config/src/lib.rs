@@ -2253,6 +2253,29 @@ pub struct OidcConfig {
     /// default until per-environment overrides ride the M5 promotion pipeline.
     pub require_pkce_for_confidential_clients: bool,
 
+    /// Whether the token endpoint requires a server-issued `DPoP` nonce (RFC 9449
+    /// section 8) on every proof.
+    ///
+    /// # What it buys, and why it is not the default
+    ///
+    /// Without a nonce, a proof's freshness rests on the client's own `iat` clock: an
+    /// attacker holding a stolen proof has the whole freshness window to present it to
+    /// a server that has never seen it, where the `jti` replay cache cannot help
+    /// because to that server it is not a replay. With one, freshness becomes the
+    /// SERVER's assertion: a proof minted before the challenge cannot satisfy it.
+    ///
+    /// It is off by default because turning it on costs every `DPoP` client one extra
+    /// round trip on its first request (the `use_dpop_nonce` challenge and retry), and
+    /// a client that does not implement the retry stops working outright. RFC 9449
+    /// section 8 makes the nonce the server's option for exactly this reason. Turn it
+    /// on where proof interception is in the threat model and the clients are known to
+    /// handle the challenge.
+    ///
+    /// The nonce store is PER-INSTANCE. Behind a load balancer with no affinity a
+    /// client may be challenged more than once before it lands on the node that issued
+    /// its nonce; it converges, at the cost of the extra round trips.
+    pub require_dpop_nonce: bool,
+
     /// Whether an authenticated subject may CREATE an organization from the login discovery
     /// step (issue #96, criterion 5). Default `false`.
     ///
@@ -3133,6 +3156,10 @@ impl Default for OidcConfig {
             session_device_binding: false,
             jwks_cache_max_age_secs: 600,
             require_pkce_for_confidential_clients: true,
+            // Off by default: it costs every DPoP client a challenge round trip and
+            // breaks any client that does not implement the retry (RFC 9449 section 8
+            // makes it the server's option).
+            require_dpop_nonce: false,
             self_service_organizations: false,
             conform_id_token_claims: false,
             client_assertion_audience: ClientAssertionAudience::TokenEndpointOrIssuer,

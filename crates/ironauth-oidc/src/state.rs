@@ -378,6 +378,11 @@ pub struct OidcState {
     // recorded here for the freshness window so a replay inside that window is
     // refused; a robust cross-instance jti store is the resource-server follow-up.
     dpop_replay: Arc<crate::dpop::DpopReplayCache>,
+    // The per-instance server-issued DPoP nonce store (RFC 9449 section 8), shared
+    // across request threads behind one Arc exactly as the replay cache is. Always
+    // present; whether it is CONSULTED is the `require_dpop_nonce` setting, so
+    // enabling the policy never has to construct anything.
+    dpop_nonces: Arc<crate::dpop::DpopNonceStore>,
     // The in-process L1 counter store for the fast request-shaping layer (issue #64).
     // Kept OUTSIDE `Inner` so it is swappable with a cheap builder: the optional
     // IronCache L2 installs its `CounterStore` impl here later, and a test wires a
@@ -506,6 +511,9 @@ struct Inner {
     // the authorize path); this only governs confidential clients, and defaults to
     // required.
     require_pkce_for_confidential: bool,
+    // Whether the token endpoint challenges for a server-issued DPoP nonce (RFC 9449
+    // section 8, issue #124). Off by default; see the config field for why.
+    require_dpop_nonce: bool,
     // Whether to copy the scope-derived claims into the ID token (the non-conform
     // node-oidc-provider `conformIdTokenClaims = false` behavior, issue #15). The
     // spec-conform default is false: scope claims live at UserInfo and the ID token
@@ -790,6 +798,7 @@ impl OidcState {
                 par_ttl: Duration::from_secs(config.par_ttl_secs),
                 require_pushed_authorization_requests: config.require_pushed_authorization_requests,
                 require_pkce_for_confidential: config.require_pkce_for_confidential_clients,
+                require_dpop_nonce: config.require_dpop_nonce,
                 conform_id_token_claims: config.conform_id_token_claims,
                 client_assertion_audience: config.client_assertion_audience,
                 client_assertion_skew: Duration::from_secs(config.client_assertion_max_skew_secs),
@@ -938,6 +947,7 @@ impl OidcState {
             hashing_pool: None,
             custom_journey_source: None,
             dpop_replay: Arc::new(crate::dpop::DpopReplayCache::new()),
+            dpop_nonces: Arc::new(crate::dpop::DpopNonceStore::new()),
             abuse_counters: Arc::new(crate::abuse::MemoryCounterStore::new()),
             geoip_provider: Arc::new(crate::risk::NullGeoIpProvider),
             ip_reputation_provider: Arc::new(crate::risk::NullIpReputationProvider),
@@ -2773,6 +2783,13 @@ impl OidcState {
         self.inner.require_pkce_for_confidential
     }
 
+    /// Whether the token endpoint challenges for a server-issued `DPoP` nonce (RFC
+    /// 9449 section 8, issue #124).
+    #[must_use]
+    pub fn require_dpop_nonce(&self) -> bool {
+        self.inner.require_dpop_nonce
+    }
+
     /// The current wall-clock time from the environment clock seam.
     #[must_use]
     pub fn now(&self) -> SystemTime {
@@ -2785,6 +2802,13 @@ impl OidcState {
     #[must_use]
     pub(crate) fn dpop_replay(&self) -> &crate::dpop::DpopReplayCache {
         &self.dpop_replay
+    }
+
+    /// The per-instance server-issued `DPoP` nonce store (RFC 9449 section 8, issue
+    /// #124). Consulted only when `require_dpop_nonce` is set.
+    #[must_use]
+    pub(crate) fn dpop_nonces(&self) -> &crate::dpop::DpopNonceStore {
+        &self.dpop_nonces
     }
 
     /// The per-environment issuer for `scope`. Two environments never share an
