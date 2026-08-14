@@ -191,4 +191,21 @@ else
   echo "==> cargo deny skipped (not installed; CI enforces it)"
 fi
 
+# The IRONBUS lane of the dual-mode async matrix (issue #104, criterion 6).
+#
+# CI runs this against a broker it installs. Locally a broker is optional, so the lane
+# is run only when IRONBUS_ADDR points at one, and its ABSENCE is announced rather than
+# silent. That is the difference this gate's own header is about: a local gate that is
+# quietly a subset of CI teaches you to trust a green that does not mean what it looks
+# like. The workspace run above already compiles this lane under --all-features; without
+# a broker its cases skip, so what is missing locally is the live-broker assertion and
+# nothing else.
+if [ -n "${IRONBUS_ADDR:-}" ]; then
+  echo "==> outbox ironbus lane (IRONBUS_ADDR=$IRONBUS_ADDR)"
+  scripts/with-test-db.sh cargo test -p ironauth-store --features testing,ironbus \
+    --test outbox --test outbox_ironbus
+else
+  echo "==> outbox ironbus lane SKIPPED (set IRONBUS_ADDR to a broker to run it; CI always does)"
+fi
+
 echo "gate: all local checks green"

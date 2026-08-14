@@ -93,6 +93,68 @@ jobs:
       - name: doctests
         run: cargo test --workspace --all-features --doc
 
+  # The IRONBUS lane of the dual-mode async matrix (issue #104, criterion 6).
+  #
+  # The `test` job above already covers the POSTGRES-ONLY mode: it runs
+  # `--all-features`, so `outbox_ironbus` compiles there, and with no `IRONBUS_ADDR`
+  # each of its cases skips rather than fails. That gating is what makes this lane
+  # additive instead of a second place the whole suite can break.
+  #
+  # This job supplies the other half: a real broker, so the same drain is exercised
+  # with a bus attached. It runs the outbox suites ONLY, not the workspace, because the
+  # backbone's contract is narrow (a signal wakes the drain; an absent or failing
+  # broker degrades to exactly the Postgres behaviour) and everything else about the
+  # outbox is mode-independent and already covered above. Running the workspace twice
+  # would double a 30-minute job to prove nothing extra.
+  ironbus-matrix:
+    name: outbox (ironbus mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --shm-size=1g
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      IRONBUS_ADDR: 127.0.0.1:17654
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Built from git rather than crates.io: `ironbus-cli` (which carries the broker
+      # binary) is not published, only the CLIENT is. Pinned to an exact COMMIT rather
+      # than a branch or a tag: a branch lets another repository silently change what
+      # this lane tests, and the `v0.1.0` tag predates the `ironbus dev` subcommand this
+      # job uses. This SHA is the revision the backbone was actually verified against.
+      - name: install the IronBus broker
+        run: >-
+          cargo install --locked --git https://github.com/ELares/IronBus
+          --rev 0ed2f54f127b1096e032f51f971536d7603ad66a ironbus-cli
+      - name: start the broker
+        run: |
+          ironbus dev --addr 127.0.0.1:17654 &
+          # Wait for the listener rather than sleeping a guess: a fixed sleep is either
+          # flaky on a slow runner or wasted time on a fast one.
+          for _ in $(seq 1 60); do
+            if nc -z 127.0.0.1 17654; then echo "broker up"; exit 0; fi
+            sleep 1
+          done
+          echo "broker did not come up" >&2
+          exit 1
+      # Both lanes, in one invocation, so a divergence between them shows up as a
+      # single failing job rather than two that have to be compared by hand.
+      - name: outbox suites (postgres drain + ironbus backbone)
+        run: cargo test -p ironauth-store --features testing,ironbus --test outbox --test outbox_ironbus
+
   msrv:
     name: msrv (1.85)
     runs-on: ubuntu-latest
