@@ -239,6 +239,21 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OutboxConfig {
+    /// The optional IronBus wake-up backbone (issue #104): `host:port` of a broker, or
+    /// [`None`] for Postgres-only.
+    ///
+    /// # This is a LATENCY setting, not a durability one
+    ///
+    /// The outbox row is the durable source of truth in BOTH modes. A backbone only
+    /// replaces the `poll_interval` wait with "a producer said there is work", so setting
+    /// this makes the drain react in milliseconds instead of seconds. It cannot make the
+    /// queue more reliable, and, just as importantly, it cannot make it less: a broker
+    /// that is unreachable at startup, or that dies later, degrades to exactly the
+    /// Postgres-only behaviour rather than failing the process or wedging the drain.
+    ///
+    /// Unset is the shipped default, so a deployment that does not want a broker does not
+    /// need one and nothing about its drain changes.
+    pub ironbus_addr: Option<String>,
     /// How many worker tasks ONE process runs per consumer. Workers claim independently
     /// (`FOR UPDATE SKIP LOCKED` under a visibility lease), so raising this needs no
     /// coordination and cannot reorder an aggregate's messages: per-aggregate ordering is
@@ -715,6 +730,9 @@ impl Default for WebhooksConfig {
 impl Default for OutboxConfig {
     fn default() -> Self {
         Self {
+            // Postgres-only by default: a deployment that wants no broker needs none,
+            // and its drain behaves exactly as it always has.
+            ironbus_addr: None,
             worker_concurrency: 2,
             visibility_timeout_secs: 30,
             poll_interval_secs: 5,

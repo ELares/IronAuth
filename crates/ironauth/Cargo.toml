@@ -51,6 +51,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 tracing.workspace = true
 
 [features]
+# Passes the optional IronBus wake-up backbone through to ironauth-store (issue #104).
+ironbus = ["ironauth-store/ironbus"]
 # Forwarded to the server crate: OTLP trace export off by default so the
 # default build and the musl static lane stay lean and protoc-free.
 otlp = ["ironauth-server/otlp"]

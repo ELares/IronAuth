@@ -1668,6 +1668,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "ironbus_addr": {
+          "default": null,
+          "description": "The optional IronBus wake-up backbone (issue #104): `host:port` of a broker, or\n[`None`] for Postgres-only.\n\n# This is a LATENCY setting, not a durability one\n\nThe outbox row is the durable source of truth in BOTH modes. A backbone only\nreplaces the `poll_interval` wait with \"a producer said there is work\", so setting\nthis makes the drain react in milliseconds instead of seconds. It cannot make the\nqueue more reliable, and, just as importantly, it cannot make it less: a broker\nthat is unreachable at startup, or that dies later, degrades to exactly the\nPostgres-only behaviour rather than failing the process or wedging the drain.\n\nUnset is the shipped default, so a deployment that does not want a broker does not\nneed one and nothing about its drain changes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "max_attempts": {
           "default": 14,
           "description": "The total number of attempts a message gets before it is DEAD-LETTERED. `1` means\nno retry at all: the first failure is terminal.\n\nThis bound is not only a politeness to a failing endpoint. A message that shares\nan ordering key with others BLOCKS them until it reaches a terminal state, so the\ndead letter is what releases the aggregate; an unbounded retry would wedge that\naggregate forever, which is why there is no \"unlimited\" value here and never will\nbe. Must be at least 1.\n\nThe default is 14, raised from 5 (issue #106). At five attempts on the old ten\nsecond base a message exhausted its whole budget in about two and a half MINUTES,\nso a receiver that was down for five dead-lettered every delivery in the window and\nan operator had to replay by hand after a blip. #106 asks for the opposite: a\nconsumer whose endpoint died over a weekend should recover. Fourteen attempts on\nthe thirty second base below span roughly 37 hours, which is a real outage rather\nthan a hiccup, and the schedule still TERMINATES, which is what the wedge argument\nabove requires.\n\nThe wedge argument does not reach a consumer whose producers give every message its\nOWN ordering key, because each of its groups is a singleton with nothing behind it\nto block. Such a consumer may be given a larger budget IN CODE, where the singleton\nproperty can be argued for that consumer specifically; the back-channel logout\nfan-out is the one that is. It stays out of this knob deliberately: this value\napplies to EVERY consumer at once, and most of them do have aggregates.",
@@ -3015,6 +3023,7 @@
         "claim_batch": 64,
         "completed_retention_secs": 604800,
         "dead_letter_retention_secs": 0,
+        "ironbus_addr": null,
         "max_attempts": 14,
         "metrics_sample_interval_secs": 15,
         "poll_interval_secs": 5,

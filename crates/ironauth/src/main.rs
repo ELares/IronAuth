@@ -46,9 +46,9 @@ use ironauth_store::{
         AuditRetentionSweeper,
     },
     outbox::{
-        ConsumerRegistry, ControlPlaneScopes, DrainStats, OutboxConsumer, OutboxObserver,
-        OutboxReaper, OutboxWorker, OutboxWorkerPool, RetentionObserver, RetentionSettings,
-        RetentionStats, RetentionSweeper, ScopeSource, WorkerSettings,
+        ConsumerRegistry, ControlPlaneScopes, DrainStats, OutboxBackbone, OutboxConsumer,
+        OutboxObserver, OutboxReaper, OutboxWorker, OutboxWorkerPool, PollOnly, RetentionObserver,
+        RetentionSettings, RetentionStats, RetentionSweeper, ScopeSource, WorkerSettings,
     },
 };
 
@@ -2079,15 +2079,64 @@ fn spawn_consumer_pools(
     scopes: &Arc<dyn ScopeSource>,
     observer: &Arc<dyn OutboxObserver>,
 ) -> Vec<OutboxWorkerPool> {
+    // Resolve the wake-up backbone ONCE, not per consumer: one broker connection pair is
+    // shared by every pool in the process, and a broker that is unreachable is resolved to
+    // Postgres-only here rather than being retried per pool.
+    let backbone = resolve_outbox_backbone(outbox);
     consumers
         .all()
         .into_iter()
         .map(|consumer| {
             let settings = outbox_worker_settings(outbox, consumer.name());
             let worker = OutboxWorker::new(store.clone(), env.clone(), consumer, settings);
-            OutboxWorkerPool::spawn(&worker, scopes, observer)
+            OutboxWorkerPool::spawn_with_backbone(&worker, scopes, observer, &backbone)
         })
         .collect()
+}
+
+/// Resolve the configured outbox wake-up backbone (issue #104), falling back to
+/// [`PollOnly`] whenever a broker is not configured, not compiled in, or not reachable.
+///
+/// # An unreachable broker is not a startup failure
+///
+/// This is the whole point of an OPTIONAL backbone: its absence is a supported mode, so a
+/// broker that is down must not stop the process from serving. It degrades to the
+/// Postgres-only drain, which is slower by the poll interval and identical in every other
+/// respect, and it says so once at boot rather than silently.
+///
+/// The alternative (refusing to start) would make adding a latency optimisation a new way
+/// for the whole deployment to be down, which is a bad trade for something that cannot
+/// affect correctness.
+fn resolve_outbox_backbone(outbox: &OutboxConfig) -> Arc<dyn OutboxBackbone> {
+    let Some(addr) = outbox.ironbus_addr.as_deref().filter(|a| !a.is_empty()) else {
+        return Arc::new(PollOnly);
+    };
+    #[cfg(feature = "ironbus")]
+    {
+        match ironauth_store::outbox_ironbus::IronBusBackbone::connect(addr) {
+            Ok(backbone) => {
+                tracing::info!(%addr, "outbox wake-up backbone: IronBus");
+                return Arc::new(backbone);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %addr,
+                    %error,
+                    "outbox IronBus backbone unreachable; draining on the poll interval"
+                );
+                return Arc::new(PollOnly);
+            }
+        }
+    }
+    #[cfg(not(feature = "ironbus"))]
+    {
+        tracing::warn!(
+            %addr,
+            "outbox.ironbus_addr is set but this build has no `ironbus` feature; \
+             draining on the poll interval"
+        );
+        Arc::new(PollOnly)
+    }
 }
 
 /// Spawn the outbox RETENTION sweeper (issue #104, PR 3), reaping the terminal tail of
