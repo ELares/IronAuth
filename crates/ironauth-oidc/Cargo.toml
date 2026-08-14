@@ -1134,6 +1134,20 @@ name = "dpop_jkt_code_binding"
 path = "tests/dpop_jkt_code_binding.rs"
 required-features = ["testing"]
 
+# Server-issued DPoP nonces at the token endpoint (RFC 9449 section 8, issue #124). Without a nonce a
+# proof's freshness rests on the client's own iat clock, so a stolen proof works against any server
+# that has not seen it, where the jti replay cache cannot help. The challenge-retry flow is driven end
+# to end: a proof with no nonce is challenged and the retry succeeds without burning the code, a nonce
+# the server never issued is refused, absent and unrecognised are indistinguishable (no oracle for
+# which nonces an instance holds), one nonce serves more than one request (section 8 does not make it
+# single use; the jti cache owns replay), and a stale nonce draws a NEW challenge. The policy is off by
+# default, so the default path is pinned too: no challenge, and a volunteered nonce ignored rather than
+# refused. Over a real database (DATABASE_URL).
+[[test]]
+name = "dpop_nonce"
+path = "tests/dpop_nonce.rs"
+required-features = ["testing"]
+
 # The DURABLE organization token context (issue #94, PR-B1): the organization parameter
 # binds a live-and-active org onto the session and both tokens (org_id claim), a
 # single-org subject auto-selects, a multi-org subject with no parameter gets none, a

@@ -1296,6 +1296,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "require_dpop_nonce": {
+          "default": false,
+          "description": "Whether the token endpoint requires a server-issued `DPoP` nonce (RFC 9449\nsection 8) on every proof.\n\n# What it buys, and why it is not the default\n\nWithout a nonce, a proof's freshness rests on the client's own `iat` clock: an\nattacker holding a stolen proof has the whole freshness window to present it to\na server that has never seen it, where the `jti` replay cache cannot help\nbecause to that server it is not a replay. With one, freshness becomes the\nSERVER's assertion: a proof minted before the challenge cannot satisfy it.\n\nIt is off by default because turning it on costs every `DPoP` client one extra\nround trip on its first request (the `use_dpop_nonce` challenge and retry), and\na client that does not implement the retry stops working outright. RFC 9449\nsection 8 makes the nonce the server's option for exactly this reason. Turn it\non where proof interception is in the threat model and the clients are known to\nhandle the challenge.\n\nThe nonce store is PER-INSTANCE. Behind a load balancer with no affinity a\nclient may be challenged more than once before it lands on the node that issued\nits nonce; it converges, at the cost of the extra round trips.",
+          "type": "boolean"
+        },
         "require_pkce_for_confidential_clients": {
           "default": true,
           "description": "Whether a CONFIDENTIAL client (one that authenticates at the token endpoint\nwith a secret) must use PKCE (issue #13, RFC 9700 2.1). Default `true`: PKCE\nis required for every client. A PUBLIC client (`token_endpoint_auth_method`\n= `none`) ALWAYS requires PKCE regardless of this setting, because RFC 9700\n2.1.1 makes it structural for public clients; this knob only governs the\nper-environment policy for confidential clients, whose default is `required`.\nSet it to `false` only for an environment whose confidential clients cannot\nyet send a `code_challenge` (a migration aid); a code issued without a\nchallenge is still never redeemable with a verifier (downgrade prevention\nholds in both directions). This is a promotable per-environment setting in\nspirit, like `jwks_cache_max_age_secs`; the process value is the deployment\ndefault until per-environment overrides ride the M5 promotion pipeline.",
@@ -2921,6 +2926,7 @@
           "window_secs": 300
         },
         "remembered_consent_ttl_secs": 2592000,
+        "require_dpop_nonce": false,
         "require_pkce_for_confidential_clients": true,
         "require_pushed_authorization_requests": false,
         "reuse_grace_secs": 10,

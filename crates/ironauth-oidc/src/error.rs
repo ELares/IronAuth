@@ -59,6 +59,7 @@
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use crate::dpop::DPOP_NONCE_HEADER;
 use crate::pages;
 use crate::registry::ResponseMode;
 use crate::response;
@@ -313,6 +314,24 @@ pub enum TokenError {
     /// `invalid_dpop_proof` (the granular variant is logged server-side only), so a
     /// client cannot use the response as an oracle to probe which check failed.
     InvalidDpopProof,
+    /// The token request must be retried carrying a server-issued `DPoP` nonce (RFC
+    /// 9449 section 8). The response is a `400` whose body is `use_dpop_nonce` and
+    /// whose `DPoP-Nonce` header carries the value to echo in the retry's proof.
+    ///
+    /// DISTINCT from [`TokenError::InvalidDpopProof`], and deliberately so, even
+    /// though the two are neighbours. `invalid_dpop_proof` is uniform precisely to
+    /// deny an attacker an oracle; this one is the opposite by design, because it is
+    /// an INSTRUCTION to a legitimate client, and a client that cannot tell "retry
+    /// with this nonce" from "your proof is bad" cannot implement the retry at all.
+    /// It discloses nothing: the nonce is a value the server is handing out on
+    /// request, and the challenge itself says only that this deployment wants one.
+    ///
+    /// Carries the nonce rather than reaching for the store when rendering, so the
+    /// value in the header is exactly the value that was recorded as issued.
+    UseDpopNonce {
+        /// The freshly issued nonce for the `DPoP-Nonce` response header.
+        nonce: String,
+    },
     /// The device-authorization request is still pending human approval (RFC 8628
     /// section 3.5, issue #24): the device code is valid but the user has not yet
     /// approved (or denied) the flow at the verification page. The device keeps
@@ -385,6 +404,7 @@ impl TokenError {
             TokenError::InvalidTarget => "invalid_target",
             TokenError::UnsupportedGrantType => "unsupported_grant_type",
             TokenError::InvalidDpopProof => "invalid_dpop_proof",
+            TokenError::UseDpopNonce { .. } => "use_dpop_nonce",
             TokenError::AuthorizationPending => "authorization_pending",
             TokenError::SlowDown => "slow_down",
             TokenError::AccessDenied => "access_denied",
@@ -422,6 +442,9 @@ impl TokenError {
             }
             TokenError::UnsupportedGrantType => "the grant type is not supported",
             TokenError::InvalidDpopProof => "the DPoP proof is missing, malformed, or invalid",
+            TokenError::UseDpopNonce { .. } => {
+                "retry with the server-issued nonce from the DPoP-Nonce header"
+            }
             TokenError::AuthorizationPending => {
                 "the authorization request is still pending user approval"
             }
@@ -493,6 +516,17 @@ impl IntoResponse for TokenError {
                 header::WWW_AUTHENTICATE,
                 header::HeaderValue::from_static("Basic realm=\"ironauth\", charset=\"UTF-8\""),
             );
+        }
+        // RFC 9449 section 8: the nonce challenge is useless without the nonce, so
+        // the header is the substance of this response rather than a decoration.
+        // The value is base64url minted by this server, never reflected input, but it
+        // is still built with the fallible constructor: a header value that would not
+        // encode must drop the header rather than panic serving a request, and the
+        // client then retries into a fresh challenge.
+        if let TokenError::UseDpopNonce { nonce } = &self {
+            if let Ok(value) = header::HeaderValue::from_str(nonce) {
+                response.headers_mut().insert(DPOP_NONCE_HEADER, value);
+            }
         }
         response
     }

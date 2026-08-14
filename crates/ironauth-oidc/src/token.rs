@@ -522,9 +522,14 @@ fn resolve_dpop_binding(
         htu: &htu,
         iat_leeway: crate::dpop::DPOP_IAT_LEEWAY,
         iat_skew: crate::dpop::DPOP_IAT_SKEW,
-        // ath binding is the resource-server follow-up; no server-issued DPoP-Nonce
-        // yet. Both stay absent here (the core ignores an unexpected one, correctly).
+        // ath binding is the resource-server follow-up, so it stays absent here.
         ath: None,
+        // The nonce is NOT checked by the core here, and that is not an oversight.
+        // The core compares against a nonce the caller already knows; this server
+        // does not know which of its outstanding nonces this client holds, so it
+        // RECOGNISES the one the proof carries instead (below, against the issued
+        // store). Passing the proof's own nonce back as the expectation would make
+        // the core's check compare a value against itself.
         nonce: None,
     };
     let proof = validate_dpop_proof(proof_jws, &expected, now).map_err(|error| {
@@ -533,6 +538,29 @@ fn resolve_dpop_binding(
         tracing::warn!(%error, "rejecting an invalid DPoP proof at the token endpoint");
         TokenError::InvalidDpopProof
     })?;
+
+    // RFC 9449 section 8, when this deployment requires a server-issued nonce: the
+    // proof must echo one this instance handed out and has not aged out. A proof
+    // minted before the challenge cannot, which is the whole point: it moves
+    // freshness from the client's `iat` clock to the server's own assertion.
+    //
+    // Checked BEFORE the replay record so a challenged request does not burn a `jti`
+    // the client is about to abandon anyway (its retry carries a new proof).
+    if state.require_dpop_nonce() {
+        let acceptable = proof
+            .nonce
+            .as_deref()
+            .is_some_and(|nonce| state.dpop_nonces().is_acceptable(nonce, now));
+        if !acceptable {
+            // Absent and stale are answered IDENTICALLY, with a fresh challenge. They
+            // are the same situation from the client's side ("you need a nonce you do
+            // not have"), and the remedy is the same, so splitting them would add an
+            // oracle for which nonces this instance still holds and buy nothing.
+            let nonce = state.dpop_nonces().issue(state.env().entropy(), now);
+            tracing::debug!("challenging a token request for a server-issued DPoP nonce");
+            return Err(TokenError::UseDpopNonce { nonce });
+        }
+    }
 
     // Replay: a (jkt, jti) already recorded inside the freshness window is refused,
     // the same uniform error, and never rebinds.

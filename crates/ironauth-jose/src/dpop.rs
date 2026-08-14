@@ -240,6 +240,18 @@ pub struct DpopProof {
     pub jti: String,
     /// The proof's issued-at time.
     pub iat: SystemTime,
+    /// The server-issued nonce the proof carried (RFC 9449 section 8), or [`None`]
+    /// when it carried none.
+    ///
+    /// Reported rather than merely checked, because the two ways a server can use a
+    /// nonce need different things. A caller that REMEMBERS which nonce it handed to
+    /// this client sets [`DpopExpectations::nonce`] and this field is redundant. A
+    /// caller that recognises its OWN nonces instead (a bounded store of recently
+    /// issued values, or a keyed self-describing value) cannot name the expected
+    /// string in advance, so it needs to read the one the proof actually carried, and
+    /// reading it from a SIGNATURE-VERIFIED proof is the only safe way to get it: the
+    /// alternative is a second, unverified parse of the same JWS in the caller.
+    pub nonce: Option<String>,
 }
 
 /// Validate a compact `DPoP` proof JWS against `expected`, evaluated at `now`.
@@ -317,6 +329,10 @@ pub fn validate_dpop_proof(
         jkt,
         jti: jti.to_owned(),
         iat: UNIX_EPOCH + Duration::from_secs(iat_secs),
+        nonce: claims
+            .get("nonce")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -579,6 +595,38 @@ pub mod test_util {
             "iat": iat_secs,
             "jti": jti,
             "ath": ath,
+        });
+        sign_compact(key, &header, &payload)
+    }
+
+    /// Build and sign a well-formed compact `DPoP` proof JWS that ALSO carries a
+    /// server-issued `nonce` (RFC 9449 section 8). Identical to [`sign_proof`] but
+    /// with the `nonce` claim added, so a test can drive the challenge-retry flow.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization or signing fails, which does not happen for a
+    /// well-formed key and JSON claims.
+    #[must_use]
+    pub fn sign_proof_with_nonce(
+        key: &SigningKey,
+        htm: &str,
+        htu: &str,
+        iat_secs: u64,
+        jti: &str,
+        nonce: &str,
+    ) -> String {
+        let header = json!({
+            "typ": DPOP_TYP,
+            "alg": key.algorithm().as_jose_name(),
+            "jwk": public_jwk(key),
+        });
+        let payload = json!({
+            "htm": htm,
+            "htu": htu,
+            "iat": iat_secs,
+            "jti": jti,
+            "nonce": nonce,
         });
         sign_compact(key, &header, &payload)
     }
