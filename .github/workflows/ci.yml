@@ -154,6 +154,14 @@ jobs:
       # single failing job rather than two that have to be compared by hand.
       - name: outbox suites (postgres drain + ironbus backbone)
         run: cargo test -p ironauth-store --features testing,ironbus --test outbox --test outbox_ironbus
+      # Webhook delivery, DLQ, and replay under the SAME broker (issue #106, criterion 7).
+      #
+      # The backbone only decides WHEN the drain runs, never what a consumer does, so
+      # `WebhookDeliveryConsumer` is mode-independent by construction. This runs it with a
+      # broker present anyway, because "by construction" is an argument and a passing suite
+      # is evidence, and the cost is one already-cached test binary.
+      - name: webhook delivery (ironbus mode)
+        run: cargo test -p ironauth-admin --features testing --test webhook_delivery
 
   msrv:
     name: msrv (1.85)
