@@ -10,14 +10,20 @@ all.
 
 ## Runtime support
 
-| Runtime | Supported | How |
+Every row says how the claim is BACKED, because "supported" without that is an
+assertion. Until issue #118's snippet conformance landed, this table said `yes` six times
+on the strength of one runtime's test suite: the snippet ran only on Node, and the other
+five rows were reasoning about what WebCrypto-only code ought to do.
+
+| Runtime | Supported | Evidence |
 |---|---|---|
-| Cloudflare Workers | yes | `packages/ironauth-sdk/snippets/verify-webcrypto.mjs`, unmodified |
-| Deno | yes | the same file |
-| Bun | yes | the same file |
-| Node.js 20+ | yes | the same file, or `@ironauth/sdk` |
-| Vercel Edge | yes | the same file |
-| Lambda@Edge | yes | the same file (full Node runtime) |
+| Node.js 20+ | yes | **measured**: the snippet runs the full conformance corpus in the `node` CI lane |
+| Deno | yes | **measured**: same corpus, `deno` lane |
+| Bun | yes | **measured**: same corpus, `bun` lane |
+| Cloudflare Workers | yes | **measured**: same corpus, executed inside `workerd` (the real Workers runtime, not a Node shim) |
+| Vercel Edge | yes | **by proxy**: covered by the `workerd` lane. Vercel Edge and Workers are both V8 isolates with the same WebCrypto surface, and no Vercel-hosted lane runs in CI. Treat this as a strong inference rather than a measurement |
+| Lambda@Edge | yes | **by inference**: Lambda@Edge IS a full Node runtime, so the `node` lane covers it. The inference is sound because the runtime is the same, not merely similar |
+| Fastly Compute | not yet | No snippet ships. Compute runs Rust/WASM, so the WebCrypto file does not apply and a separate Rust artifact is needed. Tracked by issue #118 criterion 1 |
 | **CloudFront Functions** | **no** | see below |
 
 ### CloudFront Functions is not supported
