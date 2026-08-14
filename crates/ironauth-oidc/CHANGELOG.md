@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`dpop_jkt` binds an authorization CODE to a `DPoP` key before the token request exists
+  (issue #124, RFC 9449 section 10).** The parameter was not implemented on either delivery path:
+  `authorize.rs` set the code's binding to `None` with a comment deferring the decision, and
+  `ParParams` had no such field.
+
+  - **What it closes.** Binding at the token endpoint alone constrains what a code is exchanged
+    FOR, never who may exchange it. An attacker who intercepts a code (a redirect leak, a
+    malicious app that claimed the redirect URI) could redeem it under a proof key of their own
+    and receive a valid token bound to themselves. A code that names its key cannot be redeemed
+    by anyone else: the token endpoint refuses a proof for a different key AND refuses a
+    redemption carrying no proof, so the binding cannot be dropped rather than matched.
+
+  - **Both deliveries, one seam.** Inline on `/authorize`, and pushed through the authenticated
+    back channel with PAR, which section 10 recommends because a front-channel query parameter is
+    visible to the browser and anything hosting it. PAR needed no storage change: a pushed request
+    is stored as a serialized `AuthorizeParams` document, so the field round-trips on its own. The
+    interaction round trip needed none either, since a login or consent detour carries the whole
+    original `/authorize` URL as its resume target.
+
+  - **Shape validation, and deliberately nothing more.** The value is checked to be an unpadded
+    base64url SHA-256 thumbprint (exactly 43 characters) and is otherwise carried opaquely. It is a
+    PUBLIC commitment, so possession of the matching key cannot be checked at the authorization
+    request and does not need to be: a well-formed thumbprint that is nobody's key binds the code
+    and then fails closed at redemption. Rejecting a MALFORMED one still matters, because a value
+    no thumbprint could ever equal turns a client typo into a code that fails with a confusing
+    proof mismatch instead of an `invalid_request` at the point of the mistake.
+
+  - **Unchanged without the parameter.** A request that carries no `dpop_jkt` issues an unbound
+    code, and the token endpoint's opportunistic RFC 9449 section 5 binding still applies, so every
+    existing browser client is byte-identical.
+
 - **Token introspection reports a token's `DPoP` binding, and a bound token no longer reads to a
   resource server as a plain bearer token (issue #124, RFC 9449 section 6.2).** `/introspect`
   reported `token_type: "Bearer"` for every access token and never emitted a `cnf` member, which

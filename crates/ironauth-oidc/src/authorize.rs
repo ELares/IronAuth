@@ -193,6 +193,26 @@ pub struct AuthorizeParams {
     /// REFUSES a not-a-member or disabled org uniformly. It round-trips through PAR
     /// storage verbatim like every other field.
     pub organization: Option<String>,
+    /// The RFC 9449 section 10 `dpop_jkt`: the JWK SHA-256 thumbprint of the `DPoP`
+    /// key the client will prove at the token endpoint, binding the CODE to that key
+    /// before the token request exists.
+    ///
+    /// It closes the window RFC 9449 section 10 is written for. Binding at the token
+    /// request alone constrains only what the code is exchanged FOR; an attacker who
+    /// intercepts the code (a redirect leak, a malicious app claiming the redirect
+    /// URI) can still redeem it under a key of their own. A code that already names
+    /// its key cannot be redeemed by anyone else at all: the token endpoint refuses a
+    /// proof for a different key, AND refuses a redemption carrying no proof, so the
+    /// binding cannot be dropped rather than matched.
+    ///
+    /// Shape-validated at request time (a base64url SHA-256 thumbprint) and otherwise
+    /// carried opaquely: nothing here can check that the client actually holds the
+    /// private key, and nothing needs to. The value is a PUBLIC commitment, so a
+    /// forged one only binds the code to a key the forger must then prove at the
+    /// token endpoint. It round-trips through PAR storage like every other field,
+    /// which is the delivery RFC 9449 section 10 recommends, since a front-channel
+    /// query parameter is visible to the browser and anything hosting it.
+    pub dpop_jkt: Option<String>,
 }
 
 /// `GET /authorize`.
@@ -535,6 +555,7 @@ async fn issue_code(
         max_age_secs,
         hints,
         requested_organization,
+        dpop_jkt,
     } = validated;
 
     // From here on, client_id and redirect_uri are validated, so every error is
@@ -743,9 +764,11 @@ async fn issue_code(
         consent_ref: consent_ref.as_deref(),
         claims_request: claims_canonical.as_deref(),
         granted_resources: &params.resources,
-        // A BROWSER code is not sender-constrained (issue #368). DPoP for the browser
-        // authorize path is its own decision, not a side effect of this one.
-        dpop_jkt: None,
+        // The RFC 9449 section 10 binding, when the client committed to a key on the
+        // authorization request (issue #124). Absent, the code stays unbound and the
+        // token endpoint's opportunistic binding still applies, so an ordinary
+        // browser flow is byte-identical to before.
+        dpop_jkt: dpop_jkt.as_deref(),
     };
 
     // 7b. Single-use PAR consume at the moment of issuance (RFC 9126, issue #27).
@@ -1082,6 +1105,10 @@ pub(crate) struct ValidatedRequest<'a> {
     /// this scope, [`None`] when the parameter was absent. Membership is resolved and
     /// enforced later (after the subject authenticates), never here.
     pub(crate) requested_organization: Option<OrganizationId>,
+    /// The shape-validated RFC 9449 section 10 `dpop_jkt`, or [`None`] when the
+    /// request carried none. Frozen onto the issued code, where the token endpoint
+    /// enforces it.
+    pub(crate) dpop_jkt: Option<String>,
 }
 
 /// An error from the shared authorization-request validation, in a NEUTRAL form
@@ -1332,6 +1359,23 @@ fn validate_request_tail<'a>(
         None => None,
     };
 
+    // 5f. The RFC 9449 section 10 `dpop_jkt`. SHAPE only, and shape is all there is to
+    //     check: the value is a PUBLIC thumbprint, so possession of the matching key
+    //     is proved at the token endpoint and cannot be proved here. Rejecting a
+    //     malformed one still matters, because a value that could never equal any
+    //     real thumbprint would bind the code to a key NOBODY can prove, turning a
+    //     typo into a code that fails at redemption with a proof-mismatch error.
+    let dpop_jkt = match params
+        .dpop_jkt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(raw) if is_jwk_thumbprint(raw) => Some(raw.to_owned()),
+        Some(_) => return Err(invalid("the dpop_jkt parameter is malformed")),
+        None => None,
+    };
+
     Ok(ValidatedRequest {
         redirect_uri,
         response_type,
@@ -1345,7 +1389,28 @@ fn validate_request_tail<'a>(
         max_age_secs,
         hints,
         requested_organization,
+        dpop_jkt,
     })
+}
+
+/// The length of a base64url-encoded, unpadded SHA-256 digest: 32 bytes encode to 43
+/// characters. RFC 7638 thumbprints are SHA-256 and RFC 9449 section 10 carries them
+/// in that encoding, so the length is EXACT rather than a bound.
+const JWK_THUMBPRINT_LEN: usize = 43;
+
+/// Whether `value` has the shape of an RFC 7638 JWK SHA-256 thumbprint as RFC 9449
+/// carries it: exactly [`JWK_THUMBPRINT_LEN`] unpadded base64url characters.
+///
+/// Deliberately a shape check and not a decode-and-compare. The thumbprint this is
+/// matched against is computed at the token endpoint from the proof key itself, and
+/// the comparison there is over the whole string, so accepting a well-formed value
+/// that happens to be nobody's key costs nothing: it binds the code to a key that
+/// cannot be proved, which is the client's own mistake and fails closed.
+fn is_jwk_thumbprint(value: &str) -> bool {
+    value.len() == JWK_THUMBPRINT_LEN
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Validate the request's `redirect_uri` against the client's registered set
