@@ -22,6 +22,12 @@ import {
   loadOrCreateProofKey,
   proofKeySlot,
 } from '../dist/dpop-store.js';
+// The SNIPPET, not the SDK module. Its headline claim is that it "drops into a Cloudflare
+// Worker, a Deno or Bun service, a Node 20+ handler, or a Lambda@Edge function unchanged",
+// and until it ran in these lanes that sentence was untested everywhere except Node. The
+// one file most likely to be copied into a Worker was the one file never executed in one.
+import { VerifyError as SnippetVerifyError, createVerifier } from '../snippets/verify-webcrypto.mjs';
+import corpus from '../vectors/verify-vectors.mjs';
 
 /** Run every check, returning `{ ok, failed, count }`. */
 export async function runChecks() {
@@ -197,9 +203,69 @@ export async function runChecks() {
   const expectedAth = btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   checks.push(['the userinfo proof ath matches the presented token', seen.userinfo?.payload?.ath === expectedAth]);
 
+  // The edge snippet, executed IN THIS RUNTIME against the shared conformance corpus
+  // (issue #118, criterion 1). A snippet that only ever runs on Node cannot support a
+  // claim about Workers, and the vectors are the same ones the SDK's own verifier is held
+  // to, so the two implementations are held to one standard rather than two.
+  const snippetVerifier = (algorithms) =>
+    createVerifier({
+      issuer: corpus.issuer,
+      audience: corpus.audience,
+      jwksUri: 'https://issuer.example/jwks',
+      algorithms,
+      skewSeconds: 0,
+      now: () => corpus.now,
+      fetch: async () =>
+        new Response(JSON.stringify(corpus.jwks), {
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'max-age=300' },
+        }),
+    });
+
+  // The WHOLE corpus, not a sample. Every case names the outcome it expects, so running
+  // all of them here costs one pass and makes this lane as strict as the Node suite.
+  let accepted = 0;
+  let rejected = 0;
+  let mismatched = 0;
+  for (const testCase of corpus.cases) {
+    // ONE vector is judged against an EdDSA-only issuer. That is what makes it a test of
+    // the ALLOW-LIST rather than of whether ES256 happens to be implemented: judged
+    // against the full published set the token is legitimately acceptable, so a harness
+    // that used one algorithm list everywhere would report a false mismatch here. The
+    // Node suite makes the same distinction.
+    const algorithms =
+      testCase.name === 'alg_not_published_by_the_issuer'
+        ? corpus.algorithmsEddsaOnly
+        : corpus.algorithms;
+    const snippetVerify = snippetVerifier(algorithms);
+    let outcome;
+    try {
+      await snippetVerify(testCase.token);
+      outcome = 'accept';
+    } catch (error) {
+      // A non-`VerifyError` escaping is itself a failure: it means the snippet threw
+      // something a caller cannot branch on, which on an edge runtime is a 500.
+      outcome = error instanceof SnippetVerifyError ? 'reject' : 'threw';
+    }
+    if (testCase.expect === 'accept') {
+      if (outcome === 'accept') accepted += 1;
+      else mismatched += 1;
+    } else if (outcome === 'reject') {
+      rejected += 1;
+    } else {
+      mismatched += 1;
+    }
+  }
+  checks.push(['the edge snippet matches every conformance vector in this runtime', mismatched === 0]);
+  // Both directions observed. A corpus that happened to contain only rejections would make
+  // the check above pass for a verifier that refuses everything.
+  checks.push([
+    'the edge snippet both accepted and rejected in this runtime',
+    accepted > 0 && rejected > 0,
+  ]);
+
   const failed = checks.filter(([, ok]) => !ok).map(([name]) => name);
   return { ok: failed.length === 0, failed, count: checks.length };
 }
 
 /** The number of checks a lane must observe. A lower count means checks were skipped. */
-export const EXPECTED_CHECKS = 20;
+export const EXPECTED_CHECKS = 22;

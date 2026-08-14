@@ -167,3 +167,21 @@ test('an algorithm outside the published set costs no key lookup', async () => {
   );
   assert.equal(fetches(), 0, 'a refused algorithm must not reach the key set');
 });
+
+test('the generated vectors module matches the json corpus', async () => {
+  // The `.mjs` exists so the shared runtime checks can import the corpus without a JSON
+  // import attribute or a bundler rule, which vary across the five runtimes this package
+  // targets. That convenience is only safe while the two agree, and nothing else would
+  // notice them diverging: the Rust conformance test and the Node suite read the JSON,
+  // while the portability lanes read the module, so a drift would silently mean the
+  // runtimes are held to a stale corpus.
+  const json = JSON.parse(
+    readFileSync(new URL('../vectors/verify-vectors.json', import.meta.url), 'utf8'),
+  );
+  const generated = (await import('../vectors/verify-vectors.mjs')).default;
+  assert.deepStrictEqual(
+    generated,
+    json,
+    'regenerate vectors/verify-vectors.mjs from verify-vectors.json',
+  );
+});
