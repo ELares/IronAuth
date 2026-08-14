@@ -524,6 +524,10 @@ jobs:
         # JavaScript. Compiling per runtime would let a lane pass against different output.
         working-directory: packages/ironauth-sdk
         run: npx tsc
+      # BEFORE the five runtimes: this is the same defect the matrix exists to catch, and
+      # it reports it in a second against a diff instead of after provisioning workerd.
+      - name: portability scan (no Node-only imports in portable sources)
+        run: scripts/sdk-portability-scan.sh
       - name: node (full suite, plus the shared portability checks)
         working-directory: packages/ironauth-sdk
         run: |

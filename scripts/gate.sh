@@ -143,6 +143,9 @@ scripts/jose-audit.sh
 echo "==> no M2M metering (no metering/billing/quota hook on the client-credentials path)"
 scripts/no-m2m-metering.sh
 
+echo "==> SDK portability scan (no Node-only imports in runtime-portable sources)"
+scripts/sdk-portability-scan.sh
+
 echo "==> dash scan"
 scripts/dash-scan.sh
 
