@@ -6,6 +6,30 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The outbox gains an optional wake-up backbone, and `ironbus-client` is a declared dependency for
+  the first time (issue #104).**
+
+  - **IronBus is a NOTIFICATION backbone, never the transport of record.** This is the decision the
+    design turns on. The outbox ROW stays the durable source of truth in every mode; a backbone only
+    answers "there is work now", replacing the `poll_interval` wait. Making the bus the transport is
+    the obvious reading of "optional IronBus backbone" and is wrong in a specific way: a message lost
+    or reordered on the bus would be a LOST EVENT, and this issue requires zero loss under `kill -9`.
+    Notification-only makes a dropped signal cost LATENCY and nothing else, because the poll still
+    finds the row.
+  - That is what makes the two modes identical rather than merely similar: Postgres-only keeps the
+    poll as its fallback, consumers never see a backbone so their code is unchanged by construction,
+    and the lease plus the completion latch still decide, so a duplicated signal cannot duplicate an
+    event either.
+  - **`spawn` keeps its signature** and delegates to `spawn_with_backbone` with `PollOnly`, so every
+    existing caller and the whole existing suite are untouched.
+
+- **Fixed: a worker parked in a long backbone wait ignored `shutdown` (issue #104).** `stop` is only
+  read at the top of the drain loop, so a pool would keep running until its wait elapsed. That was
+  harmless while the wait was a fixed 5-second sleep; a backbone makes LONG intervals the normal case
+  (the whole point is to stop polling), so a 5-minute interval meant a 5-minute shutdown. The wait is
+  now raced against a shutdown notification in both `shutdown` and `Drop`. Found by the new backbone
+  test hanging on exactly this.
+
 - **An organization can shorten the access tokens its clients receive (issue #103, bet 1,
   criterion 1).** Migration 0122 adds `org_auth_policies.access_token_ttl_secs`, nullable
   with no default and `CHECK (… IS NULL OR … > 0)`, granted `UPDATE` to `ironauth_control`

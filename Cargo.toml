@@ -42,6 +42,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ELares/IronAuth"
 
 [workspace.dependencies]
+# The IronBus client (issue #104): the OPTIONAL notification backbone for the
+# transactional outbox. Optional in the strict sense the issue requires: Postgres alone
+# is a complete, supported mode, and this crate is behind the `ironbus` feature so a
+# deployment that does not want it does not build it.
+ironbus-client = { version = "0.1.0", default-features = false }
 ironauth-env = { path = "crates/ironauth-env", version = "0.1.0" }
 ironauth-hash-scheme = { path = "crates/ironauth-hash-scheme", version = "0.2.0" }
 ironauth-config = { path = "crates/ironauth-config", version = "0.1.0" }

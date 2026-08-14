@@ -707,6 +707,75 @@ pub trait OutboxObserver: Send + Sync {
 /// An observer that reports nothing (issue #104): for tests, and for a caller that has
 /// deliberately decided a pool's outcomes are not worth surfacing.
 ///
+/// The optional wake-up backbone for the outbox drain (issue #104).
+///
+/// # IronBus is a NOTIFICATION backbone, never the transport of record
+///
+/// This is the decision the whole design turns on, so it is stated here rather than
+/// inferred. The outbox ROW stays the durable source of truth in every mode. A backbone
+/// only answers "there is work now", replacing the `poll_interval` wait; it never carries
+/// the work itself.
+///
+/// Making the bus the transport would be the obvious reading of "optional IronBus
+/// backbone" and it would be wrong in a specific, expensive way: a message lost or
+/// reordered on the bus would be a LOST EVENT, and issue #104 requires zero event loss
+/// under `kill -9` on both sides. With notification-only, a lost signal costs LATENCY and
+/// nothing else, because the poll still finds the row. That is what makes the two modes
+/// behave identically rather than merely similarly:
+///
+/// - **Criterion 1** (Postgres alone): the poll is always present, so it IS the fallback.
+/// - **Criterion 2** (config-only): [`OutboxConsumer`] implementations never see a
+///   backbone, so consumer code is unchanged by construction rather than by discipline.
+/// - **Criterion 3** (zero loss, bounded duplicates): a dropped signal cannot lose an
+///   event; a duplicated one cannot duplicate one either, because the lease and the
+///   `completed_at` latch still decide, exactly as they do when polling.
+/// - **Criterion 4** (atomic commit): unchanged. The row commits with its domain write and
+///   the signal is fired AFTER, so a rolled-back write signals nothing anyone can act on
+///   (and if it did, the drain would find no row).
+///
+/// # Signals are advisory, so implementations may lose them
+///
+/// [`notify`](Self::notify) returns nothing and cannot fail the caller: a backbone that is
+/// down must never turn a successful domain write into an error. [`wait`](Self::wait) is
+/// allowed to return early, spuriously, or only when the deadline elapses. An
+/// implementation that simply slept for `max_wait` on every call would be correct, just
+/// slow, which is exactly what [`PollOnly`] is.
+pub trait OutboxBackbone: Send + Sync {
+    /// Signal that `consumer` has work in `scope`. Advisory and infallible by contract.
+    fn notify(&self, consumer: &str, scope: Scope);
+
+    /// Wait until there may be work for `consumer`, or until `max_wait` elapses.
+    ///
+    /// Returning early is always permitted: the caller re-drains and finds nothing, which
+    /// is the same empty pass a poll would have made.
+    fn wait<'a>(
+        &'a self,
+        consumer: &'a str,
+        max_wait: Duration,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// The default backbone: no signalling, wait out the full `poll_interval` (issue #104).
+///
+/// This is the Postgres-only mode, and it is a real implementation rather than a null
+/// object standing in for one. It is what every deployment gets unless it configures
+/// otherwise, and the drain's behaviour under it is the behaviour the whole existing
+/// outbox suite already pins.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PollOnly;
+
+impl OutboxBackbone for PollOnly {
+    fn notify(&self, _consumer: &str, _scope: Scope) {}
+
+    fn wait<'a>(
+        &'a self,
+        _consumer: &'a str,
+        max_wait: Duration,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move { tokio::time::sleep(max_wait).await })
+    }
+}
+
 /// Named rather than made the default, so that choosing silence is a line of code somebody
 /// wrote and a reviewer can see, instead of the absence of an argument.
 pub struct SilentObserver;
@@ -731,6 +800,9 @@ pub struct OutboxWorkerPool {
     handles: Vec<tokio::task::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     live: Arc<AtomicUsize>,
+    /// Wakes workers parked in `backbone.wait` so `shutdown` does not have to outlast a
+    /// poll interval, which a backbone deployment may legitimately set to minutes.
+    shutdown_signal: Arc<tokio::sync::Notify>,
 }
 
 /// Decrements the pool's LIVE worker count when its task ends, however it ends.
@@ -764,7 +836,32 @@ impl OutboxWorkerPool {
         scopes: &Arc<dyn ScopeSource>,
         observer: &Arc<dyn OutboxObserver>,
     ) -> Self {
+        Self::spawn_with_backbone(
+            worker,
+            scopes,
+            observer,
+            &(Arc::new(PollOnly) as Arc<dyn OutboxBackbone>),
+        )
+    }
+
+    /// Spawn the pool against an explicit wake-up backbone (issue #104).
+    ///
+    /// [`spawn`](Self::spawn) is this with [`PollOnly`], which is the Postgres-only mode
+    /// and the shipped default. Passing an IronBus-backed implementation removes the
+    /// `poll_interval` latency and changes NOTHING else: the drain, the leases, the
+    /// completion latch, and the consumer are identical, because a backbone only ever
+    /// answers "there may be work now".
+    #[must_use]
+    pub fn spawn_with_backbone(
+        worker: &OutboxWorker,
+        scopes: &Arc<dyn ScopeSource>,
+        observer: &Arc<dyn OutboxObserver>,
+        backbone: &Arc<dyn OutboxBackbone>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        // Wakes workers parked in `backbone.wait` so shutdown does not have to outlast a
+        // poll interval that a backbone deployment may set to minutes.
+        let shutdown_signal = Arc::new(tokio::sync::Notify::new());
         let workers = usize::try_from(worker.settings.concurrency.max(1)).unwrap_or(1);
         let poll = worker.settings.poll_interval;
         let live = Arc::new(AtomicUsize::new(0));
@@ -774,6 +871,9 @@ impl OutboxWorkerPool {
             let scopes = Arc::clone(scopes);
             let observer = Arc::clone(observer);
             let stop = Arc::clone(&stop);
+            let backbone = Arc::clone(backbone);
+            let shutdown = Arc::clone(&shutdown_signal);
+            let consumer_name = worker.consumer_name().to_owned();
             // Counted UP here rather than inside the task, so `size` is the configured
             // count the instant `spawn` returns and only ever falls from a real death.
             // The guard is moved into the task, so it is dropped whether the task returns
@@ -814,7 +914,24 @@ impl OutboxWorkerPool {
                             observer.scopes_unavailable(worker.consumer_name(), &error);
                         }
                     }
-                    tokio::time::sleep(poll).await;
+                    // The backbone decides how long an empty pass waits. `PollOnly`
+                    // sleeps the whole interval, which is the behaviour every existing
+                    // outbox test pins; an IronBus backbone returns as soon as a producer
+                    // signals. Either way the next iteration re-drains and the durable
+                    // row is what decides, so a lost or spurious signal costs latency and
+                    // never an event.
+                    //
+                    // RACED AGAINST SHUTDOWN, which is not optional here. `stop` is only
+                    // read at the top of the loop, so a worker parked in a long wait would
+                    // ignore `shutdown()` until the wait elapsed. That was harmless while
+                    // this was a fixed 5-second sleep; a backbone makes LONG waits the
+                    // normal case (the whole point is to stop polling), so a 5-minute
+                    // interval would mean a 5-minute shutdown. Found by the backbone test
+                    // hanging on exactly this.
+                    tokio::select! {
+                        () = backbone.wait(&consumer_name, poll) => {}
+                        () = shutdown.notified() => {}
+                    }
                 }
             }));
         }
@@ -823,6 +940,7 @@ impl OutboxWorkerPool {
             handles,
             stop,
             live,
+            shutdown_signal,
         }
     }
 
@@ -881,6 +999,9 @@ impl OutboxWorkerPool {
     /// reads it while the process is still running and can act.
     pub async fn shutdown(mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Wake anyone parked in `backbone.wait` BEFORE awaiting the handles, or this
+        // await lasts as long as the poll interval.
+        self.shutdown_signal.notify_waiters();
         // Taken rather than consumed: this type has a `Drop` that re-signals the flag, so
         // its fields cannot be moved out. Draining the vector in place leaves the drop
         // with nothing left to do and keeps the belt-and-braces signal for the path where
@@ -897,6 +1018,9 @@ impl Drop for OutboxWorkerPool {
         // operator's back. The flag stops them at the next check; a caller that needs to
         // WAIT for them uses `shutdown`.
         self.stop.store(true, Ordering::Relaxed);
+        // And wake anyone parked in `backbone.wait`, or "the next check" is a poll
+        // interval away rather than immediate.
+        self.shutdown_signal.notify_waiters();
     }
 }
 
