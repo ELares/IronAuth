@@ -53,6 +53,25 @@ pub const FEDCM_FEATURE: &str = "fedcm";
 /// the shape bumps it and invalidates the old ack.
 pub const FEDCM_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the Client ID Metadata Documents experimental feature (issue
+/// #128). One flag for the whole surface: URL `client_id` resolution, the fetch, the
+/// document cache, and the domain trust policy are one capability and there is no
+/// coherent half to enable.
+pub const CIMD_FEATURE: &str = "client-id-metadata-documents";
+
+/// The experimental `ack` version for CIMD (issue #128), naming the PINNED DRAFT
+/// REVISION it implements.
+///
+/// The draft is `draft-parecki-oauth-client-id-metadata-document`, and the version is in
+/// this string rather than only in prose because that is what an operator is
+/// acknowledging. CIMD inverts the usual trust direction: an unregistered party chooses a
+/// URL and the authorization server dereferences it. An operator turning that on should
+/// be saying "I have read what this does, at this revision", not "I set a boolean".
+///
+/// A draft revision that changes the document shape or the hardening rules bumps this and
+/// invalidates the old ack, which is the point of the ladder.
+pub const CIMD_VERSION: &str = "draft-parecki-04-exp.1";
+
 /// The registry name of the third-party risk-signal ingestion experimental feature
 /// (issue #82, PR 1). Chosen as one plain umbrella flag so the whole ingestion surface
 /// (the endpoint and the engine's external-signal path) toggles under one ack, mirroring
@@ -252,6 +271,7 @@ impl FeatureRegistry {
         registry.register_sample_experimental();
         registry.register_global_token_revocation();
         registry.register_custom_domains_acme();
+        registry.register_cimd();
         registry.register_fedcm();
         registry.register_risk_signals();
         registry.register_org_scoped_clients();
@@ -350,6 +370,27 @@ impl FeatureRegistry {
     /// between releases and enabling it must acknowledge the exact implemented
     /// revision. Redirect flows are UNAFFECTED. Off by default; every FedCM route
     /// answers a uniform 404 until the feature is enabled AND acknowledged.
+    /// Registers the Client ID Metadata Documents feature (issue #128): a URL
+    /// `client_id` the authorization server fetches, validates, caches, and resolves
+    /// against a domain trust policy.
+    pub fn register_cimd(&mut self) {
+        self.register(Feature::experimental(
+            CIMD_FEATURE,
+            "Client ID Metadata Documents: a URL client_id the authorization server \
+             DEREFERENCES and then trusts to describe a client, replacing registration \
+             for that client. EXPERIMENTAL: it inverts the usual trust direction, so an \
+             unregistered party chooses a URL the server fetches, and the IETF draft is \
+             still moving. Every hardening rule (https only, no redirects, no \
+             private or special-use targets, a size bound, an exact client_id match \
+             inside the document) exists because the alternative hands an attacker \
+             either the server's network position or another client's identity. \
+             Unknown domains are QUARANTINED, not allowed: consent is always shown and \
+             redirects are restricted to https. Registered clients are UNAFFECTED.",
+            CIMD_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
     pub fn register_fedcm(&mut self) {
         self.register(Feature::experimental(
             FEDCM_FEATURE,
@@ -825,6 +866,55 @@ mod tests {
         ));
         registry.validate(&acked).expect("the exact ack boots");
         assert!(registry.is_enabled(&acked, CUSTOM_DOMAINS_ACME_FEATURE));
+    }
+
+    #[test]
+    fn cimd_is_experimental_and_off_by_default() {
+        // Issue #128 criterion 4. CIMD inverts the usual trust direction: an unregistered
+        // party chooses a URL and the authorization server dereferences it. So the flag is
+        // default-off AND gated on an ack naming the pinned draft revision, which is what
+        // makes enabling it a decision an operator made rather than a boolean they flipped.
+        let registry = FeatureRegistry::builtin();
+        let feature = registry.get(CIMD_FEATURE).expect("cimd is registered");
+        assert!(matches!(feature.maturity(), Maturity::Experimental { .. }));
+        assert!(!feature.default_enabled(), "CIMD must be off by default");
+
+        let absent = config_with_features("");
+        registry.validate(&absent).expect("absent is fine");
+        assert!(
+            !registry.is_enabled(&absent, CIMD_FEATURE),
+            "cimd is off when absent from [features], so a URL client_id is just an \
+             unknown client"
+        );
+
+        // Enabled without an ack refuses to boot.
+        let no_ack = config_with_features("\"client-id-metadata-documents\" = { enabled = true }");
+        registry
+            .validate(&no_ack)
+            .expect_err("enabling CIMD without acknowledging the draft revision must not boot");
+
+        // A WRONG ack still refuses. The ack names the pinned revision, so a stale one is
+        // an operator acknowledging a draft this build no longer implements.
+        let wrong_ack = config_with_features(
+            "\"client-id-metadata-documents\" = { enabled = true, ack = \"draft-parecki-01\" }",
+        );
+        registry
+            .validate(&wrong_ack)
+            .expect_err("a stale draft ack must refuse to boot");
+
+        // The exact ack boots.
+        let acked = config_with_features(&format!(
+            "\"client-id-metadata-documents\" = {{ enabled = true, ack = \"{CIMD_VERSION}\" }}"
+        ));
+        registry.validate(&acked).expect("the exact ack boots");
+        assert!(registry.is_enabled(&acked, CIMD_FEATURE));
+
+        // The ack names the DRAFT, not a product version. That is the whole point: an
+        // operator is acknowledging which revision of a moving spec they are exposed to.
+        assert!(
+            CIMD_VERSION.contains("draft-"),
+            "the ack must name the pinned draft revision, got {CIMD_VERSION}"
+        );
     }
 
     #[test]
