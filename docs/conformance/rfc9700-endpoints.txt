@@ -7,6 +7,8 @@
 # docs/conformance/rfc9700-checklist.md, so a new OAuth endpoint cannot ship
 # uncovered while the checklist reads complete.
 /.well-known/oauth-authorization-server/t/{tenant_id}/e/{environment_id}
+/.well-known/oauth-protected-resource
+/.well-known/oauth-protected-resource/{*resource_path}
 /.well-known/openid-configuration/t/{tenant_id}/e/{environment_id}
 /.well-known/web-identity
 /.well-known/webauthn

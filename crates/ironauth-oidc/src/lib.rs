@@ -531,6 +531,23 @@ pub fn oidc_router(state: OidcState) -> Router {
         // so the route literals stay UNCONDITIONAL for the RFC 9700 endpoint inventory.
         // Redirect flows are unaffected; with the flag off nothing here answers.
         .route("/.well-known/web-identity", get(fedcm::well_known))
+        // RFC 9728 Protected Resource Metadata (issue #127). DEPLOYMENT-ROOT, because
+        // section 3.1 composes the metadata URL from the RESOURCE identifier by inserting
+        // the well-known segment between authority and path; a scope-routed URL is not the
+        // path that composition produces, so a spec-following client would never build it.
+        // The scope is recovered from the path suffix instead. Both forms are mounted: the
+        // bare path for an identifier with no path component, and the catch-all for one
+        // that has a path (which every IronAuth-hosted resource does, since its identifier
+        // carries `/t/{tenant}/e/{environment}`). An unregistered or non-hosted identifier
+        // is a uniform 404, so this discloses no tenant or resource that exists.
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(prm::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/{*resource_path}",
+            get(prm::protected_resource),
+        )
         .route(
             "/t/{tenant_id}/e/{environment_id}/fedcm/config.json",
             get(fedcm::config),
