@@ -299,6 +299,18 @@ pub struct AuthenticatedClient {
     /// public client. A confidential method here means a real secret / assertion was
     /// verified (a `none` client proves only possession of its non-secret id).
     pub auth_method: ClientAuthMethod,
+    /// Whether this client may obtain plain BEARER tokens (issue #124, RFC 9449).
+    ///
+    /// Read from the registration the authentication just verified, so the token
+    /// endpoint enforces the `DPoP`-by-default posture without a second store round
+    /// trip and without the chance of reading a different row than the one that
+    /// authenticated.
+    ///
+    /// Only meaningful together with [`auth_method`](Self::auth_method): the posture
+    /// applies to PUBLIC clients, and a confidential client is unaffected because it
+    /// authenticates, so the sender constraint a proof adds is not the control that
+    /// protects it.
+    pub allow_bearer_tokens: bool,
 }
 
 /// Why the reusable client-authentication seam rejected a request. The caller maps
@@ -515,6 +527,7 @@ async fn authenticate_presented(
             Ok(()) => Ok(AuthenticatedClient {
                 client_id: client_id_str,
                 auth_method: registered,
+                allow_bearer_tokens: record.allow_bearer_tokens,
             }),
             Err(SecretAuthError::MethodMismatch) => {
                 fail!(&method_str, ClientAuthDiagnosticReason::MethodMismatch)
@@ -532,6 +545,7 @@ async fn authenticate_presented(
                 Ok(()) => Ok(AuthenticatedClient {
                     client_id: client_id_str,
                     auth_method: registered,
+                    allow_bearer_tokens: record.allow_bearer_tokens,
                 }),
                 // The assertion failed: the diagnostic carries the SPECIFIC reject
                 // reason (bad signature, expired, clock skew, audience mismatch,
@@ -1342,6 +1356,10 @@ mod tests {
             jwks_uri: None,
             token_endpoint_auth_signing_alg: None,
             refresh_rotation: None,
+            // The strict posture, matching the column default: these fixtures test
+            // authentication, and a fixture that quietly relaxed the DPoP default
+            // would be the wrong shape to reason from.
+            allow_bearer_tokens: false,
         }
     }
 

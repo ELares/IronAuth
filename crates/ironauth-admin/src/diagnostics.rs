@@ -426,6 +426,29 @@ pub struct WarningItemView {
     pub detail: String,
 }
 
+/// Warn about every PUBLIC client relaxed out of the `DPoP`-by-default posture (issue
+/// #124).
+///
+/// The relax exists because some public clients cannot mint proofs at all, so it is a
+/// legitimate setting and not a misconfiguration. It is still worth surfacing: it is a
+/// standing weakening of a client that cannot keep a secret, it is invisible in the
+/// client list unless an operator goes looking, and the operator who set it for one
+/// legacy app is rarely the one auditing the environment a year later.
+///
+/// Confidential clients are skipped: they authenticate, so the flag changes nothing
+/// for them, and listing them would bury the clients this is actually about.
+fn bearer_relaxed_warnings(clients: &[ironauth_store::ClientRecord]) -> Vec<WarningItemView> {
+    clients
+        .iter()
+        .filter(|client| client.allow_bearer_tokens && client.auth_method == "none")
+        .map(|client| WarningItemView {
+            kind: "dpop_posture_relaxed".to_owned(),
+            subject: client.id.to_string(),
+            detail: "public client may obtain bearer tokens without a DPoP proof".to_owned(),
+        })
+        .collect()
+}
+
 /// The environment's operational warnings (issue #91), COMPUTED LIVE from the existing
 /// seams (the connector health registry and the token size event sink). Nothing here is a
 /// stored, staleness prone materialization except the token size events, which are already
@@ -552,6 +575,20 @@ pub async fn get_diagnostics_warnings(
 
     // Permission-claim budget warnings (issue #98), out of the access-token window.
     items.extend(permission_budget_warnings(&budget_events));
+
+    // Public clients relaxed out of the DPoP-by-default posture (issue #124).
+    //
+    // Computed live from the client registry rather than from an event, because this is
+    // a STANDING condition and not something that happened: a client relaxed a year ago
+    // is exactly as relaxed today, and an event-derived warning would age out of its
+    // window and quietly stop reporting a client that is still accepting bearer tokens.
+    //
+    // Only PUBLIC clients are listed. The column exists on every client, but a
+    // confidential client authenticates, so the flag changes nothing about its posture
+    // and warning about it would be noise that trains an operator to ignore the family.
+    items.extend(bearer_relaxed_warnings(
+        &state.store().scoped(scope).clients().list().await?,
+    ));
 
     let list = DiagnosticsWarningsList { items };
     let body = serde_json::to_string(&list).map_err(|_| ApiError::Internal)?;

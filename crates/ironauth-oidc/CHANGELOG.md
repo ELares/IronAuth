@@ -6,6 +6,43 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`DPoP` is now the DEFAULT for PUBLIC clients, and bearer the exception (issue #124, RFC 9449).**
+  Closes the last acceptance criterion that needed code.
+
+  - **Why public clients specifically.** A public client cannot keep a secret, so no client
+    authentication stands between an attacker and its tokens. Requiring a proof turns a stolen
+    token into one the thief cannot present. A CONFIDENTIAL client authenticates on every token
+    request, so the sender constraint a proof adds is not the control protecting it, and requiring
+    one would impose a round trip and a key-management burden to defend something already defended.
+
+  - **Migration 0142** adds `clients.allow_bearer_tokens`, defaulting to `false`. The column is
+    phrased as `allow_bearer_tokens` rather than `require_dpop` precisely so the boolean's FALSE
+    value is the strict one: a row created before the migration, or by any path that does not name
+    the column, then lands on the safe side, and a forgotten default cannot fail open.
+
+  - **The escape hatch is per client, not per deployment.** Some public clients cannot mint proofs
+    at all (an embedded runtime with no `WebCrypto`, a vendor SDK the operator does not control), and
+    a deployment forced to choose between "no DPoP anywhere" and "break the TV app" will choose the
+    former. A deployment-wide switch would have to be set for the WEAKEST client and would silently
+    relax every other client with it.
+
+  - **The writer grant ships in the same migration.** 0115 exists only because
+    `require_pushed_authorization_requests` shipped in 0015 with a column, a reader, a setter, and
+    no `UPDATE` grant to any role: the setter could not have had a production caller, the per-client
+    half sat at its default on every deployment for years, and nothing surfaced it because the only
+    callers were tests running through a superuser pool. Granting the control plane alongside the
+    column avoids repeating that.
+
+  - **Enforced on the refresh path too.** An unbound family reaches the permissive branch of the
+    refresh `DPoP` check, so without a gate there a public client could sidestep the posture entirely
+    by refreshing a family obtained before it was enabled: the exchange would be constrained and
+    every renewal after it would not.
+
+  - **Relaxed clients surface in admin diagnostics** as `dpop_posture_relaxed`, computed live from
+    the client registry rather than from an event. This is a STANDING condition, and an
+    event-derived warning would age out of its window and quietly stop reporting a client that is
+    still accepting bearer tokens.
+
 - **The `DPoP` nonce challenge reaches IronAuth's own protected resources (issue #124, RFC 9449
   section 8).** Completes the nonce work: the token endpoint half shipped first, and `UserInfo` is
   the resource-server half the same What section names.

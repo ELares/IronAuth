@@ -323,6 +323,12 @@ async fn authorization_code_grant(
     //     opportunistic: a client that sent a proof gets a bound token or this error,
     //     never a silent bearer token.
     let dpop_confirmation = resolve_dpop_binding(state, headers)?;
+    // 5g-bis. The DPoP-by-default posture (issue #124): a PUBLIC client must have
+    //         produced a binding above unless its registration is explicitly relaxed.
+    //         Placed after the opportunistic resolve so a client that DID send a valid
+    //         proof passes here without a second check, and before the code is
+    //         consumed so a refusal leaves the code live for the client's retry.
+    enforce_public_client_dpop(&authenticated_client, dpop_confirmation.as_ref())?;
     let dpop_jkt = dpop_confirmation.as_ref().map(Confirmation::value);
 
     // 5h. A code that is itself SENDER-CONSTRAINED (issue #368) narrows 5g's opportunistic
@@ -572,6 +578,53 @@ fn resolve_dpop_binding(
         return Err(TokenError::InvalidDpopProof);
     }
     Ok(Some(Confirmation::Jkt(proof.jkt)))
+}
+
+/// Enforce the `DPoP`-by-default posture for PUBLIC clients (issue #124).
+///
+/// IronAuth's stated posture is that `DPoP` is the default for a public client and
+/// bearer is the exception. A public client is one that cannot keep a secret, so its
+/// tokens are the ones a theft most directly monetizes, and sender-constraining them
+/// is what turns a stolen token into one an attacker cannot present.
+///
+/// # Why only public clients
+///
+/// A confidential client authenticates on every token request. The sender constraint
+/// a proof adds is therefore not the control protecting it, and requiring one would
+/// impose a round trip and a key-management burden to defend something already
+/// defended. The posture is aimed exactly where the gap is.
+///
+/// # Why the escape hatch is per client
+///
+/// Some public clients cannot mint proofs at all: an embedded or TV runtime with no
+/// `WebCrypto`, a vendor SDK the operator does not control, a native app shipped before
+/// the operator adopted this posture. Without a way out, those deployments would have
+/// to abandon the posture wholesale, which is strictly worse than naming the two
+/// clients that need bearer and constraining every other one. A deployment-wide
+/// switch would have to be set for the WEAKEST client and would then silently relax
+/// every other client with it, which is the accident this shape prevents.
+///
+/// # Errors
+///
+/// [`TokenError::InvalidDpopProof`], the same uniform error a bad proof draws. A
+/// public client that sent no proof to a deployment expecting one is in the same
+/// position as one whose proof failed: it must present a valid proof to proceed, and
+/// the remedy is identical, so a separate code would only tell an attacker which
+/// clients are relaxed.
+fn enforce_public_client_dpop(
+    client: &AuthenticatedClient,
+    confirmation: Option<&Confirmation>,
+) -> Result<(), TokenError> {
+    if client.auth_method != ClientAuthMethod::None || client.allow_bearer_tokens {
+        return Ok(());
+    }
+    if confirmation.is_some() {
+        return Ok(());
+    }
+    tracing::warn!(
+        "rejecting a bearer token request from a public client that is not allowed bearer tokens"
+    );
+    Err(TokenError::InvalidDpopProof)
 }
 
 /// Enforce a SENDER-CONSTRAINED authorization code's `DPoP` binding at redemption
@@ -2008,6 +2061,12 @@ async fn refresh_token_grant(
     //     invalid_dpop_proof, and because this runs before the redeem it neither
     //     rotates nor revokes the family (no DoS on a legitimate holder).
     let dpop_confirmation = enforce_refresh_dpop(state, headers, resolution.dpop_jkt.as_deref())?;
+    // The DPoP-by-default posture (issue #124) on the refresh path too. An UNBOUND
+    // family reaches `enforce_refresh_dpop`'s permissive branch, so without this a
+    // public client could sidestep the posture entirely by refreshing a family it had
+    // obtained before the posture was turned on: the exchange would be constrained
+    // and every renewal after it would not.
+    enforce_public_client_dpop(&authenticated_client, dpop_confirmation.as_ref())?;
 
     // 5. Resolve the client's posture and rotation override to decide whether a live
     //    token rotates (public/unbound: always; confidential/bound: past the TTL

@@ -1162,6 +1162,20 @@ name = "dpop_nonce_userinfo"
 path = "tests/dpop_nonce_userinfo.rs"
 required-features = ["testing"]
 
+# The DPoP-by-default posture for PUBLIC clients (issue #124): a public client cannot keep a secret,
+# so there is no client authentication between an attacker and its tokens, and requiring a proof turns
+# a stolen token into one the thief cannot present. Covers both halves, because a posture that refused
+# everything would pass a strict-only suite: a strict public client is refused a bearer token and
+# succeeds with a proof, the refusal does not burn the one-time code (or the posture would convert an
+# un-upgraded client from "gets bearer tokens" to "cannot authenticate at all"), a RELAXED client still
+# gets bearer tokens, a CONFIDENTIAL client is unaffected even at the strict default, and the posture
+# holds on the refresh path so a family grandfathered in before it was enabled cannot renew as bearer.
+# Over a real database (DATABASE_URL).
+[[test]]
+name = "dpop_public_client_posture"
+path = "tests/dpop_public_client_posture.rs"
+required-features = ["testing"]
+
 # The DURABLE organization token context (issue #94, PR-B1): the organization parameter
 # binds a live-and-active org onto the session and both tokens (org_id claim), a
 # single-org subject auto-selects, a multi-org subject with no parameter gets none, a
