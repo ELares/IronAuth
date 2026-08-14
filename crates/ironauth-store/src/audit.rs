@@ -702,6 +702,11 @@ pub enum Action {
     /// A client's `require_pushed_authorization_requests` flag was set (RFC 9126
     /// section 5, issue #27).
     ClientRequirePushedAuthorizationSet,
+    /// A client's `allow_bearer_tokens` flag was set (issue #124): the per-client
+    /// escape hatch from the `DPoP`-by-default posture for public clients. Audited
+    /// because relaxing it WEAKENS a client, and a weakening should be a recorded
+    /// act rather than a silent column update.
+    ClientAllowBearerTokensSet,
     /// A DCR initial access token was minted through the management API (issue
     /// #31, RFC 7591 section 1.2). The token authorizes future self-service client
     /// registrations, optionally under an attached policy chain.
@@ -1436,6 +1441,7 @@ impl Action {
             Action::ClientRequirePushedAuthorizationSet => {
                 "client.require_pushed_authorization_requests.set"
             }
+            Action::ClientAllowBearerTokensSet => "client.allow_bearer_tokens.set",
             Action::DcrInitialAccessTokenMint => "dcr.iat_minted",
             Action::DcrPolicyCreate => "dcr.policy_created",
             Action::DcrPolicyRejected => "dcr.policy_rejected",

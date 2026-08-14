@@ -755,6 +755,29 @@ impl Harness {
             .register_redirect_uris(&env, &client_id, &[REDIRECT_URI])
             .await
             .expect("register redirect uri");
+        // RELAX the DPoP-by-default posture for the seeded PUBLIC client (issue #124),
+        // exactly as this harness relaxes `require_pkce_for_confidential_clients`.
+        //
+        // The shipped default requires a public client to accompany its token request
+        // with a DPoP proof. Nearly every suite here predates that posture and drives a
+        // plain bearer exchange to test something else entirely (consent, claims,
+        // revocation, org context), so leaving it strict would make hundreds of tests
+        // fail for a reason none of them are about.
+        //
+        // The posture itself is therefore exercised by clients created EXPLICITLY
+        // strict, in `dpop_public_client_posture.rs`. A relaxed default here plus a
+        // strict fixture there is the only arrangement where both the posture and
+        // everything it could break are actually covered.
+        // Through the CONTROL store: `allow_bearer_tokens` is a management decision and
+        // the data-plane role holds no grant on it (0142), so this would be a bare
+        // "permission denied for table clients" on the app pool.
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .clients()
+            .set_allow_bearer_tokens(&env, &client_id, true)
+            .await
+            .expect("relax the DPoP posture for the seeded test client");
 
         (db, env, clock, scope, client_id)
     }
@@ -2285,6 +2308,26 @@ impl Harness {
         self.session_cookie(&subject).await
     }
 
+    /// Set a client's `allow_bearer_tokens` flag (issue #124): the per-client escape
+    /// hatch from the `DPoP`-by-default posture for public clients.
+    ///
+    /// This harness RELAXES the clients it seeds, because nearly every suite predates
+    /// the posture and drives a plain bearer exchange to test something else. A test
+    /// that is actually about the posture calls this with `false` to put a client back
+    /// under the shipped default, so its fixture states the condition rather than
+    /// inheriting it.
+    pub async fn set_client_bearer_posture(&self, client_id: &ClientId, allowed: bool) {
+        let (actor, corr) = self.seeding_actor();
+        self.db()
+            .control_store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .set_allow_bearer_tokens(&self.env, client_id, allowed)
+            .await
+            .expect("set the client bearer posture");
+    }
+
     /// Create a PUBLIC client that registered `require_auth_time` (issue #14), so
     /// its ID tokens carry `auth_time` even without a `max_age` request. Returns
     /// its id.
@@ -2299,6 +2342,9 @@ impl Harness {
             .await
             .expect("create require_auth_time client");
         self.register_default_redirect(&id).await;
+        // Relaxed like every other public client this harness makes (issue #124):
+        // callers of this helper are testing `auth_time`, not the DPoP posture.
+        self.set_client_bearer_posture(&id, true).await;
         id
     }
 
@@ -2327,6 +2373,17 @@ impl Harness {
             .register_redirect_uris(&self.env, &id, redirect_uris)
             .await
             .expect("register redirect uris");
+        // Relaxed like the seeded client, and for the same reason: callers of this
+        // helper are testing redirect-URI behavior, not the DPoP posture.
+        let (actor, corr) = self.seeding_actor();
+        self.db()
+            .control_store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .set_allow_bearer_tokens(&self.env, &id, true)
+            .await
+            .expect("relax the DPoP posture");
         id
     }
 

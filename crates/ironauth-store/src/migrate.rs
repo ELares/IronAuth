@@ -1142,6 +1142,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0141_authorization_code_dpop.sql"),
         },
+        Migration {
+            version: 142,
+            name: "client_allow_bearer_tokens",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0142_client_allow_bearer_tokens.sql"),
+        },
     ]
 }
 
