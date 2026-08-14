@@ -73,7 +73,7 @@ use crate::claims_request::ClaimsRequest;
 use crate::client_auth::{
     self, AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod,
 };
-use crate::dpop::{DPOP_HEADER, DPOP_HTM_POST};
+use crate::dpop::{DPOP_HEADER, DPOP_HTM_POST, token_type_for_dpop};
 use crate::error::TokenError;
 use crate::issuer::{IssuerEntry, IssuerResolution};
 use crate::permission_budget::{
@@ -1478,7 +1478,7 @@ fn token_response(
     // RFC 9449 section 5: a token sender-constrained by a DPoP proof is advertised as
     // `DPoP`, so the client presents it as `Authorization: DPoP` with a fresh proof
     // rather than as a plain bearer. An unbound exchange stays `Bearer`.
-    let token_type = if dpop_bound { "DPoP" } else { "Bearer" };
+    let token_type = token_type_for_dpop(dpop_bound);
     let mut body = serde_json::json!({
         "access_token": minted.access.token(),
         "token_type": token_type,
@@ -2393,7 +2393,7 @@ fn refresh_response(
     // RFC 9449 section 5: a refresh of a DPoP-bound family re-binds the rotated access
     // token to the same key, so the response advertises `DPoP` and the client presents
     // the token with a fresh proof. An unbound family stays `Bearer`, byte identical.
-    let token_type = if dpop_bound { "DPoP" } else { "Bearer" };
+    let token_type = token_type_for_dpop(dpop_bound);
     let mut body = serde_json::json!({
         "access_token": minted.token(),
         "token_type": token_type,

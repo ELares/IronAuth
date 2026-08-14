@@ -16,6 +16,16 @@
 //!   revoked, cross-tenant, or wrong-format token all return the SAME `200
 //!   {"active":false}`, so an authenticated caller cannot tell one not-active cause
 //!   from another (no state oracle among token states).
+//! - **A sender-constrained token never reads as a plain bearer token.** RFC 9449
+//!   section 6.2 requires a `DPoP`-bound access token's binding to reach the resource
+//!   server as a top-level `cnf` member, and requires that a `token_type` member, if
+//!   present, be `DPoP`. Introspection is where a resource server that cannot parse a
+//!   token for itself (an opaque token has no claims at all) learns that a proof is
+//!   required, so reporting `Bearer` here would tell it to accept the token from
+//!   whoever presents it, silently undoing the binding. The wire `token_type` is
+//!   therefore DERIVED from the recorded confirmation rather than stored beside it
+//!   (see [`IntrospectionClaims::is_access_token`]), which makes the pairing
+//!   "`Bearer` alongside a `cnf.jkt`" unrepresentable instead of merely untested.
 //! - **The active response is byte-consistent with the token's real claims.** For an
 //!   `at+jwt` the metadata comes from the VERIFIED token (a tampered payload fails the
 //!   signature and reads as not-active); for an opaque or refresh token it comes from
@@ -44,19 +54,16 @@ use axum::extract::{Form, State};
 use axum::http::HeaderMap;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_jose::VerifiedToken;
+use ironauth_jose::{Confirmation, VerifiedToken};
 use ironauth_store::{IssuedTokenId, RefreshTokenId, Scope};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::client_auth::{ClientAuthInputs, ClientAuthMethod, authenticate_client_self_scoped};
+use crate::dpop::{BEARER_TOKEN_TYPE, DPOP_TOKEN_TYPE};
 use crate::state::OidcState;
 use crate::token_credential::{self, PresentedTokenKind, opaque_handle, peek_claim, peek_jti};
 use crate::tokens::{OPAQUE_ACCESS_TOKEN_PREFIX, OPAQUE_REFRESH_TOKEN_PREFIX};
-
-/// The RFC 6749 5.1 token type reported for an access token (`Bearer`). Refresh
-/// tokens carry no RFC 6749 5.1 token type, so their introspection omits the field.
-const BEARER_TOKEN_TYPE: &str = "Bearer";
 
 /// The typed introspection result the endpoint builds and the serializer renders.
 ///
@@ -77,8 +84,15 @@ pub struct IntrospectionClaims {
     /// The token's subject, derived through the ONE shared subject function so it is
     /// byte-identical to the ID token's / `UserInfo`'s `sub`.
     pub sub: Option<String>,
-    /// The token type (`Bearer` for an access token; omitted for a refresh token).
-    pub token_type: Option<String>,
+    /// Whether this is an ACCESS token, which carries an RFC 6749 section 5.1
+    /// `token_type`. A refresh token is not one and reports no type at all.
+    ///
+    /// The wire VALUE is deliberately not stored here. It is derived from
+    /// [`confirmation`](Self::confirmation) by [`access_token_type`] when the response
+    /// is serialized, so this struct cannot express a `Bearer` access token that also
+    /// carries a `cnf.jkt`: the RFC 9449 section 6.2 MUST is enforced by the type,
+    /// not by every construction site remembering to keep two fields in step.
+    pub is_access_token: bool,
     /// Expiry, in seconds since the Unix epoch.
     pub exp: Option<i64>,
     /// Issuance, in seconds since the Unix epoch.
@@ -89,6 +103,18 @@ pub struct IntrospectionClaims {
     /// common case, byte-identical to the pre-#28 wire form) or a JSON ARRAY for
     /// several (RFC 7662 permits either).
     pub aud: Vec<String>,
+    /// The proof-of-possession confirmation the token is bound to (RFC 7800), or
+    /// [`None`] for an unbound token.
+    ///
+    /// Emitted as the top-level `cnf` member of the response (RFC 9449 section 6.2),
+    /// which is how a resource server learns it must check a proof. It matters most
+    /// for an OPAQUE token, which carries no claims of its own, so introspection is
+    /// the ONLY way its binding can be discovered.
+    ///
+    /// Typed as the shared [`Confirmation`] rather than a bare thumbprint string so a
+    /// future binding (RFC 8705 `x5t#S256`) reaches the wire through this same field
+    /// with no further change here, which is what the shared `cnf` model exists for.
+    pub confirmation: Option<Confirmation>,
 }
 
 impl IntrospectionClaims {
@@ -96,6 +122,36 @@ impl IntrospectionClaims {
     #[must_use]
     pub fn inactive() -> Self {
         Self::default()
+    }
+}
+
+/// The `token_type` to report for an ACCESS token with this confirmation, or [`None`]
+/// to omit the member entirely.
+///
+/// RFC 7662 section 2.2 makes `token_type` OPTIONAL, and RFC 9449 section 6.2 narrows
+/// that to "if the `token_type` member is included in the introspection response, it
+/// MUST contain the value `DPoP`" for a bound token. Omission is therefore always
+/// available and is the right answer whenever this build cannot state the type
+/// truthfully: it leaves the resource server unable to conclude "plain bearer", while
+/// the `cnf` member still tells it a binding exists.
+fn access_token_type(confirmation: Option<&Confirmation>) -> Option<&'static str> {
+    let Some(confirmation) = confirmation else {
+        // Unbound: an ordinary RFC 6750 bearer token.
+        return Some(BEARER_TOKEN_TYPE);
+    };
+    match confirmation {
+        // RFC 9449 section 6.2: a DPoP-bound token MUST report `DPoP`.
+        Confirmation::Jkt(_) => Some(DPOP_TOKEN_TYPE),
+        // RFC 8705 section 3.1: mutual-TLS binding constrains the sender at the
+        // transport layer, and the token is still presented as `Bearer`.
+        Confirmation::X5tS256(_) => Some(BEARER_TOKEN_TYPE),
+        // A binding type added to the shared model that this endpoint has not been
+        // taught yet. `Confirmation` is `#[non_exhaustive]`, so the compiler cannot
+        // force that decision across the crate boundary the way an in-crate enum
+        // would; omitting the member is the fail-closed stand-in. Guessing `Bearer`
+        // would be the one answer that actively misleads, since it invites the
+        // resource server to accept a constrained token from any holder.
+        _ => None,
     }
 }
 
@@ -133,10 +189,26 @@ impl IntrospectionSerializer for JsonIntrospectionSerializer {
         insert_str(&mut object, "scope", claims.scope.as_deref());
         insert_str(&mut object, "client_id", claims.client_id.as_deref());
         insert_str(&mut object, "sub", claims.sub.as_deref());
-        insert_str(&mut object, "token_type", claims.token_type.as_deref());
+        // Derived, never stored: an access token's type follows from its binding, so
+        // a bound token cannot be reported as `Bearer` (RFC 9449 section 6.2). A
+        // refresh token has no RFC 6749 section 5.1 type and reports none.
+        let token_type = claims
+            .is_access_token
+            .then(|| access_token_type(claims.confirmation.as_ref()))
+            .flatten();
+        insert_str(&mut object, "token_type", token_type);
         insert_i64(&mut object, "exp", claims.exp);
         insert_i64(&mut object, "iat", claims.iat);
         insert_aud(&mut object, &claims.aud);
+        // RFC 9449 section 6.2: the binding travels as a TOP-LEVEL `cnf` member whose
+        // content is the same `{ member: thumbprint }` object a bound JWT carries, so
+        // a resource server reads an identical shape whichever it has in hand.
+        if let Some(confirmation) = &claims.confirmation {
+            object.insert(
+                "cnf".to_owned(),
+                Value::Object(confirmation.to_cnf_object()),
+            );
+        }
         SerializedIntrospection {
             content_type: "application/json",
             body: Value::Object(object).to_string(),
@@ -337,6 +409,18 @@ async fn resolve_jwt(state: &OidcState, scope: Scope, token: &str) -> Option<Int
     let audiences = peek_audiences(token)?;
     let verified = verify_any_audience(state, &scope, &audiences, token).await?;
     let claims = verified.claims();
+    // The binding is read off the VERIFIED claims, so the reported `cnf` is the one
+    // this server signed and not one a caller edited in.
+    //
+    // A `cnf` that is present but unparseable reads NOT-ACTIVE rather than unbound.
+    // The alternative, treating it as absent, would report a token this server itself
+    // marked as key-bound as a plain `Bearer`, which is the exact downgrade the whole
+    // mechanism exists to prevent. It can only be reached by a signature-valid token
+    // carrying a malformed `cnf`, so it means this server has a minting bug, and
+    // failing closed is the correct answer to that.
+    let Ok(confirmation) = Confirmation::from_claims(claims) else {
+        return None;
+    };
     Some(IntrospectionClaims {
         active: true,
         scope: claims
@@ -348,7 +432,7 @@ async fn resolve_jwt(state: &OidcState, scope: Scope, token: &str) -> Option<Int
             .and_then(Value::as_str)
             .map(str::to_owned),
         sub: claims.subject().map(str::to_owned),
-        token_type: Some(BEARER_TOKEN_TYPE.to_owned()),
+        is_access_token: true,
         exp: claims.expiration(),
         iat: claims.issued_at(),
         // Report the token's FULL signed audience set (RFC 7662 section 2.2: the `aud`
@@ -359,6 +443,7 @@ async fn resolve_jwt(state: &OidcState, scope: Scope, token: &str) -> Option<Int
         // string (byte-identical to the pre-#28 single-audience wire form) and emits an
         // array for several, exactly the shape the opaque path reports.
         aud: claims.audiences().to_vec(),
+        confirmation,
     })
 }
 
@@ -433,13 +518,17 @@ async fn resolve_opaque(
         // The opaque row stores the LOCAL subject; derive the public sub through the
         // ONE shared function so it is byte-identical to the ID token's / UserInfo's.
         sub: Some(state.resolve_public_subject(&active.subject)),
-        token_type: Some(BEARER_TOKEN_TYPE.to_owned()),
+        is_access_token: true,
         exp: Some(active.expires_at_unix_micros.div_euclid(1_000_000)),
         iat: Some(active.issued_at_unix_micros.div_euclid(1_000_000)),
         // The FULL recorded audience set (issue #28): an opaque token carries no
         // self-contained claims, so its audiences are recorded on the row and
         // reported here exactly as minted (a single string, or an array).
         aud: active.audiences,
+        // The jkt recorded on the row at issuance. An opaque token has no claims to
+        // inspect, so this response is the ONLY place its binding is observable: a
+        // resource server holding one cannot discover it any other way.
+        confirmation: active.dpop_jkt.map(Confirmation::Jkt),
     })
 }
 
@@ -475,10 +564,16 @@ async fn resolve_refresh(
         client_id: Some(resolution.client_id.clone()),
         sub: Some(state.resolve_public_subject(&resolution.subject)),
         // A refresh token carries no RFC 6749 5.1 token type and no audience.
-        token_type: None,
+        is_access_token: false,
         exp: Some(resolution.idle_expires_at_unix_micros.div_euclid(1_000_000)),
         iat: Some(resolution.issued_at_unix_micros.div_euclid(1_000_000)),
         aud: Vec::new(),
+        // The family's binding. RFC 9449 section 6.2 is written about access tokens,
+        // but a bound family is just as sender-constrained (only a request proving
+        // this key can rotate it), and reporting it costs nothing: the thumbprint is
+        // public key material the client already puts in every proof header. The
+        // omitted `token_type` stays omitted, which section 6.2 permits outright.
+        confirmation: resolution.dpop_jkt.map(Confirmation::Jkt),
     })
 }
 
@@ -539,10 +634,11 @@ mod tests {
             scope: Some("openid profile".to_owned()),
             client_id: Some("cli_x".to_owned()),
             sub: Some("usr_abc".to_owned()),
-            token_type: Some("Bearer".to_owned()),
+            is_access_token: true,
             exp: Some(1_300),
             iat: Some(1_000),
             aud: vec!["cli_x".to_owned()],
+            confirmation: None,
         };
         let value: Value =
             serde_json::from_str(&JsonIntrospectionSerializer.serialize(&claims).body).unwrap();
@@ -555,6 +651,11 @@ mod tests {
         assert_eq!(value["iat"], 1_000);
         assert_eq!(value["aud"], "cli_x");
 
+        assert!(
+            value.get("cnf").is_none(),
+            "an unbound token carries no cnf"
+        );
+
         // A refresh-shaped active response omits aud and token_type entirely (never
         // emitted as null).
         let refresh = IntrospectionClaims {
@@ -562,15 +663,131 @@ mod tests {
             scope: None,
             client_id: Some("cli_x".to_owned()),
             sub: Some("usr_abc".to_owned()),
-            token_type: None,
+            is_access_token: false,
             exp: Some(9),
             iat: Some(1),
             aud: Vec::new(),
+            confirmation: None,
         };
         let value: Value =
             serde_json::from_str(&JsonIntrospectionSerializer.serialize(&refresh).body).unwrap();
         assert!(value.get("aud").is_none(), "aud omitted, not null");
         assert!(value.get("token_type").is_none(), "token_type omitted");
         assert!(value.get("scope").is_none(), "absent scope omitted");
+    }
+
+    /// An access-token skeleton with the given binding, for the `cnf` cases.
+    fn bound(confirmation: Option<Confirmation>) -> IntrospectionClaims {
+        IntrospectionClaims {
+            active: true,
+            client_id: Some("cli_x".to_owned()),
+            sub: Some("usr_abc".to_owned()),
+            is_access_token: true,
+            confirmation,
+            ..IntrospectionClaims::default()
+        }
+    }
+
+    fn rendered(claims: &IntrospectionClaims) -> Value {
+        serde_json::from_str(&JsonIntrospectionSerializer.serialize(claims).body)
+            .expect("serializer emits JSON")
+    }
+
+    /// THE criterion: a `DPoP`-bound token reports its `cnf.jkt` and a `DPoP`
+    /// `token_type` (RFC 9449 section 6.2), and specifically NOT `Bearer`.
+    ///
+    /// Reporting `Bearer` here would tell a resource server that a sender-constrained
+    /// token may be accepted from whoever presents it, which is the silent downgrade
+    /// the binding exists to prevent, and is what this endpoint did before.
+    #[test]
+    fn a_dpop_bound_token_reports_its_binding_and_never_reads_as_bearer() {
+        let value = rendered(&bound(Some(Confirmation::Jkt("thumb-a".to_owned()))));
+        assert_eq!(value["cnf"]["jkt"], "thumb-a");
+        assert_eq!(value["token_type"], "DPoP");
+        assert_ne!(
+            value["token_type"], "Bearer",
+            "a bound token must never report the bearer type"
+        );
+    }
+
+    /// The `cnf` is a TOP-LEVEL member of the response (RFC 9449 section 6.2), not
+    /// nested inside anything, because that is where a resource server reads it.
+    #[test]
+    fn the_cnf_member_sits_at_the_top_level_of_the_response() {
+        let value = rendered(&bound(Some(Confirmation::Jkt("thumb-a".to_owned()))));
+        let object = value.as_object().expect("a JSON object");
+        assert!(object.contains_key("cnf"), "cnf is a top-level member");
+        assert_eq!(
+            object["cnf"],
+            serde_json::json!({ "jkt": "thumb-a" }),
+            "the cnf content is the same shape a bound JWT carries"
+        );
+    }
+
+    /// The type is DERIVED from the binding, so the two can never disagree: flipping
+    /// only the confirmation flips only the reported type, with nothing else to keep
+    /// in step.
+    #[test]
+    fn the_reported_type_follows_the_binding_and_nothing_else() {
+        let unbound = rendered(&bound(None));
+        assert_eq!(unbound["token_type"], "Bearer");
+        assert!(unbound.get("cnf").is_none());
+
+        // RFC 8705 section 3.1: a certificate-bound token is still a `Bearer`, so the
+        // rule is specifically about DPoP rather than "any binding".
+        let cert = rendered(&bound(Some(Confirmation::X5tS256("thumb-c".to_owned()))));
+        assert_eq!(cert["token_type"], "Bearer");
+        assert_eq!(cert["cnf"]["x5t#S256"], "thumb-c");
+    }
+
+    /// A bound REFRESH token reports its `cnf` but still no `token_type`: it has no
+    /// RFC 6749 section 5.1 type to report, and section 6.2 requires the member only
+    /// if it is included at all.
+    #[test]
+    fn a_bound_refresh_token_reports_cnf_without_a_token_type() {
+        let claims = IntrospectionClaims {
+            active: true,
+            is_access_token: false,
+            confirmation: Some(Confirmation::Jkt("thumb-r".to_owned())),
+            ..IntrospectionClaims::default()
+        };
+        let value = rendered(&claims);
+        assert_eq!(value["cnf"]["jkt"], "thumb-r");
+        assert!(
+            value.get("token_type").is_none(),
+            "a refresh token reports no RFC 6749 5.1 type"
+        );
+    }
+
+    /// The not-active response stays exactly `{"active":false}`: a binding must not
+    /// leak through it, or introspection would become an oracle for which tokens
+    /// exist (RFC 7662 section 4).
+    #[test]
+    fn a_not_active_response_reveals_no_binding() {
+        let body = JsonIntrospectionSerializer
+            .serialize(&IntrospectionClaims::inactive())
+            .body;
+        assert_eq!(body, r#"{"active":false}"#);
+    }
+
+    /// Every shipped binding produces a `token_type` this build can state truthfully.
+    ///
+    /// The `_ => None` arm of [`access_token_type`] is deliberately NOT asserted here:
+    /// `Confirmation` is `#[non_exhaustive]`, so no third variant is constructible
+    /// from this crate and no test can reach that arm today. It is an equivalent
+    /// mutant under the current enum, and it exists for the build in which someone
+    /// adds a variant to the shared model without revisiting this endpoint.
+    #[test]
+    fn every_constructible_binding_yields_a_stateable_type() {
+        for confirmation in [
+            Confirmation::Jkt("j".to_owned()),
+            Confirmation::X5tS256("x".to_owned()),
+        ] {
+            assert!(
+                access_token_type(Some(&confirmation)).is_some(),
+                "{confirmation:?} must map to a token_type"
+            );
+        }
+        assert_eq!(access_token_type(None), Some("Bearer"));
     }
 }

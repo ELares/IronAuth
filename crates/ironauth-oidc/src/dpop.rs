@@ -47,6 +47,40 @@ pub(crate) const DPOP_HTM_GET: &str = "GET";
 /// The `htm` value a `DPoP` proof must carry on a `POST`.
 pub(crate) const DPOP_HTM_POST: &str = "POST";
 
+/// The RFC 6749 section 5.1 `token_type` of an UNBOUND access token: an ordinary
+/// bearer token (RFC 6750), presented as `Authorization: Bearer` with nothing else.
+///
+/// Also the type an RFC 8705 certificate-bound token reports: mutual-TLS binding
+/// constrains the sender at the transport layer and leaves the HTTP presentation as
+/// `Bearer` (RFC 8705 section 3.1's example response says so explicitly).
+pub(crate) const BEARER_TOKEN_TYPE: &str = "Bearer";
+
+/// The `token_type` of a `DPoP`-bound access token (RFC 9449 section 5): the client
+/// presents it as `Authorization: DPoP` accompanied by a fresh proof, NEVER as a
+/// plain bearer.
+///
+/// This is the ONE definition, shared by the two surfaces that state a token's type:
+/// the token endpoint's response (RFC 9449 section 5) and the introspection response
+/// (section 6.2, where carrying any other value for a bound token is a MUST
+/// violation). A resource server reads whichever of the two it has, so the two
+/// cannot be allowed to drift onto different spellings.
+pub(crate) const DPOP_TOKEN_TYPE: &str = "DPoP";
+
+/// The `token_type` to report for an access token that a `DPoP` proof did (or did
+/// not) sender-constrain.
+///
+/// Used by the token endpoint, which knows only whether the exchange carried a valid
+/// proof. Introspection resolves a token it did not just mint, so it derives the same
+/// answer from the token's recorded confirmation instead; both read these constants,
+/// so the two surfaces agree by construction.
+pub(crate) fn token_type_for_dpop(dpop_bound: bool) -> &'static str {
+    if dpop_bound {
+        DPOP_TOKEN_TYPE
+    } else {
+        BEARER_TOKEN_TYPE
+    }
+}
+
 /// How far in the past a `DPoP` proof's `iat` may be and still be fresh (RFC 9449
 /// section 4.3, the freshness window). Passed to the core as `iat_leeway`.
 pub(crate) const DPOP_IAT_LEEWAY: Duration = Duration::from_secs(60);

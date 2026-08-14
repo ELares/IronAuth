@@ -6,6 +6,46 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Token introspection reports a token's `DPoP` binding, and a bound token no longer reads to a
+  resource server as a plain bearer token (issue #124, RFC 9449 section 6.2).** `/introspect`
+  reported `token_type: "Bearer"` for every access token and never emitted a `cnf` member, which
+  is a MUST violation of RFC 9449 section 6.2 and, more concretely, a silent downgrade of every
+  sender-constrained token at the one surface built for resource servers to consult.
+
+  - **What it broke.** Introspection is how a resource server learns what a token is. For an
+    OPAQUE access token it is the only way: such a token carries no claims, so its binding was
+    recorded on its row at issuance and then observable nowhere at all. A resource server that
+    introspected a `DPoP`-bound token was told, in the response field that exists precisely to
+    answer the question, that it was an ordinary `Bearer` token acceptable from any holder. The
+    binding still constrained the token endpoint, so refreshes and rotations were safe; what
+    leaked was the resource server's own accept decision.
+
+  - **The shape of the fix.** The response now carries the `cnf` object as a top-level member
+    (RFC 9449 section 6.2, the same `{ member: thumbprint }` shape a bound JWT carries) for the
+    `at+jwt`, opaque, and refresh paths alike, and `token_type` is `DPoP` for a bound access
+    token. `IntrospectionClaims` no longer stores a `token_type` string beside the binding: it
+    stores `is_access_token` plus the typed `Confirmation`, and the wire value is DERIVED at
+    serialization. The pairing "`Bearer` alongside a `cnf.jkt`" is therefore unrepresentable
+    rather than merely untested, which matters because the two facts were previously set at
+    three separate construction sites.
+
+  - **RFC 8705 is not RFC 9449.** The derivation is specifically about `DPoP`: a certificate-bound
+    token (`x5t#S256`) reports its `cnf` and stays `Bearer`, because mutual-TLS constrains the
+    sender at the transport layer and RFC 8705 section 3.1 leaves the HTTP presentation alone.
+    A binding member this build does not recognize omits `token_type` entirely rather than
+    guessing, which RFC 7662 section 2.2 permits and which leaves a resource server unable to
+    conclude "plain bearer" from silence.
+
+  - **A malformed `cnf` reads not-active.** A signature-valid `at+jwt` whose `cnf` will not parse
+    is refused rather than reported as unbound. Reporting it as unbound would downgrade a token
+    this server itself marked key-bound, reachable by a minting bug rather than an attacker, and
+    a uniform `{"active":false}` keeps the RFC 7662 section 4 anti-oracle property intact.
+
+  - **The `DPoP`/`Bearer` spelling is now one constant.** The token endpoint (RFC 9449 section 5)
+    and introspection (section 6.2) both state a token's type, a resource server may see either,
+    and they had independent string literals. `dpop_introspection.rs` pins the two against each
+    other for the same token in the same exchange.
+
 - **`branding::sanitize` returns a FIXED POINT of the allowlist, and the idempotence it has
   always claimed is now true (issue #86).** The nightly `branding_sanitize` fuzz target found
   an input where `sanitize(sanitize(x)) != sanitize(x)`, which made two shipped sentences
