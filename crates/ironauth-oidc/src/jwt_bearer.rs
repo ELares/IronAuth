@@ -179,6 +179,13 @@ pub async fn jwt_bearer_grant(
             }
             ClientAuthError::InvalidClient { via_basic } => TokenError::InvalidClient { via_basic },
         })?;
+    // The ONE shared grant-restriction seam (issue #763): this client must be
+    // registered for the grant it just presented.
+    crate::token::enforce_registered_grant_for(
+        state,
+        &authenticated,
+        crate::registry::GrantType::JwtBearer,
+    )?;
     let client_id_str = authenticated.client_id;
 
     // 3. Validate the requested `scope` against the SHARED machine-grant policy

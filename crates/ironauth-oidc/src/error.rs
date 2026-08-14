@@ -307,6 +307,15 @@ pub enum TokenError {
     /// The `grant_type` is not one this server supports (only
     /// `authorization_code`). This is where ROPC and every other grant land.
     UnsupportedGrantType,
+    /// The authenticated client is not registered for the grant type it presented (RFC
+    /// 6749 5.2 `unauthorized_client`, issue #763).
+    ///
+    /// DISTINCT from [`TokenError::UnsupportedGrantType`], which says the SERVER does
+    /// not implement the grant. This one says the server implements it and THIS client
+    /// may not use it, which is a different remedy: an operator widens the client's
+    /// registration rather than the deployment adding a feature. Collapsing the two
+    /// would send an integrator looking for a server capability that is already there.
+    UnauthorizedClient,
     /// A `DPoP` proof accompanied the token request but was not acceptable (RFC
     /// 9449 section 5): malformed, a bad signature, a wrong `htm`/`htu`/`typ`, a
     /// stale or future `iat`, a missing `jti`, a replayed `jti`, or more than one
@@ -403,6 +412,7 @@ impl TokenError {
             TokenError::InvalidScope => "invalid_scope",
             TokenError::InvalidTarget => "invalid_target",
             TokenError::UnsupportedGrantType => "unsupported_grant_type",
+            TokenError::UnauthorizedClient => "unauthorized_client",
             TokenError::InvalidDpopProof => "invalid_dpop_proof",
             TokenError::UseDpopNonce { .. } => "use_dpop_nonce",
             TokenError::AuthorizationPending => "authorization_pending",
@@ -441,6 +451,7 @@ impl TokenError {
                 "the requested resource is invalid, unknown, or not allowed for this client"
             }
             TokenError::UnsupportedGrantType => "the grant type is not supported",
+            TokenError::UnauthorizedClient => "the client is not registered for this grant type",
             TokenError::InvalidDpopProof => "the DPoP proof is missing, malformed, or invalid",
             TokenError::UseDpopNonce { .. } => {
                 "retry with the server-issued nonce from the DPoP-Nonce header"

@@ -2276,6 +2276,31 @@ pub struct OidcConfig {
     /// its nonce; it converges, at the cost of the extra round trips.
     pub require_dpop_nonce: bool,
 
+    /// Whether the token endpoint enforces each client's REGISTERED `grant_types`
+    /// allowlist (issue #763).
+    ///
+    /// `clients.grant_types` has always documented itself as "the list of OAuth grant
+    /// types the client is permitted", and until this setting existed exactly one
+    /// handler honoured it: the device grant. A client registered for
+    /// `authorization_code` alone could still obtain tokens through
+    /// `client_credentials`, `jwt_bearer`, and `refresh_token`. That is the Dex
+    /// `AllowedConnectors` failure class, enforcing a restriction in some grant
+    /// handlers but not others.
+    ///
+    /// # Why it is off by default
+    ///
+    /// Migration 0021 defaults the column to `authorization_code` for every client
+    /// that predates it, which is most of them on any existing deployment. Turning
+    /// enforcement on unconditionally would refuse every refresh, client-credentials,
+    /// and JWT-bearer request from those clients at once: a flag day, not an upgrade.
+    ///
+    /// Off by default makes the safe state REACHABLE without one. An operator reads
+    /// the `grant_types_would_refuse` admin diagnostics to see exactly which clients
+    /// would break, widens those registrations, then turns this on. The dry run is the
+    /// point: without it, "would this break us?" is a question no operator can answer
+    /// except by trying it in production.
+    pub enforce_client_grant_types: bool,
+
     /// Whether an authenticated subject may CREATE an organization from the login discovery
     /// step (issue #96, criterion 5). Default `false`.
     ///
@@ -3160,6 +3185,9 @@ impl Default for OidcConfig {
             // breaks any client that does not implement the retry (RFC 9449 section 8
             // makes it the server's option).
             require_dpop_nonce: false,
+            // Off by default: 0021 defaults every pre-existing client to
+            // authorization_code alone, so enforcing unconditionally is a flag day.
+            enforce_client_grant_types: false,
             self_service_organizations: false,
             conform_id_token_claims: false,
             client_assertion_audience: ClientAssertionAudience::TokenEndpointOrIssuer,

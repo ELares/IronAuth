@@ -426,6 +426,43 @@ pub struct WarningItemView {
     pub detail: String,
 }
 
+/// Warn about every client whose registered `grant_types` would refuse it a grant it
+/// plausibly uses, if `enforce_client_grant_types` were enabled (issue #763).
+///
+/// A client registered for `authorization_code` alone cannot use `refresh_token`, which
+/// nearly every such client does use, so that pairing is the one an operator most needs
+/// to see before enabling enforcement. The warning names the client and the grants its
+/// registration omits; it does not guess at traffic, because the registration is the
+/// only thing this can read and pretending otherwise would be a false negative for a
+/// client that is simply idle right now.
+///
+/// Emitted regardless of whether enforcement is on. Its purpose is the dry run.
+fn grant_types_would_refuse_warnings(
+    clients: &[ironauth_store::ClientRecord],
+) -> Vec<WarningItemView> {
+    // `refresh_token` is singled out because a client registered for the code grant and
+    // not for refresh is the overwhelmingly common shape 0021's default produced, and
+    // the one whose breakage would be immediate and total.
+    const EXPECTED: &str = "refresh_token";
+    clients
+        .iter()
+        .filter(|client| {
+            !client
+                .grant_types
+                .split_whitespace()
+                .any(|token| token == EXPECTED)
+        })
+        .map(|client| WarningItemView {
+            kind: "grant_types_would_refuse".to_owned(),
+            subject: client.id.to_string(),
+            detail: format!(
+                "registered for '{}'; enabling enforce_client_grant_types would refuse {EXPECTED}",
+                client.grant_types
+            ),
+        })
+        .collect()
+}
+
 /// Warn about every PUBLIC client relaxed out of the `DPoP`-by-default posture (issue
 /// #124).
 ///
@@ -586,9 +623,18 @@ pub async fn get_diagnostics_warnings(
     // Only PUBLIC clients are listed. The column exists on every client, but a
     // confidential client authenticates, so the flag changes nothing about its posture
     // and warning about it would be noise that trains an operator to ignore the family.
-    items.extend(bearer_relaxed_warnings(
-        &state.store().scoped(scope).clients().list().await?,
-    ));
+    let clients = state.store().scoped(scope).clients().list().await?;
+    items.extend(bearer_relaxed_warnings(&clients));
+
+    // The DRY RUN for the grant_types allowlist (issue #763). Names every client that
+    // would be refused a grant if `enforce_client_grant_types` were turned on.
+    //
+    // This is the whole reason the enforcement can ship off by default rather than as a
+    // flag day: migration 0021 defaults the column to `authorization_code` for every
+    // pre-existing client, so an operator needs to know WHICH of their clients would
+    // break before they flip it, not after. Emitted whether or not enforcement is on,
+    // because its job is to answer "what happens if I turn this on".
+    items.extend(grant_types_would_refuse_warnings(&clients));
 
     let list = DiagnosticsWarningsList { items };
     let body = serde_json::to_string(&list).map_err(|_| ApiError::Internal)?;

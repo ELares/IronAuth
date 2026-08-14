@@ -514,6 +514,9 @@ struct Inner {
     // Whether the token endpoint challenges for a server-issued DPoP nonce (RFC 9449
     // section 8, issue #124). Off by default; see the config field for why.
     require_dpop_nonce: bool,
+    // Whether the token endpoint enforces each client's registered grant_types
+    // allowlist (issue #763). Off by default; see the config field.
+    enforce_client_grant_types: bool,
     // Whether to copy the scope-derived claims into the ID token (the non-conform
     // node-oidc-provider `conformIdTokenClaims = false` behavior, issue #15). The
     // spec-conform default is false: scope claims live at UserInfo and the ID token
@@ -799,6 +802,7 @@ impl OidcState {
                 require_pushed_authorization_requests: config.require_pushed_authorization_requests,
                 require_pkce_for_confidential: config.require_pkce_for_confidential_clients,
                 require_dpop_nonce: config.require_dpop_nonce,
+                enforce_client_grant_types: config.enforce_client_grant_types,
                 conform_id_token_claims: config.conform_id_token_claims,
                 client_assertion_audience: config.client_assertion_audience,
                 client_assertion_skew: Duration::from_secs(config.client_assertion_max_skew_secs),
@@ -2788,6 +2792,13 @@ impl OidcState {
     #[must_use]
     pub fn require_dpop_nonce(&self) -> bool {
         self.inner.require_dpop_nonce
+    }
+
+    /// Whether the token endpoint enforces each client's registered `grant_types`
+    /// allowlist (issue #763).
+    #[must_use]
+    pub fn enforce_client_grant_types(&self) -> bool {
+        self.inner.enforce_client_grant_types
     }
 
     /// The current wall-clock time from the environment clock seam.

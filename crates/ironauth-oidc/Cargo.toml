@@ -1190,6 +1190,21 @@ name = "protected_resource_metadata"
 path = "tests/protected_resource_metadata.rs"
 required-features = ["testing"]
 
+# The ONE shared client grant-restriction seam (issue #763). clients.grant_types has documented itself
+# since 0021 as the list of grants a client is PERMITTED, and exactly one handler honoured it: a client
+# registered for authorization_code alone could still use client_credentials, jwt_bearer and
+# refresh_token. That is the Dex AllowedConnectors shape #125 names. Enforcement is opt-in because 0021
+# defaults the column to authorization_code for every pre-existing client, so unconditional enforcement
+# is a flag day; the grant_types_would_refuse diagnostics are the dry run that makes the safe state
+# reachable. every_grant_handler_consults_the_shared_seam enumerates GrantType::ALL so a grant added
+# without a call to the seam fails a test rather than silently skipping the check, and the device
+# grant's own long-standing allowlist stays UNCONDITIONAL so routing it through the seam does not
+# weaken a shipped check into an opt-in one. Over a real database (DATABASE_URL).
+[[test]]
+name = "client_grant_restriction"
+path = "tests/client_grant_restriction.rs"
+required-features = ["testing"]
+
 # The DURABLE organization token context (issue #94, PR-B1): the organization parameter
 # binds a live-and-active org onto the session and both tokens (org_id claim), a
 # single-org subject auto-selects, a multi-org subject with no parameter gets none, a

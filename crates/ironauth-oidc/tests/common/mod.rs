@@ -30,10 +30,10 @@ use ironauth_oidc::{
 use ironauth_quota::QuotaEnforcer;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    AssertionMappingId, ClientAdminGrantId, ClientId, CorrelationId, ExternalIssuerId,
-    InitialAccessTokenId, NewAdminUser, NewAssertionSubjectMapping, NewClientAdminGrant,
-    NewExternalAssertionIssuer, NewInitialAccessToken, NewJwtAuthClient, NewSigningKey, Scope,
-    SessionId, SigningKeyId, SigningKeyMaterialKind, Store, UserState,
+    AssertionMappingId, ClientAdminGrantId, ClientId, CorrelationId, DeviceCodeId,
+    ExternalIssuerId, InitialAccessTokenId, NewAdminUser, NewAssertionSubjectMapping,
+    NewClientAdminGrant, NewExternalAssertionIssuer, NewInitialAccessToken, NewJwtAuthClient,
+    NewSigningKey, Scope, SessionId, SigningKeyId, SigningKeyMaterialKind, Store, UserState,
 };
 use tower::ServiceExt;
 
@@ -2306,6 +2306,32 @@ impl Harness {
         let subject = self.seed_unique_user().await;
         self.grant_consent(&subject, client_id).await;
         self.session_cookie(&subject).await
+    }
+
+    /// A well-formed device-code string in this harness's scope, naming NO live flow.
+    ///
+    /// The device grant recovers its scope from the code before it authenticates the
+    /// client, so a test that needs to reach the post-authentication checks needs a
+    /// syntactically valid handle rather than an arbitrary string.
+    #[must_use]
+    pub fn mint_device_code_handle(&self) -> String {
+        let id = DeviceCodeId::generate(&self.env, &self.scope);
+        format!("ira_dc_{id}~unused-secret")
+    }
+
+    /// Set a client's registered `grant_types` allowlist (issue #763).
+    ///
+    /// Data-plane writable (migration 0021 granted the app role a column-scoped UPDATE
+    /// on it), unlike `allow_bearer_tokens`, which is control-plane only.
+    pub async fn set_client_grant_types(&self, client_id: &ClientId, grant_types: &str) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .set_device_grant(&self.env, client_id, grant_types, None)
+            .await
+            .expect("set grant types");
     }
 
     /// Set a client's `allow_bearer_tokens` flag (issue #124): the per-client escape
