@@ -297,6 +297,91 @@ impl CimdCache {
     }
 }
 
+/// What a deployment has decided about a CIMD client's domain (issue #128).
+///
+/// # Three states, not two
+///
+/// Allow and deny are the obvious pair. The third exists because a CIMD `client_id` is a
+/// URL an unregistered party chose, so the DEFAULT case is a domain nobody has ever
+/// decided about, and that is the common case rather than an edge one. Collapsing it into
+/// either neighbour is wrong in a different direction each way:
+///
+/// * folded into ALLOW, an operator who has vetted two domains has silently vetted the
+///   whole internet;
+/// * folded into DENY, the feature does nothing until every domain is enumerated in
+///   advance, which for arbitrary URL clients is not a list anyone can write.
+///
+/// So an undecided domain is [`Quarantined`](Self::Quarantined): usable, and visibly less
+/// trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CimdTrust {
+    /// The operator listed this domain. Treated as an ordinary registered client.
+    Allowed,
+    /// The operator listed this domain as forbidden. Refused outright.
+    Denied,
+    /// Nobody has decided. Permitted, with consent forced and redirects restricted.
+    Quarantined,
+}
+
+impl CimdTrust {
+    /// Whether a client on this domain may proceed at all.
+    #[must_use]
+    pub fn is_permitted(self) -> bool {
+        !matches!(self, CimdTrust::Denied)
+    }
+
+    /// Whether the consent screen must be shown regardless of prior consent.
+    ///
+    /// Quarantine forces it. Remembered consent is a statement about a client the user
+    /// recognises, and a quarantined CIMD client is by definition one nobody has vetted,
+    /// so carrying consent forward would let an unvetted domain inherit trust the user
+    /// granted to something else.
+    #[must_use]
+    pub fn forces_consent(self) -> bool {
+        matches!(self, CimdTrust::Quarantined)
+    }
+
+    /// Whether this client's redirect targets are restricted to the https subset.
+    ///
+    /// The same rule the unverified-client quarantine (issue #31) applies, and for the
+    /// same reason: a custom-scheme or loopback redirect is the shape that hands a code to
+    /// a local listener, which is exactly what an unvetted party would want.
+    #[must_use]
+    pub fn restricts_redirects(self) -> bool {
+        matches!(self, CimdTrust::Quarantined)
+    }
+}
+
+/// Resolve a CIMD `client_id` URL's host against the operator's lists (issue #128).
+///
+/// # Deny wins
+///
+/// A host on both lists is DENIED. The lists are edited by hand and over time, so an
+/// overlap is a mistake rather than an intent, and the two ways to resolve it are not
+/// symmetric: resolving to allow turns a typo into an open door, while resolving to deny
+/// turns it into a refused client somebody notices and fixes.
+///
+/// # Matching is exact, per host
+///
+/// No suffix matching. `evil-example.test` must not inherit a decision made about
+/// `example.test`, and a suffix rule that meant to allow `*.example.test` would do exactly
+/// that for an attacker who registers the right name. A deployment that wants a subdomain
+/// allowed lists the subdomain.
+#[must_use]
+pub fn resolve_trust(host: &str, allow: &[String], deny: &[String]) -> CimdTrust {
+    // Hosts are compared case-insensitively: DNS is, and a list written in one case must
+    // not be bypassed by a URL written in another.
+    let host = host.to_ascii_lowercase();
+    let listed = |list: &[String]| list.iter().any(|entry| entry.to_ascii_lowercase() == host);
+    if listed(deny) {
+        return CimdTrust::Denied;
+    }
+    if listed(allow) {
+        return CimdTrust::Allowed;
+    }
+    CimdTrust::Quarantined
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -620,5 +705,108 @@ mod tests {
             "the evicted entry is a MISS, so its next use re-validates from scratch"
         );
         assert!(cache.get("https://b.test/id", now).is_some());
+    }
+    // --- Domain trust policy (issue #128, criterion 3) ---
+
+    fn list(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|e| (*e).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_allowed_host_is_an_ordinary_client() {
+        let trust = resolve_trust("app.example", &list(&["app.example"]), &[]);
+        assert_eq!(trust, CimdTrust::Allowed);
+        assert!(trust.is_permitted());
+        assert!(
+            !trust.forces_consent(),
+            "a vetted domain keeps remembered consent"
+        );
+        assert!(!trust.restricts_redirects());
+    }
+
+    #[test]
+    fn a_denied_host_cannot_proceed() {
+        let trust = resolve_trust("evil.example", &[], &list(&["evil.example"]));
+        assert_eq!(trust, CimdTrust::Denied);
+        assert!(!trust.is_permitted());
+    }
+
+    /// THE default case: a domain nobody has decided about is usable and visibly less
+    /// trusted. For arbitrary URL clients this is the common case, not an edge one.
+    #[test]
+    fn an_unknown_host_is_quarantined_rather_than_allowed_or_refused() {
+        let trust = resolve_trust(
+            "nobody.decided",
+            &list(&["app.example"]),
+            &list(&["evil.example"]),
+        );
+        assert_eq!(trust, CimdTrust::Quarantined);
+        assert!(trust.is_permitted(), "quarantine is usable, not a refusal");
+        assert!(
+            trust.forces_consent(),
+            "consent is always shown, so an unvetted domain cannot inherit trust the user \
+             granted to something else"
+        );
+        assert!(
+            trust.restricts_redirects(),
+            "https-only, as the issue #31 quarantine does"
+        );
+    }
+
+    /// A host on BOTH lists is denied.
+    ///
+    /// The lists are hand-edited over time, so an overlap is a mistake. Resolving it to
+    /// allow turns a typo into an open door; resolving to deny turns it into a refused
+    /// client somebody notices and fixes.
+    #[test]
+    fn deny_wins_over_allow() {
+        let both = list(&["contested.example"]);
+        assert_eq!(
+            resolve_trust("contested.example", &both, &both),
+            CimdTrust::Denied
+        );
+    }
+
+    /// Matching is EXACT. A neighbour must not inherit a decision.
+    ///
+    /// Suffix matching would let an attacker who registers `evil-example.test` inherit a
+    /// rule written for `example.test`, which is the whole reason this is not a suffix
+    /// match.
+    #[test]
+    fn a_neighbouring_host_inherits_nothing() {
+        let allow = list(&["example.test"]);
+        for neighbour in ["evil-example.test", "example.test.evil", "sub.example.test"] {
+            assert_eq!(
+                resolve_trust(neighbour, &allow, &[]),
+                CimdTrust::Quarantined,
+                "{neighbour} must not inherit example.test's decision"
+            );
+        }
+    }
+
+    /// DNS is case-insensitive, so a list written in one case cannot be bypassed by a URL
+    /// written in another.
+    #[test]
+    fn host_matching_ignores_case() {
+        assert_eq!(
+            resolve_trust("APP.Example", &list(&["app.example"]), &[]),
+            CimdTrust::Allowed
+        );
+        assert_eq!(
+            resolve_trust("Evil.EXAMPLE", &[], &list(&["evil.example"])),
+            CimdTrust::Denied
+        );
+    }
+
+    /// With no lists configured at all, every domain is quarantined rather than allowed.
+    ///
+    /// An operator who enables the feature without writing lists gets the safe posture,
+    /// not an open one.
+    #[test]
+    fn an_unconfigured_deployment_quarantines_everything() {
+        assert_eq!(
+            resolve_trust("anything.test", &[], &[]),
+            CimdTrust::Quarantined
+        );
     }
 }
