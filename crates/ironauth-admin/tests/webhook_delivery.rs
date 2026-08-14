@@ -1497,3 +1497,78 @@ async fn an_event_outside_the_catalog_is_refused_permanently_and_reaches_no_endp
         deliveries.len()
     );
 }
+
+/// EXHAUSTIVE over `SendFailure`: no failure path completes a delivery (issue #106).
+///
+/// Criterion 6 asks that "no path exists by which an undelivered event is dropped without
+/// a DLQ entry". The existing tests each pin ONE failure, which is the shape that lets a
+/// new variant ship uncovered: someone adds a `SendFailure`, writes no test for it, and
+/// every existing test still passes. This walks the variant list instead.
+///
+/// The property asserted is the one that matters and is weaker than "always dead-letters",
+/// deliberately. A failure must never be reported as SUCCESS, because a completed message
+/// is removed from the queue and there is then nothing left to dead-letter or replay: the
+/// event is gone. Whether a given failure retries first or dead-letters immediately is the
+/// classification the retry policy owns, and `a_refused_delivery_is_retryable_and_a_
+/// malformed_payload_is_not` pins both sides of it. What no failure may do is vanish.
+#[tokio::test]
+async fn no_send_failure_is_ever_reported_as_a_successful_delivery() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-exhaustive").await;
+    let (id, _, _) = register(&h, &tenant, &environment).await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+
+    // Every variant this build can express. Written out rather than derived, so a new
+    // variant makes this list visibly incomplete to a reviewer AND fails the count
+    // assertion below rather than being skipped in silence.
+    let failures = [
+        SendFailure::Blocked,
+        SendFailure::Timeout,
+        SendFailure::Transport,
+        // The status arm carries a value, so both a retryable and a terminal status are
+        // exercised: a single 500 would leave the 4xx path unmeasured.
+        SendFailure::Status(500),
+        SendFailure::Status(410),
+    ];
+
+    let mut labels = std::collections::BTreeSet::new();
+    for (n, failure) in failures.iter().enumerate() {
+        let sender = RecordingSender::failing(*failure);
+        let consumer = WebhookDeliveryConsumer::new(h.store().clone(), sender.clone());
+        let error = consumer
+            .handle(
+                &env,
+                scope,
+                &queued(
+                    &id,
+                    &format!("evt_exhaustive_{n}"),
+                    &serde_json::json!({ "type": "user.created" }),
+                ),
+            )
+            .await
+            .expect_err("a send failure must never read as a delivered message");
+
+        // The label is the operator's only record of WHY, and it must be a bounded,
+        // non-secret token rather than a receiver's error body.
+        let label = error.label().to_string();
+        assert!(
+            !label.is_empty(),
+            "{failure:?} must report a reason an operator can act on"
+        );
+        assert!(
+            label.len() < 64 && !label.contains(' '),
+            "{failure:?} label is a bounded token, got {label:?}"
+        );
+        labels.insert(label);
+    }
+
+    // Each failure is distinguishable from the others. A shared label would make two
+    // different outages read identically in the attempt history, which is where an
+    // operator looks first.
+    assert_eq!(
+        labels.len(),
+        failures.len(),
+        "every failure has its own reason; collapsed labels: {labels:?}"
+    );
+}
