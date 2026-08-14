@@ -143,6 +143,9 @@ scripts/jose-audit.sh
 echo "==> no M2M metering (no metering/billing/quota hook on the client-credentials path)"
 scripts/no-m2m-metering.sh
 
+echo "==> dormant module scan (a public surface nothing calls)"
+scripts/dormant-module-scan.sh
+
 echo "==> SDK portability scan (no Node-only imports in runtime-portable sources)"
 scripts/sdk-portability-scan.sh
 

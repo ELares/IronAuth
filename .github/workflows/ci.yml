@@ -233,6 +233,8 @@ jobs:
           python-version: "3.12"
       - name: provision the conformance static-check python deps (hash pinned)
         run: python3 -m pip install --require-hashes -r deploy/conformance/requirements.txt
+      - name: dormant module scan (a public surface nothing calls)
+        run: scripts/dormant-module-scan.sh
       - name: invariant lints
         run: scripts/invariant-lints.sh
       - name: query audit (no scoped-table SQL outside the repository module)
