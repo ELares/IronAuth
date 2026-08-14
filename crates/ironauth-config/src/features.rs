@@ -391,6 +391,14 @@ impl FeatureRegistry {
         ));
     }
 
+    /// Registers the IdP-side FedCM feature (issue #83), the W3C Federated Credential
+    /// Management surface: the origin-level well-known, the config file, the accounts
+    /// endpoint, and the id-assertion endpoint, plus the Login Status headers. It is
+    /// EXPLORATORY: browser support is Chrome only (Firefox paused, Safari absent) and
+    /// the spec is a moving W3C draft, so the wire shape may break between releases and
+    /// enabling it must acknowledge the exact implemented revision. Redirect flows are
+    /// UNAFFECTED. Off by default; every FedCM route answers a uniform 404 until the
+    /// feature is enabled AND acknowledged.
     pub fn register_fedcm(&mut self) {
         self.register(Feature::experimental(
             FEDCM_FEATURE,
