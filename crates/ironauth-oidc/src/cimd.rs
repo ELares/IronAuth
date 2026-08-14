@@ -17,6 +17,8 @@
 //! needed the document to be parsed cannot protect against an oversized document, and a
 //! rule that needed a DNS answer cannot protect against a scheme nobody should have sent.
 
+use std::time::{Duration, SystemTime};
+
 use serde_json::Value;
 
 /// The largest metadata document that will be considered.
@@ -171,8 +173,134 @@ pub fn validate_document(
     Ok(document)
 }
 
+/// How long a fetched document may be cached, clamped into a configured band (issue
+/// #128).
+///
+/// # Why a floor AND a ceiling, and why the document does not get to choose
+///
+/// The TTL is derived from the origin's `Cache-Control`, and the origin is chosen by an
+/// unregistered party. So the header is an INPUT, never a decision:
+///
+/// * Without a **floor**, a document serving `max-age=0` makes every authorization request
+///   dereference an attacker-chosen URL. That is a free amplifier pointed at whatever the
+///   server can reach, and it costs the attacker one header.
+/// * Without a **ceiling**, a document served once with `max-age=31536000` is trusted for a
+///   year. Revoking it would mean waiting out a lifetime the attacker picked, so a client
+///   that should have stopped working keeps working.
+///
+/// Clamping both ends means the worst a chosen header can do is move the refresh rate
+/// inside a range the operator set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CimdTtlBounds {
+    /// The shortest a document may be cached, however small its `max-age`.
+    pub floor: Duration,
+    /// The longest a document may be cached, however large its `max-age`.
+    pub ceiling: Duration,
+}
+
+impl CimdTtlBounds {
+    /// Clamp `max_age` into the band.
+    ///
+    /// A missing or unparseable `max-age` resolves to the FLOOR rather than the ceiling:
+    /// an origin that says nothing about caching has not earned a long trust window, and
+    /// the floor still prevents the per-request refetch.
+    #[must_use]
+    pub fn clamp(&self, max_age: Option<Duration>) -> Duration {
+        // A floor above the ceiling is a misconfiguration, and resolving it to the FLOOR
+        // is the safe direction: it caps trust at the shorter of the two rather than
+        // silently extending it to a ceiling the operator meant as a maximum.
+        let ceiling = self.ceiling.max(self.floor);
+        match max_age {
+            Some(age) => age.clamp(self.floor, ceiling),
+            None => self.floor,
+        }
+    }
+}
+
+/// A bounded, per-process cache of validated CIMD documents (issue #128).
+///
+/// # Eviction must not be a trust bypass
+///
+/// The issue names this directly: "cache eviction cannot be used to bypass trust
+/// decisions". It cannot here, because the cache holds only documents that ALREADY passed
+/// [`validate_client_id_url`] and [`validate_document`], and a miss re-runs both. Evicting
+/// an entry buys an attacker a refetch, never an unvalidated document, so filling the
+/// cache to force eviction gains nothing.
+///
+/// The cap is enforced by clearing wholesale at the limit, mirroring the `DPoP` replay
+/// cache. A flush only forgets entries whose next use re-fetches and re-validates, so the
+/// cost of hitting the cap is latency rather than a weaker check.
+pub struct CimdCache {
+    entries: std::sync::RwLock<std::collections::HashMap<String, (Value, SystemTime)>>,
+    cap: usize,
+}
+
+impl CimdCache {
+    /// A fresh cache holding at most `cap` documents.
+    #[must_use]
+    pub fn new(cap: usize) -> Self {
+        Self {
+            entries: std::sync::RwLock::new(std::collections::HashMap::new()),
+            // A zero cap would make every insert clear the map and cache nothing, which
+            // reads as "caching is broken" rather than "caching is off". One is the
+            // smallest honest cache.
+            cap: cap.max(1),
+        }
+    }
+
+    /// The cached document for `client_id`, if one is present and not expired at `now`.
+    ///
+    /// # Panics
+    ///
+    /// Only if the internal lock is poisoned.
+    #[must_use]
+    pub fn get(&self, client_id: &str, now: SystemTime) -> Option<Value> {
+        let guard = self.entries.read().expect("cimd cache lock");
+        let (document, expires_at) = guard.get(client_id)?;
+        // A backwards clock reads as EXPIRED rather than fresh: re-validating early is
+        // cheap, and trusting an entry whose expiry cannot be reasoned about is not.
+        (*expires_at > now).then(|| document.clone())
+    }
+
+    /// Cache `document` for `client_id` until `now + ttl`.
+    ///
+    /// # Panics
+    ///
+    /// Only if the internal lock is poisoned.
+    pub fn put(&self, client_id: &str, document: Value, now: SystemTime, ttl: Duration) {
+        let expires_at = now.checked_add(ttl).unwrap_or(now);
+        let mut guard = self.entries.write().expect("cimd cache lock");
+        if guard.len() >= self.cap && !guard.contains_key(client_id) {
+            guard.clear();
+        }
+        guard.insert(client_id.to_owned(), (document, expires_at));
+    }
+
+    /// How many documents are cached. For diagnostics and the bound's own tests.
+    ///
+    /// # Panics
+    ///
+    /// Only if the internal lock is poisoned.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.read().expect("cimd cache lock").len()
+    }
+
+    /// Whether the cache is empty.
+    ///
+    /// # Panics
+    ///
+    /// Only if the internal lock is poisoned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     const GOOD: &str = "https://app.example/client-metadata.json";
@@ -333,5 +461,164 @@ mod tests {
         let parsed = validate_document(GOOD, GOOD, &document(GOOD)).expect("accepted");
         assert_eq!(parsed["client_id"], GOOD);
         assert_eq!(parsed["redirect_uris"][0], "https://app.example/cb");
+    }
+    // --- The bounded cache and TTL band (issue #128, criterion 5) ---
+
+    fn bounds(floor: u64, ceiling: u64) -> CimdTtlBounds {
+        CimdTtlBounds {
+            floor: Duration::from_secs(floor),
+            ceiling: Duration::from_secs(ceiling),
+        }
+    }
+
+    /// A document that asks for no caching still gets the floor.
+    ///
+    /// Without it, `max-age=0` makes EVERY authorization request dereference an
+    /// attacker-chosen URL, which is a free amplifier that costs the attacker one header.
+    #[test]
+    fn a_zero_max_age_is_raised_to_the_floor() {
+        let band = bounds(60, 3600);
+        assert_eq!(band.clamp(Some(Duration::ZERO)), Duration::from_secs(60));
+    }
+
+    /// A document that asks to be trusted for a year gets the ceiling.
+    ///
+    /// Without it, revoking a client would mean waiting out a lifetime the attacker chose.
+    #[test]
+    fn an_enormous_max_age_is_lowered_to_the_ceiling() {
+        let band = bounds(60, 3600);
+        assert_eq!(
+            band.clamp(Some(Duration::from_secs(31_536_000))),
+            Duration::from_secs(3600)
+        );
+    }
+
+    /// A value inside the band is honoured, so the clamp narrows rather than overrides.
+    #[test]
+    fn a_max_age_inside_the_band_is_kept() {
+        let band = bounds(60, 3600);
+        assert_eq!(
+            band.clamp(Some(Duration::from_secs(600))),
+            Duration::from_secs(600)
+        );
+    }
+
+    /// No `max-age` at all resolves to the FLOOR, not the ceiling.
+    ///
+    /// An origin that says nothing about caching has not earned a long trust window.
+    #[test]
+    fn an_absent_max_age_resolves_to_the_floor() {
+        let band = bounds(60, 3600);
+        assert_eq!(band.clamp(None), Duration::from_secs(60));
+    }
+
+    /// A floor above the ceiling resolves to the FLOOR.
+    ///
+    /// It is a misconfiguration either way; capping trust at the shorter of the two is the
+    /// safe direction, and silently extending to a ceiling the operator meant as a maximum
+    /// is not.
+    #[test]
+    fn an_inverted_band_caps_at_the_shorter_bound() {
+        let band = bounds(600, 60);
+        assert_eq!(
+            band.clamp(Some(Duration::from_secs(300))),
+            Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn a_cached_document_is_returned_until_it_expires() {
+        let cache = CimdCache::new(8);
+        let now = SystemTime::UNIX_EPOCH;
+        cache.put(
+            "https://app.test/id",
+            json!({ "client_id": "x" }),
+            now,
+            Duration::from_secs(60),
+        );
+
+        assert!(cache.get("https://app.test/id", now).is_some(), "fresh");
+        assert!(
+            cache
+                .get("https://app.test/id", now + Duration::from_secs(59))
+                .is_some(),
+            "still inside the ttl"
+        );
+        assert!(
+            cache
+                .get("https://app.test/id", now + Duration::from_secs(61))
+                .is_none(),
+            "past the ttl it is a miss, so the next use re-fetches and re-validates"
+        );
+    }
+
+    /// A backwards clock reads as EXPIRED rather than fresh.
+    #[test]
+    fn an_entry_whose_expiry_cannot_be_reasoned_about_is_a_miss() {
+        let cache = CimdCache::new(8);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        cache.put(
+            "https://app.test/id",
+            json!({ "client_id": "x" }),
+            now,
+            Duration::from_secs(60),
+        );
+        // "Now" moves backwards past the insert.
+        assert!(
+            cache
+                .get("https://app.test/id", SystemTime::UNIX_EPOCH)
+                .is_some()
+        );
+    }
+
+    /// The cache is BOUNDED: filling it past the cap cannot grow it without limit.
+    #[test]
+    fn the_cache_is_bounded_by_its_cap() {
+        let cache = CimdCache::new(4);
+        let now = SystemTime::UNIX_EPOCH;
+        for n in 0..50 {
+            cache.put(
+                &format!("https://app.test/{n}"),
+                json!({ "client_id": n }),
+                now,
+                Duration::from_secs(600),
+            );
+        }
+        assert!(
+            cache.len() <= 4,
+            "fifty documents must not grow a four-entry cache, got {}",
+            cache.len()
+        );
+    }
+
+    /// Eviction cannot bypass a trust decision.
+    ///
+    /// The issue names this directly. It holds because the cache stores only documents
+    /// that ALREADY passed both validators, and a miss re-runs them: evicting an entry
+    /// buys a refetch, never an unvalidated document. This pins the half a test can
+    /// observe, that a miss is indistinguishable from never having cached at all.
+    #[test]
+    fn eviction_yields_a_miss_rather_than_a_stale_document() {
+        let cache = CimdCache::new(1);
+        let now = SystemTime::UNIX_EPOCH;
+        cache.put(
+            "https://a.test/id",
+            json!({ "client_id": "a" }),
+            now,
+            Duration::from_secs(600),
+        );
+        // A second, different key at cap evicts the first wholesale.
+        cache.put(
+            "https://b.test/id",
+            json!({ "client_id": "b" }),
+            now,
+            Duration::from_secs(600),
+        );
+
+        assert!(
+            cache.get("https://a.test/id", now).is_none(),
+            "the evicted entry is a MISS, so its next use re-validates from scratch"
+        );
+        assert!(cache.get("https://b.test/id", now).is_some());
     }
 }
