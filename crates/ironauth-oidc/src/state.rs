@@ -3667,8 +3667,8 @@ impl OidcState {
         proof: Option<&str>,
         htm: &str,
         token: &str,
-    ) -> Result<(), ()> {
-        use crate::dpop::PresentedScheme;
+    ) -> Result<(), crate::dpop::DpopPresentationFailure> {
+        use crate::dpop::{DpopPresentationFailure, PresentedScheme};
         let Some(expected_jkt) = expected_jkt else {
             // An UNBOUND token: it must be a plain bearer. A DPoP-scheme presentation of
             // an unbound token is refused (the DPoP scheme requires a bound token).
@@ -3678,7 +3678,7 @@ impl OidcState {
                     tracing::warn!(
                         "rejecting a DPoP-scheme presentation of an unbound access token"
                     );
-                    Err(())
+                    Err(DpopPresentationFailure::Rejected)
                 }
             };
         };
@@ -3686,12 +3686,12 @@ impl OidcState {
         // A BOUND token must never be accepted as a bearer (RFC 9449 7.1): no downgrade.
         if scheme != PresentedScheme::Dpop {
             tracing::warn!("rejecting a DPoP-bound access token presented as a bearer token");
-            return Err(());
+            return Err(DpopPresentationFailure::Rejected);
         }
         // The DPoP scheme requires exactly one proof header.
         let Some(proof) = proof else {
             tracing::warn!("rejecting a DPoP-bound access token presented with no DPoP proof");
-            return Err(());
+            return Err(DpopPresentationFailure::Rejected);
         };
 
         // The proof must carry the ath of the EXACT presented token string, and match
@@ -3710,6 +3710,7 @@ impl OidcState {
         };
         let validated = validate_dpop_proof(proof, &expected, now).map_err(|error| {
             tracing::warn!(%error, "rejecting an invalid DPoP proof at userinfo");
+            DpopPresentationFailure::Rejected
         })?;
 
         // The proof key MUST be the key the token was bound to (its cnf.jkt / dpop_jkt).
@@ -3717,7 +3718,29 @@ impl OidcState {
             tracing::warn!(
                 "rejecting a DPoP proof whose key thumbprint does not match the token binding"
             );
-            return Err(());
+            return Err(DpopPresentationFailure::Rejected);
+        }
+
+        // RFC 9449 section 8, when this deployment requires a server-issued nonce. A
+        // protected resource challenges with a 401 carrying the DPoP-scheme
+        // WWW-Authenticate and the DPoP-Nonce header, where the token endpoint uses a
+        // 400 with a JSON body; the nonce STORE is the same one, so a nonce this
+        // instance issued at either surface is accepted at both, which is what lets a
+        // client that already holds one skip the extra round trip here.
+        //
+        // Checked BEFORE the replay record so a challenged request does not spend a
+        // database write recording a jti the client is about to abandon: its retry
+        // carries a new proof.
+        if self.require_dpop_nonce() {
+            let acceptable = validated
+                .nonce
+                .as_deref()
+                .is_some_and(|nonce| self.dpop_nonces().is_acceptable(nonce, now));
+            if !acceptable {
+                let nonce = self.dpop_nonces().issue(self.env().entropy(), now);
+                tracing::debug!("challenging a userinfo request for a server-issued DPoP nonce");
+                return Err(DpopPresentationFailure::NeedsNonce { nonce });
+            }
         }
 
         // Cross-node replay: a (jkt, jti) already recorded inside the freshness window
@@ -3737,10 +3760,11 @@ impl OidcState {
             .await
             .map_err(|error| {
                 tracing::warn!(%error, "the DPoP proof replay store failed at userinfo");
+                DpopPresentationFailure::Rejected
             })?;
         if !fresh {
             tracing::warn!("rejecting a replayed DPoP proof jti at userinfo");
-            return Err(());
+            return Err(DpopPresentationFailure::Rejected);
         }
         Ok(())
     }

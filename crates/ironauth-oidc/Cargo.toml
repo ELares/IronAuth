@@ -1148,6 +1148,20 @@ name = "dpop_nonce"
 path = "tests/dpop_nonce.rs"
 required-features = ["testing"]
 
+# Server-issued DPoP nonces at the PROTECTED RESOURCE (RFC 9449 section 8, issue #124), the companion
+# to the token-endpoint half. The mechanism is shared (one store, one DPoP-Nonce constant) but the wire
+# shape is not: userinfo challenges with a 401 and a DPoP-scheme WWW-Authenticate naming use_dpop_nonce
+# where the token endpoint uses a 400 and a JSON body. Covers the challenge-retry flow, that a nonce
+# drawn from the TOKEN endpoint is spendable here with no second challenge (the property that makes one
+# shared store worth having), that a never-issued nonce draws a fresh challenge, that the challenge
+# stays DISTINGUISHABLE from the uniform invalid_token rejection so a client does not retry forever
+# against a proof that can never be accepted, and that a stale nonce draws a NEW one. The policy is off
+# by default, so that path is pinned too. Over a real database (DATABASE_URL).
+[[test]]
+name = "dpop_nonce_userinfo"
+path = "tests/dpop_nonce_userinfo.rs"
+required-features = ["testing"]
+
 # The DURABLE organization token context (issue #94, PR-B1): the organization parameter
 # binds a live-and-active org onto the session and both tokens (org_id claim), a
 # single-org subject auto-selects, a multi-org subject with no parameter gets none, a
