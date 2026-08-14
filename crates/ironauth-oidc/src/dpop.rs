@@ -134,6 +134,30 @@ const DPOP_NONCE_CAP: usize = 4096;
 /// in the sense a key is: it is handed to the client in a response header.
 const DPOP_NONCE_BYTES: usize = 32;
 
+/// Why a `DPoP` presentation at a protected resource failed.
+///
+/// Two outcomes, and the split is the whole point. [`Rejected`](Self::Rejected) is
+/// the uniform refusal every real failure collapses to (RFC 9449 section 7.1), so a
+/// caller cannot use the response to probe which check failed.
+/// [`NeedsNonce`](Self::NeedsNonce) is not a refusal in the same sense at all: it is
+/// an INSTRUCTION to a client that has done nothing wrong, and a client that cannot
+/// tell it from a rejection cannot perform the retry it is being asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DpopPresentationFailure {
+    /// The presentation is not acceptable, for a reason the client is not told (a
+    /// missing or invalid proof, a key that does not match the token's binding, a
+    /// bound token presented as a bearer, a replayed `jti`).
+    Rejected,
+    /// The presentation must be retried carrying this server-issued nonce (RFC 9449
+    /// section 8). The nonce travels with the failure rather than being fetched when
+    /// the response is built, so the value in the header is exactly the one recorded
+    /// as issued.
+    NeedsNonce {
+        /// The freshly issued nonce for the `DPoP-Nonce` response header.
+        nonce: String,
+    },
+}
+
 /// The server-issued `DPoP` nonce store (RFC 9449 section 8).
 ///
 /// # What a nonce buys that `iat` and the replay cache do not

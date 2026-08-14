@@ -81,7 +81,9 @@ use crate::claims_request::ClaimsRequest;
 // The `DPoP` proof header and the `htm` method tokens are defined ONCE in
 // `crate::dpop` and shared with `/token` and the authorization challenge endpoint, so
 // the three readers cannot drift onto different literals.
-use crate::dpop::{DPOP_HEADER, DPOP_HTM_GET, DPOP_HTM_POST, PresentedScheme};
+use crate::dpop::{
+    DPOP_HEADER, DPOP_HTM_GET, DPOP_HTM_POST, DpopPresentationFailure, PresentedScheme,
+};
 use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::state::OidcState;
 use crate::tokens::{OPAQUE_ACCESS_TOKEN_DELIMITER, OPAQUE_ACCESS_TOKEN_PREFIX};
@@ -532,7 +534,12 @@ async fn enforce_dpop(
             token,
         )
         .await
-        .map_err(|()| UserInfoError::InvalidTokenDpop)
+        .map_err(|failure| match failure {
+            DpopPresentationFailure::Rejected => UserInfoError::InvalidTokenDpop,
+            // Carried through rather than collapsed: this is the one DPoP outcome the
+            // client is meant to act on rather than be told nothing about.
+            DpopPresentationFailure::NeedsNonce { nonce } => UserInfoError::UseDpopNonce { nonce },
+        })
 }
 
 /// Read the `jti` from a compact JWS payload WITHOUT verifying it, as a lookup
@@ -594,7 +601,13 @@ fn success(claims: &Map<String, Value>) -> Response {
 }
 
 /// A `UserInfo` failure, each mapping to a spec-exact RFC 6750 3.1 challenge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// NOT `Copy`: [`UseDpopNonce`](Self::UseDpopNonce) carries the nonce it issued. The
+/// value has to travel WITH the failure rather than be fetched when the response is
+/// built, or the header could advertise a different nonce than the one recorded as
+/// issued, and the client's retry would then be refused by the very check that just
+/// challenged it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum UserInfoError {
     /// No access token was presented: `401` with a bare `Bearer` challenge and NO
     /// error code (RFC 6750 3.1).
@@ -607,6 +620,19 @@ enum UserInfoError {
     /// uniform `401` `invalid_token` (no oracle), but the challenge advertises the
     /// `DPoP` scheme so a compliant client retries with a proof.
     InvalidTokenDpop,
+    /// The presentation must be retried carrying a server-issued `DPoP` nonce (RFC
+    /// 9449 section 8): a `401` whose `DPoP` challenge names `use_dpop_nonce` and
+    /// whose `DPoP-Nonce` header carries the value to echo.
+    ///
+    /// Deliberately DISTINCT from [`UserInfoError::InvalidTokenDpop`], which is
+    /// uniform precisely to deny an oracle. This one is an instruction to a client
+    /// that has done nothing wrong, and a client that cannot tell the two apart
+    /// cannot perform the retry it is being asked for. It discloses nothing: the
+    /// nonce is a value the server hands out on request.
+    UseDpopNonce {
+        /// The freshly issued nonce for the `DPoP-Nonce` response header.
+        nonce: String,
+    },
     /// The token is valid but lacks the `openid` scope: `403` `insufficient_scope`
     /// carrying the required `scope` attribute.
     InsufficientScope,
@@ -655,6 +681,18 @@ impl IntoResponse for UserInfoError {
                      error_description=\"the access token requires a valid DPoP proof\""
                 )),
             ),
+            // RFC 9449 section 8 at a protected resource: the DPoP-scheme challenge
+            // names use_dpop_nonce, and the nonce itself rides the DPoP-Nonce header
+            // below. `algs` is repeated because this challenge may be the FIRST one a
+            // client sees, so it must be as self-sufficient as the others.
+            UserInfoError::UseDpopNonce { .. } => (
+                StatusCode::UNAUTHORIZED,
+                Some(format!(
+                    "DPoP realm=\"{REALM}\", error=\"use_dpop_nonce\", \
+                     error_description=\"retry with the server-issued nonce from the \
+                     DPoP-Nonce header\", algs=\"{DPOP_CHALLENGE_ALGS}\""
+                )),
+            ),
             UserInfoError::InsufficientScope => (
                 StatusCode::FORBIDDEN,
                 Some(format!(
@@ -677,6 +715,19 @@ impl IntoResponse for UserInfoError {
                 response
                     .headers_mut()
                     .insert(header::WWW_AUTHENTICATE, value);
+            }
+        }
+        // RFC 9449 section 8: the challenge is useless without the nonce, so this
+        // header is the substance of the response rather than a decoration. The value
+        // is base64url minted by this server, never reflected input, but it still goes
+        // through the fallible constructor: a value that would not encode must drop
+        // the header rather than panic serving a request, and the client then retries
+        // into a fresh challenge.
+        if let UserInfoError::UseDpopNonce { nonce } = &self {
+            if let Ok(value) = HeaderValue::from_str(nonce) {
+                response
+                    .headers_mut()
+                    .insert(crate::dpop::DPOP_NONCE_HEADER, value);
             }
         }
         response

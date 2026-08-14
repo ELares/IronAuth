@@ -6,6 +6,32 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The `DPoP` nonce challenge reaches IronAuth's own protected resources (issue #124, RFC 9449
+  section 8).** Completes the nonce work: the token endpoint half shipped first, and `UserInfo` is
+  the resource-server half the same What section names.
+
+  - **Same mechanism, different wire shape.** One nonce store and one `DPoP-Nonce` header constant
+    serve both, but a token endpoint challenges with a `400` and a JSON `use_dpop_nonce` body while
+    a protected resource challenges with a `401` and a `DPoP`-scheme `WWW-Authenticate` naming
+    `use_dpop_nonce`. Sharing the store is what lets a client spend a nonce it already holds at
+    either surface instead of being challenged again at each one, and that cross-surface property
+    has its own test.
+
+  - **The challenge stays distinguishable from a rejection.** `invalid_token` at `UserInfo` is
+    uniform precisely to deny an oracle; `use_dpop_nonce` is an instruction to a client that has
+    done nothing wrong. Both are `401`, so the error code in the challenge is the only thing
+    carrying the difference, and a client that could not tell them apart would either retry forever
+    against a proof that can never be accepted or never retry at all. A genuinely bad proof (a wrong
+    `htu`) is asserted NOT to read as `use_dpop_nonce` and to carry no nonce.
+
+  - **`UserInfoError` is no longer `Copy`.** The nonce has to travel WITH the failure rather than be
+    fetched when the response is built, or the header could advertise a value other than the one
+    recorded as issued, and the client's retry would then be refused by the very check that
+    challenged it. The type is module-private, so the change reaches nothing outside `userinfo.rs`.
+
+  - `verify_dpop_presentation` now returns a typed `DpopPresentationFailure` rather than `()`, which
+    is what makes "needs a nonce" expressible at all without widening the uniform rejection.
+
 - **Server-issued `DPoP` nonces at the token endpoint (issue #124, RFC 9449 section 8).** The
   challenge-retry flow did not exist: `token.rs` said so outright ("no server-issued DPoP-Nonce"),
   which left one item of this issue's test matrix untestable rather than untested.

@@ -631,6 +631,40 @@ pub mod test_util {
         sign_compact(key, &header, &payload)
     }
 
+    /// Build and sign a compact `DPoP` proof carrying BOTH the access-token hash
+    /// (`ath`) and a server-issued `nonce`: a resource-server presentation against a
+    /// deployment that challenges for nonces (RFC 9449 sections 7 and 8 together).
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization or signing fails, which does not happen for a
+    /// well-formed key and JSON claims.
+    #[must_use]
+    pub fn sign_proof_with_ath_nonce(
+        key: &SigningKey,
+        htm: &str,
+        htu: &str,
+        iat_secs: u64,
+        jti: &str,
+        ath: &str,
+        nonce: &str,
+    ) -> String {
+        let header = json!({
+            "typ": DPOP_TYP,
+            "alg": key.algorithm().as_jose_name(),
+            "jwk": public_jwk(key),
+        });
+        let payload = json!({
+            "htm": htm,
+            "htu": htu,
+            "iat": iat_secs,
+            "jti": jti,
+            "ath": ath,
+            "nonce": nonce,
+        });
+        sign_compact(key, &header, &payload)
+    }
+
     /// Assemble a compact JWS from a header and payload, signed by `key`.
     fn sign_compact(key: &SigningKey, header: &Value, payload: &Value) -> String {
         let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(header).expect("header json"));
