@@ -274,6 +274,14 @@ async fn authorization_code_grant(
     //    replay resistance over a grace-retry of the same assertion.
     let authenticated_client = authenticate_client(state, scope, headers, &params).await?;
 
+    // 4-bis. The ONE shared grant-restriction seam (issue #763), FIRST among the
+    //        post-authentication checks. Placed here rather than later so a client that
+    //        may not use this grant is refused before any grant-specific work: a late
+    //        placement makes the reported error depend on which validation happens to
+    //        fail first, which is how `every_grant_handler_consults_the_shared_seam`
+    //        caught it sitting after the code load.
+    enforce_registered_grant_for(state, &authenticated_client, GrantType::AuthorizationCode)?;
+
     // 5. The authenticated client MUST be the one the code was issued to (the
     //    Zitadel advisory class: a code for client A is not redeemable by client
     //    B). A mismatch is a uniform invalid_grant, kept separate from the
@@ -578,6 +586,64 @@ fn resolve_dpop_binding(
         return Err(TokenError::InvalidDpopProof);
     }
     Ok(Some(Confirmation::Jkt(proof.jkt)))
+}
+
+/// Whether `grant_types` (the client's registered space-separated allowlist) permits
+/// `grant`.
+///
+/// Split on whitespace and compared as exact wire values, which is how RFC 7591 defines
+/// the metadata and how the device grant has always read this column.
+#[must_use]
+pub(crate) fn registered_for(grant_types: &str, grant: GrantType) -> bool {
+    grant_types
+        .split_whitespace()
+        .any(|token| token == grant.as_str())
+}
+
+/// THE shared client grant-restriction seam (issue #763).
+///
+/// # The failure this closes
+///
+/// `clients.grant_types` documents itself as "the list of OAuth grant types the client
+/// is permitted", and until this existed exactly ONE handler honoured it: the device
+/// grant. A client registered for `authorization_code` alone could still obtain tokens
+/// through `client_credentials`, `jwt_bearer`, and `refresh_token`. That is the Dex
+/// `AllowedConnectors` shape: a restriction enforced in some grant handlers and not
+/// others, where the gap is discovered by whoever uses it.
+///
+/// # One seam, called by every handler
+///
+/// Every grant handler calls THIS function and no other, so the rule cannot diverge
+/// between grants. `every_grant_handler_consults_the_shared_seam` drives all of
+/// [`GrantType::ALL`] end to end against a client registered for none of them, so a
+/// grant added without a call here fails a test that enumerates the variants rather
+/// than silently skipping the check.
+///
+/// # Off by default
+///
+/// Migration 0021 defaults the column to `authorization_code` for every pre-existing
+/// client, so unconditional enforcement is a flag day rather than an upgrade. The
+/// `grant_types_would_refuse` admin diagnostics name the clients that would be refused,
+/// so an operator can widen those registrations BEFORE turning this on.
+///
+/// # Errors
+///
+/// [`TokenError::UnauthorizedClient`]: RFC 6749 5.2 defines it as "the authenticated
+/// client is not authorized to use this authorization grant type", which is exactly
+/// this condition, and it is what the device grant already returns for the same reason.
+pub(crate) fn enforce_registered_grant_for(
+    state: &OidcState,
+    client: &AuthenticatedClient,
+    grant: GrantType,
+) -> Result<(), TokenError> {
+    if !state.enforce_client_grant_types() || registered_for(&client.grant_types, grant) {
+        return Ok(());
+    }
+    tracing::warn!(
+        grant = grant.as_str(),
+        "refusing a grant the client is not registered for"
+    );
+    Err(TokenError::UnauthorizedClient)
 }
 
 /// Enforce the `DPoP`-by-default posture for PUBLIC clients (issue #124).
@@ -2011,6 +2077,10 @@ async fn refresh_token_grant(
 
     // 2. Authenticate the client through the shared seam.
     let authenticated_client = authenticate_client(state, scope, headers, &params).await?;
+
+    // The shared grant-restriction seam (issue #763), before the family is touched, for
+    // the same reason as the code path.
+    enforce_registered_grant_for(state, &authenticated_client, GrantType::RefreshToken)?;
 
     // 3. Resolve the presented token's live state (read only). Absent is a uniform
     //    invalid_grant.

@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Every token-endpoint grant handler now consults ONE shared client grant-restriction seam
+  (issue #763).** `clients.grant_types` has documented itself since migration 0021 as "the list of
+  OAuth grant types the client is permitted", and exactly one handler honoured it: the device grant.
+
+  - **What was wrong.** A client registered for `authorization_code` alone could still obtain tokens
+    through `client_credentials`, `jwt_bearer`, and `refresh_token`. That is the Dex
+    `AllowedConnectors` shape, a restriction enforced in some grant handlers and not others, where
+    the gap is found by whoever uses it rather than by a test.
+
+  - **One seam, and a test that enumerates the variants.**
+    `every_grant_handler_consults_the_shared_seam` drives all of `GrantType::ALL` end to end against
+    a client registered for none of them, so a grant added without a call fails a test that walks the
+    variant list. That test earned its keep immediately: it caught the seam sitting AFTER the code
+    load in the authorization-code path, where the reported error depended on which validation
+    happened to fail first. The seam now runs first among the post-authentication checks.
+
+  - **The device grant is routed through the same function** rather than keeping its own copy, but
+    stays UNCONDITIONAL: it has always enforced its allowlist and RFC 8628 requires the grant be
+    enabled per client, so gating it behind the new setting would weaken a shipped check.
+
+  - **Opt-in, because the alternative is a flag day.** 0021 defaults the column to
+    `authorization_code` for every pre-existing client, so unconditional enforcement would refuse
+    most grants for most clients on any existing deployment at once. `enforce_client_grant_types`
+    ships `false`, and the `grant_types_would_refuse` admin diagnostics name every client that
+    enabling it would refuse. The dry run is the point: without it, "would this break us?" is a
+    question no operator can answer except by trying it in production.
+
+  - **`unauthorized_client`, not `unsupported_grant_type`.** One says the server does not implement
+    the grant; the other says it does and this client may not use it. The remedies differ, so
+    collapsing them would send an integrator hunting for a capability that is already present.
+
 - **RFC 9728 Protected Resource Metadata is served for IronAuth-hosted resources (issue #127).** The
   `prm` module shipped complete and unreachable: five public functions, zero callers. This is the
   wiring, and it closes acceptance criteria 1 and 5.

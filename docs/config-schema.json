@@ -1027,6 +1027,11 @@
           "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
           "type": "boolean"
         },
+        "enforce_client_grant_types": {
+          "default": false,
+          "description": "Whether the token endpoint enforces each client's REGISTERED `grant_types`\nallowlist (issue #763).\n\n`clients.grant_types` has always documented itself as \"the list of OAuth grant\ntypes the client is permitted\", and until this setting existed exactly one\nhandler honoured it: the device grant. A client registered for\n`authorization_code` alone could still obtain tokens through\n`client_credentials`, `jwt_bearer`, and `refresh_token`. That is the Dex\n`AllowedConnectors` failure class, enforcing a restriction in some grant\nhandlers but not others.\n\n# Why it is off by default\n\nMigration 0021 defaults the column to `authorization_code` for every client\nthat predates it, which is most of them on any existing deployment. Turning\nenforcement on unconditionally would refuse every refresh, client-credentials,\nand JWT-bearer request from those clients at once: a flag day, not an upgrade.\n\nOff by default makes the safe state REACHABLE without one. An operator reads\nthe `grant_types_would_refuse` admin diagnostics to see exactly which clients\nwould break, widens those registrations, then turns this on. The dry run is the\npoint: without it, \"would this break us?\" is a question no operator can answer\nexcept by trying it in production.",
+          "type": "boolean"
+        },
         "fedcm": {
           "$ref": "#/$defs/FedcmConfig",
           "default": {
@@ -2833,6 +2838,7 @@
         "enable_response_type_id_token": false,
         "enable_response_type_none": false,
         "enabled": false,
+        "enforce_client_grant_types": false,
         "fedcm": {
           "background_color": null,
           "designated_environment": null,

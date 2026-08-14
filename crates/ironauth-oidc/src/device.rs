@@ -405,6 +405,11 @@ pub async fn device_code_grant(
     // Authenticate the client BEFORE touching poll state, so an unauthenticated caller
     // cannot advance a flow. A public device client presents only its client_id.
     let authenticated = authenticate_token_client(state, scope, headers, &params).await?;
+    // The ONE shared grant-restriction seam (issue #763). The device-authorization
+    // endpoint already refuses a client whose allowlist omits the device grant, so a
+    // device_code should not exist for one; this is the token-endpoint half, so the
+    // rule holds even for a code minted before the registration was narrowed.
+    crate::token::enforce_registered_grant_for(state, &authenticated, GrantType::DeviceCode)?;
 
     let now_micros = epoch_micros(state.now());
     let slow_down_increment = i64::try_from(state.device_slow_down_increment_secs()).unwrap_or(0);
@@ -812,9 +817,16 @@ fn map_client_auth_error(error: &ClientAuthError) -> DeviceAuthError {
 
 /// Whether a space-separated grant-type allowlist contains the `device_code` URN.
 fn grant_types_allow_device(grant_types: &str) -> bool {
-    grant_types
-        .split_whitespace()
-        .any(|token| token == GrantType::DEVICE_CODE_URN)
+    // Routed through the ONE shared seam (issue #763) rather than kept alongside it.
+    // This check predates that seam by a long way and was the ONLY grant restriction
+    // anywhere; leaving a second implementation next to the shared one is how the two
+    // drift, and a drift here reads as "the device grant enforces something subtly
+    // different", which is exactly the class of bug the shared seam exists to remove.
+    //
+    // Unconditional, unlike the token-endpoint call: the device grant has always
+    // enforced its allowlist, so gating it behind `enforce_client_grant_types` would
+    // WEAKEN a shipped check. RFC 8628 also requires the grant be enabled per client.
+    crate::token::registered_for(grant_types, GrantType::DeviceCode)
 }
 
 /// Generate a device code (issue #24): the `ira_dc_` prefix, the scope-declaring

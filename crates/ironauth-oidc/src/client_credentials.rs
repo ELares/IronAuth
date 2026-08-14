@@ -117,6 +117,13 @@ pub async fn client_credentials_grant(
             }
             ClientAuthError::InvalidClient { via_basic } => TokenError::InvalidClient { via_basic },
         })?;
+    // The ONE shared grant-restriction seam (issue #763): this client must be
+    // registered for the grant it just presented.
+    crate::token::enforce_registered_grant_for(
+        state,
+        &authenticated,
+        crate::registry::GrantType::ClientCredentials,
+    )?;
     let client_id = state
         .store()
         .scoped(scope)

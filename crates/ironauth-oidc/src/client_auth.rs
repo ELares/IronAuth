@@ -311,6 +311,9 @@ pub struct AuthenticatedClient {
     /// authenticates, so the sender constraint a proof adds is not the control that
     /// protects it.
     pub allow_bearer_tokens: bool,
+    /// The space-separated OAuth grant types this client is REGISTERED for (issue
+    /// #763), read off the registration that just authenticated.
+    pub grant_types: String,
 }
 
 /// Why the reusable client-authentication seam rejected a request. The caller maps
@@ -528,6 +531,7 @@ async fn authenticate_presented(
                 client_id: client_id_str,
                 auth_method: registered,
                 allow_bearer_tokens: record.allow_bearer_tokens,
+                grant_types: record.grant_types.clone(),
             }),
             Err(SecretAuthError::MethodMismatch) => {
                 fail!(&method_str, ClientAuthDiagnosticReason::MethodMismatch)
@@ -546,6 +550,7 @@ async fn authenticate_presented(
                     client_id: client_id_str,
                     auth_method: registered,
                     allow_bearer_tokens: record.allow_bearer_tokens,
+                    grant_types: record.grant_types.clone(),
                 }),
                 // The assertion failed: the diagnostic carries the SPECIFIC reject
                 // reason (bad signature, expired, clock skew, audience mismatch,
@@ -1360,6 +1365,9 @@ mod tests {
             // authentication, and a fixture that quietly relaxed the DPoP default
             // would be the wrong shape to reason from.
             allow_bearer_tokens: false,
+            // The 0021 column default: every pre-existing client is registered for
+            // authorization_code alone, which is the state #763 is about.
+            grant_types: "authorization_code".to_owned(),
         }
     }
 

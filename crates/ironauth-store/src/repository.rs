@@ -2230,6 +2230,14 @@ pub struct ClientRecord {
     /// A CONFIDENTIAL client is unaffected either way: it authenticates, so the
     /// sender constraint a proof adds is not the control protecting it.
     pub allow_bearer_tokens: bool,
+    /// The space-separated OAuth grant types this client is REGISTERED for (RFC 7591
+    /// `grant_types`, migration 0021).
+    ///
+    /// Documented from the start as "the list of OAuth grant types the client is
+    /// permitted", but honoured by the device grant alone until issue #763 gave every
+    /// handler one shared seam. Read here so admin diagnostics can name the clients
+    /// that enabling enforcement would refuse.
+    pub grant_types: String,
     /// Whether this client is under the unverified-client quarantine (issue #31):
     /// a client from open (or low-trust) self-service registration starts
     /// quarantined. While quarantined, the authorization/consent path IGNORES the
@@ -2396,6 +2404,10 @@ pub struct ClientAuthRecord {
     /// endpoint reads the posture off the very registration it just authenticated
     /// rather than re-reading the row and risking a different answer.
     pub allow_bearer_tokens: bool,
+    /// The space-separated OAuth grant types this client is REGISTERED for (issue
+    /// #763). Carried on the authentication record so the token endpoint checks the
+    /// registration it just authenticated rather than re-reading the row.
+    pub grant_types: String,
 }
 
 impl fmt::Debug for ClientAuthRecord {
@@ -2415,6 +2427,7 @@ impl fmt::Debug for ClientAuthRecord {
             // an operator debugging "why is this client refused a bearer token" needs
             // to see.
             .field("allow_bearer_tokens", &self.allow_bearer_tokens)
+            .field("grant_types", &self.grant_types)
             .finish()
     }
 }
@@ -2649,7 +2662,8 @@ impl ClientRepo<'_> {
              frontchannel_logout_uri, frontchannel_logout_session_required, \
              consent_mode, skip_consent, \
              store_skipped_consent, \
-             require_pushed_authorization_requests, allow_bearer_tokens, quarantined, \
+             require_pushed_authorization_requests, allow_bearer_tokens, grant_types, \
+             quarantined, \
              step_up_acr, step_up_max_age_secs, logo_uri, first_party, \
              (EXTRACT(EPOCH FROM verified_at) * 1000000)::bigint AS verified_at_us FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
@@ -2677,7 +2691,8 @@ impl ClientRepo<'_> {
              frontchannel_logout_uri, frontchannel_logout_session_required, \
              consent_mode, skip_consent, \
              store_skipped_consent, \
-             require_pushed_authorization_requests, allow_bearer_tokens, quarantined, \
+             require_pushed_authorization_requests, allow_bearer_tokens, grant_types, \
+             quarantined, \
              step_up_acr, step_up_max_age_secs, logo_uri, first_party, \
              (EXTRACT(EPOCH FROM verified_at) * 1000000)::bigint AS verified_at_us FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
@@ -2732,7 +2747,7 @@ impl ClientRepo<'_> {
         let row = sqlx::query(
             "SELECT display_name, token_endpoint_auth_method, secret_hash, \
              jwks, jwks_uri, token_endpoint_auth_signing_alg, refresh_rotation, \
-             allow_bearer_tokens FROM clients \
+             allow_bearer_tokens, grant_types FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -2751,6 +2766,7 @@ impl ClientRepo<'_> {
             token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
             refresh_rotation: row.get("refresh_rotation"),
             allow_bearer_tokens: row.get("allow_bearer_tokens"),
+            grant_types: row.get("grant_types"),
         })
     }
 
@@ -2984,6 +3000,7 @@ impl ClientRepo<'_> {
             store_skipped_consent: row.get("store_skipped_consent"),
             require_pushed_authorization_requests: row.get("require_pushed_authorization_requests"),
             allow_bearer_tokens: row.get("allow_bearer_tokens"),
+            grant_types: row.get("grant_types"),
             quarantined: row.get("quarantined"),
             step_up_acr: row.get("step_up_acr"),
             step_up_max_age_secs: row
