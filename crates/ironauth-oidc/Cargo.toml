@@ -1107,6 +1107,19 @@ name = "dpop_challenge"
 path = "tests/dpop_challenge.rs"
 required-features = ["testing"]
 
+# DPoP binding as a RESOURCE SERVER sees it, through RFC 7662 introspection (RFC 9449 section 6.2,
+# issue #124): a bound at+jwt, a bound opaque token, and a bound refresh family each report their
+# cnf.jkt, and a bound ACCESS token reports token_type DPoP rather than Bearer, which is what stops a
+# resource server accepting a sender-constrained token from any holder. The opaque case is the one that
+# cannot be covered anywhere else: such a token carries no claims, so introspection is the only place
+# its binding is observable at all. An unbound exchange stays a plain Bearer with no cnf, and the token
+# endpoint and introspection are pinned against each other so the two surfaces cannot drift. Over a
+# real database (DATABASE_URL).
+[[test]]
+name = "dpop_introspection"
+path = "tests/dpop_introspection.rs"
+required-features = ["testing"]
+
 # The DURABLE organization token context (issue #94, PR-B1): the organization parameter
 # binds a live-and-active org onto the session and both tokens (org_id claim), a
 # single-org subject auto-selects, a multi-org subject with no parameter gets none, a
