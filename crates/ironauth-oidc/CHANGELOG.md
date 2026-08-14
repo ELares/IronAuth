@@ -6,6 +6,30 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **RFC 9728 Protected Resource Metadata is served for IronAuth-hosted resources (issue #127).** The
+  `prm` module shipped complete and unreachable: five public functions, zero callers. This is the
+  wiring, and it closes acceptance criteria 1 and 5.
+
+  - **Deployment-root, not scope-routed.** Section 3.1 composes the metadata URL from the RESOURCE
+    identifier, inserting the well-known segment between authority and path. A scope-routed URL is not
+    what that composition produces, so a spec-following client would never construct it.
+
+  - **The scope comes from the path suffix, and that is the whole design.** Resource-server lookup is
+    scope-bound, and a deployment-root path carries no scope. Scanning scopes to bridge that would be
+    cross-tenant by construction AND would turn an unauthenticated endpoint into a probe for which
+    audiences exist anywhere in the deployment. So IronAuth serves PRM only for identifiers rooted at
+    its own issuer with the scope in the path, where the suffix yields the scope with no scan.
+
+  - **Non-breaking by construction.** A registered audience shaped any other way keeps working as a
+    resource server and simply has no document here; its metadata is its own origin's to publish.
+
+  - **Every miss is byte-identical.** Unregistered, another scope, a non-hosted shape, and a malformed
+    scope are one response, so the endpoint enumerates no tenant and no resource.
+
+  - **The advertised `resource` is reconstructed from the issuer base, never echoed from the request**,
+    so a caller cannot induce a document naming another authority. It equals the enforced `aud` by
+    construction, which is what `validate_configuration` refuses to publish without.
+
 - **`DPoP` is now the DEFAULT for PUBLIC clients, and bearer the exception (issue #124, RFC 9449).**
   Closes the last acceptance criterion that needed code.
 

@@ -259,6 +259,140 @@ pub fn insufficient_scope_challenge(metadata_url: &str, required_scope: &str) ->
     )
 }
 
+// ---------------------------------------------------------------------------
+// Serving (issue #127)
+// ---------------------------------------------------------------------------
+
+/// How long a PRM document may be cached, in seconds.
+///
+/// The same 300-to-900 band the JWKS and discovery surfaces use. A resource's metadata
+/// changes about as often as its issuer configuration does, which is rarely, and a client
+/// that caches it for five minutes still notices a change well inside any rotation window.
+const PRM_MAX_AGE_SECS: u64 = 600;
+
+/// How a token may be presented to IronAuth's resource-server path.
+///
+/// `header` only, and stated rather than inherited: RFC 9728 registers `body` and `query`
+/// too, and advertising either would be a document that lies, since the resource-server
+/// path accepts neither.
+const BEARER_METHODS: [&str; 1] = ["header"];
+
+/// `GET /.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/{*path}`
+/// (RFC 9728 section 3, issue #127).
+///
+/// # Why this is deployment-root and not scope-routed
+///
+/// Section 3.1 composes the metadata URL from the RESOURCE identifier, inserting the
+/// well-known segment between the authority and the path. A scope-routed URL
+/// (`/t/{t}/e/{e}/.well-known/...`) is not the path that composition produces, so a client
+/// following the spec would never construct it. The route therefore lives at the
+/// deployment root and the scope is recovered from the path suffix.
+///
+/// # Why the scope comes from the suffix
+///
+/// [`crate::state::OidcState::store`] resolves resource servers only within a scope, and a
+/// deployment-root path carries none. The two obvious ways to bridge that are both wrong: a
+/// scan across scopes is cross-tenant by construction AND turns the endpoint into a probe
+/// for which audiences exist anywhere in the deployment; and giving up and serving it
+/// scope-routed abandons section 3.1.
+///
+/// So IronAuth serves PRM ONLY for resource identifiers rooted at its own issuer with the
+/// scope in the path (`{issuer_base}/t/{tenant}/e/{environment}/...`). For those, the suffix
+/// yields the scope with no scan, and the reconstructed identifier is looked up in exactly
+/// that scope. A registered audience shaped any other way simply has no document here: it
+/// keeps working as a resource server, and its metadata is its own origin's to publish
+/// (the SDK middleware half of this issue). That is deliberately non-breaking.
+///
+/// # Uniform 404
+///
+/// A malformed scope, a suffix that is not scope-rooted, an audience registered in another
+/// scope, and an audience registered nowhere are ONE response. Distinguishing them would
+/// disclose which tenants and which resource identifiers exist to an unauthenticated caller,
+/// and this endpoint is necessarily unauthenticated.
+pub async fn protected_resource(
+    axum::extract::State(state): axum::extract::State<crate::state::OidcState>,
+    path: Option<axum::extract::Path<String>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let suffix = path.map(|axum::extract::Path(p)| p).unwrap_or_default();
+    let Some((scope, resource)) = resolve_hosted_resource(state.issuer_base(), &suffix) else {
+        return crate::wellknown::not_found();
+    };
+
+    // The registration is the authority: an identifier this deployment never registered
+    // gets no document, even though its shape is one we could serve.
+    match state
+        .store()
+        .scoped(scope)
+        .resource_servers()
+        .by_audience(&resource)
+        .await
+    {
+        Ok(Some(_record)) => {}
+        // A store fault is a 404 like everything else here. Publishing a document we could
+        // not confirm is registered would be worse than publishing none.
+        Ok(None) | Err(_) => return crate::wellknown::not_found(),
+    }
+
+    let issuers = [state.issuer_for(&scope)];
+    let scopes: Vec<String> = crate::discovery::SCOPES_SUPPORTED
+        .iter()
+        .map(|scope| (*scope).to_owned())
+        .collect();
+    let methods: Vec<String> = BEARER_METHODS.iter().map(|m| (*m).to_owned()).collect();
+    let descriptor = ProtectedResource {
+        resource: &resource,
+        authorization_servers: &issuers,
+        scopes_supported: &scopes,
+        bearer_methods_supported: &methods,
+        // The audience IronAuth actually enforces for this resource is the resource
+        // identifier itself (RFC 8707: the `resource` a client requests becomes the token's
+        // `aud`). They are the same string by construction here, which is what
+        // `validate_configuration` requires and why this endpoint cannot advertise a
+        // resource whose tokens it would then reject.
+        enforced_audience: &resource,
+    };
+    let Ok(document) = protected_resource_metadata(&descriptor) else {
+        // Unreachable while `resource` and `enforced_audience` are the same binding, but
+        // fail closed rather than serve a document the validator refused.
+        return crate::wellknown::not_found();
+    };
+
+    crate::wellknown::cacheable_response(
+        &headers,
+        "application/json",
+        PRM_MAX_AGE_SECS,
+        &serde_json::Value::Object(document).to_string(),
+    )
+}
+
+/// Recover the `(scope, resource identifier)` a well-known path suffix names, or [`None`]
+/// when the suffix does not name an IronAuth-hosted resource.
+///
+/// The suffix is everything after `/.well-known/oauth-protected-resource/`. It must begin
+/// `t/{tenant}/e/{environment}` for the scope to be recoverable; anything else is not a
+/// resource this deployment hosts.
+fn resolve_hosted_resource(
+    issuer_base: &str,
+    suffix: &str,
+) -> Option<(ironauth_store::Scope, String)> {
+    let trimmed = suffix.trim_start_matches('/');
+    let mut parts = trimmed.split('/');
+    if parts.next()? != "t" {
+        return None;
+    }
+    let tenant = parts.next()?;
+    if parts.next()? != "e" {
+        return None;
+    }
+    let environment = parts.next()?;
+    let scope = crate::wellknown::parse_scope(tenant, environment)?;
+    // Reconstructed from the issuer base rather than echoed from the request, so a caller
+    // cannot induce a document naming a resource on some other authority.
+    let resource = format!("{}/{trimmed}", issuer_base.trim_end_matches('/'));
+    Some((scope, resource))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

@@ -1176,6 +1176,20 @@ name = "dpop_public_client_posture"
 path = "tests/dpop_public_client_posture.rs"
 required-features = ["testing"]
 
+# RFC 9728 Protected Resource Metadata for IronAuth-hosted resources (issue #127). A client that gets
+# a 401 follows the resource_metadata pointer to a document naming which authorization servers the
+# resource trusts; that chain only works if the document is truthful, so the load-bearing cases are the
+# ones where a document would LIE and must not exist: an unregistered identifier, one registered in
+# another scope, and one whose shape this deployment does not host. Route is DEPLOYMENT-ROOT because
+# section 3.1 composes the URL from the resource identifier, so the scope is recovered from the path
+# suffix rather than from a scope-routed prefix a spec-following client would never build. Every miss
+# is byte-identical, since the endpoint is unauthenticated and would otherwise enumerate the
+# deployment. Cache headers and 304 revalidation per criterion 5. Over a real database (DATABASE_URL).
+[[test]]
+name = "protected_resource_metadata"
+path = "tests/protected_resource_metadata.rs"
+required-features = ["testing"]
+
 # The DURABLE organization token context (issue #94, PR-B1): the organization parameter
 # binds a live-and-active org onto the session and both tokens (org_id claim), a
 # single-org subject auto-selects, a multi-org subject with no parameter gets none, a
