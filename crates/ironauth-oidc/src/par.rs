@@ -117,6 +117,10 @@ pub struct ParParams {
     /// replayed verbatim, so a pushed request resolves the SAME org context as an
     /// inline one.
     pub organization: Option<String>,
+    /// The RFC 9449 section 10 `dpop_jkt`, pushed through the AUTHENTICATED back
+    /// channel. This is the delivery that section 10 recommends over a front-channel
+    /// query parameter, which the browser and anything hosting it can read.
+    pub dpop_jkt: Option<String>,
     /// A `request_uri` presented at the PAR endpoint is REJECTED (RFC 9126 section
     /// 2.1): a pushed request cannot itself reference another pushed request.
     pub request_uri: Option<String>,
@@ -157,6 +161,11 @@ impl ParParams {
             // The requested organization context (issue #94, PR-B1): replayed verbatim
             // so a pushed request resolves the same org as an inline one.
             organization: self.organization,
+            // The RFC 9449 section 10 code binding (issue #124), replayed verbatim so
+            // a pushed request binds its code exactly as an inline one does. It needs
+            // no storage change: a pushed request is stored as a serialized
+            // `AuthorizeParams` document, so a new field round-trips on its own.
+            dpop_jkt: self.dpop_jkt,
             emit_auth_time: None,
             par_resume: None,
             // The internal consent-denied marker (issue #88) is never stored: a pushed request

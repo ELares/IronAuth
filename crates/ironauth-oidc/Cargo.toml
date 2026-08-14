@@ -1120,6 +1120,20 @@ name = "dpop_introspection"
 path = "tests/dpop_introspection.rs"
 required-features = ["testing"]
 
+# RFC 9449 section 10 dpop_jkt (issue #124): an authorization request commits to a DPoP key and the
+# CODE is bound to it before the token request exists, which is what stops an intercepted code being
+# redeemed under an attacker's own key. Both deliveries are covered because they are separate paths to
+# the same seam: the parameter inline on /authorize, and pushed through the authenticated back channel
+# with PAR (RFC 9126), which section 10 recommends since a front-channel parameter is browser-visible.
+# A foreign key and a MISSING proof are both refused (a binding that could be dropped rather than
+# matched would be no binding), a refusal does not burn the code, a malformed value is invalid_request,
+# a well-formed thumbprint for no key binds and fails closed at redemption, and a request without the
+# parameter is byte-identical to before. Over a real database (DATABASE_URL).
+[[test]]
+name = "dpop_jkt_code_binding"
+path = "tests/dpop_jkt_code_binding.rs"
+required-features = ["testing"]
+
 # The DURABLE organization token context (issue #94, PR-B1): the organization parameter
 # binds a live-and-active org onto the session and both tokens (org_id claim), a
 # single-org subject auto-selects, a multi-org subject with no parameter gets none, a
