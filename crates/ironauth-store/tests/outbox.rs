@@ -48,10 +48,10 @@ use std::time::{Duration, SystemTime};
 
 use ironauth_env::Env;
 use ironauth_store::outbox::{
-    ConsumerError, ConsumerRegistry, DrainStats, OutboxConsumer, OutboxObserver, OutboxReaper,
-    OutboxWorker, OutboxWorkerPool, RetentionObserver, RetentionSettings, RetentionStats,
-    RetentionSweeper, ScopeSource, SilentObserver, SilentRetentionObserver, StaticScopes,
-    WorkerSettings,
+    ConsumerError, ConsumerRegistry, DrainStats, OutboxBackbone, OutboxConsumer, OutboxObserver,
+    OutboxReaper, OutboxWorker, OutboxWorkerPool, RetentionObserver, RetentionSettings,
+    RetentionStats, RetentionSweeper, ScopeSource, SilentObserver, SilentRetentionObserver,
+    StaticScopes, WorkerSettings,
 };
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
@@ -3480,5 +3480,145 @@ async fn lag_measures_the_oldest_due_message_and_ignores_one_waiting_out_its_bac
         "a queue whose only remaining message is inside its retry backoff has NO lag: it \
          is waiting on a clock, not on a worker. Reporting its future gate here would put \
          a permanent non-zero reading on a consumer that is behaving exactly as designed"
+    );
+}
+
+/// A backbone that wakes instantly on a signal, standing in for IronBus (issue #104).
+///
+/// Not a mock of IronBus. It is a second REAL implementation of the seam, present so the
+/// trait ships with more than one and so the POOL's use of it is exercised rather than
+/// merely declared. A seam with a single implementation reads as finished and is not.
+#[derive(Default)]
+struct SignallingBackbone {
+    notify: tokio::sync::Notify,
+}
+
+impl OutboxBackbone for SignallingBackbone {
+    fn notify(&self, _consumer: &str, _scope: Scope) {
+        // `notify_one`, NOT `notify_waiters`: the latter wakes only waiters already
+        // parked and drops the signal otherwise, so a producer that signals before the
+        // worker reaches its wait would lose it and this test would race. `notify_one`
+        // stores a permit. A real backbone has the same obligation, which is why the
+        // trait documents signals as advisory and keeps the poll deadline underneath.
+        self.notify.notify_one();
+    }
+
+    fn wait<'a>(
+        &'a self,
+        _consumer: &'a str,
+        max_wait: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            // Whichever comes first: the signal, or the poll deadline. The deadline is
+            // never removed, which is what makes a LOST signal cost latency and never an
+            // event.
+            let _ = tokio::time::timeout(max_wait, self.notify.notified()).await;
+        })
+    }
+}
+
+/// A counting consumer for the backbone test.
+struct CountingConsumer {
+    name: String,
+    handled: std::sync::Mutex<Vec<String>>,
+}
+
+impl CountingConsumer {
+    fn new(name: &str) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.to_owned(),
+            handled: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn handled(&self) -> Vec<String> {
+        self.handled.lock().expect("handled lock").clone()
+    }
+}
+
+impl OutboxConsumer for CountingConsumer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _env: &'a Env,
+        _scope: Scope,
+        message: &'a OutboxMessage,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ConsumerError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.handled
+                .lock()
+                .expect("handled lock")
+                .push(message.idempotency_key.clone());
+            Ok(())
+        })
+    }
+}
+
+/// The backbone seam is swappable, and a signal short-circuits the poll wait.
+///
+/// The load-bearing setup is `poll_interval: 1 hour`. The second message can only drain
+/// if the pool AWAITS THE BACKBONE rather than sleeping the interval, so this proves the
+/// `spawn_with_backbone` wiring is real rather than declared. `PollOnly` (the shipped
+/// default) is the same code path with the same deadline and no early wake, which is
+/// what every other test in this file already pins.
+#[tokio::test]
+async fn a_signalling_backbone_wakes_the_drain_before_the_poll_interval() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0xB0_5E);
+    let scope = db.seed_scope(&env).await;
+
+    let consumer = CountingConsumer::new(CONSUMER);
+    let backbone: Arc<dyn OutboxBackbone> = Arc::new(SignallingBackbone::default());
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        env.clone(),
+        Arc::clone(&consumer) as Arc<dyn OutboxConsumer>,
+        WorkerSettings {
+            concurrency: 1,
+            visibility_timeout: Duration::from_secs(30),
+            // Far past any patience this test has: a pool that slept this could not
+            // drain the second message at all.
+            poll_interval: Duration::from_secs(3_600),
+            batch: 64,
+            retry: RetryPolicy::default(),
+        },
+    );
+
+    enqueue(&db, &env, scope, "k-1", "agg-a").await;
+    let scopes: Arc<dyn ScopeSource> = Arc::new(StaticScopes::new(vec![scope]));
+    let pool = OutboxWorkerPool::spawn_with_backbone(&worker, &scopes, &silent(), &backbone);
+
+    // The first pass runs immediately, before any wait.
+    let mut first = false;
+    for _ in 0..200 {
+        if consumer.handled().len() == 1 {
+            first = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(first, "the first pass drains without needing a signal");
+
+    // The pool is now inside `backbone.wait` with an hour on the clock. Enqueue and
+    // signal: only an awaited backbone can pick this up.
+    enqueue(&db, &env, scope, "k-2", "agg-a").await;
+    backbone.notify(CONSUMER, scope);
+    let mut second = false;
+    for _ in 0..200 {
+        if consumer.handled().len() == 2 {
+            second = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    pool.shutdown().await;
+    assert!(
+        second,
+        "a signalled backbone drains without waiting out poll_interval; handled {:?}",
+        consumer.handled()
     );
 }

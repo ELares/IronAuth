@@ -81,7 +81,14 @@ serde.workspace = true
 # MSRV 1.85, the musl static lane, and cargo-deny are all unchanged.
 tokio = { workspace = true, features = ["rt", "time"] }
 
+# The IronBus client (issue #104), OPTIONAL: the notification backbone for the outbox.
+# Postgres alone stays a complete supported mode, so a deployment that does not want the
+# bus does not build it.
+ironbus-client = { workspace = true, optional = true }
+
 [features]
+# The optional IronBus notification backbone for the transactional outbox (issue #104).
+ironbus = ["dep:ironbus-client"]
 # Default build is lean: no test-support surface. Production only ever needs the
 # default feature set.
 default = []
