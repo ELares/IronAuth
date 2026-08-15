@@ -18,7 +18,7 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, IssuedTokenId,
-    NewOpaqueAccessToken, RedeemOutcome, Scope, opaque_access_token_digest,
+    NewOpaqueAccessToken, RedeemOutcome, Scope, StoredClientId, opaque_access_token_digest,
 };
 use sqlx::Row;
 
@@ -56,7 +56,7 @@ async fn issue_code(
             IssueCode {
                 code_id: &code_id,
                 grant_id: &grant_id,
-                client_id: &client_id,
+                client_id: StoredClientId::Registered(&client_id),
                 redirect_uri: "https://client.test/cb",
                 browserless: false,
                 nonce: None,

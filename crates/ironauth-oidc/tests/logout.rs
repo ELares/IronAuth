@@ -30,7 +30,7 @@ use ironauth_jose::TokenTyp;
 use ironauth_oidc::SESSION_COOKIE;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
-    RefreshFamilyId, RefreshTokenId, Scope, SessionId, refresh_token_digest,
+    RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoredClientId, refresh_token_digest,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -952,7 +952,7 @@ async fn seed_grant(
             IssueCode {
                 code_id: &code_id,
                 grant_id: &grant_id,
-                client_id: &client_id,
+                client_id: StoredClientId::Registered(&client_id),
                 redirect_uri: "https://client.test/cb",
                 browserless: false,
                 nonce: None,

@@ -27,7 +27,7 @@ use axum::http::{Request, StatusCode, header};
 use common::Harness;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily,
-    RefreshFamilyId, RefreshTokenId, Scope, refresh_token_digest,
+    RefreshFamilyId, RefreshTokenId, Scope, StoredClientId, refresh_token_digest,
 };
 use serde_json::{Value, json};
 
@@ -138,7 +138,7 @@ async fn seed_family(
             IssueCode {
                 code_id: &code_id,
                 grant_id: &grant_id,
-                client_id: &grant_client,
+                client_id: StoredClientId::Registered(&grant_client),
                 redirect_uri: "https://client.test/cb",
                 browserless: false,
                 nonce: None,

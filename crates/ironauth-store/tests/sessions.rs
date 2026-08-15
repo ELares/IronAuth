@@ -23,7 +23,7 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
     RefreshFamilyId, RefreshFamilyOpenOutcome, RefreshTokenId, Scope, SessionEndCause,
-    SessionFleetFilter, SessionId, StoreError, UserId, refresh_token_digest,
+    SessionFleetFilter, SessionId, StoreError, StoredClientId, UserId, refresh_token_digest,
 };
 use sqlx::Row;
 
@@ -87,7 +87,7 @@ async fn seed_grant(
             IssueCode {
                 code_id: &code_id,
                 grant_id: &grant_id,
-                client_id: &client_id,
+                client_id: StoredClientId::Registered(&client_id),
                 redirect_uri: "https://client.test/cb",
                 browserless: false,
                 nonce: None,

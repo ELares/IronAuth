@@ -93,10 +93,10 @@ use crate::id::{
     RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
     RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
-    SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId,
-    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
-    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
-    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId,
+    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId,
+    UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -8428,7 +8428,7 @@ pub struct IssueCode<'a> {
     /// The `grt_` grant identifier this code belongs to.
     pub grant_id: &'a GrantId,
     /// The OAuth client the code is bound to.
-    pub client_id: &'a ClientId,
+    pub client_id: StoredClientId<'a>,
     /// The redirect URI the code is bound to (re-checked at redemption). Empty for a
     /// browserless first-party challenge code (issue #93), which is bound to no redirect URI.
     pub redirect_uri: &'a str,

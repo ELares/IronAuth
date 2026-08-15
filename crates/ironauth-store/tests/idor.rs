@@ -11,8 +11,8 @@ use ironauth_store::{
     CorrelationId, CredentialType, FederationLoginStateId, GrantId, IssueCode,
     NewClientAuthDiagnostic, NewConnector, NewFederationLoginState, NewPolicyDecisionTrace,
     NewRefreshFamily, NewSession, NewUpstreamTokens, PolicyDecisionInputs, PolicyKind,
-    PolicyOutcome, RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError, UpstreamTokenId,
-    UserId, refresh_token_digest,
+    PolicyOutcome, RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError, StoredClientId,
+    UpstreamTokenId, UserId, refresh_token_digest,
 };
 
 /// A timestamp far past any test's clock, so a planted fixture never expires mid-test.
@@ -459,7 +459,7 @@ async fn plant_refresh_family(
             IssueCode {
                 code_id: &code_id,
                 grant_id: &grant_id,
-                client_id: &client_id,
+                client_id: StoredClientId::Registered(&client_id),
                 redirect_uri: "https://client.test/cb",
                 browserless: false,
                 nonce: None,

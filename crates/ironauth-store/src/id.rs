@@ -1544,6 +1544,72 @@ pub struct ScopedId<K: ScopedKind> {
 /// An OAuth client identifier (`cli_...`), the worked scoped-resource example.
 pub type ClientId = ScopedId<ClientKind>;
 
+/// A client identifier as it is STORED (issue #128): a registration, or the identity
+/// derived from a CIMD document's URL.
+///
+/// # Why this exists rather than a plain `ClientId`
+///
+/// The rows that record what a client was granted (`authorization_codes`, `grants`,
+/// `issued_tokens`) hold `client_id` as `text` with NO foreign key to `clients`, so the
+/// database has always been able to store either. The Rust type was the only thing that
+/// could not say so, and it is what stopped a CIMD client from completing a flow.
+///
+/// The draft is explicit that a CIMD client HAS grants and consent worth persisting: it
+/// tells an authorization server that a metadata change "could impact the validity of
+/// previously granted user consent" and that it MAY revoke "the user's consent for this
+/// client". Neither sentence means anything unless the grant was recorded against the
+/// client in the first place, so declining to persist CIMD grants would have put IronAuth
+/// outside the spec it is implementing.
+///
+/// The two variants stay DISTINCT rather than collapsing to a string, so a `cimc_` remains
+/// visibly not a registration everywhere it is written, which is the property the whole
+/// separate kind was chosen for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredClientId<'a> {
+    /// A client registered in this deployment.
+    Registered(&'a ClientId),
+    /// A client that described itself at a URL.
+    Cimd(&'a CimdClientId),
+}
+
+impl StoredClientId<'_> {
+    /// The scope this identifier is bound to.
+    #[must_use]
+    pub fn scope(&self) -> Scope {
+        match self {
+            Self::Registered(id) => id.scope(),
+            Self::Cimd(id) => id.scope(),
+        }
+    }
+
+    /// Whether this is a CIMD client rather than a registration.
+    #[must_use]
+    pub fn is_cimd(&self) -> bool {
+        matches!(self, Self::Cimd(_))
+    }
+}
+
+impl fmt::Display for StoredClientId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registered(id) => id.fmt(f),
+            Self::Cimd(id) => id.fmt(f),
+        }
+    }
+}
+
+impl<'a> From<&'a ClientId> for StoredClientId<'a> {
+    fn from(id: &'a ClientId) -> Self {
+        Self::Registered(id)
+    }
+}
+
+impl<'a> From<&'a CimdClientId> for StoredClientId<'a> {
+    fn from(id: &'a CimdClientId) -> Self {
+        Self::Cimd(id)
+    }
+}
+
 /// The identifier of a CIMD client (issue #128), derived deterministically from the
 /// HTTPS URL that IS its `client_id`. Distinct from [`ClientId`] on the wire (`cimc_`
 /// rather than `cli_`) so an unregistered, requester-chosen client is never mistaken for
@@ -3039,5 +3105,51 @@ mod tests {
             CimdClientId::derive(&scope, b"https://a.example/mm"),
             CimdClientId::derive(&scope, b"https://a.example/m")
         );
+    }
+
+    #[test]
+    fn a_stored_client_id_renders_the_identifier_it_wraps() {
+        let env = test_env();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let registered = ClientId::generate(&env, &scope);
+        let cimd = CimdClientId::derive(&scope, CIMD_URL.as_bytes());
+
+        assert_eq!(
+            StoredClientId::Registered(&registered).to_string(),
+            registered.to_string()
+        );
+        assert_eq!(StoredClientId::Cimd(&cimd).to_string(), cimd.to_string());
+    }
+
+    #[test]
+    fn a_stored_cimd_id_stays_visibly_not_a_registration() {
+        // The whole reason for a separate kind. If a `cimc_` rendered as a `cli_` once it
+        // reached a row, the audit trail would call an unregistered client a registration
+        // and the distinction would exist only in memory.
+        let env = test_env();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let cimd = CimdClientId::derive(&scope, CIMD_URL.as_bytes());
+        let stored = StoredClientId::Cimd(&cimd);
+
+        assert!(stored.to_string().starts_with("cimc_"), "{stored}");
+        assert!(!stored.to_string().starts_with("cli_"), "{stored}");
+        assert!(stored.is_cimd());
+    }
+
+    #[test]
+    fn a_stored_client_id_reports_the_scope_of_either_kind() {
+        // The persistence layer refuses a write whose client_id is out of scope, and it
+        // asks THIS for the scope. If a CIMD id answered wrongly, that cross-scope guard
+        // would stop applying to exactly the clients nobody vetted.
+        let env = test_env();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let other = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let registered = ClientId::generate(&env, &scope);
+        let cimd = CimdClientId::derive(&scope, CIMD_URL.as_bytes());
+
+        assert_eq!(StoredClientId::Registered(&registered).scope(), scope);
+        assert_eq!(StoredClientId::Cimd(&cimd).scope(), scope);
+        assert_ne!(StoredClientId::Cimd(&cimd).scope(), other);
+        assert!(!StoredClientId::Registered(&registered).is_cimd());
     }
 }

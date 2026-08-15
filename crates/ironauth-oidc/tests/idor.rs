@@ -12,7 +12,7 @@ use common::{Harness, REDIRECT_URI};
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::{
     ActorRef, AuthorizationCodeId, CorrelationId, GrantId, IssueCode, IssuedTokenId,
-    IssuedTokenRecord, RedeemOutcome, ServiceId, TokenKind, TokenStatus,
+    IssuedTokenRecord, RedeemOutcome, ServiceId, StoredClientId, TokenKind, TokenStatus,
 };
 
 /// A far-future expiry (year 2100) so the victim code stays live for the whole
@@ -54,7 +54,7 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
             IssueCode {
                 code_id: &code_b,
                 grant_id: &grant_b,
-                client_id: &client_b,
+                client_id: StoredClientId::Registered(&client_b),
                 redirect_uri: REDIRECT_URI,
                 browserless: false,
                 nonce: None,
