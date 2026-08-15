@@ -6,6 +6,41 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator seeds a USER, and the master key is attached where the seeding happens
+  (issue #121).** `ironauth dev` now prints an issuer, a client, and a working login.
+
+  - **The user goes through the REPOSITORY, and that is forced rather than chosen.** `users`
+    stores `identifier_sealed`, `identifier_bidx` and `claims_sealed`, so a row cannot be a
+    seed statement the way the tenant, environment, client and serving state are. The
+    repository seals the identifier and provisions the envelope keys as a side effect
+    (`ensure_scope_keys`, KEK then DEK, both Conflict-tolerant), so there is no separate
+    key-provisioning step to run first -- correcting my own earlier note on the issue, which
+    claimed there was.
+
+  - **FIX found by running it: the seeding store had no master key.** `Store::connect` alone
+    does not carry one, and the envelope paths read it off the STORE, so the first attempt
+    failed with "envelope decryption failed" -- a failure of the seed, not of the config the
+    server later reads. The key is now attached with `with_master_key` at the point of
+    seeding.
+
+  - **The master key material is named ONCE** (`DEV_MASTER_KEY`) and used by both the
+    generated config and the seed path. They have to agree: the seed seals a user identifier
+    with it and the server unseals with whatever the config says, so two literals that drifted
+    would produce a user nobody can log in as, with no error anywhere.
+
+  - **Idempotent by treating `Conflict` as already-seeded**, because a dev restart against an
+    existing `DATABASE_URL` re-runs every seed.
+
+  - **A third gate exemption, and worth counting as such.** The hashing-pool boundary refused
+    the seed's `hash_password` call: every request-path hash must run on the admission
+    controlled pool so one tenant's hashing storm degrades only that tenant. This is a
+    one-off boot-time hash with no request behind it and no `OidcState` in existence yet to
+    route through, so it carries `pool-boundary-allow` with that reason. It joins the two
+    `query-audit-allow` markers on the dev seeds. Each is defensible alone; three exemptions
+    in one feature is a signal that dev seeding sits outside the seams the production paths
+    are held to, which is worth a reviewer's judgement rather than mine.
+
+
 - **A no-egress harness for the emulator (issue #121, criterion 2).**
   `scripts/dev-no-egress.sh` asserts that while `ironauth dev` is up and serving, the process
   holds no TCP connection whose peer is off this machine. A CI job runs it.

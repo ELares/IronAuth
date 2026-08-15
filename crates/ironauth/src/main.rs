@@ -4385,6 +4385,11 @@ fn print_dev_scope(bind: &str, scope: &dev::SeededScope) {
         scope.client,
         dev::DEV_REDIRECT_URI
     );
+    println!(
+        "ironauth dev: user {} / {}",
+        dev::DEV_USER_IDENTIFIER,
+        dev::DEV_USER_PASSWORD
+    );
 }
 
 /// Provision the schema roles and apply the schema, before the server boots.
@@ -4413,9 +4418,19 @@ fn prepare_dev_schema(
     // empty one.
     let scope = dev::seed_ids(seed);
     runtime.block_on(async {
+        // The master key is ATTACHED here, not merely present in the generated config. The
+        // envelope paths (a sealed user identifier, a sealed connector secret) read it off
+        // the STORE, so a `Store::connect` without it fails with "envelope decryption
+        // failed" -- measured, and it is a failure of the seed rather than of the config.
+        // It derives from the same literal the generated config carries, so the seeded and
+        // the served store agree.
         let store = ironauth_store::Store::connect(database_url)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+            .with_master_key(std::sync::Arc::new(MasterKey::derive(
+                "master-1",
+                dev::DEV_MASTER_KEY.as_bytes(),
+            )));
         store
             .migrate()
             .await
@@ -4432,7 +4447,10 @@ fn prepare_dev_schema(
             ironauth_store::EnvironmentId::parse(&scope.environment)
                 .map_err(|error| format!("the seeded environment id does not parse: {error:?}"))?,
         );
-        dev::provision_signing_key(&store, &env, parsed, seed).await
+        dev::provision_signing_key(&store, &env, parsed, seed).await?;
+        // The user goes through the repository for the same reason the key does: its
+        // identifier is SEALED, so it cannot be a seed statement.
+        dev::seed_user(&store, &env, parsed).await
     })?;
     Ok(scope)
 }

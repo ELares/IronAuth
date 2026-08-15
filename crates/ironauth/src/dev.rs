@@ -488,6 +488,61 @@ pub async fn provision_signing_key(
         .map_err(|error| format!("provisioning the dev signing key: {error}"))
 }
 
+/// The dev master key material.
+///
+/// Named once so the generated config and the SEED path derive the same key. They must
+/// agree: the seed seals a user identifier with it and the server unseals with whatever the
+/// config says, so two literals that drifted would produce a user nobody can log in as.
+pub const DEV_MASTER_KEY: &str = "ironauth-dev-master-key-not-for-production";
+
+/// The seeded user's credentials. Fixed, like every other dev secret.
+pub const DEV_USER_IDENTIFIER: &str = "dev@example.test";
+/// The seeded user's password.
+pub const DEV_USER_PASSWORD: &str = "dev-password-not-for-production";
+
+/// Seed the dev user.
+///
+/// Through the REPOSITORY, not a seed statement, and that is forced rather than chosen:
+/// `users` stores `identifier_sealed`, `identifier_bidx` and `claims_sealed`, so a row
+/// cannot be written as literal SQL the way the tenant, environment, client and serving
+/// state are. The repository seals the identifier and provisions the envelope keys
+/// (`ensure_scope_keys`, KEK then DEK, both Conflict-tolerant) as a side effect, so there is
+/// no separate key-provisioning step to run first.
+///
+/// Idempotent by tolerating the conflict a second run produces, which is the same shape the
+/// envelope provisioning uses internally: a dev restart against an existing `DATABASE_URL`
+/// re-runs every seed.
+///
+/// # Errors
+///
+/// A message naming the failure, unless it is the already-seeded conflict.
+pub async fn seed_user(
+    store: &ironauth_store::Store,
+    env: &ironauth_env::Env,
+    scope: ironauth_store::Scope,
+) -> Result<(), String> {
+    // The pool is REQUEST-PATH admission control, so one tenant's hashing storm degrades
+    // only that tenant. A single hash run once at startup, with no request behind it and no
+    // OidcState in existence yet to route through, is not that path.
+    let password_hash = ironauth_oidc::hash_password(env, DEV_USER_PASSWORD) // pool-boundary-allow: one-off boot-time seed, no server or pool exists yet
+        .map_err(|error| format!("hashing the dev password: {error:?}"))?;
+    match store
+        .scoped(scope)
+        .acting(
+            ironauth_store::ActorRef::human(ironauth_store::HumanId::generate(env)),
+            ironauth_store::CorrelationId::generate(env),
+        )
+        .users()
+        .register(env, DEV_USER_IDENTIFIER, &password_hash)
+        .await
+    {
+        // A Conflict is ALREADY SEEDED, not a failure: a dev restart against an existing
+        // DATABASE_URL re-runs every seed, so the second run must be a no-op.
+        Ok(_) | Err(ironauth_store::StoreError::Conflict) => Ok(()),
+        Err(error) => Err(format!("seeding the dev user: {error}")),
+    }
+}
+
 /// The message shown when no Postgres binaries can be found.
 ///
 /// Names what to install and the escape hatch, because "could not start the emulator" sends
@@ -572,7 +627,7 @@ pub fn dev_config_toml(database_url: &str, bind: &str, management_bind: &str) ->
          url = \"{database_url}\"\n\
          # Required for the encrypted-PII paths (registration, login, UserInfo); without it\n\
          # they fail CLOSED and no login works. Fixed, like every other dev secret.\n\
-         master_key = \"ironauth-dev-master-key-not-for-production\"\n\
+         master_key = \"{DEV_MASTER_KEY}\"\n\
          \n\
          [oidc]\n\
          # Off by default, so an emulator that did not set it served no OIDC at all, which is\n\
