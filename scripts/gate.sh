@@ -190,6 +190,8 @@ scripts/openapi-check.sh
 scripts/openapi-lint.sh
 # The spec-diff changelog generator must itself be correct (issue #122).
 python3 scripts/openapi-changelog.py --self-test
+# The published wire-format contract must still describe the code (issue #122).
+python3 scripts/sdk-contract.py --check
 
 echo "==> fuzz matrix freshness (every registered fuzz target has a CI matrix row)"
 scripts/fuzz-matrix-freshness.sh
