@@ -32,6 +32,25 @@ pub fn verify_s256(code_verifier: &str, code_challenge: &str) -> bool {
     constant_time_eq(computed.as_bytes(), code_challenge.as_bytes())
 }
 
+/// The PKCE `S256` code challenge for `code_verifier` (RFC 7636 4.2):
+/// `BASE64URL(SHA256(code_verifier))`.
+///
+/// # Why generation lives beside verification
+///
+/// There were two implementations of this transform in the workspace: this one, and a
+/// private copy in `federation.rs`. They agreed, which is the dangerous state to be in:
+/// nothing would have failed if one had been changed. Base64 with padding instead of
+/// without, or standard alphabet instead of URL-safe, produces a challenge that looks
+/// right, and the mismatch surfaces as an authorization failure nobody attributes to the
+/// encoder.
+///
+/// One transform, sitting next to the [`verify_s256`] that must agree with it, is the only
+/// arrangement where a change to either is visibly a change to both.
+#[must_use]
+pub fn s256_challenge(code_verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()))
+}
+
 /// Whether a `code_verifier` meets the RFC 7636 4.1 format: 43 to 128 characters
 /// of the unreserved set `[A-Za-z0-9-._~]`. The length is the RFC's entropy floor
 /// (43 characters is 256 bits of base64url); the charset keeps it transport-safe.
@@ -152,5 +171,34 @@ mod tests {
             "a".repeat(42)
         ))); // '~' is not base64url
         assert!(!code_challenge_is_well_formed("")); // plain (unrepresentable) / empty
+    }
+
+    #[test]
+    fn the_generator_and_the_verifier_agree_by_construction() {
+        // The property the consolidation exists for. Two copies of this transform agreed
+        // until somebody changed one; one copy cannot.
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert!(verify_s256(verifier, &s256_challenge(verifier)));
+    }
+
+    #[test]
+    fn the_challenge_is_url_safe_and_unpadded() {
+        // The two ways this goes wrong silently: standard base64 emits `+` and `/`, and
+        // padded base64 emits `=`. Either produces a challenge that LOOKS right and fails
+        // verification somewhere nobody attributes to the encoder.
+        let challenge = s256_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
+        assert!(!challenge.contains('='), "padded: {challenge}");
+        assert!(!challenge.contains('+'), "standard alphabet: {challenge}");
+        assert!(!challenge.contains('/'), "standard alphabet: {challenge}");
+    }
+
+    #[test]
+    fn the_generator_reproduces_the_rfc7636_appendix_b_vector() {
+        // The spec's own vector, so this is pinned to RFC 7636 rather than to whatever the
+        // implementation happens to produce.
+        assert_eq!(
+            s256_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
     }
 }

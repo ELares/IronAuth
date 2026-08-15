@@ -52,7 +52,6 @@ use ironauth_store::{
     NewAccountLink, NewAdminUser, NewFederationLoginState, NewUpstreamTokens, OrgConnectionId,
     Scope, SessionId, StoreError, TraitSchema, UpstreamTokenId, UserId, UserState,
 };
-use sha2::{Digest, Sha256};
 
 use crate::account_linking::{self, LinkDecision};
 use crate::authn::{self, AuthenticationEvent};
@@ -832,7 +831,7 @@ pub(crate) async fn issue_upstream_authorize(
         PkceMode::AutoWhereSupported => advertises_s256,
     };
     let code_verifier = use_pkce.then(|| random_token(state));
-    let code_challenge = code_verifier.as_deref().map(s256_challenge);
+    let code_challenge = code_verifier.as_deref().map(crate::pkce::s256_challenge);
 
     let redirect_uri = federation_callback_url(state, tenant_id, environment_id, connector_slug);
 
@@ -2298,12 +2297,6 @@ fn random_token(state: &OidcState) -> String {
     let mut buf = [0_u8; 32];
     state.env().entropy().fill_bytes(&mut buf);
     URL_SAFE_NO_PAD.encode(buf)
-}
-
-/// The PKCE `S256` code challenge for `code_verifier` (RFC 7636 4.2):
-/// `BASE64URL(SHA256(code_verifier))`.
-fn s256_challenge(code_verifier: &str) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()))
 }
 
 /// The federated callback redirect URI for a connector, built from the deployment's public
