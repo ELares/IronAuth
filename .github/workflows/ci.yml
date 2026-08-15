@@ -368,6 +368,8 @@ jobs:
         run: python3 scripts/openapi-changelog.py --self-test
       - name: SDK wire-format contract freshness (issue #122)
         run: python3 scripts/sdk-contract.py --check
+      - name: Events-vs-webhooks guidance freshness (issue #107)
+        run: python3 scripts/events-vs-webhooks.py --check
       - name: governance files present
         # The license and covenant files are trust infrastructure; this lint
         # ensures they cannot be silently removed or renamed.
