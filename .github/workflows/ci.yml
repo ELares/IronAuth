@@ -364,6 +364,8 @@ jobs:
         run: scripts/openapi-check.sh
       - name: OpenAPI contract is generator-ready (issue #122)
         run: scripts/openapi-lint.sh
+      - name: OpenAPI changelog generator self-test (issue #122)
+        run: python3 scripts/openapi-changelog.py --self-test
       - name: governance files present
         # The license and covenant files are trust infrastructure; this lint
         # ensures they cannot be silently removed or renamed.
