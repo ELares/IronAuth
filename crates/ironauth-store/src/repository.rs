@@ -20346,6 +20346,53 @@ pub struct UsageTally {
     connections: u64,
 }
 
+/// The event types metering counts, and what each contributes (issue #107).
+///
+/// A CLOSED list rather than a catch-all. Metering feeds billing, so an unrecognised event
+/// must contribute nothing rather than be guessed at: guessing turns a new event type into
+/// a silent change in everybody's invoice, discovered by a customer rather than by us.
+/// Adding a type here is therefore a deliberate line in a diff.
+const ACTIVITY_EVENT: &str = "user.signed_in";
+const TOKEN_EVENT: &str = "token.issued";
+const CONNECTION_EVENT: &str = "connection.opened";
+
+impl UsageTally {
+    /// Fold a page of the event feed into this tally (issue #107).
+    ///
+    /// Reads the envelope `type` and, for activity, the `payload.subject`. An event with no
+    /// recognised type, or an activity event with no subject, contributes NOTHING and does
+    /// not error: the feed is shared infrastructure carrying every domain's events, so
+    /// metering must ignore what is not its business rather than fail on it. A metering
+    /// consumer that errored on an unrelated event type would stop the whole fold the first
+    /// time another team shipped a new event.
+    pub fn absorb(&mut self, messages: &[OutboxMessage]) {
+        for message in messages {
+            let Some(event_type) = message
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            match event_type {
+                ACTIVITY_EVENT => {
+                    if let Some(subject) = message
+                        .payload
+                        .get("payload")
+                        .and_then(|p| p.get("subject"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        self.saw_active(subject);
+                    }
+                }
+                TOKEN_EVENT => self.saw_token_issued(),
+                CONNECTION_EVENT => self.saw_connection(),
+                _ => {}
+            }
+        }
+    }
+}
+
 impl UsageTally {
     /// An empty tally.
     #[must_use]
