@@ -20322,6 +20322,62 @@ pub fn membership_change(added: Vec<String>, removed: Vec<String>) -> Membership
     }
 }
 
+/// An opaque position in the event feed (issue #107).
+///
+/// # Why opaque, when it wraps one integer
+///
+/// #107 promises a "stable next cursor", and the promise is about the CONSUMER's
+/// checkpoint surviving. A bare sequence number invites two things that break that: a
+/// consumer computing `cursor + 1` because it looks arithmetic, and a consumer persisting
+/// it as an integer that a future ordering domain cannot express.
+///
+/// The wire form is deliberately not a number a caller would be tempted to do arithmetic
+/// on, and it round-trips exactly. What it encodes stays an implementation detail, so the
+/// ordering domain can change (a commit-ordered appender, a composite key) without every
+/// stored checkpoint becoming meaningless.
+///
+/// It is NOT a security boundary. A consumer that decodes it learns a sequence number it
+/// was already served, so this is an encapsulation choice rather than a secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EventCursor(i64);
+
+impl EventCursor {
+    /// The position before the first event: where a consumer with no checkpoint starts.
+    #[must_use]
+    pub const fn beginning() -> Self {
+        Self(0)
+    }
+
+    /// The cursor just after `sequence`, which is what a consumer checkpoints having
+    /// handled that event.
+    #[must_use]
+    pub const fn after_sequence(sequence: i64) -> Self {
+        Self(sequence)
+    }
+
+    /// The sequence this cursor sits after. Crate-internal: the query needs the number,
+    /// callers do not.
+    pub(crate) const fn sequence(self) -> i64 {
+        self.0
+    }
+
+    /// The wire form a consumer stores and sends back.
+    #[must_use]
+    pub fn to_wire(self) -> String {
+        format!("evc_{}", self.0)
+    }
+
+    /// Parse a wire form.
+    ///
+    /// A malformed cursor is `None` rather than a silent fallback to the beginning. Reading
+    /// an unparseable checkpoint as "start over" would replay the entire retained feed at a
+    /// consumer that merely sent a typo, which is the expensive way to be forgiving.
+    #[must_use]
+    pub fn from_wire(wire: &str) -> Option<Self> {
+        wire.strip_prefix("evc_")?.parse::<i64>().ok().map(Self)
+    }
+}
+
 /// What an event-feed read returned (issue #107).
 ///
 /// A page and a "your cursor fell off the window" are DIFFERENT outcomes, not a page that
@@ -20562,9 +20618,10 @@ impl OutboxRepo<'_> {
     /// [`StoreError::Database`] on a persistence fault.
     pub async fn events_page_after(
         &self,
-        after_sequence: i64,
+        cursor: EventCursor,
         limit: i64,
     ) -> Result<EventPage, StoreError> {
+        let after_sequence = cursor.sequence();
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         let oldest: Option<i64> = sqlx::query_scalar(
@@ -59405,5 +59462,51 @@ mod membership_delta {
             }
             other => panic!("expected truncation, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod event_cursor {
+    use super::EventCursor;
+
+    #[test]
+    fn a_cursor_round_trips_through_its_wire_form() {
+        for sequence in [0_i64, 1, 42, i64::MAX] {
+            let cursor = EventCursor::after_sequence(sequence);
+            assert_eq!(
+                EventCursor::from_wire(&cursor.to_wire()),
+                Some(cursor),
+                "a checkpoint a consumer stored must come back as the same position"
+            );
+        }
+    }
+
+    #[test]
+    fn the_beginning_is_before_every_event() {
+        assert!(EventCursor::beginning() < EventCursor::after_sequence(1));
+    }
+
+    #[test]
+    fn a_malformed_cursor_is_rejected_rather_than_read_as_the_beginning() {
+        // Falling back to the beginning would replay the whole retained feed at a consumer
+        // that sent a typo, which is the expensive way to be forgiving.
+        for wire in ["", "evc_", "evc_abc", "12", "EVC_1", "evc_1.5", "cursor_1"] {
+            assert_eq!(
+                EventCursor::from_wire(wire),
+                None,
+                "{wire:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wire_form_is_not_a_bare_number_a_caller_would_do_arithmetic_on() {
+        // The point of the encoding: `cursor + 1` should not typecheck OR look sensible.
+        let wire = EventCursor::after_sequence(7).to_wire();
+        assert!(
+            wire.parse::<i64>().is_err(),
+            "{wire} reads as a plain integer"
+        );
+        assert!(wire.starts_with("evc_"), "{wire}");
     }
 }
