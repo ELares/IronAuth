@@ -23,6 +23,7 @@
 #![cfg(feature = "testing")]
 
 use ironauth_env::Env;
+use ironauth_store::EventPage;
 use ironauth_store::test_support::TestDatabase;
 use sqlx::Row;
 
@@ -281,18 +282,26 @@ async fn an_unrelated_open_transaction_stalls_the_whole_feed() {
     let pool = db.owner_pool();
     let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
 
-    // A fully committed event, with no writer of its own outstanding.
+    // ORDER MATTERS, and getting it wrong is how this test first passed for the wrong
+    // reason. The watermark is the oldest transaction id still running, so a row is
+    // withheld only when an older transaction was ALREADY OPEN when the row was written.
+    // Opening the bystander after the commit proves nothing: the row's xmin is already
+    // below the watermark and it is served correctly. The first draft did exactly that and
+    // passed anyway, because OTHER tests in this file happened to be holding older
+    // transactions open. It was measuring the suite, not its own fixture.
+    //
+    // So: the bystander opens first, and takes a transaction id by writing nothing at all.
+    let mut bystander = pool.begin().await.expect("begin bystander");
+    sqlx::query("SELECT pg_current_xact_id()")
+        .execute(&mut *bystander)
+        .await
+        .expect("bystander takes an xid");
+
+    // Only now is the event written and committed, beneath a transaction already running.
     let mut writer = pool.begin().await.expect("begin");
     let committed =
         insert_returning_sequence(&mut writer, &tenant, &environment, "evt_unrelated").await;
     writer.commit().await.expect("commit");
-
-    // An unrelated transaction that touches nothing at all, merely open.
-    let mut bystander = pool.begin().await.expect("begin bystander");
-    sqlx::query("SELECT 1")
-        .execute(&mut *bystander)
-        .await
-        .expect("bystander reads");
 
     let stalled = read_after_watermarked(pool, 0).await;
     assert!(
@@ -302,9 +311,105 @@ async fn an_unrelated_open_transaction_stalls_the_whole_feed() {
 
     bystander.rollback().await.expect("bystander ends");
 
-    let released = eventually_visible(pool, 0, &[committed]).await;
+    // The release side is deliberately NOT asserted, and the reason is the finding itself.
+    //
+    // Ending this bystander does not release the feed, because the watermark is held down
+    // by the OLDEST transaction anywhere on the cluster and the rest of this suite is
+    // running concurrently. An assertion here failed exactly that way once the file grew to
+    // seven tests. Pinning it would mean serialising the suite, which would hide the very
+    // property being demonstrated: under any concurrent workload the feed advances on
+    // somebody else's schedule.
+    //
+    // What IS deterministic, and what this test pins, is the withholding above.
+}
+
+/// Delete every event at or below `through`, standing in for the retention sweep.
+async fn prune_through(pool: &sqlx::PgPool, tenant: &str, environment: &str, through: i64) {
+    sqlx::query(
+        "DELETE FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND sequence <= $3",
+    )
+    .bind(tenant)
+    .bind(environment)
+    .bind(through)
+    .execute(pool)
+    .await
+    .expect("prune");
+}
+
+#[tokio::test]
+async fn a_cursor_that_aged_out_is_told_so_rather_than_handed_an_empty_page() {
+    // The distinction #107 forbids collapsing. A consumer whose cursor has been pruned past
+    // must NOT receive an empty page: it would read that as "nothing new", resume from a
+    // position that skipped everything pruned in between, and never learn it lost anything.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
+
+    let mut tx = pool.begin().await.expect("begin");
+    let first = insert_returning_sequence(&mut tx, &tenant, &environment, "evt_r1").await;
+    let second = insert_returning_sequence(&mut tx, &tenant, &environment, "evt_r2").await;
+    let third = insert_returning_sequence(&mut tx, &tenant, &environment, "evt_r3").await;
+    tx.commit().await.expect("commit");
+
+    // A consumer sitting at `first` has not yet seen `second` or `third`.
+    prune_through(pool, &tenant, &environment, second).await;
+
+    let outbox = db.store().scoped(scope).outbox();
+    let page = outbox.events_page_after(first, 100).await.expect("read");
+
+    match page {
+        EventPage::Gone { oldest_retained } => assert_eq!(
+            oldest_retained, third,
+            "the reconcile point must be the oldest event that still exists"
+        ),
+        EventPage::Page(events) => panic!(
+            "a pruned-past cursor must not be served a page; got {:?}",
+            events.iter().map(|m| m.sequence).collect::<Vec<_>>()
+        ),
+    }
+}
+
+#[tokio::test]
+async fn a_cursor_exactly_one_below_the_oldest_retained_event_has_missed_nothing() {
+    // The off-by-one this whole rule turns on. A consumer sitting one below the oldest
+    // retained event has missed NOTHING, and reporting Gone here would send a healthy
+    // consumer into a full resync after every prune.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
+
+    let mut tx = pool.begin().await.expect("begin");
+    let first = insert_returning_sequence(&mut tx, &tenant, &environment, "evt_b1").await;
+    let second = insert_returning_sequence(&mut tx, &tenant, &environment, "evt_b2").await;
+    tx.commit().await.expect("commit");
+
+    prune_through(pool, &tenant, &environment, first).await;
+
+    let outbox = db.store().scoped(scope).outbox();
+    // The cursor is `first`; the oldest retained is `second` == first + 1. Nothing lost.
+    let page = outbox.events_page_after(first, 100).await.expect("read");
     assert!(
-        released.contains(&committed),
-        "and is released once it ends: {released:?}"
+        matches!(page, EventPage::Page(_)),
+        "a cursor one below the oldest retained event has missed nothing: {page:?}"
     );
+    let _ = second;
+}
+
+#[tokio::test]
+async fn an_empty_feed_is_a_page_not_a_gone() {
+    // Nothing was pruned; there is simply nothing to send. Reporting Gone would send every
+    // brand-new consumer into a reconcile before it had read anything at all.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let outbox = db.store().scoped(scope).outbox();
+    let page = outbox.events_page_after(0, 100).await.expect("read");
+
+    assert_eq!(page, EventPage::Page(Vec::new()));
 }
