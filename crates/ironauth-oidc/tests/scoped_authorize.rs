@@ -142,7 +142,12 @@ async fn a_mismatched_scope_is_indistinguishable_from_an_unknown_client() {
 }
 
 #[tokio::test]
-async fn a_malformed_scope_in_the_path_is_refused_without_a_store_lookup() {
+async fn a_malformed_scope_in_the_path_is_refused() {
+    // Named for what it checks. An earlier name said "without a store lookup", which this
+    // body cannot see: it reads a status and a page, and a lookup that happened and then
+    // failed would produce the same two. The refusal really does precede any store call
+    // (`parse_scope` returns None before the handler touches state), but that is a claim
+    // about the code, and a test name has to be a claim about the assertions.
     let harness = Harness::start_store_backed().await;
     let client_id = harness.client_id().to_string();
 
