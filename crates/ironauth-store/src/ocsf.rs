@@ -162,6 +162,10 @@ const AUTHENTICATION_DOMAINS: &[&str] = &[
     "refresh_token",
     "risk",
     "signup_quarantine",
+    // An RFC 8693 exchange MINTS a credential from a credential (issue #125), which is the
+    // same event shape as the sibling grants beside it here: `jwt_bearer_assertion` and
+    // `device_code` are both "a presented credential was traded for an issued one".
+    "token_exchange",
     "trusted_device",
 ];
 

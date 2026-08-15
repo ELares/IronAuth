@@ -65,7 +65,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      impersonated refresh families, \
      impersonation authorizations, user trait login index, backfill login index job \
      kind, audit stream, audit stream backfill, audit chain, audit retention role, log streams, audit organization, log stream organization, log stream dead letters, \
-     authorization code DPoP binding, client allow bearer tokens.";
+     authorization code DPoP binding, client allow bearer tokens, \
+     client token exchange policy.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -671,7 +672,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        142,
+        143,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -709,7 +710,8 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
             90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108,
             109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
-            126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142
+            126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
+            143
         ]
     );
     let phase_of = |version: i64| async move {

@@ -1148,6 +1148,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0142_client_allow_bearer_tokens.sql"),
         },
+        Migration {
+            version: 143,
+            name: "client_token_exchange_policy",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0143_client_token_exchange_policy.sql"),
+        },
     ]
 }
 

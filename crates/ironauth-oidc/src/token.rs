@@ -146,6 +146,25 @@ pub struct TokenParams {
     /// credential the constrained device presents on every poll, so it is redacted
     /// from `Debug` and never logged in plaintext.
     pub device_code: Option<String>,
+    /// The RFC 8693 section 2.1 `subject_token`: the token being exchanged, representing
+    /// the identity the issued token will act for (issue #125). A bearer credential, so it
+    /// is redacted from `Debug`.
+    pub subject_token: Option<String>,
+    /// The RFC 8693 `subject_token_type`, identifying what `subject_token` is. REQUIRED
+    /// with it: the spec makes the type explicit rather than sniffed, so a caller cannot
+    /// have one kind of token read as another.
+    pub subject_token_type: Option<String>,
+    /// The RFC 8693 `actor_token`: who is acting on the subject's behalf, present only for
+    /// delegation. A bearer credential, so it is redacted from `Debug`.
+    pub actor_token: Option<String>,
+    /// The RFC 8693 `actor_token_type`, REQUIRED whenever `actor_token` is present.
+    pub actor_token_type: Option<String>,
+    /// The RFC 8693 `requested_token_type`: what the client wants back. Optional; omitted
+    /// means the client's configured default access-token format.
+    pub requested_token_type: Option<String>,
+    /// The RFC 8693 `audience`: the logical name of the target service the issued token is
+    /// for. Narrowing only, never widening.
+    pub audience: Option<String>,
 }
 
 impl fmt::Debug for TokenParams {
@@ -161,6 +180,13 @@ impl fmt::Debug for TokenParams {
             .field("has_refresh_token", &self.refresh_token.is_some())
             .field("has_assertion", &self.assertion.is_some())
             .field("has_device_code", &self.device_code.is_some())
+            // Both exchange tokens are bearer credentials: presence only, never the value.
+            .field("has_subject_token", &self.subject_token.is_some())
+            .field("subject_token_type", &self.subject_token_type)
+            .field("has_actor_token", &self.actor_token.is_some())
+            .field("actor_token_type", &self.actor_token_type)
+            .field("requested_token_type", &self.requested_token_type)
+            .field("audience", &self.audience)
             .finish_non_exhaustive()
     }
 }
@@ -220,6 +246,12 @@ async fn exchange(
         }
         Some(GrantType::DeviceCode) => {
             crate::device::device_code_grant(state, headers, params).await
+        }
+        // The RFC 8693 exchange DOES compose with resource indicators: `resource` and the
+        // RFC 8693 `audience` parameter both name a target service, and the handler unions
+        // them so naming one cannot silently widen past the other.
+        Some(GrantType::TokenExchange) => {
+            crate::token_exchange::token_exchange_grant(state, headers, params, &resources).await
         }
         None => Err(TokenError::UnsupportedGrantType),
     }
@@ -1616,7 +1648,7 @@ async fn merge_enriched_claims(
 
 /// Build the `200 OK` token response (RFC 6749 5.1) from the pre-minted tokens,
 /// including the refresh token (issue #21) when one was issued.
-fn token_response(
+pub(crate) fn token_response(
     minted: &IssuedTokens,
     bindings: &CodeBindings,
     refresh_token: Option<&str>,

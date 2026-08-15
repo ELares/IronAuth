@@ -314,6 +314,13 @@ pub struct AuthenticatedClient {
     /// The space-separated OAuth grant types this client is REGISTERED for (issue
     /// #763), read off the registration that just authenticated.
     pub grant_types: String,
+    /// Whether this client may use the RFC 8693 exchange in IMPERSONATION mode (issue
+    /// #125). Read off the registration that just authenticated, so the exchange cannot
+    /// consult a different row than the one it verified.
+    pub token_exchange_impersonation_allowed: bool,
+    /// Whether this client may receive a refresh token from an RFC 8693 exchange (issue
+    /// #125). Read off the same registration, for the same reason.
+    pub token_exchange_refresh_allowed: bool,
 }
 
 /// Why the reusable client-authentication seam rejected a request. The caller maps
@@ -532,6 +539,8 @@ async fn authenticate_presented(
                 auth_method: registered,
                 allow_bearer_tokens: record.allow_bearer_tokens,
                 grant_types: record.grant_types.clone(),
+                token_exchange_impersonation_allowed: record.token_exchange_impersonation_allowed,
+                token_exchange_refresh_allowed: record.token_exchange_refresh_allowed,
             }),
             Err(SecretAuthError::MethodMismatch) => {
                 fail!(&method_str, ClientAuthDiagnosticReason::MethodMismatch)
@@ -551,6 +560,9 @@ async fn authenticate_presented(
                     auth_method: registered,
                     allow_bearer_tokens: record.allow_bearer_tokens,
                     grant_types: record.grant_types.clone(),
+                    token_exchange_impersonation_allowed: record
+                        .token_exchange_impersonation_allowed,
+                    token_exchange_refresh_allowed: record.token_exchange_refresh_allowed,
                 }),
                 // The assertion failed: the diagnostic carries the SPECIFIC reject
                 // reason (bad signature, expired, clock skew, audience mismatch,
@@ -1368,6 +1380,9 @@ mod tests {
             // The 0021 column default: every pre-existing client is registered for
             // authorization_code alone, which is the state #763 is about.
             grant_types: "authorization_code".to_owned(),
+            // Default-deny in fixtures too: a test that wants either policy must say so.
+            token_exchange_impersonation_allowed: false,
+            token_exchange_refresh_allowed: false,
         }
     }
 

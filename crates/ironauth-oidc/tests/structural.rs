@@ -22,12 +22,12 @@
 use ironauth_oidc::{GrantType, PkceMethod, ResponseMode, ResponseType};
 
 #[test]
-fn grant_type_registry_expresses_the_five_serviced_grants_and_no_ropc() {
-    // The whole registry is exactly five variants: the authorization-code grant, the
+fn grant_type_registry_expresses_the_six_serviced_grants_and_no_ropc() {
+    // The whole registry is exactly six variants: the authorization-code grant, the
     // refresh-token grant (issue #21), the client-credentials grant (issue #23), the
-    // JWT bearer assertion grant (issue #26), and the RFC 8628 device-code grant
-    // (issue #24). No other grant type is representable (ROPC has no variant at all,
-    // and RFC 8693 token exchange is a separate M13 grant).
+    // JWT bearer assertion grant (issue #26), the RFC 8628 device-code grant
+    // (issue #24), and the RFC 8693 token-exchange grant (issue #125). No other grant
+    // type is representable, and ROPC has no variant at all.
     assert_eq!(
         GrantType::ALL,
         &[
@@ -36,9 +36,10 @@ fn grant_type_registry_expresses_the_five_serviced_grants_and_no_ropc() {
             GrantType::ClientCredentials,
             GrantType::JwtBearer,
             GrantType::DeviceCode,
+            GrantType::TokenExchange,
         ]
     );
-    assert_eq!(GrantType::ALL.len(), 5);
+    assert_eq!(GrantType::ALL.len(), 6);
 
     // Every offered grant round-trips through its exact wire spelling.
     assert_eq!(
@@ -67,15 +68,23 @@ fn grant_type_registry_expresses_the_five_serviced_grants_and_no_ropc() {
         GrantType::DeviceCode.as_str(),
         "urn:ietf:params:oauth:grant-type:device_code"
     );
+    // The token-exchange grant likewise uses its long URN wire spelling (RFC 8693).
+    assert_eq!(
+        GrantType::parse("urn:ietf:params:oauth:grant-type:token-exchange"),
+        Some(GrantType::TokenExchange)
+    );
+    assert_eq!(
+        GrantType::TokenExchange.as_str(),
+        "urn:ietf:params:oauth:grant-type:token-exchange"
+    );
 
     // Every forbidden or unknown grant type is unrepresentable: it parses to
     // None, so it can never resolve to a handler. ROPC is the headline case.
     for forbidden in [
         "password", // ROPC: structurally excluded.
         "implicit",
-        // RFC 8693 token exchange is a separate M13 grant, not serviced here.
-        "urn:ietf:params:oauth:grant-type:token-exchange",
-        "device_code", // the bare spelling is NOT the serviced URN.
+        "device_code",    // the bare spelling is NOT the serviced URN.
+        "token-exchange", // likewise: the bare token is not the serviced URN.
         "",
         "Authorization_Code", // casing is exact.
         "Refresh_Token",      // casing is exact.

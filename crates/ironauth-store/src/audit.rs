@@ -707,6 +707,10 @@ pub enum Action {
     /// because relaxing it WEAKENS a client, and a weakening should be a recorded
     /// act rather than a silent column update.
     ClientAllowBearerTokensSet,
+    /// A client's RFC 8693 token-exchange policy was set (issue #125): the
+    /// impersonation and/or exchanged-refresh switches. Both default-deny, so this row
+    /// records a WEAKENING and is audited like the other per-client posture toggles.
+    ClientTokenExchangePolicySet,
     /// A DCR initial access token was minted through the management API (issue
     /// #31, RFC 7591 section 1.2). The token authorizes future self-service client
     /// registrations, optionally under an attached policy chain.
@@ -758,6 +762,17 @@ pub enum Action {
     /// (issue #26): a validated external assertion was exchanged for a token under
     /// the mapped identity. No refresh token accompanies it (RFC 7521 4.1).
     JwtBearerAssertionIssue,
+    /// A token was issued under the RFC 8693 token-exchange grant (issue #125): a
+    /// presented `subject_token` was revalidated in full and traded for a strictly weaker
+    /// one.
+    ///
+    /// A DISTINCT verb rather than [`Action::TokenIssue`], because an exchange is the one
+    /// issuance where the token's subject need not be the party that authenticated. Every
+    /// CVE in this family is an exchange that should not have been permitted, so "which
+    /// issuances were exchanges" has to be answerable from the trail without joining
+    /// anything: the criterion in #125 asks for an audit event on EVERY exchange, and
+    /// impersonation in particular is only defensible because it is recorded.
+    TokenExchangeIssue,
     /// A client's RFC 8707 resource-indicator policy was set (issue #28): the
     /// per-client allowed-resource allowlist and the no-resource behavior
     /// (default audience or refusal).
@@ -1442,6 +1457,7 @@ impl Action {
                 "client.require_pushed_authorization_requests.set"
             }
             Action::ClientAllowBearerTokensSet => "client.allow_bearer_tokens.set",
+            Action::ClientTokenExchangePolicySet => "client.token_exchange_policy.set",
             Action::DcrInitialAccessTokenMint => "dcr.iat_minted",
             Action::DcrPolicyCreate => "dcr.policy_created",
             Action::DcrPolicyRejected => "dcr.policy_rejected",
@@ -1459,6 +1475,7 @@ impl Action {
                 "external_assertion_subject_mapping.set_enabled"
             }
             Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",
+            Action::TokenExchangeIssue => "token_exchange.issue",
             Action::ClientResourceIndicatorPolicySet => "client.resource_indicator_policy.set",
             Action::ClientAllowedScopesSet => "client.allowed_scopes.set",
             Action::DeviceCodeIssue => "device_code.issue",

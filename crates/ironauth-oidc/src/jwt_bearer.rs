@@ -533,7 +533,7 @@ async fn resolve_mapped_principal(
 /// answer available. This scope cannot resolve a foreign user's state (RLS and the
 /// tenant/environment SQL filter both stop it), so the fence cannot be applied to it, and
 /// an unfenceable user-bound mint is exactly what this issue exists to prevent.
-enum MappedPrincipal {
+pub(crate) enum MappedPrincipal {
     /// A [`ironauth_store::UserId`] minted in THIS scope: lifecycle bearing and
     /// readable here, so the fence applies.
     User,
@@ -557,7 +557,7 @@ impl MappedPrincipal {
     /// whose wire form is this grant's uniform `invalid_grant`, byte-identical to every
     /// other mapping failure. A caller cannot vary the principal and so cannot read
     /// anything out of the distinction.
-    fn classify(principal: &str, scope: &Scope) -> Self {
+    pub(crate) fn classify(principal: &str, scope: &Scope) -> Self {
         if UserId::parse_in_scope(principal, scope).is_ok() {
             return MappedPrincipal::User;
         }
@@ -732,6 +732,8 @@ async fn mint_and_persist(
             client_id: client_id_str,
             oauth_scope: requested_scope,
             custom_claims: &no_custom,
+            // A mapped federated identity acts for itself: no `act` chain (issue #125).
+            act: None,
         },
         &target,
     )

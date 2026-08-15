@@ -2411,6 +2411,50 @@ impl Harness {
             .expect("set the client bearer posture");
     }
 
+    /// Register `grant_types` on a client in an ARBITRARY scope.
+    ///
+    /// The unscoped variant writes in the harness's own scope, which cannot set up a
+    /// cross-tenant test: the foreign client would be left unregistered for the grant, and
+    /// the refusal under test would then be attributable to the registration rather than
+    /// to the tenant boundary.
+    pub async fn set_client_grant_types_in(
+        &self,
+        scope: Scope,
+        client_id: &ClientId,
+        grant_types: &str,
+    ) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(scope)
+            .acting(actor, corr)
+            .clients()
+            .set_device_grant(&self.env, client_id, grant_types, None)
+            .await
+            .expect("set grant types in scope");
+    }
+
+    /// Set a client's RFC 8693 token-exchange policy (issue #125).
+    ///
+    /// Both switches ship default-deny, so a test that exercises impersonation or an
+    /// exchanged refresh token must call this: the fixture states the condition rather
+    /// than inheriting a relaxed default from the harness.
+    pub async fn set_token_exchange_policy(
+        &self,
+        client_id: &ClientId,
+        impersonation: bool,
+        refresh: bool,
+    ) {
+        let (actor, corr) = self.seeding_actor();
+        self.db()
+            .control_store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .set_token_exchange_policy(&self.env, client_id, impersonation, refresh)
+            .await
+            .expect("set the token exchange policy");
+    }
+
     /// Create a PUBLIC client that registered `require_auth_time` (issue #14), so
     /// its ID tokens carry `auth_time` even without a `max_age` request. Returns
     /// its id.
@@ -2526,6 +2570,32 @@ impl Harness {
         let query = format!(
             "response_type=code&client_id={client_id}&redirect_uri={}",
             enc(REDIRECT_URI)
+        );
+        let (status, headers, body) = self.authorize_with_cookie(&query, &cookie).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
+        location_param(&headers, "code").expect("code in redirect")
+    }
+
+    /// Issue an authorization code for `client_id` that GRANTS `scope`.
+    ///
+    /// The unscoped variant sends no `scope` parameter, so the resulting access token
+    /// carries no scope at all. That is fine for suites testing something else, but an RFC
+    /// 8693 exchange refuses such a token outright ("nothing to narrow from"), so a
+    /// downscoping test built on it would be measuring the empty-scope rule rather than
+    /// the narrowing it means to test.
+    pub async fn issue_authenticated_code_with_scope(
+        &self,
+        client_id: &str,
+        scope: &str,
+    ) -> String {
+        let subject = self.seed_unique_user().await;
+        self.grant_consent_scoped(&subject, client_id, Some(scope))
+            .await;
+        let cookie = self.session_cookie(&subject).await;
+        let query = format!(
+            "response_type=code&client_id={client_id}&redirect_uri={}&scope={}",
+            enc(REDIRECT_URI),
+            enc(scope)
         );
         let (status, headers, body) = self.authorize_with_cookie(&query, &cookie).await;
         assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
