@@ -212,7 +212,7 @@ jobs:
           command: check
 
   dev-boot-time:
-    name: emulator boots and serves within its budget
+    name: emulator boots within budget and reaches nothing off-machine
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -234,6 +234,14 @@ jobs:
       # it shipped in twice during this issue -- up, quiet, and useless.
       - name: Measure boot to serving
         run: PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) ./scripts/dev-boot-time.sh
+      # Issue #121 criterion 2: the emulator is FULLY OFFLINE. Inspection rather than
+      # enforcement, deliberately: a severed network would prove only that the emulator
+      # survives having none, where this catches a process that quietly reaches out and
+      # ignores the failure.
+      - name: Install lsof
+        run: sudo apt-get install -y lsof
+      - name: Assert no egress
+        run: PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) ./scripts/dev-no-egress.sh
 
   invariants:
     name: invariant lints, dash scan, compat matrix

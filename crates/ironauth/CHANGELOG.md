@@ -6,6 +6,30 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A no-egress harness for the emulator (issue #121, criterion 2).**
+  `scripts/dev-no-egress.sh` asserts that while `ironauth dev` is up and serving, the process
+  holds no TCP connection whose peer is off this machine. A CI job runs it.
+
+  - **Inspection, not enforcement, and that is the stronger check here.** A sandbox with the
+    network severed would prove only that the emulator SURVIVES having no network. A process
+    that quietly phoned a telemetry endpoint and ignored the failure would pass that and fail
+    this one, and that is the failure worth catching.
+
+  - **It exercises the surfaces before looking.** A check run against an idle process would
+    pass without the emulator having done anything.
+
+  - **The detection is proved to FIRE.** Run against synthetic peers it flags
+    `140.82.113.4:443` while correctly ignoring loopback, IPv6 loopback, and listeners (which
+    have no peer at all). A no-egress check that cannot detect egress is worse than none,
+    because it certifies the property it never tested.
+
+  - **What it does NOT claim**, stated in the script rather than left to be assumed: that no
+    egress can ever happen. It observes one live process over a window in which it boots and
+    serves discovery and JWKS. A call made only on some later path is out of its reach, and
+    claiming otherwise would be the guarantee-by-assertion this project keeps finding and
+    removing.
+
+
 - **The emulator's boot time is MEASURED and asserted (issue #121, criterion 1).**
   `scripts/dev-boot-time.sh` times `ironauth dev` from launch to serving and fails over
   budget; a CI job runs it. Measured 1.16s against a 5 second budget, on a debug build.
