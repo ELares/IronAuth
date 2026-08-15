@@ -91,7 +91,7 @@ use ironauth_env::Env;
 use ironauth_jose::JwsAlgorithm;
 use ironauth_store::{
     Action, ActorRef, CorrelationId, DynamicClientRecord, DynamicClientUpdate, GuardrailSet,
-    InitialAccessTokenId, NewDynamicClient, Scope, ServiceId, StoreError,
+    InitialAccessTokenId, NewDynamicClient, Scope, ServiceId, StoreError, StoredClientId,
     redirect_uri_is_registrable,
 };
 use serde_json::{Value, json};
@@ -440,7 +440,7 @@ pub async fn update(
     // token's hash no longer matches, so it stops working immediately.
     let new_token = generate_registration_token(state.env());
     let new_token_hash = hash_secret(&new_token);
-    let actor = client_service_actor(&record.id);
+    let actor = client_service_actor(StoredClientId::Registered(&record.id));
 
     let store_update = DynamicClientUpdate {
         display_name: &validated.display_name,
@@ -493,7 +493,7 @@ pub async fn delete(
         return unauthorized();
     };
 
-    let actor = client_service_actor(&record.id);
+    let actor = client_service_actor(StoredClientId::Registered(&record.id));
     match state
         .store()
         .scoped(scope)
@@ -752,7 +752,7 @@ async fn record_policy_rejection_for_client(
     // Operator-safe detail dimension (FIX 11): the offending property, so the update
     // rejection is diagnosable from the audit table alone. The wire stays opaque.
     let detail = Some(rejection.property.as_str());
-    let actor = client_service_actor(client_id);
+    let actor = client_service_actor(StoredClientId::Registered(client_id));
     let correlation = CorrelationId::generate(state.env());
     if let Err(error) = state
         .store()

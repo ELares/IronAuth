@@ -1582,6 +1582,17 @@ impl StoredClientId<'_> {
         }
     }
 
+    /// The unique component, for deriving a stable per-client value (an actor reference,
+    /// for instance). A CIMD client answers from its own `cimc_`, so anything derived from
+    /// it stays distinct from every registration.
+    #[must_use]
+    pub fn unique_bytes(&self) -> [u8; COMPONENT_BYTES] {
+        match self {
+            Self::Registered(id) => id.unique_bytes(),
+            Self::Cimd(id) => id.unique_bytes(),
+        }
+    }
+
     /// Whether this is a CIMD client rather than a registration.
     #[must_use]
     pub fn is_cimd(&self) -> bool {
@@ -2162,6 +2173,25 @@ pub trait AuditTarget {
 
     /// The identifier's wire form recorded in `audit_log.target_id`.
     fn audit_target_id(&self) -> String;
+}
+
+/// A stored client identifier audits as the KIND it actually is.
+///
+/// This is where the separate `cimc_` kind earns itself. An audit row for a CIMD client
+/// records `target_kind = "cimc"`, so an operator reading the log sees an unregistered,
+/// self-described client as exactly that. Collapsing the two kinds here would have left
+/// the distinction alive in memory and absent from the only place anyone looks afterwards.
+impl AuditTarget for StoredClientId<'_> {
+    fn audit_target_kind(&self) -> &'static str {
+        match self {
+            Self::Registered(_) => ClientKind::PREFIX,
+            Self::Cimd(_) => CimdClientKind::PREFIX,
+        }
+    }
+
+    fn audit_target_id(&self) -> String {
+        self.to_string()
+    }
 }
 
 impl<K: ScopedKind> AuditTarget for ScopedId<K> {
@@ -3151,5 +3181,23 @@ mod tests {
         assert_eq!(StoredClientId::Cimd(&cimd).scope(), scope);
         assert_ne!(StoredClientId::Cimd(&cimd).scope(), other);
         assert!(!StoredClientId::Registered(&registered).is_cimd());
+    }
+
+    #[test]
+    fn a_cimd_client_audits_as_cimc_and_never_as_cli() {
+        let env = test_env();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let registered = ClientId::generate(&env, &scope);
+        let cimd = CimdClientId::derive(&scope, CIMD_URL.as_bytes());
+
+        assert_eq!(
+            StoredClientId::Registered(&registered).audit_target_kind(),
+            "cli"
+        );
+        assert_eq!(StoredClientId::Cimd(&cimd).audit_target_kind(), "cimc");
+        assert_eq!(
+            StoredClientId::Cimd(&cimd).audit_target_id(),
+            cimd.to_string()
+        );
     }
 }

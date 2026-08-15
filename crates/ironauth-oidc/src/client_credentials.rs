@@ -38,7 +38,7 @@ use axum::http::{HeaderMap, header};
 use axum::response::Response;
 use ironauth_store::{
     ClientCredentialsAccess, ClientId, ClientScopePolicy, CorrelationId, GrantId,
-    IssueClientCredentials, NewOpaqueAccessToken, Scope, StoreError,
+    IssueClientCredentials, NewOpaqueAccessToken, Scope, StoreError, StoredClientId,
 };
 use serde_json::json;
 
@@ -184,7 +184,7 @@ async fn mint_and_persist(
         .store()
         .scoped(scope)
         .acting(
-            client_service_actor(client_id),
+            client_service_actor(StoredClientId::Registered(client_id)),
             CorrelationId::generate(state.env()),
         )
         .service_accounts()
@@ -261,7 +261,7 @@ async fn mint_and_persist(
         .store()
         .scoped(scope)
         .acting(
-            client_service_actor(client_id),
+            client_service_actor(StoredClientId::Registered(client_id)),
             CorrelationId::generate(state.env()),
         )
         .authorization()

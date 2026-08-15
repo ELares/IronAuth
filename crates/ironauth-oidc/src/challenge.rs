@@ -92,7 +92,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use ironauth_jose::{DpopExpectations, validate_dpop_proof};
-use ironauth_store::{ClientId, ClientRecord, FlowId, Scope};
+use ironauth_store::{ClientId, ClientRecord, FlowId, Scope, StoredClientId};
 
 use crate::authorize::{
     AdminConsentOutcome, ChallengeCodeContext, mint_challenge_code, user_is_quarantined,
@@ -1069,7 +1069,14 @@ async fn complete_challenge(
         // introduce, change, or clear it, so the code binds the key the login was driven with.
         dpop_jkt: params.dpop_jkt.as_deref(),
     };
-    match mint_challenge_code(state, scope, client_id, &context).await {
+    match mint_challenge_code(
+        state,
+        scope,
+        StoredClientId::Registered(client_id),
+        &context,
+    )
+    .await
+    {
         Ok(authorization_code) => success(&ChallengeSuccess { authorization_code }),
         Err(()) => error(
             StatusCode::INTERNAL_SERVER_ERROR,

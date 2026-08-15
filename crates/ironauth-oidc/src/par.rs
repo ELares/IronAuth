@@ -37,7 +37,9 @@
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_store::{ClientId, CorrelationId, PushRequest, PushedRequestId, Scope};
+use ironauth_store::{
+    ClientId, CorrelationId, PushRequest, PushedRequestId, Scope, StoredClientId,
+};
 use serde::Deserialize;
 
 use crate::authorize::{
@@ -237,16 +239,20 @@ async fn push(
     //    channel rather than being deferred to `/authorize`, and reusing the one helper
     //    means the PAR and authorize checks cannot diverge. A store fault stays an
     //    opaque 500 `server_error` (fail closed), never a 400 mislabeled invalid_target.
-    validate_authorize_resources(state, scope, &client_id, &resources)
-        .await
-        .map_err(|code| match code {
-            AuthzErrorCode::ServerError => PushedAuthError::ServerError,
-            code => PushedAuthError::Validation {
-                code,
-                description: "the requested resource is invalid, unknown, or not allowed"
-                    .to_owned(),
-            },
-        })?;
+    validate_authorize_resources(
+        state,
+        scope,
+        StoredClientId::Registered(&client_id),
+        &resources,
+    )
+    .await
+    .map_err(|code| match code {
+        AuthzErrorCode::ServerError => PushedAuthError::ServerError,
+        code => PushedAuthError::Validation {
+            code,
+            description: "the requested resource is invalid, unknown, or not allowed".to_owned(),
+        },
+    })?;
 
     // 5. Validate the COMPLETE authorization request with EXACTLY the same rules as
     //    `/authorize`, through the ONE shared validator. An error surfaces HERE on the
@@ -272,7 +278,10 @@ async fn push(
     if let Err(error) = state
         .store()
         .scoped(scope)
-        .acting(client_service_actor(&client_id), correlation)
+        .acting(
+            client_service_actor(StoredClientId::Registered(&client_id)),
+            correlation,
+        )
         .pushed_authorization_requests()
         .push(
             state.env(),
