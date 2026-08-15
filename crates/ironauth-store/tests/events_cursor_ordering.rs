@@ -422,3 +422,54 @@ async fn an_empty_feed_is_a_page_not_a_gone() {
 
     assert_eq!(page, EventPage::Page(Vec::new()));
 }
+
+#[tokio::test]
+async fn the_feed_orders_by_sequence_which_is_not_commit_order() {
+    // #107 criterion 2 asks that ordering "matches commit order of the originating
+    // transactions". The watermark does NOT deliver that, and this test is here to stop
+    // anyone concluding it does from the fact that the gap tests pass.
+    //
+    // The watermark solves a DIFFERENT problem. It stops a cursor advancing past an event
+    // that has not committed yet, which is what makes replay complete and repeatable
+    // (criterion 1). It says nothing about the ORDER events are served in, because they are
+    // served by sequence, and sequence is assigned at INSERT.
+    //
+    // So when two writers overlap and the later-sequenced one commits first, the feed emits
+    // them in the opposite order to the order they became visible. Criterion 2 therefore
+    // needs a commit-ordered appender, not this. Recorded as a measurement rather than an
+    // opinion, because the two criteria look adjacent and are satisfied by different things.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
+
+    let mut early = pool.begin().await.expect("begin early");
+    let early_seq = insert_returning_sequence(&mut early, &tenant, &environment, "evt_co_a").await;
+
+    let mut late = pool.begin().await.expect("begin late");
+    let late_seq = insert_returning_sequence(&mut late, &tenant, &environment, "evt_co_b").await;
+
+    // COMMIT ORDER: the higher sequence becomes visible first.
+    late.commit().await.expect("commit late");
+    early.commit().await.expect("commit early");
+    let commit_order = vec![late_seq, early_seq];
+
+    let served = eventually_visible(pool, 0, &[early_seq, late_seq]).await;
+    let feed_order: Vec<i64> = served
+        .into_iter()
+        .filter(|s| *s == early_seq || *s == late_seq)
+        .collect();
+
+    assert_eq!(
+        feed_order,
+        vec![early_seq, late_seq],
+        "the feed serves in sequence order"
+    );
+    assert_ne!(
+        feed_order, commit_order,
+        "and sequence order is NOT commit order here, which is exactly why criterion 2 \
+         needs a commit-ordered appender rather than this watermark"
+    );
+}
+
