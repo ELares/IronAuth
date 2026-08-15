@@ -6,6 +6,30 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator now SERVES: `ironauth dev` provisions the seeded environment's signing key
+  (issue #121).** Discovery and JWKS answer 200 with a real document. That is the last piece
+  criterion 1 was missing.
+
+  - **Why every scoped endpoint 404-ed before.** A tenant, an environment and a serving state
+    are not enough: without a signing key the environment has no issuer entry, and
+    `registry.entry_for(scope)` returns `None` -- the SAME answer it gives for a scope that
+    never existed. So the server started cleanly, logged nothing, and 404-ed everything, which
+    reads as a broken emulator rather than an unprovisioned one.
+
+  - **Ed25519 from a DEDICATED entropy stream**, like the seeded identifiers, so the key does
+    not change because unrelated code drew a byte earlier in the boot. Published and active
+    from the epoch, so it signs and appears in the JWKS the moment the server answers rather
+    than after a delay nobody configured.
+
+  - **The key is built before it is persisted**, purely to fail loudly on material the signer
+    would reject rather than storing bytes that first break at the token endpoint.
+
+  - **The bring-up test now covers the whole path** -- cluster, roles, schema, seeds, key --
+    and re-runs the seeds AND the schema to pin idempotence. A dev restart against an existing
+    `DATABASE_URL` does exactly that, so a second run duplicating a tenant or failing on an
+    existing key would break it.
+
+
 - **Declarative idempotent seeds for the emulator (issue #121, criterion 3).** `ironauth dev`
   seeds an operator, a tenant, its first environment, and the environment's serving state
   before the server boots, and prints the resulting scoped issuer URL.
