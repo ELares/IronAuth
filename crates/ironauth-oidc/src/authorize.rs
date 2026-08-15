@@ -32,7 +32,8 @@ use ironauth_config::QuarantineConfig;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId, GrantId,
     GrantedConsent, IssueCode, OrganizationId, PushedRequestId, Scope, SessionId, StoreError,
-    UserId, admin_grant_covers_scope, redirect_uri_is_registrable, redirect_uri_matches,
+    StoredClientId, UserId, admin_grant_covers_scope, redirect_uri_is_registrable,
+    redirect_uri_matches,
 };
 use serde::{Deserialize, Serialize};
 
@@ -3257,7 +3258,7 @@ async fn issue_code_core(
     let issue = IssueCode {
         code_id: &code_id,
         grant_id: &grant_id,
-        client_id,
+        client_id: StoredClientId::Registered(client_id),
         redirect_uri,
         browserless,
         nonce: resolved.nonce,

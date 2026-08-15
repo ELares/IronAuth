@@ -11,8 +11,8 @@ use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewPolicyDecisionTrace,
     NewRefreshFamily, NewSession, NewTokenSizeEvent, PolicyDecisionInputs,
     PolicyDecisionTraceQuery, PolicyKind, PolicyOutcome, PolicyTraceSignal, RefreshFamilyId,
-    RefreshTokenId, Scope, SessionId, StoreError, TokenSizeEventsRepo, TokenSizeKind,
-    TokenSizeReason, refresh_token_digest,
+    RefreshTokenId, Scope, SessionId, StoreError, StoredClientId, TokenSizeEventsRepo,
+    TokenSizeKind, TokenSizeReason, refresh_token_digest,
 };
 
 #[tokio::test]
@@ -685,7 +685,7 @@ async fn seed_grant(
             IssueCode {
                 code_id: &code_id,
                 grant_id: &grant_id,
-                client_id: &client_id,
+                client_id: StoredClientId::Registered(&client_id),
                 redirect_uri: "https://client.test/cb",
                 browserless: false,
                 nonce: None,

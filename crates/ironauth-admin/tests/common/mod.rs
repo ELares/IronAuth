@@ -17,8 +17,8 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewDynamicClient,
-    NewRefreshFamily, NewSession, RefreshFamilyId, RefreshTokenId, Scope, SessionId, Store, UserId,
-    refresh_token_digest,
+    NewRefreshFamily, NewSession, RefreshFamilyId, RefreshTokenId, Scope, SessionId, Store,
+    StoredClientId, UserId, refresh_token_digest,
 };
 use tower::ServiceExt;
 
@@ -863,7 +863,7 @@ impl Harness {
                 IssueCode {
                     code_id: &code_id,
                     grant_id: &grant_id,
-                    client_id: &client,
+                    client_id: StoredClientId::Registered(&client),
                     redirect_uri: "https://rp.example/cb",
                     browserless: false,
                     nonce: None,

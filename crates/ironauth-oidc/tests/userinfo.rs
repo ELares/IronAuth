@@ -22,7 +22,7 @@ use common::{
 use ironauth_config::{OidcConfig, TokenFormat as ConfigTokenFormat};
 use ironauth_store::{
     ActorRef, AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, IssuedTokenId,
-    NewOpaqueAccessToken, ServiceId, opaque_access_token_digest,
+    NewOpaqueAccessToken, ServiceId, StoredClientId, opaque_access_token_digest,
 };
 use serde_json::Value;
 use std::time::Duration;
@@ -688,7 +688,7 @@ async fn seed_opaque_token_with_audience(
             IssueCode {
                 code_id: &code_id,
                 grant_id: &grant_id,
-                client_id: &code_client,
+                client_id: StoredClientId::Registered(&code_client),
                 redirect_uri: REDIRECT_URI,
                 browserless: false,
                 nonce: None,
