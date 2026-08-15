@@ -215,6 +215,7 @@ use crate::views::{
                                      so admin mutations pass the sudo freshness gate")
     ),
     paths(
+        crate::event_feed::read_event_feed,
         crate::operators::list_operators,
         crate::operators::get_operator,
         crate::resource_types::list_resource_types,
@@ -477,6 +478,9 @@ use crate::views::{
         crate::resource_servers::ResourceServerList,
         crate::resource_servers::UpdateResourceServerRequest,
         crate::org_roles::OrgRoleView,
+        crate::event_feed::EventFeedPage,
+        crate::event_feed::FeedEvent,
+        crate::event_feed::FeedGone,
         crate::org_roles::OrgRoleList,
         crate::org_roles::CreateOrgRoleRequest,
         crate::org_roles::SetOrgDefaultRoleRequest,

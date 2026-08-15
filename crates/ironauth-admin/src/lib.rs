@@ -57,6 +57,7 @@ mod dcr;
 mod diagnostics;
 mod environments;
 mod error;
+mod event_feed;
 pub mod events;
 mod export;
 mod flow_versions;
@@ -587,6 +588,13 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants/{grant_id}",
             delete(project_grants::withdraw_project_grant),
+        )
+        // The ordered event feed (issue #107): the cursor-paginated READ surface over the
+        // log, recommended over webhooks for data synchronisation. An aged-out cursor is a
+        // 410 carrying the oldest cursor that still resolves, never an empty 200.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/events",
+            get(event_feed::read_event_feed),
         )
         // Organization roles (issue #97): first-class, per-organization named roles.
         // A role in M10 is a NAME only; what it grants is issue #98. There is no cap
