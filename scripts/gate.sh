@@ -192,6 +192,8 @@ scripts/openapi-lint.sh
 python3 scripts/openapi-changelog.py --self-test
 # The published wire-format contract must still describe the code (issue #122).
 python3 scripts/sdk-contract.py --check
+# The events-vs-webhooks guidance must still match the code it quotes (issue #107).
+python3 scripts/events-vs-webhooks.py --check
 
 echo "==> fuzz matrix freshness (every registered fuzz target has a CI matrix row)"
 scripts/fuzz-matrix-freshness.sh
