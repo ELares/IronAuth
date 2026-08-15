@@ -23,8 +23,8 @@
 #![cfg(feature = "testing")]
 
 use ironauth_env::Env;
-use ironauth_store::EventPage;
 use ironauth_store::test_support::TestDatabase;
+use ironauth_store::{EventCursor, EventPage};
 use sqlx::Row;
 
 /// Seed a real (tenant, environment) so the table's foreign keys are satisfied.
@@ -358,7 +358,10 @@ async fn a_cursor_that_aged_out_is_told_so_rather_than_handed_an_empty_page() {
     prune_through(pool, &tenant, &environment, second).await;
 
     let outbox = db.store().scoped(scope).outbox();
-    let page = outbox.events_page_after(first, 100).await.expect("read");
+    let page = outbox
+        .events_page_after(EventCursor::after_sequence(first), 100)
+        .await
+        .expect("read");
 
     match page {
         EventPage::Gone { oldest_retained } => assert_eq!(
@@ -392,7 +395,10 @@ async fn a_cursor_exactly_one_below_the_oldest_retained_event_has_missed_nothing
 
     let outbox = db.store().scoped(scope).outbox();
     // The cursor is `first`; the oldest retained is `second` == first + 1. Nothing lost.
-    let page = outbox.events_page_after(first, 100).await.expect("read");
+    let page = outbox
+        .events_page_after(EventCursor::after_sequence(first), 100)
+        .await
+        .expect("read");
     assert!(
         matches!(page, EventPage::Page(_)),
         "a cursor one below the oldest retained event has missed nothing: {page:?}"
@@ -409,7 +415,10 @@ async fn an_empty_feed_is_a_page_not_a_gone() {
     let scope = db.seed_scope(&env).await;
 
     let outbox = db.store().scoped(scope).outbox();
-    let page = outbox.events_page_after(0, 100).await.expect("read");
+    let page = outbox
+        .events_page_after(EventCursor::beginning(), 100)
+        .await
+        .expect("read");
 
     assert_eq!(page, EventPage::Page(Vec::new()));
 }
