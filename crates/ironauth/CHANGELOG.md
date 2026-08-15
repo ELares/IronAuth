@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator seeds a usable CLIENT (issue #121).** `ironauth dev` now prints an issuer and
+  a `client_id`, and the authorization endpoint accepts it: discovery 200, JWKS 200,
+  `/authorize` 303 to the login page.
+
+  - **Public (`none`), not confidential.** The emulator exists to drive flows from a CLI or a
+    sample app, and both use a public client with a loopback redirect. A confidential one
+    would need a secret every quickstart then has to carry.
+
+  - **`127.0.0.1`, never `localhost`.** RFC 8252 loopback matching is port-agnostic but exact
+    in every other respect, and this server does not treat the NAME as loopback, so a
+    registration naming it could never match an ephemeral port. Verified end to end: an
+    authorization request on port 5555 matched a registration of `http://127.0.0.1/callback`
+    and returned 303, which is the same matching `ironauth login` depends on.
+
+  - **Both values are PRINTED**, because a flow needs each and neither is derivable by the
+    caller. An emulator that seeds a client without saying which one has made the developer
+    read the database to use it.
+
+
 - **The emulator now SERVES: `ironauth dev` provisions the seeded environment's signing key
   (issue #121).** Discovery and JWKS answer 200 with a real document. That is the last piece
   criterion 1 was missing.
