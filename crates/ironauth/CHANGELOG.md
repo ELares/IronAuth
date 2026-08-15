@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator's message capture sink (issue #121, criterion 5).** Email and SMS one-time
+  codes are captured and readable, so CI can assert a complete login without a mail server.
+
+  - **A SEPARATE loopback listener, not a route on the OIDC router.** This endpoint hands out
+    live one-time codes in plaintext, which is the entire point in dev and catastrophic
+    anywhere else. Mounting it on the production router would make safety depend on a
+    conditional staying correct forever: one refactor moving a route registration outside its
+    `if`, and a deployment is serving OTP codes. On its own listener, started only by
+    `ironauth dev`, the production router has no such route to leak. Structural, not a flag
+    nobody re-reads.
+
+  - **It reuses the existing delivery seam.** `VerificationSender` and `SmsSender` are already
+    the boundary, and the boot chain already installed `LoggingVerificationSender` /
+    `LoggingSmsSender` there. The sink is a third implementation of traits that existed, not
+    new architecture.
+
+  - **A process-global set once, rather than a parameter threaded through production
+    signatures.** Installing it via `SharedPlaneInputs` would change three signatures for a
+    dev-only switch, and every future caller would carry an argument that is `None` in every
+    real deployment. A `OnceLock` states what this actually is: one process-lifetime decision
+    made before anything boots. Nothing reads it unless `ironauth dev` set it.
+
+  - **The buffer is bounded and drops the OLDEST**, because a test asserts against what it
+    just triggered, and an unbounded log of every code in a long dev session is a slow leak.
+    Responses are `no-store`: they carry live codes, so a cache holding them is the leak the
+    loopback-only design exists to avoid.
+
+  - **A codeless notification is deliberately not recorded**, so it cannot evict a message
+    somebody is waiting for.
+
+
 - **`ironauth dev`: the first slice of the local emulator (issue #121).** The real server on
   loopback, with a generated dev configuration and a guard that refuses to run anywhere it
   could be reached from outside the machine.
