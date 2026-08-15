@@ -98,6 +98,7 @@ mod loopback_flow;
 
 /// Where `ironauth login` stores what it obtains (issue #120): the platform keychain, with
 /// a trait seam so the command's logic is testable on a runner that has no keychain.
+mod capture;
 mod credentials;
 
 /// `ironauth dev`: the local emulator (issue #121).
@@ -1209,8 +1210,17 @@ async fn build_oidc_plane(
         // link only at the `debug` trace level, so the OTP and magic-link logic works end
         // to end without a mail server. A production deployment installs its own
         // `VerificationSender` here.
-        .with_verification_sender(std::sync::Arc::new(
-            ironauth_oidc::LoggingVerificationSender,
+        // In dev mode the capture sink replaces the logging transport, so a CI script can
+        // read the code back rather than scraping a debug log. Everywhere else this is
+        // `None` and the logging transport is installed exactly as before.
+        .with_verification_sender(DEV_CAPTURE.get().map_or_else(
+            || {
+                std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender)
+                    as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
+            },
+            |sink| {
+                std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
+            },
         ))
         // The guarded SMS-OTP factor (issue #70) delivers through a SEPARATE provider
         // seam. Until a real SMS provider (Twilio Verify, Vonage, SNS) is wired (M11
@@ -1218,7 +1228,13 @@ async fn build_oidc_plane(
         // the `debug` trace level, so the guarded SMS logic works end to end without an
         // SMS gateway. A production deployment installs its own `SmsSender` here. SMS OTP
         // is off by default, so this stub is inert until a tenant explicitly enables SMS.
-        .with_sms_sender(std::sync::Arc::new(ironauth_oidc::LoggingSmsSender));
+        .with_sms_sender(DEV_CAPTURE.get().map_or_else(
+            || {
+                std::sync::Arc::new(ironauth_oidc::LoggingSmsSender)
+                    as std::sync::Arc<dyn ironauth_oidc::SmsSender>
+            },
+            |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::SmsSender>,
+        ));
     // Installed after the chain because it is CONDITIONAL: a disabled hook, or one whose
     // allowlist is empty, resolves to `None` and issuance is byte-for-byte unchanged.
     let state = match &claims_enrichment_hook {
@@ -4280,6 +4296,38 @@ fn print_probe_report(report: &ironauth_oidc::ProbeReport) {
 /// Drives the RFC 8628 device flow and stores the result in the platform keychain. The
 /// loop itself lives in `login.rs` over injected endpoints, so it is tested without a
 /// network; this function is the production wiring of those endpoints.
+/// The dev capture sink, installed by `ironauth dev` before the server boots.
+///
+/// A process-global set ONCE, rather than an `Option` threaded through `serve`,
+/// `SharedPlaneInputs`, and `build_oidc_plane`. That is a deliberate trade: the alternative
+/// changes three production signatures for a dev-only switch, and every future caller then
+/// carries a parameter that is `None` in every real deployment. A `OnceLock` says exactly
+/// what this is, which is one process-lifetime decision made before anything boots.
+///
+/// Nothing reads it unless `ironauth dev` set it, so a production `serve` behaves as if it
+/// did not exist.
+static DEV_CAPTURE: std::sync::OnceLock<std::sync::Arc<capture::CaptureSink>> =
+    std::sync::OnceLock::new();
+
+/// Serve the captured messages on `listener` until the process exits.
+///
+/// Its own listener rather than a route on the OIDC router: this hands out live one-time
+/// codes in plaintext, so the goal is that the production router has no such route to leak.
+/// See the module docs in `capture.rs`.
+fn serve_capture_sink(listener: std::net::TcpListener, sink: std::sync::Arc<capture::CaptureSink>) {
+    std::thread::spawn(move || {
+        use std::io::Write as _;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // The request is not read: there is exactly one resource here, and reading a
+            // body this never uses would only add a way to block on a client that sends
+            // headers and waits.
+            let _ = stream.write_all(capture::sink_response(&sink).as_bytes());
+            let _ = stream.flush();
+        }
+    });
+}
+
 /// `ironauth dev [--bind ADDR]`: run the emulator.
 ///
 /// Prepares the environment and hands off to the SAME `serve` path production uses, rather
@@ -4354,6 +4402,26 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
             config_path.display()
         );
         return ExitCode::FAILURE;
+    }
+
+    // The capture sink, installed BEFORE the server boots so `build_oidc_plane` sees it.
+    let sink = std::sync::Arc::new(capture::CaptureSink::default());
+    let _ = DEV_CAPTURE.set(std::sync::Arc::clone(&sink));
+
+    // Its own loopback listener on an ephemeral port. Failing to bind it is not fatal: the
+    // codes are printed to the console too, so the emulator is still usable, and refusing
+    // to start over a diagnostic surface would be the wrong trade.
+    match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => {
+            match listener.local_addr() {
+                Ok(addr) => println!("ironauth dev: captured messages at http://{addr}/"),
+                Err(_) => println!("ironauth dev: capture sink listening"),
+            }
+            serve_capture_sink(listener, sink);
+        }
+        Err(error) => {
+            eprintln!("ironauth dev: no capture sink endpoint ({error}); codes still print here");
+        }
     }
 
     print!("{}", dev::banner(&bind));
