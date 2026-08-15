@@ -24,7 +24,7 @@
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{EventCursor, EventPage, NewOutboxMessage};
+use ironauth_store::{EventCursor, EventPage, NewOutboxMessage, UsageTally};
 use sqlx::Row;
 
 /// Seed a real (tenant, environment) so the table's foreign keys are satisfied.
@@ -721,4 +721,124 @@ async fn replay_from_a_cursor_is_identical_across_a_restart() {
             "cursor after {sequence} must resolve to the same remainder it did before"
         );
     }
+}
+
+/// Append one event envelope, the shape `ironauth-admin` emits.
+async fn append_envelope(
+    store: &ironauth_store::Store,
+    env: &Env,
+    scope: ironauth_store::Scope,
+    key: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) {
+    store
+        .scoped(scope)
+        .outbox()
+        .append_event(
+            env,
+            &NewOutboxMessage {
+                consumer: "metering-fixture",
+                idempotency_key: key,
+                ordering_key: "k",
+                payload: serde_json::json!({
+                    "id": key,
+                    "type": event_type,
+                    "payload_schema_version": 1,
+                    "occurred_at_unix_ms": 0,
+                    "tenant_id": scope.tenant().to_string(),
+                    "environment_id": scope.environment().to_string(),
+                    "payload": payload,
+                }),
+            },
+        )
+        .await
+        .expect("append");
+}
+
+#[tokio::test]
+async fn metering_matches_seeded_activity_exactly() {
+    // #107 criterion 4: "metering matches seeded activity exactly". Seeded through the REAL
+    // appender and read back through the REAL feed, so this measures the pipeline rather
+    // than the arithmetic, which the unit tests already cover.
+    //
+    // The fixture is deliberately not uniform: alice appears three times and bob once, so a
+    // fold that counted activity events instead of users would report 4 actives instead of
+    // 2 and this test would say so. A fixture with one event per user cannot tell those
+    // apart, which is how a metering bug survives its own test suite.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.store().clone();
+
+    for (i, subject) in ["alice", "bob", "alice", "alice"].iter().enumerate() {
+        append_envelope(
+            &store,
+            &env,
+            scope,
+            &format!("evt_act_{i}"),
+            "user.signed_in",
+            serde_json::json!({ "subject": subject }),
+        )
+        .await;
+    }
+    for i in 0..5 {
+        append_envelope(
+            &store,
+            &env,
+            scope,
+            &format!("evt_tok_{i}"),
+            "token.issued",
+            serde_json::json!({}),
+        )
+        .await;
+    }
+    append_envelope(
+        &store,
+        &env,
+        scope,
+        "evt_conn_0",
+        "connection.opened",
+        serde_json::json!({}),
+    )
+    .await;
+    // An event metering has no business with. It must be IGNORED, not counted and not an
+    // error: the feed carries every domain's events, and a metering fold that failed on an
+    // unfamiliar type would stop the first time another team shipped one.
+    append_envelope(
+        &store,
+        &env,
+        scope,
+        "evt_other_0",
+        "something.unrelated",
+        serde_json::json!({ "subject": "carol" }),
+    )
+    .await;
+
+    let outbox = store.scoped(scope).outbox();
+    let mut tally = UsageTally::new();
+    for _ in 0..100 {
+        match outbox
+            .events_page_after(EventCursor::beginning(), 100)
+            .await
+            .expect("read")
+        {
+            EventPage::Page(events) if events.len() == 11 => {
+                tally = UsageTally::new();
+                tally.absorb(&events);
+                break;
+            }
+            EventPage::Page(_) => {}
+            EventPage::Gone { .. } => panic!("nothing was pruned"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        tally.monthly_active_users(),
+        2,
+        "alice three times and bob once is TWO active users"
+    );
+    assert_eq!(tally.tokens_issued(), 5);
+    assert_eq!(tally.connections(), 1);
 }
