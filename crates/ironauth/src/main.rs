@@ -93,6 +93,10 @@ mod login_flow;
 /// Building the loopback redirect URI for `ironauth login` (issue #120), per RFC 8252 7.3.
 mod loopback;
 
+/// Where `ironauth login` stores what it obtains (issue #120): the platform keychain, with
+/// a trait seam so the command's logic is testable on a runner that has no keychain.
+mod credentials;
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -127,6 +131,11 @@ fn main() -> ExitCode {
         // that makes the declarative policy usable; a hosted admin HTTP CRUD can layer on
         // later (as #262 did for step-up).
         Some("credential-class-policy") => manage_credential_class_policy(&mut args),
+        // Remove every credential this machine stored for a deployment (issue #120).
+        // Deliberately independent of `login`: a machine has to be able to reach a known
+        // state without first being able to reach a server, which is exactly the situation
+        // a user is in when they are logging out because something is wrong.
+        Some("logout") => logout(&mut args),
         Some("--version" | "-V" | "version") => {
             println!("ironauth {VERSION}");
             ExitCode::SUCCESS
@@ -4250,6 +4259,106 @@ fn print_probe_report(report: &ironauth_oidc::ProbeReport) {
     println!("An existing user's hash upgrades on their next successful login.");
 }
 
+/// `ironauth logout [--account NAME]`: remove every credential stored for a deployment.
+///
+/// Exits SUCCESS when there was nothing to remove. That is the contract `logout` needs: a
+/// user runs it to reach a known state, and reporting failure because the machine was
+/// already in that state would tell them something is still stored when nothing is.
+///
+/// A keychain that refuses is a real failure and does exit non-zero, because then the
+/// credential may still be there and saying otherwise would be a lie about a credential.
+fn logout(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut account = "default".to_owned();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--account" => {
+                let Some(value) = args.next() else {
+                    eprintln!("ironauth logout: --account needs a value");
+                    return ExitCode::FAILURE;
+                };
+                account = value;
+            }
+            other => {
+                eprintln!("ironauth logout: unknown argument '{other}'");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    logout_with(&credentials::KeyringStore, &account)
+}
+
+/// The logout logic, over an injected store.
+///
+/// Split out so the behaviour is testable without a platform keychain: see the module docs
+/// in `credentials.rs` for why the seam is the store rather than the keychain.
+fn logout_with(store: &impl credentials::CredentialStore, account: &str) -> ExitCode {
+    match store.delete(account) {
+        Ok(()) => {
+            println!("ironauth: removed stored credentials for '{account}'");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ironauth logout: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod logout_tests {
+    use super::credentials::testing::{MemoryStore, RefusingStore};
+    use super::logout_with;
+    use std::process::ExitCode;
+
+    fn is_success(code: ExitCode) -> bool {
+        format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS)
+    }
+
+    /// Criterion 5, through the COMMAND rather than the store beneath it.
+    #[test]
+    fn logout_removes_the_stored_credential() {
+        let store = MemoryStore::default();
+        store.seed("default");
+
+        assert!(is_success(logout_with(&store, "default")));
+        assert!(
+            !store.holds("default"),
+            "the command must leave nothing stored"
+        );
+    }
+
+    /// Logging out of a machine that never logged in SUCCEEDS. A user runs this to reach a
+    /// known state; failing because the machine was already in it would report that
+    /// something is still stored when nothing is.
+    #[test]
+    fn logout_succeeds_when_there_was_nothing_stored() {
+        assert!(is_success(logout_with(&MemoryStore::default(), "default")));
+    }
+
+    /// A keychain that REFUSES exits non-zero, because the credential may still be there.
+    /// Reporting success would be a lie about a credential.
+    #[test]
+    fn a_refusing_keychain_fails_the_command() {
+        assert!(!is_success(logout_with(&RefusingStore, "default")));
+    }
+
+    /// Logging out of one deployment must not remove another's credential.
+    #[test]
+    fn logout_is_scoped_to_its_account() {
+        let store = MemoryStore::default();
+        store.seed("prod");
+        store.seed("staging");
+
+        logout_with(&store, "prod");
+
+        assert!(!store.holds("prod"));
+        assert!(
+            store.holds("staging"),
+            "another deployment's credential must survive"
+        );
+    }
+}
+
 fn print_help() {
     println!("ironauth {VERSION}");
     println!("A standards-first OpenID Connect identity platform.");
@@ -4259,6 +4368,8 @@ fn print_help() {
     println!("  ironauth hash-probe [--config PATH] [--memory-budget KIB] [--json]");
     println!("                                   Measure Argon2id on this host and");
     println!("                                   recommend parameters (issue #62)");
+    println!("  ironauth logout [--account NAME] Remove stored credentials for a");
+    println!("                                   deployment (issue #120)");
     println!("  ironauth validate <document>     Validate a config document (local)");
     println!("  ironauth plan <document> ...      Render the server-computed promotion plan");
     println!("  ironauth apply <document> ...     Apply a config document to a target");

@@ -49,6 +49,15 @@ ironauth-apply.workspace = true
 axum = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 tracing.workspace = true
+# `ironauth login` stores a structured credential (issue #120), and the keychain holds ONE
+# opaque string per entry, so the record needs an encoding. JSON rather than TOML because
+# this is a machine-written blob nobody edits by hand, and `serde_json` is already in the
+# tree. This is the JSON surface the dev-dependency note above once said the binary had
+# none of; that statement was true until this landed.
+serde.workspace = true
+serde_json.workspace = true
+
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 [features]
 # Passes the optional IronBus wake-up backbone through to ironauth-store (issue #104).
@@ -80,8 +89,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # The boot-wiring harness (issue #414) derives its subject list from the serialized shape
 # of `Config` itself and compares whole config sections across the two plane states as
 # JSON, so a section that grows a key is compared with the new key rather than silently
-# around it. Test-only; the binary parses TOML and adds no JSON surface.
-serde_json.workspace = true
+# around it. Both are also REAL dependencies now (see below), so this dev entry is
+# redundant rather than load-bearing; it is kept so the harness's reason stays recorded.
 
 # The step-up-policy CLI integration test needs the store test-support harness; it is
 # gated on the `testing` feature so the default build stays lean, exactly as the
