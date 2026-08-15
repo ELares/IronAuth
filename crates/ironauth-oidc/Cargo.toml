@@ -1259,3 +1259,11 @@ workspace = true
 name = "unauthenticated_scope_oracle"
 path = "tests/unauthenticated_scope_oracle.rs"
 required-features = ["testing"]
+
+# The scope-routed authorization endpoint (issue #128): the path is the authority on
+# which (tenant, environment) a request lives in, so a client_id declaring a different
+# one is refused rather than followed.
+[[test]]
+name = "scoped_authorize"
+path = "tests/scoped_authorize.rs"
+required-features = ["testing"]

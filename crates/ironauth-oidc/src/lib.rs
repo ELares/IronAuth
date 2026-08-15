@@ -313,6 +313,16 @@ pub fn oidc_router(state: OidcState) -> Router {
             "/authorize",
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
+        // The SCOPE-ROUTED authorization endpoint (issue #128). Additive: the
+        // deployment-root mount above is untouched. It exists because a CIMD client_id
+        // is a URL and declares no (tenant, environment), so the scope must come from
+        // somewhere the requester cannot pick at will, and the path is that place. A
+        // `cli_` client_id presented here must DECLARE the scope the path names, or it
+        // is refused; see `authorize::scoped_authorize_get`.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/authorize",
+            get(authorize::scoped_authorize_get).post(authorize::scoped_authorize_post),
+        )
         .route("/token", post(token::token))
         // Pushed authorization requests (PAR, RFC 9126, issue #27): an authenticated
         // back-channel POST that validates a complete authorization request and
