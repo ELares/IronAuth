@@ -97,6 +97,9 @@ mod loopback;
 /// a trait seam so the command's logic is testable on a runner that has no keychain.
 mod credentials;
 
+/// `ironauth login`: the RFC 8628 device flow (issue #120).
+mod login;
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -135,6 +138,10 @@ fn main() -> ExitCode {
         // Deliberately independent of `login`: a machine has to be able to reach a known
         // state without first being able to reach a server, which is exactly the situation
         // a user is in when they are logging out because something is wrong.
+        // Sign in to a deployment (issue #120). The device flow: it needs no listener, no
+        // browser on this machine, and no open port, so it is the flow that works on the
+        // headless boxes and over the SSH sessions where a CLI login most often happens.
+        Some("login") => login(&mut args),
         Some("logout") => logout(&mut args),
         Some("--version" | "-V" | "version") => {
             println!("ironauth {VERSION}");
@@ -4259,6 +4266,86 @@ fn print_probe_report(report: &ironauth_oidc::ProbeReport) {
     println!("An existing user's hash upgrades on their next successful login.");
 }
 
+/// `ironauth login --issuer URL --client-id ID [--account NAME]`.
+///
+/// Drives the RFC 8628 device flow and stores the result in the platform keychain. The
+/// loop itself lives in `login.rs` over injected endpoints, so it is tested without a
+/// network; this function is the production wiring of those endpoints.
+fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut issuer = None;
+    let mut client_id = None;
+    let mut account = "default".to_owned();
+    while let Some(flag) = args.next() {
+        let mut take = |name: &str| {
+            let Some(value) = args.next() else {
+                eprintln!("ironauth login: {name} needs a value");
+                return Err(());
+            };
+            Ok(value)
+        };
+        match flag.as_str() {
+            "--issuer" => match take("--issuer") {
+                Ok(value) => issuer = Some(value),
+                Err(()) => return ExitCode::FAILURE,
+            },
+            "--client-id" => match take("--client-id") {
+                Ok(value) => client_id = Some(value),
+                Err(()) => return ExitCode::FAILURE,
+            },
+            "--account" => match take("--account") {
+                Ok(value) => account = value,
+                Err(()) => return ExitCode::FAILURE,
+            },
+            other => {
+                eprintln!("ironauth login: unknown argument '{other}'");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let (Some(issuer), Some(client_id)) = (issuer, client_id) else {
+        eprintln!("ironauth login: --issuer and --client-id are required");
+        return ExitCode::FAILURE;
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth login: could not start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async {
+        let store = credentials::KeyringStore;
+        // Through the Env clock seam, never the host clock directly: the stored expiry
+        // is derived from this instant, so it is protocol-adjacent state that has to stay
+        // deterministic under a manual clock. `invariant-lints.sh` enforces the rule and
+        // caught this exact line taking the shortcut.
+        let now = login::epoch_secs(&ironauth_env::SystemClock);
+
+        let result = login::run_device_flow(
+            &issuer,
+            &account,
+            &store,
+            now,
+            || login::request_device_authorization(&issuer, &client_id),
+            |device_code| login::request_token(&issuer, &client_id, device_code),
+            |duration| async move { tokio::time::sleep(duration).await },
+        )
+        .await;
+
+        match result {
+            Ok(()) => {
+                println!("ironauth: signed in as '{account}'");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("ironauth login: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
 /// `ironauth logout [--account NAME]`: remove every credential stored for a deployment.
 ///
 /// Exits SUCCESS when there was nothing to remove. That is the contract `logout` needs: a
@@ -4368,6 +4455,8 @@ fn print_help() {
     println!("  ironauth hash-probe [--config PATH] [--memory-budget KIB] [--json]");
     println!("                                   Measure Argon2id on this host and");
     println!("                                   recommend parameters (issue #62)");
+    println!("  ironauth login --issuer URL --client-id ID [--account NAME]");
+    println!("                                   Sign in via the RFC 8628 device flow");
     println!("  ironauth logout [--account NAME] Remove stored credentials for a");
     println!("                                   deployment (issue #120)");
     println!("  ironauth validate <document>     Validate a config document (local)");

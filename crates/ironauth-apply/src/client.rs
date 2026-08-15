@@ -40,6 +40,12 @@ use crate::error::ClientError;
 /// from exhausting memory.
 const MAX_RESPONSE_BYTES: usize = 8 << 20;
 
+/// The management API's content type.
+const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// The OAuth content type (RFC 6749 section 4.1.3 and every token-endpoint request).
+const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+
 /// The default total deadline for one request (connect, TLS, exchange, body).
 const TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -244,12 +250,23 @@ impl ManagementClient {
                     TokioIo::new(tls_stream),
                     &full_path,
                     &host_header,
-                    &auth,
+                    Some(&auth),
+                    JSON_CONTENT_TYPE,
                     body,
                 )
                 .await
             }
-            Scheme::Http => send(TokioIo::new(stream), &full_path, &host_header, &auth, body).await,
+            Scheme::Http => {
+                send(
+                    TokioIo::new(stream),
+                    &full_path,
+                    &host_header,
+                    Some(&auth),
+                    JSON_CONTENT_TYPE,
+                    body,
+                )
+                .await
+            }
         }
     }
 
@@ -294,7 +311,8 @@ async fn send<I>(
     io: I,
     path: &str,
     host_header: &str,
-    authorization: &str,
+    authorization: Option<&str>,
+    content_type: &str,
     body: Vec<u8>,
 ) -> Result<ServerResponse, ClientError>
 where
@@ -308,13 +326,19 @@ where
         let _ = conn.await;
     });
 
-    let request = Request::builder()
+    let mut builder = Request::builder()
         .method(Method::POST)
         .uri(path)
         .header(http::header::HOST, host_header)
-        .header(http::header::AUTHORIZATION, authorization)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .header(http::header::ACCEPT, "application/json")
+        .header(http::header::CONTENT_TYPE, content_type)
+        .header(http::header::ACCEPT, "application/json");
+    // OPTIONAL, because an OAuth token request authenticates in the body (or not at all,
+    // for a public client) rather than with a bearer credential. Sending an empty
+    // Authorization header instead would be a malformed request rather than an absent one.
+    if let Some(authorization) = authorization {
+        builder = builder.header(http::header::AUTHORIZATION, authorization);
+    }
+    let request = builder
         .body(Full::new(Bytes::from(body)))
         .map_err(|error| ClientError::Transport(error.to_string()))?;
 
@@ -330,6 +354,84 @@ where
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     };
     Ok(ServerResponse { status, body })
+}
+
+/// POST a form-encoded body to `base_url` + `path`, with NO bearer credential.
+///
+/// This is the OAuth shape: `ironauth login` drives the RFC 8628 device-authorization and
+/// token endpoints, which take `application/x-www-form-urlencoded` and authenticate in the
+/// body (or not at all, for a public client).
+///
+/// It lives HERE rather than in the CLI crate on purpose. The parts that matter for safety
+/// are the ones it shares with [`ManagementClient`]: the TLS configuration built from the
+/// platform trust roots, the total deadline, and the response size cap. A second copy of
+/// those in another crate would be two things to keep in step, and the copy that drifts is
+/// the one nobody is looking at. Only the content type and the absent Authorization header
+/// differ, so only those are parameters.
+///
+/// # Errors
+///
+/// [`ClientError`] on a URL, resolution, connection, TLS, timeout, size-cap, or protocol
+/// failure.
+pub async fn post_form(
+    base_url: &str,
+    path: &str,
+    form_body: String,
+) -> Result<ServerResponse, ClientError> {
+    let base = parse_base_url(base_url)?;
+    let tls = match base.scheme {
+        Scheme::Https => Some(build_tls_config()?),
+        Scheme::Http => None,
+    };
+    let exchange = async {
+        let full_path = format!("{}{path}", base.prefix);
+        let host = base.host.as_str();
+        let mut addrs = tokio::net::lookup_host((host, base.port))
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| ClientError::Unresolved(host.to_owned()))?;
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let host_header = if base.host.contains(':') {
+            format!("[{}]:{}", base.host, base.port)
+        } else {
+            format!("{}:{}", base.host, base.port)
+        };
+        let body = form_body.into_bytes();
+        match base.scheme {
+            Scheme::Https => {
+                let config = tls.clone().ok_or(ClientError::TlsProvider)?;
+                let tls_stream = tls_connect(&config, host, stream).await?;
+                send(
+                    TokioIo::new(tls_stream),
+                    &full_path,
+                    &host_header,
+                    None,
+                    FORM_CONTENT_TYPE,
+                    body,
+                )
+                .await
+            }
+            Scheme::Http => {
+                send(
+                    TokioIo::new(stream),
+                    &full_path,
+                    &host_header,
+                    None,
+                    FORM_CONTENT_TYPE,
+                    body,
+                )
+                .await
+            }
+        }
+    };
+    match tokio::time::timeout(TOTAL_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ClientError::Timeout),
+    }
 }
 
 /// Read a streaming body frame by frame, aborting the moment the accumulated size
