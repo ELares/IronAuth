@@ -131,6 +131,7 @@ pub struct PermissionView {
     pub display_name: String,
     /// Free-form vocabulary metadata (the empty object when none was set). Never
     /// interpreted by the auth core and never emitted in a token claim.
+    #[schema(value_type = Object)]
     pub metadata: serde_json::Value,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
@@ -169,6 +170,7 @@ pub struct CreatePermissionRequest {
     pub display_name: String,
     /// Optional free-form vocabulary metadata; the empty object when omitted.
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -226,6 +228,7 @@ pub struct UpdatePermissionRequest {
     /// Replacement free-form metadata (a whole-document replace, not a merge).
     /// Omitted leaves it unchanged.
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
     /// REFUSED if the key is present AT ALL, `null` included: the stable name is
     /// immutable. A permission slug is a direct authorization input, so a rename

@@ -268,6 +268,7 @@ pub struct CreateLogStreamRequest {
     pub sink_type: String,
     /// Sink shape: endpoint, and for S3 a bucket and region. NEVER a credential.
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub sink_config: Option<serde_json::Value>,
     /// The NAME of the environment secret holding the sink credential.
     #[serde(default)]
