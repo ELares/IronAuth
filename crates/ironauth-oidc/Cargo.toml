@@ -1267,3 +1267,10 @@ required-features = ["testing"]
 name = "scoped_authorize"
 path = "tests/scoped_authorize.rs"
 required-features = ["testing"]
+
+# A URL client_id reaching the authorization endpoint (issue #128): the feature gate, the
+# deny-before-fetch ordering, and the scope-routed-only reachability.
+[[test]]
+name = "cimd_authorize"
+path = "tests/cimd_authorize.rs"
+required-features = ["testing"]

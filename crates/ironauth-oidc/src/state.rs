@@ -181,6 +181,25 @@ fn audit_screening_fail_open(scope: &Scope, provider: &str) {
     );
 }
 
+/// How many validated CIMD documents the per-process cache holds (issue #128).
+///
+/// A cap, not a tuning knob. The cache is keyed by an attacker-chosen URL, so without a
+/// bound it is a memory-exhaustion primitive handed to anyone who can reach `/authorize`.
+/// Hitting it costs latency (a refetch and a revalidation), never a weaker check.
+const CIMD_CACHE_ENTRIES: usize = 512;
+
+/// The shortest a CIMD document may be cached, however small its `max-age`.
+///
+/// Without a floor, a document serving `max-age=0` makes every authorization request
+/// dereference an attacker-chosen URL, which is a free amplifier costing one header.
+const CIMD_TTL_FLOOR_SECS: u64 = 300;
+
+/// The longest a CIMD document may be cached, however large its `max-age`.
+///
+/// Without a ceiling, a document served once with a year-long `max-age` is trusted for a
+/// year, and revoking it means waiting out a lifetime the attacker picked.
+const CIMD_TTL_CEILING_SECS: u64 = 3600;
+
 /// Cheaply cloneable state shared by every OIDC handler.
 // The boot-resolved surface-arming flags (global-token-revocation, fedcm, risk-signals) are
 // each an INDEPENDENT experimental-feature gate the boot path sets from the strict feature
@@ -217,6 +236,27 @@ pub struct OidcState {
     // uniform 404 and discovery advertises nothing. The designated env and branding
     // that SHAPE the documents live in `Inner` (config data cannot arm the surface).
     fedcm_enabled: bool,
+    // Whether the experimental CIMD surface is armed (issue #128). Kept OUTSIDE `Inner` and
+    // set through the builder for the SAME anti-bypass reason as fedcm: an operator who
+    // could flip this from the `[oidc]` table would have the server dereferencing
+    // attacker-chosen URLs without ever acknowledging the pinned draft revision. The ONLY
+    // writer is the boot path. Default false, so a URL client_id is just an unknown client.
+    cimd_enabled: bool,
+    // The shared cache of validated CIMD documents. Shared rather than per-request, because
+    // a per-request cache would make every authorization request dereference the URL again,
+    // which is the amplifier the TTL floor exists to prevent.
+    cimd_cache: Arc<crate::cimd::CimdCache>,
+    // Where CIMD documents come from. `None` means nothing can be fetched, which is why
+    // arming the feature without installing a source resolves every URL client_id to
+    // unreachable rather than to a default that reaches the network unhardened.
+    cimd_source: Option<Arc<dyn crate::cimd::CimdDocumentSource>>,
+    // The operator's CIMD domain policy. Empty lists mean every domain is QUARANTINED:
+    // usable, consent always on, redirect capability restricted. That is the conservative
+    // default the issue asks for, and it is what an operator who armed the feature without
+    // writing a policy gets.
+    cimd_allow: Arc<Vec<String>>,
+    cimd_deny: Arc<Vec<String>>,
+    cimd_bounds: crate::cimd::CimdTtlBounds,
     // Whether the experimental third-party risk-signal ingestion surface is armed (issue
     // #82, PR 1). Kept OUTSIDE `Inner` and set through the builder for the SAME anti-bypass
     // reason as fedcm/global-token-revocation: it is NOT a plain `OidcConfig` toggle an
@@ -932,6 +972,15 @@ impl OidcState {
             introspection_serializer: default_serializer(),
             global_token_revocation_enabled: false,
             fedcm_enabled: false,
+            cimd_enabled: false,
+            cimd_cache: Arc::new(crate::cimd::CimdCache::new(CIMD_CACHE_ENTRIES)),
+            cimd_source: None,
+            cimd_allow: Arc::new(Vec::new()),
+            cimd_deny: Arc::new(Vec::new()),
+            cimd_bounds: crate::cimd::CimdTtlBounds {
+                floor: std::time::Duration::from_secs(CIMD_TTL_FLOOR_SECS),
+                ceiling: std::time::Duration::from_secs(CIMD_TTL_CEILING_SECS),
+            },
             risk_signals_enabled: false,
             org_scoped_clients_enabled: false,
             org_provisioning: None,
@@ -1052,6 +1101,72 @@ impl OidcState {
     #[must_use]
     pub fn fedcm_enabled(&self) -> bool {
         self.fedcm_enabled
+    }
+
+    /// Arm the experimental CIMD surface (issue #128) and install the document source.
+    ///
+    /// A builder rather than an `OidcConfig` field for the same anti-bypass reason as
+    /// FedCM: the draft is unstable and ships behind an acknowledgment naming the pinned
+    /// revision, and an operator who could flip this from config would be dereferencing
+    /// attacker-chosen URLs without having acknowledged anything. The ONLY writer is the
+    /// boot path, which resolves the feature ladder first.
+    ///
+    /// The source is taken HERE rather than defaulted, so arming the feature cannot
+    /// silently reach the network through anything but the hardened fetcher.
+    #[must_use]
+    pub fn with_cimd_source(
+        mut self,
+        source: Arc<dyn crate::cimd::CimdDocumentSource>,
+        allow: Vec<String>,
+        deny: Vec<String>,
+    ) -> Self {
+        self.cimd_source = Some(source);
+        self.cimd_allow = Arc::new(allow);
+        self.cimd_deny = Arc::new(deny);
+        self
+    }
+
+    /// Arm the surface, SEPARATELY from installing the source.
+    ///
+    /// Two switches rather than one because they answer different questions, and a single
+    /// call that did both made the ARMING untestable: with the source absent, a URL
+    /// client_id is refused for want of a source whether or not the flag is set, so a test
+    /// could not tell the gate from the missing dependency. A mutation sweep found exactly
+    /// that, by forcing this to true and watching every test still pass. Installing a
+    /// source WITHOUT arming is now a state a test can build, and the gate is what refuses
+    /// it.
+    #[must_use]
+    pub fn with_cimd_enabled(mut self, enabled: bool) -> Self {
+        self.cimd_enabled = enabled;
+        self
+    }
+
+    /// Whether the experimental CIMD surface is armed (issue #128).
+    #[must_use]
+    pub fn cimd_enabled(&self) -> bool {
+        self.cimd_enabled
+    }
+
+    /// The installed CIMD document source, if the surface is armed.
+    #[must_use]
+    pub fn cimd_source(&self) -> Option<&dyn crate::cimd::CimdDocumentSource> {
+        self.cimd_source.as_deref()
+    }
+
+    /// The shared cache of validated CIMD documents.
+    #[must_use]
+    pub fn cimd_cache(&self) -> &crate::cimd::CimdCache {
+        &self.cimd_cache
+    }
+
+    /// The operator's CIMD domain policy.
+    #[must_use]
+    pub fn cimd_policy(&self) -> crate::cimd::CimdPolicy<'_> {
+        crate::cimd::CimdPolicy {
+            allow: &self.cimd_allow,
+            deny: &self.cimd_deny,
+            bounds: self.cimd_bounds,
+        }
     }
 
     /// Arm the experimental third-party risk-signal ingestion surface (issue #82, PR 1).
