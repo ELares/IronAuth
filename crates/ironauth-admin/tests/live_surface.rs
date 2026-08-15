@@ -2217,6 +2217,12 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/resource-servers/{resource_server}"),
             &serde_json::json!({ "permission_claims_enabled": true }),
         ),
+        // ---- the ordered event feed and usage export (issue #107) ----
+        // Both are environment-scoped READS folded from the outbox, so the sweep drives
+        // them exactly as it drives any other list: they must answer for a live scope and
+        // refuse a soft-deleted one like everything else here.
+        Case::empty("event_feed.readEventFeed", "GET", format!("{base}/events")),
+        Case::empty("usage.exportUsage", "GET", format!("{base}/usage")),
         // ---- sessions ----
         Case::empty("sessions.listSessions", "GET", format!("{base}/sessions")),
         Case::empty(
