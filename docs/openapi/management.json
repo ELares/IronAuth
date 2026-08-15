@@ -18309,6 +18309,7 @@
           "usage"
         ],
         "summary": "Export a tenant's usage (issue #107).",
+        "description": "# Errors\n\n[`ApiError`] for an unresolvable scope, a caller without `management.read`, or a\npersistence fault.",
         "operationId": "exportUsage",
         "parameters": [
           {

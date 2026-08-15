@@ -153,6 +153,7 @@ fn operation_ids_are_the_stable_set() {
             "enableOrganization",
             "exportConfigSnapshot",
             "exportIdentities",
+            "exportUsage",
             "extendSignupQuarantine",
             "getActiveTraitSchema",
             "getAuthzenConfiguration",
@@ -252,6 +253,7 @@ fn operation_ids_are_the_stable_set() {
             "postFlowDryRun",
             "probePasswordHashing",
             "purgeTenant",
+            "readEventFeed",
             "rejectRecoveryApproval",
             "rejectSignupQuarantine",
             "removeOrgGroupMember",
@@ -542,6 +544,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/decisions/{decision_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/risk/users/{user_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/warnings",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/events",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/export",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
@@ -593,6 +596,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/active",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations/{job_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/usage",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents",
@@ -794,7 +798,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        224,
+        226,
         "the documented route count is pinned"
     );
 
