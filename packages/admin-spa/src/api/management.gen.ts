@@ -777,6 +777,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the ordered event feed (issue #107). */
+        get: operations["readEventFeed"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/export": {
         parameters: {
             query?: never;
@@ -2422,6 +2439,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Export a tenant's usage (issue #107).
+         * @description # Errors
+         *
+         *     [`ApiError`] for an unresolvable scope, a caller without `management.read`, or a
+         *     persistence fault.
+         */
+        get: operations["exportUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users": {
         parameters: {
             query?: never;
@@ -3119,7 +3159,7 @@ export interface components {
         AuthzenBatchItem: {
             action?: null | components["schemas"]["AuthzenAction"];
             /** @description Overrides the shared context. */
-            context?: unknown;
+            context?: Record<string, never> | null;
             resource?: null | components["schemas"]["AuthzenResource"];
             subject?: null | components["schemas"]["AuthzenSubject"];
         };
@@ -3159,7 +3199,7 @@ export interface components {
             /** @description What they are doing. */
             action: components["schemas"]["AuthzenAction"];
             /** @description Free-form context. `IronAuth` reads exactly one key, `organization_id`. */
-            context?: unknown;
+            context?: Record<string, never>;
             /** @description What they are reaching. */
             resource: components["schemas"]["AuthzenResource"];
             /** @description Who is asking. */
@@ -3169,7 +3209,7 @@ export interface components {
         AuthzenEvaluationsRequest: {
             action?: null | components["schemas"]["AuthzenAction"];
             /** @description Shared context default. */
-            context?: unknown;
+            context?: Record<string, never>;
             /** @description The evaluations, each overriding the defaults above where it names a value. */
             evaluations: components["schemas"]["AuthzenBatchItem"][];
             /** @description Evaluation options. */
@@ -3567,7 +3607,7 @@ export interface components {
              */
             created_at_unix_ms: number;
             /** @description The connector's secret-free definition document (no `client_secret`). */
-            definition: unknown;
+            definition: Record<string, never>;
             /** @description Whether the connector is active. */
             enabled: boolean;
             /** @description The connector identifier (`cnr_...`). */
@@ -3643,16 +3683,13 @@ export interface components {
              * @description The capability matrix (conservative defaults; `email_verified_trust` defaults
              *     to `untrusted`).
              */
-            capabilities?: unknown;
+            capabilities?: Record<string, never> | null;
             /** @description The declarative claim mapping (the stored shape). */
-            claim_mapping?: unknown;
+            claim_mapping?: Record<string, never> | null;
             /** @description The client identifier IronAuth registers at the upstream. */
             client_id: string;
-            /**
-             * @description The upstream client secret by indirection (`"..."`, `{ "file": "/path" }`, or
-             *     `{ "env": "VAR" }`); sealed at rest, never returned by a read.
-             */
-            client_secret: unknown;
+            /** @description The secret itself as a string, or an indirection object naming where to read it from: `{ "file": "/path" }` or `{ "env": "VAR" }`. */
+            client_secret: string | Record<string, never>;
             /**
              * @description The connector slug (lowercase ASCII alphanumerics, hyphen, underscore), unique
              *     per environment.
@@ -3671,7 +3708,7 @@ export interface components {
              * @description The upstream endpoints: EITHER `{ "issuer": "..." }` OR
              *     `{ "authorization_endpoint", "token_endpoint", "jwks_uri", "userinfo_endpoint"? }`.
              */
-            endpoints: unknown;
+            endpoints: Record<string, never>;
             /**
              * @description How PKCE is applied to the upstream (`auto_where_supported` / `required` /
              *     `disabled`).
@@ -3683,7 +3720,7 @@ export interface components {
              */
             protocol: string;
             /** @description Provider quirks expressed as data. */
-            quirks?: unknown;
+            quirks?: Record<string, never> | null;
             /** @description The scopes requested from the upstream (`openid` is required). */
             scopes: string[];
         };
@@ -3712,7 +3749,7 @@ export interface components {
              */
             name: string;
             /** @description The ordered primitive list (force / restrict / reject / default objects). */
-            primitives: unknown[];
+            primitives: Record<string, never>[];
         };
         /** @description The body to create an environment under a tenant. */
         CreateEnvironmentRequest: {
@@ -3756,7 +3793,7 @@ export interface components {
          */
         CreateFlowVersionRequest: {
             /** @description The canonical journey artifact (a JSON document). */
-            artifact: unknown;
+            artifact: Record<string, never>;
         };
         /** @description The body to mint a DCR initial access token (RFC 7591, issue #31). */
         CreateInitialAccessTokenRequest: {
@@ -3816,7 +3853,7 @@ export interface components {
             /** @description Scope the stream to one organization. Absent means environment-wide. */
             organization_id?: string | null;
             /** @description Sink shape: endpoint, and for S3 a bucket and region. NEVER a credential. */
-            sink_config?: unknown;
+            sink_config?: Record<string, never> | null;
             /** @description `http`, `s3`, `datadog`, or `splunk_hec`. */
             sink_type: string;
             /** @description `admin_action`, `authentication`, or `both`. */
@@ -3833,7 +3870,7 @@ export interface components {
         /** @description The body to add a user to an organization. */
         CreateMembershipRequest: {
             /** @description Optional free-form membership metadata; the empty object when omitted. */
-            metadata?: unknown;
+            metadata?: Record<string, never> | null;
             /**
              * @description The user to add to the organization (a `usr_` id in this environment).
              * @example usr_...
@@ -3848,7 +3885,7 @@ export interface components {
              */
             display_name: string;
             /** @description Optional free-form group metadata; the empty object when omitted. */
-            metadata?: unknown;
+            metadata?: Record<string, never> | null;
             /**
              * @description The parent group to nest under. Omitted or null creates a ROOT, which is
              *     always admissible. A parent that is not a LIVE group of THIS organization
@@ -3872,7 +3909,7 @@ export interface components {
              */
             display_name: string;
             /** @description Optional free-form role metadata; the empty object when omitted. */
-            metadata?: unknown;
+            metadata?: Record<string, never> | null;
             /**
              * @description The IMMUTABLE stable name, unique among the organization's LIVE roles.
              *     Must match `^[a-z0-9][a-z0-9._-]{0,62}$`; it is never trimmed or case
@@ -3897,7 +3934,7 @@ export interface components {
              */
             display_name: string;
             /** @description Optional free-form vocabulary metadata; the empty object when omitted. */
-            metadata?: unknown;
+            metadata?: Record<string, never> | null;
             /**
              * @description The IMMUTABLE namespaced stable name, unique among the environment's LIVE
              *     permissions. Must match `^[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)+$` and
@@ -3997,7 +4034,7 @@ export interface components {
              * @description The declarative transform program, a JSON array. Omitted means the empty program,
              *     which is what a dry-run uses and what a migrate that only re-validates uses.
              */
-            transform?: unknown;
+            transform?: Record<string, never>[] | null;
         };
         /**
          * @description The body to create a new immutable trait-schema version (issue #53).
@@ -4070,7 +4107,7 @@ export interface components {
             /** @description The policy name. */
             name: string;
             /** @description The ordered primitive list (as stored). */
-            primitives: unknown[];
+            primitives: Record<string, never>[];
         };
         /** @description An endpoint's dead-lettered deliveries, oldest first. */
         DeadLetterList: {
@@ -4332,6 +4369,16 @@ export interface components {
              */
             trait_errors?: components["schemas"]["TraitErrorView"][] | null;
         };
+        /** @description A page of the feed. */
+        EventFeedPage: {
+            /** @description The events, in order. */
+            events: components["schemas"]["FeedEvent"][];
+            /**
+             * @description The cursor to resume from. Present even when `events` is empty, so a caller always
+             *     has somewhere to continue.
+             */
+            next_cursor: string;
+        };
         /**
          * @description The body to EXTEND a signup-quarantine review window (issue #82, PR 2). The window is
          *     required; the new horizon is `now + extend_secs`.
@@ -4343,6 +4390,30 @@ export interface components {
              * @example 604800
              */
             extend_secs: number;
+        };
+        /** @description One event on the feed. */
+        FeedEvent: {
+            /**
+             * @description The cursor to send back to resume AFTER this event. Opaque: store it, do not parse
+             *     it or do arithmetic on it.
+             */
+            cursor: string;
+            /** @description The event id. */
+            id: string;
+            /** @description The event body. */
+            payload: Record<string, never>;
+        };
+        /** @description What a caller gets when its cursor has aged out of the retention window. */
+        FeedGone: {
+            /** @description The stable machine-readable code. Branch on this, never on `message`. */
+            code: string;
+            /** @description What happened, for a human reading a log. */
+            message: string;
+            /**
+             * @description The oldest cursor that still resolves. Resume here after reconciling, and treat
+             *     everything between your old cursor and this one as unknown rather than unchanged.
+             */
+            oldest_cursor: string;
         };
         /**
          * @description The redacted flow context projection surfaced by the inspector (issue #91): only safe
@@ -4469,7 +4540,7 @@ export interface components {
         /** @description A custom-journey version, as returned by the management API (issue #92, PR 5). */
         FlowVersionView: {
             /** @description The canonical journey artifact (a JSON document). */
-            artifact: unknown;
+            artifact: Record<string, never>;
             /** @description The `flv_` version id (embeds its scope). */
             id: string;
             /** @description The author-facing journey id this version belongs to. */
@@ -4919,7 +4990,7 @@ export interface components {
             /** @description The membership identifier (`omb_...`, embeds its scope). */
             id: string;
             /** @description Free-form membership metadata (the empty object when none was set). */
-            metadata: unknown;
+            metadata: Record<string, never>;
             /** @description The organization the user is a member of (`org_...`). */
             organization_id: string;
             /** @description The membership lifecycle state (`active`). */
@@ -5197,7 +5268,7 @@ export interface components {
             /** @description The group identifier (`grp_...`, embeds its scope). */
             id: string;
             /** @description Free-form group metadata (the empty object when none was set). */
-            metadata: unknown;
+            metadata: Record<string, never>;
             /** @description The organization the group belongs to (`org_...`). */
             organization_id: string;
             /**
@@ -5341,7 +5412,7 @@ export interface components {
              */
             is_default: boolean;
             /** @description Free-form role metadata (the empty object when none was set). */
-            metadata: unknown;
+            metadata: Record<string, never>;
             /** @description The organization the role belongs to (`org_...`). */
             organization_id: string;
             /**
@@ -5685,7 +5756,7 @@ export interface components {
              * @description Free-form vocabulary metadata (the empty object when none was set). Never
              *     interpreted by the auth core and never emitted in a token claim.
              */
-            metadata: unknown;
+            metadata: Record<string, never>;
             /**
              * @description The IMMUTABLE namespaced stable name. This is the string a token claim
              *     carries, so a relabel changes `display_name` and never this.
@@ -5802,7 +5873,7 @@ export interface components {
         /** @description One identity that failed validation, with the fields that failed. */
         RecordFailureView: {
             /** @description The per-field failures, each an RFC 6901 JSON Pointer and a reason. */
-            failures: unknown[];
+            failures: Record<string, never>[];
             /** @description The failing identity's subject (a `usr_` id). */
             subject: string;
         };
@@ -6046,7 +6117,7 @@ export interface components {
             /** @description The LOW/MED/HIGH score as a wire string. */
             score: string;
             /** @description The enumerated contributing signals as a JSON document. */
-            signals: unknown;
+            signals: Record<string, never>[];
             /** @description The `usr_` subject the login was scored for. */
             subject: string;
         };
@@ -6562,7 +6633,7 @@ export interface components {
              * @description The narrowing-only rule set: a JSON object over the trait schema's closed keyword
              *     vocabulary, each of which may only TIGHTEN the trait's constraint.
              */
-            rules?: unknown;
+            rules?: Record<string, never>;
             /** @description The step the field is collected at: `signup` or `later_login`. */
             step: string;
             /** @description The RFC 6901 JSON Pointer naming the identity trait this field collects. */
@@ -6916,7 +6987,7 @@ export interface components {
              * @description Replacement free-form metadata (a whole-document replace, not a merge).
              *     Omitted leaves it unchanged.
              */
-            metadata?: unknown;
+            metadata?: Record<string, never> | null;
         };
         /**
          * @description The body to rename a role (RFC 7396 style partial edit: an omitted field is
@@ -6929,7 +7000,7 @@ export interface components {
              * @description Replacement free-form metadata (a whole-document replace, not a merge).
              *     Omitted leaves it unchanged.
              */
-            metadata?: unknown;
+            metadata?: Record<string, never> | null;
         };
         /**
          * @description The body to relabel a permission (RFC 7396 style partial edit: an omitted field
@@ -6954,7 +7025,7 @@ export interface components {
              * @description Replacement free-form metadata (a whole-document replace, not a merge).
              *     Omitted leaves it unchanged.
              */
-            metadata?: unknown;
+            metadata?: Record<string, never> | null;
             /**
              * @description REFUSED if the key is present AT ALL, `null` included: the stable name is
              *     immutable. A permission slug is a direct authorization input, so a rename
@@ -7044,6 +7115,30 @@ export interface components {
              *     is written.
              */
             traits?: Record<string, never>;
+        };
+        /** @description A tenant's usage for the retained window. */
+        UsageExport: {
+            /**
+             * Format: int64
+             * @description Connections opened.
+             */
+            connections: number;
+            /**
+             * Format: int64
+             * @description Distinct users seen active. A user active forty times is one.
+             */
+            monthly_active_users: number;
+            /**
+             * Format: int64
+             * @description Tokens issued. NOT deduplicated by user: this counts issuance, not people.
+             */
+            tokens_issued: number;
+            /**
+             * @description Whether the fold stopped at its limit rather than reaching the end of the feed.
+             *     When true these numbers are a LOWER BOUND, and saying so is the point: a silently
+             *     truncated usage figure is the one number a customer would never think to question.
+             */
+            truncated: boolean;
         };
         /**
          * @description A user's connected apps (issue #88): the remembered consents they hold, oldest
@@ -7278,9 +7373,9 @@ export interface components {
          */
         VerifyProfile: {
             /** @description The user's OIDC standard-claim document, or null when the user has none. */
-            claims?: unknown;
+            claims?: Record<string, never> | null;
             /** @description The user's identity-traits document, or null when the user has none. */
-            traits?: unknown;
+            traits?: Record<string, never> | null;
         };
         /**
          * @description One operational warning item (issue #91): a bounded `kind`, the `subject` it is about
@@ -11113,6 +11208,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readEventFeed: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The opaque cursor from a previous page. Omitted means "from the beginning of what
+                 *     is retained".
+                 * @example evc_42
+                 */
+                cursor?: string | null;
+                /** @description How many events to return, capped at 1000. */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of events in order */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EventFeedPage"];
+                };
+            };
+            /** @description Malformed cursor or limit */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The cursor aged out of the retention window */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FeedGone"];
                 };
             };
         };
@@ -19306,6 +19471,58 @@ export interface operations {
             };
             /** @description The cutover is BLOCKED (identities fail the target schema), or the Idempotency-Key was reused with a different request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    exportUsage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage for the retained window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsageExport"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown tenant or environment */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
