@@ -689,3 +689,9 @@ path = "tests/org_audit_attribution.rs"
 name = "postures"
 path = "tests/postures.rs"
 required-features = ["testing"]
+
+# The per-tenant usage export (issue #107 criterion 4).
+[[test]]
+name = "usage_export"
+path = "tests/usage_export.rs"
+required-features = ["testing"]

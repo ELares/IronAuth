@@ -70,6 +70,7 @@ mod input;
 mod invitations;
 mod keys;
 mod locales;
+pub mod usage;
 
 /// SIEM log stream delivery (issue #110): the sink interface, the HTTP sink, and the
 /// shipper that reads audit rows forward from each stream's cursor. Public because the
@@ -588,6 +589,12 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants/{grant_id}",
             delete(project_grants::withdraw_project_grant),
+        )
+        // The per-tenant usage export (issue #107): folded from the feed on request, so
+        // asking for usage costs a feed read and no work on the authentication path.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/usage",
+            get(usage::export_usage),
         )
         // The ordered event feed (issue #107): the cursor-paginated READ surface over the
         // log, recommended over webhooks for data synchronisation. An aged-out cursor is a
