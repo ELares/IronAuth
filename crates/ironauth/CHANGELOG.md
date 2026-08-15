@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Declarative idempotent seeds for the emulator (issue #121, criterion 3).** `ironauth dev`
+  seeds an operator, a tenant, its first environment, and the environment's serving state
+  before the server boots, and prints the resulting scoped issuer URL.
+
+  - **Idempotence comes from TWO things together**, and neither works alone: the identifiers
+    are derived deterministically from the dev seed, and every statement is `ON CONFLICT DO
+    NOTHING`. Identifiers that changed per run would insert a second tenant every time and the
+    conflict clauses would never fire, because nothing would conflict.
+
+  - **The ids are GENERATED, not hand-written.** A fabricated identifier fails at its first use
+    with an error about the id rather than about the seed, which is a trap this milestone has
+    already sprung once. Generating them guarantees the format is whatever the id type
+    currently says it is, and a test asserts each one parses back.
+
+  - **They come from a DEDICATED entropy stream**, so the seeded tenant does not change
+    whenever some unrelated code draws a byte earlier in the boot. Reproducibility that breaks
+    when adjacent code changes is not reproducibility.
+
+  - **The serving state is a seed statement, and that was found by running it.** An environment
+    row alone is not enough: the data plane reads `environment_states`, and a scope with no row
+    there is not served. With the first three statements only, discovery returned 404 while the
+    server reported no error at all -- which reads as a broken emulator rather than an unserved
+    scope. That is the lifecycle fence working correctly, and the seed has to satisfy it.
+
+  - **Discovery still 404s, and the cause is now identified rather than guessed.**
+    `registry.entry_for(scope)` returns `None` because the environment has no provisioned
+    SIGNING KEY. That needs real key material rather than an insert, so it is the next change
+    and not this one. The seeds themselves are verified: the rows land, and re-running is a
+    no-op.
+
+
 - **FIX: `ironauth dev` booted, but was not a working emulator (issue #121).** Found by RUNNING
   it rather than by reading it. The generated configuration was too minimal in four separate
   ways, each of which the server reported and none of which any test could see.

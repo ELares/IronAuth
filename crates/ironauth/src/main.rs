@@ -4379,7 +4379,11 @@ fn write_dev_config(database_url: &str, bind: &str) -> Result<std::path::PathBuf
 /// # Errors
 ///
 /// A message naming the step that failed.
-fn prepare_dev_schema(bin_dir: &std::path::Path, database_url: &str) -> Result<(), String> {
+fn prepare_dev_schema(
+    bin_dir: &std::path::Path,
+    database_url: &str,
+    seed: u64,
+) -> Result<dev::SeededScope, String> {
     dev::provision_roles(bin_dir, database_url)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -4393,7 +4397,15 @@ fn prepare_dev_schema(bin_dir: &std::path::Path, database_url: &str) -> Result<(
             .migrate()
             .await
             .map_err(|error| format!("could not apply the schema: {error}"))
-    })
+    })?;
+
+    // Seeds come AFTER the schema, for the obvious reason, and before the server boots so
+    // the scoped OIDC surfaces exist the moment it answers. Without them the server starts
+    // and every scoped endpoint is a 404, which reads as a broken emulator rather than an
+    // empty one.
+    let scope = dev::seed_ids(seed);
+    dev::apply_seeds(bin_dir, database_url, &scope)?;
+    Ok(scope)
 }
 
 /// `ironauth dev [--bind ADDR]`: run the emulator.
@@ -4478,9 +4490,19 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
     // Skipped when the developer supplied their own DATABASE_URL: that database is theirs,
     // already managed by whatever manages it.
     if let Some(bin_dir) = &dev_bin_dir {
-        if let Err(error) = prepare_dev_schema(bin_dir, &database_url) {
-            eprintln!("ironauth dev: {error}");
-            return ExitCode::FAILURE;
+        match prepare_dev_schema(bin_dir, &database_url, seed) {
+            Ok(scope) => {
+                // Printed because the issuer URL is scoped, so a developer cannot construct
+                // it without these two values and would otherwise be left guessing at a 404.
+                println!(
+                    "ironauth dev: issuer http://{bind}/t/{}/e/{}",
+                    scope.tenant, scope.environment
+                );
+            }
+            Err(error) => {
+                eprintln!("ironauth dev: {error}");
+                return ExitCode::FAILURE;
+            }
         }
     }
 

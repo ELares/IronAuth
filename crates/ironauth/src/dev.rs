@@ -287,6 +287,119 @@ pub fn provision_roles(bin_dir: &Path, database_url: &str) -> Result<(), String>
     Ok(())
 }
 
+/// The scope the emulator seeds: an operator, a tenant, and its first environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeededScope {
+    /// The owning operator.
+    pub operator: String,
+    /// The tenant.
+    pub tenant: String,
+    /// The tenant's first environment.
+    pub environment: String,
+}
+
+/// Derive the seeded identifiers from `seed`.
+///
+/// GENERATED rather than hardcoded, from a dedicated entropy stream. Hardcoding them would
+/// mean writing identifier strings by hand, and a hand-written id that does not parse fails
+/// at the first use with an error about the id rather than about the seed -- a trap this
+/// milestone has already sprung once. Generating guarantees the format is whatever the id
+/// type currently says it is.
+///
+/// The stream is dedicated so the values do NOT depend on how many draws happened earlier.
+/// Sharing the server's entropy would make the seeded tenant change whenever anything else
+/// in the boot drew a byte first, which is reproducibility that breaks when unrelated code
+/// changes.
+#[must_use]
+pub fn seed_ids(seed: u64) -> SeededScope {
+    let env = ironauth_env::Env::from_parts(
+        std::sync::Arc::new(ironauth_env::SystemClock),
+        std::sync::Arc::new(ironauth_env::FixedEntropy::new(seed)),
+    );
+    let tenant = ironauth_store::TenantId::generate(&env);
+    SeededScope {
+        operator: ironauth_store::OperatorId::generate(&env).to_string(),
+        tenant: tenant.to_string(),
+        environment: ironauth_store::EnvironmentId::generate(&env).to_string(),
+    }
+}
+
+/// The seed statements, in dependency order.
+///
+/// Every one is `ON CONFLICT DO NOTHING`, which together with the deterministic ids above is
+/// what makes re-running a no-op rather than a duplicate. That pair IS the criterion's
+/// idempotence: identifiers that change per run would insert a second tenant every time, and
+/// conflict clauses alone would not help because nothing would ever conflict.
+#[must_use]
+pub fn seed_statements(scope: &SeededScope) -> Vec<String> {
+    vec![
+        format!(
+            "INSERT INTO operators (id, display_name) VALUES ('{}', 'dev operator') \
+             ON CONFLICT (id) DO NOTHING;",
+            scope.operator
+        ),
+        format!(
+            "INSERT INTO tenants (id, operator_id, display_name) \
+             VALUES ('{}', '{}', 'dev tenant') ON CONFLICT (id) DO NOTHING;",
+            scope.tenant, scope.operator
+        ),
+        format!(
+            "INSERT INTO environments (id, tenant_id, display_name, kind) \
+             VALUES ('{}', '{}', 'dev environment', 'dev') ON CONFLICT (id) DO NOTHING;",
+            scope.environment, scope.tenant
+        ),
+        // The serving state, WITHOUT which every scoped endpoint is a 404.
+        //
+        // An environment row alone is not enough: the data plane reads
+        // `environment_states`, and a scope with no row there is not served. That is the
+        // lifecycle fence working correctly (a scope must be affirmatively serving), and it
+        // is the difference between an emulator that answers and one that starts cleanly,
+        // logs nothing, and 404s every request. Measured: with the first three statements
+        // only, discovery returned 404 while the server reported no error at all.
+        format!(
+            "INSERT INTO environment_states /* query-audit-allow: dev-only seeding of a \
+             scoped table's precondition, as the cluster owner, against a throwaway \
+             database this process created, BEFORE any server exists to route it through a \
+             scoped repository */ (tenant_id, environment_id, serving_status) \
+             VALUES ('{}', '{}', 'active') \
+             ON CONFLICT (tenant_id, environment_id) DO NOTHING;",
+            scope.tenant, scope.environment
+        ),
+    ]
+}
+
+/// Apply the seed statements.
+///
+/// Through `psql` from the same directory the cluster came from, like the role provisioning,
+/// so it cannot silently address a different Postgres than the one just started.
+///
+/// # Errors
+///
+/// A message naming the statement that failed.
+pub fn apply_seeds(bin_dir: &Path, database_url: &str, scope: &SeededScope) -> Result<(), String> {
+    for statement in seed_statements(scope) {
+        let output = Command::new(bin_dir.join("psql"))
+            .args([
+                "-d",
+                database_url,
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                &statement,
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| format!("psql: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "seeding failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The message shown when no Postgres binaries can be found.
 ///
 /// Names what to install and the escape hatch, because "could not start the emulator" sends
@@ -524,6 +637,74 @@ mod tests {
             // Applying twice must be a no-op, which is what makes a dev restart cheap.
             store.migrate().await.expect("the schema is idempotent");
         });
+    }
+
+    /// The seeded identifiers are REPRODUCIBLE, which is half of what makes re-running a
+    /// no-op. Ids that changed per run would insert a second tenant every time, and the
+    /// conflict clauses would never fire because nothing would conflict.
+    #[test]
+    fn the_seeded_ids_are_reproducible_and_seed_dependent() {
+        assert_eq!(seed_ids(1), seed_ids(1), "the same seed must reproduce");
+        assert_ne!(seed_ids(1), seed_ids(2), "a different seed must diverge");
+    }
+
+    /// The ids PARSE as the types they name. Generated rather than hand-written for exactly
+    /// this reason: a fabricated identifier fails at first use with an error about the id
+    /// rather than about the seed.
+    #[test]
+    fn the_seeded_ids_parse_as_their_types() {
+        let scope = seed_ids(1);
+        ironauth_store::TenantId::parse(&scope.tenant).expect("a valid tenant id");
+        ironauth_store::EnvironmentId::parse(&scope.environment).expect("a valid environment id");
+        ironauth_store::OperatorId::parse(&scope.operator).expect("a valid operator id");
+    }
+
+    /// Every statement is conflict-tolerant, which is the other half of idempotence.
+    #[test]
+    fn every_seed_statement_tolerates_a_re_run() {
+        let statements = seed_statements(&seed_ids(1));
+        assert_eq!(
+            statements.len(),
+            4,
+            "operator, tenant, environment, serving state"
+        );
+        for statement in &statements {
+            assert!(
+                statement.contains("ON CONFLICT"),
+                "a seed statement without a conflict clause duplicates on re-run: {statement}"
+            );
+        }
+    }
+
+    /// Dependency order: an environment referencing a tenant that does not exist yet fails
+    /// the foreign key, and the failure names the constraint rather than the ordering.
+    #[test]
+    fn the_seed_statements_are_in_dependency_order() {
+        let statements = seed_statements(&seed_ids(1));
+        assert!(
+            statements[0].contains("INTO operators"),
+            "{:?}",
+            statements[0]
+        );
+        assert!(
+            statements[1].contains("INTO tenants"),
+            "{:?}",
+            statements[1]
+        );
+        assert!(
+            statements[2].contains("INTO environments"),
+            "{:?}",
+            statements[2]
+        );
+        // The serving state comes last and is not optional: without it every scoped
+        // endpoint is a 404 while the server reports no error, which reads as a broken
+        // emulator rather than an unserved scope.
+        assert!(
+            statements[3].contains("INTO environment_states"), // query-audit-allow: an assertion about a statement, not SQL
+            "{:?}",
+            statements[3]
+        );
+        assert!(statements[3].contains("'active'"), "{:?}", statements[3]);
     }
 
     /// Loopback literals are accepted, in both families.
