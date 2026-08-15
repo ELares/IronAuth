@@ -23310,7 +23310,11 @@
             "description": "The client identifier IronAuth registers at the upstream."
           },
           "client_secret": {
-            "description": "The upstream client secret by indirection (`\"...\"`, `{ \"file\": \"/path\" }`, or\n`{ \"env\": \"VAR\" }`); sealed at rest, never returned by a read."
+            "type": [
+              "string",
+              "object"
+            ],
+            "description": "The secret itself as a string, or an indirection object naming where to read it from: `{ \"file\": \"/path\" }` or `{ \"env\": \"VAR\" }`."
           },
           "connector_id": {
             "type": "string",
@@ -23375,7 +23379,9 @@
           },
           "primitives": {
             "type": "array",
-            "items": {},
+            "items": {
+              "type": "object"
+            },
             "description": "The ordered primitive list (force / restrict / reject / default objects)."
           }
         }
@@ -23815,6 +23821,13 @@
             "description": "The candidate schema version identities are migrated or validated TO."
           },
           "transform": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "object"
+            },
             "description": "The declarative transform program, a JSON array. Omitted means the empty program,\nwhich is what a dry-run uses and what a migrate that only re-validates uses."
           }
         }
@@ -23954,7 +23967,9 @@
           },
           "primitives": {
             "type": "array",
-            "items": {},
+            "items": {
+              "type": "object"
+            },
             "description": "The ordered primitive list (as stored)."
           }
         }
@@ -26701,7 +26716,9 @@
         "properties": {
           "failures": {
             "type": "array",
-            "items": {},
+            "items": {
+              "type": "object"
+            },
             "description": "The per-field failures, each an RFC 6901 JSON Pointer and a reason."
           },
           "subject": {
@@ -27116,6 +27133,10 @@
             "description": "The LOW/MED/HIGH score as a wire string."
           },
           "signals": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
             "description": "The enumerated contributing signals as a JSON document."
           },
           "subject": {

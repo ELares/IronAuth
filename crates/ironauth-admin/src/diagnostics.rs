@@ -1385,6 +1385,7 @@ pub struct RiskDecisionSummary {
     /// The dispatched action verb.
     pub action: String,
     /// The enumerated contributing signals as a JSON document.
+    #[schema(value_type = Vec<Object>)]
     pub signals: serde_json::Value,
     /// When the decision was recorded, in milliseconds since the epoch.
     pub created_at_unix_ms: i64,

@@ -539,6 +539,7 @@ pub struct CreateTraitMigrationRequest {
     /// The declarative transform program, a JSON array. Omitted means the empty program,
     /// which is what a dry-run uses and what a migrate that only re-validates uses.
     #[serde(default)]
+    #[schema(value_type = Option<Vec<Object>>)]
     pub transform: Option<serde_json::Value>,
 }
 
@@ -548,6 +549,7 @@ pub struct RecordFailureView {
     /// The failing identity's subject (a `usr_` id).
     pub subject: String,
     /// The per-field failures, each an RFC 6901 JSON Pointer and a reason.
+    #[schema(value_type = Vec<Object>)]
     pub failures: Vec<serde_json::Value>,
 }
 
