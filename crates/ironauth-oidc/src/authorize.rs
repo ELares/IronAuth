@@ -232,7 +232,7 @@ pub async fn authorize_get(
             .into_response();
     };
     params.resources = resource::resources_from_encoded(&raw);
-    handle(&state, &headers, params).await
+    handle(&state, &headers, params, None).await
 }
 
 /// `POST /authorize`. Parses the raw form body the same way as [`authorize_get`],
@@ -247,7 +247,63 @@ pub async fn authorize_post(
             .into_response();
     };
     params.resources = resource::resources_from_encoded(&body);
-    handle(&state, &headers, params).await
+    handle(&state, &headers, params, None).await
+}
+
+/// `GET /t/{t}/e/{e}/authorize`: the SCOPE-ROUTED authorization endpoint (issue #128).
+///
+/// # Why a second mount rather than a parameter
+///
+/// The deployment-root `/authorize` learns its (tenant, environment) from the
+/// `client_id` itself, because a `cli_` identifier DECLARES its own scope. A CIMD
+/// `client_id` is a URL and declares nothing, so on that route there is no answer to
+/// "whose allow list, whose deny list, whose acknowledgment of the draft applies". The
+/// scope has to come from somewhere the client cannot choose freely, and the path is
+/// that somewhere.
+///
+/// The root route keeps its exact existing behaviour. This one is additive.
+///
+/// # A declared scope must MATCH the path
+///
+/// When a `cli_` client_id arrives here it still declares a scope, and that scope is
+/// now checked against the path rather than believed. Believing it would make this
+/// route a cross-tenant hole: any tenant's URL would serve any other tenant's client,
+/// and the path would be decoration.
+pub async fn scoped_authorize_get(
+    State(state): State<OidcState>,
+    axum::extract::Path((tenant_id, environment_id)): axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let Some(scope) = crate::wellknown::parse_scope(&tenant_id, &environment_id) else {
+        return AuthorizeError::page("the client_id is malformed or unknown").into_response();
+    };
+    let raw = query.unwrap_or_default();
+    let Ok(mut params) = serde_urlencoded::from_str::<AuthorizeParams>(&raw) else {
+        return AuthorizeError::page("the authorization request could not be processed")
+            .into_response();
+    };
+    params.resources = resource::resources_from_encoded(&raw);
+    handle(&state, &headers, params, Some(scope)).await
+}
+
+/// `POST /t/{t}/e/{e}/authorize`. The form-body twin of [`scoped_authorize_get`],
+/// under the same path-scope rule.
+pub async fn scoped_authorize_post(
+    State(state): State<OidcState>,
+    axum::extract::Path((tenant_id, environment_id)): axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let Some(scope) = crate::wellknown::parse_scope(&tenant_id, &environment_id) else {
+        return AuthorizeError::page("the client_id is malformed or unknown").into_response();
+    };
+    let Ok(mut params) = serde_urlencoded::from_str::<AuthorizeParams>(&body) else {
+        return AuthorizeError::page("the authorization request could not be processed")
+            .into_response();
+    };
+    params.resources = resource::resources_from_encoded(&body);
+    handle(&state, &headers, params, Some(scope)).await
 }
 
 /// Run the authorization request, returning the success redirect, an interaction
@@ -260,12 +316,21 @@ pub async fn authorize_post(
 /// runs on the pushed request. A [`PushedContext`] records that the request arrived
 /// through PAR (so the require-PAR gate does not reject it) and carries the reference
 /// forward so the single-use consume happens ATOMICALLY at code issuance.
-async fn handle(state: &OidcState, headers: &HeaderMap, params: AuthorizeParams) -> Response {
+/// `path_scope` is `Some` only on the scope-routed mount ([`scoped_authorize_get`]),
+/// where it is the authority on which (tenant, environment) the request lives in. On
+/// the deployment-root mount it is `None` and the scope comes from the `client_id`, as
+/// it always has.
+async fn handle(
+    state: &OidcState,
+    headers: &HeaderMap,
+    params: AuthorizeParams,
+    path_scope: Option<Scope>,
+) -> Response {
     let (params, pushed) = match resolve_pushed_request(state, params).await {
         Ok(resolved) => resolved,
         Err(error) => return error.into_response(),
     };
-    match issue_code(state, headers, params, pushed.as_ref()).await {
+    match issue_code(state, headers, params, pushed.as_ref(), path_scope).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
@@ -463,6 +528,7 @@ async fn issue_code(
     headers: &HeaderMap,
     params: AuthorizeParams,
     pushed: Option<&PushedContext>,
+    path_scope: Option<Scope>,
 ) -> Result<Response, AuthorizeError> {
     // 1. client_id: present and well formed. A cli_ id declares its own scope, so
     //    it is the routing key to the (tenant, environment) this request lives in.
@@ -475,6 +541,20 @@ async fn issue_code(
     let client_id = ClientId::parse_declared_scope(client_id_raw)
         .map_err(|_| AuthorizeError::page("the client_id is malformed or unknown"))?;
     let scope = client_id.scope();
+
+    // 1a. On the scope-routed mount (issue #128) the PATH decides the scope, and a
+    //     client_id that declares a different one is refused rather than followed.
+    //     Following it would mean the path segment names one tenant while the lookup
+    //     runs in another, which is a cross-tenant read dressed up as a routing detail.
+    //     The refusal is the SAME opaque page as an unknown client, so this does not
+    //     become an oracle for which (tenant, environment) pairs exist.
+    if let Some(path_scope) = path_scope {
+        if path_scope != scope {
+            return Err(AuthorizeError::page(
+                "the client_id is malformed or unknown",
+            ));
+        }
+    }
 
     // 2. The client must exist in its declared scope. This lookup is BEFORE any
     //    redirect, so an unknown client renders a page and never redirects. A

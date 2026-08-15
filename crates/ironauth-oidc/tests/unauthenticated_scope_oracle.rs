@@ -159,6 +159,19 @@ fn cases() -> Vec<Case> {
             body: "user_code=ABCD-EFGH",
             live_status: StatusCode::OK,
         },
+        // The scope-routed authorization endpoint (issue #128). Driven with NO
+        // client_id, which is the shape an unauthenticated prober sends: the request is
+        // refused for the missing parameter before the scope is ever used to look
+        // anything up, so a live and a ghost scope must be one answer. Driving it with a
+        // real client_id instead would measure the cross-scope refusal, which
+        // `scoped_authorize.rs` owns, and would say nothing about the ghost case.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/authorize",
+            method: "GET",
+            content_type: "text/plain",
+            body: "",
+            live_status: StatusCode::BAD_REQUEST,
+        },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/device",
             method: "GET",
