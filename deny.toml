@@ -28,6 +28,11 @@ allow = [
 exceptions = [
   { crate = "cssparser", allow = ["MPL-2.0"] },
   { crate = "dtoa-short", allow = ["MPL-2.0"] },
+  # BSL-1.0 is the Boost licence: OSI approved, permissive, and no reciprocity, so it asks
+  # LESS of us than the MPL-2.0 exceptions above. Pinned to this crate for the same reason
+  # they are: the point of an exception list is that the next arrival is noticed.
+  # Reached transitively through sqlx-postgres, not chosen.
+  { crate = "xxhash-rust", allow = ["BSL-1.0"] },
 ]
 
 [bans]
