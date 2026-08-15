@@ -4369,6 +4369,24 @@ fn write_dev_config(database_url: &str, bind: &str) -> Result<std::path::PathBuf
     Ok(config_path)
 }
 
+/// Print what a developer needs to drive a flow against the emulator.
+///
+/// Both values, because a flow needs each and neither is derivable by the caller: the issuer
+/// URL is SCOPED, so it cannot be constructed without the seeded tenant and environment, and
+/// an emulator that seeds a client without saying which one has made the developer read the
+/// database to use it.
+fn print_dev_scope(bind: &str, scope: &dev::SeededScope) {
+    println!(
+        "ironauth dev: issuer http://{bind}/t/{}/e/{}",
+        scope.tenant, scope.environment
+    );
+    println!(
+        "ironauth dev: client_id {} (public, redirect {})",
+        scope.client,
+        dev::DEV_REDIRECT_URI
+    );
+}
+
 /// Provision the schema roles and apply the schema, before the server boots.
 ///
 /// Nothing else does this. `serve` does not migrate, and a freshly `initdb`-ed cluster has
@@ -4502,14 +4520,7 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
     // already managed by whatever manages it.
     if let Some(bin_dir) = &dev_bin_dir {
         match prepare_dev_schema(bin_dir, &database_url, seed) {
-            Ok(scope) => {
-                // Printed because the issuer URL is scoped, so a developer cannot construct
-                // it without these two values and would otherwise be left guessing at a 404.
-                println!(
-                    "ironauth dev: issuer http://{bind}/t/{}/e/{}",
-                    scope.tenant, scope.environment
-                );
-            }
+            Ok(scope) => print_dev_scope(&bind, &scope),
             Err(error) => {
                 eprintln!("ironauth dev: {error}");
                 return ExitCode::FAILURE;

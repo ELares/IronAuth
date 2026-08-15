@@ -296,6 +296,9 @@ pub struct SeededScope {
     pub tenant: String,
     /// The tenant's first environment.
     pub environment: String,
+    /// A PUBLIC client registered for the loopback redirect, so `ironauth login` works
+    /// against the emulator with no further setup.
+    pub client: String,
 }
 
 /// Derive the seeded identifiers from `seed`.
@@ -317,12 +320,24 @@ pub fn seed_ids(seed: u64) -> SeededScope {
         std::sync::Arc::new(ironauth_env::FixedEntropy::new(seed)),
     );
     let tenant = ironauth_store::TenantId::generate(&env);
+    let environment = ironauth_store::EnvironmentId::generate(&env);
+    let scope = ironauth_store::Scope::new(tenant, environment);
     SeededScope {
         operator: ironauth_store::OperatorId::generate(&env).to_string(),
         tenant: tenant.to_string(),
-        environment: ironauth_store::EnvironmentId::generate(&env).to_string(),
+        environment: environment.to_string(),
+        client: ironauth_store::ClientId::generate(&env, &scope).to_string(),
     }
 }
+
+/// The loopback redirect the seeded client registers.
+///
+/// Registered because RFC 8252 loopback matching is PORT-AGNOSTIC but exact in every other
+/// respect: `ironauth login` binds an ephemeral port and the server accepts any port for a
+/// matching literal and path. Registering `127.0.0.1` (not `localhost`, which this server
+/// does not match port-agnostically) is what makes the emulator usable with the CLI login
+/// without further setup.
+pub const DEV_REDIRECT_URI: &str = "http://127.0.0.1/callback";
 
 /// The seed statements, in dependency order.
 ///
@@ -364,6 +379,19 @@ pub fn seed_statements(scope: &SeededScope) -> Vec<String> {
              VALUES ('{}', '{}', 'active') \
              ON CONFLICT (tenant_id, environment_id) DO NOTHING;",
             scope.tenant, scope.environment
+        ),
+        // A PUBLIC client (`none`): the emulator's reason to exist is driving flows from a
+        // CLI or a sample app, and a public client with a loopback redirect is what both
+        // use. A confidential one would need a secret every quickstart then has to carry.
+        format!(
+            "INSERT INTO clients /* query-audit-allow: dev-only seeding as the cluster \
+             owner, against a throwaway database this process created, BEFORE any server \
+             exists to route it through a scoped repository */ \
+             (id, tenant_id, environment_id, display_name, token_endpoint_auth_method, \
+              redirect_uris) \
+             VALUES ('{}', '{}', '{}', 'dev client', 'none', ARRAY['{}']) \
+             ON CONFLICT (id) DO NOTHING;",
+            scope.client, scope.tenant, scope.environment, DEV_REDIRECT_URI
         ),
     ]
 }
@@ -736,6 +764,7 @@ mod tests {
         ironauth_store::TenantId::parse(&scope.tenant).expect("a valid tenant id");
         ironauth_store::EnvironmentId::parse(&scope.environment).expect("a valid environment id");
         ironauth_store::OperatorId::parse(&scope.operator).expect("a valid operator id");
+        ironauth_store::ClientId::parse_declared_scope(&scope.client).expect("a valid client id");
     }
 
     /// Every statement is conflict-tolerant, which is the other half of idempotence.
@@ -744,8 +773,8 @@ mod tests {
         let statements = seed_statements(&seed_ids(1));
         assert_eq!(
             statements.len(),
-            4,
-            "operator, tenant, environment, serving state"
+            5,
+            "operator, tenant, environment, serving state, client"
         );
         for statement in &statements {
             assert!(
@@ -784,6 +813,22 @@ mod tests {
             statements[3]
         );
         assert!(statements[3].contains("'active'"), "{:?}", statements[3]);
+        let client = &statements[4];
+        assert!(client.contains("INTO clients"), "{client}"); // query-audit-allow: assertion
+    }
+
+    /// The seeded client is PUBLIC and registers the loopback redirect, which is what makes
+    /// `ironauth login` work against the emulator with no further setup. A confidential
+    /// client would need a secret every quickstart then has to carry.
+    #[test]
+    fn the_seeded_client_is_public_and_loopback_registered() {
+        let statements = seed_statements(&seed_ids(1));
+        let client = &statements[4];
+        assert!(client.contains("'none'"), "{client}");
+        assert!(client.contains(DEV_REDIRECT_URI), "{client}");
+        // The literal, never the name: this server does not match `localhost`
+        // port-agnostically, so a registration naming it could never match an ephemeral port.
+        assert!(!client.contains("localhost"), "{client}");
     }
 
     /// Loopback literals are accepted, in both families.
