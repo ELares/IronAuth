@@ -20322,6 +20322,88 @@ pub fn membership_change(added: Vec<String>, removed: Vec<String>) -> Membership
     }
 }
 
+/// Per-tenant usage, folded from the event feed (issue #107).
+///
+/// # Why this is a fold over the feed rather than counters on the hot path
+///
+/// The issue is explicit that metering "adds zero work to the login hot path", and a fold
+/// is what makes that true rather than aspirational: nothing here is called during a login.
+/// It also makes metering REPLAYABLE, which billing needs, because a disputed invoice is
+/// answered by replaying the feed from a cursor rather than by trusting a counter nobody
+/// can reconstruct.
+///
+/// # Monthly actives are DISTINCT users, which is the whole difficulty
+///
+/// A user who signs in forty times in a month is one active user. Counting activity events
+/// instead of users is the classic metering bug, and it is the expensive direction: it
+/// overbills, and it overbills the busiest customers most. So actives are a set, not a
+/// counter, and the memory that costs is the honest price of a number somebody pays money
+/// against.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageTally {
+    actives: std::collections::BTreeSet<String>,
+    tokens_issued: u64,
+    connections: u64,
+}
+
+impl UsageTally {
+    /// An empty tally.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `subject` was active.
+    ///
+    /// Idempotent by construction: the same subject twice is still one active user, which
+    /// also means a replayed event cannot inflate the number. That property is why the
+    /// at-least-once feed is safe to meter from at all.
+    pub fn saw_active(&mut self, subject: &str) {
+        self.actives.insert(subject.to_owned());
+    }
+
+    /// Record an issued token. NOT deduplicated: two tokens are two tokens, even for one
+    /// user, because this measures issuance rather than people.
+    pub fn saw_token_issued(&mut self) {
+        self.tokens_issued = self.tokens_issued.saturating_add(1);
+    }
+
+    /// Record a connection.
+    pub fn saw_connection(&mut self) {
+        self.connections = self.connections.saturating_add(1);
+    }
+
+    /// Distinct active users.
+    #[must_use]
+    pub fn monthly_active_users(&self) -> u64 {
+        self.actives.len() as u64
+    }
+
+    /// Tokens issued.
+    #[must_use]
+    pub fn tokens_issued(&self) -> u64 {
+        self.tokens_issued
+    }
+
+    /// Connections.
+    #[must_use]
+    pub fn connections(&self) -> u64 {
+        self.connections
+    }
+
+    /// Merge another tally into this one.
+    ///
+    /// Actives UNION rather than add, so folding two windows of the same month does not
+    /// double-count a user who appears in both. Summing them is the same bug as counting
+    /// events, arrived at from a different direction, and it is the one a sharded or
+    /// resumed consumer walks into.
+    pub fn merge(&mut self, other: &Self) {
+        self.actives.extend(other.actives.iter().cloned());
+        self.tokens_issued = self.tokens_issued.saturating_add(other.tokens_issued);
+        self.connections = self.connections.saturating_add(other.connections);
+    }
+}
+
 /// An opaque position in the event feed (issue #107).
 ///
 /// # Why opaque, when it wraps one integer
@@ -59508,5 +59590,97 @@ mod event_cursor {
             "{wire} reads as a plain integer"
         );
         assert!(wire.starts_with("evc_"), "{wire}");
+    }
+}
+
+#[cfg(test)]
+mod usage_tally {
+    use super::UsageTally;
+
+    #[test]
+    fn one_user_signing_in_repeatedly_is_one_active_user() {
+        // The classic metering bug, and the expensive direction: counting activity instead
+        // of users overbills, and overbills the busiest customers most.
+        let mut tally = UsageTally::new();
+        for _ in 0..40 {
+            tally.saw_active("usr_alice");
+        }
+        assert_eq!(tally.monthly_active_users(), 1);
+    }
+
+    #[test]
+    fn distinct_users_each_count_once() {
+        let mut tally = UsageTally::new();
+        tally.saw_active("usr_alice");
+        tally.saw_active("usr_bob");
+        tally.saw_active("usr_alice");
+        assert_eq!(tally.monthly_active_users(), 2);
+    }
+
+    #[test]
+    fn a_replayed_event_cannot_inflate_actives() {
+        // The feed is at-least-once, so a consumer WILL see some events twice. Metering is
+        // only safe on it because actives are idempotent; if this stopped holding, a
+        // redelivery would become a billing error.
+        let mut tally = UsageTally::new();
+        tally.saw_active("usr_alice");
+        let before = tally.monthly_active_users();
+        tally.saw_active("usr_alice");
+        assert_eq!(tally.monthly_active_users(), before);
+    }
+
+    #[test]
+    fn token_issuance_counts_events_not_people() {
+        // The deliberate asymmetry with actives: two tokens for one user are two tokens.
+        let mut tally = UsageTally::new();
+        tally.saw_active("usr_alice");
+        tally.saw_token_issued();
+        tally.saw_token_issued();
+        assert_eq!(tally.tokens_issued(), 2);
+        assert_eq!(tally.monthly_active_users(), 1);
+    }
+
+    #[test]
+    fn merging_two_windows_unions_actives_rather_than_adding_them() {
+        // The same double-count arrived at from a different direction, and the one a
+        // sharded or resumed consumer walks into: a user active in both halves of a month
+        // is still one active user.
+        let mut first = UsageTally::new();
+        first.saw_active("usr_alice");
+        first.saw_active("usr_bob");
+        first.saw_token_issued();
+
+        let mut second = UsageTally::new();
+        second.saw_active("usr_alice");
+        second.saw_active("usr_carol");
+        second.saw_token_issued();
+
+        first.merge(&second);
+
+        assert_eq!(
+            first.monthly_active_users(),
+            3,
+            "alice appears in both windows and is one person"
+        );
+        assert_eq!(first.tokens_issued(), 2, "but issuance genuinely adds");
+    }
+
+    #[test]
+    fn merging_is_order_independent() {
+        // A resumed consumer may fold windows in any order; the invoice must not depend on
+        // which one it happened to process first.
+        let mut a = UsageTally::new();
+        a.saw_active("usr_alice");
+        a.saw_connection();
+        let mut b = UsageTally::new();
+        b.saw_active("usr_bob");
+        b.saw_connection();
+
+        let mut forward = a.clone();
+        forward.merge(&b);
+        let mut backward = b.clone();
+        backward.merge(&a);
+
+        assert_eq!(forward, backward);
     }
 }
