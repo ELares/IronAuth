@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`ironauth logout`, and the keychain-backed credential store beneath it (issue #120).** The
+  first piece of the CLI login story that a user can actually run.
+
+  - **The keychain, and no file.** Credentials live in the macOS Keychain, the Windows
+    Credential Manager, or the Secret Service on Linux, reached through one `keyring` API. The
+    criterion asks for "no plaintext token files in default mode" and the reason is specific: a
+    refresh token in a dotfile is readable by every process running as that user, survives into
+    backups, and is the one credential that regenerates all the others.
+
+  - **Removing an absent credential SUCCEEDS; a refusing keychain does NOT.** `logout` exists to
+    put a machine into a known state, so failing because it was already in that state would
+    report that something is still stored when nothing is. A keychain that refuses is the
+    opposite case: the credential may still be there, and a logout that lies about a credential
+    is the one failure this command cannot have.
+
+  - **Only as large as its callers.** The store has exactly one operation, `delete`, because
+    `logout` is the only caller today; the read and write halves land WITH `ironauth login`.
+    That is a deliberate response to a measured problem in this milestone rather than
+    minimalism: `device_login.rs`, `login_flow.rs`, and `loopback.rs` all shipped earlier under
+    this same issue, are individually well tested, and have ZERO call sites, each carrying a
+    module-level `allow(dead_code)` because of it. Their tests pass because they call those
+    modules directly, which is exactly why they cannot notice that nothing else does. A
+    `store`/`load` pair with no caller would have repeated that and needed the same `allow`.
+
+  - **The seam is the store, not the keychain.** Every backend needs a real desktop session, so
+    a test against the real one would fail on a CI runner or pass on a laptop and fail in CI for
+    a reason resembling nothing in the change. `KeyringStore` is kept thin enough that what the
+    tests leave unproved is a delegation rather than a decision; only running it on each
+    platform proves the backend itself.
+
+
 - **The boot path starts the outbox RETENTION sweeper (issue #104, PR 3).**
   `spawn_retention_sweeper` takes the store, the scopes and the observer as ARGUMENTS, for
   the reason `spawn_consumer_pools` does: it is what lets a test drive the real seam against
