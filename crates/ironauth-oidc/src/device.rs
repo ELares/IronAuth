@@ -237,8 +237,11 @@ async fn enforce_consent_lockdown(
         .get(client_id)
         .await
         .map_err(|_| DeviceAuthError::ServerError)?;
-    if crate::authorize::unverified_sensitive_scope_blocked(state, &client_record, requested_scope)
-    {
+    if crate::authorize::unverified_sensitive_scope_blocked(
+        state,
+        &crate::authorize::ResolvedClient::Registered(&client_record),
+        requested_scope,
+    ) {
         return Err(DeviceAuthError::AccessDenied);
     }
     // Third-party admin-consent gate (issue #88, PR 4): a third-party client with no covering
@@ -249,7 +252,7 @@ async fn enforce_consent_lockdown(
     match crate::authorize::third_party_admin_consent_outcome(
         state,
         scope,
-        &client_record,
+        &crate::authorize::ResolvedClient::Registered(&client_record),
         &client_id.to_string(),
         requested_scope,
     )

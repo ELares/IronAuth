@@ -290,7 +290,7 @@ pub fn floor_is_achievable(floor: &str, order: &[String]) -> bool {
         .any(|supported| acr_satisfies(supported, floor, order))
 }
 
-use ironauth_store::{ClientRecord, Scope, UserId};
+use ironauth_store::{Scope, UserId};
 
 use crate::state::OidcState;
 
@@ -309,7 +309,7 @@ use crate::state::OidcState;
 pub(crate) async fn requirement_for_request(
     state: &OidcState,
     scope: Scope,
-    client: &ClientRecord,
+    client: &crate::authorize::ResolvedClient<'_>,
     requested_scope: Option<&str>,
     acr_values: Option<&str>,
     max_age_secs: Option<u64>,
@@ -334,9 +334,9 @@ pub(crate) async fn requirement_for_request(
     // The per-client registration floor.
     requirement.merge_stronger(
         &AuthnRequirement {
-            min_acr: client.step_up_acr.clone(),
+            min_acr: client.step_up_acr().map(str::to_owned),
             max_auth_age_secs: client
-                .step_up_max_age_secs
+                .step_up_max_age_secs()
                 .and_then(|secs| u64::try_from(secs).ok()),
         },
         &order,
