@@ -78,6 +78,12 @@ mod outbox_wiring_tests;
 /// Semantic version of this build, injected by Cargo.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The RFC 8628 device-flow polling state machine for `ironauth login` (issue #120).
+///
+/// Pure logic, kept out of `main` so the section 3.5 rules are tested as a table rather
+/// than through a mocked HTTP exchange.
+mod device_login;
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
