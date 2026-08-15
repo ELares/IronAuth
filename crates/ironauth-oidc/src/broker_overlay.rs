@@ -252,7 +252,7 @@ pub(crate) async fn enforce_on_callback(ctx: CallbackContext<'_>) -> CallbackOve
             let assembled = step_up::requirement_for_request(
                 ctx.state,
                 ctx.scope,
-                &client,
+                &crate::authorize::ResolvedClient::Registered(&client),
                 resume.oauth_scope.as_deref(),
                 acr_values.as_deref(),
                 max_age,

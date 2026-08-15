@@ -252,8 +252,12 @@ async fn push(
     //    `/authorize`, through the ONE shared validator. An error surfaces HERE on the
     //    back channel (RFC 9126 section 2.3), not later at `/authorize`.
     let authorize_params = params.into_authorize_params(authenticated_client_id.clone(), resources);
-    validate_request(state, &client, &authorize_params)
-        .map_err(PushedAuthError::from_validation)?;
+    validate_request(
+        state,
+        &crate::authorize::ResolvedClient::Registered(&client),
+        &authorize_params,
+    )
+    .map_err(PushedAuthError::from_validation)?;
 
     // 6. Persist the validated request behind a one-time reference bound to the
     //    authenticated client, with a short, bounded expiry from the clock seam.

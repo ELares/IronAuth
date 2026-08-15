@@ -336,6 +336,135 @@ async fn handle(
     }
 }
 
+/// The client an authorization request resolved to (issue #128).
+///
+/// # Why the pipeline stopped taking a `ClientRecord`
+///
+/// A registered client is a row this deployment wrote. A CIMD client is a document an
+/// unregistered party serves at a URL it chose. Both have to answer the same handful of
+/// questions for an authorization request to proceed, and NEITHER is a special case of the
+/// other: there is no `ClientRecord` to build for a CIMD client, because a `ClientRecord`
+/// is keyed by a `cli_` identifier that only a registration produces.
+///
+/// So the pipeline asks the questions through this type instead of reaching into a struct.
+/// The accessors below are the COMPLETE set of things the authorization path needs to know
+/// about a client, which is a useful thing to have written down: anything a future change
+/// wants to consult has to be added here deliberately, and answered for BOTH kinds.
+pub(crate) enum ResolvedClient<'a> {
+    /// A client registered in this deployment.
+    Registered(&'a ClientRecord),
+}
+
+impl ResolvedClient<'_> {
+    /// The scope this client acts in.
+    pub(crate) fn scope(&self) -> Scope {
+        match self {
+            Self::Registered(record) => record.id.scope(),
+        }
+    }
+
+    /// The registered `token_endpoint_auth_method`.
+    ///
+    /// A CIMD client is always `none`, and that is a rule rather than a default: the draft
+    /// forbids a shared secret for a client whose identity is a public URL, because a
+    /// secret agreed with a party nobody registered is a secret with nobody at the other
+    /// end. Being `none` also means PKCE is mandatory, via the same rule that governs any
+    /// public client (RFC 9700 2.1.1).
+    pub(crate) fn auth_method(&self) -> &str {
+        match self {
+            Self::Registered(record) => &record.auth_method,
+        }
+    }
+
+    /// Whether every ID token must carry `auth_time` (issue #14).
+    pub(crate) fn require_auth_time(&self) -> bool {
+        match self {
+            Self::Registered(record) => record.require_auth_time,
+        }
+    }
+
+    /// Whether this client must use PAR (RFC 9126, issue #27).
+    pub(crate) fn require_pushed_authorization_requests(&self) -> bool {
+        match self {
+            Self::Registered(record) => record.require_pushed_authorization_requests,
+        }
+    }
+
+    /// The client's consent mode.
+    pub(crate) fn consent_mode(&self) -> &str {
+        match self {
+            Self::Registered(record) => &record.consent_mode,
+        }
+    }
+
+    /// Whether consent may be skipped for this client.
+    ///
+    /// NEVER for a CIMD client. The issue states the quarantine posture directly: an
+    /// unknown domain gets consent always on. Nobody vetted this client, and the party
+    /// that chose its identifier is the party the identifier describes, so there is no
+    /// registration decision that could have authorised skipping the user.
+    pub(crate) fn skip_consent(&self) -> bool {
+        match self {
+            Self::Registered(record) => record.skip_consent,
+        }
+    }
+
+    /// Whether a skipped consent is still recorded.
+    pub(crate) fn store_skipped_consent(&self) -> bool {
+        match self {
+            Self::Registered(record) => record.store_skipped_consent,
+        }
+    }
+
+    /// Whether this client is quarantined (restricted redirect capability, consent forced).
+    ///
+    /// A CIMD client is quarantined unless the operator's ALLOW list names its domain. An
+    /// unlisted domain resolving to quarantined rather than refused is the deliberate
+    /// middle posture the issue asks for: usable, but never silently trusted.
+    pub(crate) fn quarantined(&self) -> bool {
+        match self {
+            Self::Registered(record) => record.quarantined,
+        }
+    }
+
+    /// Whether this client is first-party (and so inside the consent carve-out).
+    ///
+    /// Never for a CIMD client: first-party means the deployment vouches for it, and
+    /// nobody vouched for a document that described itself.
+    pub(crate) fn first_party(&self) -> bool {
+        match self {
+            Self::Registered(record) => record.first_party,
+        }
+    }
+
+    /// The ACR this client requires for step-up, if it registered one.
+    ///
+    /// A CIMD client registered nothing, so it requires no client-specific step-up and
+    /// falls to the environment's own policy. That is the conservative direction: it
+    /// cannot LOWER a requirement, only decline to add one of its own.
+    pub(crate) fn step_up_acr(&self) -> Option<&str> {
+        match self {
+            Self::Registered(record) => record.step_up_acr.as_deref(),
+        }
+    }
+
+    /// The maximum age, in seconds, this client requires for a step-up. `None` for a CIMD
+    /// client, which registered nothing and so adds no requirement of its own.
+    pub(crate) fn step_up_max_age_secs(&self) -> Option<i64> {
+        match self {
+            Self::Registered(record) => record.step_up_max_age_secs,
+        }
+    }
+
+    /// The redirect URIs a presented `redirect_uri` is matched against by exact string.
+    ///
+    pub(crate) fn redirect_uris(&self) -> Vec<&str> {
+        match self {
+            Self::Registered(record) => record.redirect_uris.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
 /// The context of an authorization request that arrived through a PAR `request_uri`
 /// (RFC 9126, issue #27): the reference was PEEKED (validated live and bound to the
 /// presenting client) but NOT yet consumed, so a login/consent interaction can
@@ -563,7 +692,7 @@ async fn issue_code(
     //    `require_auth_time` registration, which (with `max_age`) decides whether
     //    the ID token must carry `auth_time` (issue #14), and its
     //    `require_pushed_authorization_requests` flag (issue #27).
-    let client = match state.store().scoped(scope).clients().get(&client_id).await {
+    let record = match state.store().scoped(scope).clients().get(&client_id).await {
         Ok(record) => record,
         Err(StoreError::NotFound) => {
             return Err(AuthorizeError::page(
@@ -576,6 +705,11 @@ async fn issue_code(
             ));
         }
     };
+
+    // The rest of the pipeline asks its questions through `ResolvedClient` rather than
+    // reaching into the record, so the CIMD branch (issue #128) has somewhere to answer
+    // them from. For a registered client every answer is the record's own, unchanged.
+    let client = ResolvedClient::Registered(&record);
 
     // 2a. Tenant/environment quota (issue #50). The quota is charged ONLY here, AFTER
     //     the client has been confirmed to exist in its declared scope, so a spend
@@ -607,7 +741,7 @@ async fn issue_code(
     //     PAGE error, never an open-redirector-able redirect.
     if pushed.is_none()
         && (state.require_pushed_authorization_requests()
-            || client.require_pushed_authorization_requests)
+            || client.require_pushed_authorization_requests())
     {
         return Err(AuthorizeError::page(
             "this client requires a pushed authorization request (RFC 9126)",
@@ -812,7 +946,7 @@ async fn issue_code(
     //    are always frozen so amr/acr can be derived. acr_values is honored as a
     //    preference only: the achieved acr comes from the event, never the request.
     let auth_time_required = max_age_secs.is_some()
-        || client.require_auth_time
+        || client.require_auth_time()
         || params.emit_auth_time.is_some()
         // A step-up max-age policy (per-client or per-scope, issue #72) also requires
         // freezing auth_time so the refresh path can re-evaluate the window against
@@ -1276,7 +1410,7 @@ impl AuthRequestError {
 /// and the PKCE requirement).
 pub(crate) fn validate_request<'a>(
     state: &OidcState,
-    client: &ClientRecord,
+    client: &ResolvedClient<'_>,
     params: &'a AuthorizeParams,
 ) -> Result<ValidatedRequest<'a>, AuthRequestError> {
     // 3. redirect_uri: present, a registrable RFC 8252 target, and an EXACT match
@@ -1373,7 +1507,7 @@ pub(crate) fn validate_request<'a>(
 /// the per-function length budget; it is never called except from there.
 fn validate_request_tail<'a>(
     state: &OidcState,
-    client: &ClientRecord,
+    client: &ResolvedClient<'_>,
     params: &'a AuthorizeParams,
     redirect_uri: &'a str,
     response_type: ResponseType,
@@ -1395,7 +1529,7 @@ fn validate_request_tail<'a>(
     // 5. PKCE (S256-only, mandatory; see resolve_pkce). A PUBLIC client always
     //    requires PKCE (RFC 9700 2.1.1); a CONFIDENTIAL client follows the
     //    per-environment policy, required by default.
-    let is_public = client.auth_method == ClientAuthMethod::None.as_str();
+    let is_public = client.auth_method() == ClientAuthMethod::None.as_str();
     let pkce_required =
         response_type.issues_code() && (is_public || state.require_pkce_for_confidential());
     let code_challenge = resolve_pkce(params, pkce_required).map_err(invalid)?;
@@ -1433,7 +1567,7 @@ fn validate_request_tail<'a>(
         .filter(|value| !value.is_empty())
     {
         Some(raw) => Some(
-            OrganizationId::parse_in_scope(raw, &client.id.scope())
+            OrganizationId::parse_in_scope(raw, &client.scope())
                 .map_err(|_| invalid("the organization parameter is malformed"))?,
         ),
         None => None,
@@ -1502,7 +1636,7 @@ fn is_jwk_thumbprint(value: &str) -> bool {
 /// the caller renders as an error PAGE, never a redirect, so an unvalidated or
 /// unregistered URI can never be turned into an open redirector.
 fn validate_registered_redirect<'a>(
-    client: &ClientRecord,
+    client: &ResolvedClient<'_>,
     params: &'a AuthorizeParams,
 ) -> Result<&'a str, &'static str> {
     let redirect_uri = params
@@ -1515,7 +1649,7 @@ fn validate_registered_redirect<'a>(
         return Err("the redirect_uri is invalid");
     }
     if !client
-        .redirect_uris
+        .redirect_uris()
         .iter()
         .any(|registered| redirect_uri_matches(registered, redirect_uri))
     {
@@ -1527,7 +1661,7 @@ fn validate_registered_redirect<'a>(
     // app) is refused at authorize time until an admin verifies the client. This is
     // a PAGE error (it runs before the redirect target is trusted), never a redirect,
     // so it can never be turned into an open redirector. Verification lifts it.
-    if client.quarantined && !is_https_redirect(redirect_uri) {
+    if client.quarantined() && !is_https_redirect(redirect_uri) {
         return Err("the redirect_uri is not permitted for an unverified client");
     }
     Ok(redirect_uri)
@@ -1703,7 +1837,7 @@ fn consent_interaction(state: &OidcState, scope: Scope, return_to: &str) -> Resp
 async fn evaluate_step_up(
     state: &OidcState,
     scope: Scope,
-    client: &ClientRecord,
+    client: &ResolvedClient<'_>,
     effective_scope: Option<&str>,
     params: &AuthorizeParams,
     max_age_secs: Option<u64>,
@@ -2042,7 +2176,7 @@ enum Gate {
 async fn resolve_gate(
     state: &OidcState,
     headers: &HeaderMap,
-    client: &ClientRecord,
+    client: &ResolvedClient<'_>,
     client_id: &ClientId,
     params: &AuthorizeParams,
     effective_scope: Option<&str>,
@@ -2204,14 +2338,14 @@ pub(crate) fn strip_sensitive_scopes(
 /// endpoint (`device::device_authorization`), so both consent surfaces enforce the same block.
 pub(crate) fn unverified_sensitive_scope_blocked(
     state: &OidcState,
-    client: &ClientRecord,
+    client: &ResolvedClient<'_>,
     effective_scope: Option<&str>,
 ) -> bool {
     state
         .consent_lockdown_config()
         .gate_unverified_sensitive_scopes
-        && client.quarantined
-        && !client.first_party
+        && client.quarantined()
+        && !client.first_party()
         && effective_scope.is_some_and(|scope| {
             scope
                 .split_whitespace()
@@ -2250,13 +2384,13 @@ pub(crate) enum AdminConsentOutcome {
 pub(crate) async fn third_party_admin_consent_outcome(
     state: &OidcState,
     scope: Scope,
-    client: &ClientRecord,
+    client: &ResolvedClient<'_>,
     client_id_str: &str,
     effective_scope: Option<&str>,
 ) -> Result<AdminConsentOutcome, ()> {
     // The knob is off, or the client is a first-party (operator-owned) app: the gate does not
     // apply and the request falls through to the ordinary consent path.
-    if !state.third_party_admin_consent_required() || client.first_party {
+    if !state.third_party_admin_consent_required() || client.first_party() {
         return Ok(AdminConsentOutcome::NotApplicable);
     }
     let grant = state
@@ -2316,7 +2450,7 @@ async fn audit_skipped_consent(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn resolve_consent_gate(
     state: &OidcState,
-    client: &ClientRecord,
+    client: &ResolvedClient<'_>,
     client_id: &ClientId,
     params: &AuthorizeParams,
     effective_scope: Option<&str>,
@@ -2394,19 +2528,19 @@ async fn resolve_consent_gate(
     let now_micros = epoch_micros(state.now());
     let consent_scope =
         consent_check_scope(effective_scope, state.offline_access_requires_consent());
-    let consent_mode = ConsentMode::parse(&client.consent_mode);
+    let consent_mode = ConsentMode::parse(&client.consent_mode());
     // The browser surface trusts an `implicit`-mode client or one whose `skip_consent` flag is set
     // for the first-party carve-out. The core takes this trust as an INPUT (it does not re-derive
     // it) so the challenge surface can supply its own predicate while sharing the same decision.
-    let carveout_trusted = matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent;
+    let carveout_trusted = matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent();
 
     let inputs = consent_core::ConsentInputs {
-        client_quarantined: client.quarantined,
+        client_quarantined: client.quarantined(),
         user_quarantined,
         prompt_consent: prompt.contains(PromptValue::Consent),
         prompt_none,
         carveout_trusted,
-        store_skipped_consent: client.store_skipped_consent,
+        store_skipped_consent: client.store_skipped_consent(),
         unverified_sensitive_block,
         admin,
         recorded: recorded.as_ref(),

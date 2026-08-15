@@ -1767,8 +1767,15 @@ async fn enforce_step_up_policy(
         Err(StoreError::NotFound) => return None,
         Err(_) => return Some(TokenError::ServerError),
     };
-    let assembled =
-        step_up::requirement_for_request(state, scope, &client, oauth_scope, None, None).await;
+    let assembled = step_up::requirement_for_request(
+        state,
+        scope,
+        &crate::authorize::ResolvedClient::Registered(&client),
+        oauth_scope,
+        None,
+        None,
+    )
+    .await;
     if assembled.policy_read_faulted {
         return Some(TokenError::ServerError);
     }
