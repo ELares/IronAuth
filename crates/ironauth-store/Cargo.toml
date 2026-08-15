@@ -891,3 +891,10 @@ workspace = true
 name = "absent_scope"
 path = "tests/absent_scope.rs"
 required-features = ["testing"]
+
+# A cursor over `sequence` skips events that commit out of order; a watermarked cursor does
+# not (issue #107). Reproduces the hazard before asserting the fix.
+[[test]]
+name = "events_cursor_ordering"
+path = "tests/events_cursor_ordering.rs"
+required-features = ["testing"]
