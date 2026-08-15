@@ -400,6 +400,66 @@ pub fn apply_seeds(bin_dir: &Path, database_url: &str, scope: &SeededScope) -> R
     Ok(())
 }
 
+/// Provision the seeded environment's signing key.
+///
+/// Without one the environment has no issuer entry, and EVERY scoped endpoint answers 404
+/// while the server logs nothing: `registry.entry_for(scope)` returns `None`, which is the
+/// same answer it gives for a scope that never existed. Measured -- with the tenant,
+/// environment and serving state all seeded, discovery still 404-ed until this ran.
+///
+/// Ed25519 from a seed drawn through the dev entropy, so the key is reproducible for a given
+/// `--seed` like every other dev secret. It is published and active from the epoch, so it
+/// signs and appears in the JWKS the moment the server answers rather than after a delay
+/// nobody configured.
+///
+/// # Errors
+///
+/// A message naming the step that failed.
+pub async fn provision_signing_key(
+    store: &ironauth_store::Store,
+    env: &ironauth_env::Env,
+    scope: ironauth_store::Scope,
+    seed: u64,
+) -> Result<(), String> {
+    // A DEDICATED stream, like the identifiers: the key must not change because unrelated
+    // code drew a byte earlier in the boot.
+    let key_env = ironauth_env::Env::from_parts(
+        std::sync::Arc::new(ironauth_env::SystemClock),
+        std::sync::Arc::new(ironauth_env::FixedEntropy::new(seed ^ 0x5f3d_9a21)),
+    );
+    let key_id = ironauth_store::SigningKeyId::generate(&key_env, &scope);
+
+    let mut material = [0_u8; 32];
+    ironauth_env::Entropy::fill_bytes(key_env.entropy(), &mut material);
+    // Built here only to fail loudly on material the signer would reject, rather than
+    // persisting bytes that first break at the token endpoint.
+    ironauth_jose::SigningKey::ed25519_from_seed(Some(key_id.to_string()), &material)
+        .map_err(|error| format!("building the dev signing key: {error:?}"))?;
+
+    store
+        .scoped(scope)
+        .acting(
+            ironauth_store::ActorRef::human(ironauth_store::HumanId::generate(&key_env)),
+            ironauth_store::CorrelationId::generate(env),
+        )
+        .signing_keys()
+        .provision(
+            env,
+            ironauth_store::NewSigningKey {
+                id: &key_id,
+                algorithm: "EdDSA",
+                material_kind: ironauth_store::SigningKeyMaterialKind::Ed25519Seed,
+                material: &material,
+                publish_at_micros: 0,
+                activate_at_micros: 0,
+                retire_at_micros: None,
+                expire_at_micros: None,
+            },
+        )
+        .await
+        .map_err(|error| format!("provisioning the dev signing key: {error}"))
+}
+
 /// The message shown when no Postgres binaries can be found.
 ///
 /// Names what to install and the escape hatch, because "could not start the emulator" sends
@@ -636,6 +696,25 @@ mod tests {
             store.migrate().await.expect("the schema applies");
             // Applying twice must be a no-op, which is what makes a dev restart cheap.
             store.migrate().await.expect("the schema is idempotent");
+
+            // The seeds, then the key. Re-running BOTH must be a no-op: a dev restart
+            // reuses the same database when DATABASE_URL is set, and a second run that
+            // duplicated a tenant or failed on a existing key would break it.
+            let scope = seed_ids(7);
+            apply_seeds(&bin_dir, &cluster.database_url, &scope).expect("seeds apply");
+            apply_seeds(&bin_dir, &cluster.database_url, &scope).expect("seeds are idempotent");
+
+            let env = boot_env(Some(7));
+            let parsed = ironauth_store::Scope::new(
+                ironauth_store::TenantId::parse(&scope.tenant).expect("tenant parses"),
+                ironauth_store::EnvironmentId::parse(&scope.environment)
+                    .expect("environment parses"),
+            );
+            // Without this the environment has no issuer entry and EVERY scoped endpoint
+            // answers 404 while the server logs nothing.
+            provision_signing_key(&store, &env, parsed, 7)
+                .await
+                .expect("the signing key provisions");
         });
     }
 

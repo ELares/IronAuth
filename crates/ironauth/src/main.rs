@@ -4389,6 +4389,11 @@ fn prepare_dev_schema(
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
+    // Seeds come AFTER the schema, for the obvious reason, and before the server boots so
+    // the scoped OIDC surfaces exist the moment it answers. Without them the server starts
+    // and every scoped endpoint is a 404, which reads as a broken emulator rather than an
+    // empty one.
+    let scope = dev::seed_ids(seed);
     runtime.block_on(async {
         let store = ironauth_store::Store::connect(database_url)
             .await
@@ -4396,15 +4401,21 @@ fn prepare_dev_schema(
         store
             .migrate()
             .await
-            .map_err(|error| format!("could not apply the schema: {error}"))
-    })?;
+            .map_err(|error| format!("could not apply the schema: {error}"))?;
 
-    // Seeds come AFTER the schema, for the obvious reason, and before the server boots so
-    // the scoped OIDC surfaces exist the moment it answers. Without them the server starts
-    // and every scoped endpoint is a 404, which reads as a broken emulator rather than an
-    // empty one.
-    let scope = dev::seed_ids(seed);
-    dev::apply_seeds(bin_dir, database_url, &scope)?;
+        // The rows first (they are the signing key's foreign keys), then the key, which is
+        // what gives the environment an issuer entry at all.
+        dev::apply_seeds(bin_dir, database_url, &scope)?;
+
+        let env = dev::boot_env(Some(seed));
+        let parsed = ironauth_store::Scope::new(
+            ironauth_store::TenantId::parse(&scope.tenant)
+                .map_err(|error| format!("the seeded tenant id does not parse: {error:?}"))?,
+            ironauth_store::EnvironmentId::parse(&scope.environment)
+                .map_err(|error| format!("the seeded environment id does not parse: {error:?}"))?,
+        );
+        dev::provision_signing_key(&store, &env, parsed, seed).await
+    })?;
     Ok(scope)
 }
 
