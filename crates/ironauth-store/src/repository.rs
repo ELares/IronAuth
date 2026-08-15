@@ -20258,6 +20258,70 @@ async fn enqueue_outbox_in_tx_ignoring_conflict(
 /// groups a SINGLETON and there is no second message to be out of order with. That is a
 /// property of that consumer, not of the substrate, and the eight consumers that follow
 /// do not inherit it.
+/// How many member ids a membership event may carry before it is truncated (issue #107).
+///
+/// A cap, not a preference. Enterprise groups reach six figures, and a full-state dump on
+/// every change melts the consumer, the payload store, and the feed at the same time. The
+/// number is documented because a consumer has to size for it.
+pub const MEMBERSHIP_DELTA_CAP: usize = 1000;
+
+/// A group or organization membership change (issue #107).
+///
+/// # Why an enum rather than an array and a `truncated` flag
+///
+/// A truncated delta applied as if it were complete CORRUPTS the consumer: it will believe
+/// the members it was not sent are unchanged, and they are not. A boolean beside the arrays
+/// makes that a one-line mistake, and the mistake is silent, permanent, and discovered as
+/// mysterious drift months later.
+///
+/// So the two cases are different variants. A consumer cannot read the member lists without
+/// having matched on which kind of event this is, and the compiler will not let it skip the
+/// branch where reconciliation is mandatory. Same information, one less way to be wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipChange {
+    /// The complete change. The arrays are exhaustive and may be applied as a delta.
+    Complete {
+        /// Members added, in full.
+        added: Vec<String>,
+        /// Members removed, in full.
+        removed: Vec<String>,
+    },
+    /// The change exceeded [`MEMBERSHIP_DELTA_CAP`]. The arrays are a PREFIX and must not
+    /// be applied as a delta; the consumer reconciles by re-reading the full membership
+    /// from the management API.
+    Truncated {
+        /// The first members added, up to the cap. Incomplete, deliberately.
+        added: Vec<String>,
+        /// The first members removed, within whatever cap remains. Incomplete.
+        removed: Vec<String>,
+        /// How many members changed in total, so a consumer can log what it missed.
+        total: usize,
+    },
+}
+
+/// Build a membership event body, truncating past [`MEMBERSHIP_DELTA_CAP`].
+///
+/// The cap applies to the TOTAL number of ids in the event, not to each array separately.
+/// A per-array cap would let one event carry twice the documented limit, which is the sort
+/// of thing that is discovered by a consumer's allocator rather than by a reviewer.
+#[must_use]
+pub fn membership_change(added: Vec<String>, removed: Vec<String>) -> MembershipChange {
+    let total = added.len() + removed.len();
+    if total <= MEMBERSHIP_DELTA_CAP {
+        return MembershipChange::Complete { added, removed };
+    }
+    let mut kept_added = added;
+    kept_added.truncate(MEMBERSHIP_DELTA_CAP);
+    let remaining = MEMBERSHIP_DELTA_CAP - kept_added.len();
+    let mut kept_removed = removed;
+    kept_removed.truncate(remaining);
+    MembershipChange::Truncated {
+        added: kept_added,
+        removed: kept_removed,
+        total,
+    }
+}
+
 /// What an event-feed read returned (issue #107).
 ///
 /// A page and a "your cursor fell off the window" are DIFFERENT outcomes, not a page that
@@ -59257,5 +59321,89 @@ impl ActingApiKeyRepo<'_> {
         insert_idempotency(&mut tx, idempotency).await?;
         tx.commit().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod membership_delta {
+    use super::{MEMBERSHIP_DELTA_CAP, MembershipChange, membership_change};
+
+    fn ids(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i}")).collect()
+    }
+
+    #[test]
+    fn a_change_within_the_cap_is_complete_and_exhaustive() {
+        assert_eq!(
+            membership_change(ids("a", 3), ids("r", 2)),
+            MembershipChange::Complete {
+                added: ids("a", 3),
+                removed: ids("r", 2),
+            }
+        );
+    }
+
+    #[test]
+    fn a_change_exactly_at_the_cap_is_still_complete() {
+        // The boundary. Truncating here would send every consumer of a cap-sized change
+        // into a full resync it did not need, which is the expensive direction to be wrong.
+        let change = membership_change(ids("a", MEMBERSHIP_DELTA_CAP), Vec::new());
+        assert!(
+            matches!(change, MembershipChange::Complete { .. }),
+            "a change of exactly the cap has nothing missing: {change:?}"
+        );
+    }
+
+    #[test]
+    fn one_more_than_the_cap_truncates() {
+        // The other side of the boundary, so the two together pin the transition rather
+        // than leaving it anywhere in a range.
+        assert!(matches!(
+            membership_change(ids("a", MEMBERSHIP_DELTA_CAP + 1), Vec::new()),
+            MembershipChange::Truncated { .. }
+        ));
+    }
+
+    #[test]
+    fn the_cap_counts_the_whole_event_not_each_array() {
+        // A per-array cap would let one event carry twice the documented limit, which is
+        // discovered by a consumer's allocator rather than by a reviewer.
+        match membership_change(
+            ids("a", MEMBERSHIP_DELTA_CAP),
+            ids("r", MEMBERSHIP_DELTA_CAP),
+        ) {
+            MembershipChange::Truncated {
+                added,
+                removed,
+                total,
+            } => {
+                assert_eq!(
+                    added.len() + removed.len(),
+                    MEMBERSHIP_DELTA_CAP,
+                    "the event must never carry more ids than the documented cap"
+                );
+                assert_eq!(
+                    total,
+                    MEMBERSHIP_DELTA_CAP * 2,
+                    "and must report the real size"
+                );
+            }
+            other => panic!("expected truncation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_truncated_change_reports_the_total_it_could_not_send() {
+        match membership_change(ids("a", MEMBERSHIP_DELTA_CAP + 5), Vec::new()) {
+            MembershipChange::Truncated { added, total, .. } => {
+                assert_eq!(added.len(), MEMBERSHIP_DELTA_CAP);
+                assert_eq!(
+                    total,
+                    MEMBERSHIP_DELTA_CAP + 5,
+                    "a consumer needs the real count to log what it missed"
+                );
+            }
+            other => panic!("expected truncation, got {other:?}"),
+        }
     }
 }
