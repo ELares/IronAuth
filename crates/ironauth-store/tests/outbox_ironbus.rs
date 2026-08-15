@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use ironauth_env::Env;
+use ironauth_env::{Clock, Env, SystemClock};
 use ironauth_store::outbox::OutboxBackbone;
 use ironauth_store::outbox_ironbus::IronBusBackbone;
 use ironauth_store::{EnvironmentId, Scope, TenantId};
@@ -58,7 +58,7 @@ async fn a_signal_crosses_the_broker_and_wakes_the_drain() {
         "the reader thread is alive and subscribed"
     );
 
-    let started = std::time::Instant::now();
+    let started = SystemClock.monotonic();
     let waiter = tokio::spawn(async move {
         backbone.wait("probe", Duration::from_secs(60)).await;
         started.elapsed()
@@ -106,7 +106,7 @@ async fn the_deadline_is_honoured_when_no_signal_arrives() {
     };
     let backbone = IronBusBackbone::connect(&addr).expect("connect to the broker");
 
-    let started = std::time::Instant::now();
+    let started = SystemClock.monotonic();
     backbone.wait("quiet", Duration::from_millis(700)).await;
     let elapsed = started.elapsed();
     assert!(
