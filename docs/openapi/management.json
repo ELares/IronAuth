@@ -18303,6 +18303,82 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/usage": {
+      "get": {
+        "tags": [
+          "usage"
+        ],
+        "summary": "Export a tenant's usage (issue #107).",
+        "operationId": "exportUsage",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Usage for the retained window",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageExport"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown tenant or environment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users": {
       "get": {
         "tags": [
@@ -28861,6 +28937,40 @@
           "traits": {
             "type": "object",
             "description": "The REPLACEMENT identity-traits document (issue #53), VALIDATED against the\nenvironment's active trait schema. Absent leaves the traits unchanged; present,\nit REPLACES the whole document (traits are a schema-validated document, so a\nper-key merge could not be validated as a whole), and the schema version it\nvalidated against is recorded on the identity. A document violating the schema\nis a 422 carrying a per-field RFC 6901 JSON Pointer for each failure and NOTHING\nis written."
+          }
+        }
+      },
+      "UsageExport": {
+        "type": "object",
+        "description": "A tenant's usage for the retained window.",
+        "required": [
+          "monthly_active_users",
+          "tokens_issued",
+          "connections",
+          "truncated"
+        ],
+        "properties": {
+          "connections": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Connections opened.",
+            "minimum": 0
+          },
+          "monthly_active_users": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Distinct users seen active. A user active forty times is one.",
+            "minimum": 0
+          },
+          "tokens_issued": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Tokens issued. NOT deduplicated by user: this counts issuance, not people.",
+            "minimum": 0
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether the fold stopped at its limit rather than reaching the end of the feed.\nWhen true these numbers are a LOWER BOUND, and saying so is the point: a silently\ntruncated usage figure is the one number a customer would never think to question."
           }
         }
       },

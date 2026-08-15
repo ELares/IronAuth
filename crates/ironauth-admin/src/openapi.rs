@@ -216,6 +216,7 @@ use crate::views::{
     ),
     paths(
         crate::event_feed::read_event_feed,
+        crate::usage::export_usage,
         crate::operators::list_operators,
         crate::operators::get_operator,
         crate::resource_types::list_resource_types,
@@ -479,6 +480,7 @@ use crate::views::{
         crate::resource_servers::UpdateResourceServerRequest,
         crate::org_roles::OrgRoleView,
         crate::event_feed::EventFeedPage,
+        crate::usage::UsageExport,
         crate::event_feed::FeedEvent,
         crate::event_feed::FeedGone,
         crate::org_roles::OrgRoleList,
