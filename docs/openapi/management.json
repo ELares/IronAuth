@@ -5570,6 +5570,118 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/events": {
+      "get": {
+        "tags": [
+          "events"
+        ],
+        "summary": "Read the ordered event feed (issue #107).",
+        "operationId": "readEventFeed",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page. Omitted means \"from the beginning of what\nis retained\".",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "evc_42"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many events to return, capped at 1000.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of events in order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventFeedPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor or limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The cursor aged out of the retention window",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedGone"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/export": {
       "get": {
         "tags": [
@@ -24327,6 +24439,27 @@
           }
         }
       },
+      "EventFeedPage": {
+        "type": "object",
+        "description": "A page of the feed.",
+        "required": [
+          "events",
+          "next_cursor"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeedEvent"
+            },
+            "description": "The events, in order."
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "The cursor to resume from. Present even when `events` is empty, so a caller always\nhas somewhere to continue."
+          }
+        }
+      },
       "ExtendSignupQuarantineRequest": {
         "type": "object",
         "description": "The body to EXTEND a signup-quarantine review window (issue #82, PR 2). The window is\nrequired; the new horizon is `now + extend_secs`.",
@@ -24340,6 +24473,52 @@
             "description": "How many seconds from now to extend the review window by. Must be at least 1.",
             "example": 604800,
             "minimum": 0
+          }
+        }
+      },
+      "FeedEvent": {
+        "type": "object",
+        "description": "One event on the feed.",
+        "required": [
+          "id",
+          "cursor",
+          "payload"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "description": "The cursor to send back to resume AFTER this event. Opaque: store it, do not parse\nit or do arithmetic on it."
+          },
+          "id": {
+            "type": "string",
+            "description": "The event id."
+          },
+          "payload": {
+            "type": "object",
+            "description": "The event body."
+          }
+        }
+      },
+      "FeedGone": {
+        "type": "object",
+        "description": "What a caller gets when its cursor has aged out of the retention window.",
+        "required": [
+          "code",
+          "message",
+          "oldest_cursor"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The stable machine-readable code. Branch on this, never on `message`."
+          },
+          "message": {
+            "type": "string",
+            "description": "What happened, for a human reading a log."
+          },
+          "oldest_cursor": {
+            "type": "string",
+            "description": "The oldest cursor that still resolves. Resume here after reconciling, and treat\neverything between your old cursor and this one as unknown rather than unchanged."
           }
         }
       },
