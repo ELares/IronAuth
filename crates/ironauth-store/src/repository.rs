@@ -2408,6 +2408,17 @@ pub struct ClientAuthRecord {
     /// #763). Carried on the authentication record so the token endpoint checks the
     /// registration it just authenticated rather than re-reading the row.
     pub grant_types: String,
+    /// Whether this client may use the RFC 8693 exchange in IMPERSONATION mode (issue
+    /// #125, migration 0143). Default-deny.
+    ///
+    /// Carried here for the same reason as `allow_bearer_tokens`: the exchange must read
+    /// the policy off the very registration it just authenticated. A separate read could
+    /// return a different answer than the one that authenticated, and for THIS flag the
+    /// difference is whether a client may take over another client's token.
+    pub token_exchange_impersonation_allowed: bool,
+    /// Whether this client may receive a refresh token from an RFC 8693 exchange (issue
+    /// #125, migration 0143). Default-deny.
+    pub token_exchange_refresh_allowed: bool,
 }
 
 impl fmt::Debug for ClientAuthRecord {
@@ -2428,6 +2439,16 @@ impl fmt::Debug for ClientAuthRecord {
             // to see.
             .field("allow_bearer_tokens", &self.allow_bearer_tokens)
             .field("grant_types", &self.grant_types)
+            // Shown in full for the same reason: an operator debugging "why was this
+            // exchange refused" needs to see the two policy flags that decide it.
+            .field(
+                "token_exchange_impersonation_allowed",
+                &self.token_exchange_impersonation_allowed,
+            )
+            .field(
+                "token_exchange_refresh_allowed",
+                &self.token_exchange_refresh_allowed,
+            )
             .finish()
     }
 }
@@ -2747,7 +2768,9 @@ impl ClientRepo<'_> {
         let row = sqlx::query(
             "SELECT display_name, token_endpoint_auth_method, secret_hash, \
              jwks, jwks_uri, token_endpoint_auth_signing_alg, refresh_rotation, \
-             allow_bearer_tokens, grant_types FROM clients \
+             allow_bearer_tokens, grant_types, \
+             token_exchange_impersonation_allowed, token_exchange_refresh_allowed \
+             FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -2767,6 +2790,8 @@ impl ClientRepo<'_> {
             refresh_rotation: row.get("refresh_rotation"),
             allow_bearer_tokens: row.get("allow_bearer_tokens"),
             grant_types: row.get("grant_types"),
+            token_exchange_impersonation_allowed: row.get("token_exchange_impersonation_allowed"),
+            token_exchange_refresh_allowed: row.get("token_exchange_refresh_allowed"),
         })
     }
 
@@ -5357,6 +5382,65 @@ impl ActingClientRepo<'_> {
                      WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
                 )
                 .bind(allowed)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Set a client's RFC 8693 token-exchange policy (issue #125), auditing
+    /// `client.token_exchange_policy.set` in the same transaction.
+    ///
+    /// Both switches default-deny (migration 0143), so every call that enables either is a
+    /// WEAKENING and is audited exactly like the other per-client posture toggles.
+    /// `impersonation` lets this client present a subject token issued to ANOTHER client
+    /// and receive one naming only the subject, with nothing in the token recording that
+    /// it did so; `refresh` lets an exchange yield a refresh token.
+    ///
+    /// Both are written together because they are one policy: reading them from separate
+    /// calls would let a deployment end up with half of it applied.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such client is visible in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_token_exchange_policy(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        impersonation: bool,
+        refresh: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientTokenExchangePolicySet,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients SET token_exchange_impersonation_allowed = $1, \
+                     token_exchange_refresh_allowed = $2 \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5",
+                )
+                .bind(impersonation)
+                .bind(refresh)
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
@@ -9395,6 +9479,33 @@ impl ActingAuthorizationRepo<'_> {
         request: IssueClientCredentials<'_>,
     ) -> Result<(), StoreError> {
         self.issue_machine_grant(env, request, Action::JwtBearerAssertionIssue)
+            .await
+    }
+
+    /// Persist an RFC 8693 token-exchange issuance against a fresh grant (issue #125),
+    /// audited as [`Action::TokenExchangeIssue`] in the same transaction.
+    ///
+    /// REUSES the machine-grant persistence shape for the same reason the JWT bearer
+    /// grant does: an exchanged token has no user-authentication event of its own and no
+    /// refresh-token family, so it is exactly a grant chain carrying one access token.
+    /// `subject` is the subject the exchange resolved (the subject token's, not the
+    /// client's) and `client_id` is the client that presented it.
+    ///
+    /// Going through the grant chain is what makes an exchanged token REVOCABLE and
+    /// introspectable like any other. That matters more here than elsewhere: an exchange
+    /// mints a credential from a credential, so a token that outlived revocation would
+    /// let one compromised subject token be laundered into a fresh one indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn issue_token_exchange(
+        &self,
+        env: &Env,
+        request: IssueClientCredentials<'_>,
+    ) -> Result<(), StoreError> {
+        self.issue_machine_grant(env, request, Action::TokenExchangeIssue)
             .await
     }
 

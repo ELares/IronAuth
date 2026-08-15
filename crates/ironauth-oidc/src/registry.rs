@@ -8,15 +8,15 @@
 //! illegal states are unrepresentable, because the enums have no variant for
 //! them and the parsers map every forbidden spelling to `None`.
 //!
-//! - [`GrantType`] is closed around the five grants the token endpoint services,
+//! - [`GrantType`] is closed around the six grants the token endpoint services,
 //!   which [`GrantType::ALL`] names: `authorization_code`, `refresh_token`,
-//!   `client_credentials`, the JWT bearer assertion grant, and the RFC 8628 device
-//!   grant. There is no `Password` variant, so the
-//!   resource-owner-password-credentials (ROPC) grant has no value to match and no
-//!   handler to route to: it is absent, not disabled. (This list read "exactly one
-//!   variant" until the four grants after the first had shipped past it; it is
-//!   [`GrantType::ALL`] that other code cites as the authority, so the two must
-//!   agree.)
+//!   `client_credentials`, the JWT bearer assertion grant, the RFC 8628 device
+//!   grant, and the RFC 8693 token-exchange grant. There is no `Password` variant,
+//!   so the resource-owner-password-credentials (ROPC) grant has no value to match
+//!   and no handler to route to: it is absent, not disabled. (This list read
+//!   "exactly one variant" until the four grants after the first had shipped past
+//!   it, and read "five" until the exchange landed; it is [`GrantType::ALL`] that
+//!   other code cites as the authority, so the two must agree.)
 //! - [`ResponseType`] is closed around a SET of exactly four members: `code`,
 //!   `code id_token`, `id_token`, and `none`. There is NO component for an
 //!   access token anywhere in the type, so NONE of the token-bearing response
@@ -53,8 +53,9 @@
 /// 4.1.3), the refresh-token grant (RFC 6749 6, with the RFC 9700 2.2.2 / OAuth
 /// 2.1 rotation and reuse-detection rules, issue #21), the client-credentials
 /// grant (RFC 6749 4.4, machine-to-machine, issue #23), the JWT bearer assertion
-/// grant (RFC 7521 4.1 / RFC 7523 2.1, issue #26), and the device grant (RFC 8628,
-/// issue #24). [`GrantType::ALL`] is that list in code, and callers that need to be
+/// grant (RFC 7521 4.1 / RFC 7523 2.1, issue #26), the device grant (RFC 8628,
+/// issue #24), and the token-exchange grant (RFC 8693, issue #125).
+/// [`GrantType::ALL`] is that list in code, and callers that need to be
 /// exhaustive over the token endpoint's grants drive off it. ROPC (`password`) and
 /// every other grant are simply absent, so there is no way to name one at this
 /// layer.
@@ -83,12 +84,29 @@ pub enum GrantType {
     /// approved the paired user code at the verification page. Enabled per client via
     /// a grant allowlist.
     DeviceCode,
+    /// The `urn:ietf:params:oauth:grant-type:token-exchange` grant (RFC 8693, issue
+    /// #125): an authenticated client trades a `subject_token` it already holds for a
+    /// strictly weaker one, optionally naming an `actor_token` that stays visible in the
+    /// issued token's `act` chain.
+    ///
+    /// The whole grant is built around REVALIDATION. Every CVE in this family (the 2026
+    /// Zitadel privilege escalation, Casdoor's cross-org signature bypass and its
+    /// revoked-JWT acceptance) is the same bug: an exchange inherited trust from the step
+    /// that issued the subject token instead of checking it again. So the handler
+    /// re-resolves both presented tokens through the introspection resolver, which is the
+    /// same scope-bound, revocation-authoritative path an external caller gets, and treats
+    /// nothing on the token as true because this server once signed it.
+    TokenExchange,
 }
 
 impl GrantType {
     /// The wire `grant_type` value of the RFC 8628 device grant (issue #24). Named
     /// once so the parser, the serializer, and discovery cannot drift.
     pub const DEVICE_CODE_URN: &'static str = "urn:ietf:params:oauth:grant-type:device_code";
+
+    /// The wire `grant_type` value of the RFC 8693 token-exchange grant (issue #125),
+    /// named once for the same reason as [`DEVICE_CODE_URN`](Self::DEVICE_CODE_URN).
+    pub const TOKEN_EXCHANGE_URN: &'static str = "urn:ietf:params:oauth:grant-type:token-exchange";
 
     /// Every grant type this build can express.
     pub const ALL: &'static [GrantType] = &[
@@ -97,6 +115,7 @@ impl GrantType {
         GrantType::ClientCredentials,
         GrantType::JwtBearer,
         GrantType::DeviceCode,
+        GrantType::TokenExchange,
     ];
 
     /// The wire `grant_type` value.
@@ -108,6 +127,7 @@ impl GrantType {
             GrantType::ClientCredentials => "client_credentials",
             GrantType::JwtBearer => "urn:ietf:params:oauth:grant-type:jwt-bearer",
             GrantType::DeviceCode => Self::DEVICE_CODE_URN,
+            GrantType::TokenExchange => Self::TOKEN_EXCHANGE_URN,
         }
     }
 
@@ -122,6 +142,7 @@ impl GrantType {
             "client_credentials" => Some(GrantType::ClientCredentials),
             "urn:ietf:params:oauth:grant-type:jwt-bearer" => Some(GrantType::JwtBearer),
             other if other == Self::DEVICE_CODE_URN => Some(GrantType::DeviceCode),
+            other if other == Self::TOKEN_EXCHANGE_URN => Some(GrantType::TokenExchange),
             _ => None,
         }
     }

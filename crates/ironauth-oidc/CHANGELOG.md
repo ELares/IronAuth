@@ -6,6 +6,70 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The RFC 8693 token-exchange grant is now MOUNTED at the token endpoint (issue #125).** The
+  decision layer for it has shipped in `ironauth-store` for some time (narrowing rules, `act` chain
+  extension, requested-type negotiation, and the composed `decide`), and nothing called it: there
+  was no `GrantType` variant and no handler, so every rule it encodes was inert. This wires it up.
+
+  - **The grant is built around REVALIDATION, structurally.** Every published CVE in this family is
+    the same bug: the 2026 Zitadel privilege escalation, Casdoor's cross-organization signature
+    bypass, and Casdoor's acceptance of a revoked JWT are all exchanges that inherited trust from
+    the step which issued the subject token instead of checking it again. Both presented tokens are
+    re-resolved through `introspection::revalidate`, which is the SAME scope-bound path an external
+    introspection caller gets: the `jti` is parsed in the authenticated client's scope (a token from
+    another tenant does not resolve), the STORE decides liveness (a revoked token is dead while its
+    signature still verifies), and the signature and expiry are verified. Routing through that
+    function rather than a private copy is the point: a second implementation could drift, a call
+    cannot.
+
+  - **The mode is DERIVED, and that is the security control.** RFC 8693 has no mode parameter. An
+    `actor_token` means delegation; no actor token with a subject token issued to THIS client means
+    downscoping; no actor token with a subject token issued to ANOTHER client means impersonation,
+    which is default-denied by a new per-client policy (migration 0143). So a client cannot reach
+    impersonation by omitting a parameter: presenting somebody else's token without declaring
+    yourself the actor IS the request to impersonate, and it is refused unless an operator said
+    otherwise. That is the Zitadel shape, closed by construction rather than by a check.
+
+  - **Delegation chains NEST.** `act` is carried as a whole pre-built value rather than the flat
+    `(sub, reason_code)` pair the impersonation work (issue #101) introduced, because two hops are
+    `act.act` and a flat shape can only record the most recent actor. The earlier hops are not
+    cosmetic: the chain is the evidence a resource server uses to decide whether a path of
+    delegation was permissible. Introspection reports the chain whole for the same reason.
+
+  - **A target refusal says so.** A refusal about the requested `resource`/`audience` returns RFC
+    8707's `invalid_target`; every other refusal is the opaque `invalid_grant` RFC 8693 section
+    2.2.2 requires. A target mistake is the one a client can act on, and reporting it as
+    `invalid_grant` sends it to re-authenticate a token that was never the problem.
+
+  - **What the tests measure.** Fourteen cases over a real database, each named for the property it
+    would have caught. Seven security controls were mutated one at a time and every mutant is
+    CAUGHT: removing the store's revocation authority, treating a foreign-client token as a
+    downscope, ignoring the impersonation policy, permitting scope widening, flattening the `act`
+    chain, skipping the `subject_token_type` check, and dropping the refresh-token guard. Two of
+    those tests exist BECAUSE the first sweep found the control unproven.
+
+  - **The user-lifecycle fence, which this mint needed and nothing else would have given
+    it.** `docs/design/USER-BOUND-MINT-SITES.md` records issue #52's invariant: after a user is
+    blocked, disabled, or deleted they obtain NO new tokens by ANY path. There is no live SSO
+    session between a presented subject token and this mint, so the session cascade cannot reach
+    it, and the subject token stays cryptographically valid for its full lifetime after the
+    account is fenced. So this takes the DIRECT read, like jwt-bearer. What makes it distinctive
+    is that the mint REPEATS: an exchange yields a token that can itself be exchanged, so an
+    unfenced path here would not merely outlive the block once, it would renew indefinitely. The
+    principal is discriminated structurally through the same `MappedPrincipal`, because a subject
+    token from the client-credentials grant carries an `sva_` service account that bears no
+    lifecycle and would fail closed on a `users` lookup. BOTH principals are fenced: the
+    subject, and in a delegation the ACTOR, since the issued token names the actor as the
+    party driving it and fencing only the subject would close the obvious half while leaving
+    open the half that hands out somebody else's authority.
+
+  - **A fence finding, folded in.** The first draft revalidated the subject token before resolving
+    the issuer, so a suspended environment answered a perfectly valid token with `invalid_grant`,
+    telling a conforming client to throw away a credential that was still good. The issuer is now
+    resolved first (after client authentication, so it is no environment-existence oracle) and a
+    fenced scope answers 503 like every other grant. `lifecycle_fence`'s sweep drives the new grant.
+
+
 - **Every token-endpoint grant handler now consults ONE shared client grant-restriction seam
   (issue #763).** `clients.grant_types` has documented itself since migration 0021 as "the list of
   OAuth grant types the client is permitted", and exactly one handler honoured it: the device grant.

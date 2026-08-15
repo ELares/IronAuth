@@ -111,7 +111,7 @@ use ironauth_jose::{EmissionOptions, JwkSet, SigningKey, sign_jws};
 use ironauth_oidc::{ClientAuthMethod, GrantType};
 use ironauth_store::{
     ActingTenantRepo, AuthorizationCodeId, ClientId, CorrelationId, DeviceCodeId, EnvironmentId,
-    OperatorId, RefreshTokenId, Scope, TenantId,
+    IssuedTokenId, OperatorId, RefreshTokenId, Scope, TenantId,
 };
 use sqlx::Row;
 
@@ -326,7 +326,11 @@ fn expected_probe_shape(grant: GrantType) -> (StatusCode, &'static str) {
         GrantType::RefreshToken
         | GrantType::ClientCredentials
         | GrantType::JwtBearer
-        | GrantType::DeviceCode => (StatusCode::UNAUTHORIZED, "invalid_client"),
+        | GrantType::DeviceCode
+        // The exchange authenticates its client BEFORE it looks at either presented
+        // token, so a probe reaches the same wall as the other client-authenticated
+        // grants rather than learning anything about the token it sent.
+        | GrantType::TokenExchange => (StatusCode::UNAUTHORIZED, "invalid_client"),
     }
 }
 
@@ -355,6 +359,9 @@ fn probe_forms(
         // `crate::tokens::OPAQUE_REFRESH_TOKEN_PREFIX` and `device::DEVICE_CODE_PREFIX`).
         let refresh = format!("ira_rt_{}~cHJvYmU", RefreshTokenId::generate(env, scope));
         let device = format!("ira_dc_{}~cHJvYmU", DeviceCodeId::generate(env, scope));
+        // A well-formed opaque ACCESS token for the exchange probe: it parses and
+        // declares its scope, then resolves to no stored row, exactly like the others.
+        let access = format!("ira_at_{}~cHJvYmU", IssuedTokenId::generate(env, scope));
         // Keyed by `GrantType`, and the caller checks the keys against
         // `GrantType::ALL`, so this list cannot lose a grant or miss a new one.
         vec![
@@ -400,6 +407,18 @@ fn probe_forms(
                     ("client_id", &client),
                 ]),
             ),
+            (
+                GrantType::TokenExchange,
+                form(&[
+                    ("grant_type", GrantType::TOKEN_EXCHANGE_URN),
+                    ("subject_token", &access),
+                    (
+                        "subject_token_type",
+                        "urn:ietf:params:oauth:token-type:access_token",
+                    ),
+                    ("client_id", &client),
+                ]),
+            ),
         ]
     };
     build(suspended)
@@ -420,6 +439,9 @@ struct GrantCredentials {
     assertion: String,
     /// An APPROVED device code, so a poll with it is one that would have minted.
     device_code: String,
+    /// A LIVE access token, minted while the scope was still serving, for the RFC 8693
+    /// exchange to present as its `subject_token`.
+    access_token: String,
 }
 
 /// Obtain a fresh credential for every grant that mints at `POST /token`, against a
@@ -441,6 +463,12 @@ async fn grant_credentials(
     let refresh_token = json(&body)["refresh_token"]
         .as_str()
         .expect("the code exchange opens a refresh family")
+        .to_owned();
+    // The same exchange yields the access token the RFC 8693 grant will present. Minted
+    // while the scope was serving, so the fence is what refuses it later and not its age.
+    let access_token = json(&body)["access_token"]
+        .as_str()
+        .expect("the code exchange mints an access token")
         .to_owned();
     let code = outstanding_code(harness).await;
 
@@ -467,6 +495,7 @@ async fn grant_credentials(
         refresh_token,
         assertion,
         device_code,
+        access_token,
     }
 }
 
@@ -529,6 +558,24 @@ async fn grant_answers(
         ]))
         .await;
     answers.push((GrantType::DeviceCode, comparable(status, &headers, &body)));
+
+    let (status, headers, body) = harness
+        .token_with_auth(
+            &form(&[
+                ("grant_type", GrantType::TOKEN_EXCHANGE_URN),
+                ("subject_token", &credentials.access_token),
+                (
+                    "subject_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+            ]),
+            Some(basic),
+        )
+        .await;
+    answers.push((
+        GrantType::TokenExchange,
+        comparable(status, &headers, &body),
+    ));
 
     answers
 }

@@ -6,6 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The per-client RFC 8693 token-exchange policy, and the issuance path for the grant (issue
+  #125).** Migration 0143 adds `clients.token_exchange_impersonation_allowed` and
+  `clients.token_exchange_refresh_allowed`, both `NOT NULL DEFAULT false`, both writable only by
+  the control plane.
+
+  - **Why two default-deny switches.** Impersonation is the one exchange mode that erases the
+    caller: delegation records the actor in the issued token's `act` chain so a resource server can
+    see that A is acting for B, and impersonation deliberately does not. That is what makes it
+    dangerous and what makes it useful for a support tool, so it is earned per client rather than
+    assumed. The refresh switch exists because issuing a refresh token from an exchange is a
+    lifetime-laundering primitive: a short-lived access token would become a credential that
+    outlives it and can be traded again.
+
+  - **Phrased `_allowed`, not `_restricted`.** The false value has to be the strict one, or a
+    forgotten default and a missing column both fail open. Both are carried on `ClientAuthRecord`
+    beside `allow_bearer_tokens`, so the exchange reads the policy off the very registration that
+    authenticated it rather than re-reading the row and risking a different answer.
+
+  - **`issue_token_exchange` and the `token_exchange.issue` audit verb.** The exchanged token goes
+    through the same grant chain as every other issuance, which is what makes it revocable and
+    introspectable. That matters more here than elsewhere: an exchange mints a credential from a
+    credential, so a token that outlived revocation would let one compromised subject token be
+    laundered into a fresh one indefinitely. The verb is distinct from `token.issue` because an
+    exchange is the one issuance whose subject need not be the party that authenticated, and
+    "which issuances were exchanges" has to be answerable from the trail without a join.
+
+
 - **The IronBus-backed outbox backbone, verified against a real broker (issue #104).** The seam
   landed with `PollOnly`; this is the second implementation, behind the optional `ironbus` feature.
 

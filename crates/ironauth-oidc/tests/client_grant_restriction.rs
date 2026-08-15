@@ -220,6 +220,19 @@ async fn every_grant_handler_consults_the_shared_seam() {
                 ("grant_type", grant.as_str()),
                 ("device_code", device_code_handle.as_str()),
             ],
+            // The exchange runs the seam immediately after client authentication and
+            // BEFORE it revalidates either presented token, so the subject token here
+            // need only be present and well-typed. That ordering is the point: a client
+            // not registered for this grant is refused without the server telling it
+            // anything about the token it sent.
+            GrantType::TokenExchange => vec![
+                ("grant_type", grant.as_str()),
+                ("subject_token", "ira_at_not_a_real_token"),
+                (
+                    "subject_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+            ],
         };
         let (_, _, body) = harness.token_with_auth(&form(&pairs), Some(&auth)).await;
         let error = json(&body)["error"].as_str().unwrap_or_default().to_owned();

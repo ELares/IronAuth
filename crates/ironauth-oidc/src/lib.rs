@@ -162,6 +162,7 @@ mod step_up;
 mod subject;
 mod token;
 mod token_credential;
+mod token_exchange;
 mod token_hash;
 mod tokens;
 mod totp;

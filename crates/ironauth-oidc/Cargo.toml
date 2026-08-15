@@ -1274,3 +1274,14 @@ required-features = ["testing"]
 name = "cimd_authorize"
 path = "tests/cimd_authorize.rs"
 required-features = ["testing"]
+
+# The RFC 8693 token-exchange grant (issue #125): downscoping as the default, delegation
+# nesting act.act across two hops with the whole chain visible in introspection, and the
+# CVE-derived regressions this grant exists to close (a revoked subject token, a tampered
+# one, a token from another tenant, and a token belonging to another client, which is
+# impersonation and is default-denied until a per-client policy says otherwise). Over a
+# real database (DATABASE_URL).
+[[test]]
+name = "token_exchange"
+path = "tests/token_exchange.rs"
+required-features = ["testing"]

@@ -226,6 +226,8 @@ async fn mint_and_persist(
             client_id: &client_id_str,
             oauth_scope: requested_scope,
             custom_claims: &custom_claims,
+            // A machine token acts for itself: never an `act` chain (issue #125).
+            act: None,
         },
         &target,
     )

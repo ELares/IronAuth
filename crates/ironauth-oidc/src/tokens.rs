@@ -886,6 +886,22 @@ pub struct ClientCredentialsMintRequest<'a> {
     /// design, so when the resolved format is opaque these claims are dropped (and the
     /// mint warns), their metadata surfacing instead through #22 introspection.
     pub custom_claims: &'a serde_json::Map<String, serde_json::Value>,
+    /// The RFC 8693 section 4.1 `act` delegation chain, for a token issued by the
+    /// token-exchange grant (issue #125). [`None`] for every other issuance, and the
+    /// client-credentials grant always passes [`None`]: `act` asserts that somebody other
+    /// than the subject is driving, and a machine token acting for itself must not claim
+    /// it.
+    ///
+    /// Carried as a whole pre-built [`serde_json::Value`] rather than a flat
+    /// `(sub, reason)` pair like [`TokenActor`], because a delegation chain NESTS: two
+    /// hops are `act.act`, and a flat shape can only ever record the most recent actor.
+    /// Losing the earlier hops is not cosmetic; the chain is the evidence a resource
+    /// server uses to decide whether this path of delegation was permissible.
+    ///
+    /// The value is built by the store's `extend_act_chain` from the VALIDATED actor
+    /// token and the subject token's existing verified chain, never from a request
+    /// parameter, so a client cannot post a chain of its choosing.
+    pub act: Option<&'a serde_json::Value>,
 }
 
 /// Build the RFC 9068 access-token claim set for a CLIENT-CREDENTIALS (M2M) token
@@ -951,6 +967,13 @@ pub(crate) fn build_client_credentials_access_token_claims(
             }
             object.entry(name.clone()).or_insert_with(|| value.clone());
         }
+    }
+    // The delegation chain is set AFTER the custom-claim merge, so it is issuer-only in
+    // the strongest sense available here: `act` is in PROTECTED_ACCESS_TOKEN_CLAIMS (so
+    // the loop above already skips it), and writing it last means even a future change
+    // that loosened that set could not let a stored custom claim decide who is acting.
+    if let Some(act) = request.act {
+        claims["act"] = act.clone();
     }
     claims
 }
@@ -2056,6 +2079,7 @@ mod tests {
             client_id: "cli_example",
             oauth_scope: None,
             custom_claims: &hostile,
+            act: None,
         };
         let cc_claims = build_client_credentials_access_token_claims(
             &cc_request,
@@ -2125,6 +2149,7 @@ mod tests {
             client_id: "cli_example",
             oauth_scope: Some("api"),
             custom_claims: empty_extra(),
+            act: None,
         };
         let claims = build_client_credentials_access_token_claims(
             &request,
@@ -2309,6 +2334,7 @@ mod tests {
             client_id: "cli_example",
             oauth_scope: None,
             custom_claims: custom,
+            act: None,
         }
     }
 

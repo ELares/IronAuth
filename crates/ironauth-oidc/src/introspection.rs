@@ -103,6 +103,18 @@ pub struct IntrospectionClaims {
     /// common case, byte-identical to the pre-#28 wire form) or a JSON ARRAY for
     /// several (RFC 7662 permits either).
     pub aud: Vec<String>,
+    /// The RFC 8693 section 4.1 `act` delegation chain the token carries, or [`None`] on
+    /// an ordinary token (issue #125).
+    ///
+    /// Reported because a delegated token's whole point is that the actor stays VISIBLE: a
+    /// resource server deciding whether to honour "A acting for B" has to be able to see
+    /// A, and for a multi-hop chain it has to see every hop, not just the last one. The
+    /// value is the nested object exactly as signed, so `act.act` chains read in full.
+    ///
+    /// Only a JWT subject token can carry one. An opaque token has no claims of its own,
+    /// and its row does not record a chain, so an exchange whose subject was opaque starts
+    /// a fresh chain rather than silently dropping hops it could not see.
+    pub act: Option<Value>,
     /// The proof-of-possession confirmation the token is bound to (RFC 7800), or
     /// [`None`] for an unbound token.
     ///
@@ -200,6 +212,13 @@ impl IntrospectionSerializer for JsonIntrospectionSerializer {
         insert_i64(&mut object, "exp", claims.exp);
         insert_i64(&mut object, "iat", claims.iat);
         insert_aud(&mut object, &claims.aud);
+        // RFC 8693 section 4.1: the delegation chain, reported whole (issue #125). A
+        // resource server honouring "A acting for B" has to see A, and across multi-hop
+        // delegation it has to see every hop, so the nested value is emitted as signed
+        // rather than flattened to the nearest actor.
+        if let Some(act) = &claims.act {
+            object.insert("act".to_owned(), act.clone());
+        }
         // RFC 9449 section 6.2: the binding travels as a TOP-LEVEL `cnf` member whose
         // content is the same `{ member: thumbprint }` object a bound JWT carries, so
         // a resource server reads an identical shape whichever it has in hand.
@@ -364,6 +383,30 @@ pub async fn introspect(
         .into_response()
 }
 
+/// Revalidate a token IN FULL and return its active claims, or [`None`] if it is not
+/// active for ANY reason (issue #125).
+///
+/// This is [`resolve`] under a name that says what a non-introspection caller is asking
+/// for. The RFC 8693 token-exchange grant has to re-verify a `subject_token` and an
+/// `actor_token` from scratch, and the entire CVE class it defends against is an exchange
+/// that trusted a token because an earlier step had. Routing that through THIS function
+/// rather than a private copy is what makes the guarantee structural: the exchange gets
+/// the same scope-bound `jti` parse (so a token from another tenant or environment does
+/// not resolve), the same store-as-revocation-authority check (so a revoked token is dead
+/// while its signature still verifies), and the same signature and expiry verification
+/// that an external introspection caller gets. A second implementation could drift from
+/// this one; a call cannot.
+///
+/// The caller must still decide what an active token ENTITLES. This answers only whether
+/// the token is real and live, which is the question that has historically been skipped.
+pub(crate) async fn revalidate(
+    state: &OidcState,
+    scope: Scope,
+    token: &str,
+) -> Option<IntrospectionClaims> {
+    resolve(state, scope, token).await
+}
+
 /// Resolve the presented token to its active claims, or [`None`] for every not-active
 /// cause (which the caller maps to the uniform inactive response). Dispatches on the
 /// token's self-describing format and runs the SCOPE-BOUND, RLS-forced resolve for it.
@@ -423,6 +466,10 @@ async fn resolve_jwt(state: &OidcState, scope: Scope, token: &str) -> Option<Int
     };
     Some(IntrospectionClaims {
         active: true,
+        // Read off the VERIFIED claims, like `cnf` above and for the same reason: an `act`
+        // chain taken from the unverified payload would let a caller append a hop this
+        // server never issued and have it reported as one that it did.
+        act: claims.get("act").cloned(),
         scope: claims
             .get("scope")
             .and_then(Value::as_str)
@@ -513,6 +560,9 @@ async fn resolve_opaque(
         .ok()??;
     Some(IntrospectionClaims {
         active: true,
+        // An opaque token carries no claims, so no chain is observable; an exchange from
+        // one starts a fresh chain rather than dropping hops it cannot see.
+        act: None,
         scope: active.scope.clone(),
         client_id: Some(active.client_id.clone()),
         // The opaque row stores the LOCAL subject; derive the public sub through the
@@ -560,6 +610,8 @@ async fn resolve_refresh(
     }
     Some(IntrospectionClaims {
         active: true,
+        // A refresh token is not a delegation carrier and never reports a chain.
+        act: None,
         scope: resolution.scope.clone(),
         client_id: Some(resolution.client_id.clone()),
         sub: Some(state.resolve_public_subject(&resolution.subject)),
@@ -631,6 +683,7 @@ mod tests {
     fn active_response_omits_absent_fields_and_keeps_present_ones() {
         let claims = IntrospectionClaims {
             active: true,
+            act: None,
             scope: Some("openid profile".to_owned()),
             client_id: Some("cli_x".to_owned()),
             sub: Some("usr_abc".to_owned()),
@@ -660,6 +713,7 @@ mod tests {
         // emitted as null).
         let refresh = IntrospectionClaims {
             active: true,
+            act: None,
             scope: None,
             client_id: Some("cli_x".to_owned()),
             sub: Some("usr_abc".to_owned()),
