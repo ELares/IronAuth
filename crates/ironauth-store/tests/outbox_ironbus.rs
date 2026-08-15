@@ -15,9 +15,7 @@
 
 use std::time::Duration;
 
-use ironauth_env::{Clock, SystemClock};
-
-use ironauth_env::Env;
+use ironauth_env::{Clock, Env, SystemClock};
 use ironauth_store::outbox::OutboxBackbone;
 use ironauth_store::outbox_ironbus::IronBusBackbone;
 use ironauth_store::{EnvironmentId, Scope, TenantId};

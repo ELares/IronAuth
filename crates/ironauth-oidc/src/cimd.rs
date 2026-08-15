@@ -414,22 +414,45 @@ pub enum CimdResolveError {
 /// a statement about ordering, and ordering is exactly what a live HTTP dependency makes
 /// awkward to assert.
 pub trait CimdDocumentSource: Send + Sync {
-    /// Fetch `url`, returning the body and the URL the response actually came from.
+    /// Fetch `url`, returning the response or the unit error that means "could not
+    /// retrieve".
     fn get<'a>(&'a self, url: &'a str) -> CimdFetchFuture<'a>;
 }
 
-/// What a [`CimdDocumentSource`] returns: the final URL and the response body, or the
-/// unit error that means "could not retrieve". The error carries nothing deliberately;
-/// why a document was unreachable is the fetcher's to log, and letting it reach the
-/// caller would invite it into an error response an unauthenticated party can read.
+/// What a [`CimdDocumentSource`] retrieved.
+///
+/// The origin's `max-age` is carried HERE rather than being passed in alongside the
+/// operator's policy, because it is response data: nobody knows it until the fetch has
+/// happened. Taking it as an argument would have made the ceiling in [`CimdTtlBounds`]
+/// unreachable in this composition, since no caller could ever supply a value it had not
+/// yet been told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CimdResponse {
+    /// The URL the body actually came from, which a redirect would make differ from the
+    /// URL that was requested.
+    pub final_url: String,
+    /// The response body.
+    pub body: Vec<u8>,
+    /// The `max-age` the origin declared, if it declared one. An INPUT to the TTL clamp,
+    /// never a decision: see [`CimdTtlBounds`].
+    pub max_age: Option<Duration>,
+}
+
+/// What a [`CimdDocumentSource`] returns: a [`CimdResponse`], or the unit error that
+/// means "could not retrieve". The error carries nothing deliberately; why a document was
+/// unreachable is the fetcher's to log, and letting it reach the caller would invite it
+/// into an error response an unauthenticated party can read.
 pub type CimdFetchFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(String, Vec<u8>), ()>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<CimdResponse, ()>> + Send + 'a>>;
 
 /// The operator's CIMD policy: who is trusted, and how long a document may be reused.
 ///
-/// Grouped rather than passed loose because these four move together. A deployment edits
+/// Grouped rather than passed loose because these three move together. A deployment edits
 /// its allow list and its TTL bounds in the same config file, and a signature that takes
 /// them separately invites a caller to pass one call site's lists with another's bounds.
+///
+/// Everything here is the OPERATOR's. What the document asked for arrives on the
+/// [`CimdResponse`], so the two cannot be confused at a call site.
 #[derive(Debug, Clone, Copy)]
 pub struct CimdPolicy<'a> {
     /// Hosts the operator has vetted.
@@ -438,8 +461,6 @@ pub struct CimdPolicy<'a> {
     pub deny: &'a [String],
     /// The bounds any document-declared `max-age` is clamped into.
     pub bounds: CimdTtlBounds,
-    /// The `max-age` the document offered, if it offered one.
-    pub max_age: Option<Duration>,
 }
 
 /// Resolve a URL `client_id` into a validated, trust-classified client (issue #128).
@@ -454,7 +475,8 @@ pub struct CimdPolicy<'a> {
 ///    this after the fetch would leave the deny list enforcing authorization while still
 ///    granting the attacker the server's network position.
 /// 3. **Cache third.** A hit skips the network entirely.
-/// 4. **Fetch, then validate the document**, then cache only what passed.
+/// 4. **Fetch, then validate the document**, then cache only what passed, for a lifetime
+///    the operator's bounds clamp the origin's `max-age` into.
 ///
 /// A rejected document is NEVER cached. Caching a failure would turn one bad response
 /// into a decision that outlives it, and the next request would inherit a verdict rather
@@ -486,7 +508,7 @@ pub async fn resolve_cimd_client(
         });
     }
 
-    let (final_url, body) = source
+    let response = source
         .get(client_id)
         .await
         .map_err(|()| CimdResolveError::Unreachable)?;
@@ -495,14 +517,15 @@ pub async fn resolve_cimd_client(
     // so this can only fire if that policy is ever loosened. Defense in depth costs one
     // string comparison and the alternative is a silent hole the day someone makes
     // redirects configurable.
-    let document =
-        validate_document(client_id, &final_url, &body).map_err(CimdResolveError::Rejected)?;
+    let document = validate_document(client_id, &response.final_url, &response.body)
+        .map_err(CimdResolveError::Rejected)?;
 
+    // The origin's `max-age` is an input to the operator's band, never a decision.
     cache.put(
         client_id,
         document.clone(),
         now,
-        policy.bounds.clamp(policy.max_age),
+        policy.bounds.clamp(response.max_age),
     );
     Ok(ResolvedCimdClient {
         document,
@@ -948,6 +971,7 @@ mod tests {
         calls: std::sync::Mutex<Vec<String>>,
         body: Option<Vec<u8>>,
         final_url: Option<String>,
+        max_age: Option<Duration>,
         fails: bool,
     }
 
@@ -955,6 +979,17 @@ mod tests {
         fn serving(body: Vec<u8>) -> Self {
             Self {
                 body: Some(body),
+                ..Self::default()
+            }
+        }
+
+        /// A source whose origin declares a `max-age`, so the clamp has something to
+        /// clamp. Without this the `Some` arm of [`CimdTtlBounds::clamp`] is unreachable
+        /// through `resolve_cimd_client`, and the ceiling is prose rather than behaviour.
+        fn serving_with_max_age(body: Vec<u8>, max_age: Duration) -> Self {
+            Self {
+                body: Some(body),
+                max_age: Some(max_age),
                 ..Self::default()
             }
         }
@@ -985,10 +1020,11 @@ mod tests {
             let result = if self.fails {
                 Err(())
             } else {
-                Ok((
-                    self.final_url.clone().unwrap_or_else(|| url.to_owned()),
-                    self.body.clone().unwrap_or_default(),
-                ))
+                Ok(CimdResponse {
+                    final_url: self.final_url.clone().unwrap_or_else(|| url.to_owned()),
+                    body: self.body.clone().unwrap_or_default(),
+                    max_age: self.max_age,
+                })
             };
             Box::pin(async move { result })
         }
@@ -999,7 +1035,6 @@ mod tests {
             allow,
             deny,
             bounds: bounds(300, 900),
-            max_age: None,
         }
     }
 
@@ -1064,6 +1099,32 @@ mod tests {
         assert!(second.from_cache);
         assert_eq!(first.document, second.document);
         assert_eq!(source.calls(), 1, "the cache hit must skip the network");
+    }
+
+    #[tokio::test]
+    async fn a_newly_denied_domain_is_refused_even_though_its_document_is_cached() {
+        // This is what pins trust BEFORE the cache. The cold-cache denial test cannot:
+        // with the order reversed the lookup would simply miss, the trust check would run
+        // next, and it would still report Denied having made no request. Only a WARM cache
+        // tells the two orders apart, and getting it wrong is the cache serving a document
+        // for a domain the operator has since forbidden.
+        let source = RecordingSource::serving(document(GOOD));
+        let cache = CimdCache::new(8);
+        let now = SystemTime::UNIX_EPOCH;
+
+        resolve(&source, &cache, &[], &[], now)
+            .await
+            .expect("seed the cache while the domain is still permitted");
+
+        let deny = vec!["app.example".to_owned()];
+        let outcome = resolve(&source, &cache, &[], &deny, now).await;
+
+        assert_eq!(
+            outcome,
+            Err(CimdResolveError::Denied),
+            "a cache hit must not outrank the deny list"
+        );
+        assert_eq!(source.calls(), 1, "and it must not refetch either");
     }
 
     #[tokio::test]
@@ -1168,5 +1229,79 @@ mod tests {
         assert!(inside.from_cache, "the entry must live the whole floor");
         assert!(!outside.from_cache, "and must not outlive it");
         assert_eq!(source.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_origin_asking_to_be_trusted_for_a_year_is_cut_to_the_ceiling() {
+        // The ceiling exists so a document served once cannot pick its own revocation
+        // date. A year is the case the type's documentation names.
+        let source = RecordingSource::serving_with_max_age(
+            document(GOOD),
+            Duration::from_secs(365 * 24 * 60 * 60),
+        );
+        let cache = CimdCache::new(8);
+        let now = SystemTime::UNIX_EPOCH;
+        let ceiling = bounds(300, 900).ceiling;
+
+        resolve(&source, &cache, &[], &[], now).await.expect("seed");
+        let inside = resolve(
+            &source,
+            &cache,
+            &[],
+            &[],
+            now + ceiling - Duration::from_secs(1),
+        )
+        .await
+        .expect("still fresh");
+        let outside = resolve(
+            &source,
+            &cache,
+            &[],
+            &[],
+            now + ceiling + Duration::from_secs(1),
+        )
+        .await
+        .expect("expired");
+
+        assert!(
+            inside.from_cache,
+            "the clamp raises to the ceiling, it does not collapse to the floor"
+        );
+        assert!(
+            !outside.from_cache,
+            "an origin does not get to choose how long it is trusted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_origin_asking_not_to_be_cached_is_still_held_for_the_floor() {
+        // `max-age=0` costs an attacker one header and would otherwise make every
+        // authorization request dereference a URL they chose. The floor is what stops
+        // that from being an amplifier.
+        let source = RecordingSource::serving_with_max_age(document(GOOD), Duration::ZERO);
+        let cache = CimdCache::new(8);
+        let now = SystemTime::UNIX_EPOCH;
+        let floor = bounds(300, 900).floor;
+
+        resolve(&source, &cache, &[], &[], now).await.expect("seed");
+        let inside = resolve(
+            &source,
+            &cache,
+            &[],
+            &[],
+            now + floor - Duration::from_secs(1),
+        )
+        .await
+        .expect("still fresh");
+
+        assert!(
+            inside.from_cache,
+            "max-age=0 must not buy a refetch on every request"
+        );
+        assert_eq!(
+            source.calls(),
+            1,
+            "the second resolve never reached the network"
+        );
     }
 }
