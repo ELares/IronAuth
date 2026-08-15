@@ -4341,6 +4341,34 @@ fn serve_capture_sink(listener: std::net::TcpListener, sink: std::sync::Arc<capt
     });
 }
 
+/// Write the generated dev configuration and return its path.
+///
+/// The management port is EPHEMERAL. Its default is a fixed 9443, and a collision there does
+/// not merely degrade the emulator, it exits the server: measured by running `ironauth dev`
+/// on a machine already using that port and watching the whole process die with "Address
+/// already in use".
+///
+/// # Errors
+///
+/// A message naming the step that failed.
+fn write_dev_config(database_url: &str, bind: &str) -> Result<std::path::PathBuf, String> {
+    let management_bind = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| format!("127.0.0.1:{}", addr.port()))
+        .map_err(|error| format!("could not reserve a management port: {error}"))?;
+
+    let dir = std::env::temp_dir().join("ironauth-dev");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let config_path = dir.join("ironauth-dev.toml");
+    std::fs::write(
+        &config_path,
+        dev::dev_config_toml(database_url, bind, &management_bind),
+    )
+    .map_err(|error| format!("cannot write {}: {error}", config_path.display()))?;
+    Ok(config_path)
+}
+
 /// Provision the schema roles and apply the schema, before the server boots.
 ///
 /// Nothing else does this. `serve` does not migrate, and a freshly `initdb`-ed cluster has
@@ -4456,20 +4484,13 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
     }
 
-    let generated = dev::dev_config_toml(&database_url, &bind);
-    let dir = std::env::temp_dir().join("ironauth-dev");
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        eprintln!("ironauth dev: cannot create {}: {error}", dir.display());
-        return ExitCode::FAILURE;
-    }
-    let config_path = dir.join("ironauth-dev.toml");
-    if let Err(error) = std::fs::write(&config_path, generated) {
-        eprintln!(
-            "ironauth dev: cannot write {}: {error}",
-            config_path.display()
-        );
-        return ExitCode::FAILURE;
-    }
+    let config_path = match write_dev_config(&database_url, &bind) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("ironauth dev: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Deterministic secrets, installed BEFORE the server boots. The guard above has already
     // refused a non-loopback bind, which is what makes this safe to do at all.

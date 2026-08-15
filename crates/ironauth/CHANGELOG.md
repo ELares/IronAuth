@@ -6,6 +6,32 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **FIX: `ironauth dev` booted, but was not a working emulator (issue #121).** Found by RUNNING
+  it rather than by reading it. The generated configuration was too minimal in four separate
+  ways, each of which the server reported and none of which any test could see.
+
+  - **`oidc.enabled` was false**, so the emulator served no OIDC at all. That is the one thing
+    it exists to serve.
+  - **`dev_mode` was unset.** The server asks for it by name: the management API, the scheduled
+    offboarding worker, and outbox retention each refused to start saying "or run in dev_mode",
+    because they need a control-plane DSN and `dev_mode` lets them fall back to `database.url`.
+    An emulator missing all three is not the real server.
+  - **`database.master_key` was unset**, so the encrypted-PII paths (registration, login,
+    UserInfo) failed CLOSED and no login could work.
+  - **`server.management_bind` defaulted to a fixed `127.0.0.1:9443`**, which on a machine
+    already using that port did not degrade the emulator, it EXITED the server: "Address
+    already in use", process dead. It is now an ephemeral port chosen the way the cluster's is.
+
+  Verified by running it again: zero errors, the server answers, the capture sink endpoint
+  returns its JSON, and the throwaway cluster is gone after the process is signalled.
+
+  **Why no test caught any of this.** Every part had unit tests and they all passed. The
+  generated config was asserted to CONTAIN the database URL and the bind address, which it did.
+  Nothing started the binary, so nothing could observe that the server it produced refused to
+  mount its own OIDC provider. Running the thing was worth more than every assertion about its
+  pieces, which is the same lesson as the schema gap one change earlier.
+
+
 - **FIX: `ironauth dev` brought up a database the server could not use (issue #121).** The
   cluster started, and then nothing created the roles the schema's GRANTs name or applied the
   schema at all, because `serve` does not migrate and a freshly `initdb`-ed cluster has neither.
