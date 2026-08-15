@@ -42,4 +42,10 @@ name = "branding_sanitize"
 path = "fuzz_targets/branding_sanitize.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "cimd_document"
+path = "fuzz_targets/cimd_document.rs"
+test = false
+doc = false
 bench = false

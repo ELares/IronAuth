@@ -55,6 +55,11 @@ jobs:
             target: flow_submission_parse
           - dir: crates/ironauth-oidc
             target: branding_sanitize
+          # CIMD client-ID and metadata-document parsing (issue #128). Both parsers run on
+          # bytes an UNREGISTERED party chose, so a panic here is reachable by anyone who
+          # can reach /authorize.
+          - dir: crates/ironauth-oidc
+            target: cimd_document
           - dir: .
             target: ceremony_parse
           # Added by issue #419. These landed with their crates (all five importers in
