@@ -382,6 +382,135 @@ pub fn resolve_trust(host: &str, allow: &[String], deny: &[String]) -> CimdTrust
     CimdTrust::Quarantined
 }
 
+/// Everything a resolved CIMD client contributes to an authorization request (issue #128).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCimdClient {
+    /// The validated metadata document, verbatim.
+    pub document: Value,
+    /// What the deployment has decided about the document's domain.
+    pub trust: CimdTrust,
+    /// Whether this resolution came from the cache rather than the network. Carried so
+    /// the caller can emit the "cache refresh" audit event the issue asks for without
+    /// inferring it from timing.
+    pub from_cache: bool,
+}
+
+/// Why a CIMD `client_id` could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CimdResolveError {
+    /// The URL or the document failed a hardening rule.
+    Rejected(CimdRejection),
+    /// The operator's deny list names this domain.
+    Denied,
+    /// The document could not be retrieved.
+    Unreachable,
+}
+
+/// The document source, so resolution is testable without a network (issue #128).
+///
+/// A trait rather than a concrete `Fetcher` because the thing worth testing here is the
+/// COMPOSITION: that a denied domain is refused before anything is fetched, that a cached
+/// document skips the fetch, and that a hardening failure is not cached. Each of those is
+/// a statement about ordering, and ordering is exactly what a live HTTP dependency makes
+/// awkward to assert.
+pub trait CimdDocumentSource: Send + Sync {
+    /// Fetch `url`, returning the body and the URL the response actually came from.
+    fn get<'a>(&'a self, url: &'a str) -> CimdFetchFuture<'a>;
+}
+
+/// What a [`CimdDocumentSource`] returns: the final URL and the response body, or the
+/// unit error that means "could not retrieve". The error carries nothing deliberately;
+/// why a document was unreachable is the fetcher's to log, and letting it reach the
+/// caller would invite it into an error response an unauthenticated party can read.
+pub type CimdFetchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(String, Vec<u8>), ()>> + Send + 'a>>;
+
+/// The operator's CIMD policy: who is trusted, and how long a document may be reused.
+///
+/// Grouped rather than passed loose because these four move together. A deployment edits
+/// its allow list and its TTL bounds in the same config file, and a signature that takes
+/// them separately invites a caller to pass one call site's lists with another's bounds.
+#[derive(Debug, Clone, Copy)]
+pub struct CimdPolicy<'a> {
+    /// Hosts the operator has vetted.
+    pub allow: &'a [String],
+    /// Hosts the operator has forbidden. Deny wins over allow.
+    pub deny: &'a [String],
+    /// The bounds any document-declared `max-age` is clamped into.
+    pub bounds: CimdTtlBounds,
+    /// The `max-age` the document offered, if it offered one.
+    pub max_age: Option<Duration>,
+}
+
+/// Resolve a URL `client_id` into a validated, trust-classified client (issue #128).
+///
+/// # Order is the security property
+///
+/// 1. **URL shape first**, before anything is dereferenced. `validate_client_id_url`
+///    rejects non-https, special-use and private hosts, and URLs carrying a fragment or
+///    userinfo. A malformed URL must never reach the fetcher.
+/// 2. **Trust second**, still before the fetch. A DENIED domain is refused without a
+///    request, so a deny-listed host cannot be used to make the server emit traffic. Doing
+///    this after the fetch would leave the deny list enforcing authorization while still
+///    granting the attacker the server's network position.
+/// 3. **Cache third.** A hit skips the network entirely.
+/// 4. **Fetch, then validate the document**, then cache only what passed.
+///
+/// A rejected document is NEVER cached. Caching a failure would turn one bad response
+/// into a decision that outlives it, and the next request would inherit a verdict rather
+/// than re-derive it.
+///
+/// # Errors
+///
+/// [`CimdResolveError`] naming the first rule that refused.
+pub async fn resolve_cimd_client(
+    client_id: &str,
+    source: &dyn CimdDocumentSource,
+    cache: &CimdCache,
+    policy: CimdPolicy<'_>,
+    now: SystemTime,
+) -> Result<ResolvedCimdClient, CimdResolveError> {
+    let target = validate_client_id_url(client_id).map_err(CimdResolveError::Rejected)?;
+
+    // Before the fetch, deliberately. See the ordering note above.
+    let trust = resolve_trust(&target.host, policy.allow, policy.deny);
+    if !trust.is_permitted() {
+        return Err(CimdResolveError::Denied);
+    }
+
+    if let Some(document) = cache.get(client_id, now) {
+        return Ok(ResolvedCimdClient {
+            document,
+            trust,
+            from_cache: true,
+        });
+    }
+
+    let (final_url, body) = source
+        .get(client_id)
+        .await
+        .map_err(|()| CimdResolveError::Unreachable)?;
+
+    // `final_url` is checked even though the shipped fetcher refuses redirects outright,
+    // so this can only fire if that policy is ever loosened. Defense in depth costs one
+    // string comparison and the alternative is a silent hole the day someone makes
+    // redirects configurable.
+    let document =
+        validate_document(client_id, &final_url, &body).map_err(CimdResolveError::Rejected)?;
+
+    cache.put(
+        client_id,
+        document.clone(),
+        now,
+        policy.bounds.clamp(policy.max_age),
+    );
+    Ok(ResolvedCimdClient {
+        document,
+        trust,
+        from_cache: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -808,5 +937,236 @@ mod tests {
             resolve_trust("anything.test", &[], &[]),
             CimdTrust::Quarantined
         );
+    }
+
+    /// A source that records every URL it was asked for, so a test can assert that a
+    /// fetch did NOT happen. "Refused before the fetch" is the actual security property
+    /// for a deny-listed domain, and a test that only checks the returned error would
+    /// pass just as happily if the request went out first.
+    #[derive(Default)]
+    struct RecordingSource {
+        calls: std::sync::Mutex<Vec<String>>,
+        body: Option<Vec<u8>>,
+        final_url: Option<String>,
+        fails: bool,
+    }
+
+    impl RecordingSource {
+        fn serving(body: Vec<u8>) -> Self {
+            Self {
+                body: Some(body),
+                ..Self::default()
+            }
+        }
+
+        fn redirecting_to(body: Vec<u8>, final_url: &str) -> Self {
+            Self {
+                body: Some(body),
+                final_url: Some(final_url.to_owned()),
+                ..Self::default()
+            }
+        }
+
+        fn unreachable() -> Self {
+            Self {
+                fails: true,
+                ..Self::default()
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.lock().expect("calls").len()
+        }
+    }
+
+    impl CimdDocumentSource for RecordingSource {
+        fn get<'a>(&'a self, url: &'a str) -> CimdFetchFuture<'a> {
+            self.calls.lock().expect("calls").push(url.to_owned());
+            let result = if self.fails {
+                Err(())
+            } else {
+                Ok((
+                    self.final_url.clone().unwrap_or_else(|| url.to_owned()),
+                    self.body.clone().unwrap_or_default(),
+                ))
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    fn policy<'a>(allow: &'a [String], deny: &'a [String]) -> CimdPolicy<'a> {
+        CimdPolicy {
+            allow,
+            deny,
+            bounds: bounds(300, 900),
+            max_age: None,
+        }
+    }
+
+    async fn resolve(
+        source: &RecordingSource,
+        cache: &CimdCache,
+        allow: &[String],
+        deny: &[String],
+        now: SystemTime,
+    ) -> Result<ResolvedCimdClient, CimdResolveError> {
+        resolve_cimd_client(GOOD, source, cache, policy(allow, deny), now).await
+    }
+
+    #[tokio::test]
+    async fn a_denied_domain_is_refused_without_the_server_making_a_request() {
+        let source = RecordingSource::serving(document(GOOD));
+        let cache = CimdCache::new(8);
+        let deny = vec!["app.example".to_owned()];
+
+        let outcome = resolve(&source, &cache, &[], &deny, SystemTime::UNIX_EPOCH).await;
+
+        assert_eq!(outcome, Err(CimdResolveError::Denied));
+        assert_eq!(
+            source.calls(),
+            0,
+            "a deny-listed domain must not get the use of the server's network position"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_client_id_is_refused_before_it_is_dereferenced() {
+        let source = RecordingSource::serving(document(GOOD));
+        let cache = CimdCache::new(8);
+
+        let outcome = resolve_cimd_client(
+            "http://app.example/m.json",
+            &source,
+            &cache,
+            policy(&[], &[]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .await;
+
+        assert!(matches!(outcome, Err(CimdResolveError::Rejected(_))));
+        assert_eq!(source.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cached_document_is_served_without_a_second_fetch_and_says_so() {
+        let source = RecordingSource::serving(document(GOOD));
+        let cache = CimdCache::new(8);
+        let now = SystemTime::UNIX_EPOCH;
+
+        let first = resolve(&source, &cache, &[], &[], now)
+            .await
+            .expect("first resolve");
+        let second = resolve(&source, &cache, &[], &[], now)
+            .await
+            .expect("second resolve");
+
+        assert!(!first.from_cache);
+        assert!(second.from_cache);
+        assert_eq!(first.document, second.document);
+        assert_eq!(source.calls(), 1, "the cache hit must skip the network");
+    }
+
+    #[tokio::test]
+    async fn a_document_that_fails_validation_is_not_cached() {
+        // The body announces a different client_id than the URL it was served from, which
+        // `validate_document` refuses. Caching that verdict would let one bad response
+        // decide the next request too.
+        let source = RecordingSource::serving(document("https://other.example/m.json"));
+        let cache = CimdCache::new(8);
+        let now = SystemTime::UNIX_EPOCH;
+
+        let first = resolve(&source, &cache, &[], &[], now).await;
+        let second = resolve(&source, &cache, &[], &[], now).await;
+
+        assert!(matches!(first, Err(CimdResolveError::Rejected(_))));
+        assert!(matches!(second, Err(CimdResolveError::Rejected(_))));
+        assert_eq!(
+            source.calls(),
+            2,
+            "a rejected document must be re-derived, not remembered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirected_response_is_refused_even_though_the_fetcher_forbids_redirects() {
+        let source = RecordingSource::redirecting_to(document(GOOD), "https://elsewhere.example/m");
+        let cache = CimdCache::new(8);
+
+        let outcome = resolve(&source, &cache, &[], &[], SystemTime::UNIX_EPOCH).await;
+
+        assert_eq!(
+            outcome,
+            Err(CimdResolveError::Rejected(CimdRejection::Redirected))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_domain_resolves_quarantined_rather_than_being_refused() {
+        let source = RecordingSource::serving(document(GOOD));
+        let cache = CimdCache::new(8);
+
+        let resolved = resolve(&source, &cache, &[], &[], SystemTime::UNIX_EPOCH)
+            .await
+            .expect("quarantined clients still resolve");
+
+        assert_eq!(resolved.trust, CimdTrust::Quarantined);
+        assert!(resolved.trust.forces_consent());
+    }
+
+    #[tokio::test]
+    async fn an_allowed_domain_resolves_allowed() {
+        let source = RecordingSource::serving(document(GOOD));
+        let cache = CimdCache::new(8);
+        let allow = vec!["app.example".to_owned()];
+
+        let resolved = resolve(&source, &cache, &allow, &[], SystemTime::UNIX_EPOCH)
+            .await
+            .expect("allowed");
+
+        assert_eq!(resolved.trust, CimdTrust::Allowed);
+        assert!(!resolved.trust.forces_consent());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_document_is_distinguished_from_a_rejected_one() {
+        let source = RecordingSource::unreachable();
+        let cache = CimdCache::new(8);
+
+        let outcome = resolve(&source, &cache, &[], &[], SystemTime::UNIX_EPOCH).await;
+
+        assert_eq!(outcome, Err(CimdResolveError::Unreachable));
+    }
+
+    #[tokio::test]
+    async fn a_cached_entry_expires_at_the_clamped_ttl_and_not_before() {
+        let source = RecordingSource::serving(document(GOOD));
+        let cache = CimdCache::new(8);
+        let now = SystemTime::UNIX_EPOCH;
+        // No `max-age` was offered, so the clamp lands on the floor.
+        let floor = bounds(300, 900).floor;
+
+        resolve(&source, &cache, &[], &[], now).await.expect("seed");
+        let inside = resolve(
+            &source,
+            &cache,
+            &[],
+            &[],
+            now + floor - Duration::from_secs(1),
+        )
+        .await
+        .expect("still fresh");
+        let outside = resolve(
+            &source,
+            &cache,
+            &[],
+            &[],
+            now + floor + Duration::from_secs(1),
+        )
+        .await
+        .expect("expired");
+
+        assert!(inside.from_cache, "the entry must live the whole floor");
+        assert!(!outside.from_cache, "and must not outlive it");
+        assert_eq!(source.calls(), 2);
     }
 }
