@@ -6,6 +6,31 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **FIX: `ironauth dev` brought up a database the server could not use (issue #121).** The
+  cluster started, and then nothing created the roles the schema's GRANTs name or applied the
+  schema at all, because `serve` does not migrate and a freshly `initdb`-ed cluster has neither.
+  The server booted against an empty database and failed deep in its own startup, which reads
+  as an unrelated fault rather than "the schema is not there".
+
+  - **What was missing.** `ironauth_app`, `ironauth_control`, and `ironauth_audit_retention`
+    are provisioned out of band in production and by the test harness in tests; a dev cluster
+    had neither them nor a single table. Dev now creates all three (idempotently, via `psql`
+    from the SAME directory the cluster came from, so it cannot talk to a different Postgres
+    than the one just started) and applies the schema through `Store::migrate` before the
+    server boots.
+
+  - **It is skipped when the developer supplied their own `DATABASE_URL`.** That database is
+    theirs, already managed by whatever manages it, and migrating somebody else's database
+    because they pointed a dev tool at it would be the wrong default.
+
+  - **The gap existed because nothing tested the PATH.** The cluster had a lifecycle test and
+    the schema has an extensive migration suite, and both passed while the step joining them
+    did not exist. The new test drives the whole bring-up (cluster, roles, schema) and applies
+    the schema twice to pin idempotence, which is what makes a dev restart cheap. Measured
+    against the bug: with role provisioning removed, it fails exactly where the shipped code
+    did.
+
+
 - **Deterministic secrets in the emulator (issue #121).** `ironauth dev [--seed N]` makes every
   generated secret reproducible: OTP codes, identifiers, client secrets. That is what criterion
   2 needs to assert a complete email-OTP login against a named code.
