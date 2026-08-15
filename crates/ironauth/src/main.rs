@@ -84,6 +84,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// than through a mocked HTTP exchange.
 mod device_login;
 
+/// Choosing between the loopback and device flows for `ironauth login` (issue #120).
+///
+/// A SECURITY default: loopback has no cross-device phishing exposure, so it is preferred
+/// whenever a browser can be opened and the device flow is the fallback.
+mod login_flow;
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {

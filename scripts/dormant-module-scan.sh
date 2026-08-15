@@ -31,6 +31,9 @@ allow() {
     # assertable only as pure logic, whereas the transport, browser hand-off and keychain
     # around them are not. It stops being allowlisted when `ironauth login` lands.
     ironauth/device_login) return 0 ;;                    # issue #120
+    # The flow-selection rules for `ironauth login` (issue #120), landed with the polling
+    # state machine and ahead of the same caller. Both stop being allowlisted together.
+    ironauth/login_flow) return 0 ;;                      # issue #120
     ironauth-oidc/mds3_sync) return 0 ;;                 # untraced; see #774
     ironauth-store/message_feedback) return 0 ;;         # issue #111
     ironauth-store/token_exchange_decision) return 0 ;;  # issue #125

@@ -205,7 +205,10 @@ mod tests {
             other => panic!("expected a stop, got {other:?}"),
         });
         assert_eq!(
-            messages.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            messages
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
             3,
             "each cause must say something different: {messages:?}"
         );
@@ -249,7 +252,10 @@ mod tests {
 
     #[test]
     fn every_defined_error_code_maps_to_its_own_outcome() {
-        assert_eq!(outcome_for_error("authorization_pending"), PollOutcome::Pending);
+        assert_eq!(
+            outcome_for_error("authorization_pending"),
+            PollOutcome::Pending
+        );
         assert_eq!(outcome_for_error("slow_down"), PollOutcome::SlowDown);
         assert_eq!(outcome_for_error("access_denied"), PollOutcome::Denied);
         assert_eq!(outcome_for_error("expired_token"), PollOutcome::Expired);
