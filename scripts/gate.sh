@@ -192,6 +192,11 @@ scripts/openapi-lint.sh
 python3 scripts/openapi-changelog.py --self-test
 # The published wire-format contract must still describe the code (issue #122).
 python3 scripts/sdk-contract.py --check
+# The generated management SDKs must still match the published contract (issue #122).
+python3 scripts/gen-management-sdks.py --check
+# And they must still COMPILE, which a freshness check cannot show.
+( cd sdks/go && go build ./... )
+python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('c','sdks/python/ironauth_management/client_gen.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
 # The events-vs-webhooks guidance must still match the code it quotes (issue #107).
 python3 scripts/events-vs-webhooks.py --check
 # Metering must stay off the login and token-issuance paths (issue #107).
