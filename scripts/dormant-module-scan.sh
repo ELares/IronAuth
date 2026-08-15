@@ -26,18 +26,8 @@ allow() {
   case "$1" in
     # Wiring is the remaining work of the issue that owns each, and #774 tracks them.
     ironauth-oidc/cimd) return 0 ;;                      # issue #128
-    # The RFC 8628 polling state machine for `ironauth login` (issue #120). Landed AHEAD of
-    # its caller deliberately: the section 3.5 rules are the substance of that issue and are
-    # assertable only as pure logic, whereas the transport, browser hand-off and keychain
-    # around them are not. It stops being allowlisted when `ironauth login` lands.
-    ironauth/device_login) return 0 ;;                    # issue #120
-    # The flow-selection rules for `ironauth login` (issue #120), landed with the polling
-    # state machine and ahead of the same caller. Both stop being allowlisted together.
-    ironauth/login_flow) return 0 ;;                      # issue #120
-    ironauth/loopback) return 0 ;;                        # issue #120
     ironauth-oidc/mds3_sync) return 0 ;;                 # untraced; see #774
     ironauth-store/message_feedback) return 0 ;;         # issue #111
-    ironauth-store/token_exchange_decision) return 0 ;;  # issue #125
     *) return 1 ;;
   esac
 }

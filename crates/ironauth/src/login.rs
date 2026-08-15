@@ -160,6 +160,102 @@ where
     }
 }
 
+/// Build the authorization URL for the loopback flow.
+///
+/// Every value is percent-encoded, including the redirect URI and the challenge: a
+/// `client_id` or a redirect is caller-supplied, and an unencoded one containing `&` would
+/// forge parameters into an authorization request.
+#[must_use]
+pub fn authorize_url(
+    issuer: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    code_challenge: &str,
+    state: &str,
+    scope: &str,
+) -> String {
+    format!(
+        "{}/authorize?response_type=code&client_id={}&redirect_uri={}\
+         &code_challenge={}&code_challenge_method=S256&state={}&scope={}",
+        issuer.trim_end_matches('/'),
+        encode(client_id),
+        encode(redirect_uri),
+        encode(code_challenge),
+        encode(state),
+        encode(scope)
+    )
+}
+
+/// Exchange an authorization code for tokens (the loopback flow's final leg).
+pub async fn exchange_code(
+    issuer: &str,
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+) -> TokenAnswer {
+    let body = format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
+        encode(code),
+        encode(redirect_uri),
+        encode(client_id),
+        encode(code_verifier)
+    );
+    match ironauth_apply::client::post_form(issuer, "/token", body).await {
+        Ok(response) => {
+            if let Some(access_token) = response.body["access_token"].as_str() {
+                return TokenAnswer::Issued {
+                    access_token: access_token.to_owned(),
+                    refresh_token: response.body["refresh_token"].as_str().map(str::to_owned),
+                    expires_in_secs: response.body["expires_in"].as_i64().unwrap_or(0),
+                };
+            }
+            TokenAnswer::Error(
+                response.body["error"]
+                    .as_str()
+                    .unwrap_or("invalid_request")
+                    .to_owned(),
+            )
+        }
+        Err(error) => TokenAnswer::Error(error.to_string()),
+    }
+}
+
+/// Store what an exchange issued.
+///
+/// # Errors
+///
+/// [`LoginError::Storage`] when the keychain refuses, or [`LoginError::Refused`] when the
+/// answer was an error rather than tokens.
+pub fn store_issued(
+    answer: TokenAnswer,
+    issuer: &str,
+    account: &str,
+    store: &impl CredentialStore,
+    now_unix_secs: i64,
+) -> Result<(), LoginError> {
+    match answer {
+        TokenAnswer::Issued {
+            access_token,
+            refresh_token,
+            expires_in_secs,
+        } => store
+            .store(
+                account,
+                &StoredCredential {
+                    access_token,
+                    refresh_token,
+                    expires_at_unix_secs: now_unix_secs.saturating_add(expires_in_secs),
+                    issuer: issuer.to_owned(),
+                },
+            )
+            .map_err(|error| LoginError::Storage(error.to_string())),
+        TokenAnswer::Error(_) => Err(LoginError::Refused(
+            "the authorization server refused the exchange; run the command again",
+        )),
+    }
+}
+
 /// The current time in epoch seconds, read through the [`Clock`] seam.
 ///
 /// Exists so the login command has no reason to reach for the host clock directly: the stored
@@ -339,6 +435,33 @@ mod tests {
         )
         .await;
         (result, slept.into_inner())
+    }
+
+    /// Every value in the authorization URL is encoded, so a caller-supplied `client_id`
+    /// or redirect cannot forge additional parameters into the request.
+    #[test]
+    fn the_authorize_url_encodes_every_value() {
+        let url = super::authorize_url(
+            "https://issuer.example.test/",
+            "cli&evil=1",
+            "http://127.0.0.1:1234/cb",
+            "chal",
+            "st",
+            "openid profile",
+        );
+        assert!(
+            url.starts_with("https://issuer.example.test/authorize?"),
+            "{url}"
+        );
+        assert!(url.contains("client_id=cli%26evil%3D1"), "{url}");
+        assert!(
+            url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A1234%2Fcb"),
+            "{url}"
+        );
+        assert!(url.contains("scope=openid%20profile"), "{url}");
+        assert!(url.contains("code_challenge_method=S256"), "{url}");
+        // The trailing slash on the issuer must not produce a double slash.
+        assert!(!url.contains("test//authorize"), "{url}");
     }
 
     /// The clock seam is what the login reads, so a manual clock decides the stored expiry.

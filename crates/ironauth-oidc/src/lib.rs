@@ -130,7 +130,14 @@ mod password;
 /// the code exchange and the refresh grant.
 mod permission_budget;
 mod phone;
-mod pkce;
+/// PKCE (RFC 7636).
+///
+/// Public because `ironauth login`'s loopback flow must derive its `code_challenge` with
+/// the SAME transform this server verifies against. `s256_challenge`'s own documentation
+/// records why: two copies of it once existed here and AGREED, which is the dangerous
+/// state, because nothing would have failed if one had been changed. A third copy in the
+/// CLI would recreate exactly that.
+pub mod pkce;
 mod policy_trace;
 pub mod pow;
 mod pow_gate;

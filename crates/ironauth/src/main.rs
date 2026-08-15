@@ -93,6 +93,9 @@ mod login_flow;
 /// Building the loopback redirect URI for `ironauth login` (issue #120), per RFC 8252 7.3.
 mod loopback;
 
+/// The RFC 8252 loopback half of `ironauth login` (issue #120).
+mod loopback_flow;
+
 /// Where `ironauth login` stores what it obtains (issue #120): the platform keychain, with
 /// a trait seam so the command's logic is testable on a runner that has no keychain.
 mod credentials;
@@ -4271,10 +4274,22 @@ fn print_probe_report(report: &ironauth_oidc::ProbeReport) {
 /// Drives the RFC 8628 device flow and stores the result in the platform keychain. The
 /// loop itself lives in `login.rs` over injected endpoints, so it is tested without a
 /// network; this function is the production wiring of those endpoints.
-fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
+/// The parsed `ironauth login` arguments.
+struct LoginArgs {
+    issuer: String,
+    client_id: String,
+    account: String,
+    redirect: Option<String>,
+    preference: login_flow::FlowPreference,
+}
+
+/// Parse `ironauth login`'s arguments, or report what is missing.
+fn parse_login_args(args: &mut impl Iterator<Item = String>) -> Result<LoginArgs, ()> {
     let mut issuer = None;
     let mut client_id = None;
     let mut account = "default".to_owned();
+    let mut redirect = None;
+    let mut preference = login_flow::FlowPreference::Detect;
     while let Some(flag) = args.next() {
         let mut take = |name: &str| {
             let Some(value) = args.next() else {
@@ -4284,28 +4299,51 @@ fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Ok(value)
         };
         match flag.as_str() {
-            "--issuer" => match take("--issuer") {
-                Ok(value) => issuer = Some(value),
-                Err(()) => return ExitCode::FAILURE,
-            },
-            "--client-id" => match take("--client-id") {
-                Ok(value) => client_id = Some(value),
-                Err(()) => return ExitCode::FAILURE,
-            },
-            "--account" => match take("--account") {
-                Ok(value) => account = value,
-                Err(()) => return ExitCode::FAILURE,
-            },
+            "--issuer" => issuer = Some(take("--issuer")?),
+            "--client-id" => client_id = Some(take("--client-id")?),
+            "--account" => account = take("--account")?,
+            "--redirect" => redirect = Some(take("--redirect")?),
+            // An explicit flag wins over the heuristic, INCLUDING when it selects the
+            // device flow on a machine that could have used loopback. That is a downgrade
+            // and it is the caller's to make; what the CLI must not do is make it silently.
+            "--device" => preference = login_flow::FlowPreference::ForceDevice,
+            "--loopback" => preference = login_flow::FlowPreference::ForceLoopback,
             other => {
                 eprintln!("ironauth login: unknown argument '{other}'");
-                return ExitCode::FAILURE;
+                return Err(());
             }
         }
     }
     let (Some(issuer), Some(client_id)) = (issuer, client_id) else {
         eprintln!("ironauth login: --issuer and --client-id are required");
+        return Err(());
+    };
+    Ok(LoginArgs {
+        issuer,
+        client_id,
+        account,
+        redirect,
+        preference,
+    })
+}
+
+fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let Ok(parsed) = parse_login_args(args) else {
         return ExitCode::FAILURE;
     };
+    let LoginArgs {
+        issuer,
+        client_id,
+        account,
+        redirect,
+        preference,
+    } = parsed;
+
+    // Which flow. An explicit flag wins; otherwise the host decides, and loopback is
+    // preferred wherever it can run because it has no cross-device step for an attacker to
+    // solicit a code through.
+    let (flow, reason) = login_flow::choose_flow(login_flow::signals_from_env(), preference);
+    println!("ironauth: {}", flow_explanation(flow, reason));
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -4322,16 +4360,60 @@ fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // caught this exact line taking the shortcut.
         let now = login::epoch_secs(&ironauth_env::SystemClock);
 
-        let result = login::run_device_flow(
-            &issuer,
-            &account,
-            &store,
-            now,
-            || login::request_device_authorization(&issuer, &client_id),
-            |device_code| login::request_token(&issuer, &client_id, device_code),
-            |duration| async move { tokio::time::sleep(duration).await },
-        )
-        .await;
+        // The loopback attempt, when it was chosen AND a redirect was registered. A bind
+        // failure falls back to the device flow, which is what the criterion asks for: the
+        // host heuristic cannot know whether a listener will actually bind, so the decision
+        // has to be made at the bind and not before it.
+        let mut result = None;
+        if flow == login_flow::LoginFlow::Loopback {
+            match redirect.as_deref() {
+                Some(registered) => {
+                    match loopback_flow::prepare(registered, &ironauth_env::OsEntropy) {
+                        Ok(prepared) => {
+                            result = Some(
+                                run_loopback(&issuer, &client_id, &account, &store, now, prepared)
+                                    .await,
+                            );
+                        }
+                        Err(loopback_flow::PrepareError::Bind) => {
+                            println!(
+                                "ironauth: could not bind a loopback listener; \
+                                 using the device flow instead"
+                            );
+                        }
+                        // A registration that cannot support loopback is a CONFIGURATION
+                        // problem. Downgrading silently would hide it behind a flow that
+                        // happens to work, leaving it undiagnosable.
+                        Err(loopback_flow::PrepareError::Registration(cause)) => {
+                            eprintln!("ironauth login: {}", cause.message());
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                None => {
+                    println!(
+                        "ironauth: no --redirect registered for a loopback login; \
+                         using the device flow instead"
+                    );
+                }
+            }
+        }
+
+        let result = match result {
+            Some(result) => result,
+            None => {
+                login::run_device_flow(
+                    &issuer,
+                    &account,
+                    &store,
+                    now,
+                    || login::request_device_authorization(&issuer, &client_id),
+                    |device_code| login::request_token(&issuer, &client_id, device_code),
+                    |duration| async move { tokio::time::sleep(duration).await },
+                )
+                .await
+            }
+        };
 
         match result {
             Ok(()) => {
@@ -4344,6 +4426,98 @@ fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
             }
         }
     })
+}
+
+/// Run the loopback leg: open the browser, wait for the redirect, exchange the code.
+async fn run_loopback(
+    issuer: &str,
+    client_id: &str,
+    account: &str,
+    store: &impl credentials::CredentialStore,
+    now: i64,
+    prepared: loopback_flow::Prepared,
+) -> Result<(), login::LoginError> {
+    let url = login::authorize_url(
+        issuer,
+        client_id,
+        &prepared.redirect_uri,
+        &prepared.code_challenge,
+        &prepared.state,
+        "openid profile offline_access",
+    );
+
+    // Printed BEFORE the browser is opened, and unconditionally. Opening a browser can
+    // fail silently on a host with no handler registered, and a user staring at a terminal
+    // that only says "waiting" has no way to continue; with the URL in front of them they
+    // can paste it anywhere.
+    println!("Opening your browser to sign in. If it does not open, visit:");
+    println!("  {url}");
+    open_browser(&url);
+
+    let redirect =
+        tokio::task::block_in_place(|| loopback_flow::await_redirect(&prepared.listener))
+            .map_err(login::LoginError::Authorization)?;
+
+    let (code, state) = match redirect {
+        loopback_flow::Redirect::Code { code, state } => (code, state),
+        loopback_flow::Redirect::Failed(_) => {
+            return Err(login::LoginError::Refused(
+                "the sign-in was refused in the browser; run the command again",
+            ));
+        }
+    };
+
+    // CSRF: the echoed state must be the one we sent. A mismatch means this redirect
+    // belongs to a different authorization request, so the code in it is not ours to
+    // redeem, and redeeming it is exactly the attack `state` exists to stop.
+    if state != prepared.state {
+        return Err(login::LoginError::Refused(
+            "the browser returned a response for a different sign-in request",
+        ));
+    }
+
+    let answer = login::exchange_code(
+        issuer,
+        client_id,
+        &code,
+        &prepared.redirect_uri,
+        &prepared.code_verifier,
+    )
+    .await;
+    login::store_issued(answer, issuer, account, store, now)
+}
+
+/// Ask the platform to open `url`. Best effort: a failure is not fatal, because the URL
+/// was already printed for the user to open themselves.
+fn open_browser(url: &str) {
+    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("open", &[])
+    } else if cfg!(target_os = "windows") {
+        ("cmd", &["/C", "start", ""])
+    } else {
+        ("xdg-open", &[])
+    };
+    let _ = std::process::Command::new(program)
+        .args(args)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Say which flow was chosen and why, so the CLI does not appear to guess.
+fn flow_explanation(flow: login_flow::LoginFlow, reason: login_flow::FlowReason) -> String {
+    let flow = match flow {
+        login_flow::LoginFlow::Loopback => "loopback",
+        login_flow::LoginFlow::Device => "device",
+    };
+    let reason = match reason {
+        login_flow::FlowReason::Requested => "you asked for it",
+        login_flow::FlowReason::BrowserAvailable => "a browser can be opened here",
+        login_flow::FlowReason::SshSession => "this is an SSH session",
+        login_flow::FlowReason::NoDisplay => "no display server was found",
+    };
+    format!("using the {flow} flow ({reason})")
 }
 
 /// `ironauth logout [--account NAME]`: remove every credential stored for a deployment.

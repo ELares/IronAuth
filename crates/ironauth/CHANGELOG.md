@@ -6,6 +6,45 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The RFC 8252 loopback flow, and the end of #120's dormancy.** `ironauth login` now selects
+  between loopback and device, and every module this issue shipped has a caller.
+
+  - **All three `allow(dead_code)` markers are GONE.** `device_login.rs`, `login_flow.rs`, and
+    `loopback.rs` each shipped correct, tested, and callerless; their tests passed because they
+    called those modules directly, which is exactly why they could not notice that nothing else
+    did. The markers are removed, no dead code is reported, and
+    `scripts/dormant-module-scan.sh` no longer allowlists any of them. The scan is an
+    INDEPENDENT check: it would flag a module that was still unreachable, so its silence is
+    evidence rather than assertion. `ironauth-store/token_exchange_decision` came off the same
+    allowlist, where it should have gone when #826 gave it a caller.
+
+  - **The fallback lives at the BIND, not at the heuristic.** `choose_flow` reads the host (a
+    display, an SSH session, a platform that opens a browser implicitly), and none of that says
+    whether a listener can actually bind: a locked-down host, a sandbox without loopback, or an
+    exhausted ephemeral range all fail afterwards. So `prepare` returns a bind failure as a
+    VALUE and the command falls back to the device flow, which is the criterion's wording.
+
+  - **A registration that cannot support loopback is REPORTED, not downgraded.** `localhost`
+    and `https://` redirects fail with the reason. Silently switching flows would hide a
+    configuration error behind something that happens to work, leaving it undiagnosable.
+
+  - **PKCE uses the SERVER's own transform.** The challenge comes from
+    `ironauth_oidc::pkce::s256_challenge`, and the tests assert the generated verifier against
+    `verify_s256` and `code_verifier_is_well_formed` rather than against strings written here.
+    That is not stylistic: dropping the verifier below the RFC 7636 entropy floor is caught by
+    the server's own rejection, and `s256_challenge`'s documentation records that two copies of
+    this transform once existed in this workspace and AGREED, which is the dangerous state.
+
+  - **The `state` is compared, and an error beats a code.** A redirect whose state differs
+    belongs to a different authorization request, so its code is not ours to redeem. A response
+    carrying both an error and a code is malformed, and reading the code would proceed with a
+    grant the server just said it was refusing.
+
+  - **The URL is printed before the browser is opened.** Opening a browser can fail silently on
+    a host with no handler registered, and a user watching a terminal that only says "waiting"
+    has no way to continue.
+
+
 - **`ironauth login` drives the RFC 8628 device flow (issue #120).** The three modules that
   shipped earlier under this issue now have a caller.
 
