@@ -32,11 +32,29 @@ range per docs/RELEASING.md.
     boot sequence, which would drift, and drift invisibly, because dev is where nobody looks
     for a production difference.
 
-  - **Scope, stated rather than implied.** The cluster lifecycle is not automated yet;
-    `DATABASE_URL` is used when the developer already has one, and the error names what to
-    install plus both escape hatches. Nothing in the module is dead: a binary-search helper
-    written ahead of that automation was REMOVED rather than kept behind an `allow(dead_code)`,
-    which is the shape three modules on #120 had to be dug out of.
+  - **The throwaway cluster is now automated.** `ironauth dev` locates the Postgres binaries,
+    runs `initdb`, starts a loopback-only server on an ephemeral port, and STOPS AND DELETES
+    the whole thing on drop. An existing `DATABASE_URL` still wins, so a developer who has a
+    database does not get a second one started underneath them.
+
+  - **Two defects the real cluster test caught, neither of which a mock would have.**
+
+    First, `pg_ctl start` launches a daemon that inherits whatever stdout and stderr it is
+    given and holds them for its lifetime, so capturing them with `Command::output` blocks
+    forever waiting for an EOF that arrives only when the database shuts down. It hung for ten
+    minutes against a perfectly healthy running cluster. The server's output now goes to a log
+    file via `pg_ctl -l`, this process's handles are closed, and the log is read back only on
+    failure. This is precisely why `scripts/with-test-db.sh` redirects to `/dev/null` at that
+    step.
+
+    Second, the binary search claimed in its own doc comment to use "the same search order"
+    as that script and did not: it omitted `~/.theseus/postgresql/*/bin`, which is where this
+    project's own tooling installs Postgres, so it failed on a host where the shell script
+    succeeds. The claim is now true rather than intended.
+
+  - **Nothing in the module is dead.** A binary-search helper written ahead of the automation
+    was REMOVED rather than kept behind an `allow(dead_code)`, which is the shape three
+    modules on #120 had to be dug out of; it came back when the automation gave it a caller.
 
 
 - **The RFC 8252 loopback flow, and the end of #120's dormancy.** `ironauth login` now selects

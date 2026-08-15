@@ -4310,12 +4310,35 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // The throwaway cluster is not automated yet; an existing DATABASE_URL is used when the
-    // developer has one. The message names what to install and both escape hatches rather
-    // than failing with something that reads like an IronAuth fault.
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
-        eprintln!("ironauth dev: {}", dev::missing_postgres_message());
-        return ExitCode::FAILURE;
+    // An existing DATABASE_URL wins: a developer who already has a database should not have
+    // a second one started underneath them. Otherwise a throwaway cluster is brought up for
+    // this process and discarded when it exits.
+    //
+    // `_cluster` is bound rather than dropped immediately, and that binding IS the
+    // lifetime: dropping it stops the server and deletes the directory, so letting it fall
+    // out of scope here would tear the database down before the server ever booted.
+    let mut _cluster = None;
+    let database_url = if let Ok(url) = std::env::var("DATABASE_URL") {
+        url
+    } else {
+        {
+            let Some(bin_dir) = dev::locate_bin_dir(std::env::var("PG_BIN").ok().as_deref()) else {
+                eprintln!("ironauth dev: {}", dev::missing_postgres_message());
+                return ExitCode::FAILURE;
+            };
+            let unique = std::process::id().to_string();
+            match dev::DevCluster::start(&bin_dir, &unique) {
+                Ok(cluster) => {
+                    let url = cluster.database_url.clone();
+                    _cluster = Some(cluster);
+                    url
+                }
+                Err(error) => {
+                    eprintln!("ironauth dev: could not start the throwaway database: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
     };
 
     let generated = dev::dev_config_toml(&database_url, &bind);
