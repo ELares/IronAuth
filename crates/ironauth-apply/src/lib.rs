@@ -28,7 +28,12 @@
 //! own control-plane HTTP client rather than the server's SSRF-hardened fetcher.
 
 mod args;
-mod client;
+/// The control-plane HTTP client.
+///
+/// Public because `ironauth login` (issue #120) drives the OAuth device and token endpoints
+/// and must not carry a second copy of this crate's TLS configuration, total deadline, and
+/// response size cap. See `client::post_form`.
+pub mod client;
 mod command;
 mod error;
 

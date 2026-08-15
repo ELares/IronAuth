@@ -6,6 +6,43 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`ironauth login` drives the RFC 8628 device flow (issue #120).** The three modules that
+  shipped earlier under this issue now have a caller.
+
+  - **`device_login.rs` is no longer dormant.** It shipped with a module-level
+    `allow(dead_code)` and zero call sites; its tests passed because they called it directly,
+    which is exactly why they could not notice that nothing else did. The `allow` is now
+    REMOVED and the module reports no dead code, which is the measurable form of "it is
+    wired". `login_flow.rs` and `loopback.rs` remain dormant until the loopback flow lands,
+    and still say so.
+
+  - **The device flow first, because it is the one that works everywhere.** It needs no
+    listener, no browser on this machine, and no open port, so it is the flow available on the
+    headless boxes and over the SSH sessions where a CLI login most often happens.
+
+  - **The transport is SHARED, not copied.** The HTTP goes through
+    `ironauth_apply::client::post_form`, the same connect, TLS configuration, total deadline,
+    and response size cap the control-plane client uses. `send` gained a content type and an
+    optional Authorization header, which is the whole difference between a management-API call
+    and an OAuth token request. A second copy of that logic in this crate would have been two
+    things to keep in step, and the copy that drifts is the one nobody is looking at.
+
+  - **Section 3.5, enforced through the command.** The client waits BEFORE its first poll
+    (polling immediately guarantees an `authorization_pending` the user could not have
+    avoided); an omitted `interval` means five seconds; `slow_down` raises the interval for
+    this AND every subsequent request rather than once; and any error code other than the two
+    pending ones stops polling, because a client cannot know an unrecognised one is transient
+    and guessing that it is turns one server change into a fleet polling forever.
+
+  - **A failed store fails the LOGIN.** Reporting success would tell the user they are signed
+    in on a machine that has nothing stored, and the next command would fail for a reason that
+    looks unrelated.
+
+  - **Form values are percent-encoded.** A `client_id` is caller-supplied and opaque, so
+    interpolating it raw would let a value containing `&` or `=` forge additional parameters;
+    the test asserts exactly that case.
+
+
 - **`ironauth logout`, and the keychain-backed credential store beneath it (issue #120).** The
   first piece of the CLI login story that a user can actually run.
 

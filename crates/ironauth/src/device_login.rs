@@ -22,13 +22,6 @@
 //! entry rather than a mocked HTTP exchange, so the state machine is tested at the level
 //! the RFC describes it.
 
-// The whole module is reachable only from `ironauth login`, which has not landed yet, so
-// every item here is dead until it does. Allowed at the MODULE level with the reason rather
-// than per item: per-item allows have to be removed one at a time when the caller arrives,
-// which is exactly when nobody is looking for them. `dormant-module-scan.sh` records the
-// same fact and both retire together.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 /// The RFC 8628 default when the authorization server omits `interval`.

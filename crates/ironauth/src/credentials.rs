@@ -17,9 +17,10 @@
 //!
 //! # This module is deliberately only as large as its callers
 //!
-//! Today the only caller is `ironauth logout`, so the only operation here is
-//! [`CredentialStore::delete`]. The write and read halves land WITH `ironauth login`, in
-//! the change that gives them a caller.
+//! The operations here are exactly the ones something calls: [`CredentialStore::store`] for
+//! `ironauth login` and [`CredentialStore::delete`] for `ironauth logout`. There is no
+//! `load` yet, because nothing reads a stored credential back; it lands with the command
+//! that does.
 //!
 //! That is a deliberate response to a measured problem in this milestone rather than
 //! minimalism for its own sake. `device_login.rs`, `login_flow.rs`, and `loopback.rs` all
@@ -41,6 +42,28 @@
 //! implementation. What that deliberately does NOT prove is that the keychain backend works
 //! on all three platforms; only running it there does. [`KeyringStore`] is kept as thin as
 //! possible so that what these tests leave unproved is a delegation, not a decision.
+
+/// What a successful login obtained, as stored.
+///
+/// The refresh token shares the entry rather than getting its own, so a `logout` cannot
+/// partially succeed and leave the regenerating half behind.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredCredential {
+    /// The access token.
+    pub access_token: String,
+    /// The refresh token, when the flow returned one.
+    pub refresh_token: Option<String>,
+    /// Expiry of the ACCESS token, epoch seconds.
+    ///
+    /// Stored rather than derived, so "am I still signed in" is answerable without a round
+    /// trip: asking the server would turn every command into a network call, and treating a
+    /// token as good until a 401 makes the first command after expiry fail for a reason the
+    /// user reads as an outage.
+    pub expires_at_unix_secs: i64,
+    /// The issuer these tokens came from, so a credential is never presented to a different
+    /// deployment than the one that minted it.
+    pub issuer: String,
+}
 
 /// The service name every entry is filed under, so `logout` finds what `login` wrote and a
 /// user can recognise the entries in their platform's keychain UI.
@@ -67,6 +90,15 @@ impl std::fmt::Display for CredentialError {
 
 /// Where credentials live. See the module docs for why the seam is here.
 pub trait CredentialStore {
+    /// Store `credential` for `account`, replacing any existing entry.
+    ///
+    /// # Errors
+    ///
+    /// [`CredentialError::Backend`] when the platform keychain refuses. A login MUST fail
+    /// on that: reporting success would tell the user they are signed in on a machine that
+    /// has nothing stored, and the next command would fail for an unrelated-looking reason.
+    fn store(&self, account: &str, credential: &StoredCredential) -> Result<(), CredentialError>;
+
     /// Remove the credential for `account`. Removing an absent one SUCCEEDS.
     ///
     /// Idempotent on purpose: `logout` must leave the machine in a known state from ANY
@@ -85,6 +117,15 @@ pub trait CredentialStore {
 pub struct KeyringStore;
 
 impl CredentialStore for KeyringStore {
+    fn store(&self, account: &str, credential: &StoredCredential) -> Result<(), CredentialError> {
+        let encoded = serde_json::to_string(credential)
+            .map_err(|error| CredentialError::Backend(error.to_string()))?;
+        keyring::Entry::new(SERVICE, account)
+            .map_err(|error| CredentialError::Backend(error.to_string()))?
+            .set_password(&encoded)
+            .map_err(|error| CredentialError::Backend(error.to_string()))
+    }
+
     fn delete(&self, account: &str) -> Result<(), CredentialError> {
         let entry = keyring::Entry::new(SERVICE, account)
             .map_err(|error| CredentialError::Backend(error.to_string()))?;
@@ -99,15 +140,16 @@ impl CredentialStore for KeyringStore {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::collections::BTreeSet;
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
-    use super::{CredentialError, CredentialStore};
+    use super::{CredentialError, CredentialStore, StoredCredential};
 
-    /// An in-memory store recording which accounts hold a credential.
+    /// An in-memory store holding what was written, so a test can assert the CONTENT and
+    /// not merely the presence of a credential.
     #[derive(Default)]
     pub(crate) struct MemoryStore {
-        accounts: Mutex<BTreeSet<String>>,
+        accounts: Mutex<BTreeMap<String, StoredCredential>>,
     }
 
     impl MemoryStore {
@@ -116,7 +158,7 @@ pub(crate) mod testing {
             self.accounts
                 .lock()
                 .expect("credential store mutex")
-                .insert(account.to_owned());
+                .insert(account.to_owned(), sample());
         }
 
         /// Whether `account` still holds one.
@@ -124,11 +166,42 @@ pub(crate) mod testing {
             self.accounts
                 .lock()
                 .expect("credential store mutex")
-                .contains(account)
+                .contains_key(account)
+        }
+
+        /// The stored expiry, so the derived instant is assertable.
+        pub(crate) fn expiry_of(&self, account: &str) -> Option<i64> {
+            self.accounts
+                .lock()
+                .expect("credential store mutex")
+                .get(account)
+                .map(|credential| credential.expires_at_unix_secs)
+        }
+    }
+
+    /// A filler credential for `seed`.
+    fn sample() -> StoredCredential {
+        StoredCredential {
+            access_token: "seeded".to_owned(),
+            refresh_token: Some("seeded-refresh".to_owned()),
+            expires_at_unix_secs: 0,
+            issuer: "https://issuer.example.test".to_owned(),
         }
     }
 
     impl CredentialStore for MemoryStore {
+        fn store(
+            &self,
+            account: &str,
+            credential: &StoredCredential,
+        ) -> Result<(), CredentialError> {
+            self.accounts
+                .lock()
+                .expect("credential store mutex")
+                .insert(account.to_owned(), credential.clone());
+            Ok(())
+        }
+
         fn delete(&self, account: &str) -> Result<(), CredentialError> {
             self.accounts
                 .lock()
@@ -142,6 +215,10 @@ pub(crate) mod testing {
     pub(crate) struct RefusingStore;
 
     impl CredentialStore for RefusingStore {
+        fn store(&self, _: &str, _: &StoredCredential) -> Result<(), CredentialError> {
+            Err(CredentialError::Backend("refused".to_owned()))
+        }
+
         fn delete(&self, _account: &str) -> Result<(), CredentialError> {
             Err(CredentialError::Backend("refused".to_owned()))
         }
