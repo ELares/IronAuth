@@ -100,6 +100,9 @@ mod loopback_flow;
 /// a trait seam so the command's logic is testable on a runner that has no keychain.
 mod credentials;
 
+/// `ironauth dev`: the local emulator (issue #121).
+mod dev;
+
 /// `ironauth login`: the RFC 8628 device flow (issue #120).
 mod login;
 
@@ -144,6 +147,9 @@ fn main() -> ExitCode {
         // Sign in to a deployment (issue #120). The device flow: it needs no listener, no
         // browser on this machine, and no open port, so it is the flow that works on the
         // headless boxes and over the SSH sessions where a CLI login most often happens.
+        // The local emulator (issue #121): the REAL server on loopback, with deterministic
+        // secrets and a throwaway database, refusing to run anywhere it could be reached.
+        Some("dev") => dev_command(&mut args),
         Some("login") => login(&mut args),
         Some("logout") => logout(&mut args),
         Some("--version" | "-V" | "version") => {
@@ -4274,6 +4280,66 @@ fn print_probe_report(report: &ironauth_oidc::ProbeReport) {
 /// Drives the RFC 8628 device flow and stores the result in the platform keychain. The
 /// loop itself lives in `login.rs` over injected endpoints, so it is tested without a
 /// network; this function is the production wiring of those endpoints.
+/// `ironauth dev [--bind ADDR]`: run the emulator.
+///
+/// Prepares the environment and hands off to the SAME `serve` path production uses, rather
+/// than carrying a second boot sequence. A second one would drift, and the drift would be
+/// invisible precisely because dev is where nobody looks for a production difference.
+fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut bind = "127.0.0.1:8080".to_owned();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--bind" => {
+                let Some(value) = args.next() else {
+                    eprintln!("ironauth dev: --bind needs a value");
+                    return ExitCode::FAILURE;
+                };
+                bind = value;
+            }
+            other => {
+                eprintln!("ironauth dev: unknown argument '{other}'");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // BEFORE anything is started. The guard exists because dev mode's deterministic secrets
+    // are safe only on loopback, so the check belongs ahead of every side effect.
+    if let Err(refusal) = dev::guard_loopback_only(&bind) {
+        eprintln!("ironauth dev: {refusal}");
+        return ExitCode::FAILURE;
+    }
+
+    // The throwaway cluster is not automated yet; an existing DATABASE_URL is used when the
+    // developer has one. The message names what to install and both escape hatches rather
+    // than failing with something that reads like an IronAuth fault.
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("ironauth dev: {}", dev::missing_postgres_message());
+        return ExitCode::FAILURE;
+    };
+
+    let generated = dev::dev_config_toml(&database_url, &bind);
+    let dir = std::env::temp_dir().join("ironauth-dev");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("ironauth dev: cannot create {}: {error}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let config_path = dir.join("ironauth-dev.toml");
+    if let Err(error) = std::fs::write(&config_path, generated) {
+        eprintln!(
+            "ironauth dev: cannot write {}: {error}",
+            config_path.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    print!("{}", dev::banner(&bind));
+
+    // The real boot path, with the generated config.
+    let mut serve_args = vec!["--config".to_owned(), config_path.display().to_string()].into_iter();
+    serve(&mut serve_args)
+}
+
 /// The parsed `ironauth login` arguments.
 struct LoginArgs {
     issuer: String,
@@ -4629,6 +4695,7 @@ fn print_help() {
     println!("  ironauth hash-probe [--config PATH] [--memory-budget KIB] [--json]");
     println!("                                   Measure Argon2id on this host and");
     println!("                                   recommend parameters (issue #62)");
+    println!("  ironauth dev [--bind ADDR]      Run the local emulator (loopback only)");
     println!("  ironauth login --issuer URL --client-id ID [--account NAME]");
     println!("                                   Sign in via the RFC 8628 device flow");
     println!("  ironauth logout [--account NAME] Remove stored credentials for a");

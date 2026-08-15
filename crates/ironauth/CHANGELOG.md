@@ -6,6 +6,39 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`ironauth dev`: the first slice of the local emulator (issue #121).** The real server on
+  loopback, with a generated dev configuration and a guard that refuses to run anywhere it
+  could be reached from outside the machine.
+
+  - **The storage fork is settled by policy, not preference.** The issue asks for "embedded or
+    lightweight storage requiring no external services", and two readings of that were already
+    ruled out here. Embedding a database is FORBIDDEN: `docs/design/TENANCY.md` records that
+    the only maintained pure-Rust embedded-Postgres crate pulls licences outside the permissive
+    allowlist, which the supply-chain policy forbids and `cargo deny check licenses` enforces.
+    A substitute dev store contradicts this issue's own requirement to boot "the real server
+    binary (not a mock)": dev and CI would never exercise row-level security, so the emulator
+    would be green on exactly the class of bug it exists to catch. A disposable cluster is what
+    remains, and `scripts/with-test-db.sh` already proves the mechanism.
+
+  - **The guard is the bind address, and that coupling is deliberate** (criterion 6). Dev
+    mode's value comes from deterministic secrets and seeded identities, and those are exactly
+    what make it catastrophic to expose. Gating on the bind means the unsafe combination cannot
+    be assembled by setting one flag and forgetting another. A HOSTNAME is refused even when it
+    would resolve to loopback: `localhost` resolves to `::1` on some hosts and `127.0.0.1` on
+    others, and to whatever `/etc/hosts` says on a host somebody has edited, so a guard that
+    trusts a name is one that can be talked out of its answer.
+
+  - **It hands off to the SAME `serve` path production uses** rather than carrying a second
+    boot sequence, which would drift, and drift invisibly, because dev is where nobody looks
+    for a production difference.
+
+  - **Scope, stated rather than implied.** The cluster lifecycle is not automated yet;
+    `DATABASE_URL` is used when the developer already has one, and the error names what to
+    install plus both escape hatches. Nothing in the module is dead: a binary-search helper
+    written ahead of that automation was REMOVED rather than kept behind an `allow(dead_code)`,
+    which is the shape three modules on #120 had to be dug out of.
+
+
 - **The RFC 8252 loopback flow, and the end of #120's dormancy.** `ironauth login` now selects
   between loopback and device, and every module this issue shipped has a caller.
 
