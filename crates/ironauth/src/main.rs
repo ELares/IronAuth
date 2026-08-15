@@ -90,6 +90,9 @@ mod device_login;
 /// whenever a browser can be opened and the device flow is the fallback.
 mod login_flow;
 
+/// Building the loopback redirect URI for `ironauth login` (issue #120), per RFC 8252 7.3.
+mod loopback;
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
