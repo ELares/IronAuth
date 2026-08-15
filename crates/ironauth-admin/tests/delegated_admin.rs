@@ -1606,3 +1606,54 @@ async fn the_authzen_endpoints_demand_read_and_never_answer_unauthenticated() {
          every subject in the environment: {body}"
     );
 }
+
+/// The event feed and the usage export are `management.read`, PROVEN rather than declared
+/// (issue #107).
+///
+/// Classification is a table entry; this is the test that makes it true. A credential
+/// holding a different permission must be refused, and one holding `management.read` must
+/// be allowed, because only asserting the refusal would also pass if the endpoints refused
+/// everyone, and only asserting the allow would pass if they refused no one.
+#[tokio::test]
+async fn read_is_required_and_sufficient_for_the_event_feed_and_usage_export() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-feed").await;
+
+    let feed = format!("/v1/tenants/{tenant}/environments/{environment}/events");
+    let usage = format!("/v1/tenants/{tenant}/environments/{environment}/usage");
+
+    // A credential restricted to a DIFFERENT permission. Not "no permissions": an empty set
+    // could be refused by some earlier check and prove nothing about which permission these
+    // operations actually require.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+
+    for path in [&feed, &usage] {
+        let (status, _, body) = h.get_as(path, &secret).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a write_config credential must not read {path}: {body}"
+        );
+    }
+
+    // The same credential, now holding read, must be allowed. Without this half the test
+    // would pass against endpoints that refused everybody.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    for path in [&feed, &usage] {
+        let (status, _, body) = h.get_as(path, &secret).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a read credential must be allowed to read {path}: {body}"
+        );
+    }
+}

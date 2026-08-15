@@ -142,6 +142,9 @@ pub async fn read_event_feed(
     Query(query): Query<FeedQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`. The feed
+    // replays what already happened, so it grants sight of nothing a reader could not
+    // already list.
     principal.require_permission(ManagementPermission::Read)?;
 
     // A malformed cursor is refused, never silently read as "from the beginning". Starting

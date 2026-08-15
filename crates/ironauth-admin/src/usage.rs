@@ -121,6 +121,8 @@ pub async fn export_usage(
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`. The export
+    // folds the same feed, so it is the same authority over the same facts.
     principal.require_permission(ManagementPermission::Read)?;
 
     let (tally, truncated) =

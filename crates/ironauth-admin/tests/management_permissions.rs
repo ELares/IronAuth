@@ -133,6 +133,11 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("createMembership", ManagementPermission::WriteOrganizations),
     ("deleteMembership", ManagementPermission::WriteOrganizations),
     ("listMemberships", ManagementPermission::Read),
+    // The ordered event feed and the usage export (issue #107). Both are environment-scoped
+    // READS: the feed replays what already happened and the export folds it, so neither
+    // grants sight of anything a `management.read` caller could not already list.
+    ("readEventFeed", ManagementPermission::Read),
+    ("exportUsage", ManagementPermission::Read),
     ("createPermission", ManagementPermission::WriteOrganizations),
     ("updatePermission", ManagementPermission::WriteOrganizations),
     ("deletePermission", ManagementPermission::WriteOrganizations),
@@ -536,6 +541,11 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
 /// the false coverage claim this list exists to prevent. Hand-maintained, and only for
 /// operations somebody actually checked.
 const PERMISSION_PROVEN: &[&str] = &[
+    // Proven in `read_is_required_and_sufficient_for_the_event_feed_and_usage_export`, in
+    // BOTH directions: a `write_config` credential is refused and a `read` one is allowed,
+    // so neither a blanket refusal nor a missing gate would pass it.
+    "readEventFeed",
+    "exportUsage",
     // Proven in `a_read_only_credential_can_list_api_keys_and_cannot_mint_or_kill_one`,
     // verified by mutation: downgrading all three to `Read` fails that test and passes every
     // other pin.
@@ -607,7 +617,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        163,
+        165,
         "the classified set changed size; update the unproven count below with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -632,6 +642,8 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     ("impersonation.rs", include_str!("../src/impersonation.rs")),
     ("authzen.rs", include_str!("../src/authzen.rs")),
     ("log_streams.rs", include_str!("../src/log_streams.rs")),
+    ("event_feed.rs", include_str!("../src/event_feed.rs")),
+    ("usage.rs", include_str!("../src/usage.rs")),
     ("users.rs", include_str!("../src/users.rs")),
     ("organizations.rs", include_str!("../src/organizations.rs")),
     ("memberships.rs", include_str!("../src/memberships.rs")),
