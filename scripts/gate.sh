@@ -194,6 +194,8 @@ python3 scripts/openapi-changelog.py --self-test
 python3 scripts/sdk-contract.py --check
 # The events-vs-webhooks guidance must still match the code it quotes (issue #107).
 python3 scripts/events-vs-webhooks.py --check
+# Metering must stay off the login and token-issuance paths (issue #107).
+scripts/metering-off-hot-path.sh
 
 echo "==> fuzz matrix freshness (every registered fuzz target has a CI matrix row)"
 scripts/fuzz-matrix-freshness.sh
