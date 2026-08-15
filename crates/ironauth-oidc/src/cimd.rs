@@ -534,6 +534,54 @@ pub async fn resolve_cimd_client(
     })
 }
 
+/// Whether a response's `Content-Type` is a JSON document.
+///
+/// The draft requires a content-type check, and the reason is worth stating: without one,
+/// a `client_id` URL pointed at an HTML page, an image, or an arbitrary blob is still
+/// fetched in full and only rejected once the JSON parser gives up. Checking the header
+/// refuses the obvious cases at the cheapest point, and refusing a document that arrives
+/// with NO content-type is deliberate too, since a server that will not say what it sent
+/// is not one whose bytes should define a client.
+///
+/// `application/json` and the structured suffix `+json` are accepted; parameters such as
+/// `; charset=utf-8` are ignored, because a charset does not change what the body IS.
+#[must_use]
+pub fn is_json_document(content_type: Option<&str>) -> bool {
+    let Some(value) = content_type else {
+        return false;
+    };
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json" || essence.ends_with("+json")
+}
+
+/// The `max-age` an origin declared in `Cache-Control`, if it declared a usable one.
+///
+/// An INPUT to [`CimdTtlBounds::clamp`], never a decision: see that type for why the
+/// origin does not get to choose how long it is trusted. `no-store` and `no-cache` resolve
+/// to `Some(0)` rather than `None`, because an origin that asked not to be cached HAS
+/// spoken, and the floor is what answers it; treating that as silence would be reading the
+/// opposite of what the header says.
+#[must_use]
+pub fn declared_max_age(cache_control: Option<&str>) -> Option<Duration> {
+    let value = cache_control?.to_ascii_lowercase();
+    let mut directives = value.split(',').map(str::trim);
+    if directives
+        .clone()
+        .any(|d| d == "no-store" || d == "no-cache")
+    {
+        return Some(Duration::ZERO);
+    }
+    let raw = directives.find_map(|d| d.strip_prefix("max-age="))?;
+    // A malformed or negative max-age is NOT zero. It is nothing: the origin tried to say
+    // something and failed, which is silence, and silence resolves to the floor anyway.
+    raw.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1046,6 +1094,66 @@ mod tests {
         now: SystemTime,
     ) -> Result<ResolvedCimdClient, CimdResolveError> {
         resolve_cimd_client(GOOD, source, cache, policy(allow, deny), now).await
+    }
+
+    #[test]
+    fn a_json_content_type_is_accepted_with_or_without_parameters() {
+        assert!(is_json_document(Some("application/json")));
+        assert!(is_json_document(Some("application/json; charset=utf-8")));
+        assert!(is_json_document(Some("  APPLICATION/JSON  ")));
+        // The structured suffix: the draft's document is JSON however it is labelled.
+        assert!(is_json_document(Some("application/client-metadata+json")));
+    }
+
+    #[test]
+    fn a_non_json_or_absent_content_type_is_refused() {
+        assert!(!is_json_document(Some("text/html")));
+        assert!(!is_json_document(Some("application/octet-stream")));
+        // A server that will not say what it sent is not one whose bytes define a client.
+        assert!(!is_json_document(None));
+        // Not a suffix match on the essence alone: "json/evil" is not JSON.
+        assert!(!is_json_document(Some("json/evil")));
+        // The parameter must not be able to smuggle acceptance.
+        assert!(!is_json_document(Some("text/html; x=application/json")));
+    }
+
+    #[test]
+    fn a_declared_max_age_is_read_from_cache_control() {
+        assert_eq!(
+            declared_max_age(Some("max-age=600")),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            declared_max_age(Some("public, max-age=600, must-revalidate")),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            declared_max_age(Some("MAX-AGE=42")),
+            Some(Duration::from_secs(42))
+        );
+    }
+
+    #[test]
+    fn an_origin_refusing_caching_is_heard_as_zero_not_as_silence() {
+        // no-store is the origin SPEAKING. Reading it as None would resolve it to the
+        // floor by the "said nothing" rule, which is the same answer for the wrong reason,
+        // and would stop being the same answer the moment the floor rule changed.
+        assert_eq!(declared_max_age(Some("no-store")), Some(Duration::ZERO));
+        assert_eq!(
+            declared_max_age(Some("no-cache, max-age=99999")),
+            Some(Duration::ZERO),
+            "a refusal to cache outranks a long max-age in the same header"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_unparseable_max_age_is_silence() {
+        assert_eq!(declared_max_age(None), None);
+        assert_eq!(declared_max_age(Some("public")), None);
+        assert_eq!(declared_max_age(Some("max-age=")), None);
+        assert_eq!(declared_max_age(Some("max-age=abc")), None);
+        // Negative is not zero: the origin tried to say something and failed.
+        assert_eq!(declared_max_age(Some("max-age=-5")), None);
     }
 
     #[tokio::test]
