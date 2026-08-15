@@ -362,6 +362,8 @@ jobs:
         run: scripts/journey-replay.sh
       - name: openapi freshness (served management spec vs committed artifact)
         run: scripts/openapi-check.sh
+      - name: OpenAPI contract is generator-ready (issue #122)
+        run: scripts/openapi-lint.sh
       - name: governance files present
         # The license and covenant files are trust infrastructure; this lint
         # ensures they cannot be silently removed or renamed.

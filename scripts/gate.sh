@@ -186,6 +186,8 @@ git diff --exit-code docs/flow-golden.json
 
 echo "==> openapi freshness (served management spec vs committed artifact)"
 scripts/openapi-check.sh
+# Drift says the spec is CURRENT; this says it is generator-ready (issue #122).
+scripts/openapi-lint.sh
 
 echo "==> fuzz matrix freshness (every registered fuzz target has a CI matrix row)"
 scripts/fuzz-matrix-freshness.sh
