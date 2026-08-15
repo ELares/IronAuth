@@ -366,6 +366,11 @@ jobs:
         run: scripts/openapi-lint.sh
       - name: OpenAPI changelog generator self-test (issue #122)
         run: python3 scripts/openapi-changelog.py --self-test
+      # The other half of #122 criterion 5: the self-test proves the generator, this runs it
+      # against the REAL diff so the API-surface change lands in the step summary beside the
+      # code review. Reports a breaking change; deliberately never fails on one.
+      - name: OpenAPI changelog for this change (issue #122)
+        run: scripts/openapi-changelog-ci.sh "origin/${{ github.base_ref || 'main' }}"
       - name: SDK wire-format contract freshness (issue #122)
         run: python3 scripts/sdk-contract.py --check
       - name: Events-vs-webhooks guidance freshness (issue #107)
