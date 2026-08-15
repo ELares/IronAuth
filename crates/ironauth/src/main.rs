@@ -2131,7 +2131,7 @@ fn resolve_outbox_backbone(outbox: &OutboxConfig) -> Arc<dyn OutboxBackbone> {
         match ironauth_store::outbox_ironbus::IronBusBackbone::connect(addr) {
             Ok(backbone) => {
                 tracing::info!(%addr, "outbox wake-up backbone: IronBus");
-                return Arc::new(backbone);
+                Arc::new(backbone)
             }
             Err(error) => {
                 tracing::warn!(
@@ -2139,7 +2139,7 @@ fn resolve_outbox_backbone(outbox: &OutboxConfig) -> Arc<dyn OutboxBackbone> {
                     %error,
                     "outbox IronBus backbone unreachable; draining on the poll interval"
                 );
-                return Arc::new(PollOnly);
+                Arc::new(PollOnly)
             }
         }
     }

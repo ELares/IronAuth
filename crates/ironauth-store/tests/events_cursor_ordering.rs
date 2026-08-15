@@ -482,7 +482,7 @@ fn appender_lock_key(tenant: &str, environment: &str) -> i64 {
     tenant.hash(&mut hasher);
     environment.hash(&mut hasher);
     // Postgres advisory locks take a signed 64-bit key.
-    hasher.finish() as i64
+    i64::from_ne_bytes(hasher.finish().to_ne_bytes())
 }
 
 #[tokio::test]

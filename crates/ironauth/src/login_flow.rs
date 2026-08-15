@@ -23,6 +23,13 @@
 //! The signals are taken as data rather than read from the process here, so every rule
 //! below is a table entry rather than something that only reproduces on the right host.
 
+// The whole module is reachable only from `ironauth login`, which has not landed yet, so
+// every item here is dead until it does. Allowed at the MODULE level with the reason rather
+// than per item: per-item allows have to be removed one at a time when the caller arrives,
+// which is exactly when nobody is looking for them. `dormant-module-scan.sh` records the
+// same fact and both retire together.
+#![allow(dead_code)]
+
 /// Which flow `ironauth login` should drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginFlow {
