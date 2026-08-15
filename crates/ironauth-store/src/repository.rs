@@ -20456,6 +20456,72 @@ impl OutboxRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence fault.
+    /// Read the ordered event feed after `after_sequence`, for a cursor consumer
+    /// (issue #107).
+    ///
+    /// # Why this is not `WHERE sequence > $n`
+    ///
+    /// `sequence` is `GENERATED ALWAYS AS IDENTITY`, so it is assigned at INSERT while
+    /// visibility happens at COMMIT, and Postgres holds no lock across that gap. Two
+    /// overlapping writers can commit in the opposite order to their sequences, which the
+    /// outbox's own documentation already says about the drain.
+    ///
+    /// The drain survives it because it CLAIMS: a message that appears late is still
+    /// claimable, so out-of-order commit costs ordering and never delivery. A cursor
+    /// consumer has no such protection. It advances a high-water mark, and an event that
+    /// becomes visible below that mark is never returned to it again. That is a permanent
+    /// silent gap, and it is invisible in testing because it needs two overlapping writers
+    /// and an unlucky interleaving.
+    ///
+    /// So the read is gated on a VISIBILITY WATERMARK.
+    /// `pg_snapshot_xmin(pg_current_snapshot())` is the oldest transaction id still
+    /// running; a row whose `xmin` is below it is visible to everyone, and nothing can
+    /// ever commit beneath it afterwards. Serving only those rows means a cursor cannot
+    /// advance past a point another writer could still fill in.
+    ///
+    /// # What this costs, measured rather than estimated
+    ///
+    /// `pg_snapshot_xmin` is CLUSTER-wide. It does not know which table, tenant, or even
+    /// DATABASE a transaction touches, so a long-running query with nothing to do with
+    /// events holds this feed back exactly as an overlapping writer would. That is
+    /// head-of-line blocking sourced from an unrelated workload, and it is the reason a
+    /// commit-ordered appender is worth weighing against this rather than assuming the
+    /// watermark is free.
+    ///
+    /// This was not predicted, it was observed: the tests began failing once a third one
+    /// was added and its open transaction held the watermark down from another database.
+    /// `an_unrelated_open_transaction_stalls_the_whole_feed` pins it deliberately now.
+    ///
+    /// `events_cursor_ordering.rs` also reproduces the skip this prevents, rather than
+    /// asserting that it is possible.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn events_after(
+        &self,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<OutboxMessage>, StoreError> {
+        let scope = self.scope;
+        let sql = format!(
+            "SELECT {OUTBOX_COLUMNS} FROM outbox_messages \
+             WHERE tenant_id = $1 AND environment_id = $2 AND sequence > $3 \
+             AND xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint \
+             ORDER BY sequence LIMIT $4"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(after_sequence)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(outbox_message_from_row).collect())
+    }
+
     pub async fn pending(
         &self,
         consumer: &str,
