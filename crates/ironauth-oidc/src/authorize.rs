@@ -30,15 +30,17 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use ironauth_config::QuarantineConfig;
 use ironauth_store::{
-    AuthorizationCodeId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId, GrantId,
-    GrantedConsent, IssueCode, OrganizationId, PushedRequestId, Scope, SessionId, StoreError,
-    StoredClientId, UserId, admin_grant_covers_scope, redirect_uri_is_registrable,
+    AuthorizationCodeId, CimdClientId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId,
+    GrantId, GrantedConsent, IssueCode, OrganizationId, PushedRequestId, Scope, SessionId,
+    StoreError, StoredClientId, UserId, admin_grant_covers_scope, redirect_uri_is_registrable,
     redirect_uri_matches,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::authn;
 use crate::broker_overlay;
+use crate::cimd::CimdTrust;
 use crate::claims_request::{ClaimsRequest, ClaimsRequestError};
 use crate::client_auth::ClientAuthMethod;
 use crate::consent::ConsentMode;
@@ -354,6 +356,19 @@ async fn handle(
 pub(crate) enum ResolvedClient<'a> {
     /// A client registered in this deployment.
     Registered(&'a ClientRecord),
+    /// A client that described itself at a URL (issue #128).
+    Cimd(&'a CimdClient),
+}
+
+/// A CIMD client: the identity derived from its URL, the validated document, and what the
+/// operator has decided about its domain.
+pub(crate) struct CimdClient {
+    /// The identifier derived from the URL under this scope. A `cimc_`, never a `cli_`.
+    pub id: CimdClientId,
+    /// The validated metadata document.
+    pub document: Value,
+    /// What the deployment decided about the document's domain.
+    pub trust: CimdTrust,
 }
 
 impl ResolvedClient<'_> {
@@ -361,6 +376,7 @@ impl ResolvedClient<'_> {
     pub(crate) fn scope(&self) -> Scope {
         match self {
             Self::Registered(record) => record.id.scope(),
+            Self::Cimd(client) => client.id.scope(),
         }
     }
 
@@ -374,6 +390,9 @@ impl ResolvedClient<'_> {
     pub(crate) fn auth_method(&self) -> &str {
         match self {
             Self::Registered(record) => &record.auth_method,
+            // Never a shared secret: a secret agreed with a party nobody registered has
+            // nobody at the other end. `none` also makes PKCE mandatory (RFC 9700 2.1.1).
+            Self::Cimd(_) => "none",
         }
     }
 
@@ -381,6 +400,7 @@ impl ResolvedClient<'_> {
     pub(crate) fn require_auth_time(&self) -> bool {
         match self {
             Self::Registered(record) => record.require_auth_time,
+            Self::Cimd(_) => false,
         }
     }
 
@@ -388,6 +408,7 @@ impl ResolvedClient<'_> {
     pub(crate) fn require_pushed_authorization_requests(&self) -> bool {
         match self {
             Self::Registered(record) => record.require_pushed_authorization_requests,
+            Self::Cimd(_) => false,
         }
     }
 
@@ -395,6 +416,7 @@ impl ResolvedClient<'_> {
     pub(crate) fn consent_mode(&self) -> &str {
         match self {
             Self::Registered(record) => &record.consent_mode,
+            Self::Cimd(_) => "always",
         }
     }
 
@@ -407,6 +429,8 @@ impl ResolvedClient<'_> {
     pub(crate) fn skip_consent(&self) -> bool {
         match self {
             Self::Registered(record) => record.skip_consent,
+            // The issue states it directly: an unknown domain gets consent always on.
+            Self::Cimd(_) => false,
         }
     }
 
@@ -414,6 +438,7 @@ impl ResolvedClient<'_> {
     pub(crate) fn store_skipped_consent(&self) -> bool {
         match self {
             Self::Registered(record) => record.store_skipped_consent,
+            Self::Cimd(_) => false,
         }
     }
 
@@ -425,6 +450,8 @@ impl ResolvedClient<'_> {
     pub(crate) fn quarantined(&self) -> bool {
         match self {
             Self::Registered(record) => record.quarantined,
+            // Quarantined unless the operator's ALLOW list names the domain.
+            Self::Cimd(client) => client.trust.forces_consent(),
         }
     }
 
@@ -435,6 +462,8 @@ impl ResolvedClient<'_> {
     pub(crate) fn first_party(&self) -> bool {
         match self {
             Self::Registered(record) => record.first_party,
+            // Nobody vouched for a document that described itself.
+            Self::Cimd(_) => false,
         }
     }
 
@@ -446,6 +475,7 @@ impl ResolvedClient<'_> {
     pub(crate) fn step_up_acr(&self) -> Option<&str> {
         match self {
             Self::Registered(record) => record.step_up_acr.as_deref(),
+            Self::Cimd(_) => None,
         }
     }
 
@@ -454,6 +484,7 @@ impl ResolvedClient<'_> {
     pub(crate) fn step_up_max_age_secs(&self) -> Option<i64> {
         match self {
             Self::Registered(record) => record.step_up_max_age_secs,
+            Self::Cimd(_) => None,
         }
     }
 
@@ -462,6 +493,14 @@ impl ResolvedClient<'_> {
     pub(crate) fn redirect_uris(&self) -> Vec<&str> {
         match self {
             Self::Registered(record) => record.redirect_uris.iter().map(String::as_str).collect(),
+            // Attacker-chosen, which is why the document had to prove it names itself
+            // before we got here, and why an unlisted domain stays quarantined.
+            Self::Cimd(client) => client
+                .document
+                .get("redirect_uris")
+                .and_then(Value::as_array)
+                .map(|uris| uris.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default(),
         }
     }
 }
@@ -648,6 +687,106 @@ async fn consume_pushed_request(
     }
 }
 
+/// Which kind of client an authorization request named (issue #128).
+///
+/// One value rather than a pair of `Option`s, so "neither" is unrepresentable and the
+/// matches over it are total without an `unreachable!`.
+enum ClientIdentity {
+    /// A `cli_` identifier, which declares its own scope.
+    Registered(ClientId),
+    /// A URL, resolved to a document and a derived `cimc_`. Boxed because a `CimdClient`
+    /// carries a whole metadata document and the other variant is one identifier.
+    Cimd(Box<CimdClient>),
+}
+
+impl ClientIdentity {
+    /// The scope this request lives in.
+    fn scope(&self) -> Scope {
+        match self {
+            Self::Registered(client_id) => client_id.scope(),
+            Self::Cimd(client) => client.id.scope(),
+        }
+    }
+
+    /// The identifier as it will be stored and audited.
+    fn stored(&self) -> StoredClientId<'_> {
+        match self {
+            Self::Registered(client_id) => StoredClientId::Registered(client_id),
+            Self::Cimd(client) => StoredClientId::Cimd(&client.id),
+        }
+    }
+}
+
+/// Whether a `client_id` is SHAPED like a CIMD identifier rather than a registered one.
+///
+/// A shape test and nothing more. It decides which branch runs, not whether the URL is
+/// acceptable; every actual rule (https, no fragment, no userinfo, no special-use host)
+/// lives in `validate_client_id_url` and runs after. Duplicating any of it here would put
+/// the same rule in two places, and the copy that drifts is the one that decides.
+fn looks_like_cimd_client_id(client_id: &str) -> bool {
+    client_id.starts_with("https://") || client_id.starts_with("http://")
+}
+
+/// Resolve a URL `client_id` into a CIMD client (issue #128).
+///
+/// Resolution runs through the SAME `resolve_cimd_client` the unit tests drive, so the
+/// ordering it guarantees holds on this path too: the URL's shape is checked before
+/// anything is dereferenced, the operator's trust decision is taken BEFORE the fetch so a
+/// deny-listed domain never gets the use of the server's network position, the cache is
+/// consulted before the network, and only a document that passed validation is cached.
+///
+/// Every failure is the SAME opaque page an unknown client gets. A CIMD failure is rich
+/// diagnostically and must stay silent on the wire: telling an unauthenticated caller
+/// whether a domain is deny-listed, whether a document parsed, or whether a fetch timed
+/// out turns the authorization endpoint into a probe for the operator's policy and for
+/// what the deployment can reach.
+async fn resolve_cimd(
+    state: &OidcState,
+    scope: Scope,
+    client_id_url: &str,
+    arrived_through_par: bool,
+) -> Result<CimdClient, AuthorizeError> {
+    let unknown = || AuthorizeError::page("the client_id is malformed or unknown");
+
+    // PAR and CIMD are refused together rather than half-supported: a pushed request is
+    // bound to its pushing client by a `par_` reference, and nothing yet binds one to a
+    // client with no registration.
+    //
+    // This is DEFENCE IN DEPTH and is deliberately recorded as unmeasured. A mutation
+    // sweep removed it and no test failed, and the reason is that the pair looks
+    // unreachable today: `/par` authenticates the pushing client, and a CIMD client has no
+    // registration to authenticate as, so `pushed` should never be `Some` alongside a URL
+    // client_id. Proving that properly needs a stored, client-bound `par_` row, which is
+    // the same fixture the scope-routed route still owes (see #782). Until that exists,
+    // the honest statement is that this costs one branch and closes the hole if the
+    // reachability argument ever stops holding, NOT that a test pins it.
+    if arrived_through_par {
+        return Err(unknown());
+    }
+
+    let Some(source) = state.cimd_source() else {
+        // Armed with no source installed. Refuse rather than fall back to anything that
+        // could reach the network outside the hardened fetcher.
+        return Err(unknown());
+    };
+
+    let resolved = crate::cimd::resolve_cimd_client(
+        client_id_url,
+        source,
+        state.cimd_cache(),
+        state.cimd_policy(),
+        state.env().clock().now_utc(),
+    )
+    .await
+    .map_err(|_| unknown())?;
+
+    Ok(CimdClient {
+        id: CimdClientId::derive(&scope, client_id_url.as_bytes()),
+        document: resolved.document,
+        trust: resolved.trust,
+    })
+}
+
 // A linear, numbered validation pipeline (client, require-PAR gate, shared
 // request validation, gate, acr, issue): each step is short but heavily commented
 // for the security rationale, so the whole reads over the line budget. Kept as one
@@ -668,9 +807,28 @@ async fn issue_code(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AuthorizeError::page("the client_id parameter is required"))?;
-    let client_id = ClientId::parse_declared_scope(client_id_raw)
-        .map_err(|_| AuthorizeError::page("the client_id is malformed or unknown"))?;
-    let scope = client_id.scope();
+    // 1a. A URL client_id is a CIMD client (issue #128), and it can only be one on the
+    //     scope-routed mount: a URL declares no (tenant, environment), and that mount is
+    //     the only place a scope arrives from somewhere the requester cannot choose. With
+    //     the feature off, or at the deployment root, a URL falls through to the parse
+    //     below and is refused as an unknown client, having dereferenced nothing.
+    // ONE value rather than two Options, so "neither" cannot be represented and the
+    // matches below need no unreachable arm. A panic here would be a panic in the most
+    // security-sensitive function in the crate, justified only by a reader checking that
+    // two Options are never both None; making it unrepresentable is cheaper than that
+    // proof and does not decay when someone edits the branch.
+    let identity = match (state.cimd_enabled(), path_scope) {
+        (true, Some(path_scope)) if looks_like_cimd_client_id(client_id_raw) => {
+            ClientIdentity::Cimd(Box::new(
+                resolve_cimd(state, path_scope, client_id_raw, pushed.is_some()).await?,
+            ))
+        }
+        _ => ClientIdentity::Registered(
+            ClientId::parse_declared_scope(client_id_raw)
+                .map_err(|_| AuthorizeError::page("the client_id is malformed or unknown"))?,
+        ),
+    };
+    let scope = identity.scope();
 
     // 1a. On the scope-routed mount (issue #128) the PATH decides the scope, and a
     //     client_id that declares a different one is refused rather than followed.
@@ -686,31 +844,53 @@ async fn issue_code(
         }
     }
 
-    // 2. The client must exist in its declared scope. This lookup is BEFORE any
-    //    redirect, so an unknown client renders a page and never redirects. A
-    //    store failure here also fails closed to a page (we cannot safely redirect
-    //    without a validated client). The record carries the client's
-    //    `require_auth_time` registration, which (with `max_age`) decides whether
-    //    the ID token must carry `auth_time` (issue #14), and its
-    //    `require_pushed_authorization_requests` flag (issue #27).
-    let record = match state.store().scoped(scope).clients().get(&client_id).await {
-        Ok(record) => record,
-        Err(StoreError::NotFound) => {
-            return Err(AuthorizeError::page(
-                "the client_id is malformed or unknown",
-            ));
+    // 2. A REGISTERED client must exist in its declared scope. This lookup is BEFORE any
+    //    redirect, so an unknown client renders a page and never redirects. A store
+    //    failure here also fails closed to a page (we cannot safely redirect without a
+    //    validated client). The record carries the client's `require_auth_time`
+    //    registration, which (with `max_age`) decides whether the ID token must carry
+    //    `auth_time` (issue #14), and its `require_pushed_authorization_requests` flag
+    //    (issue #27).
+    //
+    //    A CIMD client has no row to find. Its document IS its registration, and it was
+    //    already fetched and validated above, so this lookup is skipped rather than
+    //    expected to fail.
+    let record = match &identity {
+        ClientIdentity::Registered(client_id) => {
+            match state.store().scoped(scope).clients().get(client_id).await {
+                Ok(record) => Some(record),
+                Err(StoreError::NotFound) => {
+                    return Err(AuthorizeError::page(
+                        "the client_id is malformed or unknown",
+                    ));
+                }
+                Err(_) => {
+                    return Err(AuthorizeError::page(
+                        "the authorization request could not be processed",
+                    ));
+                }
+            }
         }
-        Err(_) => {
+        ClientIdentity::Cimd(_) => None,
+    };
+
+    // The rest of the pipeline asks its questions through `ResolvedClient` rather than
+    // reaching into the record, so the CIMD branch (issue #128) answers them from its
+    // document. For a registered client every answer is the record's own, unchanged.
+    let client = match (&identity, &record) {
+        (ClientIdentity::Cimd(cimd), _) => ResolvedClient::Cimd(cimd),
+        (ClientIdentity::Registered(_), Some(record)) => ResolvedClient::Registered(record),
+        // A registered identity always produced a record above or returned early.
+        (ClientIdentity::Registered(_), None) => {
             return Err(AuthorizeError::page(
                 "the authorization request could not be processed",
             ));
         }
     };
 
-    // The rest of the pipeline asks its questions through `ResolvedClient` rather than
-    // reaching into the record, so the CIMD branch (issue #128) has somewhere to answer
-    // them from. For a registered client every answer is the record's own, unchanged.
-    let client = ResolvedClient::Registered(&record);
+    // The identifier as it will be STORED and audited. A CIMD client carries its `cimc_`
+    // here, so every row and every audit entry names it as what it is.
+    let stored = identity.stored();
 
     // 2a. Tenant/environment quota (issue #50). The quota is charged ONLY here, AFTER
     //     the client has been confirmed to exist in its declared scope, so a spend
@@ -822,19 +1002,14 @@ async fn issue_code(
     //     least one. Every violation is `invalid_target`, delivered through the
     //     negotiated mode (the redirect_uri is validated by now). This runs before the
     //     login/consent gate so a rejection never triggers an interaction.
-    validate_authorize_resources(
-        state,
-        scope,
-        StoredClientId::Registered(&client_id),
-        &params.resources,
-    )
-    .await
-    .map_err(|code| {
-        redirect_error(
-            code,
-            "the requested resource is invalid, unknown, or not allowed",
-        )
-    })?;
+    validate_authorize_resources(state, scope, stored, &params.resources)
+        .await
+        .map_err(|code| {
+            redirect_error(
+                code,
+                "the requested resource is invalid, unknown, or not allowed",
+            )
+        })?;
 
     // 6. Establish the authenticated subject and their consent, applying prompt and
     //    max_age. A missing session, missing consent, or a forced (re-)authentication
@@ -856,7 +1031,7 @@ async fn issue_code(
         state,
         headers,
         &client,
-        StoredClientId::Registered(&client_id),
+        stored,
         &params,
         effective_scope.as_deref(),
         redirect_uri,
@@ -1003,14 +1178,7 @@ async fn issue_code(
     //     round-trip never burns the pending request; the consume's audit row is
     //     written on the winning branch only.
     if let Some(context) = pushed {
-        if !consume_pushed_request(
-            state,
-            scope,
-            StoredClientId::Registered(&client_id),
-            context,
-        )
-        .await?
-        {
+        if !consume_pushed_request(state, scope, stored, context).await? {
             return Err(AuthorizeError::page(
                 "the request_uri is invalid, expired, or already used",
             ));
@@ -1026,18 +1194,7 @@ async fn issue_code(
     //      (hybrid only) `c_hash` of the issued code, never an access token;
     //    - `none`: issue nothing.
     let code = if response_type.issues_code() {
-        Some(
-            persist_code(
-                state,
-                scope,
-                StoredClientId::Registered(&client_id),
-                redirect_uri,
-                &iss,
-                mode,
-                &resolved,
-            )
-            .await?,
-        )
+        Some(persist_code(state, scope, stored, redirect_uri, &iss, mode, &resolved).await?)
     } else {
         None
     };
@@ -1045,7 +1202,7 @@ async fn issue_code(
         let minted = mint_front_channel_id_token(
             state,
             scope,
-            StoredClientId::Registered(&client_id),
+            stored,
             &iss,
             response_type,
             &resolved,
@@ -1072,7 +1229,7 @@ async fn issue_code(
         session_mgmt::authorization_session_state(
             state,
             &iss,
-            &client_id.to_string(),
+            &stored.to_string(),
             redirect_uri,
             &session_ref,
         )

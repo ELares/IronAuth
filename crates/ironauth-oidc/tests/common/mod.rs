@@ -1153,6 +1153,63 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the experimental CIMD surface (issue #128) for the harness scope and rebuild the
+    /// protocol router, installing `source` as where documents come from. Builds a fresh
+    /// state over the SAME store, env, and registry, exactly as the boot path would after
+    /// resolving the feature ladder.
+    pub fn enable_cimd(
+        &mut self,
+        source: Arc<dyn ironauth_oidc::cimd::CimdDocumentSource>,
+        allow: Vec<String>,
+        deny: Vec<String>,
+    ) {
+        self.install_cimd(source, allow, deny, true);
+    }
+
+    /// Install a CIMD source WITHOUT arming the feature, so a test can tell the
+    /// acknowledgment gate apart from a missing dependency.
+    pub fn install_cimd_source_unarmed(
+        &mut self,
+        source: Arc<dyn ironauth_oidc::cimd::CimdDocumentSource>,
+    ) {
+        self.install_cimd(source, Vec::new(), Vec::new(), false);
+    }
+
+    fn install_cimd(
+        &mut self,
+        source: Arc<dyn ironauth_oidc::cimd::CimdDocumentSource>,
+        allow: Vec<String>,
+        deny: Vec<String>,
+        armed: bool,
+    ) {
+        let config = OidcConfig {
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        };
+        let state = OidcState::new(
+            self.db.store().clone(),
+            self.env.clone(),
+            Arc::clone(&self.registry),
+            &config,
+            ISSUER_BASE,
+        )
+        .with_cimd_source(source, allow, deny)
+        .with_cimd_enabled(armed)
+        .with_third_party_admin_consent_required(false);
+        let issuer_state = IssuerState::new(Arc::clone(&self.registry), self.env.clone());
+        let discovery_state = DiscoveryState::new(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
+            DiscoveryCapabilities::from_config(&config),
+            Arc::clone(&self.registry),
+            self.env.clone(),
+        );
+        self.router = oidc_router(state.clone())
+            .merge(issuer_router(issuer_state))
+            .merge(discovery_router(discovery_state));
+        self.state = state;
+    }
+
     /// Arm the experimental third-party risk-signal ingestion surface (issue #82, PR 1) for
     /// the harness scope and rebuild the protocol router. Builds a fresh state over the SAME
     /// master-key-wired store, env, and registry, with the risk engine ENABLED and the given
