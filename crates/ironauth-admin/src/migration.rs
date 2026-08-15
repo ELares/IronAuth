@@ -182,9 +182,11 @@ pub struct VerifyCredentialResponse {
 pub struct VerifyProfile {
     /// The user's OIDC standard-claim document, or null when the user has none.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
     pub claims: Option<serde_json::Value>,
     /// The user's identity-traits document, or null when the user has none.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
     pub traits: Option<serde_json::Value>,
 }
 

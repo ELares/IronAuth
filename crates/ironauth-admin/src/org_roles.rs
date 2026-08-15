@@ -131,6 +131,7 @@ pub struct OrgRoleView {
     /// The mutable human-facing label.
     pub display_name: String,
     /// Free-form role metadata (the empty object when none was set).
+    #[schema(value_type = Object)]
     pub metadata: serde_json::Value,
     /// Whether this role is the organization's DEFAULT role (issue #98): the role
     /// every LIVE ACTIVE member of the organization holds without an assignment
@@ -182,6 +183,7 @@ pub struct CreateOrgRoleRequest {
     pub display_name: String,
     /// Optional free-form role metadata; the empty object when omitted.
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -195,6 +197,7 @@ pub struct UpdateOrgRoleRequest {
     /// Replacement free-form metadata (a whole-document replace, not a merge).
     /// Omitted leaves it unchanged.
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
 }
 

@@ -110,6 +110,7 @@ pub struct AuthzenEvaluationRequest {
     pub action: AuthzenAction,
     /// Free-form context. `IronAuth` reads exactly one key, `organization_id`.
     #[serde(default)]
+    #[schema(value_type = Object)]
     pub context: serde_json::Value,
 }
 
@@ -134,6 +135,7 @@ pub struct AuthzenEvaluationsRequest {
     pub action: Option<AuthzenAction>,
     /// Shared context default.
     #[serde(default)]
+    #[schema(value_type = Object)]
     pub context: serde_json::Value,
     /// The evaluations, each overriding the defaults above where it names a value.
     pub evaluations: Vec<AuthzenBatchItem>,
@@ -156,6 +158,7 @@ pub struct AuthzenBatchItem {
     pub action: Option<AuthzenAction>,
     /// Overrides the shared context.
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub context: Option<serde_json::Value>,
 }
 

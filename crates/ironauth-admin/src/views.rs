@@ -435,6 +435,7 @@ pub struct MembershipView {
     /// The membership lifecycle state (`active`).
     pub state: String,
     /// Free-form membership metadata (the empty object when none was set).
+    #[schema(value_type = Object)]
     pub metadata: serde_json::Value,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
@@ -463,6 +464,7 @@ pub struct CreateMembershipRequest {
     pub user_id: String,
     /// Optional free-form membership metadata; the empty object when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -1693,6 +1695,7 @@ pub struct CreateConnectorRequest {
     pub protocol: String,
     /// The upstream endpoints: EITHER `{ "issuer": "..." }` OR
     /// `{ "authorization_endpoint", "token_endpoint", "jwks_uri", "userinfo_endpoint"? }`.
+    #[schema(value_type = Object)]
     pub endpoints: serde_json::Value,
     /// The scopes requested from the upstream (`openid` is required).
     pub scopes: Vec<String>,
@@ -1707,13 +1710,16 @@ pub struct CreateConnectorRequest {
     pub pkce: Option<String>,
     /// The declarative claim mapping (the stored shape).
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub claim_mapping: Option<serde_json::Value>,
     /// The capability matrix (conservative defaults; `email_verified_trust` defaults
     /// to `untrusted`).
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub capabilities: Option<serde_json::Value>,
     /// Provider quirks expressed as data.
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub quirks: Option<serde_json::Value>,
     /// Whether the connector is active. Defaults to `true` on create; an update
     /// honors the submitted value, so an operator can disable a connector without
@@ -1748,6 +1754,7 @@ pub struct ConnectorView {
     /// The connector slug (unique per environment).
     pub connector_slug: String,
     /// The connector's secret-free definition document (no `client_secret`).
+    #[schema(value_type = Object)]
     pub definition: serde_json::Value,
     /// Whether the connector is active.
     pub enabled: bool,
@@ -1852,6 +1859,7 @@ pub struct SignupFormFieldView {
     /// The narrowing-only rule set: a JSON object over the trait schema's closed keyword
     /// vocabulary, each of which may only TIGHTEN the trait's constraint.
     #[serde(default)]
+    #[schema(value_type = Object)]
     pub rules: serde_json::Value,
     /// The numeric message id of the field's label.
     pub label_message_id: u32,
@@ -1888,6 +1896,7 @@ pub struct SignupFormView {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateFlowVersionRequest {
     /// The canonical journey artifact (a JSON document).
+    #[schema(value_type = Object)]
     pub artifact: serde_json::Value,
 }
 
@@ -1901,6 +1910,7 @@ pub struct FlowVersionView {
     /// The per-scope, per-journey monotonic version number.
     pub version: i32,
     /// The canonical journey artifact (a JSON document).
+    #[schema(value_type = Object)]
     pub artifact: serde_json::Value,
     /// Whether this version is the journey's active pin (the version a fresh custom flow is created
     /// against).

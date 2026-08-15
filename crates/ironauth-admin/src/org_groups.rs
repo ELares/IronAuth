@@ -89,6 +89,7 @@ pub struct OrgGroupView {
     /// The mutable human-facing label.
     pub display_name: String,
     /// Free-form group metadata (the empty object when none was set).
+    #[schema(value_type = Object)]
     pub metadata: serde_json::Value,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
@@ -132,6 +133,7 @@ pub struct CreateOrgGroupRequest {
     pub parent_id: Option<String>,
     /// Optional free-form group metadata; the empty object when omitted.
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -149,6 +151,7 @@ pub struct UpdateOrgGroupRequest {
     /// Replacement free-form metadata (a whole-document replace, not a merge).
     /// Omitted leaves it unchanged.
     #[serde(default)]
+    #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
 }
 

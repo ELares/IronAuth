@@ -32,8 +32,19 @@ SPEC="docs/openapi/management.json"
 # ceiling that quietly excused them. A raise means a new
 # untyped field reached the published contract, which is the regression this gate exists to
 # catch, so it is a failure and not a number to edit.
+#
+# The remaining six are NOT objects, which is why they are still here. Typing them needs a
+# per-field decision, not a sweep:
+#   CreateConnectorRequest.client_secret  a UNION: a bare string, or { "file": "..." }
+#   CreateTraitMigrationRequest.transform an ARRAY (a declarative transform program)
+#   CreateDcrPolicyRequest.primitives[]   array ELEMENTS, shape not yet pinned
+#   DcrPolicyView.primitives[]            the same elements, on the read side
+#   RecordFailureView.failures[]          array elements
+#   RiskDecisionSummary.signals           enumerated contributing signals
+# Declaring any of these `type: object` would replace an untyped field with a WRONG one,
+# and a generated client would then confidently decode the wrong shape. Worse than the debt.
 MAX_RESPONSES_WITHOUT_SCHEMA=7
-MAX_UNTYPED_SCHEMA_NODES=31
+MAX_UNTYPED_SCHEMA_NODES=6
 
 python3 - "$SPEC" "$MAX_RESPONSES_WITHOUT_SCHEMA" "$MAX_UNTYPED_SCHEMA_NODES" <<'PY'
 import json
