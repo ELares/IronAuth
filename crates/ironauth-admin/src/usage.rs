@@ -57,6 +57,11 @@ pub struct UsageExport {
 /// that should be unverified.
 ///
 /// Returns the tally and whether it stopped early.
+///
+/// # Errors
+///
+/// [`ApiError::Internal`] if the feed reports an aged-out cursor, which cannot happen from
+/// the beginning and therefore means the retention rule changed underneath the read.
 pub async fn fold_usage(
     outbox: &ironauth_store::OutboxRepo<'_>,
     limit: i64,
@@ -88,6 +93,11 @@ pub async fn fold_usage(
 }
 
 /// Export a tenant's usage (issue #107).
+///
+/// # Errors
+///
+/// [`ApiError`] for an unresolvable scope, a caller without `management.read`, or a
+/// persistence fault.
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/usage",

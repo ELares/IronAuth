@@ -26,6 +26,13 @@
 //! preference. Choosing here and hoping would fail on exactly the dual-stack machines where
 //! it is hardest to reproduce.
 
+// The whole module is reachable only from `ironauth login`, which has not landed yet, so
+// every item here is dead until it does. Allowed at the MODULE level with the reason rather
+// than per item: per-item allows have to be removed one at a time when the caller arrives,
+// which is exactly when nobody is looking for them. `dormant-module-scan.sh` records the
+// same fact and both retire together.
+#![allow(dead_code)]
+
 /// Why a registered redirect URI cannot be used for a loopback login.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoopbackError {

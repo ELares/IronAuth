@@ -1130,7 +1130,7 @@ impl OidcState {
     ///
     /// Two switches rather than one because they answer different questions, and a single
     /// call that did both made the ARMING untestable: with the source absent, a URL
-    /// client_id is refused for want of a source whether or not the flag is set, so a test
+    /// `client_id` is refused for want of a source whether or not the flag is set, so a test
     /// could not tell the gate from the missing dependency. A mutation sweep found exactly
     /// that, by forcing this to true and watching every test still pass. Installing a
     /// source WITHOUT arming is now a state a test can build, and the gate is what refuses

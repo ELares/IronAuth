@@ -20178,86 +20178,6 @@ async fn enqueue_outbox_in_tx_ignoring_conflict(
     Ok(inserted.rows_affected() > 0)
 }
 
-/// The generic transactional outbox and lease based job queue (issue #104), keyed to one
-/// scope: the ONE at-least-once dispatch substrate every async path in this milestone
-/// drains, in place of a hand-rolled queue per consumer.
-///
-/// It is the union of the two queues that preceded it: the transactional enqueue, the
-/// `FOR UPDATE SKIP LOCKED` claim and the visibility lease of the session-ended outbox
-/// (#35), plus the attempts counter, the `next_attempt_at` backoff gate and the
-/// dead-letter terminal state of the back-channel logout delivery queue (#34). It adds
-/// the two things neither needed: a `consumer` discriminator so one table serves many
-/// independent drains, and per-aggregate ORDERING.
-///
-/// # Per-aggregate ordering, and what it costs
-///
-/// [`claim`](OutboxRepo::claim) will not lease a message while a NON-TERMINAL message of
-/// the same `(consumer, ordering_key)` group holds a lower `sequence`. Only the group's
-/// head is ever eligible, so two messages of one aggregate can never be in flight at
-/// once and the group advances strictly in enqueue order. The rule keys on TERMINALITY,
-/// not on the lease, which is what makes it hold under concurrency: a competing worker's
-/// in-flight claim on the head does not retire the head, so the second message stays
-/// blocked whether the first succeeds, fails into a backoff, or is abandoned by a crashed
-/// worker.
-///
-/// Three costs follow and none of them is hidden:
-///
-/// - A group's head BLOCKS its group. A message that keeps failing holds its aggregate
-///   until the attempts bound dead-letters it, which is why [`RetryPolicy::max_attempts`]
-///   must be finite.
-/// - Parallelism within a consumer is bounded by the number of distinct ordering keys
-///   with due work, not by the worker count. A consumer that needs no ordering passes a
-///   per-message ordering key, making every group a singleton.
-/// - The claim carries one extra correlated anti-join per candidate row, served by the
-///   `outbox_messages_group_head_idx` partial index (migration 0099), so it is an index
-///   probe of the group's minimum rather than a scan of the group.
-///
-/// # The PRODUCER precondition, which is part of the guarantee and not a footnote
-///
-/// Everything above is a statement about CLAIMS. It becomes a statement about ORDER only
-/// when the sequences it compares were assigned in the order the producers intended, and
-/// that is a property of the producers, not of this module.
-///
-/// `sequence` is assigned at INSERT, which can be long before COMMIT. Two producer
-/// transactions that OVERLAP on one ordering key can therefore commit in the opposite
-/// order to their sequences: producer 1 takes sequence 10 and holds, producer 2 takes 11
-/// and commits, a drain claims 11 and is inside its handler, producer 1 commits, and 10
-/// becomes the group's head and claimable WHILE 11 IS STILL LEASED. That is not merely
-/// out-of-order delivery, it is two messages of one aggregate in flight at once, which is
-/// the very thing the head-of-group rule exists to prevent. It is unreachable from this
-/// module because the window opens before either row exists to be claimed.
-///
-/// So the substrate keeps this UNCONDITIONALLY:
-///
-/// - at most one message per `(consumer, ordering_key)` group is claimable at a time, out
-///   of the messages VISIBLE when the claim runs, and it is that group's lowest-sequenced
-///   non-terminal message;
-/// - a message stays its group's blocker until it is completed or dead-lettered, whatever
-///   happens to its lease;
-/// - a lifecycle write is fenced on the lease the writer was handed
-///   ([`OutboxMessage::lease_stamp_unix_micros`]), so a stalled worker cannot retire a
-///   message a live worker holds and release the successor under it.
-///
-/// And it keeps the STRONG form, "two messages sharing an `ordering_key` are never
-/// handled at the same time and arrive in enqueue order", exactly when the producers meet
-/// this precondition:
-///
-/// > Two enqueues under one `(consumer, ordering_key)` must not have overlapping
-/// > transactions. Serializing them on the aggregate's own row lock, taken in the same
-/// > transaction as the enqueue, is what a domain write naturally does and is the
-/// > supported way to meet it.
-///
-/// A producer that cannot meet it (a scheduled job, an operator-triggered replay, and
-/// anything going through [`enqueue`](OutboxRepo::enqueue), which holds no aggregate lock
-/// at all) gets the unconditional list and must not assume the strong form.
-///
-/// The shipped session-ended consumer meets it in the strongest possible way, and by a
-/// structural accident worth naming rather than generalizing from: its ordering key, its
-/// idempotency key and the ended session id are all the same value, so the UNIQUE
-/// `(tenant, environment, consumer, idempotency_key)` constraint makes every one of its
-/// groups a SINGLETON and there is no second message to be out of order with. That is a
-/// property of that consumer, not of the substrate, and the eight consumers that follow
-/// do not inherit it.
 /// How many member ids a membership event may carry before it is truncated (issue #107).
 ///
 /// A cap, not a preference. Enterprise groups reach six figures, and a full-state dump on
@@ -20540,30 +20460,98 @@ fn append_lock_key(scope: Scope) -> i64 {
     let mut hasher = DefaultHasher::new();
     scope.tenant().to_string().hash(&mut hasher);
     scope.environment().to_string().hash(&mut hasher);
-    // Postgres advisory locks take a SIGNED 64-bit key, so the cast is required rather
-    // than lossy: every bit pattern is a valid key.
-    hasher.finish() as i64
+    // Postgres advisory locks take a SIGNED 64-bit key. Reinterpreting the bits rather
+    // than casting says that explicitly: every bit pattern is a valid key, so this is a
+    // reinterpretation and not a narrowing that could lose one.
+    i64::from_ne_bytes(hasher.finish().to_ne_bytes())
 }
 
+/// The generic transactional outbox and lease based job queue (issue #104), keyed to one
+/// scope: the ONE at-least-once dispatch substrate every async path in this milestone
+/// drains, in place of a hand-rolled queue per consumer.
+///
+/// It is the union of the two queues that preceded it: the transactional enqueue, the
+/// `FOR UPDATE SKIP LOCKED` claim and the visibility lease of the session-ended outbox
+/// (#35), plus the attempts counter, the `next_attempt_at` backoff gate and the
+/// dead-letter terminal state of the back-channel logout delivery queue (#34). It adds
+/// the two things neither needed: a `consumer` discriminator so one table serves many
+/// independent drains, and per-aggregate ORDERING.
+///
+/// # Per-aggregate ordering, and what it costs
+///
+/// [`claim`](OutboxRepo::claim) will not lease a message while a NON-TERMINAL message of
+/// the same `(consumer, ordering_key)` group holds a lower `sequence`. Only the group's
+/// head is ever eligible, so two messages of one aggregate can never be in flight at
+/// once and the group advances strictly in enqueue order. The rule keys on TERMINALITY,
+/// not on the lease, which is what makes it hold under concurrency: a competing worker's
+/// in-flight claim on the head does not retire the head, so the second message stays
+/// blocked whether the first succeeds, fails into a backoff, or is abandoned by a crashed
+/// worker.
+///
+/// Three costs follow and none of them is hidden:
+///
+/// - A group's head BLOCKS its group. A message that keeps failing holds its aggregate
+///   until the attempts bound dead-letters it, which is why [`RetryPolicy::max_attempts`]
+///   must be finite.
+/// - Parallelism within a consumer is bounded by the number of distinct ordering keys
+///   with due work, not by the worker count. A consumer that needs no ordering passes a
+///   per-message ordering key, making every group a singleton.
+/// - The claim carries one extra correlated anti-join per candidate row, served by the
+///   `outbox_messages_group_head_idx` partial index (migration 0099), so it is an index
+///   probe of the group's minimum rather than a scan of the group.
+///
+/// # The PRODUCER precondition, which is part of the guarantee and not a footnote
+///
+/// Everything above is a statement about CLAIMS. It becomes a statement about ORDER only
+/// when the sequences it compares were assigned in the order the producers intended, and
+/// that is a property of the producers, not of this module.
+///
+/// `sequence` is assigned at INSERT, which can be long before COMMIT. Two producer
+/// transactions that OVERLAP on one ordering key can therefore commit in the opposite
+/// order to their sequences: producer 1 takes sequence 10 and holds, producer 2 takes 11
+/// and commits, a drain claims 11 and is inside its handler, producer 1 commits, and 10
+/// becomes the group's head and claimable WHILE 11 IS STILL LEASED. That is not merely
+/// out-of-order delivery, it is two messages of one aggregate in flight at once, which is
+/// the very thing the head-of-group rule exists to prevent. It is unreachable from this
+/// module because the window opens before either row exists to be claimed.
+///
+/// So the substrate keeps this UNCONDITIONALLY:
+///
+/// - at most one message per `(consumer, ordering_key)` group is claimable at a time, out
+///   of the messages VISIBLE when the claim runs, and it is that group's lowest-sequenced
+///   non-terminal message;
+/// - a message stays its group's blocker until it is completed or dead-lettered, whatever
+///   happens to its lease;
+/// - a lifecycle write is fenced on the lease the writer was handed
+///   ([`OutboxMessage::lease_stamp_unix_micros`]), so a stalled worker cannot retire a
+///   message a live worker holds and release the successor under it.
+///
+/// And it keeps the STRONG form, "two messages sharing an `ordering_key` are never
+/// handled at the same time and arrive in enqueue order", exactly when the producers meet
+/// this precondition:
+///
+/// > Two enqueues under one `(consumer, ordering_key)` must not have overlapping
+/// > transactions. Serializing them on the aggregate's own row lock, taken in the same
+/// > transaction as the enqueue, is what a domain write naturally does and is the
+/// > supported way to meet it.
+///
+/// A producer that cannot meet it (a scheduled job, an operator-triggered replay, and
+/// anything going through [`enqueue`](OutboxRepo::enqueue), which holds no aggregate lock
+/// at all) gets the unconditional list and must not assume the strong form.
+///
+/// The shipped session-ended consumer meets it in the strongest possible way, and by a
+/// structural accident worth naming rather than generalizing from: its ordering key, its
+/// idempotency key and the ended session id are all the same value, so the UNIQUE
+/// `(tenant, environment, consumer, idempotency_key)` constraint makes every one of its
+/// groups a SINGLETON and there is no second message to be out of order with. That is a
+/// property of that consumer, not of the substrate, and the eight consumers that follow
+/// do not inherit it.
 pub struct OutboxRepo<'a> {
     store: &'a Store,
     scope: Scope,
 }
 
 impl OutboxRepo<'_> {
-    /// Enqueue ONE message in its OWN transaction (issue #104), for a producer that has
-    /// no surrounding domain write to ride: a scheduled job, an operator-triggered
-    /// replay, a test fixture.
-    ///
-    /// A producer that DOES have a domain write must not use this. The atomicity the
-    /// outbox exists for comes from sharing the domain write's transaction, which is what
-    /// [`enqueue_outbox_in_tx`] does; enqueuing separately reintroduces the window where
-    /// one of the two writes survives a crash and the other does not.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`] on a persistence fault, including the unique violation a
-    /// second enqueue under the same `(consumer, idempotency_key)` raises.
     /// Append an event so the feed's order IS commit order (issue #107 criterion 2).
     ///
     /// # Why a lock, and why no new column
@@ -20621,6 +20609,19 @@ impl OutboxRepo<'_> {
         Ok(id.to_string())
     }
 
+    /// Enqueue ONE message in its OWN transaction (issue #104), for a producer that has
+    /// no surrounding domain write to ride: a scheduled job, an operator-triggered
+    /// replay, a test fixture.
+    ///
+    /// A producer that DOES have a domain write must not use this. The atomicity the
+    /// outbox exists for comes from sharing the domain write's transaction, which is what
+    /// [`enqueue_outbox_in_tx`] does; enqueuing separately reintroduces the window where
+    /// one of the two writes survives a crash and the other does not.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, including the unique violation a
+    /// second enqueue under the same `(consumer, idempotency_key)` raises.
     pub async fn enqueue(
         &self,
         env: &Env,
@@ -20792,14 +20793,6 @@ impl OutboxRepo<'_> {
         Ok(rows.iter().map(outbox_message_from_row).collect())
     }
 
-    /// Read up to `limit` non-terminal messages for `consumer` in this scope, oldest
-    /// first, WITHOUT claiming them (issue #104): a read-only peek at the queue for
-    /// diagnostics and tests. A real drain goes through [`claim`](OutboxRepo::claim) so
-    /// the lease, the skip-locked semantics, and the ordering rule apply.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`] on a persistence fault.
     /// Read the event feed, distinguishing "nothing new" from "your cursor aged out"
     /// (issue #107).
     ///
@@ -20913,6 +20906,14 @@ impl OutboxRepo<'_> {
         Ok(rows.iter().map(outbox_message_from_row).collect())
     }
 
+    /// Read up to `limit` non-terminal messages for `consumer` in this scope, oldest
+    /// first, WITHOUT claiming them (issue #104): a read-only peek at the queue for
+    /// diagnostics and tests. A real drain goes through [`claim`](OutboxRepo::claim) so
+    /// the lease, the skip-locked semantics, and the ordering rule apply.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
     pub async fn pending(
         &self,
         consumer: &str,
@@ -59648,7 +59649,9 @@ mod membership_delta {
                     "and must report the real size"
                 );
             }
-            other => panic!("expected truncation, got {other:?}"),
+            complete @ MembershipChange::Complete { .. } => {
+                panic!("expected truncation, got {complete:?}")
+            }
         }
     }
 
@@ -59663,7 +59666,9 @@ mod membership_delta {
                     "a consumer needs the real count to log what it missed"
                 );
             }
-            other => panic!("expected truncation, got {other:?}"),
+            complete @ MembershipChange::Complete { .. } => {
+                panic!("expected truncation, got {complete:?}")
+            }
         }
     }
 }
