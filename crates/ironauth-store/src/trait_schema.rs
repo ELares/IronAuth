@@ -1689,4 +1689,59 @@ mod tests {
         let out = apply_transform(&ops, &json!({"name": "Zeke"}));
         assert_eq!(out, json!({"full_name": "Zeke", "locale": "en"}));
     }
+
+    /// RFC 6901 escaping, which is order dependent in BOTH directions and silent when it
+    /// is wrong.
+    ///
+    /// Escaping must replace `~` before `/`: doing `/` first produces a `~1` that the `~`
+    /// pass then turns into `~01`. Unescaping must replace `~1` before `~0` for the mirror
+    /// reason: `~01` becomes `~1` under a `~0`-first pass, and then `/`.
+    ///
+    /// Both functions are currently correct and neither was tested, which is the state
+    /// where somebody tidies the two `replace` calls into a "cleaner" order and nothing
+    /// says otherwise. A field named `a/b` would then point at a nested location that does
+    /// not exist, and the client would be told its error is somewhere it never sent.
+    #[test]
+    fn pointer_tokens_round_trip_through_escaping() {
+        for token in [
+            "plain",
+            "",
+            "with/slash",
+            "with~tilde",
+            // The adversarial pair: text that already LOOKS like an escape sequence.
+            "~0",
+            "~1",
+            "~01",
+            "a/b~c",
+            "///",
+            "~~~",
+        ] {
+            assert_eq!(
+                unescape_token(&escape_token(token)),
+                token,
+                "escaping {token:?} must be reversible"
+            );
+        }
+    }
+
+    #[test]
+    fn escaping_replaces_tilde_before_slash() {
+        // Pinned directly, not just via the round trip: the wrong order round-trips for
+        // some inputs while producing a pointer no other RFC 6901 implementation agrees
+        // with, so a reversible-but-nonstandard encoding would slip past the test above.
+        assert_eq!(escape_token("a/b"), "a~1b");
+        assert_eq!(escape_token("a~b"), "a~0b");
+        // The case that separates the two orders. Correct: `~` -> `~0`, then `/` -> `~1`.
+        // Wrong: `/` -> `~1`, then that `~` -> `~0`, giving `a~01b`.
+        assert_eq!(escape_token("a~/b"), "a~0~1b");
+    }
+
+    #[test]
+    fn unescaping_replaces_tilde_one_before_tilde_zero() {
+        assert_eq!(unescape_token("a~1b"), "a/b");
+        assert_eq!(unescape_token("a~0b"), "a~b");
+        // The mirror case. Correct: `~1` -> `/` first, so `~01` keeps its `0` and becomes
+        // `~1`. Wrong: `~0` -> `~` first turns `~01` into `~1`, which then becomes `/`.
+        assert_eq!(unescape_token("~01"), "~1");
+    }
 }
