@@ -265,7 +265,7 @@ pub async fn authorize_post(
 ///
 /// # A declared scope must MATCH the path
 ///
-/// When a `cli_` client_id arrives here it still declares a scope, and that scope is
+/// When a `cli_` `client_id` arrives here it still declares a scope, and that scope is
 /// now checked against the path rather than believed. Believing it would make this
 /// route a cross-tenant hole: any tenant's URL would serve any other tenant's client,
 /// and the path would be decoration.
@@ -2528,7 +2528,7 @@ async fn resolve_consent_gate(
     let now_micros = epoch_micros(state.now());
     let consent_scope =
         consent_check_scope(effective_scope, state.offline_access_requires_consent());
-    let consent_mode = ConsentMode::parse(&client.consent_mode());
+    let consent_mode = ConsentMode::parse(client.consent_mode());
     // The browser surface trusts an `implicit`-mode client or one whose `skip_consent` flag is set
     // for the first-party carve-out. The core takes this trust as an INPUT (it does not re-derive
     // it) so the challenge surface can supply its own predicate while sharing the same decision.
