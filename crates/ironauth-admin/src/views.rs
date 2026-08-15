@@ -537,6 +537,7 @@ pub struct CreateDcrPolicyRequest {
     #[schema(example = "force-private-key-jwt")]
     pub name: String,
     /// The ordered primitive list (force / restrict / reject / default objects).
+    #[schema(value_type = Vec<Object>)]
     pub primitives: Vec<serde_json::Value>,
 }
 
@@ -548,6 +549,7 @@ pub struct DcrPolicyView {
     /// The policy name.
     pub name: String,
     /// The ordered primitive list (as stored).
+    #[schema(value_type = Vec<Object>)]
     pub primitives: Vec<serde_json::Value>,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
@@ -1703,6 +1705,7 @@ pub struct CreateConnectorRequest {
     pub client_id: String,
     /// The upstream client secret by indirection (`"..."`, `{ "file": "/path" }`, or
     /// `{ "env": "VAR" }`); sealed at rest, never returned by a read.
+    #[schema(schema_with = secret_indirection_schema)]
     pub client_secret: serde_json::Value,
     /// How PKCE is applied to the upstream (`auto_where_supported` / `required` /
     /// `disabled`).
@@ -2043,6 +2046,29 @@ pub struct BrandAssetView {
     pub sha256: String,
     /// The stored payload length in bytes.
     pub size_bytes: i64,
+}
+
+/// The published schema for a secret-by-indirection field.
+///
+/// A `oneOf`, because the field genuinely IS two things: a bare string holding the secret,
+/// or an object naming where to read it from. `value_type = Object` would have cleared the
+/// untyped count while telling every generated client that a plain string is invalid, which
+/// is a worse contract than saying nothing: an untyped field makes a generator emit `any`
+/// and the caller stays correct, whereas a wrongly typed one makes it emit a type that
+/// rejects valid input.
+fn secret_indirection_schema() -> utoipa::openapi::schema::Object {
+    use utoipa::openapi::schema::{ObjectBuilder, Type};
+
+    ObjectBuilder::new()
+        .schema_type(utoipa::openapi::schema::SchemaType::from_iter([
+            Type::String,
+            Type::Object,
+        ]))
+        .description(Some(
+            "The secret itself as a string, or an indirection object naming where to read \
+             it from: `{ \"file\": \"/path\" }` or `{ \"env\": \"VAR\" }`.",
+        ))
+        .build()
 }
 
 #[cfg(test)]

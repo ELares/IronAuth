@@ -33,18 +33,19 @@ SPEC="docs/openapi/management.json"
 # untyped field reached the published contract, which is the regression this gate exists to
 # catch, so it is a failure and not a number to edit.
 #
-# The remaining six are NOT objects, which is why they are still here. Typing them needs a
-# per-field decision, not a sweep:
-#   CreateConnectorRequest.client_secret  a UNION: a bare string, or { "file": "..." }
-#   CreateTraitMigrationRequest.transform an ARRAY (a declarative transform program)
-#   CreateDcrPolicyRequest.primitives[]   array ELEMENTS, shape not yet pinned
-#   DcrPolicyView.primitives[]            the same elements, on the read side
-#   RecordFailureView.failures[]          array elements
-#   RiskDecisionSummary.signals           enumerated contributing signals
-# Declaring any of these `type: object` would replace an untyped field with a WRONG one,
-# and a generated client would then confidently decode the wrong shape. Worse than the debt.
+# The untyped count is now ZERO, which is #122 criterion 1 met rather than approached. The
+# ceiling stays as a ceiling because reaching zero is not the same as staying there: the
+# next `serde_json::Value` field added without a `value_type` lands here, and it lands as a
+# failure rather than as a number somebody bumps.
+#
+# Typing them was per-field work, not a sweep, and one of them proves why. `client_secret`
+# is a UNION (a bare string, or `{ "file": ... }` / `{ "env": ... }`) and carries a custom
+# `oneOf` schema. Calling it `type: object` would have cleared the count while telling every
+# generated client a plain string is invalid, which is a WORSE contract than saying nothing:
+# untyped makes a generator emit `any` and the caller stays correct, wrongly typed makes it
+# emit a type that rejects valid input.
 MAX_RESPONSES_WITHOUT_SCHEMA=7
-MAX_UNTYPED_SCHEMA_NODES=6
+MAX_UNTYPED_SCHEMA_NODES=0
 
 python3 - "$SPEC" "$MAX_RESPONSES_WITHOUT_SCHEMA" "$MAX_UNTYPED_SCHEMA_NODES" <<'PY'
 import json
