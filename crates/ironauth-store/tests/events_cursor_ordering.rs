@@ -90,6 +90,25 @@ async fn read_after_watermarked(pool: &sqlx::PgPool, after: i64) -> Vec<i64> {
     .collect()
 }
 
+/// Poll until `want` appears, or give up.
+///
+/// The wait is not test flakiness dressed up; it IS the semantics.
+/// `pg_snapshot_xmin(pg_current_snapshot())` is CLUSTER-wide, so the feed advances only
+/// once every transaction that was open anywhere on the instance has finished, including
+/// ones touching other databases entirely. An event is therefore withheld for as long as
+/// the longest unrelated transaction runs. That is the real cost of this remedy and it is
+/// asserted rather than hidden: see `an_unrelated_open_transaction_stalls_the_whole_feed`.
+async fn eventually_visible(pool: &sqlx::PgPool, after: i64, want: &[i64]) -> Vec<i64> {
+    for _ in 0..100 {
+        let seen = read_after_watermarked(pool, after).await;
+        if want.iter().all(|s| seen.contains(s)) {
+            return seen;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    read_after_watermarked(pool, after).await
+}
+
 #[tokio::test]
 async fn a_cursor_over_sequence_alone_skips_an_event_that_commits_late() {
     let db = TestDatabase::start().await;
@@ -177,7 +196,7 @@ async fn a_watermarked_cursor_never_advances_past_an_in_flight_write() {
 
     // With nothing in flight, BOTH become available, in sequence order, and a consumer
     // starting from zero receives the earlier one it would otherwise have lost.
-    let after_settle = read_after_watermarked(pool, 0).await;
+    let after_settle = eventually_visible(pool, 0, &[early_seq, late_seq]).await;
     assert!(
         after_settle.contains(&early_seq) && after_settle.contains(&late_seq),
         "both rows must appear once the writers settle: {after_settle:?}"
@@ -187,5 +206,105 @@ async fn a_watermarked_cursor_never_advances_past_an_in_flight_write() {
     assert!(
         early_at < late_at,
         "and in sequence order, which is the ordering criterion 1 promises"
+    );
+}
+
+#[tokio::test]
+async fn the_repo_feed_holds_back_an_event_an_older_writer_could_still_precede() {
+    // The same property, through the API a consumer will actually call rather than through
+    // hand-written SQL. A test that only exercised the raw query would leave the shipped
+    // method unmeasured, which is the gap between "the idea works" and "the code does it".
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
+
+    let mut early = pool.begin().await.expect("begin early");
+    let early_seq =
+        insert_returning_sequence(&mut early, &tenant, &environment, "evt_repo_early").await;
+
+    let mut late = pool.begin().await.expect("begin late");
+    let late_seq =
+        insert_returning_sequence(&mut late, &tenant, &environment, "evt_repo_late").await;
+    late.commit().await.expect("commit late");
+
+    let outbox = db.store().scoped(scope).outbox();
+
+    let held = outbox.events_after(0, 100).await.expect("read");
+    let held_sequences: Vec<i64> = held.iter().map(|m| m.sequence).collect();
+    assert!(
+        !held_sequences.contains(&late_seq),
+        "the committed event must be withheld while an older writer is in flight: \
+         {held_sequences:?}"
+    );
+
+    early.commit().await.expect("commit early");
+
+    // Same bounded wait, same reason: the watermark is cluster-wide.
+    let mut settled_sequences: Vec<i64> = Vec::new();
+    for _ in 0..100 {
+        let settled = outbox.events_after(0, 100).await.expect("read");
+        settled_sequences = settled.iter().map(|m| m.sequence).collect();
+        if settled_sequences.contains(&early_seq) && settled_sequences.contains(&late_seq) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        settled_sequences.contains(&early_seq) && settled_sequences.contains(&late_seq),
+        "both must appear once the writers settle: {settled_sequences:?}"
+    );
+    assert!(
+        settled_sequences.windows(2).all(|pair| pair[0] < pair[1]),
+        "and strictly in sequence order: {settled_sequences:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unrelated_open_transaction_stalls_the_whole_feed() {
+    // The cost of the watermark, stated as a test rather than left for an operator to
+    // discover under load.
+    //
+    // `pg_snapshot_xmin(pg_current_snapshot())` is CLUSTER-wide. It does not know which
+    // table, tenant, or even DATABASE a transaction touches, so a long-running query with
+    // nothing to do with events holds the feed back exactly as an overlapping writer would.
+    // This is head-of-line blocking sourced from an unrelated workload, and it is the
+    // reason a commit-ordered appender is worth weighing against this remedy rather than
+    // assuming the watermark is free.
+    //
+    // I found this by accident: these tests began failing only when a third was added and
+    // its open transaction held the watermark down from another database.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
+
+    // A fully committed event, with no writer of its own outstanding.
+    let mut writer = pool.begin().await.expect("begin");
+    let committed =
+        insert_returning_sequence(&mut writer, &tenant, &environment, "evt_unrelated").await;
+    writer.commit().await.expect("commit");
+
+    // An unrelated transaction that touches nothing at all, merely open.
+    let mut bystander = pool.begin().await.expect("begin bystander");
+    sqlx::query("SELECT 1")
+        .execute(&mut *bystander)
+        .await
+        .expect("bystander reads");
+
+    let stalled = read_after_watermarked(pool, 0).await;
+    assert!(
+        !stalled.contains(&committed),
+        "a committed event is withheld while an UNRELATED transaction is open: {stalled:?}"
+    );
+
+    bystander.rollback().await.expect("bystander ends");
+
+    let released = eventually_visible(pool, 0, &[committed]).await;
+    assert!(
+        released.contains(&committed),
+        "and is released once it ends: {released:?}"
     );
 }
