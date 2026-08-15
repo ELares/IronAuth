@@ -36,7 +36,191 @@
 //! own boot sequence: a second one would drift, and the drift would be invisible precisely
 //! because dev is where nobody is looking for a production difference.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, TcpListener};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Locate a directory holding both `initdb` and `pg_ctl`.
+///
+/// The search order is the one `scripts/with-test-db.sh` already encodes, deliberately: a
+/// developer whose shell script works must find the same binaries here, or the two disagree
+/// on a host with more than one Postgres, which is the confusing case rather than the rare
+/// one. `PG_BIN` is honoured first so that host can pin which install is used.
+#[must_use]
+pub fn locate_bin_dir(pg_bin_env: Option<&str>) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = pg_bin_env {
+        candidates.push(PathBuf::from(dir));
+    }
+    // Whatever `pg_ctl` is on PATH, via its own directory.
+    if let Ok(output) = Command::new("sh")
+        .args(["-c", "command -v pg_ctl"])
+        .output()
+    {
+        let found = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !found.is_empty() {
+            if let Some(parent) = Path::new(&found).parent() {
+                candidates.push(parent.to_path_buf());
+            }
+        }
+    }
+    // The versioned install roots, EXACTLY the ones `with-test-db.sh` globs. The
+    // `~/.theseus` entry is not optional trivia: it is where this project's own tooling
+    // puts Postgres, and omitting it made this function fail on a host where the shell
+    // script succeeds. The claim above that the orders match has to be true, not intended.
+    let mut roots = vec![PathBuf::from("/usr/lib/postgresql")];
+    if let Ok(home) = std::env::var("HOME") {
+        roots.push(PathBuf::from(home).join(".theseus/postgresql"));
+    }
+    roots.push(PathBuf::from("/opt/homebrew/opt"));
+    for base in roots {
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                candidates.push(entry.path().join("bin"));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("initdb").is_file() && dir.join("pg_ctl").is_file())
+}
+
+/// A throwaway Postgres cluster owned by this process.
+///
+/// Stopped and DELETED on drop. That is the whole contract: an emulator that left a cluster
+/// behind would accumulate one per run in a temp directory nobody reads, which is exactly
+/// the leak that has bitten this project's gate before.
+pub struct DevCluster {
+    workdir: PathBuf,
+    pg_ctl: PathBuf,
+    /// The connection string for the cluster, on loopback TCP.
+    pub database_url: String,
+}
+
+impl DevCluster {
+    /// Initialise and start a cluster under a fresh temp directory.
+    ///
+    /// Listens on LOOPBACK TCP only and trusts local connections, which is safe for exactly
+    /// the reason dev mode is: nothing outside this machine can reach it. That is the same
+    /// posture `with-test-db.sh` uses and the same one the bind guard enforces above.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the step that failed, so a developer can run it by hand.
+    pub fn start(bin_dir: &Path, unique: &str) -> Result<Self, String> {
+        let workdir = std::env::temp_dir().join(format!("ironauth-dev-pg-{unique}"));
+        let data = workdir.join("data");
+        let sock = workdir.join("sock");
+        std::fs::create_dir_all(&sock)
+            .map_err(|error| format!("creating {}: {error}", sock.display()))?;
+
+        // An ephemeral port, chosen the same way the shell script does: bind, read, release.
+        // There is an unavoidable race between releasing and Postgres binding; it is the
+        // same one every ephemeral-port allocator has, and the failure is a clean startup
+        // error rather than a silent misbind.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .map(|addr| addr.port())
+            .map_err(|error| format!("choosing a port: {error}"))?;
+
+        let superuser = "ironauth_super";
+        run_step(
+            &bin_dir.join("initdb"),
+            &[
+                "-D",
+                &data.display().to_string(),
+                "-U",
+                superuser,
+                "-A",
+                "trust",
+            ],
+            "initdb",
+        )?;
+
+        let options = format!(
+            "-p {port} -k {} -c listen_addresses=127.0.0.1",
+            sock.display()
+        );
+        let pg_ctl = bin_dir.join("pg_ctl");
+        let logfile = workdir.join("postgres.log");
+        start_server(&pg_ctl, &data, &options, &logfile)?;
+
+        Ok(Self {
+            workdir,
+            pg_ctl,
+            database_url: format!("postgres://{superuser}@127.0.0.1:{port}/postgres"),
+        })
+    }
+}
+
+impl Drop for DevCluster {
+    fn drop(&mut self) {
+        // `immediate` rather than a graceful stop: there is nothing to preserve, and a
+        // clean shutdown that hangs would leave the directory behind, which is the failure
+        // this drop exists to prevent.
+        let _ = Command::new(&self.pg_ctl)
+            .args([
+                "-D",
+                &self.workdir.join("data").display().to_string(),
+                "-m",
+                "immediate",
+                "stop",
+            ])
+            .output();
+        let _ = std::fs::remove_dir_all(&self.workdir);
+    }
+}
+
+/// Start the server WITHOUT inheriting this process's pipes.
+///
+/// `pg_ctl start` launches a daemon that inherits whatever stdout and stderr it is given
+/// and holds them for its lifetime. Capturing those (via `Command::output`) therefore blocks
+/// forever waiting for an EOF that arrives only when the database shuts down, which is the
+/// very thing this is bringing up. Measured, not theorised: it hung for ten minutes with a
+/// perfectly healthy cluster already running, which is why `with-test-db.sh` redirects to
+/// /dev/null at exactly this step.
+///
+/// So the server's output goes to a LOG FILE (`pg_ctl -l`), this process's handles are
+/// closed, and the exit status is what is waited on. The log is read back only on failure,
+/// which is the one time its contents matter.
+fn start_server(pg_ctl: &Path, data: &Path, options: &str, logfile: &Path) -> Result<(), String> {
+    let status = Command::new(pg_ctl)
+        .args([
+            "-D",
+            &data.display().to_string(),
+            "-l",
+            &logfile.display().to_string(),
+            "-w",
+            "-o",
+            options,
+            "start",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("pg_ctl start: {error}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    let log = std::fs::read_to_string(logfile).unwrap_or_default();
+    Err(format!("pg_ctl start failed. Server log:\n{}", log.trim()))
+}
+
+/// Run one cluster-setup command, reporting its stderr on failure.
+fn run_step(program: &Path, args: &[&str], step: &str) -> Result<(), String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("{step}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{step} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
 
 /// The message shown when no Postgres binaries can be found.
 ///
@@ -134,6 +318,53 @@ pub fn banner(bind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cluster starts, is reachable on the port it reports, and is GONE after drop.
+    ///
+    /// Ignored by default because it spawns a real Postgres, which is the point: the parts
+    /// that can be wrong here (the `initdb` flags, the `pg_ctl` options, the teardown) are
+    /// exactly the parts a mock would not exercise. Run with `--ignored` on a host with
+    /// Postgres installed.
+    #[test]
+    #[ignore = "spawns a real Postgres cluster; run with --ignored"]
+    fn the_cluster_starts_and_is_removed_on_drop() {
+        let Some(bin_dir) = locate_bin_dir(std::env::var("PG_BIN").ok().as_deref()) else {
+            panic!("no Postgres binaries found; set PG_BIN");
+        };
+        let workdir;
+        {
+            let cluster = DevCluster::start(&bin_dir, "selftest").expect("cluster starts");
+            assert!(
+                cluster
+                    .database_url
+                    .starts_with("postgres://ironauth_super@127.0.0.1:"),
+                "{}",
+                cluster.database_url
+            );
+            workdir = std::env::temp_dir().join("ironauth-dev-pg-selftest");
+            assert!(
+                workdir.join("data").is_dir(),
+                "the data directory must exist"
+            );
+            // The reported port must actually be listening: a cluster that reported a port
+            // it did not bind would fail later, in the server, as an unrelated-looking error.
+            let port: u16 = cluster
+                .database_url
+                .rsplit(':')
+                .next()
+                .and_then(|tail| tail.split('/').next())
+                .and_then(|p| p.parse().ok())
+                .expect("a port in the url");
+            assert!(
+                std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+                "nothing is listening on the reported port {port}"
+            );
+        }
+        assert!(
+            !workdir.exists(),
+            "dropping the cluster must delete {workdir:?}"
+        );
+    }
 
     /// Loopback literals are accepted, in both families.
     #[test]
