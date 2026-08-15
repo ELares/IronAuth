@@ -695,3 +695,9 @@ required-features = ["testing"]
 name = "usage_export"
 path = "tests/usage_export.rs"
 required-features = ["testing"]
+
+# The reconcile path a truncated membership event points at (issue #107 criterion 3).
+[[test]]
+name = "membership_reconcile"
+path = "tests/membership_reconcile.rs"
+required-features = ["testing"]
