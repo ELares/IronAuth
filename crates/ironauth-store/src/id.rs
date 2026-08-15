@@ -98,6 +98,46 @@ impl ScopedKind for ClientKind {
     const PREFIX: &'static str = "cli";
 }
 
+/// Marker for a CIMD client (issue #128): a client whose `client_id` is an HTTPS URL
+/// hosting its own metadata document, rather than a registration in this deployment.
+///
+/// # Why a distinct prefix and not a `cli_`
+///
+/// A CIMD client never registered. Nobody vetted it, nobody agreed to anything, and the
+/// party that chose its identifier is the same party the identifier describes. Minting a
+/// `cli_` for it would put an unregistered, requester-chosen client behind an identifier
+/// that reads as a registration in every audit row, log line, and admin view, and an
+/// operator would need a join to tell the two apart. A `cimc_` says what it is at a
+/// glance and cannot be mistaken for the other thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CimdClientKind;
+impl ScopedKind for CimdClientKind {
+    const PREFIX: &'static str = "cimc";
+}
+
+/// The kinds whose identifiers may be DERIVED deterministically from public input.
+///
+/// # This trait is the whole safety argument
+///
+/// [`ScopedId::derive`] produces the same identifier for the same input, every time, for
+/// anyone. That is exactly right for a CIMD client, whose identity IS a public URL and
+/// whose identifier is therefore already public and already chosen by the requester;
+/// deriving it means the same document resolves to one identity instead of a new one per
+/// request, so grants and audit rows accumulate against a stable subject.
+///
+/// It would be catastrophic for the kinds whose identifiers double as BEARER SECRETS. An
+/// [`AuthorizationCodeId`] IS the credential the token endpoint redeems; a derivable one
+/// could be computed rather than possessed. So `derive` is gated on this marker rather
+/// than offered on every [`ScopedKind`], and the gate is a compile error, not a comment.
+/// Implement it only for a kind whose identifier is public by construction, and never for
+/// one whose [`ScopedKind::REDACT_DEBUG`] is `true`.
+pub trait DerivableKind: ScopedKind {}
+
+// A CIMD client_id IS a public HTTPS URL chosen by the requester, so an identifier derived
+// from it discloses nothing that was not already public. Every other kind must justify
+// itself the same way, on this line, where a reviewer will see it.
+impl DerivableKind for CimdClientKind {} // invariant-allow: derivable-kind-is-public
+
 /// Marker for an organization. In milestone M1 organizations are a schema slot
 /// only (see the tenancy design doc); the identifier type exists so scoped
 /// tables and the isolation harness cover the table from day one.
@@ -1487,6 +1527,12 @@ pub struct ScopedId<K: ScopedKind> {
 
 /// An OAuth client identifier (`cli_...`), the worked scoped-resource example.
 pub type ClientId = ScopedId<ClientKind>;
+
+/// The identifier of a CIMD client (issue #128), derived deterministically from the
+/// HTTPS URL that IS its `client_id`. Distinct from [`ClientId`] on the wire (`cimc_`
+/// rather than `cli_`) so an unregistered, requester-chosen client is never mistaken for
+/// a registration; see [`CimdClientKind`].
+pub type CimdClientId = ScopedId<CimdClientKind>;
 /// An organization identifier (`org_...`); schema slot only in M1.
 pub type OrganizationId = ScopedId<OrganizationKind>;
 /// An organization-membership identifier (`omb_...`), the join row binding a user
@@ -1826,6 +1872,47 @@ impl<K: ScopedKind> ScopedId<K> {
     pub fn generate(env: &Env, scope: &Scope) -> Self {
         let mut unique = [0_u8; COMPONENT_BYTES];
         env.entropy().fill_bytes(&mut unique);
+        Self {
+            tenant: scope.tenant(),
+            environment: scope.environment(),
+            unique,
+            _kind: PhantomData,
+        }
+    }
+
+    /// Derive a DETERMINISTIC scoped identifier for `seed` under `scope`.
+    ///
+    /// Same `(scope, seed)` gives the same identifier, always and for everyone. Gated on
+    /// [`DerivableKind`], so a kind whose identifier is a bearer secret cannot reach this
+    /// (see that trait for why the gate is a compile error rather than a convention).
+    ///
+    /// The scope is hashed IN, not merely copied into the id: without it the same seed
+    /// would produce the same unique component in every environment, and one document's
+    /// identity would be textually related across tenants. It is also domain-separated
+    /// from any other use of this hash, so a derivation here can never collide with one
+    /// added later for a different purpose.
+    #[must_use]
+    pub fn derive(scope: &Scope, seed: &[u8]) -> Self
+    where
+        K: DerivableKind,
+    {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"ironauth/scoped-id/derive/v1");
+        hasher.update([0_u8]);
+        hasher.update(K::PREFIX.as_bytes());
+        hasher.update([0_u8]);
+        hasher.update(scope.tenant().bytes());
+        hasher.update(scope.environment().bytes());
+        // The seed is length-prefixed so two different seeds cannot be concatenated into
+        // the same byte string as one longer one.
+        hasher.update((seed.len() as u64).to_be_bytes());
+        hasher.update(seed);
+
+        let digest = hasher.finalize();
+        let mut unique = [0_u8; COMPONENT_BYTES];
+        unique.copy_from_slice(&digest[..COMPONENT_BYTES]);
         Self {
             tenant: scope.tenant(),
             environment: scope.environment(),
@@ -2827,6 +2914,100 @@ mod tests {
         assert_eq!(
             TenantId::generate(&env_a).to_string(),
             TenantId::generate(&env_b).to_string()
+        );
+    }
+
+    const CIMD_URL: &str = "https://app.example/client-metadata.json";
+
+    #[test]
+    fn a_derived_cimd_id_is_stable_across_calls() {
+        // The whole point of deriving rather than generating. If this were random, one
+        // document would acquire a new identity on every resolution and no grant, consent,
+        // or audit trail could accumulate against it.
+        let env = test_env();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+
+        let first = CimdClientId::derive(&scope, CIMD_URL.as_bytes());
+        let second = CimdClientId::derive(&scope, CIMD_URL.as_bytes());
+
+        assert_eq!(first, second, "the same document must be the same client");
+    }
+
+    #[test]
+    fn a_derived_cimd_id_wears_its_own_prefix_and_embeds_its_scope() {
+        let env = test_env();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+
+        let id = CimdClientId::derive(&scope, CIMD_URL.as_bytes());
+        let text = id.to_string();
+
+        assert!(
+            text.starts_with("cimc_"),
+            "an unregistered client must not read as a registration: {text}"
+        );
+        assert!(!text.starts_with("cli_"), "{text}");
+        assert_eq!(id.scope(), scope);
+        assert_eq!(
+            CimdClientId::parse_in_scope(&text, &scope).expect("in scope"),
+            id
+        );
+    }
+
+    #[test]
+    fn the_same_url_derives_a_different_id_in_a_different_environment() {
+        // The scope is hashed IN, not merely copied alongside. Without that, one
+        // document's unique component would be identical in every environment, and the
+        // identifiers would be textually related across tenancy boundaries.
+        let env = test_env();
+        let tenant = TenantId::generate(&env);
+        let one = Scope::new(tenant, EnvironmentId::generate(&env));
+        let other = Scope::new(tenant, EnvironmentId::generate(&env));
+
+        let here = CimdClientId::derive(&one, CIMD_URL.as_bytes());
+        let there = CimdClientId::derive(&other, CIMD_URL.as_bytes());
+
+        assert_ne!(
+            here.unique_bytes(),
+            there.unique_bytes(),
+            "the unique component must differ, not just the embedded scope"
+        );
+    }
+
+    #[test]
+    fn the_same_url_derives_a_different_id_in_a_different_tenant() {
+        let env = test_env();
+        let environment = EnvironmentId::generate(&env);
+        let one = Scope::new(TenantId::generate(&env), environment);
+        let other = Scope::new(TenantId::generate(&env), environment);
+
+        assert_ne!(
+            CimdClientId::derive(&one, CIMD_URL.as_bytes()).unique_bytes(),
+            CimdClientId::derive(&other, CIMD_URL.as_bytes()).unique_bytes()
+        );
+    }
+
+    #[test]
+    fn different_documents_derive_different_ids() {
+        let env = test_env();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+
+        assert_ne!(
+            CimdClientId::derive(&scope, CIMD_URL.as_bytes()),
+            CimdClientId::derive(&scope, b"https://other.example/client-metadata.json")
+        );
+    }
+
+    #[test]
+    fn a_seed_is_length_prefixed_so_two_seeds_cannot_alias() {
+        // Without the length prefix the hash input is a bare concatenation, and a seed
+        // ending where another begins would hash alike. Cheap to prevent, invisible when
+        // it goes wrong, and it goes wrong as one client answering for another.
+        let env = test_env();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+
+        assert_ne!(
+            CimdClientId::derive(&scope, b"https://a.example/mm"),
+            CimdClientId::derive(&scope, b"https://a.example/m")
         );
     }
 }
