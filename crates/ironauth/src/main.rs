@@ -4341,6 +4341,33 @@ fn serve_capture_sink(listener: std::net::TcpListener, sink: std::sync::Arc<capt
     });
 }
 
+/// Provision the schema roles and apply the schema, before the server boots.
+///
+/// Nothing else does this. `serve` does not migrate, and a freshly `initdb`-ed cluster has
+/// neither the roles the GRANTs name nor a single table, so without this step `ironauth dev`
+/// brings up a database the server cannot use and the failure surfaces as an
+/// unrelated-looking error deep in the boot rather than as "the schema is not there".
+///
+/// # Errors
+///
+/// A message naming the step that failed.
+fn prepare_dev_schema(bin_dir: &std::path::Path, database_url: &str) -> Result<(), String> {
+    dev::provision_roles(bin_dir, database_url)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        let store = ironauth_store::Store::connect(database_url)
+            .await
+            .map_err(|error| error.to_string())?;
+        store
+            .migrate()
+            .await
+            .map_err(|error| format!("could not apply the schema: {error}"))
+    })
+}
+
 /// `ironauth dev [--bind ADDR]`: run the emulator.
 ///
 /// Prepares the environment and hands off to the SAME `serve` path production uses, rather
@@ -4393,6 +4420,9 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
     // lifetime: dropping it stops the server and deletes the directory, so letting it fall
     // out of scope here would tear the database down before the server ever booted.
     let mut _cluster = None;
+    // Set only when THIS process brought the database up, which is also when it is ours to
+    // migrate.
+    let mut dev_bin_dir = None;
     let database_url = if let Ok(url) = std::env::var("DATABASE_URL") {
         url
     } else {
@@ -4402,6 +4432,7 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 return ExitCode::FAILURE;
             };
             let unique = std::process::id().to_string();
+            dev_bin_dir = Some(bin_dir.clone());
             match dev::DevCluster::start(&bin_dir, &unique) {
                 Ok(cluster) => {
                     let url = cluster.database_url.clone();
@@ -4415,6 +4446,15 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
             }
         }
     };
+
+    // Skipped when the developer supplied their own DATABASE_URL: that database is theirs,
+    // already managed by whatever manages it.
+    if let Some(bin_dir) = &dev_bin_dir {
+        if let Err(error) = prepare_dev_schema(bin_dir, &database_url) {
+            eprintln!("ironauth dev: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     let generated = dev::dev_config_toml(&database_url, &bind);
     let dir = std::env::temp_dir().join("ironauth-dev");

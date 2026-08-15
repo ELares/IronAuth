@@ -245,6 +245,48 @@ pub fn boot_env(dev_seed: Option<u64>) -> ironauth_env::Env {
     }
 }
 
+/// The roles the schema's GRANTs name. Missing any one makes every migration that grants to
+/// it fail, so they are provisioned before the chain runs.
+///
+/// The same three the test harness provisions, and for the same reason: they are created out
+/// of band in production, so a database that has only just been `initdb`-ed has none of them.
+const SCHEMA_ROLES: [&str; 3] = [
+    "ironauth_app",
+    "ironauth_control",
+    "ironauth_audit_retention",
+];
+
+/// Create the schema roles, idempotently.
+///
+/// Uses `psql` from the SAME directory the cluster came from, so this cannot silently talk to
+/// a different Postgres than the one just started. The `DO $$ ... EXCEPTION` form makes a
+/// re-run a no-op rather than an error, which matters because `ironauth dev` may be pointed
+/// at a `DATABASE_URL` that already has them.
+///
+/// # Errors
+///
+/// A message naming the role that could not be created.
+pub fn provision_roles(bin_dir: &Path, database_url: &str) -> Result<(), String> {
+    for role in SCHEMA_ROLES {
+        let sql = format!(
+            "DO $$ BEGIN CREATE ROLE {role} LOGIN PASSWORD '{role}'; \
+             EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$;"
+        );
+        let output = Command::new(bin_dir.join("psql"))
+            .args(["-d", database_url, "-v", "ON_ERROR_STOP=1", "-c", &sql])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| format!("psql for role {role}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "creating role {role}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The message shown when no Postgres binaries can be found.
 ///
 /// Names what to install and the escape hatch, because "could not start the emulator" sends
@@ -432,6 +474,38 @@ mod tests {
             .as_secs();
         // Any real clock is far past this; a frozen one would sit at the epoch.
         assert!(now > 1_600_000_000, "the clock must be real, got {now}");
+    }
+
+    /// The whole database bring-up: cluster, roles, schema. This is the path
+    /// `ironauth dev` takes on a machine with no database, and it is the one that was
+    /// BROKEN before this test existed: the cluster started and nothing ever created the
+    /// roles or applied the schema, so the server booted against an empty database and
+    /// failed deep in its own startup rather than saying the schema was missing.
+    ///
+    /// Ignored by default because it spawns a real Postgres. Run with `--ignored`.
+    #[test]
+    #[ignore = "spawns a real Postgres cluster; run with --ignored"]
+    fn the_database_is_usable_after_bring_up() {
+        let Some(bin_dir) = locate_bin_dir(std::env::var("PG_BIN").ok().as_deref()) else {
+            panic!("no Postgres binaries found; set PG_BIN");
+        };
+        let cluster = DevCluster::start(&bin_dir, "schema-selftest").expect("cluster starts");
+        provision_roles(&bin_dir, &cluster.database_url).expect("roles are created");
+        // Idempotent: `ironauth dev` may be pointed at a database that already has them.
+        provision_roles(&bin_dir, &cluster.database_url).expect("roles provision twice");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let store = ironauth_store::Store::connect(&cluster.database_url)
+                .await
+                .expect("connect");
+            store.migrate().await.expect("the schema applies");
+            // Applying twice must be a no-op, which is what makes a dev restart cheap.
+            store.migrate().await.expect("the schema is idempotent");
+        });
     }
 
     /// Loopback literals are accepted, in both families.
