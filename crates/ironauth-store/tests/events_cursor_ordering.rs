@@ -626,3 +626,99 @@ async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
         "strictly increasing: {sequences:?}"
     );
 }
+
+/// Read the whole feed through a store, retrying while the cluster-wide watermark settles.
+async fn drain_feed(
+    store: &ironauth_store::Store,
+    scope: ironauth_store::Scope,
+    want: usize,
+) -> Vec<i64> {
+    for _ in 0..100 {
+        match store
+            .scoped(scope)
+            .outbox()
+            .events_page_after(EventCursor::beginning(), 100)
+            .await
+            .expect("read")
+        {
+            EventPage::Page(events) => {
+                let seqs: Vec<i64> = events.iter().map(|m| m.sequence).collect();
+                if seqs.len() >= want {
+                    return seqs;
+                }
+            }
+            EventPage::Gone { .. } => panic!("nothing was pruned"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Vec::new()
+}
+
+#[tokio::test]
+async fn replay_from_a_cursor_is_identical_across_a_restart() {
+    // #107 criterion 1's second half, which the earlier tests did not touch: replay must be
+    // identical "across repeated reads AND ACROSS A SERVER RESTART".
+    //
+    // What that criterion is really guarding is that ordering is a property of the DATABASE
+    // and not of anything a process remembers. A feed that ordered by an in-memory counter,
+    // a cached high-water mark, or insertion order into some local structure would pass
+    // every repeated-read test and then renumber itself the first time the process died.
+    //
+    // So this reads the feed, throws the store away, reconnects as the app role exactly as
+    // a restarted server would, and asserts the same sequences in the same order, plus that
+    // every individual cursor still resolves to the same remainder.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.store().clone();
+
+    for i in 0..4 {
+        store
+            .scoped(scope)
+            .outbox()
+            .append_event(
+                &env,
+                &NewOutboxMessage {
+                    consumer: "events-replay-test",
+                    idempotency_key: &format!("evt_replay_{i}"),
+                    ordering_key: "k",
+                    payload: serde_json::json!({ "i": i }),
+                },
+            )
+            .await
+            .expect("append");
+    }
+
+    let before = drain_feed(&store, scope, 4).await;
+    assert_eq!(before.len(), 4, "all four events must be readable first");
+
+    // The restart. A NEW pool, a new Store, nothing carried over in memory.
+    let restarted = db.restart_app_store().await;
+
+    let after = drain_feed(&restarted, scope, 4).await;
+    assert_eq!(
+        after, before,
+        "the same events in the same order must survive a restart"
+    );
+
+    // Stronger than reading from the beginning twice: every INTERMEDIATE cursor must also
+    // resolve to the same remainder. A feed that renumbered itself could still agree on the
+    // full list while disagreeing about where any given cursor sits inside it.
+    for (index, sequence) in before.iter().enumerate() {
+        let remainder = match restarted
+            .scoped(scope)
+            .outbox()
+            .events_page_after(EventCursor::after_sequence(*sequence), 100)
+            .await
+            .expect("read from an intermediate cursor")
+        {
+            EventPage::Page(events) => events.iter().map(|m| m.sequence).collect::<Vec<_>>(),
+            EventPage::Gone { .. } => panic!("nothing was pruned"),
+        };
+        assert_eq!(
+            remainder,
+            before[index + 1..].to_vec(),
+            "cursor after {sequence} must resolve to the same remainder it did before"
+        );
+    }
+}
