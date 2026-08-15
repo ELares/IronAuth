@@ -133,6 +133,22 @@ impl ScopedKind for CimdClientKind {
 /// one whose [`ScopedKind::REDACT_DEBUG`] is `true`.
 pub trait DerivableKind: ScopedKind {}
 
+/// Carries the compile-time check that a [`DerivableKind`] is not a secret-bearing kind.
+///
+/// A generic associated const is evaluated per instantiation, so the assertion below fires
+/// when [`ScopedId::derive`] is first called for an offending `K`, turning the rule stated
+/// on [`DerivableKind`] into something the compiler enforces rather than something a
+/// reviewer has to remember.
+struct AssertPublicKind<K: ScopedKind>(PhantomData<K>);
+
+impl<K: ScopedKind> AssertPublicKind<K> {
+    const NOT_A_SECRET: () = assert!(
+        !K::REDACT_DEBUG,
+        "a kind that redacts its debug output holds a bearer secret, and a derivable \
+         secret can be computed rather than possessed; do not implement DerivableKind for it"
+    );
+}
+
 // A CIMD client_id IS a public HTTPS URL chosen by the requester, so an identifier derived
 // from it discloses nothing that was not already public. Every other kind must justify
 // itself the same way, on this line, where a reviewer will see it.
@@ -1891,12 +1907,26 @@ impl<K: ScopedKind> ScopedId<K> {
     /// identity would be textually related across tenants. It is also domain-separated
     /// from any other use of this hash, so a derivation here can never collide with one
     /// added later for a different purpose.
+    ///
+    /// The digest is truncated to [`COMPONENT_BYTES`], which is the SAME 128-bit unique
+    /// component every generated identifier already carries, so this spends no more of the
+    /// collision budget than the rest of the scheme does. That is a deliberate match, not
+    /// an oversight: two seeds colliding here would be two documents sharing one client
+    /// identity within a single environment, which is exactly as bad, and exactly as
+    /// unlikely, as two generated identifiers colliding.
     #[must_use]
     pub fn derive(scope: &Scope, seed: &[u8]) -> Self
     where
         K: DerivableKind,
     {
         use sha2::{Digest, Sha256};
+
+        // The link between "derivable" and "not a secret" is CHECKED, not merely written
+        // down above. A kind that redacts its debug output does so because its identifier
+        // is a bearer credential, and a bearer credential that can be derived can be
+        // computed instead of possessed. Marking such a kind `DerivableKind` now fails to
+        // compile at the first call rather than shipping behind a comment.
+        let () = AssertPublicKind::<K>::NOT_A_SECRET;
 
         let mut hasher = Sha256::new();
         hasher.update(b"ironauth/scoped-id/derive/v1");
