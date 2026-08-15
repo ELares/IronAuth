@@ -20258,6 +20258,27 @@ async fn enqueue_outbox_in_tx_ignoring_conflict(
 /// groups a SINGLETON and there is no second message to be out of order with. That is a
 /// property of that consumer, not of the substrate, and the eight consumers that follow
 /// do not inherit it.
+/// What an event-feed read returned (issue #107).
+///
+/// A page and a "your cursor fell off the window" are DIFFERENT outcomes, not a page that
+/// happens to be empty. #107 forbids silent gaps, and collapsing the two is exactly how a
+/// silent gap is served: a consumer whose cursor has aged out receives an empty page, reads
+/// it as "nothing new", and resumes from a position that skipped everything pruned in
+/// between. It never learns it lost anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventPage {
+    /// Events after the cursor, in sequence order. An EMPTY page here means "nothing new
+    /// yet", which is a genuine and common answer.
+    Page(Vec<OutboxMessage>),
+    /// The cursor points before the retained window: events the consumer had not seen have
+    /// been pruned. Carries the oldest sequence that still exists, so a consumer can
+    /// reconcile from a known point instead of guessing.
+    Gone {
+        /// The oldest sequence still retained.
+        oldest_retained: i64,
+    },
+}
+
 pub struct OutboxRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -20456,6 +20477,52 @@ impl OutboxRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence fault.
+    /// Read the event feed, distinguishing "nothing new" from "your cursor aged out"
+    /// (issue #107).
+    ///
+    /// # The rule, and its off-by-one
+    ///
+    /// The consumer has not seen anything above `after_sequence`. If the oldest sequence
+    /// still retained is greater than `after_sequence + 1`, then something in between
+    /// existed and was pruned, and the consumer missed it: that is [`EventPage::Gone`].
+    ///
+    /// The `+ 1` is the whole correctness of this. A cursor sitting exactly one below the
+    /// oldest retained event has missed NOTHING, and reporting `Gone` there would send a
+    /// healthy consumer into a full resync on every poll after the first prune.
+    ///
+    /// An empty log is a `Page`, never `Gone`: nothing was pruned, there is simply nothing
+    /// to send.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn events_page_after(
+        &self,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<EventPage, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let oldest: Option<i64> = sqlx::query_scalar(
+            "SELECT MIN(sequence) FROM outbox_messages \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        if let Some(oldest_retained) = oldest {
+            if oldest_retained > after_sequence.saturating_add(1) {
+                return Ok(EventPage::Gone { oldest_retained });
+            }
+        }
+        Ok(EventPage::Page(
+            self.events_after(after_sequence, limit).await?,
+        ))
+    }
+
     /// Read the ordered event feed after `after_sequence`, for a cursor consumer
     /// (issue #107).
     ///

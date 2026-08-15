@@ -264,7 +264,7 @@ pub use repository::{
     DynamicClientUpdate, EffectiveRoleGrant, EffectiveRoleSource, EnvelopeRepo,
     EnvironmentGuardrailRepo, EnvironmentRecord, EnvironmentRepo, EnvironmentSecretMetadata,
     EnvironmentSecretRepo, EnvironmentServingState, EnvironmentVariableRecord,
-    EnvironmentVariableRepo, ExportedCredential, ExportedRecoveryCode, ExportedTotp,
+    EnvironmentVariableRepo, EventPage, ExportedCredential, ExportedRecoveryCode, ExportedTotp,
     ExternalAssertionIssuerRecord, ExternalAssertionIssuerRepo, ExternalAssertionJtiRepo,
     FailureOutcome, FamilyImpersonation, FedcmNonceRepo, FirstPasswordOutcome,
     FrontchannelLogoutParticipant, GrantOwner, GrantedConsent, INVITATION_TOKEN_PREFIX,
