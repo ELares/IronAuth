@@ -20481,6 +20481,23 @@ pub enum EventPage {
     },
 }
 
+/// The advisory-lock key a serialized event append takes, derived from the scope.
+///
+/// Per SCOPE rather than global, so one tenant's append rate never gates another's. The
+/// hash is not a security boundary and does not need to be: a collision between two scopes
+/// costs unnecessary serialisation, never a wrong order.
+fn append_lock_key(scope: Scope) -> i64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    scope.tenant().to_string().hash(&mut hasher);
+    scope.environment().to_string().hash(&mut hasher);
+    // Postgres advisory locks take a SIGNED 64-bit key, so the cast is required rather
+    // than lossy: every bit pattern is a valid key.
+    hasher.finish() as i64
+}
+
 pub struct OutboxRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -20500,6 +20517,63 @@ impl OutboxRepo<'_> {
     ///
     /// [`StoreError::Database`] on a persistence fault, including the unique violation a
     /// second enqueue under the same `(consumer, idempotency_key)` raises.
+    /// Append an event so the feed's order IS commit order (issue #107 criterion 2).
+    ///
+    /// # Why a lock, and why no new column
+    ///
+    /// `sequence` is assigned at INSERT and visibility happens at COMMIT, so two
+    /// overlapping writers can be handed sequences in one order and commit in the other.
+    /// #805 measures that: the watermarked feed serves in sequence order, and sequence
+    /// order is not commit order.
+    ///
+    /// Taking a per-scope advisory lock that is held until COMMIT removes the overlap
+    /// rather than compensating for it. A second appender blocks before it can reach its
+    /// insert, so it cannot be handed a sequence until the first has committed. The order
+    /// sequences are handed out therefore IS the order transactions commit, necessarily
+    /// rather than usually, and no extra column is needed to record it.
+    ///
+    /// # What it costs, and what it also buys
+    ///
+    /// Writes to ONE scope serialise. That is exactly the price #798 named for a
+    /// commit-ordered appender, and it is per scope rather than global, so one tenant's
+    /// write rate does not gate another's.
+    ///
+    /// It also removes the REASON the watermark exists, though not yet the watermark
+    /// itself. With no overlapping appenders there is nothing for a cursor to skip past, so
+    /// a feed carrying only appended events would not need one.
+    ///
+    /// [`OutboxRepo::events_page_after`] still applies it unconditionally, so appended
+    /// events are still subject to the cluster-wide stall #798 measured. Dropping it would
+    /// mean proving that NOTHING reaches this table except through this method, and
+    /// `enqueue` deliberately still exists, so that is not true today. Said here rather
+    /// than left implied: a first version of this comment claimed the stall stopped
+    /// applying, and the repo-level test contradicted it within the minute.
+    ///
+    /// Ordinary [`OutboxRepo::enqueue`] is UNCHANGED and still unordered: the drain claims
+    /// rather than cursors, so it never needed this and should not pay for it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn append_event(
+        &self,
+        env: &Env,
+        message: &NewOutboxMessage<'_>,
+    ) -> Result<String, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Held until this transaction ends, by `pg_advisory_xact_lock`'s definition. That
+        // is the property the ordering rests on: releasing it before commit would let the
+        // next appender take a sequence while this one is still uncommitted.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(append_lock_key(scope))
+            .execute(&mut *tx)
+            .await?;
+        let id = enqueue_outbox_in_tx(&mut tx, env, scope, message).await?;
+        tx.commit().await?;
+        Ok(id.to_string())
+    }
+
     pub async fn enqueue(
         &self,
         env: &Env,

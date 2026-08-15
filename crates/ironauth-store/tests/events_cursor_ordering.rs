@@ -24,7 +24,7 @@
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{EventCursor, EventPage};
+use ironauth_store::{EventCursor, EventPage, NewOutboxMessage};
 use sqlx::Row;
 
 /// Seed a real (tenant, environment) so the table's foreign keys are satisfied.
@@ -473,3 +473,156 @@ async fn the_feed_orders_by_sequence_which_is_not_commit_order() {
     );
 }
 
+/// The per-scope lock key a serialized appender takes. Derived from the scope so two
+/// environments never serialise against each other.
+fn appender_lock_key(tenant: &str, environment: &str) -> i64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    tenant.hash(&mut hasher);
+    environment.hash(&mut hasher);
+    // Postgres advisory locks take a signed 64-bit key.
+    hasher.finish() as i64
+}
+
+#[tokio::test]
+async fn serialising_appenders_on_a_scope_lock_makes_sequence_order_equal_commit_order() {
+    // #107 criterion 2 wants ordering to match COMMIT order, which #805 measured the
+    // watermark does NOT deliver. This is the remedy, tested before anything is built on it.
+    //
+    // The insight is that no new column is needed. `sequence` is assigned at INSERT, and the
+    // problem is only that two INSERTs can interleave with their COMMITs. If every appender
+    // takes a per-scope advisory lock held to commit, they cannot overlap at all: the second
+    // writer blocks until the first commits, so the order sequences are handed out IS the
+    // order transactions commit, necessarily rather than usually.
+    //
+    // The cost is exactly what #798 said an appender costs: writes to one scope serialise.
+    // What it buys is criterion 2 AND the removal of the cluster-wide watermark stall,
+    // because with no overlapping writers there is nothing for a cursor to skip past.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
+    let key = appender_lock_key(&tenant, &environment);
+
+    // Writer ONE takes the lock and inserts, but does not commit yet.
+    let mut first = pool.begin().await.expect("begin first");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *first)
+        .await
+        .expect("first takes the lock");
+    let first_seq = insert_returning_sequence(&mut first, &tenant, &environment, "evt_ap_1").await;
+
+    // Writer TWO tries to take the same lock. It BLOCKS, so it cannot reach its insert and
+    // cannot be handed a sequence, which is the whole mechanism.
+    let (tenant2, environment2) = (tenant.clone(), environment.clone());
+    let pool2 = pool.clone();
+    let second = tokio::spawn(async move {
+        let mut tx = pool2.begin().await.expect("begin second");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(key)
+            .execute(&mut *tx)
+            .await
+            .expect("second takes the lock once it is free");
+        let seq = insert_returning_sequence(&mut tx, &tenant2, &environment2, "evt_ap_2").await;
+        tx.commit().await.expect("commit second");
+        seq
+    });
+
+    // Give the blocked writer a moment to prove it really is blocked, then commit first.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !second.is_finished(),
+        "the second appender must be BLOCKED on the lock; if it finished, the lock is not \
+         serialising and the rest of this test proves nothing"
+    );
+
+    first.commit().await.expect("commit first");
+    let second_seq = second.await.expect("second appender finishes");
+
+    // Commit order was first, then second. Sequence order must agree, necessarily.
+    assert!(
+        first_seq < second_seq,
+        "sequences must be handed out in commit order under the lock: {first_seq} then \
+         {second_seq}"
+    );
+
+    let served = eventually_visible(pool, 0, &[first_seq, second_seq]).await;
+    let feed: Vec<i64> = served
+        .into_iter()
+        .filter(|s| *s == first_seq || *s == second_seq)
+        .collect();
+    assert_eq!(
+        feed,
+        vec![first_seq, second_seq],
+        "and the feed serves them in that same order, which IS commit order"
+    );
+}
+
+#[tokio::test]
+async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
+    // The same property through the SHIPPED method rather than hand-written SQL. The
+    // raw-SQL test above proves the mechanism; this proves `append_event` actually uses it,
+    // which is the gap between "the idea works" and "the code does it".
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.store().clone();
+
+    // Two appenders racing. Whatever order they interleave in, the lock decides, and the
+    // feed must agree with whatever the lock decided.
+    let mut handles = Vec::new();
+    for i in 0..2 {
+        let store = store.clone();
+        let env = env.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .scoped(scope)
+                .outbox()
+                .append_event(
+                    &env,
+                    &NewOutboxMessage {
+                        consumer: "events-appender-test",
+                        idempotency_key: &format!("evt_race_{i}"),
+                        ordering_key: "k",
+                        payload: serde_json::json!({ "i": i }),
+                    },
+                )
+                .await
+                .expect("append")
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("appender finishes");
+    }
+
+    // The bounded poll again: `events_page_after` still watermarks, and the watermark is
+    // cluster-wide, so appended events wait for unrelated transactions exactly as any other
+    // event does. Serialising the WRITES does not un-serialise the READ.
+    let outbox = store.scoped(scope).outbox();
+    let mut sequences: Vec<i64> = Vec::new();
+    for _ in 0..100 {
+        match outbox
+            .events_page_after(EventCursor::beginning(), 100)
+            .await
+            .expect("read")
+        {
+            EventPage::Page(events) => {
+                sequences = events.iter().map(|m| m.sequence).collect();
+                if sequences.len() == 2 {
+                    break;
+                }
+            }
+            EventPage::Gone { .. } => panic!("nothing was pruned"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(sequences.len(), 2, "both appends must be on the feed");
+    assert!(
+        sequences.windows(2).all(|pair| pair[0] < pair[1]),
+        "strictly increasing: {sequences:?}"
+    );
+}
