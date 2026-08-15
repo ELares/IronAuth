@@ -582,6 +582,83 @@ pub fn declared_max_age(cache_control: Option<&str>) -> Option<Duration> {
     raw.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// A [`CimdDocumentSource`] backed by the SSRF-hardened outbound fetcher (issue #128).
+///
+/// This is the only production implementation, and it is deliberately thin. Every
+/// hardening rule that matters already lives in `ironauth-fetch` (special-use and private
+/// ranges refused, redirects never followed, a response cap, a timeout, HTTPS only) or in
+/// [`validate_client_id_url`] and [`validate_document`]. Re-checking any of it here would
+/// put the same rule in two places, and the copy that drifts is the one that decides.
+///
+/// What it adds is the two response-level rules a fetch alone cannot express: the
+/// content-type must say JSON, and the origin's `max-age` is read so the operator's band
+/// has something to clamp.
+pub struct FetchedCimdDocuments {
+    fetcher: std::sync::Arc<ironauth_fetch::Fetcher>,
+}
+
+impl FetchedCimdDocuments {
+    /// Wrap a shared hardened fetcher.
+    #[must_use]
+    pub fn new(fetcher: std::sync::Arc<ironauth_fetch::Fetcher>) -> Self {
+        Self { fetcher }
+    }
+}
+
+/// Turn a fetched response into a [`CimdResponse`], or refuse it.
+///
+/// Split out from the fetch so the response RULES are testable without a socket. They are
+/// the two a fetch alone cannot express, and both are refusals a network test would only
+/// exercise by accident.
+///
+/// `None` means "not a document": a non-2xx (an error page must not be allowed to define a
+/// client) or a content type that does not say JSON. An `Option` rather than a
+/// `Result<_, ()>` because the refusal genuinely carries nothing, deliberately: why a
+/// document was rejected is the fetcher's to log, and letting it reach a caller would
+/// invite it into a response an unauthenticated party can read.
+#[must_use]
+pub fn document_from_response(
+    url: &str,
+    response: &ironauth_fetch::FetchResponse,
+) -> Option<CimdResponse> {
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let header = |name: &str| -> Option<&str> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+
+    if !is_json_document(header("content-type")) {
+        return None;
+    }
+
+    Some(CimdResponse {
+        // The fetcher refuses redirects non-tunably, so the response came from the URL that
+        // was requested. `validate_document` still compares the two: this is the value that
+        // makes its check meaningful the day that stops being true.
+        final_url: url.to_owned(),
+        max_age: declared_max_age(header("cache-control")),
+        body: response.body().to_vec(),
+    })
+}
+
+impl CimdDocumentSource for FetchedCimdDocuments {
+    fn get<'a>(&'a self, url: &'a str) -> CimdFetchFuture<'a> {
+        Box::pin(async move {
+            let request = ironauth_fetch::FetchRequest::get(
+                ironauth_fetch::FetchPurpose::ClientMetadata,
+                url,
+            );
+            let response = self.fetcher.fetch(request).await.map_err(|_| ())?;
+            document_from_response(url, &response).ok_or(())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1094,6 +1171,103 @@ mod tests {
         now: SystemTime,
     ) -> Result<ResolvedCimdClient, CimdResolveError> {
         resolve_cimd_client(GOOD, source, cache, policy(allow, deny), now).await
+    }
+
+    fn response(
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> ironauth_fetch::FetchResponse {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in headers {
+            map.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                http::HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        ironauth_fetch::FetchResponse {
+            status: http::StatusCode::from_u16(status).expect("status"),
+            headers: map,
+            body: body.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_json_response_becomes_a_document_carrying_its_max_age() {
+        let body = document(GOOD);
+        let fetched = document_from_response(
+            GOOD,
+            &response(
+                200,
+                &[
+                    ("content-type", "application/json"),
+                    ("cache-control", "public, max-age=600"),
+                ],
+                &body,
+            ),
+        )
+        .expect("a json 200 is a document");
+
+        assert_eq!(fetched.final_url, GOOD);
+        assert_eq!(fetched.body, body);
+        assert_eq!(fetched.max_age, Some(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn an_error_page_is_not_a_document() {
+        // Without the status check a 404 body would define a client, and the body of an
+        // error page is chosen by whoever serves the URL just as freely as a real one.
+        assert!(
+            document_from_response(
+                GOOD,
+                &response(404, &[("content-type", "application/json")], b"{}")
+            )
+            .is_none()
+        );
+        assert!(
+            document_from_response(
+                GOOD,
+                &response(
+                    500,
+                    &[("content-type", "application/json")],
+                    &document(GOOD)
+                )
+            )
+            .is_none(),
+            "a 500 serving a PERFECTLY VALID document is still not a document"
+        );
+    }
+
+    #[test]
+    fn a_non_json_response_is_refused_however_valid_its_body() {
+        // The body here would pass `validate_document`. The content type is the only thing
+        // refusing it, so this fails if the check is dropped.
+        assert!(
+            document_from_response(
+                GOOD,
+                &response(200, &[("content-type", "text/html")], &document(GOOD))
+            )
+            .is_none()
+        );
+        assert!(document_from_response(GOOD, &response(200, &[], &document(GOOD))).is_none());
+    }
+
+    #[test]
+    fn a_response_that_says_nothing_about_caching_carries_no_max_age() {
+        let fetched = document_from_response(
+            GOOD,
+            &response(
+                200,
+                &[("content-type", "application/json")],
+                &document(GOOD),
+            ),
+        )
+        .expect("still a document");
+
+        assert_eq!(
+            fetched.max_age, None,
+            "silence must reach the clamp as silence, so the floor answers it"
+        );
     }
 
     #[test]
