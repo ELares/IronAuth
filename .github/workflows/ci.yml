@@ -211,6 +211,30 @@ jobs:
         with:
           command: check
 
+  dev-boot-time:
+    name: emulator boots and serves within its budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The emulator brings up its OWN throwaway cluster, so this job needs the Postgres
+      # BINARIES but no Postgres service: `initdb` and `pg_ctl`, which is exactly what
+      # `dev` looks for. A service container would measure the wrong thing, because a
+      # database somebody else already started is not the cold path a user experiences.
+      - name: Install PostgreSQL binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql
+      - run: cargo build -p ironauth --bin ironauth
+      # Issue #121 criterion 1. The measured instant is discovery answering 200, not the
+      # process starting: a server that has bound its socket but has no signing key answers
+      # 404, and calling that "ready" would let the emulator regress into exactly the state
+      # it shipped in twice during this issue -- up, quiet, and useless.
+      - name: Measure boot to serving
+        run: PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) ./scripts/dev-boot-time.sh
+
   invariants:
     name: invariant lints, dash scan, compat matrix
     runs-on: ubuntu-latest

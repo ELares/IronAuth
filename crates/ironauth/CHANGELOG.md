@@ -6,6 +6,32 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator's boot time is MEASURED and asserted (issue #121, criterion 1).**
+  `scripts/dev-boot-time.sh` times `ironauth dev` from launch to serving and fails over
+  budget; a CI job runs it. Measured 1.16s against a 5 second budget, on a debug build.
+
+  - **The measured instant is discovery answering 200**, not the process starting, not a log
+    line, not the port opening. A server that has bound its socket but has no signing key
+    answers 404, and calling that "ready" would let the emulator regress into exactly the
+    state it shipped in TWICE during this issue: up, quiet, and useless.
+
+  - **The whole cold path is inside the measurement** -- locate Postgres, initdb, start the
+    cluster, provision roles, apply the schema, seed the scope and client, provision the
+    signing key, boot the server -- because all of it happens before a user can do anything.
+    `DATABASE_URL` is deliberately unset: measuring against a database somebody already
+    started would report a number no user experiences.
+
+  - **It polls rather than sleeping.** A fixed sleep measures the sleep.
+
+  - **The assertion is proved to FAIL**, not merely to pass: run with `BUDGET_SECS=0.01` it
+    exits non-zero, and cleans up its cluster on that path too. A budget check that cannot
+    fail is not a check.
+
+  - **The CI job installs the Postgres BINARIES, not a service container.** The emulator
+    brings up its own cluster, and a database somebody else already started is not the cold
+    path this measures.
+
+
 - **The emulator seeds a usable CLIENT (issue #121).** `ironauth dev` now prints an issuer and
   a `client_id`, and the authorization endpoint accepts it: discovery 200, JWKS 200,
   `/authorize` 303 to the login page.
