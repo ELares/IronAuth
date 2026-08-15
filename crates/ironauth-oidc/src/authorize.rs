@@ -622,7 +622,7 @@ async fn resolve_pushed_request(
 async fn consume_pushed_request(
     state: &OidcState,
     scope: Scope,
-    client_id: &ClientId,
+    client_id: StoredClientId<'_>,
     context: &PushedContext,
 ) -> Result<bool, AuthorizeError> {
     // Attribute the consume audit to the client the code is for, exactly as the code
@@ -822,14 +822,19 @@ async fn issue_code(
     //     least one. Every violation is `invalid_target`, delivered through the
     //     negotiated mode (the redirect_uri is validated by now). This runs before the
     //     login/consent gate so a rejection never triggers an interaction.
-    validate_authorize_resources(state, scope, &client_id, &params.resources)
-        .await
-        .map_err(|code| {
-            redirect_error(
-                code,
-                "the requested resource is invalid, unknown, or not allowed",
-            )
-        })?;
+    validate_authorize_resources(
+        state,
+        scope,
+        StoredClientId::Registered(&client_id),
+        &params.resources,
+    )
+    .await
+    .map_err(|code| {
+        redirect_error(
+            code,
+            "the requested resource is invalid, unknown, or not allowed",
+        )
+    })?;
 
     // 6. Establish the authenticated subject and their consent, applying prompt and
     //    max_age. A missing session, missing consent, or a forced (re-)authentication
@@ -851,7 +856,7 @@ async fn issue_code(
         state,
         headers,
         &client,
-        &client_id,
+        StoredClientId::Registered(&client_id),
         &params,
         effective_scope.as_deref(),
         redirect_uri,
@@ -998,7 +1003,14 @@ async fn issue_code(
     //     round-trip never burns the pending request; the consume's audit row is
     //     written on the winning branch only.
     if let Some(context) = pushed {
-        if !consume_pushed_request(state, scope, &client_id, context).await? {
+        if !consume_pushed_request(
+            state,
+            scope,
+            StoredClientId::Registered(&client_id),
+            context,
+        )
+        .await?
+        {
             return Err(AuthorizeError::page(
                 "the request_uri is invalid, expired, or already used",
             ));
@@ -1018,7 +1030,7 @@ async fn issue_code(
             persist_code(
                 state,
                 scope,
-                &client_id,
+                StoredClientId::Registered(&client_id),
                 redirect_uri,
                 &iss,
                 mode,
@@ -1033,7 +1045,7 @@ async fn issue_code(
         let minted = mint_front_channel_id_token(
             state,
             scope,
-            &client_id,
+            StoredClientId::Registered(&client_id),
             &iss,
             response_type,
             &resolved,
@@ -1161,7 +1173,7 @@ struct FrontChannelSession {
 async fn mint_front_channel_id_token(
     state: &OidcState,
     scope: Scope,
-    client_id: &ClientId,
+    client_id: StoredClientId<'_>,
     iss: &str,
     response_type: ResponseType,
     resolved: &Resolved<'_>,
@@ -2178,7 +2190,7 @@ async fn resolve_gate(
     state: &OidcState,
     headers: &HeaderMap,
     client: &ResolvedClient<'_>,
-    client_id: &ClientId,
+    client_id: StoredClientId<'_>,
     params: &AuthorizeParams,
     effective_scope: Option<&str>,
     redirect_uri: &str,
@@ -2427,7 +2439,7 @@ async fn audit_skipped_consent(
     state: &OidcState,
     scope: Scope,
     subject: &str,
-    client_id: &ClientId,
+    client_id: StoredClientId<'_>,
     detail: &str,
 ) -> Result<(), ()> {
     let actor = interaction::subject_actor(state, scope, subject);
@@ -2452,7 +2464,7 @@ async fn audit_skipped_consent(
 async fn resolve_consent_gate(
     state: &OidcState,
     client: &ResolvedClient<'_>,
-    client_id: &ClientId,
+    client_id: StoredClientId<'_>,
     params: &AuthorizeParams,
     effective_scope: Option<&str>,
     session: interaction::AuthenticatedSession,
@@ -3176,7 +3188,7 @@ async fn resolve_org_context(
 pub(crate) async fn validate_authorize_resources(
     state: &OidcState,
     scope: Scope,
-    client_id: &ClientId,
+    client_id: StoredClientId<'_>,
     resources: &[String],
 ) -> Result<(), AuthzErrorCode> {
     let policy = state
@@ -3214,7 +3226,7 @@ pub(crate) async fn validate_authorize_resources(
 async fn persist_code(
     state: &OidcState,
     scope: Scope,
-    client_id: &ClientId,
+    client_id: StoredClientId<'_>,
     redirect_uri: &str,
     iss: &str,
     mode: ResponseMode,
@@ -3245,7 +3257,7 @@ async fn persist_code(
 async fn issue_code_core(
     state: &OidcState,
     scope: Scope,
-    client_id: &ClientId,
+    client_id: StoredClientId<'_>,
     redirect_uri: &str,
     browserless: bool,
     resolved: &Resolved<'_>,
@@ -3258,7 +3270,7 @@ async fn issue_code_core(
     let issue = IssueCode {
         code_id: &code_id,
         grant_id: &grant_id,
-        client_id: StoredClientId::Registered(client_id),
+        client_id,
         redirect_uri,
         browserless,
         nonce: resolved.nonce,
@@ -3346,7 +3358,7 @@ pub(crate) struct ChallengeCodeContext<'a> {
 pub(crate) async fn mint_challenge_code(
     state: &OidcState,
     scope: Scope,
-    client_id: &ClientId,
+    client_id: StoredClientId<'_>,
     context: &ChallengeCodeContext<'_>,
 ) -> Result<String, ()> {
     // FORK E: perform the consent-reference IO the shared core dictated. `RecordSkipped` persists a

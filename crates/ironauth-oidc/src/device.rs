@@ -37,7 +37,8 @@ use ironauth_env::Env;
 use ironauth_store::{
     ApprovedDeviceGrant, ClientId, CorrelationId, DeviceCodeId, DevicePollOutcome,
     DeviceRedeemOutcome, IssuedTokenRecord, NewDeviceCode, NewOpaqueAccessToken, NewRefreshFamily,
-    RefreshFamilyId, RefreshFamilyOpenOutcome, Scope, SessionId, StoreError, TokenKind,
+    RefreshFamilyId, RefreshFamilyOpenOutcome, Scope, SessionId, StoreError, StoredClientId,
+    TokenKind,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -327,7 +328,7 @@ async fn device_authorization_inner(
         let (user_code_display, user_code_normalized) = generate_user_code(state.env());
         let digest = ironauth_store::device_code_digest(&device_code);
         let user_hash = ironauth_store::user_code_hash(&user_code_normalized);
-        let actor = client_service_actor(&client_id);
+        let actor = client_service_actor(StoredClientId::Registered(&client_id));
         let correlation = CorrelationId::generate(state.env());
         let result = state
             .store()
@@ -487,9 +488,9 @@ async fn issue_device_tokens(
         }),
     };
 
-    let actor = client_service_actor(
-        &ClientId::parse_in_scope(&grant.client_id, &scope).map_err(|_| TokenError::ServerError)?,
-    );
+    let device_client =
+        ClientId::parse_in_scope(&grant.client_id, &scope).map_err(|_| TokenError::ServerError)?;
+    let actor = client_service_actor(StoredClientId::Registered(&device_client));
     let correlation = CorrelationId::generate(state.env());
     let outcome = state
         .store()
@@ -713,7 +714,7 @@ async fn issue_device_refresh(
     let Ok(client_id) = ClientId::parse_in_scope(&grant.client_id, &scope) else {
         return Ok(None);
     };
-    let actor = client_service_actor(&client_id);
+    let actor = client_service_actor(StoredClientId::Registered(&client_id));
     let correlation = CorrelationId::generate(state.env());
     let result = state
         .store()

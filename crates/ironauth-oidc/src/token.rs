@@ -61,7 +61,7 @@ use ironauth_store::{
     IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, OrganizationId, RedeemOutcome,
     RefreshFamilyId, RefreshFamilyOpenOutcome, RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId,
     RefreshTokenResolution, RotatedRefreshToken, Scope, ServiceId, SessionId, StoreError,
-    TokenKind, TokenSizeReason, UserId,
+    StoredClientId, TokenKind, TokenSizeReason, UserId,
 };
 use serde::Deserialize;
 
@@ -1432,7 +1432,7 @@ async fn resolve_code_exchange_target(
         .store()
         .scoped(scope)
         .clients()
-        .resource_policy(&client_id)
+        .resource_policy(StoredClientId::Registered(&client_id))
         .await
         .map_err(map_store_error)?;
     // Every NAMED resource must be a valid indicator and on the client's allowlist.
@@ -1647,7 +1647,7 @@ fn token_response(
 /// so a malformed stored value never fails an otherwise-valid exchange.
 fn client_actor(state: &OidcState, scope: Scope, client_id: &str) -> ActorRef {
     match ClientId::parse_in_scope(client_id, &scope) {
-        Ok(id) => client_service_actor(&id),
+        Ok(id) => client_service_actor(StoredClientId::Registered(&id)),
         Err(_) => ActorRef::service(ServiceId::generate(state.env())),
     }
 }
@@ -2481,7 +2481,7 @@ async fn resolve_refresh_target(
         .store()
         .scoped(scope)
         .clients()
-        .resource_policy(client_id)
+        .resource_policy(StoredClientId::Registered(client_id))
         .await
         .map_err(map_store_error)?;
     if !resource::resources_permitted(resources, &policy) {

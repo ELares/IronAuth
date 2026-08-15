@@ -2883,7 +2883,10 @@ impl ClientRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the identifier is out of this scope or no client
     /// matches; [`StoreError::Database`] on a persistence failure.
-    pub async fn resource_policy(&self, id: &ClientId) -> Result<ClientResourcePolicy, StoreError> {
+    pub async fn resource_policy(
+        &self,
+        id: StoredClientId<'_>,
+    ) -> Result<ClientResourcePolicy, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -35616,7 +35619,7 @@ impl ActingConsentRepo<'_> {
     pub async fn audit_skipped_consent(
         &self,
         env: &Env,
-        client_id: &ClientId,
+        client_id: StoredClientId<'_>,
         detail: &str,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
@@ -35629,7 +35632,7 @@ impl ActingConsentRepo<'_> {
                 acting: &self.acting,
                 env,
                 action: Action::ConsentSkipped,
-                target: client_id,
+                target: &client_id,
             },
             Some(detail),
         )

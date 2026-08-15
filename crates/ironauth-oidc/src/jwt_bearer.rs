@@ -96,7 +96,7 @@ use ironauth_jose::{
 use ironauth_store::{
     ClientAuthDiagnosticReason, ClientCredentialsAccess, ClientId, CorrelationId,
     ExternalAssertionIssuerRecord, GrantId, IssueClientCredentials, JtiOutcome,
-    NewClientAuthDiagnostic, NewOpaqueAccessToken, Scope, UserId,
+    NewClientAuthDiagnostic, NewOpaqueAccessToken, Scope, StoredClientId, UserId,
 };
 use serde_json::Value;
 
@@ -775,7 +775,7 @@ async fn mint_and_persist(
         .store()
         .scoped(scope)
         .acting(
-            client_service_actor(&client_id),
+            client_service_actor(StoredClientId::Registered(&client_id)),
             CorrelationId::generate(state.env()),
         )
         .authorization()

@@ -9,7 +9,7 @@
 
 use std::time::SystemTime;
 
-use ironauth_store::{ActorRef, ClientId, ServiceId};
+use ironauth_store::{ActorRef, ServiceId};
 
 /// The stable audit service-actor for an OAuth client.
 ///
@@ -20,7 +20,7 @@ use ironauth_store::{ActorRef, ClientId, ServiceId};
 /// component (never a secret) exactly as a management key derives its audit actor,
 /// so it is stable across requests and nodes without storing anything.
 #[must_use]
-pub fn client_service_actor(client_id: &ClientId) -> ActorRef {
+pub fn client_service_actor(client_id: ironauth_store::StoredClientId<'_>) -> ActorRef {
     ActorRef::service(ServiceId::from_seed_bytes(client_id.unique_bytes()))
 }
 

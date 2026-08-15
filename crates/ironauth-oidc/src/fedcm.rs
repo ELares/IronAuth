@@ -60,7 +60,9 @@
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_store::{ClientId, ClientRecord, CorrelationId, FedcmNonceId, StoreError, UserId};
+use ironauth_store::{
+    ClientId, ClientRecord, CorrelationId, FedcmNonceId, StoreError, StoredClientId, UserId,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -612,7 +614,7 @@ pub(crate) async fn assertion(
     // Audit the issuance (who = the session subject, which client), targeting the
     // consumed nonce; the token value is NEVER recorded. A failed audit fails closed:
     // an assertion that cannot be recorded is not returned.
-    let actor = client_service_actor(&client_id);
+    let actor = client_service_actor(StoredClientId::Registered(&client_id));
     let correlation = CorrelationId::generate(state.env());
     if state
         .store()

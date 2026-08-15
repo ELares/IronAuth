@@ -51,6 +51,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
     ClientId, CorrelationId, GrantId, GrantOwner, IssuedTokenId, RefreshTokenId, Scope, StoreError,
+    StoredClientId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -475,7 +476,7 @@ fn revoke_actor(
     client_id: &str,
 ) -> (ironauth_store::ActorRef, CorrelationId) {
     let actor = match ClientId::parse_in_scope(client_id, &scope) {
-        Ok(id) => client_service_actor(&id),
+        Ok(id) => client_service_actor(StoredClientId::Registered(&id)),
         Err(_) => {
             ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(state.env()))
         }

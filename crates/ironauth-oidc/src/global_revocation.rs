@@ -84,7 +84,8 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    ActorRef, ClientId, CorrelationId, Scope, ServiceId, StoreError, UserId, UserRevocation,
+    ActorRef, ClientId, CorrelationId, Scope, ServiceId, StoreError, StoredClientId, UserId,
+    UserRevocation,
 };
 use serde::Deserialize;
 
@@ -254,7 +255,7 @@ fn publish_terminal_signals(state: &OidcState, scope: &Scope, outcome: &UserRevo
 /// generated service actor rather than failing the revocation.
 fn revoke_actor(state: &OidcState, scope: Scope, client_id: &str) -> ActorRef {
     match ClientId::parse_in_scope(client_id, &scope) {
-        Ok(id) => client_service_actor(&id),
+        Ok(id) => client_service_actor(StoredClientId::Registered(&id)),
         Err(_) => ActorRef::service(ServiceId::generate(state.env())),
     }
 }
