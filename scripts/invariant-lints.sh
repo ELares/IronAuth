@@ -73,6 +73,14 @@ scan() {
   allow_report="${allow_report}  ${rule}: ${allows}/${allow_ceiling} exemptions\n"
 }
 
+# A DERIVABLE identifier is computable by anyone who knows its inputs. That is correct for a
+# CIMD client, whose client_id is a public URL, and catastrophic for a kind whose identifier
+# doubles as a bearer secret: a derivable AuthorizationCodeId could be COMPUTED rather than
+# possessed. The compiler already gates `ScopedId::derive` on the marker; this stops the
+# marker itself from being handed out quietly. Every impl must carry the exemption, so adding
+# one is a reviewable line in the diff rather than a trait impl nobody reads.
+scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
+
 scan time-via-env 'SystemTime::now|Instant::now' 2
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
