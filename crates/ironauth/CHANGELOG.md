@@ -6,6 +6,32 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Deterministic secrets in the emulator (issue #121).** `ironauth dev [--seed N]` makes every
+  generated secret reproducible: OTP codes, identifiers, client secrets. That is what criterion
+  2 needs to assert a complete email-OTP login against a named code.
+
+  - **Entropy is replaced, the CLOCK is not.** `Env::deterministic` would freeze time, and a
+    server whose clock never advances cannot expire a token or a code, so the emulator would
+    diverge from production in exactly the behaviour most tests are about. Only the entropy
+    seam is swapped, through `Env::from_parts`.
+
+  - **The seed defaults to a FIXED value, not a random one.** Two runs on two machines must
+    produce the same codes, or a CI script cannot name the value it expects. Reproducibility by
+    accident is not reproducibility.
+
+  - **This is the other half of why dev mode refuses a non-loopback bind.** A deployment whose
+    secrets are a function of a published seed has no secrets at all, so the guard and this
+    feature are two ends of one decision.
+
+  - **The selection is a FUNCTION because the wiring is what can be wrong.** The first version
+    inlined it in `serve` and tested `Env::from_parts` directly. Measured: a mutant that ignored
+    the seed entirely compiled and failed no test, because the tests proved the primitive while
+    the thing that could break -- whether the boot path consults the seed at all -- was
+    unproved. `boot_env` is now called by `serve` and asserted directly, and that same mutant is
+    caught. The test also pins the direction that matters most: with NO dev seed the entropy
+    must be real, or production would ship fixed secrets.
+
+
 - **The emulator's message capture sink (issue #121, criterion 5).** Email and SMS one-time
   codes are captured and readable, so CI can assert a complete login without a mail server.
 

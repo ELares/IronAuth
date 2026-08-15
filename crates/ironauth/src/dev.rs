@@ -222,6 +222,29 @@ fn run_step(program: &Path, args: &[&str], step: &str) -> Result<(), String> {
     ))
 }
 
+/// The `Env` the server boots with: deterministic entropy under a dev seed, the system one
+/// otherwise, and a REAL clock either way.
+///
+/// A function rather than an expression inline in `serve`, so the SELECTION is testable.
+/// Testing `Env::from_parts` directly would prove the primitive works and leave the thing
+/// that can actually be wrong -- whether the boot path consults the seed at all -- unproved.
+/// Measured: with the selection inline, a mutant that ignored the seed entirely compiled and
+/// failed no test.
+///
+/// The clock stays real under a seed. `Env::deterministic` would freeze time, and a server
+/// whose clock never advances cannot expire a token or a code, so the emulator would diverge
+/// from production in exactly the behaviour most tests are about.
+#[must_use]
+pub fn boot_env(dev_seed: Option<u64>) -> ironauth_env::Env {
+    match dev_seed {
+        Some(seed) => ironauth_env::Env::from_parts(
+            std::sync::Arc::new(ironauth_env::SystemClock),
+            std::sync::Arc::new(ironauth_env::FixedEntropy::new(seed)),
+        ),
+        None => ironauth_env::Env::system(),
+    }
+}
+
 /// The message shown when no Postgres binaries can be found.
 ///
 /// Names what to install and the escape hatch, because "could not start the emulator" sends
@@ -364,6 +387,51 @@ mod tests {
             !workdir.exists(),
             "dropping the cluster must delete {workdir:?}"
         );
+    }
+
+    /// The property criterion 2 rests on: the SAME seed yields the same bytes, so a CI
+    /// script can name the code it expects rather than scraping it back.
+    ///
+    /// Asserted through `Env::from_parts` exactly as the boot path builds it, not through
+    /// `FixedEntropy` alone: the claim that matters is about what the SERVER will generate,
+    /// and testing the primitive would leave the wiring unproved.
+    #[test]
+    fn the_same_seed_yields_the_same_secrets() {
+        let draw = |seed: Option<u64>| {
+            let env = boot_env(seed);
+            let mut bytes = [0_u8; 16];
+            env.entropy().fill_bytes(&mut bytes);
+            bytes
+        };
+        assert_eq!(draw(Some(1)), draw(Some(1)), "the same seed must reproduce");
+        assert_ne!(
+            draw(Some(1)),
+            draw(Some(2)),
+            "a different seed must diverge, or --seed does nothing"
+        );
+        // And NO seed must not be deterministic, or production would ship fixed secrets.
+        // That is the direction of this pair that actually matters.
+        assert_ne!(
+            draw(None),
+            draw(None),
+            "without a dev seed the entropy must be real"
+        );
+    }
+
+    /// The clock stays REAL under a dev seed. `Env::deterministic` would freeze time, and a
+    /// server whose clock never advances cannot expire a token or a code, so the emulator
+    /// would diverge from production in exactly the behaviour most tests are about.
+    #[test]
+    fn a_dev_seed_does_not_freeze_the_clock() {
+        let env = boot_env(Some(1));
+        let now = env
+            .clock()
+            .now_utc()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        // Any real clock is far past this; a frozen one would sit at the epoch.
+        assert!(now > 1_600_000_000, "the clock must be real, got {now}");
     }
 
     /// Loopback literals are accepted, in both families.

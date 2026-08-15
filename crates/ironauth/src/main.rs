@@ -300,7 +300,8 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             }
         }
 
-        let env = Env::system();
+        // Deterministic entropy in dev mode, a REAL clock in both. See `DEV_ENTROPY_SEED`.
+        let env = dev::boot_env(DEV_ENTROPY_SEED.get().copied());
 
         // Install the process-wide Prometheus recorder BEFORE anything describes a
         // metric. The data-plane assembly below registers the help and type text for
@@ -4296,6 +4297,18 @@ fn print_probe_report(report: &ironauth_oidc::ProbeReport) {
 /// Drives the RFC 8628 device flow and stores the result in the platform keychain. The
 /// loop itself lives in `login.rs` over injected endpoints, so it is tested without a
 /// network; this function is the production wiring of those endpoints.
+/// The dev entropy seed, installed by `ironauth dev` before the server boots.
+///
+/// Set means "make every generated secret reproducible": OTP codes, identifiers, client
+/// secrets. That is what the issue means by deterministic secrets, and it is the whole
+/// reason `dev` refuses a non-loopback bind, because a deployment whose secrets are a
+/// function of a published seed has no secrets at all.
+///
+/// The CLOCK stays real. `Env::deterministic` would freeze time, and a server whose clock
+/// never advances cannot expire a token or a code, so the emulator would diverge from
+/// production in exactly the behaviour most tests are about. Only the entropy is replaced.
+static DEV_ENTROPY_SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
 /// The dev capture sink, installed by `ironauth dev` before the server boots.
 ///
 /// A process-global set ONCE, rather than an `Option` threaded through `serve`,
@@ -4335,8 +4348,22 @@ fn serve_capture_sink(listener: std::net::TcpListener, sink: std::sync::Arc<capt
 /// invisible precisely because dev is where nobody looks for a production difference.
 fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
     let mut bind = "127.0.0.1:8080".to_owned();
+    // A FIXED default, not a random one: two runs on two machines must produce the same
+    // codes, or a CI script cannot name the value it expects.
+    let mut seed = 1_u64;
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--seed" => {
+                let Some(value) = args.next() else {
+                    eprintln!("ironauth dev: --seed needs a value");
+                    return ExitCode::FAILURE;
+                };
+                let Ok(parsed) = value.parse::<u64>() else {
+                    eprintln!("ironauth dev: --seed must be a number, got '{value}'");
+                    return ExitCode::FAILURE;
+                };
+                seed = parsed;
+            }
             "--bind" => {
                 let Some(value) = args.next() else {
                     eprintln!("ironauth dev: --bind needs a value");
@@ -4403,6 +4430,10 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+
+    // Deterministic secrets, installed BEFORE the server boots. The guard above has already
+    // refused a non-loopback bind, which is what makes this safe to do at all.
+    let _ = DEV_ENTROPY_SEED.set(seed);
 
     // The capture sink, installed BEFORE the server boots so `build_oidc_plane` sees it.
     let sink = std::sync::Arc::new(capture::CaptureSink::default());
@@ -4786,7 +4817,8 @@ fn print_help() {
     println!("  ironauth hash-probe [--config PATH] [--memory-budget KIB] [--json]");
     println!("                                   Measure Argon2id on this host and");
     println!("                                   recommend parameters (issue #62)");
-    println!("  ironauth dev [--bind ADDR]      Run the local emulator (loopback only)");
+    println!("  ironauth dev [--bind ADDR] [--seed N]");
+    println!("                                   Run the local emulator (loopback only)");
     println!("  ironauth login --issuer URL --client-id ID [--account NAME]");
     println!("                                   Sign in via the RFC 8628 device flow");
     println!("  ironauth logout [--account NAME] Remove stored credentials for a");
