@@ -575,6 +575,52 @@ async fn impersonation_succeeds_only_with_an_explicit_policy() {
         claims["act"].is_null(),
         "impersonation must not record an actor in the token (RFC 8693 1.1): {claims}"
     );
+
+    // The audit row is the WHOLE accountability story for impersonation, because the
+    // paragraph above establishes there is no actor in the token to fall back on. Until
+    // this assertion existed the requirement was carried by the comment alone: the row
+    // was written, but nothing would have noticed if it stopped being.
+    assert_eq!(
+        harness.count_audit_action("token_exchange.issue").await,
+        1,
+        "an impersonation exchange must leave exactly one audit row"
+    );
+}
+
+/// The audit row is written for a NON-impersonation exchange too.
+///
+/// Asserting it only on the impersonation path would leave the ordinary downscope free to
+/// stop auditing unnoticed, and the issue's requirement is "every exchange emits an audit
+/// event" rather than "every impersonation does".
+#[tokio::test]
+async fn every_exchange_emits_an_audit_event_not_only_impersonation() {
+    let harness = harness().await;
+    let (client, secret) = exchanging_client(&harness).await;
+    let subject = access_token_for(&harness, &client, &secret).await;
+
+    assert_eq!(
+        harness.count_audit_action("token_exchange.issue").await,
+        0,
+        "no exchange has happened yet, so the count must start at zero"
+    );
+
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &subject),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a self downscope must succeed: {body}");
+
+    assert_eq!(
+        harness.count_audit_action("token_exchange.issue").await,
+        1,
+        "a downscope exchange must leave exactly one audit row"
+    );
 }
 
 /// A token from ANOTHER TENANT does not resolve at all.
