@@ -99,11 +99,24 @@ impl CaptureSink {
         if messages.len() == CAPACITY {
             messages.pop_front();
         }
-        // Printed as well as stored: the issue asks for both, and a developer watching the
-        // terminal should not have to curl to see the code they are waiting for.
-        println!(
-            "ironauth dev: captured {} to {}: {}",
-            captured.kind, captured.recipient, captured.body
+        // Through TRACING, never `println!`. Measured (#842): a `println!` here wedged the
+        // entire server on the first delivery -- discovery, JWKS and the token endpoint all
+        // stopped answering. This runs synchronously inside an async request handler, and
+        // `println!` takes the process-wide stdout lock that the tracing writer also uses,
+        // so a delivery could sit on it and take an executor worker down with it.
+        //
+        // `tracing` is the writer every other line in this process already goes through, and
+        // it is built for exactly this call site. Instrumented proof of the diagnosis: an
+        // `eprintln!` probe at the top of this function printed and the next statement never
+        // did.
+        //
+        // Surfaced as well as stored, because the issue asks for both and a developer
+        // watching the terminal should not have to curl to see the code they are waiting for.
+        tracing::info!(
+            kind = captured.kind,
+            recipient = %captured.recipient,
+            body = %captured.body,
+            "ironauth dev: captured message"
         );
         messages.push_back(captured);
     }
