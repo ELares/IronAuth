@@ -314,6 +314,8 @@ jobs:
         run: scripts/dash-scan.sh
       - name: emulator doc freshness (the documented CI recipe's OTP code matches CI's pin)
         run: scripts/emulator-doc-freshness.sh
+      - name: no plaintext credentials (no login path writes a token to a file)
+        run: scripts/no-plaintext-credentials.sh
       - name: discovery scan (no static discovery JSON; generated at serve time)
         run: scripts/discovery-scan.sh
       - name: rfc9700 scan (every OAuth endpoint bound to a conformance test)

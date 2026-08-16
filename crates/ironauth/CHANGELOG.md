@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **No login path can write a credential to a file, and that is now checked (issue #120,
+  criterion 4).** The criterion's second half, "no plaintext token files exist after login in
+  default mode", had no assertion of any kind. `scripts/no-plaintext-credentials.sh` (gate + CI)
+  proves it structurally rather than by looking for files after a login: a filesystem assertion
+  can only look where it thought to look, proves nothing about a path it did not imagine, and on
+  a machine with no keychain does not run at all.
+
+  Two facts, both checked, because either alone stops being true quietly: the modules a
+  credential passes through name no file-writing API, and the only `CredentialStore` compiled
+  into the shipped binary is the keychain-backed one. The second is what makes the first worth
+  having -- a `FileStore` added "for testing" but not gated behind `cfg(test)` writes files in
+  its own module, satisfying the first check while putting tokens on disk.
+
 - **`ironauth login`'s fallback to the device flow is now a tested decision rather than inline
   branching (issue #120, criterion 3).** The criterion has two halves: loopback is selected
   automatically when a browser is available, and it "falls back cleanly to device flow when the

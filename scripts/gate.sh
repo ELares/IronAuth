@@ -155,6 +155,9 @@ scripts/dash-scan.sh
 echo "==> emulator doc freshness (the documented CI recipe's OTP code matches CI's pin)"
 scripts/emulator-doc-freshness.sh
 
+echo "==> no plaintext credentials (no login path writes a token to a file)"
+scripts/no-plaintext-credentials.sh
+
 echo "==> discovery scan (no static discovery JSON; generated at serve time)"
 scripts/discovery-scan.sh
 
