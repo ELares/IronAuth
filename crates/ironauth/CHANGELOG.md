@@ -6,6 +6,27 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The stored credential can now be read back, and something reads it (issue #120, criterion
+  4).** `CredentialStore` had `store` and `delete` and no `get`: `ironauth login` wrote a
+  credential to the platform keychain that no command ever used. The doc on
+  `expires_at_unix_secs` says it is stored "so 'am I still signed in' is answerable without a
+  round trip" -- a promise nothing could keep, because the field was write-only.
+
+  `login` now short-circuits when an unexpired credential for the SAME issuer is already
+  stored, with `--force` to sign in again. The issuer bound is the point: answering "you are
+  already signed in" on the strength of another deployment's token is the mix-up the issuer is
+  stored to prevent. A keychain that REFUSES is an error rather than a signed-out state, because
+  reporting "not signed in" would start a login destined to fail again at the store step.
+
+- **A credential round-trips through the REAL platform keychain, on all three named platforms
+  (issue #120, criterion 4).** Every other credential test runs against an in-memory `BTreeMap`,
+  which proves the seam and says nothing about a keychain; the closest thing to per-platform
+  evidence was an assertion about the text of an error message. The new test is `#[ignore]`d
+  (it writes to a developer's own keychain) and a `keychain` CI job runs it with `--ignored` on
+  macOS, Windows, and Linux, installing gnome-keyring and running under `dbus-run-session`
+  there. It compares the WHOLE credential on the way back, because asserting only the access
+  token would pass for a keychain round trip that silently dropped the expiry.
+
 - **No login path can write a credential to a file, and that is now checked (issue #120,
   criterion 4).** The criterion's second half, "no plaintext token files exist after login in
   default mode", had no assertion of any kind. `scripts/no-plaintext-credentials.sh` (gate + CI)
