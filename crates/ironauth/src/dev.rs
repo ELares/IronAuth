@@ -299,6 +299,10 @@ pub struct SeededScope {
     /// A PUBLIC client registered for the loopback redirect, so `ironauth login` works
     /// against the emulator with no further setup.
     pub client: String,
+    /// An organization in the seeded environment. The criterion names orgs alongside tenants
+    /// and users, and without one every org-scoped surface (membership, org connections, the
+    /// per-org policy overlay) has nothing to be exercised against in the emulator.
+    pub organization: String,
 }
 
 /// Derive the seeded identifiers from `seed`.
@@ -327,6 +331,7 @@ pub fn seed_ids(seed: u64) -> SeededScope {
         tenant: tenant.to_string(),
         environment: environment.to_string(),
         client: ironauth_store::ClientId::generate(&env, &scope).to_string(),
+        organization: ironauth_store::OrganizationId::generate(&env, &scope).to_string(),
     }
 }
 
@@ -379,6 +384,17 @@ pub fn seed_statements(scope: &SeededScope) -> Vec<String> {
              VALUES ('{}', '{}', 'active') \
              ON CONFLICT (tenant_id, environment_id) DO NOTHING;",
             scope.tenant, scope.environment
+        ),
+        // An organization. B2B is the shape most quickstarts model, and an emulator with no
+        // org means every org-scoped surface has to be created by hand before it can be
+        // driven at all.
+        format!(
+            "INSERT INTO organizations /* query-audit-allow: dev-only seeding as the \
+             cluster owner, against a throwaway database this process created, BEFORE any \
+             server exists to route it through a scoped repository */ \
+             (id, tenant_id, environment_id, display_name) \
+             VALUES ('{}', '{}', '{}', 'dev organization') ON CONFLICT (id) DO NOTHING;",
+            scope.organization, scope.tenant, scope.environment
         ),
         // A PUBLIC client (`none`): the emulator's reason to exist is driving flows from a
         // CLI or a sample app, and a public client with a loopback redirect is what both
@@ -863,7 +879,25 @@ mod tests {
             // duplicated a tenant or failed on a existing key would break it.
             let scope = seed_ids(7);
             apply_seeds(&bin_dir, &cluster.database_url, &scope).expect("seeds apply");
+
+            // COUNT the rows, do not merely re-run without an error. The criterion is
+            // "re-running seeds does not duplicate state", and a second `apply_seeds` that
+            // returns `Ok` proves only that no statement FAILED: one that inserted a second
+            // row under a different id would satisfy it exactly as well. The counts are
+            // also asserted non-zero first, because a table the seeds never touched has the
+            // same count before and after and would make the equality below vacuous.
+            let counted = ["operators", "tenants", "environments", "organizations", "clients"];
+            let before = count_rows(&bin_dir, &cluster.database_url, &counted);
+            for (table, count) in counted.iter().zip(&before) {
+                assert!(*count > 0, "the seeds must populate {table}, found {count} rows");
+            }
+
             apply_seeds(&bin_dir, &cluster.database_url, &scope).expect("seeds are idempotent");
+            let after = count_rows(&bin_dir, &cluster.database_url, &counted);
+            assert_eq!(
+                before, after,
+                "re-running the seeds duplicated state; per-table counts for {counted:?}"
+            );
 
             let env = boot_env(Some(7));
             let parsed = ironauth_store::Scope::new(
@@ -877,6 +911,41 @@ mod tests {
                 .await
                 .expect("the signing key provisions");
         });
+    }
+
+    /// Row counts for `tables`, read through the same `psql` the seeds are applied with so
+    /// the count cannot address a different database than the one just seeded.
+    fn count_rows(bin_dir: &Path, database_url: &str, tables: &[&str]) -> Vec<i64> {
+        tables
+            .iter()
+            .map(|table| {
+                let output = Command::new(bin_dir.join("psql"))
+                    .args([
+                        "-d",
+                        database_url,
+                        "-t",
+                        "-A",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-c",
+                        // query-audit-allow: a test counting rows in a throwaway database it
+                        // just seeded, as the cluster owner, with no server in the picture.
+                        &format!("SELECT count(*) FROM {table};"),
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .unwrap_or_else(|error| panic!("psql counting {table}: {error}"));
+                assert!(
+                    output.status.success(),
+                    "counting {table}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|error| panic!("count for {table} is not a number: {error}"))
+            })
+            .collect()
     }
 
     /// The seeded identifiers are REPRODUCIBLE, which is half of what makes re-running a
@@ -906,8 +975,8 @@ mod tests {
         let statements = seed_statements(&seed_ids(1));
         assert_eq!(
             statements.len(),
-            5,
-            "operator, tenant, environment, serving state, client"
+            6,
+            "operator, tenant, environment, serving state, organization, client"
         );
         for statement in &statements {
             assert!(
@@ -946,7 +1015,13 @@ mod tests {
             statements[3]
         );
         assert!(statements[3].contains("'active'"), "{:?}", statements[3]);
-        let client = &statements[4];
+        // The organization is scoped to the environment above it, so it follows it.
+        assert!(
+            statements[4].contains("INTO organizations"), // query-audit-allow: an assertion about a statement, not SQL
+            "{:?}",
+            statements[4]
+        );
+        let client = &statements[5];
         assert!(client.contains("INTO clients"), "{client}"); // query-audit-allow: assertion
     }
 
@@ -956,7 +1031,7 @@ mod tests {
     #[test]
     fn the_seeded_client_is_public_and_loopback_registered() {
         let statements = seed_statements(&seed_ids(1));
-        let client = &statements[4];
+        let client = &statements[5];
         assert!(client.contains("'none'"), "{client}");
         assert!(client.contains(DEV_REDIRECT_URI), "{client}");
         // The literal, never the name: this server does not match `localhost`

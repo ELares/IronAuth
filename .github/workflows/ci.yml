@@ -250,6 +250,15 @@ jobs:
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
           EXPECT_CODE=334158 ./scripts/dev-otp-login.sh
+      # Issue #121 criterion 3. These tests are `#[ignore]`d because they spawn a real
+      # Postgres cluster, and NOTHING ran them: not this workflow, not gate.sh. So the
+      # criterion's whole evidence -- that applying the seeds twice does not duplicate
+      # state -- was an assertion no gate executed. This job already installs the Postgres
+      # binaries they need, so it is where they belong.
+      - name: Run the database-backed emulator tests
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          cargo test -p ironauth --bin ironauth -- --ignored
 
   invariants:
     name: invariant lints, dash scan, compat matrix
