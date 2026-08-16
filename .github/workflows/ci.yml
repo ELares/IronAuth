@@ -303,11 +303,19 @@ jobs:
       # On Linux the daemon has to own the session, so the test runs INSIDE it: gnome-keyring
       # unlocks with an empty password on a throwaway CI box and then serves the Secret
       # Service for the command it wraps.
+      #
+      # The keyring FILES are created first, and that is not optional. Unlocking a daemon that
+      # has no collection leaves the Secret Service answering "no result found" to every
+      # lookup -- which is not the same as "no such item", and surfaced as a backend error
+      # rather than an absent entry. Measured: without this the very first read failed, before
+      # anything had been stored.
       - name: Round-trip a credential through the Secret Service
         if: matrix.os == 'ubuntu-latest'
         run: |
+          mkdir -p "$HOME/.local/share/keyrings"
+          printf 'login\n' > "$HOME/.local/share/keyrings/default"
           dbus-run-session -- bash -c '
-            echo -n "" | gnome-keyring-daemon --unlock --components=secrets
+            echo -n "" | gnome-keyring-daemon --unlock --components=secrets,pkcs11,ssh
             cargo test -p ironauth --bin ironauth -- --ignored a_credential_survives_the_real_platform_keychain
           '
 
