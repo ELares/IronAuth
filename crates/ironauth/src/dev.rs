@@ -543,6 +543,77 @@ pub async fn seed_user(
     }
 }
 
+/// The slug the seeded upstream connector is registered under.
+pub const DEV_CONNECTOR_SLUG: &str = "dev-upstream";
+
+/// Seed a federation connector pointing at the fake upstream provider.
+///
+/// Through the REPOSITORY, not a seed statement, and that is forced: `connectors` stores
+/// `client_secret_sealed` and `client_secret_dek_version`, so the row cannot be written as
+/// literal SQL the way the tenant, environment, client and serving state are. The repository
+/// seals the secret under the scope's active DEK and provisions the envelope keys as a side
+/// effect, so there is no separate key step.
+///
+/// Idempotent by treating the already-exists conflict as success, because a dev restart
+/// against an existing `DATABASE_URL` re-runs every seed.
+///
+/// # Errors
+///
+/// A message naming the failure, unless it is the already-seeded conflict.
+pub async fn seed_upstream_connector(
+    store: &ironauth_store::Store,
+    env: &ironauth_env::Env,
+    scope: ironauth_store::Scope,
+    upstream_issuer: &str,
+    client_id: &str,
+) -> Result<(), String> {
+    let definition = serde_json::json!({
+        "connector_id": DEV_CONNECTOR_SLUG,
+        "display_name": "Dev upstream",
+        "protocol": "oidc",
+        "endpoints": { "issuer": upstream_issuer },
+        "scopes": ["openid", "email"],
+        "client_id": client_id,
+    })
+    .to_string();
+
+    let id = ironauth_store::ConnectorId::generate(env, &scope);
+    match store
+        .scoped(scope)
+        .acting(
+            ironauth_store::ActorRef::human(ironauth_store::HumanId::generate(env)),
+            ironauth_store::CorrelationId::generate(env),
+        )
+        .connectors()
+        .create(
+            env,
+            &id,
+            0,
+            ironauth_store::NewConnector {
+                slug: DEV_CONNECTOR_SLUG,
+                definition_json: &definition,
+                client_secret: b"dev-upstream-secret",
+                capabilities: ironauth_store::ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    // Only 'untrusted' or 'trusted' satisfy the CHECK on
+                    // cap_email_verified_trust (migration 0056). 'untrusted' is also the
+                    // right default for a provider that authenticates anyone who asks.
+                    email_verified_trust: "untrusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+    {
+        // A Conflict is ALREADY SEEDED, not a failure.
+        Ok(()) | Err(ironauth_store::StoreError::Conflict) => Ok(()),
+        Err(error) => Err(format!("seeding the upstream connector: {error}")),
+    }
+}
+
 /// The message shown when no Postgres binaries can be found.
 ///
 /// Names what to install and the escape hatch, because "could not start the emulator" sends

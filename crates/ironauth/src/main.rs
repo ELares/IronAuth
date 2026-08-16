@@ -4403,14 +4403,14 @@ fn print_dev_scope(bind: &str, scope: &dev::SeededScope) {
 ///
 /// Failing to start it is NOT fatal. The emulator is useful without an upstream, and
 /// refusing to boot over a test double would be the wrong trade.
-fn start_fake_upstream(seed: u64) {
+fn start_fake_upstream(seed: u64) -> Option<String> {
     let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
         eprintln!("ironauth dev: no fake upstream IdP (could not bind)");
-        return;
+        return None;
     };
     let Ok(addr) = listener.local_addr() else {
         eprintln!("ironauth dev: no fake upstream IdP (no local address)");
-        return;
+        return None;
     };
     // Its own key from a DEDICATED stream: reproducible for a seed, and never sharing
     // material with the server it federates into.
@@ -4421,9 +4421,13 @@ fn start_fake_upstream(seed: u64) {
         Ok(key) => {
             let issuer = format!("http://{addr}");
             println!("ironauth dev: fake upstream IdP at {issuer}");
-            fake_idp::serve(listener, key, issuer);
+            fake_idp::serve(listener, key, issuer.clone());
+            Some(issuer)
         }
-        Err(error) => eprintln!("ironauth dev: no fake upstream IdP ({error:?})"),
+        Err(error) => {
+            eprintln!("ironauth dev: no fake upstream IdP ({error:?})");
+            None
+        }
     }
 }
 
@@ -4441,6 +4445,7 @@ fn prepare_dev_schema(
     bin_dir: &std::path::Path,
     database_url: &str,
     seed: u64,
+    upstream_issuer: Option<&str>,
 ) -> Result<dev::SeededScope, String> {
     dev::provision_roles(bin_dir, database_url)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4485,7 +4490,16 @@ fn prepare_dev_schema(
         dev::provision_signing_key(&store, &env, parsed, seed).await?;
         // The user goes through the repository for the same reason the key does: its
         // identifier is SEALED, so it cannot be a seed statement.
-        dev::seed_user(&store, &env, parsed).await
+        dev::seed_user(&store, &env, parsed).await?;
+
+        // Only when the fake provider actually started: a connector pointing at an address
+        // nothing serves would be a federation login that fails for a reason having nothing
+        // to do with federation.
+        if let Some(issuer) = upstream_issuer {
+            dev::seed_upstream_connector(&store, &env, parsed, issuer, fake_idp::FAKE_CLIENT_ID)
+                .await?;
+        }
+        Ok::<(), String>(())
     })?;
     Ok(scope)
 }
@@ -4569,10 +4583,14 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
     };
 
+    // BEFORE seeding: the connector seeded below points at this provider's address, which
+    // does not exist until it binds.
+    let upstream_issuer = start_fake_upstream(seed);
+
     // Skipped when the developer supplied their own DATABASE_URL: that database is theirs,
     // already managed by whatever manages it.
     if let Some(bin_dir) = &dev_bin_dir {
-        match prepare_dev_schema(bin_dir, &database_url, seed) {
+        match prepare_dev_schema(bin_dir, &database_url, seed, upstream_issuer.as_deref()) {
             Ok(scope) => print_dev_scope(&bind, &scope),
             Err(error) => {
                 eprintln!("ironauth dev: {error}");
@@ -4612,8 +4630,6 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
             eprintln!("ironauth dev: no capture sink endpoint ({error}); codes still print here");
         }
     }
-
-    start_fake_upstream(seed);
 
     print!("{}", dev::banner(&bind));
 
