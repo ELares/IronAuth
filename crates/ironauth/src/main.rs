@@ -104,6 +104,9 @@ mod credentials;
 /// `ironauth dev`: the local emulator (issue #121).
 mod dev;
 
+/// A fake upstream OIDC provider for the emulator (issue #121, criterion 4).
+mod fake_idp;
+
 /// `ironauth login`: the RFC 8628 device flow (issue #120).
 mod login;
 
@@ -4392,6 +4395,38 @@ fn print_dev_scope(bind: &str, scope: &dev::SeededScope) {
     );
 }
 
+/// Start the fake upstream OIDC provider on its own loopback listener.
+///
+/// Its OWN listener, never the production router: this provider authenticates anyone who
+/// asks with no credential at all, so the guarantee that it cannot exist in production has
+/// to be structural rather than a conditional somebody keeps correct.
+///
+/// Failing to start it is NOT fatal. The emulator is useful without an upstream, and
+/// refusing to boot over a test double would be the wrong trade.
+fn start_fake_upstream(seed: u64) {
+    let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+        eprintln!("ironauth dev: no fake upstream IdP (could not bind)");
+        return;
+    };
+    let Ok(addr) = listener.local_addr() else {
+        eprintln!("ironauth dev: no fake upstream IdP (no local address)");
+        return;
+    };
+    // Its own key from a DEDICATED stream: reproducible for a seed, and never sharing
+    // material with the server it federates into.
+    let key_env = dev::boot_env(Some(seed ^ 0x1d3b_c7f1));
+    let mut material = [0_u8; 32];
+    ironauth_env::Entropy::fill_bytes(key_env.entropy(), &mut material);
+    match ironauth_jose::SigningKey::ed25519_from_seed(Some("upstream-1".to_owned()), &material) {
+        Ok(key) => {
+            let issuer = format!("http://{addr}");
+            println!("ironauth dev: fake upstream IdP at {issuer}");
+            fake_idp::serve(listener, key, issuer);
+        }
+        Err(error) => eprintln!("ironauth dev: no fake upstream IdP ({error:?})"),
+    }
+}
+
 /// Provision the schema roles and apply the schema, before the server boots.
 ///
 /// Nothing else does this. `serve` does not migrate, and a freshly `initdb`-ed cluster has
@@ -4577,6 +4612,8 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
             eprintln!("ironauth dev: no capture sink endpoint ({error}); codes still print here");
         }
     }
+
+    start_fake_upstream(seed);
 
     print!("{}", dev::banner(&bind));
 
