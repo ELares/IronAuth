@@ -240,6 +240,10 @@ pub fn respond(target: &str, body: &str, key: &SigningKey, issuer: &str, now_sec
     }
 }
 
+/// The largest request body this provider will buffer. A form-encoded token request is a few
+/// hundred bytes.
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
 /// Serve the fake provider until the process exits, stamping tokens off `clock`.
 pub fn serve(listener: TcpListener, key: SigningKey, issuer: String, clock: Arc<dyn Clock>) {
     std::thread::spawn(move || {
@@ -275,6 +279,11 @@ pub fn serve(listener: TcpListener, key: SigningKey, issuer: String, clock: Arc<
                     }
                 }
             }
+            // Capped, because `content_length` is a number the CLIENT chose and the buffer is
+            // allocated before a single body byte arrives: an unbounded read here lets one
+            // request declaring a multi-gigabyte body take the process down without sending
+            // it. A token request is a few hundred bytes; anything past the cap is not one.
+            let content_length = content_length.min(MAX_BODY_BYTES);
             let mut body = vec![0_u8; content_length];
             if content_length > 0 && reader.read_exact(&mut body).is_err() {
                 continue;
