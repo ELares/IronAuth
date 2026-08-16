@@ -4561,6 +4561,13 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
     // migrate.
     let mut dev_bin_dir = None;
     let database_url = if let Ok(url) = std::env::var("DATABASE_URL") {
+        // The bind guard above refuses to be REACHED from outside; this refuses to REACH
+        // outside. Dev mode seeds a fixed identity landscape with a published password into
+        // whatever this names, and `DATABASE_URL` is commonly already exported in a shell.
+        if let Err(refusal) = dev::guard_local_database(&url) {
+            eprintln!("ironauth dev: {refusal}");
+            return ExitCode::FAILURE;
+        }
         url
     } else {
         {

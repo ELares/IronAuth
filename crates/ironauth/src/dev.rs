@@ -647,6 +647,8 @@ pub fn missing_postgres_message() -> String {
 pub enum DevRefusal {
     /// The bind address is reachable from outside this machine.
     NotLoopback(String),
+    /// `DATABASE_URL` points at a database on another machine.
+    RemoteDatabase(String),
 }
 
 impl std::fmt::Display for DevRefusal {
@@ -657,6 +659,14 @@ impl std::fmt::Display for DevRefusal {
                 "refusing to start: dev mode uses DETERMINISTIC secrets, which are safe \
                  only on loopback, and {addr} is reachable from outside this machine. Use \
                  `ironauth serve` with real configuration to run somewhere exposed."
+            ),
+            Self::RemoteDatabase(host) => write!(
+                f,
+                "refusing to start: dev mode SEEDS a fixed operator, tenant, environment, \
+                 organization, client and user, with a known password and deterministic \
+                 secrets, into whatever DATABASE_URL names -- and it names {host}, which is \
+                 not this machine. Point DATABASE_URL at a local database, or unset it and \
+                 let dev bring up a throwaway cluster."
             ),
         }
     }
@@ -683,6 +693,53 @@ pub fn guard_loopback_only(bind: &str) -> Result<(), DevRefusal> {
     match host.parse::<IpAddr>() {
         Ok(addr) if addr.is_loopback() => Ok(()),
         _ => Err(DevRefusal::NotLoopback(bind.to_owned())),
+    }
+}
+
+/// Refuse to seed a database that is not on this machine.
+///
+/// The bind guard above stops dev mode being REACHED from outside. This stops it REACHING
+/// outside, which is the other direction of the same hazard and the one an operator falls
+/// into by accident: `DATABASE_URL` is commonly already exported in a shell, and `ironauth
+/// dev` honours it. It would then write a fixed operator, tenant, environment, organization,
+/// client and a user whose password is a published constant into that database.
+///
+/// The test is the same one the bind guard applies, for the same reason: a HOSTNAME is not
+/// evidence. `localhost` resolves wherever the host's resolver says, and a guard that trusts
+/// a name is a guard that can be talked out of its answer. A DSN with no host at all is a
+/// Unix socket, which cannot leave the machine.
+///
+/// # Errors
+///
+/// [`DevRefusal::RemoteDatabase`] when the DSN names a host that is not a loopback literal.
+pub fn guard_local_database(database_url: &str) -> Result<(), DevRefusal> {
+    // Everything after the scheme separator, then past any credentials, is authority.
+    let after_scheme = database_url
+        .split_once("://")
+        .map_or(database_url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    // A bracketed IPv6 literal keeps its colons, so strip the brackets before the port split.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split_once(']').map_or(rest, |(host, _)| host)
+    } else {
+        host_port
+            .rsplit_once(':')
+            .map_or(host_port, |(host, _)| host)
+    };
+    // No host: a Unix-socket DSN (`postgres:///name`, or `host=` given as a parameter). It
+    // cannot address another machine, so there is nothing to refuse.
+    if host.is_empty() {
+        return Ok(());
+    }
+    match host.parse::<IpAddr>() {
+        Ok(addr) if addr.is_loopback() => Ok(()),
+        _ => Err(DevRefusal::RemoteDatabase(host.to_owned())),
     }
 }
 
@@ -1073,6 +1130,57 @@ mod tests {
 
     /// The refusal says WHY, and points at the command to use instead. "Refusing to start"
     /// alone sends someone editing config at random.
+    /// The other direction of the same hazard: dev mode must not SEED a database that is
+    /// not on this machine. `DATABASE_URL` is commonly already exported in a shell, and dev
+    /// mode honours it, so this is the one an operator reaches by accident.
+    #[test]
+    fn a_database_on_another_machine_is_refused() {
+        for remote in [
+            "postgres://user:pw@db.internal.example:5432/ironauth",
+            "postgres://10.0.0.5:5432/ironauth",
+            "postgresql://ironauth@[2001:db8::1]:5432/ironauth",
+            // A NAME, even one that usually resolves here. The resolver decides where
+            // `localhost` points, and a guard that trusts a name can be talked out of it.
+            "postgres://localhost:5432/ironauth",
+        ] {
+            assert!(
+                guard_local_database(remote).is_err(),
+                "must refuse a non-loopback database: {remote}"
+            );
+        }
+    }
+
+    /// The guard must not refuse the databases dev mode actually uses, or it would make the
+    /// emulator unusable rather than safe. A refusal-only test would pass with a guard that
+    /// refused everything.
+    #[test]
+    fn a_local_database_is_accepted() {
+        for local in [
+            "postgres://ironauth_super@127.0.0.1:59100/postgres",
+            "postgres://127.9.9.9/ironauth",
+            "postgresql://ironauth@[::1]:5432/ironauth",
+            // No host at all: a Unix-socket DSN, which cannot address another machine.
+            "postgres:///ironauth",
+        ] {
+            assert_eq!(
+                guard_local_database(local),
+                Ok(()),
+                "must accept a local database: {local}"
+            );
+        }
+    }
+
+    /// The refusal has to say WHAT is unsafe, not just that it refused: the reason dev mode
+    /// cannot touch a remote database is the seeded password and deterministic secrets, and
+    /// an operator who does not learn that will assume the guard is being fussy.
+    #[test]
+    fn the_remote_database_refusal_names_the_hazard() {
+        let message = DevRefusal::RemoteDatabase("db.internal.example".to_owned()).to_string();
+        assert!(message.contains("db.internal.example"), "{message}");
+        assert!(message.contains("deterministic"), "{message}");
+        assert!(message.contains("DATABASE_URL"), "{message}");
+    }
+
     #[test]
     fn the_refusal_explains_itself() {
         let message = DevRefusal::NotLoopback("0.0.0.0:8080".to_owned()).to_string();
