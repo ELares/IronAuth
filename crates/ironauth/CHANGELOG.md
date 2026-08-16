@@ -6,6 +6,22 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`ironauth dev` refuses a `DATABASE_URL` on another machine (issue #121, criterion 6).** The
+  existing guard stops dev mode being REACHED from outside. This stops it REACHING outside, which
+  is the same hazard in the other direction and the one an operator falls into by accident:
+  `DATABASE_URL` is commonly already exported in a shell, and dev mode honours it. It would then
+  write a fixed operator, tenant, environment, organization, client and a user whose password is
+  a published constant into that database. As with the bind guard, a hostname is never treated as
+  local -- `localhost` resolves wherever the host's resolver says it does. A DSN with no host is a
+  Unix socket and is accepted, because it cannot address another machine.
+
+- **`docs/EMULATOR.md` documents the emulator and ships the GitHub Actions recipe the issue asks
+  for (issue #121, criterion 2).** A copy-pasteable job that completes an offline email-OTP login
+  and asserts the deterministic code. `scripts/emulator-doc-freshness.sh` checks that code against
+  the pin in this repo's own CI, in the gate and in CI: a recipe has to carry literals, and this
+  is the literal that rots invisibly, because a seeding change fails CI loudly while the doc goes
+  on telling every reader to assert the old value.
+
 - **The emulator seeds an organization, and "re-running seeds does not duplicate state" is now
   measured rather than asserted (issue #121, criterion 3).** The criterion names orgs alongside
   tenants, environments, users and clients; no organization was ever seeded, so every org-scoped
