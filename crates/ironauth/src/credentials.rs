@@ -65,6 +65,25 @@ pub struct StoredCredential {
     pub issuer: String,
 }
 
+/// Whether a keyring error is the Secret Service's way of saying "no such entry".
+///
+/// macOS and Windows answer a missing entry with [`keyring::Error::NoEntry`]. The Linux
+/// Secret Service backend does not: it surfaces "no result found" wrapped in a storage-access
+/// error, which is indistinguishable BY TYPE from a keychain that is genuinely unreachable.
+///
+/// Measured on CI, and the reason this exists: the very first read of an entry nothing had
+/// stored -- the state every first-time user is in -- came back as a backend error on Linux
+/// and as an absent entry on the other two. Without this, `ironauth login` fails outright for
+/// every Linux user who has never logged in, which is not a test problem.
+///
+/// Matching on the message is unpleasant and is the narrowest option available. Treating the
+/// whole error VARIANT as absence would be worse: that variant also covers a locked or
+/// unreachable keychain, and reporting "not signed in" there is the exact lie the refusal
+/// path exists to prevent.
+fn is_secret_service_absence(error: &keyring::Error) -> bool {
+    cfg!(target_os = "linux") && error.to_string().contains("no result found")
+}
+
 /// Whether an existing credential still stands in for a login: present, from the SAME
 /// issuer, and not expired.
 ///
@@ -169,6 +188,7 @@ impl CredentialStore for KeyringStore {
         let encoded = match entry.get_password() {
             Ok(encoded) => encoded,
             Err(keyring::Error::NoEntry) => return Ok(None),
+            Err(error) if is_secret_service_absence(&error) => return Ok(None),
             Err(error) => return Err(CredentialError::Backend(error.to_string())),
         };
         serde_json::from_str(&encoded)
