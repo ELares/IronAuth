@@ -6,6 +6,30 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A complete offline email-OTP login, asserted in CI (issue #121, criterion 2).**
+  `scripts/dev-otp-login.sh` boots the emulator, requests a code, reads it from the capture
+  sink, and completes the login -- with no mail server and no network.
+
+  ```
+  dev-otp-login: captured code 334158
+  dev-otp-login: authenticated, amr=['otp']
+  ```
+
+  - **It reads the code from the SINK, not the log.** The sink is the supported surface and
+    returns structured JSON; scraping a log line would couple the assertion to a message
+    format that exists for humans.
+
+  - **The code is pinned to the seed (`EXPECT_CODE`).** Without that the job would pass
+    against any code at all, and a regression that broke reproducibility -- the property the
+    whole seeded emulator rests on -- would go unnoticed. The same seed produced `334158`
+    across every run in this work, including on a database created from scratch each time.
+
+  - **`authenticated: true` is asserted, not just the 200.** A future change returning 200
+    with a refusal body would otherwise read as success. The 200 on `otp/send` is explicitly
+    NOT treated as evidence: that response is identical whether or not the account exists,
+    by the anti-enumeration contract, so it proves only that the request was accepted.
+
+
 - **FIX (#842): the dev capture sink wedged the whole server on the first message delivery.**
   `println!` in the delivery path took the process-wide stdout lock that the tracing writer
   also uses. The delivery runs SYNCHRONOUSLY inside an async request handler, so it could sit

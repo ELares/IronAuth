@@ -212,7 +212,7 @@ jobs:
           command: check
 
   dev-boot-time:
-    name: emulator boots within budget and reaches nothing off-machine
+    name: emulator boots, stays offline, and completes an OTP login
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -242,6 +242,14 @@ jobs:
         run: sudo apt-get install -y lsof
       - name: Assert no egress
         run: PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) ./scripts/dev-no-egress.sh
+      # Issue #121 criterion 2: a COMPLETE email-OTP login, offline, against the
+      # deterministic code. EXPECT_CODE is pinned so the job fails if seeding stops being
+      # reproducible, rather than passing against whatever code happened to be generated --
+      # reproducibility is the property the whole seeded emulator rests on.
+      - name: Assert a complete offline email-OTP login
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          EXPECT_CODE=334158 ./scripts/dev-otp-login.sh
 
   invariants:
     name: invariant lints, dash scan, compat matrix
