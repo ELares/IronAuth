@@ -57,7 +57,12 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# `vendored` builds libdbus INTO the binary instead of linking the host's. Without it the
+# Secret Service backend needs libdbus-1-dev present at build time, which is why the clippy,
+# msrv and musl lanes had all been failing on `libdbus-sys` -- they build --all-features on a
+# runner that has no dbus headers, and the musl static target could not have used the host's
+# anyway. Vendoring fixes all three without asking every builder to install a system package.
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 
 [features]
 # Passes the optional IronBus wake-up backbone through to ironauth-store (issue #104).

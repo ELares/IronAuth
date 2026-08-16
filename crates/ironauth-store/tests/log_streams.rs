@@ -314,12 +314,15 @@ async fn a_per_organization_stream_never_sees_another_organizations_rows() {
 
     // Positive: the stream is not simply empty, which would satisfy the negative vacuously.
     assert!(
-        rows.iter().any(|row| row.target_id == mine_client.to_string()),
+        rows.iter()
+            .any(|row| row.target_id == mine_client.to_string()),
         "the organization's own row must ship: {rows:?}"
     );
     // Negative: nothing from the other organization.
     assert!(
-        !rows.iter().any(|row| row.target_id == theirs_client.to_string()),
+        !rows
+            .iter()
+            .any(|row| row.target_id == theirs_client.to_string()),
         "another organization's row reached this organization's stream, which is the \
          cross-org leak: {rows:?}"
     );
@@ -327,7 +330,9 @@ async fn a_per_organization_stream_never_sees_another_organizations_rows() {
     // NULL rather than true, so the SQL already excludes it; asserting it pins that a future
     // rewrite to `IS NOT DISTINCT FROM` or a COALESCE default cannot quietly widen the feed.
     assert!(
-        !rows.iter().any(|row| row.target_id == unattributed_client.to_string()),
+        !rows
+            .iter()
+            .any(|row| row.target_id == unattributed_client.to_string()),
         "a row belonging to no organization is not this organization's event: {rows:?}"
     );
 }

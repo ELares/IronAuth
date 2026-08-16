@@ -220,7 +220,9 @@ pub fn respond(target: &str, body: &str, key: &SigningKey, issuer: &str, now_sec
         "/token" => {
             // The `nonce` the relying party bound at /authorize comes back inside the code it
             // is now redeeming, which is how a stateless provider echoes it.
-            let nonce = form_field(body, "code").as_deref().and_then(nonce_from_code);
+            let nonce = form_field(body, "code")
+                .as_deref()
+                .and_then(nonce_from_code);
             match id_token(key, issuer, FAKE_CLIENT_ID, now_secs, nonce.as_deref()) {
                 Ok(token) => json_response(
                     &serde_json::json!({

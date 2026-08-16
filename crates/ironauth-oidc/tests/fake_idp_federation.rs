@@ -84,8 +84,7 @@ async fn start_fake_idp() -> SocketAddr {
                     .unwrap_or("/")
                     .to_owned();
                 let body = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
-                let response =
-                    fake_idp::respond(&target, body, &key, UPSTREAM_ISSUER, NOW_SECS);
+                let response = fake_idp::respond(&target, body, &key, UPSTREAM_ISSUER, NOW_SECS);
                 let _ = socket.write_all(response.as_bytes()).await;
                 let _ = socket.flush().await;
             });
@@ -193,8 +192,10 @@ async fn follow_to_the_provider(addr: SocketAddr, location: &str) -> String {
     let mut socket = tokio::net::TcpStream::connect(addr).await.expect("connect");
     socket
         .write_all(
-            format!("GET {target} HTTP/1.1\r\nHost: fake-upstream.example\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "GET {target} HTTP/1.1\r\nHost: fake-upstream.example\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .await
         .expect("write");
@@ -267,7 +268,12 @@ async fn the_emulators_fake_upstream_completes_a_federation_login_offline() {
         encode(&return_to),
     );
     let response = federation_router(&harness, Arc::clone(&runtime))
-        .oneshot(Request::builder().uri(&uri).body(Body::empty()).expect("req"))
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .body(Body::empty())
+                .expect("req"),
+        )
         .await
         .expect("authorize");
     assert_eq!(

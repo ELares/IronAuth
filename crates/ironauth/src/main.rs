@@ -4497,8 +4497,14 @@ fn prepare_dev_schema(
         // nothing serves would be a federation login that fails for a reason having nothing
         // to do with federation.
         if let Some(issuer) = upstream_issuer {
-            dev::seed_upstream_connector(&store, &env, parsed, issuer, ironauth_oidc::fake_idp::FAKE_CLIENT_ID)
-                .await?;
+            dev::seed_upstream_connector(
+                &store,
+                &env,
+                parsed,
+                issuer,
+                ironauth_oidc::fake_idp::FAKE_CLIENT_ID,
+            )
+            .await?;
         }
         Ok::<(), String>(())
     })?;
@@ -4653,6 +4659,8 @@ struct LoginArgs {
     account: String,
     redirect: Option<String>,
     preference: login_flow::FlowPreference,
+    /// Sign in again even when an unexpired credential for this issuer is already stored.
+    force: bool,
 }
 
 /// Parse `ironauth login`'s arguments, or report what is missing.
@@ -4662,6 +4670,7 @@ fn parse_login_args(args: &mut impl Iterator<Item = String>) -> Result<LoginArgs
     let mut account = "default".to_owned();
     let mut redirect = None;
     let mut preference = login_flow::FlowPreference::Detect;
+    let mut force = false;
     while let Some(flag) = args.next() {
         let mut take = |name: &str| {
             let Some(value) = args.next() else {
@@ -4680,6 +4689,7 @@ fn parse_login_args(args: &mut impl Iterator<Item = String>) -> Result<LoginArgs
             // and it is the caller's to make; what the CLI must not do is make it silently.
             "--device" => preference = login_flow::FlowPreference::ForceDevice,
             "--loopback" => preference = login_flow::FlowPreference::ForceLoopback,
+            "--force" => force = true,
             other => {
                 eprintln!("ironauth login: unknown argument '{other}'");
                 return Err(());
@@ -4696,7 +4706,67 @@ fn parse_login_args(args: &mut impl Iterator<Item = String>) -> Result<LoginArgs
         account,
         redirect,
         preference,
+        force,
     })
+}
+
+/// Whether a stored credential already stands in for this login.
+///
+/// Split out over the store seam so all of it is testable without a platform keychain: the
+/// short circuit, the `--force` override, the issuer bound, and the refusal case. Left inline
+/// it would have been reachable only by a test that could write to a real keychain, which is
+/// the state criterion 3's fallback was in.
+///
+/// # Errors
+///
+/// The backend message when the keychain refuses. A refusal is NOT "not signed in": returning
+/// `false` there would start a login that is going to fail again at the store step, and report
+/// the fault as whatever went wrong second.
+fn already_signed_in(
+    store: &impl credentials::CredentialStore,
+    account: &str,
+    issuer: &str,
+    now_unix_secs: i64,
+    force: bool,
+) -> Result<bool, credentials::CredentialError> {
+    if force {
+        // Not even read. `--force` means sign in again, and a keychain that refuses must not
+        // turn an explicit re-login into a failure.
+        return Ok(false);
+    }
+    let existing = store.get(account)?;
+    Ok(credentials::still_valid(
+        existing.as_ref(),
+        issuer,
+        now_unix_secs,
+    ))
+}
+
+/// Answer `login` early when the stored credential already stands in for it.
+///
+/// `Some(code)` means `login` is over: either the user is already signed in, or the keychain
+/// could not be read and starting a flow would only fail later for a second reason.
+fn report_already_signed_in(account: &str, issuer: &str, force: bool) -> Option<ExitCode> {
+    match already_signed_in(
+        &credentials::KeyringStore,
+        account,
+        issuer,
+        login::epoch_secs(&ironauth_env::SystemClock),
+        force,
+    ) {
+        Ok(true) => {
+            println!(
+                "ironauth: already signed in to {issuer} as '{account}'; \
+                 pass --force to sign in again"
+            );
+            Some(ExitCode::SUCCESS)
+        }
+        Ok(false) => None,
+        Err(error) => {
+            eprintln!("ironauth login: could not read the stored credential: {error}");
+            Some(ExitCode::FAILURE)
+        }
+    }
 }
 
 fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
@@ -4709,7 +4779,21 @@ fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
         account,
         redirect,
         preference,
+        force,
     } = parsed;
+
+    // Already signed in? This is what the stored expiry is FOR: the field's contract is that
+    // "am I still signed in" is answerable without a round trip, and until there was a read
+    // path nothing could answer it, so every `login` re-ran the whole flow against a
+    // perfectly good credential. Bounded to the SAME issuer, because answering "you already
+    // are" on the strength of another deployment's token is the mix-up the issuer is stored
+    // to prevent.
+    //
+    // A keychain that REFUSES is not "not signed in": that is reported and fails, rather
+    // than silently starting a login that would fail again at the store step.
+    if let Some(code) = report_already_signed_in(&account, &issuer, force) {
+        return code;
+    }
 
     // Which flow. An explicit flag wins; otherwise the host decides, and loopback is
     // preferred wherever it can run because it has no cross-device step for an attacker to
@@ -4944,6 +5028,96 @@ fn logout_with(store: &impl credentials::CredentialStore, account: &str) -> Exit
 }
 
 #[cfg(test)]
+mod already_signed_in_tests {
+    use super::already_signed_in;
+    use super::credentials::testing::{MemoryStore, RefusingStore};
+    use super::credentials::{CredentialStore, StoredCredential};
+
+    const ISSUER: &str = "https://one.example";
+
+    fn stored(store: &MemoryStore, issuer: &str, expires_at_unix_secs: i64) {
+        store
+            .store(
+                "default",
+                &StoredCredential {
+                    access_token: "a".to_owned(),
+                    refresh_token: None,
+                    expires_at_unix_secs,
+                    issuer: issuer.to_owned(),
+                },
+            )
+            .expect("storing");
+    }
+
+    /// The short circuit the stored expiry exists for. Before there was a read path, every
+    /// `login` re-ran the whole flow against a perfectly good credential.
+    #[test]
+    fn an_unexpired_credential_for_this_issuer_makes_login_a_no_op() {
+        let store = MemoryStore::default();
+        stored(&store, ISSUER, 100);
+        assert!(
+            already_signed_in(&store, "default", ISSUER, 99, false).expect("the store answers")
+        );
+    }
+
+    /// The paired negatives. Without them the test above passes for a function that returns
+    /// `true` unconditionally, which would make `login` refuse to ever sign anyone in.
+    #[test]
+    fn an_expired_credential_does_not_stand_in_for_a_login() {
+        let store = MemoryStore::default();
+        stored(&store, ISSUER, 100);
+        assert!(
+            !already_signed_in(&store, "default", ISSUER, 100, false).expect("the store answers")
+        );
+    }
+
+    #[test]
+    fn a_credential_from_another_deployment_does_not_stand_in_for_a_login() {
+        let store = MemoryStore::default();
+        stored(&store, "https://two.example", 100);
+        assert!(
+            !already_signed_in(&store, "default", ISSUER, 99, false).expect("the store answers")
+        );
+    }
+
+    #[test]
+    fn nothing_stored_is_not_a_login() {
+        let store = MemoryStore::default();
+        assert!(
+            !already_signed_in(&store, "default", ISSUER, 99, false).expect("the store answers")
+        );
+    }
+
+    /// `--force` means sign in again, so the credential is not even consulted.
+    #[test]
+    fn force_signs_in_again_even_when_a_valid_credential_is_stored() {
+        let store = MemoryStore::default();
+        stored(&store, ISSUER, 100);
+        assert!(
+            !already_signed_in(&store, "default", ISSUER, 99, true).expect("the store answers")
+        );
+    }
+
+    /// A keychain that REFUSES is not "not signed in". Reporting `false` would start a login
+    /// destined to fail at the store step, and surface the fault as whatever went wrong
+    /// second rather than the keychain.
+    #[test]
+    fn a_refusing_keychain_is_an_error_not_a_signed_out_state() {
+        assert!(already_signed_in(&RefusingStore, "default", ISSUER, 99, false).is_err());
+    }
+
+    /// ...but not under `--force`, where nothing is read, so a broken keychain cannot block
+    /// an explicit re-login.
+    #[test]
+    fn force_is_unaffected_by_a_refusing_keychain() {
+        assert!(
+            !already_signed_in(&RefusingStore, "default", ISSUER, 99, true)
+                .expect("--force must not consult the store at all"),
+        );
+    }
+}
+
+#[cfg(test)]
 mod logout_tests {
     use super::credentials::testing::{MemoryStore, RefusingStore};
     use super::logout_with;
@@ -5009,8 +5183,12 @@ fn print_help() {
     println!("                                   recommend parameters (issue #62)");
     println!("  ironauth dev [--bind ADDR] [--seed N]");
     println!("                                   Run the local emulator (loopback only)");
-    println!("  ironauth login --issuer URL --client-id ID [--account NAME]");
-    println!("                                   Sign in via the RFC 8628 device flow");
+    println!("  ironauth login --issuer URL --client-id ID [--account NAME] [--force]");
+    println!("                                   Sign in (loopback where a browser is");
+    println!("                                   available, else the RFC 8628 device");
+    println!("                                   flow). Already signed in with an");
+    println!("                                   unexpired credential for this issuer is");
+    println!("                                   a no-op; --force signs in again");
     println!("  ironauth logout [--account NAME] Remove stored credentials for a");
     println!("                                   deployment (issue #120)");
     println!("  ironauth validate <document>     Validate a config document (local)");

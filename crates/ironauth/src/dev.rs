@@ -717,10 +717,7 @@ pub fn guard_local_database(database_url: &str) -> Result<(), DevRefusal> {
     let after_scheme = database_url
         .split_once("://")
         .map_or(database_url, |(_, rest)| rest);
-    let authority = after_scheme
-        .split(['/', '?'])
-        .next()
-        .unwrap_or_default();
+    let authority = after_scheme.split(['/', '?']).next().unwrap_or_default();
     let host_port = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
@@ -943,10 +940,19 @@ mod tests {
             // row under a different id would satisfy it exactly as well. The counts are
             // also asserted non-zero first, because a table the seeds never touched has the
             // same count before and after and would make the equality below vacuous.
-            let counted = ["operators", "tenants", "environments", "organizations", "clients"];
+            let counted = [
+                "operators",
+                "tenants",
+                "environments",
+                "organizations",
+                "clients",
+            ];
             let before = count_rows(&bin_dir, &cluster.database_url, &counted);
             for (table, count) in counted.iter().zip(&before) {
-                assert!(*count > 0, "the seeds must populate {table}, found {count} rows");
+                assert!(
+                    *count > 0,
+                    "the seeds must populate {table}, found {count} rows"
+                );
             }
 
             apply_seeds(&bin_dir, &cluster.database_url, &scope).expect("seeds are idempotent");

@@ -260,6 +260,57 @@ jobs:
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
           cargo test -p ironauth --bin ironauth -- --ignored
 
+  keychain:
+    # Issue #120 criterion 4: "Credentials are stored in the platform keychain with expiry on
+    # macOS, Windows, and Linux." Every other credential test runs against an in-memory
+    # BTreeMap, which proves the seam and says nothing about a keychain. This is the only job
+    # that touches a real one, so it runs on all three named platforms and nowhere less.
+    name: credentials survive the real platform keychain
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      # Not fail-fast: a backend that breaks on ONE platform is exactly what this job exists
+      # to find, and cancelling the others would hide whether it broke on the rest too.
+      fail-fast: false
+      matrix:
+        # Linux is ABSENT and that is a known gap, not an oversight. See the note below.
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Linux has no keychain until something provides the Secret Service over D-Bus. macOS
+      # and Windows have one built in, so only this platform needs setting up.
+
+      # macOS runners start with the login keychain LOCKED, and a locked keychain refuses
+      # every write with an error that reads like a backend fault rather than a locked one.
+      - name: Unlock the login keychain
+        if: matrix.os == 'macos-latest'
+        run: security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db || true
+
+      # The test is #[ignore]d because it writes to a developer's own keychain. Here that is
+      # the point, so it runs with --ignored.
+      - name: Round-trip a credential through the platform keychain
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo test -p ironauth --bin ironauth -- --ignored a_credential_survives_the_real_platform_keychain
+
+      # LINUX IS NOT COVERED HERE, and the criterion names it. Recorded rather than
+      # quietly dropped, because a matrix that used to have three entries and now has two
+      # reads as complete unless something says otherwise.
+      #
+      # What is known, measured on this branch: the build problem is solved (libdbus is
+      # vendored, so the crate compiles on a runner with no dbus headers), and the remaining
+      # failure is environmental. Under `dbus-run-session` with gnome-keyring unlocked, and
+      # again after pre-creating ~/.local/share/keyrings with a default collection, BOTH the
+      # read and the STORE answer "Secret Service: no result found" -- so the daemon is
+      # running but no usable collection exists for it to write into.
+      #
+      # One dead end worth not repeating: mapping that message to "no entry" in
+      # KeyringStore::get. It makes the read succeed and the store then fails the same way,
+      # which is the tell that this is an unusable store rather than an absent item. Shipping
+      # that mapping would have made a genuinely broken keychain report "not signed in".
+
   invariants:
     name: invariant lints, dash scan, compat matrix
     runs-on: ubuntu-latest
