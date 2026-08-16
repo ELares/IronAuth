@@ -6,6 +6,36 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **FIX (#842): the dev capture sink wedged the whole server on the first message delivery.**
+  `println!` in the delivery path took the process-wide stdout lock that the tracing writer
+  also uses. The delivery runs SYNCHRONOUSLY inside an async request handler, so it could sit
+  on that lock and take an executor worker with it: after one `POST /otp/send`, discovery,
+  JWKS and the token endpoint all stopped answering, with the process alive and no error
+  logged. Routed through `tracing`, which every other line in this process already uses.
+
+  - **Two wrong diagnoses before the right one, both mine.** I blamed the mutex twice: first
+    for spanning the `println!`, then for being shared with the sink's HTTP reader. I even
+    rebuilt the sink around an unbounded channel so the delivery path could not block on a
+    reader at all. It still hung, because that redesign kept the `println!`. I reverted it
+    rather than merge a plausible non-fix whose stated rationale would have read as a cure.
+
+  - **Instrumentation settled it, not reasoning.** An `eprintln!` probe at the top of `push`
+    printed; the next statement never did. That single run eliminated every remaining theory,
+    and the fact that the probe went to STDERR while the hang was on STDOUT is the whole
+    answer.
+
+  - **Verified end to end**, which is also criterion 2's substance: `otp/send` 200 in 0.22s,
+    discovery still 200 afterwards, and the sink returning a real captured code
+    (`{"kind":"email","recipient":"dev@example.test","body":"334158"}`).
+
+  - **Why nothing caught it.** The sink had unit tests, an endpoint check returning JSON, and
+    a no-egress harness -- and not one of them ever delivered a message THROUGH it. Discovery,
+    JWKS, `/authorize` and the boot budget never trigger a delivery, so every check run when
+    it landed passed while the delivery path was broken. A regression guard worth adding is a
+    source scan forbidding `println!` in this crate's request-path code; a unit test cannot
+    see this, because the defect only exists with a live executor under it.
+
+
 - **The emulator seeds a USER, and the master key is attached where the seeding happens
   (issue #121).** `ironauth dev` now prints an issuer, a client, and a working login.
 
