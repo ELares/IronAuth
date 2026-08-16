@@ -6,6 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator now serves the MANAGEMENT plane, and a from-scratch reference client proves it
+  (issue #122, criterion 2).** Three defects had to be fixed before a client could talk to it at
+  all, and each was only visible by trying:
+
+  - **The management API was not mounted.** `admin.bootstrap_operator_token` was unset, so the
+    emulator served the OIDC plane and none of the plane that administers it. It now sets a
+    deterministic `DEV_OPERATOR_TOKEN`, printed in the banner like every other dev secret.
+  - **It seeded the wrong operator.** The management API authenticates the bootstrap token as one
+    fixed operator id, so a generated one left the emulator's tenant owned by a principal the
+    management plane never acts as: it could list what it had not created and administer none of
+    it. The seed now uses `ironauth_admin::bootstrap_operator_id()`, the same move the admin suite
+    makes with `own_seeded_scopes_by`.
+  - **Every `POST /v1/tenants` collided.** The seeder and the running server each built an `Env`
+    from the same seed, and two `FixedEntropy` streams from one seed replay the same sequence --
+    so the server's first minted tenant id was byte-identical to the seeded one and the insert
+    died on `tenants_pkey`. It surfaced as a bare `500`, a status the published spec does not
+    declare for that operation, so a client could not tell a collision from an outage. The seeder
+    now draws from a dedicated stream, exactly as the fake upstream provider's key already did.
+
+  `clients/reference` is the client, written from `docs/openapi/management.json` and
+  `docs/SDK-CONTRACT.md` with the generated SDKs deliberately unopened -- a client derived from
+  those would only prove they are self-consistent, which was never in question. What was in
+  question is whether the published artifacts are enough to build against, and the three defects
+  above are the answer. `scripts/sdk-conformance.py` is the suite, spec-DRIVEN rather than a hand
+  list: it discovers every GET the spec declares callable, and asserts that count is non-zero so
+  a discovery pass that found nothing cannot report a clean run.
+
 - **The stored credential can now be read back, and something reads it (issue #120, criterion
   4).** `CredentialStore` had `store` and `delete` and no `get`: `ironauth login` wrote a
   credential to the platform keychain that no command ever used. The doc on

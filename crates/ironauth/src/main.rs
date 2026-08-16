@@ -4389,6 +4389,7 @@ fn print_dev_scope(bind: &str, scope: &dev::SeededScope) {
         scope.client,
         dev::DEV_REDIRECT_URI
     );
+    println!("ironauth dev: operator token {}", dev::DEV_OPERATOR_TOKEN);
     println!(
         "ironauth dev: user {} / {}",
         dev::DEV_USER_IDENTIFIER,

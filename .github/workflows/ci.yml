@@ -250,6 +250,14 @@ jobs:
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
           EXPECT_CODE=334158 ./scripts/dev-otp-login.sh
+      # Issue #122 criterion 2: a from-scratch reference client, written from the published
+      # spec and contract and NOT from the generated SDKs, passes the published conformance
+      # suite against the emulator. It runs here because this job already builds the binary
+      # and has the Postgres binaries the emulator brings its own cluster up with.
+      - name: Assert the reference client passes the SDK conformance suite
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          ./scripts/dev-sdk-conformance.sh
       # Issue #121 criterion 3. These tests are `#[ignore]`d because they spawn a real
       # Postgres cluster, and NOTHING ran them: not this workflow, not gate.sh. So the
       # criterion's whole evidence -- that applying the seeds twice does not duplicate
