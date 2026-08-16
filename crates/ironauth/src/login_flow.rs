@@ -43,6 +43,86 @@ pub enum FlowPreference {
     ForceDevice,
 }
 
+/// What `login` should actually do, once the registration and the bind are known.
+///
+/// `choose_flow` answers from the ENVIRONMENT, and the environment cannot know whether a
+/// listener will bind or whether a loopback redirect was ever registered. Both of those are
+/// discovered later, and both change the answer. Keeping that second decision here, as a
+/// value, is what makes criterion 3's fallback half testable: it used to live inline in the
+/// `login` command's async block, where nothing could reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginRoute {
+    /// Drive the loopback flow.
+    Loopback,
+    /// Drive the device flow because that is what was CHOSEN, not fallen back to. Distinct
+    /// from [`LoginRoute::DeviceFallback`] on purpose: the two are identical in what they
+    /// run and opposite in what they mean, and collapsing them would print a fallback
+    /// explanation to a user who asked for the device flow outright.
+    Device,
+    /// Drive the device flow instead, for this reason.
+    DeviceFallback(FallbackReason),
+    /// Refuse: the registration cannot support a loopback login at all.
+    ///
+    /// NOT a fallback. A registration a loopback login cannot use is a CONFIGURATION
+    /// problem, and downgrading it silently would hide it behind a flow that happens to
+    /// work, leaving it undiagnosable.
+    Misconfigured,
+}
+
+/// Why a chosen loopback login became a device login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackReason {
+    /// No loopback redirect was registered, so there is nothing to redirect to.
+    NoRedirectRegistered,
+    /// A listener could not be bound: IPv6 disabled against a `[::1]` registration, or a
+    /// sandbox that forbids listening.
+    ListenerWouldNotBind,
+}
+
+impl FallbackReason {
+    /// What the user is told. A fallback that happened silently would leave them wondering
+    /// why they are typing a code on a machine that has a browser.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NoRedirectRegistered => {
+                "no --redirect registered for a loopback login; using the device flow instead"
+            }
+            Self::ListenerWouldNotBind => {
+                "could not bind a loopback listener; using the device flow instead"
+            }
+        }
+    }
+}
+
+/// Decide the route, given the environment's choice and what was then discovered.
+///
+/// `bound_ok` is whether a listener bound. It is only consulted when a redirect exists,
+/// because binding is not attempted without one.
+#[must_use]
+pub fn route(
+    flow: LoginFlow,
+    registered_redirect: bool,
+    registration_supports_loopback: bool,
+    bound_ok: bool,
+) -> LoginRoute {
+    if flow == LoginFlow::Device {
+        // Already the device flow. Nothing discovered later can change that, and a missing
+        // redirect is not a fallback here: loopback was never wanted.
+        return LoginRoute::Device;
+    }
+    if !registered_redirect {
+        return LoginRoute::DeviceFallback(FallbackReason::NoRedirectRegistered);
+    }
+    if !bound_ok {
+        return LoginRoute::DeviceFallback(FallbackReason::ListenerWouldNotBind);
+    }
+    if !registration_supports_loopback {
+        return LoginRoute::Misconfigured;
+    }
+    LoginRoute::Loopback
+}
+
 /// The environment signals the decision reads.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostSignals {
@@ -129,6 +209,68 @@ mod tests {
 
     fn headless() -> HostSignals {
         HostSignals::default()
+    }
+
+    /// Criterion 3's second half: "falls back cleanly to device flow when the listener
+    /// cannot bind". `choose_flow` answers from the environment, which cannot know that, so
+    /// this is the decision that actually implements the criterion -- and it lived inline in
+    /// the login command's async block, where no test could reach it.
+    #[test]
+    fn a_listener_that_will_not_bind_falls_back_to_the_device_flow() {
+        assert_eq!(
+            route(LoginFlow::Loopback, true, true, false),
+            LoginRoute::DeviceFallback(FallbackReason::ListenerWouldNotBind),
+        );
+    }
+
+    /// The happy path, asserted alongside it. Without this the test above passes for a
+    /// `route` that returned the fallback unconditionally, which would mean the loopback
+    /// flow never ran at all.
+    #[test]
+    fn a_loopback_login_that_binds_stays_a_loopback_login() {
+        assert_eq!(route(LoginFlow::Loopback, true, true, true), LoginRoute::Loopback);
+    }
+
+    #[test]
+    fn no_registered_redirect_falls_back_to_the_device_flow() {
+        assert_eq!(
+            route(LoginFlow::Loopback, false, true, true),
+            LoginRoute::DeviceFallback(FallbackReason::NoRedirectRegistered),
+        );
+    }
+
+    /// A registration a loopback login cannot use is NOT a fallback. Downgrading silently
+    /// would hide a configuration error behind a flow that happens to work.
+    #[test]
+    fn a_registration_that_cannot_do_loopback_is_refused_not_downgraded() {
+        assert_eq!(route(LoginFlow::Loopback, true, false, true), LoginRoute::Misconfigured);
+    }
+
+    /// A device login that was CHOSEN is not a fallback, whatever else is true of the host.
+    /// Reporting it as one would tell a user who passed `--device` that something went
+    /// wrong.
+    #[test]
+    fn a_chosen_device_login_is_never_reported_as_a_fallback() {
+        for redirect in [true, false] {
+            for bound in [true, false] {
+                assert_eq!(
+                    route(LoginFlow::Device, redirect, true, bound),
+                    LoginRoute::Device,
+                    "redirect={redirect} bound={bound}"
+                );
+            }
+        }
+    }
+
+    /// Each fallback explains ITSELF. A user on a machine with a browser, suddenly typing a
+    /// code, needs to know which of the two reasons applied.
+    #[test]
+    fn the_two_fallbacks_do_not_share_an_explanation() {
+        let no_redirect = FallbackReason::NoRedirectRegistered.message();
+        let no_bind = FallbackReason::ListenerWouldNotBind.message();
+        assert_ne!(no_redirect, no_bind);
+        assert!(no_redirect.contains("--redirect"), "{no_redirect}");
+        assert!(no_bind.contains("bind"), "{no_bind}");
     }
 
     #[test]
