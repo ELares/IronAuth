@@ -190,12 +190,6 @@ pub fn parse_redirect(request_line: &str) -> Option<Redirect> {
 }
 
 /// Decode one percent-encoded query value.
-/// Decode one percent-encoded value. Public so the fake upstream provider can reuse it
-/// rather than carry a second decoder that could disagree with this one.
-pub fn percent_decode_public(value: &str) -> String {
-    percent_decode(value)
-}
-
 fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

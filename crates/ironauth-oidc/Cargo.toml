@@ -775,6 +775,14 @@ name = "federation"
 path = "tests/federation.rs"
 required-features = ["testing"]
 
+# The emulator's fake upstream IdP (issue #121, criterion 4): the provider `ironauth dev`
+# actually ships completes a real federation login, rather than a second mock standing in
+# for it.
+[[test]]
+name = "fake_idp_federation"
+path = "tests/fake_idp_federation.rs"
+required-features = ["testing"]
+
 # Enterprise inbound routing + JIT (issue #77): a domain/app/user-routed login redirects to
 # its org's connector and is JIT-provisioned and stamped with the org, subsequent logins
 # update in place with no duplicate, per-app/per-user rules override the domain rule, and a
