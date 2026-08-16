@@ -281,9 +281,12 @@ jobs:
 
       # Linux has no keychain until something provides the Secret Service over D-Bus. macOS
       # and Windows have one built in, so only this platform needs setting up.
+      # Only the RUNTIME pieces: something has to serve the Secret Service over D-Bus for
+      # there to be a keychain at all. The build-time libdbus is vendored into the binary
+      # (see the keyring dependency), so no -dev package is needed here.
       - name: Install the Secret Service
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y gnome-keyring dbus-x11 libsecret-1-0
+        run: sudo apt-get update && sudo apt-get install -y gnome-keyring dbus-x11
 
       # macOS runners start with the login keychain LOCKED, and a locked keychain refuses
       # every write with an error that reads like a backend fault rather than a locked one.
