@@ -6,6 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator seeds a federation connector pointing at its fake upstream (issue #121,
+  criterion 4, second half).** Verified live: zero errors, the server serving, and
+  `connectors` holding `dev-upstream enabled=true sealed=true`.
+
+  - **Through the REPOSITORY, which is forced rather than chosen.** `connectors` stores
+    `client_secret_sealed` and `client_secret_dek_version`, so the row cannot be a seed
+    statement the way the tenant, environment, client and serving state are. The repository
+    seals the secret under the scope's active DEK and provisions the envelope keys as a side
+    effect, so there is no separate key step. `sealed=true` in the row above is the evidence
+    that path actually ran.
+
+  - **The provider now starts BEFORE seeding.** The connector points at its address, which
+    does not exist until it binds. It is seeded only when the provider actually started: a
+    connector aimed at an address nothing serves would fail a federation login for a reason
+    having nothing to do with federation.
+
+  - **A CHECK constraint caught an invented value.** I set `email_verified_trust` to
+    `"always"`; migration 0056 allows only `'untrusted'` or `'trusted'`. The emulator refused
+    to boot rather than starting in a broken state, which is the right behaviour, and the
+    valid values came from reading the migration and the existing `routing_rules` example
+    rather than from a second guess. `'untrusted'` is also the correct posture for a provider
+    that authenticates anyone who asks.
+
+  - **Idempotent by treating the conflict as already-seeded**, like every other seed, because
+    a dev restart against an existing `DATABASE_URL` re-runs all of them.
+
+
 - **A fake upstream OIDC provider for the emulator (issue #121, criterion 4, first half).**
   `ironauth dev` now starts one and prints its issuer. Verified live: discovery 200 with valid
   JSON, JWKS 200 (`OKP`/`Ed25519`/`kid=upstream-1`), `/authorize` 302 redirecting back with
