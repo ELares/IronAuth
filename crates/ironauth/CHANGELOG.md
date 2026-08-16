@@ -6,6 +6,38 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A fake upstream OIDC provider for the emulator (issue #121, criterion 4, first half).**
+  `ironauth dev` now starts one and prints its issuer. Verified live: discovery 200 with valid
+  JSON, JWKS 200 (`OKP`/`Ed25519`/`kid=upstream-1`), `/authorize` 302 redirecting back with
+  `code` and the echoed `state`, `/token` 200 returning a three-segment signed `id_token`.
+
+  - **Its OWN loopback listener, never the production router.** This provider authenticates
+    anyone who asks with no credential at all, so the guarantee that it cannot exist in
+    production is structural rather than a conditional somebody keeps correct. Same containment
+    as the capture sink, for a sharper reason.
+
+  - **It signs through the real JOSE path** and projects its JWKS with
+    `JwkSet::from_signing_keys` -- the same function the server's own JWKS endpoint uses. I had
+    started to add a `public_jwk()` API for this before finding `from_signing_keys` already
+    exported; a hand-rolled JWK would have been a second encoder of the same bytes.
+
+  - **Three defects in this one module, each caught by a different layer**, which is worth
+    recording because no single layer would have done:
+    1. Backslash line-continuations inside a raw string are NOT continuations, so the discovery
+       document went out with literal backslashes and parsed nowhere. Caught by a unit test.
+    2. That unit test originally used `contains` and PASSED against the unparseable document.
+       Caught by re-reading my own test; it now parses and asserts fields.
+    3. The live server still served the broken document after the fix, because `cargo test`
+       builds the test harness and not the binary. Caught only by running it.
+
+  - **Not fatal if it cannot start.** The emulator is useful without an upstream, and refusing
+    to boot over a test double would be the wrong trade.
+
+  The remaining half of criterion 4 is a federation connector pointing at this provider, which
+  must go through `ActingConnectorRepo` because `client_secret_sealed` rules out a seed
+  statement.
+
+
 - **A complete offline email-OTP login, asserted in CI (issue #121, criterion 2).**
   `scripts/dev-otp-login.sh` boots the emulator, requests a code, reads it from the capture
   sink, and completes the login -- with no mail server and no network.
