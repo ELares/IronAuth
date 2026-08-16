@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator's capture sink is now proven to capture SMS, and to capture anything at all
+  through the seams a real send uses (issue #121, criterion 5).** The criterion reads "captured
+  email **and SMS** messages are retrievable via the local sink endpoint". The tests around the
+  sink pushed straight into its buffer, which exercises the buffer and skips the four trait
+  methods that are the only way a real send ever reaches it. So nothing said an SMS was captured
+  at all, and nothing said a captured message carried the `kind` a caller filters on -- and
+  `scripts/dev-otp-login.sh` selects on exactly that field, so an SMS landing under the wrong kind
+  would have been indistinguishable from a provider that was never exercised. The new test drives
+  `deliver_email_otp`, `deliver_magic_link` and `SmsSender::send`, then reads all three back out
+  of the ENDPOINT's own response body rather than the in-memory snapshot, because the criterion is
+  about what a caller can retrieve.
+
 - **`ironauth dev`'s fake upstream IdP now issues tokens a relying party can accept (issue #121,
   criterion 4).** The provider moved to `ironauth-oidc` (`ironauth_oidc::fake_idp`) so the
   federation integration suite can drive the one that ships, and the two defects that made a
