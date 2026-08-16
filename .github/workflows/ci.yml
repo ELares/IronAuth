@@ -250,15 +250,28 @@ jobs:
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
           EXPECT_CODE=334158 ./scripts/dev-otp-login.sh
+      # Issue #122 criterion 2: a from-scratch reference client, written from the published
+      # spec and contract and NOT from the generated SDKs, passes the published conformance
+      # suite against the emulator. It runs here because this job already builds the binary
+      # and has the Postgres binaries the emulator brings its own cluster up with.
+      - name: Assert the reference client passes the SDK conformance suite
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          ./scripts/dev-sdk-conformance.sh
       # Issue #121 criterion 3. These tests are `#[ignore]`d because they spawn a real
       # Postgres cluster, and NOTHING ran them: not this workflow, not gate.sh. So the
       # criterion's whole evidence -- that applying the seeds twice does not duplicate
       # state -- was an assertion no gate executed. This job already installs the Postgres
       # binaries they need, so it is where they belong.
+      # FILTERED to `dev::`, and that filter is load-bearing. `--ignored` alone runs every
+      # ignored test in the binary, and the keychain round trip is also ignored -- so adding
+      # it later made this step fail here on "org.freedesktop.secrets was not provided",
+      # which is a Linux runner with no Secret Service and nothing to do with the emulator.
+      # The keychain test has its own job, on the platforms that have one.
       - name: Run the database-backed emulator tests
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
-          cargo test -p ironauth --bin ironauth -- --ignored
+          cargo test -p ironauth --bin ironauth -- --ignored dev::
 
   keychain:
     # Issue #120 criterion 4: "Credentials are stored in the platform keychain with expiry on

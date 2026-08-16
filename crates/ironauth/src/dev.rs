@@ -305,6 +305,11 @@ pub struct SeededScope {
     pub organization: String,
 }
 
+/// Distinguishes the seeded-identifier stream from the running server's, which draws from
+/// `FixedEntropy::new(seed)` directly. Any constant works; what matters is that it is not
+/// zero and not shared with another stream.
+const SEED_STREAM_SCOPE: u64 = 0x5EED_5C0B_E000_0001;
+
 /// Derive the seeded identifiers from `seed`.
 ///
 /// GENERATED rather than hardcoded, from a dedicated entropy stream. Hardcoding them would
@@ -319,15 +324,31 @@ pub struct SeededScope {
 /// changes.
 #[must_use]
 pub fn seed_ids(seed: u64) -> SeededScope {
+    // A DEDICATED stream, like the fake upstream provider's key. Both this and the running
+    // server draw from `FixedEntropy`, and two of those built from the same seed replay the
+    // same sequence from the start -- so the first tenant id the SERVER minted was
+    // byte-identical to the one seeded here, and every `POST /v1/tenants` against the
+    // emulator died on `duplicate key value violates unique constraint "tenants_pkey"`. It
+    // surfaced as a bare 500, which the published spec does not even declare for that
+    // operation, so a client could not tell a collision from an outage.
+    //
+    // Deterministic ids are the emulator's whole point; two INDEPENDENT things minting the
+    // same ones is not. Separating the streams keeps both properties.
     let env = ironauth_env::Env::from_parts(
         std::sync::Arc::new(ironauth_env::SystemClock),
-        std::sync::Arc::new(ironauth_env::FixedEntropy::new(seed)),
+        std::sync::Arc::new(ironauth_env::FixedEntropy::new(seed ^ SEED_STREAM_SCOPE)),
     );
     let tenant = ironauth_store::TenantId::generate(&env);
     let environment = ironauth_store::EnvironmentId::generate(&env);
     let scope = ironauth_store::Scope::new(tenant, environment);
     SeededScope {
-        operator: ironauth_store::OperatorId::generate(&env).to_string(),
+        // The BOOTSTRAP operator, not a freshly generated one. The management API
+        // authenticates the bootstrap token as this exact operator id, so seeding any other
+        // operator leaves the emulator's own tenant owned by a principal the management
+        // plane never acts as -- it can list what it did not create and administer none of
+        // it. The admin suite makes the same move deliberately
+        // (`own_seeded_scopes_by(bootstrap_operator_id())`).
+        operator: ironauth_admin::bootstrap_operator_id().to_string(),
         tenant: tenant.to_string(),
         environment: environment.to_string(),
         client: ironauth_store::ClientId::generate(&env, &scope).to_string(),
@@ -510,6 +531,16 @@ pub async fn provision_signing_key(
 /// agree: the seed seals a user identifier with it and the server unseals with whatever the
 /// config says, so two literals that drifted would produce a user nobody can log in as.
 pub const DEV_MASTER_KEY: &str = "ironauth-dev-master-key-not-for-production";
+/// The operator token the emulator's management API accepts.
+///
+/// Without one the management plane is NOT MOUNTED -- the server says so at boot and every
+/// management route is absent. An emulator that serves the OIDC plane and not the management
+/// plane cannot stand in for the real server for anything that administers it, which is what
+/// issue #122's reference client needs to talk to.
+///
+/// Fixed, like every other dev secret, so a client can be written against it. That is exactly
+/// why dev mode refuses a non-loopback bind and a remote `DATABASE_URL`.
+pub const DEV_OPERATOR_TOKEN: &str = "ironauth-dev-operator-token-not-for-production";
 
 /// The seeded user's credentials. Fixed, like every other dev secret.
 pub const DEV_USER_IDENTIFIER: &str = "dev@example.test";
@@ -769,6 +800,12 @@ pub fn dev_config_toml(database_url: &str, bind: &str, management_bind: &str) ->
          # Required for the encrypted-PII paths (registration, login, UserInfo); without it\n\
          # they fail CLOSED and no login works. Fixed, like every other dev secret.\n\
          master_key = \"{DEV_MASTER_KEY}\"\n\
+         \n\
+         [admin]\n\
+         # Without this the management API is not mounted at all and the emulator serves only\n\
+         # half the server. Deterministic like every other dev secret, so a client can be\n\
+         # written against it.\n\
+         bootstrap_operator_token = \"{DEV_OPERATOR_TOKEN}\"\n\
          \n\
          [oidc]\n\
          # Off by default, so an emulator that did not set it served no OIDC at all, which is\n\
