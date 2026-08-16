@@ -202,6 +202,38 @@ fn user_created_event(
     }
 }
 
+/// The event a management delete emits (issue #108).
+///
+/// `hard_kill` is carried because it changes what the delete DID: a soft delete leaves the
+/// offline refresh families alive and a hard kill revokes them. A receiver reconciling its
+/// own copy cannot ask afterwards -- the user reads as absent either way.
+fn user_deleted_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    user_id: &ironauth_store::UserId,
+    hard_kill: bool,
+    deleted_at_micros: i64,
+) -> crate::events::PendingEvent {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = crate::events::envelope(
+        &id,
+        crate::events::USER_DELETED,
+        scope,
+        deleted_at_micros / 1000,
+        &serde_json::json!({
+            "user_id": user_id.to_string(),
+            "hard_kill": hard_kill,
+        }),
+    );
+    crate::events::PendingEvent {
+        id,
+        // The SUBJECT is the user, so a create and a delete of one user are exploded in the
+        // order they happened rather than concurrently.
+        subject: user_id.to_string(),
+        envelope,
+    }
+}
+
 /// Create a user under an environment.
 #[utoipa::path(
     post,
@@ -648,12 +680,19 @@ pub async fn delete_user(
     principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
+    let event = user_deleted_event(&state, scope, &id, hard.hard_kill, state.now_unix_micros());
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .users()
-        .delete(state.env(), &id, hard.hard_kill, None)
+        .delete(
+            state.env(),
+            &id,
+            hard.hard_kill,
+            None,
+            Some(&event.domain_event()),
+        )
         .await?;
     Ok(no_content())
 }

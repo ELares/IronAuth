@@ -560,7 +560,7 @@ async fn disabling_and_deleting_a_user_cascades_the_users_sessions() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .users()
-        .delete(&env, &deleted_user, false, None)
+        .delete(&env, &deleted_user, false, None, None)
         .await
         .expect("delete");
     assert!(
@@ -596,7 +596,7 @@ async fn disabling_and_deleting_a_user_cascades_the_users_sessions() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .users()
-        .delete(&env, &deleted_user, false, None)
+        .delete(&env, &deleted_user, false, None, None)
         .await;
     assert!(
         matches!(repeat, Err(StoreError::NotFound)),
@@ -683,7 +683,7 @@ async fn state_for_subject_reports_the_live_state_and_fails_closed_after_delete(
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .users()
-        .delete(&env, &user, false, None)
+        .delete(&env, &user, false, None, None)
         .await
         .expect("delete");
     assert_eq!(
@@ -1168,4 +1168,134 @@ async fn assert_every_keyed_read_resolves_in_its_own_scope(
             .is_some(),
         "tenant B resolves its own user by login handle (the probe hunts a real row)"
     );
+}
+
+/// Deleting a user emits `user.deleted` onto the webhook event queue, in the SAME transaction
+/// as the tombstone (issue #108).
+///
+/// `user.deleted` had been a subscription FILTER string in the webhook surface with nothing
+/// emitting it, so an operator could subscribe to it and wait forever. This is the producer,
+/// and this is what says it exists.
+///
+/// The envelope is validated through `event_catalog::validate_event`, which is the SAME
+/// function the fan-out consumer calls before creating a single delivery. Asserting the row
+/// is present without validating it would pass for an event the fan-out then refuses
+/// permanently -- enqueued, undeliverable, and silent.
+#[tokio::test]
+async fn deleting_a_user_emits_the_registered_user_deleted_event() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = create_user(
+        &db,
+        &env,
+        scope,
+        "deleted-event@example.test",
+        None,
+        UserState::Active,
+        1_000,
+    )
+    .await
+    .expect("create");
+
+    assert_eq!(
+        webhook_events(&db, scope).await.len(),
+        0,
+        "no event exists before the delete, so a later one is caused by it"
+    );
+
+    let envelope = serde_json::json!({
+        "id": "evt_user_deleted_1",
+        "type": "user.deleted",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1_i64,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        "payload": { "user_id": user.to_string(), "hard_kill": false },
+    });
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .delete(
+            &env,
+            &user,
+            false,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_user_deleted_1",
+                subject: &user.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("delete");
+
+    let events = webhook_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the delete enqueues exactly one event");
+    assert_eq!(events[0]["type"], "user.deleted", "{:?}", events[0]);
+    assert_eq!(events[0]["payload"]["user_id"], user.to_string());
+    assert_eq!(
+        events[0]["payload"]["hard_kill"], false,
+        "the payload records WHICH delete happened, not just that one did"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the emitted envelope validates against the registry the fan-out enforces");
+}
+
+/// A delete that carries no event enqueues nothing.
+///
+/// The paired negative. Without it the test above passes for a delete that enqueues an event
+/// unconditionally, which would emit one for every internal caller that passes `None` --
+/// including the cascade paths that are not management deletes at all.
+#[tokio::test]
+async fn a_delete_with_no_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = create_user(
+        &db,
+        &env,
+        scope,
+        "no-event@example.test",
+        None,
+        UserState::Active,
+        1_000,
+    )
+    .await
+    .expect("create");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .delete(&env, &user, false, None, None)
+        .await
+        .expect("delete");
+
+    assert_eq!(
+        webhook_events(&db, scope).await.len(),
+        0,
+        "a delete with no event must not invent one"
+    );
+}
+
+/// Every webhook-event envelope currently queued in `scope`.
+async fn webhook_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
 }

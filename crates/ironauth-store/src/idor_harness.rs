@@ -2222,7 +2222,7 @@ impl IsolationProbe for UserAdminDeleteProbe {
                 .scoped(caller)
                 .acting(actor, correlation)
                 .users()
-                .delete(&env, &id, false, None)
+                .delete(&env, &id, false, None, None)
                 .await
             {
                 Ok(()) => ProbeOutcome::Leaked,

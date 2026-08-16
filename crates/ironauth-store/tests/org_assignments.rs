@@ -208,7 +208,7 @@ async fn delete_user(db: &TestDatabase, env: &Env, scope: Scope, user: &UserId) 
         .scoped(scope)
         .acting(actor(env), CorrelationId::generate(env))
         .users()
-        .delete(env, user, false, None)
+        .delete(env, user, false, None, None)
         .await
         .expect("soft delete user");
 }

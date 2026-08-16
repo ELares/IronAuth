@@ -49,6 +49,8 @@ use ironauth_store::{
 
 /// The event type emitted when an operator creates a user.
 pub const USER_CREATED: &str = "user.created";
+/// The wire type a management delete emits.
+pub const USER_DELETED: &str = "user.deleted";
 
 /// The payload schema version every event in this envelope carries.
 ///

@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Deleting a user through the management API emits `user.deleted` (issue #108).** The handler
+  mints the event and hands it to the store write, which enqueues it transactionally. Subscribers
+  to that type now receive one; before this they could subscribe and never hear anything.
+
 - **A brand snapshot IronAuth exported can be re-imported again (issue #86).** The promotion
   wall refuses a `slots` value that is not already sanitizer output, and its message tells the
   operator to "submit the exported value rather than raw markup". Because

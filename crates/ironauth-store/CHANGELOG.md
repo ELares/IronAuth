@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`user.deleted` has a producer, and is registered because of it (issue #108).** It had been a
+  subscription FILTER string in the webhook surface with nothing emitting it, so an operator
+  could subscribe and wait forever. `UserRepo::delete` now takes an optional `DomainEvent` and
+  enqueues it in the SAME transaction as the tombstone, exactly as the create does -- emitting
+  outside the transaction would let a rolled-back delete announce itself, and a receiver cannot
+  un-see that. The payload carries `hard_kill`, because it changes what the delete DID (a soft
+  delete leaves the offline refresh families alive) and a receiver cannot ask afterwards: the
+  user reads as absent either way.
+
+  The registry's note is corrected with it. It said one type exists "because one producer
+  exists"; it now says every entry has a producer, and names `user.updated` as the one still
+  deliberately absent for exactly that reason.
+
 - **The per-client RFC 8693 token-exchange policy, and the issuance path for the grant (issue
   #125).** Migration 0143 adds `clients.token_exchange_impersonation_allowed` and
   `clients.token_exchange_refresh_allowed`, both `NOT NULL DEFAULT false`, both writable only by
