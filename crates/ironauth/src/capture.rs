@@ -187,6 +187,8 @@ pub fn sink_response(sink: &CaptureSink) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ironauth_store::EmailFactorPurpose;
+
     use super::*;
 
     fn sink() -> CaptureSink {
@@ -267,6 +269,119 @@ mod tests {
             "user@example.test",
         );
         assert!(sink.snapshot().is_empty());
+    }
+
+    /// A scope to stamp the messages with. Its value is never asserted: the sink records
+    /// what a test needs to READ a code back, and the scope is not part of that.
+    fn scope() -> Scope {
+        let env = ironauth_env::Env::from_parts(
+            std::sync::Arc::new(ironauth_env::SystemClock),
+            std::sync::Arc::new(ironauth_env::FixedEntropy::new(1)),
+        );
+        Scope::new(
+            ironauth_store::TenantId::generate(&env),
+            ironauth_store::EnvironmentId::generate(&env),
+        )
+    }
+
+    /// Every message the emulator can capture, retrieved through the ENDPOINT'S OWN payload
+    /// (issue #121, criterion 5: "Captured email and SMS messages are retrievable via the
+    /// local sink endpoint").
+    ///
+    /// The tests around this one push straight into the buffer, which exercises the buffer
+    /// and skips the four trait methods that are the only way a real send ever reaches it.
+    /// So nothing said an SMS was captured at all, and nothing said a captured message was
+    /// tagged with the kind a caller filters on: `dev-otp-login.sh` selects
+    /// `m["kind"] == "email"`, and an SMS landing under the wrong kind, or not landing, would
+    /// have looked identical to a provider that was simply not exercised.
+    #[test]
+    fn an_email_a_magic_link_and_an_sms_are_all_retrievable_from_the_endpoint() {
+        let sink = sink();
+        let scope = scope();
+
+        assert_eq!(
+            sink.snapshot().len(),
+            0,
+            "nothing is captured before a send, so a later non-empty read is caused by one"
+        );
+
+        VerificationSender::deliver_email_otp(
+            &sink,
+            &EmailOtpMessage {
+                scope,
+                purpose: EmailFactorPurpose::Login,
+                recipient: "user@example.test",
+                code: "123456",
+                ttl_secs: 300,
+            },
+        );
+        VerificationSender::deliver_magic_link(
+            &sink,
+            &MagicLinkMessage {
+                scope,
+                purpose: EmailFactorPurpose::Login,
+                recipient: "user@example.test",
+                link: "http://127.0.0.1:1/magic?token=abc",
+                short_code: "WXYZ",
+                ttl_secs: 300,
+            },
+        );
+        SmsSender::send(
+            &sink,
+            &SmsOtpMessage {
+                scope,
+                purpose: EmailFactorPurpose::Mfa,
+                recipient: "+15551234567",
+                route_key: "1",
+                code: "654321",
+                ttl_secs: 300,
+            },
+        );
+
+        // Parsed out of the endpoint's response, not the in-memory buffer: the criterion is
+        // about what a caller can RETRIEVE, and a `snapshot` assertion would hold even if the
+        // response serialization dropped a field or a whole message.
+        let response = sink_response(&sink);
+        let body = response.split_once("\r\n\r\n").expect("a body").1;
+        let messages = serde_json::from_str::<serde_json::Value>(body).expect("valid JSON")
+            ["messages"]
+            .as_array()
+            .expect("a messages array")
+            .clone();
+
+        assert_eq!(messages.len(), 3, "all three sends are retrievable");
+
+        let find = |kind: &str, recipient: &str| {
+            messages
+                .iter()
+                .find(|message| {
+                    message["kind"] == kind && message["recipient"] == recipient
+                })
+                .unwrap_or_else(|| panic!("no {kind} message for {recipient} in {body}"))
+                .clone()
+        };
+
+        // The email OTP: the body IS the code, because that is what a CI job reads back.
+        assert_eq!(find("email", "user@example.test")["body"], "123456");
+        // The SMS is tagged `sms`, so an email-filtering caller does not pick it up and an
+        // SMS-filtering caller does.
+        assert_eq!(find("sms", "+15551234567")["body"], "654321");
+        // The magic link carries the LINK, not the short code: the link is the thing a test
+        // cannot reconstruct, and it is filed under `email` because that is how it was sent.
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["kind"] == "email")
+                .count(),
+            2,
+            "the magic link is an email, so it is retrievable as one"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["body"] == "http://127.0.0.1:1/magic?token=abc"),
+            "the magic link's URL is retrievable, not just its short code: {body}"
+        );
     }
 
     /// The response is `no-store`. It carries live one-time codes, so a cache anywhere on
