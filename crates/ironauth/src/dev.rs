@@ -703,6 +703,13 @@ pub fn dev_config_toml(database_url: &str, bind: &str, management_bind: &str) ->
          [oidc]\n\
          # Off by default, so an emulator that did not set it served no OIDC at all, which is\n\
          # the one thing it exists to serve.\n\
+         enabled = true\n\
+         \n\
+         [oidc.federation]\n\
+         # The federation routes exist unconditionally but are INERT (a uniform 404) until a\n\
+         # runtime is installed, which this flag is what installs. Without it the seeded\n\
+         # upstream connector is unreachable and the emulator cannot demonstrate a federation\n\
+         # login at all.\n\
          enabled = true\n"
     )
 }

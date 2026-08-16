@@ -6,6 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator enables federation, so the seeded upstream connector is reachable (issue
+  #121).** The federation routes exist unconditionally but are INERT -- a uniform 404 -- until
+  a runtime is installed, and `[oidc.federation] enabled` is what installs it. Without this the
+  connector seeded in the previous change could not be reached at all.
+
+  Measured: `/federation/dev-upstream/authorize` went from 404 to a flow-state response, which
+  is the difference between "not mounted" and "mounted and asking for something".
+
+  - **What that response revealed about the remaining work.** The endpoint answers "Link no
+    longer valid", meaning it expects to be ENTERED FROM an existing login flow carrying flow
+    state, not called directly. So criterion 4's integration test is not a sequence of curls:
+    it needs a browser-like client with cookies that starts an `/authorize` flow, selects the
+    connector, follows the redirect to the upstream, and returns through the callback. That is
+    a materially different piece of work from the four endpoints and the connector, and it is
+    the honest reason criterion 4 is not yet demonstrated even though every component of it
+    now exists and is verified.
+
+
 - **The emulator seeds a federation connector pointing at its fake upstream (issue #121,
   criterion 4, second half).** Verified live: zero errors, the server serving, and
   `connectors` holding `dev-upstream enabled=true sealed=true`.
