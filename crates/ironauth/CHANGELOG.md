@@ -23,9 +23,15 @@ range per docs/RELEASING.md.
   which proves the seam and says nothing about a keychain; the closest thing to per-platform
   evidence was an assertion about the text of an error message. The new test is `#[ignore]`d
   (it writes to a developer's own keychain) and a `keychain` CI job runs it with `--ignored` on
-  macOS, Windows, and Linux, installing gnome-keyring and running under `dbus-run-session`
-  there. It compares the WHOLE credential on the way back, because asserting only the access
-  token would pass for a keychain round trip that silently dropped the expiry.
+  macOS and Windows. It compares the WHOLE credential on the way back, because asserting only
+  the access token would pass for a keychain round trip that silently dropped the expiry.
+
+  **Linux is not covered**, and the criterion names it. The build problem is solved (libdbus is
+  vendored, so the crate compiles on a runner with no dbus headers) but the runtime one is not:
+  under `dbus-run-session` with gnome-keyring unlocked, and again after pre-creating a default
+  collection, both the read AND the store answer "Secret Service: no result found". The daemon
+  runs; no usable collection exists for it to write into. Recorded in the workflow beside the
+  job rather than dropped quietly.
 
 - **No login path can write a credential to a file, and that is now checked (issue #120,
   criterion 4).** The criterion's second half, "no plaintext token files exist after login in
