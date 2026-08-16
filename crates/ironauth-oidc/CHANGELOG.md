@@ -6,6 +6,34 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator's fake upstream IdP could never have completed a federation login, and now does
+  (issue #121, criterion 4).** The provider `ironauth dev` ships was written, wired, seeded as a
+  connector, and reachable, and no test ever drove a login through it. Two defects were sitting in
+  it, each fatal on its own:
+
+  - **It echoed no `nonce`.** IronAuth binds an unguessable `nonce` at the federated authorize leg
+    and matches the upstream ID token's claim against it EXACTLY (OIDC Core 3.1.2.1); a token
+    without it is refused. The provider passed `None`, under a comment calling this a deliberate
+    limitation of a test double. It was not a limitation of the double. It made the double unusable
+    for the single thing it exists to do, and the comment is why that read as a decision rather
+    than a defect. The provider keeps no state by design, so the nonce now rides inside the
+    authorization code, which is the one value that travels both legs; the relying party treats
+    that code as opaque, which is what makes it safe.
+
+  - **Every token it issued expired in 1970.** The token endpoint called `id_token(..., 0, ...)`,
+    so `iat` was the epoch and `exp` was the epoch plus an hour. The clock is now a parameter, read
+    off the `ironauth-env` `Clock` seam by the caller, so `ironauth dev` stamps live time and the
+    integration suite stamps its fixed test time.
+
+  The module moved from the `ironauth` binary crate to `ironauth-oidc`, beside the federation code
+  it is a counterpart to. That is what makes the criterion testable at all: from the binary crate
+  the federation suite could only have reached it through a SECOND hand-rolled upstream standing in
+  for it, and a double whose conformance is asserted against a different double is evidence about
+  the wrong artifact. `tests/fake_idp_federation.rs` now drives a complete login through the
+  provider that actually ships, playing the browser for the `/authorize` hop the relying party
+  never makes, and asserting an identity is provisioned and a federated session established rather
+  than only that a redirect came back.
+
 - **The RFC 8693 token-exchange grant is now MOUNTED at the token endpoint (issue #125).** The
   decision layer for it has shipped in `ironauth-store` for some time (narrowing rules, `act` chain
   extension, requested-type negotiation, and the composed `decide`), and nothing called it: there

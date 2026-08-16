@@ -104,8 +104,9 @@ mod credentials;
 /// `ironauth dev`: the local emulator (issue #121).
 mod dev;
 
-/// A fake upstream OIDC provider for the emulator (issue #121, criterion 4).
-mod fake_idp;
+// The fake upstream OIDC provider this crate serves is `ironauth_oidc::fake_idp`. It lives
+// beside the federation code it is a counterpart to, so the federation suite can drive the
+// provider that actually ships rather than a second mock standing in for it.
 
 /// `ironauth login`: the RFC 8628 device flow (issue #120).
 mod login;
@@ -4421,7 +4422,7 @@ fn start_fake_upstream(seed: u64) -> Option<String> {
         Ok(key) => {
             let issuer = format!("http://{addr}");
             println!("ironauth dev: fake upstream IdP at {issuer}");
-            fake_idp::serve(listener, key, issuer.clone());
+            ironauth_oidc::fake_idp::serve(listener, key, issuer.clone(), key_env.clock_arc());
             Some(issuer)
         }
         Err(error) => {
@@ -4496,7 +4497,7 @@ fn prepare_dev_schema(
         // nothing serves would be a federation login that fails for a reason having nothing
         // to do with federation.
         if let Some(issuer) = upstream_issuer {
-            dev::seed_upstream_connector(&store, &env, parsed, issuer, fake_idp::FAKE_CLIENT_ID)
+            dev::seed_upstream_connector(&store, &env, parsed, issuer, ironauth_oidc::fake_idp::FAKE_CLIENT_ID)
                 .await?;
         }
         Ok::<(), String>(())

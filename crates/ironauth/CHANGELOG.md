@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`ironauth dev`'s fake upstream IdP now issues tokens a relying party can accept (issue #121,
+  criterion 4).** The provider moved to `ironauth-oidc` (`ironauth_oidc::fake_idp`) so the
+  federation integration suite can drive the one that ships, and the two defects that made a
+  federation login through it impossible are fixed: it echoes the bound `nonce`, and it stamps
+  tokens off the `Clock` seam instead of hardcoding the epoch. See the `ironauth-oidc` changelog
+  for the full account.
+
 - **The emulator enables federation, so the seeded upstream connector is reachable (issue
   #121).** The federation routes exist unconditionally but are INERT -- a uniform 404 -- until
   a runtime is installed, and `[oidc.federation] enabled` is what installs it. Without this the

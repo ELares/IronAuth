@@ -100,6 +100,11 @@ mod email_otp;
 pub mod enrichment;
 mod error;
 pub mod factor_downgrade;
+/// The fake upstream OIDC provider (issue #121). It lives beside the federation code it is a
+/// counterpart to, rather than in the CLI crate that boots it, so the federation integration
+/// suite can drive the SAME provider the emulator ships instead of a second hand-rolled mock
+/// that could conform where the shipped one does not.
+pub mod fake_idp;
 mod fedcm;
 mod federation;
 mod federation_client_secret;
