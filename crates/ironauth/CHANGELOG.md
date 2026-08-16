@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator seeds an organization, and "re-running seeds does not duplicate state" is now
+  measured rather than asserted (issue #121, criterion 3).** The criterion names orgs alongside
+  tenants, environments, users and clients; no organization was ever seeded, so every org-scoped
+  surface had nothing to be exercised against. And the idempotence evidence was a second
+  `apply_seeds` call that only had to return `Ok`: a statement inserting a fresh row each run
+  satisfies that exactly as well as one that does nothing. The test now counts rows per seeded
+  table before and after the second run and compares them, having first asserted every count is
+  non-zero so a table the seeds never touch cannot make the comparison vacuous.
+
+- **The database-backed emulator tests now run in CI.** They are `#[ignore]`d because they spawn
+  a real Postgres cluster, and nothing ran them: not the workflow, not `gate.sh`. The criterion's
+  whole evidence was an assertion no gate executed. The `dev-boot-time` job already installs the
+  Postgres binaries they need, so they run there.
+
 - **The emulator's capture sink is now proven to capture SMS, and to capture anything at all
   through the seams a real send uses (issue #121, criterion 5).** The criterion reads "captured
   email **and SMS** messages are retrievable via the local sink endpoint". The tests around the
