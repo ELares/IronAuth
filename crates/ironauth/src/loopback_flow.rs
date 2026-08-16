@@ -106,6 +106,26 @@ pub enum PrepareError {
 /// [`PrepareError::Bind`] when no listener could be bound, which the caller treats as
 /// "use the device flow".
 pub fn prepare(registered: &str, entropy: &dyn Entropy) -> Result<Prepared, PrepareError> {
+    prepare_with(registered, entropy, &|host| TcpListener::bind(host))
+}
+
+/// [`prepare`], over an injected binder.
+///
+/// The binder is a seam because the failure it exists to handle cannot otherwise be reached
+/// from a test: `prepare` binds `127.0.0.1:0` or `[::1]:0`, and an ephemeral port on
+/// loopback essentially always succeeds. The real failures are a host with IPv6 disabled
+/// answering a `[::1]` registration, and a sandbox that forbids listening at all -- neither
+/// reproducible in process. Without this seam the device-flow fallback was unreachable code
+/// as far as the suite was concerned, which is the state it was in.
+///
+/// # Errors
+///
+/// As [`prepare`].
+pub fn prepare_with(
+    registered: &str,
+    entropy: &dyn Entropy,
+    bind: &dyn Fn(&str) -> std::io::Result<TcpListener>,
+) -> Result<Prepared, PrepareError> {
     // Bind FIRST: the port is not known until it is bound, and the redirect URI has to
     // carry it. Port 0 asks the OS for an ephemeral one.
     //
@@ -118,7 +138,7 @@ pub fn prepare(registered: &str, entropy: &dyn Entropy) -> Result<Prepared, Prep
     } else {
         "127.0.0.1:0"
     };
-    let listener = TcpListener::bind(bind_host).map_err(|_| PrepareError::Bind)?;
+    let listener = bind(bind_host).map_err(|_| PrepareError::Bind)?;
     let port = listener
         .local_addr()
         .map_err(|_| PrepareError::Bind)?
@@ -265,6 +285,42 @@ mod tests {
 
     fn entropy() -> FixedEntropy {
         FixedEntropy::new(7)
+    }
+
+    /// A listener that will not bind is [`PrepareError::Bind`], which is what the login
+    /// command turns into the device flow (issue #120, criterion 3).
+    ///
+    /// Reached through the injected binder because it cannot be reached otherwise: an
+    /// ephemeral port on loopback essentially always binds. The real cases are a host with
+    /// IPv6 disabled answering a `[::1]` registration and a sandbox that forbids listening,
+    /// neither reproducible in process -- so before this seam the fallback was, as far as
+    /// the suite could tell, unreachable code.
+    #[test]
+    fn a_listener_that_will_not_bind_is_a_bind_error_not_a_registration_error() {
+        let refuses = |_: &str| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no such address",
+            ))
+        };
+        let result = prepare_with("http://127.0.0.1/callback", &entropy(), &refuses);
+        assert_eq!(result.err(), Some(PrepareError::Bind));
+    }
+
+    /// The same registration binds and prepares normally through the REAL binder. Without
+    /// this the test above passes for a `prepare_with` that returned `Bind` unconditionally,
+    /// which would mean no loopback login ever worked.
+    #[test]
+    fn the_same_registration_prepares_normally_when_the_bind_succeeds() {
+        let prepared = prepare_with("http://127.0.0.1/callback", &entropy(), &|host| {
+            TcpListener::bind(host)
+        })
+        .expect("a loopback listener binds");
+        assert!(
+            prepared.redirect_uri.starts_with("http://127.0.0.1:"),
+            "{}",
+            prepared.redirect_uri
+        );
     }
 
     /// The generated verifier satisfies the SERVER's own format rule, not one restated here.

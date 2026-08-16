@@ -55,7 +55,7 @@ curl -s http://127.0.0.1:58737/
 ```
 
 `kind` is `email` or `sms`. `body` is the code, the magic link, or the SMS text, **in
-plaintext** — that is the whole point, and it is why the sink is loopback-only and exists
+plaintext** -- that is the whole point, and it is why the sink is loopback-only and exists
 only in dev mode.
 
 ## A GitHub Actions recipe

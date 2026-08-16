@@ -4738,36 +4738,42 @@ fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // has to be made at the bind and not before it.
         let mut result = None;
         if flow == login_flow::LoginFlow::Loopback {
-            match redirect.as_deref() {
-                Some(registered) => {
-                    match loopback_flow::prepare(registered, &ironauth_env::OsEntropy) {
-                        Ok(prepared) => {
-                            result = Some(
-                                run_loopback(&issuer, &client_id, &account, &store, now, prepared)
-                                    .await,
-                            );
-                        }
-                        Err(loopback_flow::PrepareError::Bind) => {
-                            println!(
-                                "ironauth: could not bind a loopback listener; \
-                                 using the device flow instead"
-                            );
-                        }
-                        // A registration that cannot support loopback is a CONFIGURATION
-                        // problem. Downgrading silently would hide it behind a flow that
-                        // happens to work, leaving it undiagnosable.
-                        Err(loopback_flow::PrepareError::Registration(cause)) => {
-                            eprintln!("ironauth login: {}", cause.message());
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                }
-                None => {
-                    println!(
-                        "ironauth: no --redirect registered for a loopback login; \
-                         using the device flow instead"
+            // The attempt, then `route` over what it discovered. The DECISION is not made
+            // here: it is a value computed by `login_flow::route`, which is tested for all
+            // four outcomes. Deciding inline is how criterion 3's fallback half came to be
+            // implemented and untestable at the same time.
+            let attempt = redirect
+                .as_deref()
+                .map(|registered| loopback_flow::prepare(registered, &ironauth_env::OsEntropy));
+            let bound_ok = !matches!(attempt, Some(Err(loopback_flow::PrepareError::Bind)));
+            let supports_loopback = !matches!(
+                attempt,
+                Some(Err(loopback_flow::PrepareError::Registration(_)))
+            );
+            match login_flow::route(flow, redirect.is_some(), supports_loopback, bound_ok) {
+                login_flow::LoginRoute::Loopback => {
+                    let prepared = attempt
+                        .expect("routed to loopback, so a redirect was registered")
+                        .expect("routed to loopback, so preparing succeeded");
+                    result = Some(
+                        run_loopback(&issuer, &client_id, &account, &store, now, prepared).await,
                     );
                 }
+                login_flow::LoginRoute::DeviceFallback(reason) => {
+                    println!("ironauth: {}", reason.message());
+                }
+                login_flow::LoginRoute::Misconfigured => {
+                    let Some(Err(loopback_flow::PrepareError::Registration(cause))) = attempt
+                    else {
+                        unreachable!("Misconfigured is returned only for a registration error")
+                    };
+                    eprintln!("ironauth login: {}", cause.message());
+                    return ExitCode::FAILURE;
+                }
+                // Unreachable inside this `if`, which tests `flow == Loopback`. Matched
+                // rather than caught by a wildcard so a future variant is a compile error
+                // here instead of a silently skipped login.
+                login_flow::LoginRoute::Device => {}
             }
         }
 

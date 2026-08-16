@@ -6,6 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`ironauth login`'s fallback to the device flow is now a tested decision rather than inline
+  branching (issue #120, criterion 3).** The criterion has two halves: loopback is selected
+  automatically when a browser is available, and it "falls back cleanly to device flow when the
+  listener cannot bind". The first half was well covered by `choose_flow`. The second was
+  implemented, and untestable: it lived inside the login command's async block, and the failure
+  it turns on could not be produced anyway, because `prepare` binds an ephemeral loopback port
+  and that essentially always succeeds. As far as the suite could tell it was unreachable code.
+
+  `login_flow::route` now decides, as a value, from what the attempt discovered -- and the
+  command matches on it instead of branching itself, so the tested logic is the shipped logic
+  rather than a parallel copy. `loopback_flow::prepare_with` takes an injected binder, which is
+  what makes the bind failure reachable at all; the real cases (IPv6 disabled against a `[::1]`
+  registration, a sandbox that forbids listening) are not reproducible in process.
+
+  A device login that was CHOSEN is now distinguished from one fallen back to. They run the same
+  flow and mean opposite things, and collapsing them printed a fallback explanation to a user who
+  passed `--device`.
+
 - **`ironauth dev` refuses a `DATABASE_URL` on another machine (issue #121, criterion 6).** The
   existing guard stops dev mode being REACHED from outside. This stops it REACHING outside, which
   is the same hazard in the other direction and the one an operator falls into by accident:
