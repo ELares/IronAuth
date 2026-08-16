@@ -250,3 +250,84 @@ async fn a_per_organization_stream_round_trips_its_organization() {
          organization"
     );
 }
+
+/// A per-organization stream sees ONLY that organization's rows (issue #110, criterion 3:
+/// "cross-org leakage is impossible (adversarial test)").
+///
+/// The existing round-trip test above proves the `organization_id` column persists. It would
+/// pass unchanged if selection ignored the column entirely, which is the leak this criterion
+/// is about, so it cannot be the evidence for it. This one writes rows for TWO organizations
+/// plus an unattributed row and asserts what comes back.
+///
+/// Both directions are required and they fail differently. Missing the positive means a
+/// per-org stream ships nothing and someone notices immediately. Missing the negative means
+/// it ships another tenant's audit trail to this tenant's collector, and the delivery
+/// SUCCEEDS, so nothing in the system reports it: the operator learns from the recipient.
+#[tokio::test]
+async fn a_per_organization_stream_never_sees_another_organizations_rows() {
+    use ironauth_store::{CorrelationId, OrganizationId};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let mine = OrganizationId::generate(&env, &scope);
+    let theirs = OrganizationId::generate(&env, &scope);
+
+    // One admin mutation per organization, plus one belonging to neither. The audit row
+    // records the generated client id as its target, so the ids are captured here: matching
+    // on the human-readable name would find nothing and the negative assertions would then
+    // pass for the wrong reason.
+    let mine_client = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .in_organization(mine)
+        .clients()
+        .create(&env, "mine-1")
+        .await
+        .expect("create a client in my organization");
+    let theirs_client = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .in_organization(theirs)
+        .clients()
+        .create(&env, "theirs-1")
+        .await
+        .expect("create a client in the other organization");
+    let unattributed_client = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "environment-wide")
+        .await
+        .expect("create an unattributed client");
+
+    let rows = db
+        .store()
+        .scoped(scope)
+        .audit_chain()
+        .rows_after("admin_action", None, 100, Some(mine.to_string().as_str()))
+        .await
+        .expect("read this organization's rows");
+
+    // Positive: the stream is not simply empty, which would satisfy the negative vacuously.
+    assert!(
+        rows.iter().any(|row| row.target_id == mine_client.to_string()),
+        "the organization's own row must ship: {rows:?}"
+    );
+    // Negative: nothing from the other organization.
+    assert!(
+        !rows.iter().any(|row| row.target_id == theirs_client.to_string()),
+        "another organization's row reached this organization's stream, which is the \
+         cross-org leak: {rows:?}"
+    );
+    // And the unattributed row is not this organization's event either. `NULL = 'org'` is
+    // NULL rather than true, so the SQL already excludes it; asserting it pins that a future
+    // rewrite to `IS NOT DISTINCT FROM` or a COALESCE default cannot quietly widen the feed.
+    assert!(
+        !rows.iter().any(|row| row.target_id == unattributed_client.to_string()),
+        "a row belonging to no organization is not this organization's event: {rows:?}"
+    );
+}
