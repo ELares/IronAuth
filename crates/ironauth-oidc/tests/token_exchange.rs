@@ -614,7 +614,11 @@ async fn every_exchange_emits_an_audit_event_not_only_impersonation() {
         ],
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "a self downscope must succeed: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a self downscope must succeed: {body}"
+    );
 
     assert_eq!(
         harness.count_audit_action("token_exchange.issue").await,

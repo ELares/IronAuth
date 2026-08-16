@@ -4497,8 +4497,14 @@ fn prepare_dev_schema(
         // nothing serves would be a federation login that fails for a reason having nothing
         // to do with federation.
         if let Some(issuer) = upstream_issuer {
-            dev::seed_upstream_connector(&store, &env, parsed, issuer, ironauth_oidc::fake_idp::FAKE_CLIENT_ID)
-                .await?;
+            dev::seed_upstream_connector(
+                &store,
+                &env,
+                parsed,
+                issuer,
+                ironauth_oidc::fake_idp::FAKE_CLIENT_ID,
+            )
+            .await?;
         }
         Ok::<(), String>(())
     })?;
@@ -4736,6 +4742,33 @@ fn already_signed_in(
     ))
 }
 
+/// Answer `login` early when the stored credential already stands in for it.
+///
+/// `Some(code)` means `login` is over: either the user is already signed in, or the keychain
+/// could not be read and starting a flow would only fail later for a second reason.
+fn report_already_signed_in(account: &str, issuer: &str, force: bool) -> Option<ExitCode> {
+    match already_signed_in(
+        &credentials::KeyringStore,
+        account,
+        issuer,
+        login::epoch_secs(&ironauth_env::SystemClock),
+        force,
+    ) {
+        Ok(true) => {
+            println!(
+                "ironauth: already signed in to {issuer} as '{account}'; \
+                 pass --force to sign in again"
+            );
+            Some(ExitCode::SUCCESS)
+        }
+        Ok(false) => None,
+        Err(error) => {
+            eprintln!("ironauth login: could not read the stored credential: {error}");
+            Some(ExitCode::FAILURE)
+        }
+    }
+}
+
 fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
     let Ok(parsed) = parse_login_args(args) else {
         return ExitCode::FAILURE;
@@ -4758,25 +4791,8 @@ fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
     //
     // A keychain that REFUSES is not "not signed in": that is reported and fails, rather
     // than silently starting a login that would fail again at the store step.
-    match already_signed_in(
-        &credentials::KeyringStore,
-        &account,
-        &issuer,
-        login::epoch_secs(&ironauth_env::SystemClock),
-        force,
-    ) {
-        Ok(true) => {
-            println!(
-                "ironauth: already signed in to {issuer} as '{account}'; \
-                 pass --force to sign in again"
-            );
-            return ExitCode::SUCCESS;
-        }
-        Ok(false) => {}
-        Err(error) => {
-            eprintln!("ironauth login: could not read the stored credential: {error}");
-            return ExitCode::FAILURE;
-        }
+    if let Some(code) = report_already_signed_in(&account, &issuer, force) {
+        return code;
     }
 
     // Which flow. An explicit flag wins; otherwise the host decides, and loopback is
@@ -5014,8 +5030,8 @@ fn logout_with(store: &impl credentials::CredentialStore, account: &str) -> Exit
 #[cfg(test)]
 mod already_signed_in_tests {
     use super::already_signed_in;
-    use super::credentials::{CredentialStore, StoredCredential};
     use super::credentials::testing::{MemoryStore, RefusingStore};
+    use super::credentials::{CredentialStore, StoredCredential};
 
     const ISSUER: &str = "https://one.example";
 
@@ -5039,7 +5055,9 @@ mod already_signed_in_tests {
     fn an_unexpired_credential_for_this_issuer_makes_login_a_no_op() {
         let store = MemoryStore::default();
         stored(&store, ISSUER, 100);
-        assert_eq!(already_signed_in(&store, "default", ISSUER, 99, false).expect("the store answers"), true);
+        assert!(
+            already_signed_in(&store, "default", ISSUER, 99, false).expect("the store answers")
+        );
     }
 
     /// The paired negatives. Without them the test above passes for a function that returns
@@ -5048,20 +5066,26 @@ mod already_signed_in_tests {
     fn an_expired_credential_does_not_stand_in_for_a_login() {
         let store = MemoryStore::default();
         stored(&store, ISSUER, 100);
-        assert_eq!(already_signed_in(&store, "default", ISSUER, 100, false).expect("the store answers"), false);
+        assert!(
+            !already_signed_in(&store, "default", ISSUER, 100, false).expect("the store answers")
+        );
     }
 
     #[test]
     fn a_credential_from_another_deployment_does_not_stand_in_for_a_login() {
         let store = MemoryStore::default();
         stored(&store, "https://two.example", 100);
-        assert_eq!(already_signed_in(&store, "default", ISSUER, 99, false).expect("the store answers"), false);
+        assert!(
+            !already_signed_in(&store, "default", ISSUER, 99, false).expect("the store answers")
+        );
     }
 
     #[test]
     fn nothing_stored_is_not_a_login() {
         let store = MemoryStore::default();
-        assert_eq!(already_signed_in(&store, "default", ISSUER, 99, false).expect("the store answers"), false);
+        assert!(
+            !already_signed_in(&store, "default", ISSUER, 99, false).expect("the store answers")
+        );
     }
 
     /// `--force` means sign in again, so the credential is not even consulted.
@@ -5069,7 +5093,9 @@ mod already_signed_in_tests {
     fn force_signs_in_again_even_when_a_valid_credential_is_stored() {
         let store = MemoryStore::default();
         stored(&store, ISSUER, 100);
-        assert_eq!(already_signed_in(&store, "default", ISSUER, 99, true).expect("the store answers"), false);
+        assert!(
+            !already_signed_in(&store, "default", ISSUER, 99, true).expect("the store answers")
+        );
     }
 
     /// A keychain that REFUSES is not "not signed in". Reporting `false` would start a login

@@ -312,9 +312,6 @@ mod tests {
     #[test]
     #[ignore = "writes to the real platform keychain; run with --ignored"]
     fn a_credential_survives_the_real_platform_keychain_with_its_expiry() {
-        let store = KeyringStore;
-        let account = format!("ironauth-selftest-{}", std::process::id());
-
         // Delete on the way out, INCLUDING on panic. Without this a failing assertion leaves
         // an entry in the developer's own keychain, which is exactly what happened while this
         // test was being written: a mutation run failed before reaching the delete below and
@@ -326,6 +323,9 @@ mod tests {
                 let _ = KeyringStore.delete(&self.0);
             }
         }
+
+        let store = KeyringStore;
+        let account = format!("ironauth-selftest-{}", std::process::id());
         let _cleanup = Cleanup(account.clone());
 
         // Nothing stored yet. This is also the first assertion `get` has to satisfy, and it
@@ -369,7 +369,9 @@ mod tests {
 
         // Deleting again is not an error: `logout` must reach a known state from any
         // starting state.
-        store.delete(&account).expect("deleting twice is idempotent");
+        store
+            .delete(&account)
+            .expect("deleting twice is idempotent");
     }
 
     /// The consumer of the stored expiry. Without one, the promise on
@@ -383,12 +385,24 @@ mod tests {
             expires_at_unix_secs: 100,
             issuer: "https://one.example".to_owned(),
         };
-        assert!(super::still_valid(Some(&credential), "https://one.example", 99));
+        assert!(super::still_valid(
+            Some(&credential),
+            "https://one.example",
+            99
+        ));
 
         // Expiry is exclusive at the boundary: a token expiring exactly now is spent. The
         // alternative sends the user into a flow with a credential that dies mid-request.
-        assert!(!super::still_valid(Some(&credential), "https://one.example", 100));
-        assert!(!super::still_valid(Some(&credential), "https://one.example", 101));
+        assert!(!super::still_valid(
+            Some(&credential),
+            "https://one.example",
+            100
+        ));
+        assert!(!super::still_valid(
+            Some(&credential),
+            "https://one.example",
+            101
+        ));
 
         // A DIFFERENT deployment. The whole point of storing the issuer: answering "you are
         // already signed in" here would be answering about somewhere else.

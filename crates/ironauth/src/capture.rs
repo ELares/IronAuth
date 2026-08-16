@@ -343,20 +343,18 @@ mod tests {
         // response serialization dropped a field or a whole message.
         let response = sink_response(&sink);
         let body = response.split_once("\r\n\r\n").expect("a body").1;
-        let messages = serde_json::from_str::<serde_json::Value>(body).expect("valid JSON")
-            ["messages"]
-            .as_array()
-            .expect("a messages array")
-            .clone();
+        let messages =
+            serde_json::from_str::<serde_json::Value>(body).expect("valid JSON")["messages"]
+                .as_array()
+                .expect("a messages array")
+                .clone();
 
         assert_eq!(messages.len(), 3, "all three sends are retrievable");
 
         let find = |kind: &str, recipient: &str| {
             messages
                 .iter()
-                .find(|message| {
-                    message["kind"] == kind && message["recipient"] == recipient
-                })
+                .find(|message| message["kind"] == kind && message["recipient"] == recipient)
                 .unwrap_or_else(|| panic!("no {kind} message for {recipient} in {body}"))
                 .clone()
         };

@@ -228,7 +228,10 @@ mod tests {
     /// flow never ran at all.
     #[test]
     fn a_loopback_login_that_binds_stays_a_loopback_login() {
-        assert_eq!(route(LoginFlow::Loopback, true, true, true), LoginRoute::Loopback);
+        assert_eq!(
+            route(LoginFlow::Loopback, true, true, true),
+            LoginRoute::Loopback
+        );
     }
 
     #[test]
@@ -243,7 +246,10 @@ mod tests {
     /// would hide a configuration error behind a flow that happens to work.
     #[test]
     fn a_registration_that_cannot_do_loopback_is_refused_not_downgraded() {
-        assert_eq!(route(LoginFlow::Loopback, true, false, true), LoginRoute::Misconfigured);
+        assert_eq!(
+            route(LoginFlow::Loopback, true, false, true),
+            LoginRoute::Misconfigured
+        );
     }
 
     /// A device login that was CHOSEN is not a fallback, whatever else is true of the host.
