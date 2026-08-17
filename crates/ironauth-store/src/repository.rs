@@ -44385,8 +44385,29 @@ impl ActingTenantRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if no live tenant matched under this operator.
-    #[allow(clippy::too_many_lines)]
     pub async fn delete(&self, env: &Env, id: &TenantId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `tenant.deleted` (issue #108).
+    ///
+    /// The event is TENANT-SCOPED: its envelope names no environment, because this delete
+    /// fences all of them. The outbox row is still scoped -- it needs one to be read back --
+    /// and the scope it uses is the audit scope picked below, which is an implementation
+    /// detail of storage rather than a claim about the fact.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    // The pre-existing exception, moved here with the body it describes: splitting `delete`
+    // into a wrapper left the attribute on the one-line half.
+    #[allow(clippy::too_many_lines)]
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         // The audit scope needs an environment of this tenant; pick the oldest (it is
         // retained through soft delete, so its row still satisfies the composite
         // foreign key from `audit_log` to `environments`). A tenant always has its
@@ -44619,6 +44640,10 @@ impl ActingTenantRepo<'_> {
                     .bind(scope.environment().to_string())
                     .execute(&mut **tx)
                     .await?;
+                // In the SAME transaction as the tombstone and every environment fence it
+                // just wrote. Announcing before those commit would tell a receiver to stop
+                // trusting a tenant that is still answering.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

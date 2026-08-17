@@ -1927,3 +1927,120 @@ async fn revoking_a_management_key_without_an_event_enqueues_nothing() {
         "a revocation with no event must not invent one"
     );
 }
+
+/// Deleting a tenant emits `tenant.deleted`, and its envelope names NO environment
+/// (issue #108).
+///
+/// This is the type the per-type envelope rule exists for. Deleting a tenant fences EVERY one
+/// of its environments in the same transaction, so naming one would assert something untrue
+/// about the rest -- and the store picks the audit scope itself (the oldest environment)
+/// after the call begins, so a producer could not name the right one even if there were one.
+#[tokio::test]
+async fn deleting_a_tenant_emits_an_envelope_that_names_no_environment() {
+    let fixture = Fixture::start().await;
+    let scope = fixture.create_tenant(None).await;
+
+    let envelope = ironauth_store::event_catalog::envelope_tenant_scoped(
+        "evt_tenant_deleted",
+        "tenant.deleted",
+        &scope.tenant().to_string(),
+        1,
+        &serde_json::json!({ "tenant_id": scope.tenant().to_string() }),
+    )
+    .expect("tenant.deleted is registered as tenant-scoped");
+
+    assert!(
+        envelope.get("environment_id").is_none(),
+        "a tenant-scoped envelope carries no environment: {envelope}"
+    );
+
+    fixture
+        .db
+        .control_store()
+        .management()
+        .acting(fixture.actor, CorrelationId::generate(&fixture.env))
+        .tenants(fixture.operator)
+        .delete_with_event(
+            &fixture.env,
+            &scope.tenant(),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_tenant_deleted",
+                subject: &scope.tenant().to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("delete with event");
+
+    let events = queued_events(&fixture, scope).await;
+    assert_eq!(events.len(), 1, "the delete enqueues exactly one event");
+    assert_eq!(events[0]["type"], "tenant.deleted");
+    assert_eq!(
+        events[0]["payload"]["tenant_id"],
+        scope.tenant().to_string()
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// The two envelope constructors refuse each other's types.
+///
+/// The guarantee that makes the split worth having: a producer cannot reach the fan-out with
+/// the wrong shape, because the wrong constructor hands it `None` and the write never
+/// happens. Without this, the mistake would surface at DELIVERY -- the write committed, the
+/// event enqueued, and the notice permanently undeliverable.
+#[tokio::test]
+async fn each_envelope_constructor_refuses_the_other_scope() {
+    // An environment-scoped type built without an environment: refused.
+    assert!(
+        ironauth_store::event_catalog::envelope_tenant_scoped(
+            "evt_x",
+            "user.created",
+            "ten_x",
+            1,
+            &serde_json::json!({ "user_id": "usr_1", "state": "active" }),
+        )
+        .is_none(),
+        "user.created names an environment and must not build tenant-scoped"
+    );
+
+    // A tenant-scoped type built WITH one: also refused, and this is the direction that
+    // matters more -- an environment id here would scope a tenant-wide fact to whichever
+    // environment happened to be picked, and a receiver would act on it there alone.
+    assert!(
+        ironauth_store::event_catalog::envelope(
+            "evt_y",
+            "tenant.deleted",
+            "ten_x",
+            "env_y",
+            1,
+            &serde_json::json!({ "tenant_id": "ten_x" }),
+        )
+        .is_none(),
+        "tenant.deleted names no environment and must not build environment-scoped"
+    );
+}
+
+/// Every environment-scoped type still REQUIRES its environment id.
+///
+/// The regression guard for this change. `environment_id` left the envelope's blanket
+/// `required` list, and if the per-type rule that replaced it were wrong or absent, all
+/// twenty environment-scoped types would silently accept an envelope without one -- and
+/// nothing else in the suite would notice, because every producer supplies it.
+#[tokio::test]
+async fn an_environment_scoped_type_still_refuses_an_envelope_without_one() {
+    let missing = serde_json::json!({
+        "id": "evt_probe",
+        "type": "user.created",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1_i64,
+        "tenant_id": "ten_x",
+        "payload": { "user_id": "usr_1", "state": "active" },
+    });
+    let refusal = ironauth_store::event_catalog::validate_event(&missing)
+        .expect_err("an environment-scoped event without an environment must be refused");
+    assert!(
+        format!("{refusal:?}").contains("environment_id"),
+        "the refusal must name the missing field: {refusal:?}"
+    );
+}

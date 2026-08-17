@@ -6,6 +6,21 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Tenant-scoped events are now expressible, and `tenant.deleted` has a producer (issue
+  #108).** `environment_id` was blanket-required on every envelope, which made a tenant-wide
+  fact impossible to state: deleting a tenant fences ALL of its environments, and the store
+  picks the audit scope itself after the call begins, so no producer could name the right one.
+
+  It is now enforced PER TYPE rather than dropped. Every environment-scoped type still
+  requires it -- the twenty existing types are byte-for-byte as strict as before -- and a
+  tenant-scoped type is REFUSED for carrying one, because an environment id on a tenant-wide
+  fact is worse than none: a receiver would scope it to whichever environment happened to be
+  picked and act on it there alone.
+
+  Two constructors make the choice structural: `envelope` and `envelope_tenant_scoped` each
+  return `None` for the other's types, so a producer fails BEFORE the write rather than at
+  delivery, where the write would already have committed and the notice been undeliverable.
+
 - **A cursor older than the oldest retained event is now REFUSED rather than answered with the
   surviving tail (issue #107, criterion 6).** `rows_after` returned whatever survived, and a
   consumer resuming from a pruned cursor could not tell that from an uneventful period -- it

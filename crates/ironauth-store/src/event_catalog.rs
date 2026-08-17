@@ -55,13 +55,22 @@ pub fn envelope_schema() -> Value {
             "environment_id": {"type": "string", "minLength": 1},
             "payload": {"type": "object"}
         },
+        // `environment_id` is NOT here, and that is not a loosening of the guarantee: it is
+        // enforced PER TYPE by `validate_event`, which requires it for every
+        // environment-scoped type and forbids it for the tenant-scoped ones.
+        //
+        // Blanket-required was the old rule and it made tenant-scoped events inexpressible:
+        // deleting a tenant fences ALL of its environments, so there is no one environment to
+        // name, and the store picks the audit scope itself after the call begins. Dropping it
+        // from the list wholesale would have been the wrong fix -- a consumer of the existing
+        // twenty types decodes this field infallibly, and "sometimes absent" breaks it. Per
+        // type, those twenty are unchanged.
         "required": [
             "id",
             "type",
             "payload_schema_version",
             "occurred_at_unix_ms",
             "tenant_id",
-            "environment_id",
             "payload"
         ]
     })
@@ -95,6 +104,23 @@ const REGISTERED: &[(&str, u32, &str)] = &[
                 "state": {"type": "string", "minLength": 1}
             },
             "required": ["user_id", "state"]
+        }"#,
+    ),
+    (
+        // TENANT-SCOPED: no `environment_id` on the envelope. Deleting a tenant fences EVERY
+        // one of its environments in the same transaction, so naming one would assert
+        // something untrue about the rest -- and the store picks the audit scope itself (the
+        // oldest environment) after the call begins, so a producer could not name the right
+        // one even if there were one. This is the type the per-type envelope rule exists for.
+        "tenant.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tenant_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["tenant_id"]
         }"#,
     ),
     (
@@ -468,17 +494,70 @@ pub fn envelope(
     occurred_at_unix_ms: i64,
     payload: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let version = registered(event_type)?.payload_version;
+    let entry = registered(event_type)?;
+    // Refuse to build an environment-scoped envelope for a type that names no environment.
+    // `validate_event` would refuse it at the fan-out anyway, but that is delivery time: the
+    // write would already have committed and the notice would be enqueued and undeliverable.
+    // Failing here means the producer gets `None` and the write never happens.
+    if !entry.environment_scoped {
+        return None;
+    }
     Some(serde_json::json!({
         "id": id,
         "type": event_type,
-        "payload_schema_version": version,
+        "payload_schema_version": entry.payload_version,
         "occurred_at_unix_ms": occurred_at_unix_ms,
         "tenant_id": tenant_id,
         "environment_id": environment_id,
         "payload": payload,
     }))
 }
+
+/// [`envelope`] for a TENANT-SCOPED type: no `environment_id`, because the fact is not about
+/// one environment.
+///
+/// A separate constructor rather than an `Option<&str>` parameter, so the choice is made by
+/// which function a producer calls rather than by a value it might default. Each refuses the
+/// other's types: this one returns `None` for an environment-scoped type and `envelope`
+/// returns `None` for a tenant-scoped one, so a producer cannot reach the fan-out with the
+/// wrong shape.
+///
+/// # Errors
+///
+/// `None` when the type is unregistered, or is registered as environment-scoped.
+#[must_use]
+pub fn envelope_tenant_scoped(
+    id: &str,
+    event_type: &str,
+    tenant_id: &str,
+    occurred_at_unix_ms: i64,
+    payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let entry = registered(event_type)?;
+    if entry.environment_scoped {
+        return None;
+    }
+    Some(serde_json::json!({
+        "id": id,
+        "type": event_type,
+        "payload_schema_version": entry.payload_version,
+        "occurred_at_unix_ms": occurred_at_unix_ms,
+        "tenant_id": tenant_id,
+        "payload": payload,
+    }))
+}
+
+/// The types that name NO single environment, listed explicitly.
+///
+/// Not derived from the domain, which is the obvious shortcut and is wrong: `tenant.created`
+/// is in the `tenant` domain and legitimately carries an environment id, because creating a
+/// tenant creates its first environment in the same transaction and the event names it. A
+/// domain rule would have refused that event.
+///
+/// Listing means a new tenant-scoped type must be added here. Forgetting fails LOUDLY at the
+/// first emit rather than silently: `validate_event` requires an environment id for anything
+/// not on this list, so a producer that omits one is refused before delivery.
+const TENANT_SCOPED: &[&str] = &["tenant.deleted"];
 
 /// The number of event types issue #108 asks the catalog to reach before it closes.
 ///
@@ -498,6 +577,12 @@ pub struct RegisteredEvent {
     pub payload_version: u32,
     /// The payload JSON Schema, as text.
     pub payload_schema: String,
+    /// Whether this type names one environment.
+    ///
+    /// True for every type about something INSIDE an environment, which is all of them so
+    /// far. False for a tenant-scoped type: deleting a tenant fences all of its environments
+    /// at once, so naming one would assert something untrue about the other.
+    pub environment_scoped: bool,
 }
 
 /// Every registered event type, sorted.
@@ -523,6 +608,7 @@ pub fn registry() -> Vec<RegisteredEvent> {
                 .map_or_else(|| (*wire).to_owned(), |(head, _)| head.to_owned()),
             payload_version: *version,
             payload_schema: (*schema).to_owned(),
+            environment_scoped: !TENANT_SCOPED.contains(wire),
         })
         .collect();
     out.sort_by(|a, b| a.wire.cmp(&b.wire));
@@ -595,6 +681,27 @@ pub fn validate_event(envelope: &Value) -> Result<(), CatalogError> {
     let Some(entry) = registered(&wire) else {
         return Err(CatalogError::UnregisteredType(wire));
     };
+    // `environment_id` per type, which is what keeps the twenty environment-scoped types
+    // exactly as strict as they were before it left the envelope's blanket `required` list.
+    //
+    // BOTH directions are enforced. Requiring it where it belongs is the obvious half; the
+    // other half matters more, because a tenant-scoped event carrying SOME environment id
+    // would be worse than one carrying none -- a receiver would scope a tenant-wide fact to
+    // whichever environment the store happened to pick, and act on it there alone.
+    let has_environment = envelope
+        .get("environment_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    if entry.environment_scoped && !has_environment {
+        return Err(CatalogError::Envelope(vec![
+            "/environment_id: required for an environment-scoped event type".to_owned(),
+        ]));
+    }
+    if !entry.environment_scoped && has_environment {
+        return Err(CatalogError::Envelope(vec![
+            "/environment_id: a tenant-scoped event names no single environment".to_owned(),
+        ]));
+    }
     let declared = envelope
         .get("payload_schema_version")
         .and_then(Value::as_u64)
