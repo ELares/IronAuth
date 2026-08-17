@@ -494,12 +494,38 @@ pub async fn delete(
     };
 
     let actor = client_service_actor(StoredClientId::Registered(&record.id));
+    // The domain event (issue #108). A DCR delete is a HARD delete, so this notice is the
+    // only one a receiver gets -- it cannot read the row back to confirm. The envelope is
+    // built from the REGISTRY, so its declared version cannot disagree with the schema the
+    // fan-out validates it against.
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = record.id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "client.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state
+            .now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| {
+                i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+            }),
+        &serde_json::json!({ "client_id": subject }),
+    );
+    let domain_event = envelope
+        .as_ref()
+        .map(|envelope| ironauth_store::DomainEvent {
+            id: &event_id,
+            subject: &subject,
+            envelope,
+        });
     match state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .clients()
-        .delete(state.env(), &record.id)
+        .delete_with_event(state.env(), &record.id, domain_event.as_ref())
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

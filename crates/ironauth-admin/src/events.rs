@@ -57,6 +57,8 @@ pub const USER_UPDATED: &str = "user.updated";
 pub const ORGANIZATION_CREATED: &str = "organization.created";
 /// The wire type deleting an organization emits.
 pub const ORGANIZATION_DELETED: &str = "organization.deleted";
+/// The wire type deleting a client emits.
+pub const CLIENT_DELETED: &str = "client.deleted";
 
 /// The payload schema version every event in this envelope carries.
 ///

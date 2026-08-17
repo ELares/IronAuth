@@ -40,6 +40,23 @@
   },
   "event_types": [
     {
+      "domain": "client",
+      "payload_schema": {
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "client.deleted"
+    },
+    {
       "domain": "organization",
       "payload_schema": {
         "properties": {

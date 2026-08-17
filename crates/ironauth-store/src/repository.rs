@@ -4501,6 +4501,24 @@ impl ActingClientRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if no such client is visible in this scope.
     pub async fn delete(&self, env: &Env, id: &ClientId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `client.deleted` (issue #108).
+    ///
+    /// A delegating variant rather than a parameter on `delete`, for the reason given on
+    /// `OrganizationRepo::create_with_event`: nearly every caller emits nothing, and the
+    /// un-suffixed method already says so by existing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -4529,6 +4547,24 @@ impl ActingClientRepo<'_> {
                 // so a no-op delete leaves no audit row (we audit real mutations).
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
+                }
+                // In the SAME transaction as the row it announces. The ordering matters more
+                // here than elsewhere: this is a HARD delete, so a receiver that learned of
+                // it from a write that then rolled back would have dropped a client that
+                // still exists and authenticates.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            idempotency_key: event.id,
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
                 }
                 Ok(())
             },

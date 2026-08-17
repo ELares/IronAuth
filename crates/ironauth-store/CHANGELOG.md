@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`client.deleted` has a producer, and the envelope builder moved to the registry
+  (issue #108).** RFC 7592 dynamic client registration DELETE now emits it, in the same
+  transaction as the row. This is a HARD delete, unlike the user and organization tombstones,
+  so the event is the only notice a receiver gets -- it cannot read the row back to confirm,
+  which is also why a rolled-back write must not have announced itself.
+
+  `event_catalog::envelope` builds the envelope and stamps the version the REGISTRY declares
+  for that type, rather than taking one from the caller. Two reasons: the builder previously
+  lived in `ironauth-admin` and was unreachable from `ironauth-oidc`, where this producer
+  lives; and a hand-passed version is a second declaration of the same fact, which the
+  fan-out refuses PERMANENTLY on mismatch -- surfacing as an undeliverable event rather than a
+  compile error. An unregistered type yields `None`, so the write that would have announced it
+  never happens.
+
 - **A breaking event payload change is now REJECTED unless it bumps its version (issue #108,
   criterion 4).** `event-catalog.sh` already failed on a stale catalog and asked a human to
   review the diff -- its own words were "which is what this diff exists to surface". Surfacing
