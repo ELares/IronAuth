@@ -336,3 +336,109 @@ async fn a_per_organization_stream_never_sees_another_organizations_rows() {
         "a row belonging to no organization is not this organization's event: {rows:?}"
     );
 }
+
+/// A cursor older than the oldest retained row is REFUSED, not silently answered with the
+/// surviving tail (issue #107, criterion 6).
+///
+/// This is the criterion's whole point. A gap has no representation in a list of rows: a
+/// consumer resuming from a pruned cursor and receiving what survives cannot tell that from
+/// an uneventful period, so it would skip everything in between and go on believing it had
+/// seen the stream whole. Refusing is the only answer that reaches it.
+#[tokio::test]
+async fn a_cursor_before_the_oldest_retained_row_is_refused_with_guidance() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // Something to read, so the refusal below is about the CURSOR and not an empty stream.
+    db.store()
+        .scoped(scope)
+        .acting(
+            db.test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .clients()
+        .create(&env, "survivor")
+        .await
+        .expect("create a client");
+
+    let rows = db
+        .store()
+        .scoped(scope)
+        .audit_chain()
+        .rows_after("admin_action", None, 100, None)
+        .await
+        .expect("read from the start");
+    assert!(!rows.is_empty(), "the stream has rows to be read past");
+    let oldest = &rows[0];
+
+    // Resuming AT the oldest row is the ordinary case: the row it names still exists.
+    db.store()
+        .scoped(scope)
+        .audit_chain()
+        .rows_after(
+            "admin_action",
+            Some((oldest.occurred_micros, oldest.audit_id.as_str())),
+            100,
+            None,
+        )
+        .await
+        .expect("a cursor AT the oldest retained row still reads");
+
+    // A cursor strictly BEFORE it names a position whose rows are gone.
+    let refusal = db
+        .store()
+        .scoped(scope)
+        .audit_chain()
+        .rows_after(
+            "admin_action",
+            Some((oldest.occurred_micros - 1, "aud_pruned_away")),
+            100,
+            None,
+        )
+        .await;
+
+    let error = refusal.expect_err("a pruned cursor must not be answered with rows");
+    assert!(
+        matches!(error, ironauth_store::StoreError::RetentionGap),
+        "the refusal must be the typed retention gap, not a generic fault: {error:?}"
+    );
+
+    // The GUIDANCE half of the criterion: the message has to say what to do, because a
+    // consumer told only that it has a problem still does not know the move.
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("Reconcile"),
+        "the refusal must carry reconcile guidance: {rendered}"
+    );
+    assert!(
+        rendered.contains("resume from a fresh cursor"),
+        "the guidance must name the resume step: {rendered}"
+    );
+}
+
+/// An EMPTY stream reads as empty rather than as a gap.
+///
+/// The paired negative, and it guards a real confusion: a consumer resuming against a stream
+/// that never had rows is in a different situation from one that missed them, and answering
+/// both with a refusal would send it reconciling against nothing.
+#[tokio::test]
+async fn a_cursor_against_an_empty_stream_is_not_a_retention_gap() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let rows = db
+        .store()
+        .scoped(scope)
+        .audit_chain()
+        .rows_after(
+            "a_stream_with_no_rows",
+            Some((1, "aud_anything")),
+            100,
+            None,
+        )
+        .await
+        .expect("an empty stream is empty, not a gap");
+    assert!(rows.is_empty(), "and it reads as empty: {rows:?}");
+}

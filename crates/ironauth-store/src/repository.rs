@@ -38616,6 +38616,39 @@ impl AuditChainRepo<'_> {
             Some((micros, id)) => (Some(micros), Some(id)),
             None => (None, None),
         };
+        // REFUSE a cursor that points before the oldest surviving row (issue #107,
+        // criterion 6). Everything between it and what remains has been pruned, and returning
+        // the surviving tail would be indistinguishable from an uneventful period -- the
+        // consumer would skip the gap and go on believing it had the stream whole.
+        //
+        // Checked INSIDE this transaction, against the same scope and stream the read uses,
+        // so a prune committing between the two cannot open a gap the check already cleared.
+        //
+        // An EMPTY stream is not a gap: there is no oldest row to be older than, and a
+        // consumer resuming against a stream whose rows have all aged out but which never had
+        // any is in a different situation from one that missed events. It reads as empty.
+        if let (Some(micros), Some(id)) = (cursor_micros, cursor_id) {
+            let oldest: Option<(i64, String)> = sqlx::query(
+                "SELECT (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros, \
+                        id \
+                 FROM audit_log \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3 \
+                 ORDER BY occurred_at, id LIMIT 1",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(stream)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| (row.get("occurred_micros"), row.get("id")));
+            if let Some((oldest_micros, oldest_id)) = oldest {
+                // STRICTLY before: a cursor AT the oldest row is the ordinary resume, and the
+                // row it names still exists, so nothing was lost.
+                if (micros, id) < (oldest_micros, oldest_id.as_str()) {
+                    return Err(StoreError::RetentionGap);
+                }
+            }
+        }
         let rows = sqlx::query(
             "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
                     correlation_id, detail, \

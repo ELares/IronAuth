@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A cursor older than the oldest retained event is now REFUSED rather than answered with the
+  surviving tail (issue #107, criterion 6).** `rows_after` returned whatever survived, and a
+  consumer resuming from a pruned cursor could not tell that from an uneventful period -- it
+  would skip the gap and go on believing it had seen the stream whole. A gap has no
+  representation in a list of rows, so refusing is the only answer that reaches the consumer.
+
+  `StoreError::RetentionGap` carries the reconcile guidance the criterion asks for in its
+  Display text, because that is what the management surface renders. The check runs INSIDE the
+  read's transaction, so a prune committing between check and read cannot open a gap that was
+  already cleared. An EMPTY stream is not a gap: a consumer against a stream that never had
+  rows is in a different situation from one that missed them.
+
 - **`brand_asset.deleted` has a producer (issue #108).** A brand asset is addressed by (brand
   slug, KIND) -- one logo and one favicon per brand -- so both ride the payload. A receiver
   mirroring the hosted pages has to know whether the favicon or the logo disappeared; either
