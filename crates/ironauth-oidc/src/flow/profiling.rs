@@ -287,6 +287,7 @@ pub(super) async fn advance(
             subject,
             &traits_json,
             TraitWriteVisibility::SelfService,
+            None,
         )
         .await;
     match write {

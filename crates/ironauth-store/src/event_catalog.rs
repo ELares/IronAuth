@@ -71,13 +71,14 @@ pub fn envelope_schema() -> Value {
 ///
 /// `(wire type, payload version, payload JSON Schema)`.
 ///
-/// Every entry here has a PRODUCER. `user.updated` is still absent for that reason: it
-/// appears as a subscription filter string in the webhook surface and nothing emits it, and a
-/// registry entry for an event no producer sends is a contract a consumer would wait on
-/// forever, which is the same fiction as an invented payload schema.
+/// Every entry here has a PRODUCER. A registry entry for an event no producer sends is a
+/// contract a consumer would wait on forever, which is the same fiction as an invented
+/// payload schema, so nothing is listed until something emits it.
 ///
-/// `user.deleted` used to be in that state too. It is here now because the management delete
-/// emits it, not because the filter string existed.
+/// `user.deleted` and `user.updated` were both in that state -- subscription filter strings
+/// in the webhook surface that nothing emitted, so an operator could subscribe and wait
+/// forever. They are here now because the management delete and the management PATCH emit
+/// them, not because the filter strings existed.
 ///
 /// Adding a producer means adding a row here in the same change. The fan-out validates every
 /// envelope against this registry and REFUSES an unregistered type permanently, so a new
@@ -93,6 +94,33 @@ const REGISTERED: &[(&str, u32, &str)] = &[
                 "state": {"type": "string", "minLength": 1}
             },
             "required": ["user_id", "state"]
+        }"#,
+    ),
+    (
+        // `fields` names WHAT changed, because a PATCH may carry claims, traits, or both, and
+        // a receiver that has to re-read the whole user to find out has gained nothing from
+        // being told. It is a list rather than a single value for the same reason.
+        //
+        // One event per WRITE, not per request. The management PATCH runs claims and traits
+        // as two separate audited transactions on purpose (they are different facts and an
+        // operator reads them separately), and an event has to be transactional with the
+        // write it announces -- so a combined patch emits two, each naming its own field. The
+        // alternative, one event after both, cannot be transactional with either: if the
+        // traits write failed after the claims write committed, no event would be emitted at
+        // all and a real change would be silent.
+        "user.updated",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "fields": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string", "enum": ["claims", "traits"]}
+                }
+            },
+            "required": ["user_id", "fields"]
         }"#,
     ),
     (

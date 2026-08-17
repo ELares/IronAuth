@@ -51,6 +51,8 @@ use ironauth_store::{
 pub const USER_CREATED: &str = "user.created";
 /// The wire type a management delete emits.
 pub const USER_DELETED: &str = "user.deleted";
+/// The wire type a management PATCH emits, once per field it wrote.
+pub const USER_UPDATED: &str = "user.updated";
 
 /// The payload schema version every event in this envelope carries.
 ///

@@ -378,6 +378,7 @@ async fn admin_only_metadata_is_invisible_and_immutable_through_self_service() {
             &id,
             &hostile.to_string(),
             TraitWriteVisibility::SelfService,
+            None,
         )
         .await
         .expect_err("a self-service write naming an admin-only field must be refused");
@@ -401,6 +402,7 @@ async fn admin_only_metadata_is_invisible_and_immutable_through_self_service() {
             &id,
             &renamed.to_string(),
             TraitWriteVisibility::SelfService,
+            None,
         )
         .await
         .expect("a self-service write of only user-visible fields is allowed");

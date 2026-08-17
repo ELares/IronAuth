@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`user.updated` has a producer (issue #108).** The second half of the advertised-but-unemitted
+  pair: like `user.deleted`, it was a subscription filter string in the webhook surface that
+  nothing emitted. `update_claims` and `set_traits_with_visibility` now take an optional
+  `DomainEvent` and enqueue it inside their own transaction.
+
+  **One event per WRITE, not per request.** The management PATCH runs claims and traits as two
+  separate audited transactions on purpose, and an event has to be transactional with the write
+  it announces -- so a combined patch emits two, each naming its own field. A single event after
+  both could not be transactional with either: if the traits write failed after the claims write
+  committed, a real change would go unannounced. `fields` names what changed, because a receiver
+  told only that "the user changed" has to re-read the whole user to find out, which is the work
+  the event exists to save.
+
 - **`user.deleted` has a producer, and is registered because of it (issue #108).** It had been a
   subscription FILTER string in the webhook surface with nothing emitting it, so an operator
   could subscribe and wait forever. `UserRepo::delete` now takes an optional `DomainEvent` and

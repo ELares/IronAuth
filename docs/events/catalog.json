@@ -81,6 +81,35 @@
       },
       "payload_schema_version": 1,
       "type": "user.deleted"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "properties": {
+          "fields": {
+            "items": {
+              "enum": [
+                "claims",
+                "traits"
+              ],
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "fields"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.updated"
     }
   ]
 }
