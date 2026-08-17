@@ -114,6 +114,21 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A signup form governs what a self-service REGISTRATION collects and requires, so
+        // removing one changes who can sign up and with what. The client id rides along
+        // because a signup form is per-client and that is how an operator refers to it.
+        "signup_form.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "signup_form_id": {"type": "string", "minLength": 1},
+                "client_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["signup_form_id", "client_id"]
+        }"#,
+    ),
+    (
         // The DEPROVISIONING event. A state that ends sessions kills every live one in the
         // same transaction, so downstream systems act on this one: it is the notice that an
         // account stopped being able to log in.

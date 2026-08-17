@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`signup_form.deleted` has a producer (issue #108).** A signup form governs what a
+  self-service registration collects and requires, so removing one changes who can sign up and
+  with what. The client id travels with the form id because a form is per-client and that is
+  how an operator refers to it -- the form's own id is an internal handle they never type.
+  First producer written against the shared `enqueue_domain_event` helper.
+
 - **`user.state_changed` has a producer, and the enqueue block is now written once (issue
   #108).** The DEPROVISIONING event: a state that ends sessions kills every live one in the
   same transaction, and the event rides that transaction -- a receiver told about a suspension

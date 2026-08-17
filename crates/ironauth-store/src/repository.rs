@@ -28805,6 +28805,20 @@ impl ActingSignupFormRepo<'_> {
     /// [`StoreError::NotFound`] if `id` is out of scope or names no installed form;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, id: &SignupFormId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `signup_form.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &SignupFormId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28835,6 +28849,9 @@ impl ActingSignupFormRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // Same transaction, so a not-found delete emits nothing either: the error
+                // above rolls this back with the audit row.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
