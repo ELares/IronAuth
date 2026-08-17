@@ -6,6 +6,21 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`user.state_changed` has a producer, and the enqueue block is now written once (issue
+  #108).** The DEPROVISIONING event: a state that ends sessions kills every live one in the
+  same transaction, and the event rides that transaction -- a receiver told about a suspension
+  that then rolled back would revoke downstream access for an account still able to log in.
+  `hard_kill` is in the payload because it decides whether the offline refresh families were
+  revoked too, which a receiver cannot infer afterwards.
+
+  Adding the eleventh producer pushed `set_state` past the function-length cap, which
+  surfaced the real problem: the same fourteen-line enqueue block had been copied verbatim
+  eleven times. It is now `enqueue_domain_event`. Eleven copies is eleven chances for one to
+  drift -- to name a different consumer, or to key ordering on something other than the
+  subject, which is what keeps two events about one entity in order. A producer can still get
+  the CALL wrong (place it on the wrong path, as the api_key retry mutation showed) but no
+  longer the CONTENTS.
+
 - **`api_key.revoked` has a producer, and it inherits the revocation's IDEMPOTENCE (issue
   #108).** `revoke` is idempotent by design: revoking an already-revoked key changes nothing
   and writes no second audit row. The enqueue sits AFTER that early return, so a retried
