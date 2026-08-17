@@ -6,6 +6,17 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`organization.created` and `organization.deleted` have producers (issue #108).** Added as
+  `create_with_event` / `delete_with_event` delegating variants rather than a new parameter on
+  `create` / `delete`, matching `set_traits` / `set_traits_with_visibility`: nearly every caller
+  is an internal provisioning path or a test that emits nothing, and threading `None` through
+  thirty call sites to say "no event here" is what the un-suffixed method already says by
+  existing. Zero call sites changed.
+
+  The delete's payload deliberately omits the display name. A receiver has had it since the
+  create, and repeating it in the tombstone would invite treating the delete as the
+  authoritative record of a name that may have changed since.
+
 - **`user.updated` has a producer (issue #108).** The second half of the advertised-but-unemitted
   pair: like `user.deleted`, it was a subscription filter string in the webhook surface that
   nothing emitted. `update_claims` and `set_traits_with_visibility` now take an optional

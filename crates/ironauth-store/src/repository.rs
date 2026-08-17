@@ -45268,6 +45268,30 @@ impl ActingOrganizationRepo<'_> {
         display_name: &str,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, id, created_at_micros, display_name, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `organization.created` (issue #108).
+    ///
+    /// A separate entry point rather than a sixth parameter on `create`, matching
+    /// `set_traits` / `set_traits_with_visibility`. Nearly every caller is an internal
+    /// provisioning path or a test that emits nothing, and threading `None` through thirty
+    /// call sites to say "no event here" is what `create` already says by not being this
+    /// function.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        id: &OrganizationId,
+        created_at_micros: i64,
+        display_name: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -45283,7 +45307,7 @@ impl ActingOrganizationRepo<'_> {
             },
             async move |tx| {
                 sqlx::query(
-                    "INSERT INTO organizations \
+                    "INSERT INTO organizations /* the organization.created producer */ \
                      (id, tenant_id, environment_id, display_name, created_at) \
                      VALUES ($1, $2, $3, $4, \
                              TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval)",
@@ -45296,6 +45320,21 @@ impl ActingOrganizationRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the SAME transaction as the row it announces, like every other producer.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            idempotency_key: event.id,
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
+                }
                 Ok(())
             },
             false,
@@ -45314,6 +45353,20 @@ impl ActingOrganizationRepo<'_> {
     /// [`StoreError::NotFound`] if the id is not in this scope, or no live
     /// organization matched.
     pub async fn delete(&self, env: &Env, id: &OrganizationId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `organization.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &OrganizationId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -45342,6 +45395,21 @@ impl ActingOrganizationRepo<'_> {
                 .await?;
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
+                }
+                // In the SAME transaction as the tombstone it announces.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            idempotency_key: event.id,
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
                 }
                 Ok(())
             },

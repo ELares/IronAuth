@@ -50,6 +50,32 @@ use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{CreateOrganizationRequest, OrganizationList, OrganizationView};
 
+/// One organization domain event (issue #108).
+///
+/// The subject is the organization, so two events about one organization are exploded in the
+/// order they happened rather than concurrently.
+fn organization_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    event_type: &str,
+    payload: &serde_json::Value,
+    occurred_at_micros: i64,
+) -> crate::events::PendingEvent {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = payload
+        .get("organization_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let envelope =
+        crate::events::envelope(&id, event_type, scope, occurred_at_micros / 1000, payload);
+    crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    }
+}
+
 /// Create an organization under an environment.
 #[utoipa::path(
     post,
@@ -134,17 +160,28 @@ pub async fn create_organization(
         response_status: 201,
         response_body: &body_string,
     };
+    let event = organization_event(
+        &state,
+        scope,
+        crate::events::ORGANIZATION_CREATED,
+        &serde_json::json!({
+            "organization_id": organization_id.to_string(),
+            "display_name": display_name,
+        }),
+        created_at_micros,
+    );
     let result = state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .organizations(scope)
-        .create(
+        .create_with_event(
             state.env(),
             &organization_id,
             created_at_micros,
             &display_name,
             Some(write),
+            Some(&event.domain_event()),
         )
         .await;
 
@@ -346,6 +383,13 @@ pub async fn delete_organization(
         EnvironmentAccess::Write,
     )
     .await?;
+    let deleted_event = organization_event(
+        &state,
+        scope,
+        crate::events::ORGANIZATION_DELETED,
+        &serde_json::json!({ "organization_id": id.to_string() }),
+        state.now_unix_micros(),
+    );
     state
         .store()
         .management()
@@ -353,7 +397,7 @@ pub async fn delete_organization(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(id)
         .organizations(scope)
-        .delete(state.env(), &id)
+        .delete_with_event(state.env(), &id, Some(&deleted_event.domain_event()))
         .await?;
     Ok(no_content())
 }

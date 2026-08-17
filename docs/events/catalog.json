@@ -40,6 +40,45 @@
   },
   "event_types": [
     {
+      "domain": "organization",
+      "payload_schema": {
+        "properties": {
+          "display_name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.created"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.deleted"
+    },
+    {
       "domain": "user",
       "payload_schema": {
         "properties": {

@@ -6,6 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Creating and deleting an organization through the management API emit their events
+  (issue #108).** Both ride the transaction of the write they announce.
+
 - **The management PATCH emits `user.updated` (issue #108), once per field it writes.** A patch
   carrying both claims and traits emits two events, each naming its field, because the handler
   runs those as two separate audited transactions and each event rides the write it announces.
