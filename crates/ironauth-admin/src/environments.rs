@@ -328,12 +328,34 @@ pub async fn delete_environment(
     // Sudo mutation gate (issue #73): deleting an environment is an environment-scoped
     // mutation. Gate before the delete write so a challenge leaves nothing removed.
     crate::sudo::require_fresh_privilege(&state, Scope::new(tenant, environment), actor).await?;
+    // The domain event (issue #108). Deleting an environment fences its data plane in the
+    // same transaction, so this announces "stopped serving", not merely a row change.
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = environment.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "environment.deleted",
+        &tenant.to_string(),
+        &subject,
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "environment_id": subject,
+            "tenant_id": tenant.to_string(),
+        }),
+    );
+    let deleted_event = envelope
+        .as_ref()
+        .map(|envelope| ironauth_store::DomainEvent {
+            id: &event_id,
+            subject: &subject,
+            envelope,
+        });
     state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .environments(state.bootstrap_operator_id(), tenant)
-        .delete(state.env(), &environment)
+        .delete_with_event(state.env(), &environment, deleted_event.as_ref())
         .await?;
     Ok(no_content())
 }

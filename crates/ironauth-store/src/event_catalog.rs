@@ -97,6 +97,22 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // Deleting an environment FENCES its data plane: the same transaction flips
+        // environment_states to suspended. So this event means "this environment stopped
+        // serving", which is the fact a receiver acts on -- it is not merely a row change,
+        // and every client of that environment is affected at once.
+        "environment.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "environment_id": {"type": "string", "minLength": 1},
+                "tenant_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["environment_id", "tenant_id"]
+        }"#,
+    ),
+    (
         // A HARD delete, unlike the user and organization tombstones, so a receiver cannot
         // read the row back to confirm. That makes the event the only notice it gets, which
         // is why the payload carries the client_id and nothing that could go stale.

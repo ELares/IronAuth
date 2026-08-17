@@ -45097,6 +45097,23 @@ impl ActingEnvironmentRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if no live environment matched under this tenant.
     pub async fn delete(&self, env: &Env, id: &EnvironmentId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `environment.deleted` (issue #108).
+    ///
+    /// A delegating variant rather than a parameter, for the reason on
+    /// `OrganizationRepo::create_with_event`: the un-suffixed method already says "no event".
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &EnvironmentId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = Scope::new(self.tenant, *id);
         let tenant = self.tenant;
         write_audited(
@@ -45158,6 +45175,25 @@ impl ActingEnvironmentRepo<'_> {
                 // erasure issue's job, reached through the terminal tenant hard_delete
                 // (purge) and #48's ActingEnvelopeRepo, never folded into an ordinary
                 // delete.
+                //
+                // The domain event rides the SAME transaction as the deactivation AND the
+                // fencing row above. That grouping matters: the event announces that this
+                // environment stopped serving, and the row that stops it serving is in here
+                // too, so a receiver can never be told about a fence that did not commit.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            idempotency_key: event.id,
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
+                }
                 Ok(())
             },
             false,

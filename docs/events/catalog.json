@@ -57,6 +57,28 @@
       "type": "client.deleted"
     },
     {
+      "domain": "environment",
+      "payload_schema": {
+        "properties": {
+          "environment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment.deleted"
+    },
+    {
       "domain": "organization",
       "payload_schema": {
         "properties": {
