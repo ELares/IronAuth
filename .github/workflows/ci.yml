@@ -465,6 +465,11 @@ jobs:
         # completeness, which would simply get disabled. Pure python, so it belongs in this
         # lane rather than in the Node or Go jobs.
         run: scripts/provider-coverage.sh
+      - name: event producer coverage (every management write announces itself)
+        # Issue #108 criterion 6. A RATCHET on the uncovered set, for the same reason the
+        # provider coverage above is one: a gate that fails from its first commit gets
+        # disabled rather than fixed. #108 closes when the baseline file is empty.
+        run: scripts/producer-coverage.py
       - name: reference app bindings freshness (generated from the published contract)
         # The reference app's TypeScript types, its schema derived validation
         # constants, and its numeric id to copy map are GENERATED from
