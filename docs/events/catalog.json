@@ -118,6 +118,33 @@
       "type": "organization.deleted"
     },
     {
+      "domain": "tenant",
+      "payload_schema": {
+        "properties": {
+          "display_name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "environment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "environment_id",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.created"
+    },
+    {
       "domain": "user",
       "payload_schema": {
         "properties": {
