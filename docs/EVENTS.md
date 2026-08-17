@@ -79,6 +79,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "client_admin_grant_id": {
       "minLength": 1,
@@ -107,6 +108,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "api_key_id": {
       "minLength": 1,
@@ -130,6 +132,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "client_id": {
       "minLength": 1,
@@ -153,6 +156,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "connector_id": {
       "minLength": 1,
@@ -181,6 +185,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "environment_id": {
       "minLength": 1,
@@ -209,6 +214,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "name": {
       "minLength": 1,
@@ -232,6 +238,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "locale_bundle_id": {
       "minLength": 1,
@@ -260,6 +267,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "management_key_id": {
       "minLength": 1,
@@ -283,6 +291,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "org_role_id": {
       "minLength": 1,
@@ -312,6 +321,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "display_name": {
       "minLength": 1,
@@ -334,6 +344,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "organization_id": {
       "minLength": 1,
@@ -357,6 +368,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "permission_id": {
       "minLength": 1,
@@ -385,6 +397,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "client_id": {
       "minLength": 1,
@@ -413,6 +426,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "display_name": {
       "minLength": 1,
@@ -449,6 +463,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "state": {
       "minLength": 1,
@@ -471,6 +486,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "hard_kill": {
       "type": "boolean"
@@ -492,6 +508,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "hard_kill": {
       "type": "boolean"
@@ -518,6 +535,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "fields": {
       "items": {
@@ -553,6 +571,7 @@ receive a different shape.
 
 ```json
 {
+  "additionalProperties": false,
   "properties": {
     "webhook_endpoint_id": {
       "minLength": 1,

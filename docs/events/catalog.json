@@ -42,6 +42,7 @@
     {
       "domain": "admin_consent",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "client_admin_grant_id": {
             "minLength": 1,
@@ -64,6 +65,7 @@
     {
       "domain": "api_key",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "api_key_id": {
             "minLength": 1,
@@ -81,6 +83,7 @@
     {
       "domain": "client",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "client_id": {
             "minLength": 1,
@@ -98,6 +101,7 @@
     {
       "domain": "connector",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "connector_id": {
             "minLength": 1,
@@ -120,6 +124,7 @@
     {
       "domain": "environment",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "environment_id": {
             "minLength": 1,
@@ -142,6 +147,7 @@
     {
       "domain": "environment_variable",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "name": {
             "minLength": 1,
@@ -159,6 +165,7 @@
     {
       "domain": "locale_bundle",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "locale_bundle_id": {
             "minLength": 1,
@@ -181,6 +188,7 @@
     {
       "domain": "management_key",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "management_key_id": {
             "minLength": 1,
@@ -198,6 +206,7 @@
     {
       "domain": "org_role",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "org_role_id": {
             "minLength": 1,
@@ -220,6 +229,7 @@
     {
       "domain": "organization",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "display_name": {
             "minLength": 1,
@@ -242,6 +252,7 @@
     {
       "domain": "organization",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "organization_id": {
             "minLength": 1,
@@ -259,6 +270,7 @@
     {
       "domain": "permission",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "permission_id": {
             "minLength": 1,
@@ -281,6 +293,7 @@
     {
       "domain": "signup_form",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "client_id": {
             "minLength": 1,
@@ -303,6 +316,7 @@
     {
       "domain": "tenant",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "display_name": {
             "minLength": 1,
@@ -330,6 +344,7 @@
     {
       "domain": "user",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "state": {
             "minLength": 1,
@@ -352,6 +367,7 @@
     {
       "domain": "user",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "hard_kill": {
             "type": "boolean"
@@ -373,6 +389,7 @@
     {
       "domain": "user",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "hard_kill": {
             "type": "boolean"
@@ -399,6 +416,7 @@
     {
       "domain": "user",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "fields": {
             "items": {
@@ -428,6 +446,7 @@
     {
       "domain": "webhook_endpoint",
       "payload_schema": {
+        "additionalProperties": false,
         "properties": {
           "webhook_endpoint_id": {
             "minLength": 1,

@@ -6,6 +6,21 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Every registered payload schema now forbids undeclared fields (issue #108, criterion 1).**
+  Criterion 1 says every emitted event "validates against its registered schema", and that was
+  weaker than it read: JSON Schema permits undeclared properties unless a schema forbids them,
+  so a payload could carry ANYTHING and still validate. Measured on
+  `environment_variable.deleted`: adding the removed variable's VALUE to the payload left
+  validation passing, and only a hand-written search caught it.
+
+  All 19 schemas set `additionalProperties: false`, so "it validates" now means the fields are
+  exactly the declared ones. A test asserts it PER REGISTERED TYPE and proves it through the
+  real validator, because a schema added later without the line is how the hole reopens.
+
+  `event-registry-compat` deliberately does not flag this as breaking, and says why: it
+  defends the CONSUMER contract, and a consumer cannot break from a tightening that leaves
+  what it receives unchanged.
+
 - **`environment_variable.deleted` has a producer, and it never carries the value (issue
   #108).** The NAME is the whole payload -- a variable is addressed by name everywhere, and
   there is no separate id to fall back on. The VALUE's absence is a rule rather than an

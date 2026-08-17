@@ -598,3 +598,71 @@ async fn the_envelope_builder_takes_its_version_from_the_registry() {
         "an unregistered type must not produce an envelope"
     );
 }
+
+/// A payload carrying a field its schema does not declare is REFUSED (issue #108,
+/// criterion 1).
+///
+/// Criterion 1 says every emitted event "validates against its registered schema". That was
+/// weaker than it read: JSON Schema permits undeclared properties unless a schema forbids
+/// them, so a payload could carry anything at all and still validate. MEASURED before the
+/// fix, on `environment_variable.deleted`: adding the removed variable's VALUE to the payload
+/// left validation passing, and only a hand-written search caught the leak.
+///
+/// Every registered payload schema now sets `additionalProperties: false`, so "it validates"
+/// means the fields are exactly the declared ones. This test is what keeps that true: it is
+/// asserted per registered type rather than on one example, because a schema added later
+/// without the line is exactly how the hole reopens.
+#[tokio::test]
+async fn no_registered_payload_accepts_an_undeclared_field() {
+    let registry = ironauth_store::event_catalog::registry();
+    assert!(
+        registry.len() >= 19,
+        "the registry shrank; this test's denominator must not silently fall: {}",
+        registry.len()
+    );
+
+    for registered in registry {
+        let schema: serde_json::Value = serde_json::from_str(&registered.payload_schema)
+            .expect("a registered payload schema parses");
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "{} does not forbid undeclared fields, so anything could ride along in its payload",
+            registered.wire
+        );
+
+        // And prove it through the ACTUAL validator, not just by reading the schema: a
+        // property present in the text but ignored by the compiler would pass the assertion
+        // above and fail nothing.
+        let mut payload = serde_json::Map::new();
+        if let Some(properties) = schema["properties"].as_object() {
+            for (name, property) in properties {
+                let filler = match property["type"].as_str() {
+                    Some("boolean") => serde_json::json!(false),
+                    Some("array") => serde_json::json!(["claims"]),
+                    _ => serde_json::json!("x"),
+                };
+                payload.insert(name.clone(), filler);
+            }
+        }
+        payload.insert(
+            "smuggled".to_owned(),
+            serde_json::json!("should be refused"),
+        );
+
+        let envelope = serde_json::json!({
+            "id": "evt_probe",
+            "type": registered.wire,
+            "payload_schema_version": registered.payload_version,
+            "occurred_at_unix_ms": 1_i64,
+            "tenant_id": "ten_x",
+            "environment_id": "env_y",
+            "payload": serde_json::Value::Object(payload),
+        });
+        assert!(
+            ironauth_store::event_catalog::validate_event(&envelope).is_err(),
+            "{} accepted an undeclared `smuggled` field: {envelope}",
+            registered.wire
+        );
+    }
+}
