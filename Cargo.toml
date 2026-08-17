@@ -260,7 +260,7 @@ bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false }
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # OpenTelemetry OTLP trace export, compiled only behind the non-default `otlp`
 # feature so the default build and the musl static lane stay lean and
