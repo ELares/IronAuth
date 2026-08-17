@@ -382,3 +382,149 @@ async fn connectors_are_cross_tenant_isolated() {
     );
     tx.commit().await.expect("commit B read");
 }
+
+/// Deleting a connector emits `connector.deleted`, carrying its slug (issue #108).
+///
+/// Removing a connector changes WHO CAN LOG IN to the environment, so a receiver wants it
+/// promptly rather than at the next reconcile. The slug travels with the id because a
+/// connector is referenced by slug everywhere else -- routing rules, the federation URL, an
+/// operator's own config -- and after the delete there is no row left to look it up in.
+#[tokio::test]
+async fn deleting_a_connector_emits_the_registered_event_with_its_slug() {
+    use ironauth_store::ConnectorId;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let id = ConnectorId::generate(&env, &scope);
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug: "acme-oidc",
+                definition_json: &definition_json("acme-oidc"),
+                client_secret: SECRET_MARKER.as_bytes(),
+                capabilities: conservative_caps(),
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("create connector");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "creating a connector emits nothing today, so the delete's event is unambiguous"
+    );
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_connector_deleted",
+        "connector.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "connector_id": id.to_string(), "slug": "acme-oidc" }),
+    )
+    .expect("connector.deleted is registered");
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .delete_with_event(
+            &env,
+            &id,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_connector_deleted",
+                subject: &id.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("delete with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the delete enqueues exactly one event");
+    assert_eq!(events[0]["type"], "connector.deleted");
+    assert_eq!(events[0]["payload"]["connector_id"], id.to_string());
+    assert_eq!(
+        events[0]["payload"]["slug"], "acme-oidc",
+        "the slug survives the row it came from"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A connector delete carrying no event enqueues nothing.
+#[tokio::test]
+async fn deleting_a_connector_without_an_event_enqueues_nothing() {
+    use ironauth_store::ConnectorId;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let id = ConnectorId::generate(&env, &scope);
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug: "quiet-oidc",
+                definition_json: &definition_json("quiet-oidc"),
+                client_secret: SECRET_MARKER.as_bytes(),
+                capabilities: conservative_caps(),
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("create connector");
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .delete(&env, &id)
+        .await
+        .expect("delete");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "a delete with no event must not invent one"
+    );
+}
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}

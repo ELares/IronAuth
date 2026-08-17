@@ -57,6 +57,28 @@
       "type": "client.deleted"
     },
     {
+      "domain": "connector",
+      "payload_schema": {
+        "properties": {
+          "connector_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "slug": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "connector.deleted"
+    },
+    {
       "domain": "environment",
       "payload_schema": {
         "properties": {

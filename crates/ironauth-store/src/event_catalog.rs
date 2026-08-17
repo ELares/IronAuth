@@ -114,6 +114,23 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // Removing a connector changes WHO CAN LOG IN to this environment, which is why a
+        // receiver wants it promptly rather than at the next reconcile. The SLUG rides along
+        // with the id because that is what a connector is referenced by everywhere else --
+        // in routing rules, in the federation URL, in an operator's own configuration -- so
+        // an id alone would send the receiver looking it up in a row that no longer exists.
+        "connector.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "connector_id": {"type": "string", "minLength": 1},
+                "slug": {"type": "string", "minLength": 1}
+            },
+            "required": ["connector_id", "slug"]
+        }"#,
+    ),
+    (
         // Deleting an environment FENCES its data plane: the same transaction flips
         // environment_states to suspended. So this event means "this environment stopped
         // serving", which is the fact a receiver acts on -- it is not merely a row change,

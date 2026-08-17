@@ -29702,6 +29702,20 @@ impl ActingConnectorRepo<'_> {
     /// [`StoreError::NotFound`] if the connector is out of scope or absent;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, id: &ConnectorId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `connector.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &ConnectorId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -29729,6 +29743,24 @@ impl ActingConnectorRepo<'_> {
                 .rows_affected();
                 if affected == 0 {
                     return Err(StoreError::NotFound);
+                }
+                // In the SAME transaction as the row it announces. A HARD delete, so this
+                // event is the only notice a receiver gets -- and it changes WHO CAN LOG IN,
+                // which is why announcing a removal that then rolled back would be worse
+                // here than for an ordinary entity.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            idempotency_key: event.id,
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
                 }
                 Ok(())
             },
