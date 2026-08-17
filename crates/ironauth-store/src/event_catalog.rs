@@ -114,6 +114,24 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // REVOKED, not "deleted", because that is what happened: a management credential lost
+        // its authority. The row survives as a tombstone, and a receiver that treated this as
+        // a row deletion would garbage-collect audit references that must stay legible.
+        //
+        // No key material and no prefix: the id is enough to correlate, and anything derived
+        // from the secret would put a fragment of a credential on a wire this event exists to
+        // tell people to stop trusting.
+        "management_key.revoked",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "management_key_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["management_key_id"]
+        }"#,
+    ),
+    (
         // Removing a connector changes WHO CAN LOG IN to this environment, which is why a
         // receiver wants it promptly rather than at the next reconcile. The SLUG rides along
         // with the id because that is what a connector is referenced by everywhere else --

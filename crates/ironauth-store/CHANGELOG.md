@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`management_key.revoked` has a producer (issue #108).** The event a SIEM cares about most
+  of any registered so far: a management credential losing its authority is a security fact.
+  Named REVOKED rather than deleted because that is what happens -- the row survives as a
+  tombstone so audit references stay legible, and a receiver treating it as a row deletion
+  would garbage-collect them. The payload is the id ONLY: anything derived from the secret
+  would put part of a credential onto the wire this event exists to tell people to stop
+  trusting.
+
 - **`connector.deleted` has a producer (issue #108).** Removing a connector changes WHO CAN
   LOG IN to an environment, so a receiver wants it promptly rather than at the next reconcile.
   The payload carries the SLUG as well as the id: a connector is referenced by slug everywhere

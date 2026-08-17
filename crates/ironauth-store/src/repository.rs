@@ -45358,6 +45358,20 @@ impl ActingManagementCredentialRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if no live key matched in this scope.
     pub async fn delete(&self, env: &Env, id: &ManagementKeyId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `management_key.revoked` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &ManagementKeyId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -45386,6 +45400,24 @@ impl ActingManagementCredentialRepo<'_> {
                 .await?;
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
+                }
+                // In the SAME transaction as the revocation. This is the event a SIEM cares
+                // about most of any here: a management credential losing its authority is a
+                // security fact, and a receiver told about a revocation that then rolled
+                // back would believe a live key is dead -- the dangerous direction.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            idempotency_key: event.id,
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
                 }
                 Ok(())
             },
