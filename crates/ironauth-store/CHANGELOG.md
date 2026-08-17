@@ -6,6 +6,17 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`webhook_endpoint.deleted` has a producer, and it is the self-referential one (issue
+  #108).** Deleting a webhook endpoint emits onto the webhook event queue, so the subject is
+  the delivery machinery itself. The removed endpoint does NOT receive its own removal: the
+  fan-out lists the live endpoints after the transaction commits and it is already gone. The
+  others do, which is the point -- their delivery topology just changed. Both properties are
+  asserted rather than reasoned about.
+
+  Unlike `api_key.revoked`, this delete is a no-op SUCCESS when the endpoint is absent, so a
+  repeated delete emits a second event. The operation is idempotent in effect and not in
+  notification, and the registry note says so: a receiver treats this type as at-least-once.
+
 - **`permission.deleted` has a producer (issue #108).** The widest narrowing in the registry:
   deleting a permission removes it from every role that referenced it at once -- one row, and
   everybody who held it through any role loses it. The slug travels with the id because that

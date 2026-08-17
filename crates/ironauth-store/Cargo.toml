@@ -664,6 +664,13 @@ name = "org_roles"
 path = "tests/org_roles.rs"
 required-features = ["testing"]
 
+# The self-referential producer (issue #108): deleting a webhook endpoint emits onto the
+# webhook event queue, so the removed endpoint must not receive its own removal.
+[[test]]
+name = "webhook_endpoint_events"
+path = "tests/webhook_endpoint_events.rs"
+required-features = ["testing"]
+
 # The permission vocabulary (issue #98, store PR 1): the environment-scoped
 # permissions table read through the read-only repository on both planes, the
 # uniform not-found across absent / deleted / foreign-scope / wrong-kind, the
