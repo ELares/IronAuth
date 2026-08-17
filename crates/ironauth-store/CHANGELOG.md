@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`environment.deleted` has a producer (issue #108).** It rides the SAME transaction as the
+  fence that stops the environment serving -- deleting an environment flips
+  `environment_states` to suspended in that transaction, so a receiver can never be told
+  about a fence that did not commit. That grouping is why this event matters more than a
+  single-row change: every client of the environment is affected at once.
+
 - **`client.deleted` has a producer, and the envelope builder moved to the registry
   (issue #108).** RFC 7592 dynamic client registration DELETE now emits it, in the same
   transaction as the row. This is a HARD delete, unlike the user and organization tombstones,

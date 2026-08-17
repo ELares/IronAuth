@@ -1653,3 +1653,116 @@ async fn a_credential_grant_round_trips_through_authentication_and_absent_means_
         "a bad credential authenticated"
     );
 }
+
+/// Deleting an environment emits `environment.deleted` in the SAME transaction as the fence
+/// that stops it serving (issue #108).
+///
+/// The grouping is the substance. This event means "this environment stopped serving", and
+/// the `environment_states` row that stops it is written in the same transaction, so a
+/// receiver can never be told about a fence that did not commit. Every client of that
+/// environment is affected at once, which is why the notice matters more here than for a
+/// single-row change.
+#[tokio::test]
+async fn deleting_an_environment_emits_the_registered_event_with_its_fence() {
+    let harness = Fixture::start().await;
+    let tenant_scope = harness.create_tenant(None).await;
+    let scope = harness
+        .create_environment(tenant_scope.tenant(), None)
+        .await;
+
+    assert_eq!(
+        queued_events(&harness, scope).await.len(),
+        0,
+        "nothing is queued before the delete"
+    );
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_env_deleted",
+        "environment.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "environment_id": scope.environment().to_string(),
+            "tenant_id": scope.tenant().to_string(),
+        }),
+    )
+    .expect("environment.deleted is registered");
+
+    harness
+        .db
+        .control_store()
+        .management()
+        .acting(harness.actor, CorrelationId::generate(&harness.env))
+        .environments(harness.operator, scope.tenant())
+        .delete_with_event(
+            &harness.env,
+            &scope.environment(),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_env_deleted",
+                subject: &scope.environment().to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("delete with event");
+
+    // The fence and the notice committed together.
+    assert!(
+        !harness.environment_is_live(scope).await,
+        "the environment is deleted"
+    );
+    let events = queued_events(&harness, scope).await;
+    assert_eq!(events.len(), 1, "the delete enqueues exactly one event");
+    assert_eq!(events[0]["type"], "environment.deleted");
+    assert_eq!(
+        events[0]["payload"]["environment_id"],
+        scope.environment().to_string()
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A delete carrying no event enqueues nothing.
+///
+/// The paired negative: without it the test above passes for a delete that emits
+/// unconditionally, which would fire for every internal decommission path.
+#[tokio::test]
+async fn deleting_an_environment_without_an_event_enqueues_nothing() {
+    let harness = Fixture::start().await;
+    let tenant_scope = harness.create_tenant(None).await;
+    let scope = harness
+        .create_environment(tenant_scope.tenant(), None)
+        .await;
+
+    harness
+        .delete_environment(scope)
+        .await
+        .expect("delete the environment");
+
+    assert_eq!(
+        queued_events(&harness, scope).await.len(),
+        0,
+        "a delete with no event must not invent one"
+    );
+}
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(harness: &Fixture, scope: Scope) -> Vec<serde_json::Value> {
+    harness
+        .db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &harness.env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}
