@@ -40,6 +40,23 @@
   },
   "event_types": [
     {
+      "domain": "api_key",
+      "payload_schema": {
+        "properties": {
+          "api_key_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "api_key_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "api_key.revoked"
+    },
+    {
       "domain": "client",
       "payload_schema": {
         "properties": {

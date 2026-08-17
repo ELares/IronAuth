@@ -59823,6 +59823,25 @@ impl ActingApiKeyRepo<'_> {
         id: &ApiKeyId,
         now_micros: i64,
     ) -> Result<(), StoreError> {
+        self.revoke_with_event(env, id, now_micros, None).await
+    }
+
+    /// [`Self::revoke`], additionally emitting `api_key.revoked` (issue #108).
+    ///
+    /// The event inherits this method's IDEMPOTENCE. Revoking an already-revoked key changes
+    /// nothing, writes no second audit row, and emits no second event -- a receiver counting
+    /// revocations must not see two for one credential because a client retried.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke`].
+    pub async fn revoke_with_event(
+        &self,
+        env: &Env,
+        id: &ApiKeyId,
+        now_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -59868,6 +59887,23 @@ impl ActingApiKeyRepo<'_> {
             target: id,
         };
         insert_audit_row(&mut tx, &spec, None).await?;
+        // In the SAME transaction as the revocation and its audit row. It sits AFTER the
+        // already-revoked early return above, so it inherits that idempotence: a retried
+        // revoke emits nothing, exactly as it audits nothing.
+        if let Some(event) = event {
+            enqueue_outbox_in_tx(
+                &mut tx,
+                env,
+                scope,
+                &NewOutboxMessage {
+                    consumer: WEBHOOK_EVENT_CONSUMER,
+                    idempotency_key: event.id,
+                    ordering_key: event.subject,
+                    payload: event.envelope.clone(),
+                },
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
