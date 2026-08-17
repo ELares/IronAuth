@@ -97,6 +97,20 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A HARD delete, unlike the user and organization tombstones, so a receiver cannot
+        // read the row back to confirm. That makes the event the only notice it gets, which
+        // is why the payload carries the client_id and nothing that could go stale.
+        "client.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_id"]
+        }"#,
+    ),
+    (
         // The display name is carried because it is the whole of what a create decided that a
         // receiver cannot derive from the id. Everything else about a new organization is
         // either the id itself or scope, both already on the envelope.
@@ -169,6 +183,39 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
 ];
+
+/// Build the envelope a receiver is sent, stamping the version the REGISTRY declares for
+/// `event_type`.
+///
+/// The version is looked up rather than passed, and that is the point of building it here:
+/// the envelope and the schema it must validate against are now produced from one source, so
+/// a producer cannot stamp a version the registry does not have. A hand-passed version is a
+/// second declaration of the same fact, and the fan-out refuses a mismatch permanently --
+/// which surfaces as an undeliverable event rather than a compile error.
+///
+/// Returns `None` for an unregistered type. That is not a convenience: a producer for a type
+/// the registry does not know is exactly what the fan-out refuses, and failing here means the
+/// write that would have announced it never happens.
+#[must_use]
+pub fn envelope(
+    id: &str,
+    event_type: &str,
+    tenant_id: &str,
+    environment_id: &str,
+    occurred_at_unix_ms: i64,
+    payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let version = registered(event_type)?.payload_version;
+    Some(serde_json::json!({
+        "id": id,
+        "type": event_type,
+        "payload_schema_version": version,
+        "occurred_at_unix_ms": occurred_at_unix_ms,
+        "tenant_id": tenant_id,
+        "environment_id": environment_id,
+        "payload": payload,
+    }))
+}
 
 /// The number of event types issue #108 asks the catalog to reach before it closes.
 ///

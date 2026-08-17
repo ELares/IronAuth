@@ -554,3 +554,47 @@ async fn webhook_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Valu
         .map(|message| message.payload)
         .collect()
 }
+
+/// The envelope builder stamps the version the REGISTRY declares, and refuses an
+/// unregistered type (issue #108).
+///
+/// This is the seam that makes a producer possible from any crate. Getting it wrong is quiet:
+/// a hand-passed version that disagrees with the registry produces an event the fan-out
+/// refuses PERMANENTLY at delivery, so the write succeeds and the notice never arrives.
+#[tokio::test]
+async fn the_envelope_builder_takes_its_version_from_the_registry() {
+    let built = ironauth_store::event_catalog::envelope(
+        "evt_1",
+        "client.deleted",
+        "ten_x",
+        "env_y",
+        1_700_000_000_000,
+        &serde_json::json!({ "client_id": "cli_1" }),
+    )
+    .expect("a registered type builds");
+
+    let registered = ironauth_store::event_catalog::registered("client.deleted")
+        .expect("client.deleted is registered");
+    assert_eq!(
+        built["payload_schema_version"].as_u64(),
+        Some(u64::from(registered.payload_version)),
+        "the stamped version is the registry's, not a constant"
+    );
+    // The whole point: what it builds is what the fan-out accepts.
+    ironauth_store::event_catalog::validate_event(&built)
+        .expect("a built envelope validates against the registry that supplied its version");
+
+    // An unregistered type yields nothing rather than an envelope the fan-out would refuse.
+    assert!(
+        ironauth_store::event_catalog::envelope(
+            "evt_2",
+            "client.invented",
+            "ten_x",
+            "env_y",
+            0,
+            &serde_json::json!({}),
+        )
+        .is_none(),
+        "an unregistered type must not produce an envelope"
+    );
+}
