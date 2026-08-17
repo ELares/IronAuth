@@ -161,6 +161,9 @@ scripts/no-plaintext-credentials.sh
 echo "==> event registry compatibility (a breaking payload change bumps its version)"
 scripts/event-registry-compat.py
 
+echo "==> SDK policy (the published policy still matches the SDKs that exist)"
+scripts/sdk-policy-check.py
+
 echo "==> discovery scan (no static discovery JSON; generated at serve time)"
 scripts/discovery-scan.sh
 

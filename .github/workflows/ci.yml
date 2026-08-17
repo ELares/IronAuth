@@ -390,6 +390,8 @@ jobs:
       # changelog, which is the same thing this needs: a base revision to diff against.
       - name: event registry compatibility (a breaking payload change bumps its version)
         run: scripts/event-registry-compat.py "origin/${{ github.base_ref || 'main' }}"
+      - name: SDK policy (the published policy still matches the SDKs that exist)
+        run: scripts/sdk-policy-check.py
       - name: discovery scan (no static discovery JSON; generated at serve time)
         run: scripts/discovery-scan.sh
       - name: rfc9700 scan (every OAuth endpoint bound to a conformance test)
