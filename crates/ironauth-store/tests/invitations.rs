@@ -1015,3 +1015,126 @@ async fn the_invitation_state_wire_forms_round_trip() {
     }
     assert_eq!(InvitationCredentialType::parse("totp"), None);
 }
+
+/// Everything queued for the webhook fan-out in this scope.
+async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}
+
+/// Revoking a pending invitation emits `invitation.revoked`, and a REPEAT emits nothing.
+///
+/// The retry half is the point. The revoke matches only a `pending` row, so a second call
+/// affects nothing and returns the uniform not-found -- and the event has to inherit that
+/// guard rather than fire again. A receiver counting revocations must not see two for one
+/// invitation because a client retried.
+#[tokio::test]
+async fn revoking_an_invitation_emits_once_and_a_retry_emits_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (id, _user, _token) = create_invitation(
+        &db,
+        &env,
+        scope,
+        "revoked@example.test",
+        InvitationCredentialType::Password,
+        3_600_000_000,
+    )
+    .await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_invitation_revoked",
+        "invitation.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "invitation_id": id.to_string() }),
+    )
+    .expect("invitation.revoked is registered");
+    let subject = id.to_string();
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_invitation_revoked",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .revoke_with_event(&env, &id, None, Some(&domain_event))
+        .await
+        .expect("revoke");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(events[0]["type"], "invitation.revoked");
+    assert_eq!(events[0]["payload"]["invitation_id"], id.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // THE RETRY. No pending row matches now, so the store's guard must keep it silent.
+    let repeat = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .revoke_with_event(&env, &id, None, Some(&domain_event))
+        .await;
+    assert!(
+        matches!(repeat, Err(StoreError::NotFound)),
+        "a repeat revoke is the uniform not-found: {repeat:?}"
+    );
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a revoke that changed nothing must not announce a second revocation"
+    );
+}
+
+/// A revoke carrying no event enqueues nothing.
+///
+/// The paired negative: without it the test above passes for a revoke that emits
+/// unconditionally, which would fire for every internal path that revokes an invitation.
+#[tokio::test]
+async fn revoking_an_invitation_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (id, _user, _token) = create_invitation(
+        &db,
+        &env,
+        scope,
+        "silent@example.test",
+        InvitationCredentialType::Password,
+        3_600_000_000,
+    )
+    .await;
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .revoke(&env, &id, None)
+        .await
+        .expect("revoke");
+
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a revocation with no event must not invent one"
+    );
+}

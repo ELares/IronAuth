@@ -283,6 +283,30 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // REVOKED, not "deleted": the invitation row survives as a tombstone in the
+        // `revoked` state, and a receiver treating this as a row deletion would drop the
+        // record an operator needs to answer "who was invited, and what became of it".
+        //
+        // NO TOKEN and no digest, ever. The whole point of a revoke is that the token can no
+        // longer be redeemed; putting any part of it on a webhook would hand every subscriber
+        // material about a credential, for an event whose only news is that it stopped
+        // working. The id correlates this with the invitation that was created.
+        //
+        // The event inherits the revoke's own guard: the write matches only a PENDING row, so
+        // a repeat revoke is `NotFound` and emits nothing. A receiver counting revocations
+        // cannot see two for one invitation because a client retried.
+        "invitation.revoked",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "invitation_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["invitation_id"]
+        }"#,
+    ),
+    (
         // Emitted at most ONCE per credential. The revocation is idempotent -- a retried
         // revoke changes nothing and audits nothing -- and the event inherits that, so a
         // receiver counting revocations never sees two for one key because a client retried.

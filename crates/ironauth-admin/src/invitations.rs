@@ -511,12 +511,13 @@ pub async fn revoke_invitation(
 
     let id = parse_invitation_id(scope, &invitation_id)?;
     let body_string = state_change_body(&id, InvitationStateView::Revoked)?;
+    let pending = invitation_revoked_event(&state, scope, &id);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .invitations()
-        .revoke(
+        .revoke_with_event(
             state.env(),
             &id,
             Some(IdempotencyWrite {
@@ -526,6 +527,10 @@ pub async fn revoke_invitation(
                 response_status: 200,
                 response_body: &body_string,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
     match result {
@@ -656,4 +661,32 @@ pub async fn resend_invitation(
         Err(StoreError::Conflict) => Err(ApiError::Internal),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The event an invitation revocation emits (issue #108).
+///
+/// The id ONLY. A revoke's whole meaning is that the token no longer redeems, so putting any
+/// part of that token -- or its digest -- on a webhook would hand every subscriber material
+/// about a credential, to announce that it stopped working. The id correlates this with the
+/// invitation that was created.
+fn invitation_revoked_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    invitation_id: &InvitationId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = invitation_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "invitation.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "invitation_id": subject }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

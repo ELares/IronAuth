@@ -35895,6 +35895,31 @@ impl ActingInvitationRepo<'_> {
         id: &InvitationId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.revoke_with_event(env, id, idempotency, None).await
+    }
+
+    /// [`Self::revoke`], additionally emitting `invitation.revoked` (issue #108).
+    ///
+    /// The event inherits this method's GUARD rather than being made idempotent separately:
+    /// the update matches only a `pending` row, so a repeat revoke (or a revoke of an
+    /// accepted invitation) affects nothing, returns the uniform not-found, and never reaches
+    /// the enqueue. A receiver counting revocations cannot see two for one invitation because
+    /// a client retried.
+    ///
+    /// Enqueued INSIDE the same transaction as the state flip, so an announcement cannot
+    /// survive a rolled-back revoke and tell a receiver a token is dead while it still
+    /// redeems.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke`].
+    pub async fn revoke_with_event(
+        &self,
+        env: &Env,
+        id: &InvitationId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -35926,6 +35951,9 @@ impl ActingInvitationRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // After the guard, so nothing is announced unless a pending row actually
+                // moved, and inside the transaction, so the notice cannot outlive a rollback.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
