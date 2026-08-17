@@ -583,6 +583,7 @@ pub async fn delete_org_role(
     // The cross-parent guard: deleting a sibling organization's role through this
     // path is the uniform not-found and removes nothing.
     let record = require_role_in_org(&state, scope, &org_id, &role_id).await?;
+    let pending = org_role_deleted_event(&state, scope, &record.id, &org_id);
     state
         .store()
         .management()
@@ -590,7 +591,14 @@ pub async fn delete_org_role(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_roles(scope)
-        .delete(state.env(), &record.id)
+        .delete_with_event(
+            state.env(),
+            &record.id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }
@@ -736,4 +744,34 @@ pub async fn clear_org_default_role(
         .clear_default(state.env(), &org_id)
         .await?;
     Ok(no_content())
+}
+
+/// The event an org-role delete emits (issue #108).
+///
+/// The organization travels with the role because a role is org-scoped and a receiver mirrors
+/// access per organization; a bare role id would not tell it whose access changed.
+fn org_role_deleted_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    role_id: &ironauth_store::OrgRoleId,
+    organization_id: &ironauth_store::OrganizationId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = role_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "org_role.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "org_role_id": subject,
+            "organization_id": organization_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

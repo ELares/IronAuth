@@ -114,6 +114,25 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // Deleting a role removes whatever it granted from every member who held it, so this
+        // is a PERMISSION change and a NARROWING one. A receiver mirroring access must not
+        // learn about it late: the window between the delete and the reconcile is a window
+        // where it still believes people can do things they no longer can.
+        //
+        // The organization travels with it because a role is org-scoped and a receiver
+        // mirrors access per organization.
+        "org_role.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "org_role_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_role_id", "organization_id"]
+        }"#,
+    ),
+    (
         // An admin pre-authorization lets a client SKIP the consent screen. Revoking it means
         // the next authorize prompts instead -- a user-visible behaviour change, and the
         // narrowing of a standing grant, which is what makes it worth announcing.

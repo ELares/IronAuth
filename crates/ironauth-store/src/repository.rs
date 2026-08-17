@@ -46780,6 +46780,20 @@ impl ActingOrgRoleRepo<'_> {
     /// [`StoreError::NotFound`] if the id is not in this scope, or no live role
     /// matched.
     pub async fn delete(&self, env: &Env, id: &OrgRoleId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `org_role.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &OrgRoleId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -46813,6 +46827,10 @@ impl ActingOrgRoleRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // Same transaction. Deleting a role removes whatever it granted from every
+                // member who held it, so this is a PERMISSION change -- the direction a
+                // receiver mirroring access must not learn about late.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
