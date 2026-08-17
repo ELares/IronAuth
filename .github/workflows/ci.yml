@@ -685,8 +685,10 @@ jobs:
         run: |
           set -euo pipefail
           node --test "dist/**/*.test.js"
-          node workers/run-checks.mjs | tee /tmp/node.json
-          grep -q '"count":7' /tmp/node.json
+          # `run-checks.mjs` exits non-zero on a failed check AND on a short count, which it
+          # compares against the EXPECTED_CHECKS it imports from the suite. That is the
+          # proof-it-ran guarantee, derived rather than hand-written.
+          node workers/run-checks.mjs
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -699,11 +701,11 @@ jobs:
         # No `--allow-net`, so a module that reached the network on import would fail here.
         run: |
           set -euo pipefail
-          deno run --allow-read --allow-env workers/run-checks.mjs | tee /tmp/deno.json
-          # The lane must PROVE it ran. A runtime whose entry point silently does nothing
+          # The lane must PROVE it ran: a runtime whose entry point silently does nothing
           # exits 0, and a green step that executed no checks is the failure this whole
-          # matrix exists to avoid.
-          grep -q '"count":7' /tmp/deno.json
+          # matrix exists to avoid. `run-checks.mjs` is what proves it, by comparing the
+          # count against the EXPECTED_CHECKS it imports and throwing on a mismatch.
+          deno run --allow-read --allow-env workers/run-checks.mjs
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -712,8 +714,8 @@ jobs:
         # The shared checks, for the same reason as the Deno lane.
         run: |
           set -euo pipefail
-          bun run workers/run-checks.mjs | tee /tmp/bun.json
-          grep -q '"count":7' /tmp/bun.json
+          # As the Node and Deno lanes: the script itself is the proof-it-ran check.
+          bun run workers/run-checks.mjs
       - name: workerd (cloudflare workers, and the vercel edge runtime by proxy)
         working-directory: packages/ironauth-sdk/workers
         # Run INSIDE workerd, the real Workers runtime, not under Node with a shim. That
