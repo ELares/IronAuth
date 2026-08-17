@@ -52,7 +52,7 @@ password-hash = "0.5"
 # Firebase modified scrypt finishes by AES-256-CTR encrypting the account signer
 # key under the scrypt-derived key; aes + ctr supply exactly that primitive.
 aes = "0.8"
-ctr = "0.9"
+ctr = "0.10"
 # Constant-time comparison for the Firebase hash equality check (no timing oracle).
 subtle = "2"
 # base64 for the Firebase salt / salt-separator / signer-key / hash operands and

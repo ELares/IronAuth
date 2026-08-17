@@ -23,7 +23,7 @@ argon2.workspace = true
 base64.workspace = true
 bcrypt = "0.19"
 cipher = "0.4"
-ctr = "0.9"
+ctr = "0.10"
 password-hash = "0.5"
 pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
 scrypt = "0.11"
