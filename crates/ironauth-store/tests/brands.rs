@@ -443,3 +443,171 @@ async fn two_brands_cannot_claim_the_same_host_after_canonicalization() {
         .expect("brand present");
     assert_eq!(stored.host_pattern.as_deref(), Some("acme.test"));
 }
+
+/// Deleting a brand asset emits `brand_asset.deleted`, naming WHICH asset (issue #108).
+///
+/// A brand asset is addressed by (brand slug, kind) -- there is one logo and one favicon per
+/// brand -- so both are needed to say what went. A receiver mirroring the hosted pages has to
+/// know whether the favicon or the logo disappeared; either field alone identifies nothing it
+/// could act on.
+#[tokio::test]
+async fn deleting_a_brand_asset_emits_the_registered_event_naming_the_kind() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let id = BrandId::generate(&env, &scope);
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .set(&env, &id, 1_000_000, set_brand("acme", true, "Acme"))
+        .await
+        .expect("set brand");
+
+    let png_bytes = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02, 0x03,
+    ];
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brand_assets()
+        .set(
+            &env,
+            &id,
+            2_000_000,
+            NewBrandAsset {
+                brand_slug: "acme",
+                kind: BrandAssetKind::Logo,
+                content_type: "image/png",
+                bytes: &png_bytes,
+                sha256: "abc123",
+                size_bytes: 11,
+            },
+        )
+        .await
+        .expect("upload logo asset");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "uploading an asset emits nothing today, so the delete's event is unambiguous"
+    );
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_brand_asset_deleted",
+        "brand_asset.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "brand_id": id.to_string(),
+            "brand_slug": "acme",
+            "kind": "logo",
+        }),
+    )
+    .expect("brand_asset.deleted is registered");
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brand_assets()
+        .delete_with_event(
+            &env,
+            &id,
+            "acme",
+            BrandAssetKind::Logo,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_brand_asset_deleted",
+                subject: &id.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("delete with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the delete enqueues exactly one event");
+    assert_eq!(events[0]["type"], "brand_asset.deleted");
+    assert_eq!(
+        events[0]["payload"]["kind"], "logo",
+        "the KIND says which asset went; the brand alone would not"
+    );
+    assert_eq!(events[0]["payload"]["brand_slug"], "acme");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A delete carrying no event enqueues nothing.
+#[tokio::test]
+async fn deleting_a_brand_asset_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let id = BrandId::generate(&env, &scope);
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .set(&env, &id, 1_000_000, set_brand("quiet", true, "Quiet"))
+        .await
+        .expect("set brand");
+
+    let png_bytes = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brand_assets()
+        .set(
+            &env,
+            &id,
+            2_000_000,
+            NewBrandAsset {
+                brand_slug: "quiet",
+                kind: BrandAssetKind::Favicon,
+                content_type: "image/png",
+                bytes: &png_bytes,
+                sha256: "def456",
+                size_bytes: 8,
+            },
+        )
+        .await
+        .expect("upload favicon");
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brand_assets()
+        .delete(&env, &id, "quiet", BrandAssetKind::Favicon)
+        .await
+        .expect("delete");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "a delete with no event must not invent one"
+    );
+}
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}

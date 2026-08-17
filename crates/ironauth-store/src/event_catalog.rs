@@ -116,6 +116,24 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A brand asset is addressed by (brand slug, KIND) -- there is one logo per kind per
+        // brand -- so both are needed to say WHICH asset went. A receiver mirroring the
+        // hosted pages has to know whether the favicon or the logo disappeared; either alone
+        // identifies nothing.
+        "brand_asset.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "brand_id": {"type": "string", "minLength": 1},
+                "brand_slug": {"type": "string", "minLength": 1},
+                "kind": {"type": "string", "minLength": 1}
+            },
+            "required": ["brand_id", "brand_slug", "kind"]
+        }"#,
+    ),
+    (
         // The NAME is the payload, because a variable is addressed by name everywhere -- in
         // the config that reads it and in the operator's head. There is no separate id to
         // fall back on.
