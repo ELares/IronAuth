@@ -612,12 +612,58 @@ pub async fn delete_connector(
         .scoped(scope)
         .connectors()
         .parse_id(&connector_id)?;
+    // Read the SLUG before the row goes. It is what a connector is referenced by everywhere
+    // else -- routing rules, the federation URL, an operator's own config -- so an event
+    // carrying only the id would send a receiver looking it up in a row that no longer
+    // exists. A not-found here is the same not-found the delete would return.
+    let slug = state
+        .store()
+        .scoped(scope)
+        .connectors()
+        .get(&id)
+        .await?
+        .slug;
+    let pending = connector_deleted_event(&state, scope, &id, &slug);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .connectors()
-        .delete(state.env(), &id)
+        .delete_with_event(
+            state.env(),
+            &id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event a connector delete emits (issue #108).
+///
+/// Carries the slug as well as the id: removing a connector changes who can log in, and a
+/// receiver reconciling its own copy references connectors by slug.
+fn connector_deleted_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    connector_id: &ironauth_store::ConnectorId,
+    slug: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = connector_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "connector.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "connector_id": subject, "slug": slug }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

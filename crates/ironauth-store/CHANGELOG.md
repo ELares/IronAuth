@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`connector.deleted` has a producer (issue #108).** Removing a connector changes WHO CAN
+  LOG IN to an environment, so a receiver wants it promptly rather than at the next reconcile.
+  The payload carries the SLUG as well as the id: a connector is referenced by slug everywhere
+  else -- routing rules, the federation URL, an operator's own configuration -- and after the
+  delete there is no row left to look it up in, so the admin handler reads it before the row
+  goes.
+
 - **`tenant.created` has a producer (issue #108).** It carries the FIRST ENVIRONMENT alongside
   the tenant, matching what the management endpoint returns: creating a tenant creates one in
   the same transaction, and a receiver told only the tenant id would have to go and ask which
