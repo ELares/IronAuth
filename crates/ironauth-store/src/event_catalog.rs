@@ -114,6 +114,24 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The NAME is the payload, because a variable is addressed by name everywhere -- in
+        // the config that reads it and in the operator's head. There is no separate id to
+        // fall back on.
+        //
+        // The VALUE is deliberately absent, and that is a rule rather than an omission: a
+        // variable may hold anything an operator put there, and an event that echoed removed
+        // values would be a channel for exfiltrating configuration by deleting it.
+        "environment_variable.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "minLength": 1}
+            },
+            "required": ["name"]
+        }"#,
+    ),
+    (
         // The self-referential one, and the reason it is safe: the fan-out lists the LIVE
         // endpoints after this transaction commits, so the removed endpoint is already gone
         // and never receives its own removal. The other endpoints do, which is the point --

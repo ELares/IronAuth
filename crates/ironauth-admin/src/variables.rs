@@ -337,12 +337,47 @@ pub async fn delete_variable(
         )));
     }
 
+    let pending = environment_variable_deleted_event(&state, scope, &name);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .environment_variables()
-        .delete(state.env(), &name)
+        .delete_with_event(
+            state.env(),
+            &name,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(json(StatusCode::NO_CONTENT, String::new()))
+}
+
+/// The event an environment-variable delete emits (issue #108).
+///
+/// The NAME is the whole payload. The VALUE is deliberately absent: a variable holds whatever
+/// an operator put there, and an event echoing removed values would turn deletion into a
+/// channel for reading configuration back out.
+fn environment_variable_deleted_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    name: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "environment_variable.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "name": name }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The variable NAME is the subject: two events about one variable stay ordered.
+        subject: name.to_owned(),
+        envelope,
+    })
 }

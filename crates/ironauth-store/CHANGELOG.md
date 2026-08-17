@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`environment_variable.deleted` has a producer, and it never carries the value (issue
+  #108).** The NAME is the whole payload -- a variable is addressed by name everywhere, and
+  there is no separate id to fall back on. The VALUE's absence is a rule rather than an
+  omission: a variable holds whatever an operator put there, so an event echoing removed
+  values would turn deletion into a channel for reading configuration back out. The test
+  asserts it over the WHOLE envelope, because the schema does not forbid extra fields --
+  measured, by adding `value` to the payload and watching validation still pass.
+
 - **`webhook_endpoint.deleted` has a producer, and it is the self-referential one (issue
   #108).** Deleting a webhook endpoint emits onto the webhook event queue, so the subject is
   the delivery machinery itself. The removed endpoint does NOT receive its own removal: the

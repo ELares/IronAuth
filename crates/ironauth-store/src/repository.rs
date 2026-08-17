@@ -53348,6 +53348,20 @@ impl ActingEnvironmentVariableRepo<'_> {
     /// [`StoreError::Conflict`] if the variable is still referenced;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, name: &str) -> Result<(), StoreError> {
+        self.delete_with_event(env, name, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `environment_variable.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        name: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         // Load the row's id up front (a stable audit target) and fail closed if it
         // is absent.
@@ -53388,6 +53402,8 @@ impl ActingEnvironmentVariableRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // Same transaction, so a not-found delete emits nothing either.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
