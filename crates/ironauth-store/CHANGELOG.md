@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`org_role.deleted` has a producer (issue #108).** Deleting a role removes whatever it
+  granted from EVERY member who held it, so this is a permission change and a narrowing one.
+  The window between the delete and a receiver's next reconcile is a window where it still
+  believes people can do things they no longer can. The organization travels with the role id
+  because a role is org-scoped and a receiver mirrors access per organization.
+
 - **`admin_consent.revoked` has a producer (issue #108).** An admin pre-authorization lets a
   client SKIP the consent screen; revoking it means the next authorize prompts instead -- a
   user-visible behaviour change, and the narrowing of a standing grant. The client id travels
