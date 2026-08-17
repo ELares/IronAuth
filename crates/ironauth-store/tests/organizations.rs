@@ -367,3 +367,190 @@ async fn every_mutation_writes_its_audit_row() {
     let actions: Vec<String> = rows.iter().map(|r| r.get::<String, _>("action")).collect();
     assert_eq!(actions, vec!["organization.create", "organization.delete"]);
 }
+
+/// Creating and deleting an organization each emit their registered event, in the SAME
+/// transaction as the write (issue #108).
+///
+/// Both are asserted in one test because the pair is the point: a receiver that saw creates
+/// and no deletes would hold organizations that no longer exist, which is worse than seeing
+/// neither.
+#[tokio::test]
+async fn organization_writes_emit_their_registered_events() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = OrganizationId::generate(&env, &scope);
+
+    assert_eq!(
+        webhook_events(&db, scope).await.len(),
+        0,
+        "nothing is queued before the writes"
+    );
+
+    let created = envelope_for(
+        scope,
+        "evt_org_created",
+        "organization.created",
+        &serde_json::json!({ "organization_id": id.to_string(), "display_name": "Acme" }),
+    );
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create_with_event(
+            &env,
+            &id,
+            1_000,
+            "Acme",
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_org_created",
+                subject: &id.to_string(),
+                envelope: &created,
+            }),
+        )
+        .await
+        .expect("create with event");
+
+    let deleted = envelope_for(
+        scope,
+        "evt_org_deleted",
+        "organization.deleted",
+        &serde_json::json!({ "organization_id": id.to_string() }),
+    );
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .delete_with_event(
+            &env,
+            &id,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_org_deleted",
+                subject: &id.to_string(),
+                envelope: &deleted,
+            }),
+        )
+        .await
+        .expect("delete with event");
+
+    // ONE at a time, and that is the ordering guarantee rather than a limitation. Both events
+    // carry the organization as their ordering key, so the outbox will not hand out the
+    // delete while the create is still outstanding -- a receiver must never learn an
+    // organization was deleted before it learns it existed. Discovered here: the first
+    // version of this test claimed once and asserted both, and got only the create.
+    let first = claim_one(&db, scope).await.expect("the create is queued");
+    assert_eq!(
+        first.payload["type"], "organization.created",
+        "{:?}",
+        first.payload
+    );
+    assert_eq!(first.payload["payload"]["display_name"], "Acme");
+    ironauth_store::event_catalog::validate_event(&first.payload)
+        .expect("the create envelope validates against the registry the fan-out enforces");
+
+    assert!(
+        claim_one(&db, scope).await.is_none(),
+        "the delete must not be handed out while the create is outstanding"
+    );
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .complete(&Env::system(), &first)
+        .await
+        .expect("complete the create");
+
+    let second = claim_one(&db, scope).await.expect("the delete follows it");
+    assert_eq!(
+        second.payload["type"], "organization.deleted",
+        "{:?}",
+        second.payload
+    );
+    assert_eq!(second.payload["payload"]["organization_id"], id.to_string());
+    ironauth_store::event_catalog::validate_event(&second.payload)
+        .expect("the delete envelope validates against the registry the fan-out enforces");
+}
+
+/// One claimable webhook event, or `None` when nothing is available.
+async fn claim_one(db: &TestDatabase, scope: Scope) -> Option<ironauth_store::OutboxMessage> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .next()
+}
+
+/// The un-suffixed methods emit nothing.
+///
+/// The paired negative, and it guards a specific hazard of the delegating-wrapper shape: if
+/// `create` ever stopped passing `None` and started inventing an event, every internal
+/// provisioning path and every test would begin emitting one.
+#[tokio::test]
+async fn the_plain_organization_writes_emit_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = create_org(&db, &env, scope, "Quiet", 1_000).await;
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .delete(&env, &id)
+        .await
+        .expect("delete");
+
+    assert_eq!(
+        webhook_events(&db, scope).await.len(),
+        0,
+        "create and delete without an event must not invent one"
+    );
+}
+
+fn envelope_for(
+    scope: Scope,
+    id: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "type": event_type,
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1_i64,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        "payload": payload,
+    })
+}
+
+/// Every webhook-event envelope currently queued in `scope`, oldest first.
+async fn webhook_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}

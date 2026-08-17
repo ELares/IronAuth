@@ -53,6 +53,10 @@ pub const USER_CREATED: &str = "user.created";
 pub const USER_DELETED: &str = "user.deleted";
 /// The wire type a management PATCH emits, once per field it wrote.
 pub const USER_UPDATED: &str = "user.updated";
+/// The wire type creating an organization emits.
+pub const ORGANIZATION_CREATED: &str = "organization.created";
+/// The wire type deleting an organization emits.
+pub const ORGANIZATION_DELETED: &str = "organization.deleted";
 
 /// The payload schema version every event in this envelope carries.
 ///

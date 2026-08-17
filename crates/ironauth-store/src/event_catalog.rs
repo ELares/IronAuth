@@ -97,6 +97,35 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The display name is carried because it is the whole of what a create decided that a
+        // receiver cannot derive from the id. Everything else about a new organization is
+        // either the id itself or scope, both already on the envelope.
+        "organization.created",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "organization_id": {"type": "string", "minLength": 1},
+                "display_name": {"type": "string", "minLength": 1}
+            },
+            "required": ["organization_id", "display_name"]
+        }"#,
+    ),
+    (
+        // No display name here: the delete is a soft tombstone and the receiver has had the
+        // name since the create. Repeating it would invite a consumer to treat the delete as
+        // the authoritative record of a name it may have since changed.
+        "organization.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["organization_id"]
+        }"#,
+    ),
+    (
         // `fields` names WHAT changed, because a PATCH may carry claims, traits, or both, and
         // a receiver that has to re-read the whole user to find out has gained nothing from
         // being told. It is a list rather than a single value for the same reason.
