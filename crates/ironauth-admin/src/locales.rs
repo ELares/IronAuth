@@ -321,14 +321,49 @@ pub async fn delete_locale(
         .await?
         .ok_or(ApiError::NotFound)?;
     let id = LocaleBundleId::parse_in_scope(&record.id, &scope).map_err(|_| ApiError::NotFound)?;
+    let pending = locale_bundle_deleted_event(&state, scope, &id, &locale);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .locale_bundles()
-        .delete(state.env(), &id)
+        .delete_with_event(
+            state.env(),
+            &id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event a locale-bundle delete emits (issue #108).
+///
+/// The TAG carries the meaning: "de-DE went away" is actionable, an opaque bundle id is not.
+/// After the delete there is no row to look it up in, so it is read while one exists.
+fn locale_bundle_deleted_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    bundle_id: &LocaleBundleId,
+    tag: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = bundle_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "locale_bundle.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "locale_bundle_id": subject, "tag": tag }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }
 
 #[cfg(test)]

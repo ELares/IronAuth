@@ -267,3 +267,118 @@ async fn a_locale_is_scoped_and_never_leaks_across_environments() {
         "scope B's export carries no locale bundle"
     );
 }
+
+/// Deleting a locale bundle emits `locale_bundle.deleted`, carrying its tag (issue #108).
+///
+/// Removing a bundle changes what language a user is addressed in: the hosted pages and the
+/// messages fall back to the default. The TAG is what carries that meaning -- "fr went away"
+/// is actionable, an opaque bundle id is not -- and after the delete there is no row left to
+/// look it up in.
+#[tokio::test]
+async fn deleting_a_locale_bundle_emits_the_registered_event_with_its_tag() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = LocaleBundleId::generate(&env, &scope);
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .locale_bundles()
+        .set(&env, &id, 1_000_000, set_locale("fr", true, FR_ENTRIES))
+        .await
+        .expect("set locale bundle");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "setting a bundle emits nothing today, so the delete's event is unambiguous"
+    );
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_locale_deleted",
+        "locale_bundle.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "locale_bundle_id": id.to_string(), "tag": "fr" }),
+    )
+    .expect("locale_bundle.deleted is registered");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .locale_bundles()
+        .delete_with_event(
+            &env,
+            &id,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_locale_deleted",
+                subject: &id.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("delete with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the delete enqueues exactly one event");
+    assert_eq!(events[0]["type"], "locale_bundle.deleted");
+    assert_eq!(
+        events[0]["payload"]["tag"], "fr",
+        "the tag survives the row it came from"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A delete carrying no event enqueues nothing.
+#[tokio::test]
+async fn deleting_a_locale_bundle_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = LocaleBundleId::generate(&env, &scope);
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .locale_bundles()
+        .set(&env, &id, 1_000_000, set_locale("fr", true, FR_ENTRIES))
+        .await
+        .expect("set locale bundle");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .locale_bundles()
+        .delete(&env, &id)
+        .await
+        .expect("delete");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "a delete with no event must not invent one"
+    );
+}
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}

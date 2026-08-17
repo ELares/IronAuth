@@ -114,6 +114,22 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // Removing a locale bundle changes what language a user is addressed in: the hosted
+        // pages and the messages fall back to the default. The TAG is what carries that
+        // meaning -- "de-DE went away" is actionable, an opaque bundle id is not -- so it
+        // rides along and the handler reads it before the row goes.
+        "locale_bundle.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "locale_bundle_id": {"type": "string", "minLength": 1},
+                "tag": {"type": "string", "minLength": 1}
+            },
+            "required": ["locale_bundle_id", "tag"]
+        }"#,
+    ),
+    (
         // A signup form governs what a self-service REGISTRATION collects and requires, so
         // removing one changes who can sign up and with what. The client id rides along
         // because a signup form is per-client and that is how an operator refers to it.

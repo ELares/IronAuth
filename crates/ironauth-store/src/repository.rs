@@ -28602,6 +28602,20 @@ impl ActingLocaleBundleRepo<'_> {
     /// [`StoreError::NotFound`] if `id` is out of scope or names no installed locale;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, id: &LocaleBundleId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `locale_bundle.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &LocaleBundleId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28632,6 +28646,8 @@ impl ActingLocaleBundleRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // Same transaction, so a not-found delete emits nothing either.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

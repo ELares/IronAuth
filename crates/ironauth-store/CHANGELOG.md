@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`locale_bundle.deleted` has a producer (issue #108).** Removing a bundle changes what
+  language a user is addressed in -- the hosted pages and messages fall back to the default.
+  The TAG travels with the id because that is what carries the meaning: "fr went away" is
+  actionable, an opaque bundle id is not, and after the delete there is no row to look it up
+  in.
+
 - **`signup_form.deleted` has a producer (issue #108).** A signup form governs what a
   self-service registration collects and requires, so removing one changes who can sign up and
   with what. The client id travels with the form id because a form is per-client and that is
