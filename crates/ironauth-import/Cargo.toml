@@ -51,7 +51,7 @@ pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
 password-hash = "0.5"
 # Firebase modified scrypt finishes by AES-256-CTR encrypting the account signer
 # key under the scrypt-derived key; aes + ctr supply exactly that primitive.
-aes = "0.8"
+aes = "0.9"
 ctr = "0.9"
 # Constant-time comparison for the Firebase hash equality check (no timing oracle).
 subtle = "2"
