@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`tenant.created` has a producer (issue #108).** It carries the FIRST ENVIRONMENT alongside
+  the tenant, matching what the management endpoint returns: creating a tenant creates one in
+  the same transaction, and a receiver told only the tenant id would have to go and ask which
+  environment to talk to. The event rides that transaction along with the environment's
+  day-one signing keys, so it announces a tenant that is READY to serve rather than a
+  half-built one.
+
 - **`environment.deleted` has a producer (issue #108).** It rides the SAME transaction as the
   fence that stops the environment serving -- deleting an environment flips
   `environment_states` to suspended in that transaction, so a receiver can never be told

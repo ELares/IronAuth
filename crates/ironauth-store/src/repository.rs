@@ -43826,6 +43826,46 @@ impl ActingTenantRepo<'_> {
         signing_keys: &[NewSigningKey<'_>],
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(
+            env,
+            tenant_id,
+            environment_id,
+            created_at_micros,
+            operator_display_name,
+            tenant_display_name,
+            environment,
+            home_region,
+            signing_keys,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create`], additionally emitting `tenant.created` (issue #108).
+    ///
+    /// A delegating variant rather than an eleventh parameter: `create` already carries
+    /// `#[allow(clippy::too_many_arguments)]` at ten, so widening it is the wrong direction,
+    /// and every existing caller emits nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        tenant_id: &TenantId,
+        environment_id: &EnvironmentId,
+        created_at_micros: i64,
+        operator_display_name: &str,
+        tenant_display_name: &str,
+        environment: NewEnvironment<'_>,
+        home_region: Option<&str>,
+        signing_keys: &[NewSigningKey<'_>],
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = Scope::new(*tenant_id, *environment_id);
         // An environment must be created with at least one signing key, or its JWKS is
         // empty and it can issue no tokens; the slice parameter (issue #93) makes a
@@ -43908,6 +43948,24 @@ impl ActingTenantRepo<'_> {
                     insert_signing_key_row(tx, &scope, signing_key).await?;
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the SAME transaction as everything above -- the tenant row, its first
+                // environment, and that environment's day-one signing keys. The event
+                // announces a tenant that is READY to serve, and all three are what make it
+                // ready; announcing before they commit would announce a half-built one.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            idempotency_key: event.id,
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
+                }
                 Ok(())
             },
             false,

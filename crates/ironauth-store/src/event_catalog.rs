@@ -97,6 +97,23 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // Carries the FIRST ENVIRONMENT alongside the tenant, because creating a tenant
+        // creates one in the same transaction and the management API returns both
+        // (`TenantCreated`). A receiver told only the tenant id would have to go and ask
+        // which environment to talk to, and the answer already exists here.
+        "tenant.created",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "tenant_id": {"type": "string", "minLength": 1},
+                "environment_id": {"type": "string", "minLength": 1},
+                "display_name": {"type": "string", "minLength": 1}
+            },
+            "required": ["tenant_id", "environment_id", "display_name"]
+        }"#,
+    ),
+    (
         // Deleting an environment FENCES its data plane: the same transaction flips
         // environment_states to suspended. So this event means "this environment stopped
         // serving", which is the fact a receiver acts on -- it is not merely a row change,

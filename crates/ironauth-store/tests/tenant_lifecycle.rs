@@ -1766,3 +1766,87 @@ async fn queued_events(harness: &Fixture, scope: Scope) -> Vec<serde_json::Value
         .map(|message| message.payload)
         .collect()
 }
+
+/// Creating a tenant emits `tenant.created`, carrying the first environment (issue #108).
+///
+/// The environment is in the payload because creating a tenant creates one in the SAME
+/// transaction and the management API returns both. A receiver told only the tenant id would
+/// have to go and ask which environment to talk to, and the answer already exists at emit
+/// time.
+#[tokio::test]
+async fn creating_a_tenant_emits_the_registered_event_with_its_first_environment() {
+    let fixture = Fixture::start().await;
+    let tenant = TenantId::generate(&fixture.env);
+    let environment = EnvironmentId::generate(&fixture.env);
+    let scope = Scope::new(tenant, environment);
+    let key = DayOneKey::generate(&fixture.env, &scope);
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_tenant_created",
+        "tenant.created",
+        &tenant.to_string(),
+        &environment.to_string(),
+        1,
+        &serde_json::json!({
+            "tenant_id": tenant.to_string(),
+            "environment_id": environment.to_string(),
+            "display_name": "Acme",
+        }),
+    )
+    .expect("tenant.created is registered");
+
+    fixture
+        .db
+        .control_store()
+        .management()
+        .acting(fixture.actor, CorrelationId::generate(&fixture.env))
+        .tenants(fixture.operator)
+        .create_with_event(
+            &fixture.env,
+            &tenant,
+            &environment,
+            1_000,
+            "operator",
+            "Acme",
+            NewEnvironment {
+                display_name: "development",
+                kind: EnvironmentType::Dev,
+                custom_domain: None,
+                region: None,
+            },
+            None,
+            &[key.as_new()],
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_tenant_created",
+                subject: &tenant.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("create with event");
+
+    let events = queued_events(&fixture, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "tenant.created");
+    assert_eq!(events[0]["payload"]["tenant_id"], tenant.to_string());
+    assert_eq!(
+        events[0]["payload"]["environment_id"],
+        environment.to_string(),
+        "the first environment travels with the tenant"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A tenant create carrying no event enqueues nothing.
+#[tokio::test]
+async fn creating_a_tenant_without_an_event_enqueues_nothing() {
+    let fixture = Fixture::start().await;
+    let scope = fixture.create_tenant(None).await;
+    assert_eq!(
+        queued_events(&fixture, scope).await.len(),
+        0,
+        "a create with no event must not invent one"
+    );
+}

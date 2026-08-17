@@ -193,12 +193,22 @@ pub async fn create_tenant(
         response_status: 201,
         response_body: &body_string,
     };
+    let pending = tenant_created_event(
+        &state,
+        &tenant_id,
+        &environment_id,
+        &display_name,
+        created_at_micros,
+    );
+    let created_event = pending
+        .as_ref()
+        .map(crate::events::PendingEvent::domain_event);
     let result = state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .tenants(state.bootstrap_operator_id())
-        .create(
+        .create_with_event(
             state.env(),
             &tenant_id,
             &environment_id,
@@ -214,6 +224,7 @@ pub async fn create_tenant(
             home_region.as_deref(),
             &signing_keys.as_new(created_at_micros),
             Some(write),
+            created_event.as_ref(),
         )
         .await;
 
@@ -639,4 +650,43 @@ async fn transition_tenant(
         ))),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The event a tenant create emits (issue #108).
+///
+/// It carries the FIRST ENVIRONMENT as well as the tenant, matching what the endpoint
+/// returns: a receiver told only the tenant id would have to ask which environment to talk
+/// to, and the answer already exists at emit time.
+///
+/// `None` when the type is unregistered, which the store then treats as "no event" -- the
+/// registry decides whether this is emittable, not this function.
+///
+/// APPENDED rather than placed above `create_tenant`, which is preceded by a
+/// `#[utoipa::path(..)]` block; anchoring on the fn line would have split the two.
+fn tenant_created_event(
+    state: &AdminState,
+    tenant_id: &ironauth_store::TenantId,
+    environment_id: &ironauth_store::EnvironmentId,
+    display_name: &str,
+    created_at_micros: i64,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = tenant_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "tenant.created",
+        &subject,
+        &environment_id.to_string(),
+        created_at_micros / 1000,
+        &serde_json::json!({
+            "tenant_id": subject,
+            "environment_id": environment_id.to_string(),
+            "display_name": display_name,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }
