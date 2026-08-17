@@ -847,6 +847,24 @@ mod tests {
         assert_eq!(validate_event(&good_envelope()), Ok(()));
     }
 
+    /// Every `TENANT_SCOPED` entry names a type that is actually registered.
+    ///
+    /// The list is hand-written and keyed on the wire name, so a typo or a rename leaves an
+    /// entry matching nothing. That failure is quiet in the wrong direction: the misspelled
+    /// entry is inert, and the type it MEANT to name silently goes back to being treated as
+    /// environment-scoped -- so a tenant-scoped producer would be required to name an
+    /// environment it does not have. The reverse (a registered type missing from the list)
+    /// fails loudly at its first emit, which is why only this direction needs a guard.
+    #[test]
+    fn every_tenant_scoped_entry_names_a_registered_type() {
+        for wire in TENANT_SCOPED {
+            assert!(
+                REGISTERED.iter().any(|(name, _, _)| name == wire),
+                "TENANT_SCOPED names `{wire}`, which is not a registered event type"
+            );
+        }
+    }
+
     /// EVERY required envelope field is required, one at a time.
     ///
     /// Asserted per field rather than once, because a schema requiring only `id` would pass

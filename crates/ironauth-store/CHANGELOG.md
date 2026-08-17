@@ -21,6 +21,14 @@ range per docs/RELEASING.md.
   return `None` for the other's types, so a producer fails BEFORE the write rather than at
   delivery, where the write would already have committed and the notice been undeliverable.
 
+  A tenant-scoped event is queued for EVERY environment of the tenant, one outbox row each,
+  rather than only the environment the store picked as the audit scope. The envelope names no
+  environment, but the row carrying it is routed per environment and the fan-out lists
+  endpoints by `(tenant_id, environment_id)` -- so a single row would have reached only the
+  oldest environment's subscribers, and every other environment the delete just fenced would
+  never have been told. One row per environment rather than a tenant-wide fan-out, so no
+  endpoint ever sees an event from outside its own environment.
+
 - **A cursor older than the oldest retained event is now REFUSED rather than answered with the
   surviving tail (issue #107, criterion 6).** `rows_after` returned whatever survived, and a
   consumer resuming from a pruned cursor could not tell that from an uneventful period -- it

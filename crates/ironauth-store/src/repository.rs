@@ -44628,7 +44628,39 @@ impl ActingTenantRepo<'_> {
                 .bind(id.to_string())
                 .execute(&mut **tx)
                 .await?;
-                // 6. Restore the audit scope's row-level-security variables so the
+                // 6. Announce to EVERY environment of the tenant, not just the audit
+                //    scope's. A tenant-scoped event names no single environment, but the
+                //    outbox row carrying it IS routed per environment, and the fan-out
+                //    lists endpoints `WHERE tenant_id = $1 AND environment_id = $2`. A
+                //    single row would therefore reach only the oldest environment's
+                //    subscribers, and every other environment this delete just fenced
+                //    would never be told it had been.
+                //
+                //    One row PER environment rather than widening the fan-out to the
+                //    tenant, so the delivery path keeps its isolation EXACTLY as it is: no
+                //    endpoint ever sees an event from outside its own environment. The
+                //    event id is deliberately shared across these rows -- it is one event
+                //    -- and cannot collide, because the outbox is unique on
+                //    (tenant_id, environment_id, consumer, idempotency_key).
+                //
+                //    In the SAME transaction as the tombstone and every environment fence
+                //    it just wrote. Announcing before those commit would tell a receiver
+                //    to stop trusting a tenant that is still answering.
+                for env_row in &env_rows {
+                    let env_id: String = env_row.get("id");
+                    let announced = EnvironmentId::parse(&env_id)
+                        .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+                    // FORCE row-level security on `outbox_messages` checks an INSERT
+                    // against these settings, so each row must be written while its OWN
+                    // environment is the scoped one. Without this the insert is REFUSED,
+                    // not silently mis-scoped.
+                    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                        .bind(&env_id)
+                        .execute(&mut **tx)
+                        .await?;
+                    enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
+                }
+                // 7. Restore the audit scope's row-level-security variables so the
                 //    audited-write's audit row inserts under (tenant, oldest
                 //    environment), exactly as it did before the per-environment
                 //    re-scoping above.
@@ -44640,10 +44672,6 @@ impl ActingTenantRepo<'_> {
                     .bind(scope.environment().to_string())
                     .execute(&mut **tx)
                     .await?;
-                // In the SAME transaction as the tombstone and every environment fence it
-                // just wrote. Announcing before those commit would tell a receiver to stop
-                // trusting a tenant that is still answering.
-                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

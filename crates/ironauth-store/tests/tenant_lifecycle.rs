@@ -1983,6 +1983,83 @@ async fn deleting_a_tenant_emits_an_envelope_that_names_no_environment() {
         .expect("the envelope validates against the registry the fan-out enforces");
 }
 
+/// A tenant-scoped event reaches the subscribers of EVERY environment, not just the
+/// audit scope's (issue #108, owner decision).
+///
+/// The envelope names no environment, but the outbox row carrying it is routed per
+/// environment and the fan-out lists endpoints `WHERE tenant_id = $1 AND environment_id =
+/// $2`. So a single row is delivered only to the OLDEST environment's subscribers, and every
+/// other environment the delete just fenced is never told. That is the delivery-side twin of
+/// the bug the envelope change fixes, and it is invisible to a single-environment fixture --
+/// which is exactly what the test above uses.
+///
+/// Hence the SECOND environment here: it is the only thing that distinguishes one row from
+/// one row per environment. With the single-row producer this test finds nothing queued for
+/// `second` and fails.
+///
+/// One row per environment rather than a tenant-wide fan-out keeps the delivery isolation
+/// intact: no endpoint ever sees an event from outside its own environment.
+#[tokio::test]
+async fn a_tenant_scoped_event_is_queued_for_every_environment_of_the_tenant() {
+    let fixture = Fixture::start().await;
+    let first = fixture.create_tenant(None).await;
+    let second = fixture.create_environment(first.tenant(), None).await;
+
+    assert_ne!(
+        first.environment(),
+        second.environment(),
+        "the fixture must hold two distinct environments or this proves nothing"
+    );
+
+    let envelope = ironauth_store::event_catalog::envelope_tenant_scoped(
+        "evt_tenant_deleted_fanout",
+        "tenant.deleted",
+        &first.tenant().to_string(),
+        1,
+        &serde_json::json!({ "tenant_id": first.tenant().to_string() }),
+    )
+    .expect("tenant.deleted is registered as tenant-scoped");
+
+    fixture
+        .db
+        .control_store()
+        .management()
+        .acting(fixture.actor, CorrelationId::generate(&fixture.env))
+        .tenants(fixture.operator)
+        .delete_with_event(
+            &fixture.env,
+            &first.tenant(),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_tenant_deleted_fanout",
+                subject: &first.tenant().to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("delete with event");
+
+    // Both environments, each read under its OWN scope -- which is how the fan-out reads
+    // them, so this measures the delivery path rather than a tenant-wide query the fan-out
+    // never runs.
+    for (label, scope) in [("the audit scope's", first), ("the second", second)] {
+        let events = queued_events(&fixture, scope).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "{label} environment must have exactly one queued event, found {}",
+            events.len()
+        );
+        assert_eq!(events[0]["type"], "tenant.deleted");
+        assert!(
+            events[0].get("environment_id").is_none(),
+            "the envelope stays tenant-scoped in every environment it is queued for: {}",
+            events[0]
+        );
+        ironauth_store::event_catalog::validate_event(&events[0])
+            .expect("the envelope validates in every environment it is queued for");
+    }
+}
+
 /// The two envelope constructors refuse each other's types.
 ///
 /// The guarantee that makes the split worth having: a producer cannot reach the fan-out with
