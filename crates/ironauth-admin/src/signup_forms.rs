@@ -325,14 +325,52 @@ pub async fn delete_signup_form(
         .await?
         .ok_or(ApiError::NotFound)?;
     let id = SignupFormId::parse_in_scope(&record.id, &scope).map_err(|_| ApiError::NotFound)?;
+    let pending = signup_form_deleted_event(&state, scope, &id, &client_id);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .signup_forms()
-        .delete(state.env(), &id)
+        .delete_with_event(
+            state.env(),
+            &id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event a signup-form delete emits (issue #108).
+///
+/// The client id rides along because a signup form is per-client, and that is how an operator
+/// refers to it -- the form's own id is an internal handle they never type.
+fn signup_form_deleted_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    form_id: &SignupFormId,
+    client_id: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = form_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "signup_form.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "signup_form_id": subject,
+            "client_id": client_id,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }
 
 #[cfg(test)]

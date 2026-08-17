@@ -201,3 +201,135 @@ async fn a_signup_form_is_scoped_and_never_leaks_across_environments() {
         "scope B export carries no form"
     );
 }
+
+/// Deleting a signup form emits `signup_form.deleted` (issue #108).
+///
+/// A signup form governs what a self-service REGISTRATION collects and requires, so removing
+/// one changes who can sign up and with what. The client id travels with the form id because
+/// a form is per-client and that is how an operator refers to it -- the form's own id is an
+/// internal handle they never type.
+#[tokio::test]
+async fn deleting_a_signup_form_emits_the_registered_event() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let client = ClientId::generate(&env, &scope).to_string();
+    let id = SignupFormId::generate(&env, &scope);
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .signup_forms()
+        .set(
+            &env,
+            &id,
+            1_000_000,
+            NewSignupForm {
+                client_id: &client,
+                fields_json: FIELDS,
+            },
+        )
+        .await
+        .expect("set signup form");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "setting a form emits nothing today, so the delete's event is unambiguous"
+    );
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_signup_form_deleted",
+        "signup_form.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "signup_form_id": id.to_string(), "client_id": client }),
+    )
+    .expect("signup_form.deleted is registered");
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .signup_forms()
+        .delete_with_event(
+            &env,
+            &id,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_signup_form_deleted",
+                subject: &id.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("delete with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the delete enqueues exactly one event");
+    assert_eq!(events[0]["type"], "signup_form.deleted");
+    assert_eq!(events[0]["payload"]["client_id"], client);
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A delete carrying no event enqueues nothing.
+#[tokio::test]
+async fn deleting_a_signup_form_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let client = ClientId::generate(&env, &scope).to_string();
+    let id = SignupFormId::generate(&env, &scope);
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .signup_forms()
+        .set(
+            &env,
+            &id,
+            1_000_000,
+            NewSignupForm {
+                client_id: &client,
+                fields_json: FIELDS,
+            },
+        )
+        .await
+        .expect("set signup form");
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .signup_forms()
+        .delete(&env, &id)
+        .await
+        .expect("delete");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "a delete with no event must not invent one"
+    );
+}
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}
