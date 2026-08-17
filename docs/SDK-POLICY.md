@@ -4,7 +4,7 @@ Which SDKs IronAuth ships, which are deferred, and the reasoning behind the orde
 
 An integrator's first question is "is my language supported, and if not, will it be?" A
 silent absence answers neither. This page answers both, and states a **revisit trigger** for
-every deferral so a deferral is falsifiable rather than indefinite — the same discipline
+every deferral so a deferral is falsifiable rather than indefinite -- the same discipline
 [Will Not Implement](WILL-NOT-IMPLEMENT.md) applies to outright refusals. The difference is
 that nothing here is refused: these are ordering decisions, and the order can change.
 
@@ -16,10 +16,10 @@ protocol risk from the integrator, first.**
 | Priority | Surface | Why here |
 | --- | --- | --- |
 | 1 | Browser-facing session handling (Next.js, BFF) | Where tokens are most easily mishandled. A browser app that holds tokens in JavaScript is one XSS from full account takeover, so the layer that keeps them out of the browser earns the first slot. |
-| 2 | Headless React hooks | Same risk surface, minus the framework. State and actions only, no bundled UI — a component library ages faster than a protocol and would tie upgrades to a design system. |
+| 2 | Headless React hooks | Same risk surface, minus the framework. State and actions only, no bundled UI -- a component library ages faster than a protocol and would tie upgrades to a design system. |
 | 3 | Server SDKs generated from the published spec (Go, Python) | Generated, so they cannot drift from the contract. A hand-written server SDK is a second implementation of the API with its own bugs; generation makes the spec the single source. |
 | 4 | Step-up middleware helpers | The RFC 9470 challenge loop is fiddly and easy to get subtly wrong (comparing `acr` and `auth_time` against required values, constructing the retry request). Worth centralising once. |
-| 5 | Mobile guidance over AppAuth | Documented path rather than a shipped SDK — see the deferral reasoning below. |
+| 5 | Mobile guidance over AppAuth | Documented path rather than a shipped SDK -- see the deferral reasoning below. |
 
 ## What ships today
 
@@ -27,7 +27,7 @@ protocol risk from the integrator, first.**
 | --- | --- |
 | Go management SDK | **Generated** from `docs/openapi/management.json` (`sdks/go`) |
 | Python management SDK | **Generated** from `docs/openapi/management.json` (`sdks/python`) |
-| Reference client | **Hand-written from the published spec** (`clients/reference`) — proves the spec is sufficient to build against without reading SDK source |
+| Reference client | **Hand-written from the published spec** (`clients/reference`) -- proves the spec is sufficient to build against without reading SDK source |
 
 The generated clients are produced by the pipeline in the [SDK contract](SDK-CONTRACT.md);
 CI fails if the management API changes without regenerating them.
@@ -63,12 +63,12 @@ Nothing below is refused. Each entry states what would change our mind.
   **Instead**: the generated management client, plus the verification guidance in
   [edge verification](edge-verification.md).
   **Revisit trigger**: a verification path in one of these ecosystems proves error-prone in
-  practice — a recurring integrator mistake is evidence; an absence of one is not.
+  practice -- a recurring integrator mistake is evidence; an absence of one is not.
 
 ## Why deferrals are published rather than implied
 
 An unpublished deferral is indistinguishable from an oversight. An integrator choosing a
 stack needs to know that Vue support is a scheduling decision with a stated trigger, not an
-omission that might be fixed next week — because those two answers lead to different
+omission that might be fixed next week -- because those two answers lead to different
 decisions. Publishing the trigger also constrains us: a deferral whose trigger has fired and
 that has not been revisited is a visible contradiction rather than a quiet one.
