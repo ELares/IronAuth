@@ -29,6 +29,13 @@ BREAKING, for the shapes this registry uses:
 ADDITIVE, permitted under an unchanged version: a new OPTIONAL property, an enum gaining a
 value, a constraint loosening. A consumer written against the old schema still works.
 
+DELIBERATELY NOT FLAGGED: tightening `additionalProperties` to `false`. It reads like a
+narrowing and is not one for the party this check protects. These rules exist to defend the
+CONSUMER contract, and a consumer cannot break from it -- what it receives is unchanged.
+The only thing constrained is a PRODUCER sending undeclared fields, and every producer is in
+this repository and verified conforming. Flagging it would force a version bump on all types
+at once, stranding every pinned consumer to fix a break that nobody can experience.
+
 An event type that DISAPPEARS entirely is breaking too, and is reported: a consumer
 subscribed to it will wait forever, which is the same defect the registry's producer rule
 exists to prevent from the other direction.

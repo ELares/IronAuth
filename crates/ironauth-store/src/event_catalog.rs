@@ -89,6 +89,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "user_id": {"type": "string", "minLength": 1},
                 "state": {"type": "string", "minLength": 1}
@@ -105,6 +106,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "tenant_id": {"type": "string", "minLength": 1},
                 "environment_id": {"type": "string", "minLength": 1},
@@ -125,6 +127,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "name": {"type": "string", "minLength": 1}
             },
@@ -140,6 +143,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "webhook_endpoint_id": {"type": "string", "minLength": 1}
             },
@@ -155,6 +159,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "permission_id": {"type": "string", "minLength": 1},
                 "slug": {"type": "string", "minLength": 1}
@@ -174,6 +179,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "org_role_id": {"type": "string", "minLength": 1},
                 "organization_id": {"type": "string", "minLength": 1}
@@ -192,6 +198,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "client_admin_grant_id": {"type": "string", "minLength": 1},
                 "client_id": {"type": "string", "minLength": 1}
@@ -208,6 +215,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "locale_bundle_id": {"type": "string", "minLength": 1},
                 "tag": {"type": "string", "minLength": 1}
@@ -223,6 +231,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "signup_form_id": {"type": "string", "minLength": 1},
                 "client_id": {"type": "string", "minLength": 1}
@@ -246,6 +255,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "user_id": {"type": "string", "minLength": 1},
                 "state": {"type": "string", "minLength": 1},
@@ -265,6 +275,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "api_key_id": {"type": "string", "minLength": 1}
             },
@@ -283,6 +294,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "management_key_id": {"type": "string", "minLength": 1}
             },
@@ -299,6 +311,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "connector_id": {"type": "string", "minLength": 1},
                 "slug": {"type": "string", "minLength": 1}
@@ -315,6 +328,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "environment_id": {"type": "string", "minLength": 1},
                 "tenant_id": {"type": "string", "minLength": 1}
@@ -330,6 +344,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "client_id": {"type": "string", "minLength": 1}
             },
@@ -344,6 +359,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "organization_id": {"type": "string", "minLength": 1},
                 "display_name": {"type": "string", "minLength": 1}
@@ -359,6 +375,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "organization_id": {"type": "string", "minLength": 1}
             },
@@ -381,6 +398,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "user_id": {"type": "string", "minLength": 1},
                 "fields": {
@@ -401,6 +419,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         1,
         r#"{
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "user_id": {"type": "string", "minLength": 1},
                 "hard_kill": {"type": "boolean"}
