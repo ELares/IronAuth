@@ -925,3 +925,104 @@ async fn a_retried_create_under_one_idempotency_key_mints_exactly_one_key() {
     .expect("count keys");
     assert_eq!(count, 1, "a retried create minted a SECOND live credential");
 }
+
+/// Revoking an API key emits `api_key.revoked` ONCE, and a retried revoke emits nothing
+/// further (issue #108).
+///
+/// The idempotence is the substance. `revoke` is idempotent by design -- revoking an
+/// already-revoked key changes nothing and writes no second audit row -- and the event has to
+/// inherit that, or a receiver counting revocations sees two for one credential because a
+/// client retried a request it never learned the outcome of.
+#[tokio::test]
+async fn revoking_an_api_key_emits_once_and_a_retry_emits_nothing() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "pat-owner").await;
+    let owner = ApiKeyOwner::User(user);
+    let minted = mint_api_key(&env, &scope, ApiKeyKindTag::PersonalAccessToken);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .api_keys()
+        .create(
+            &env,
+            NewApiKey {
+                id: &minted.id,
+                key_digest: &minted.digest,
+                owner: &owner,
+                display_name: "ci token",
+                expires_at_unix_micros: None,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("create key");
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_api_key_revoked",
+        "api_key.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "api_key_id": minted.id.to_string() }),
+    )
+    .expect("api_key.revoked is registered");
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_api_key_revoked",
+        subject: &minted.id.to_string(),
+        envelope: &envelope,
+    };
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .api_keys()
+        .revoke_with_event(&env, &minted.id, now_micros(&env), Some(&domain_event))
+        .await
+        .expect("revoke");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(events[0]["type"], "api_key.revoked");
+    assert_eq!(events[0]["payload"]["api_key_id"], minted.id.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // The RETRY. Same key, same call, and the store's early return must keep it silent.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .api_keys()
+        .revoke_with_event(&env, &minted.id, now_micros(&env), Some(&domain_event))
+        .await
+        .expect("revoke again");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "a retried revoke must emit nothing: the first one already drained, and a second \
+         would make a receiver count two revocations for one credential"
+    );
+}
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &ironauth_env::Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}

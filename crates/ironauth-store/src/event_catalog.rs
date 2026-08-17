@@ -114,6 +114,23 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // Emitted at most ONCE per credential. The revocation is idempotent -- a retried
+        // revoke changes nothing and audits nothing -- and the event inherits that, so a
+        // receiver counting revocations never sees two for one key because a client retried.
+        //
+        // The id only, for the reason on `management_key.revoked`: nothing derived from the
+        // secret belongs on the wire that announces it is dead.
+        "api_key.revoked",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "api_key_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["api_key_id"]
+        }"#,
+    ),
+    (
         // REVOKED, not "deleted", because that is what happened: a management credential lost
         // its authority. The row survives as a tombstone, and a receiver that treated this as
         // a row deletion would garbage-collect audit references that must stay legible.

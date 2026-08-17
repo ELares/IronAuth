@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`api_key.revoked` has a producer, and it inherits the revocation's IDEMPOTENCE (issue
+  #108).** `revoke` is idempotent by design: revoking an already-revoked key changes nothing
+  and writes no second audit row. The enqueue sits AFTER that early return, so a retried
+  revoke emits nothing either -- a receiver counting revocations must not see two for one
+  credential because a client retried a request whose outcome it never learned. Payload is the
+  id only, for the reason on `management_key.revoked`.
+
 - **`management_key.revoked` has a producer (issue #108).** The event a SIEM cares about most
   of any registered so far: a management credential losing its authority is a security fact.
   Named REVOKED rather than deleted because that is what happens -- the row survives as a
