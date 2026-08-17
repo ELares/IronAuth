@@ -140,6 +140,23 @@
       "type": "environment.deleted"
     },
     {
+      "domain": "environment_variable",
+      "payload_schema": {
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment_variable.deleted"
+    },
+    {
       "domain": "locale_bundle",
       "payload_schema": {
         "properties": {
