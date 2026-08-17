@@ -407,6 +407,23 @@
       },
       "payload_schema_version": 1,
       "type": "user.updated"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "properties": {
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.deleted"
     }
   ]
 }

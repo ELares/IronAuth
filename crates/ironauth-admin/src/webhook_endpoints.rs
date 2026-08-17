@@ -398,12 +398,20 @@ pub async fn delete_webhook_endpoint(
 
     // No Idempotency-Key: DELETE is the idempotent removal here as everywhere else, and
     // removing an absent endpoint is a no-op success.
+    let pending = webhook_endpoint_deleted_event(&state, scope, &id);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .webhook_endpoints()
-        .delete(state.env(), &id)
+        .delete_with_event(
+            state.env(),
+            &id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }
@@ -979,4 +987,31 @@ fn into_view(record: ironauth_store::WebhookEndpointRecord) -> WebhookEndpointVi
         event_types: record.event_types,
         created_at_unix_ms: record.created_at_unix_micros / 1000,
     }
+}
+
+/// The event a webhook-endpoint delete emits (issue #108).
+///
+/// The removed endpoint does not receive this: the fan-out lists the live endpoints after the
+/// delete commits, so it is already gone. The remaining endpoints do, which is the point --
+/// their delivery topology just changed.
+fn webhook_endpoint_deleted_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    endpoint_id: &ironauth_store::WebhookEndpointId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = endpoint_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "webhook_endpoint.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "webhook_endpoint_id": subject }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

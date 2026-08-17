@@ -114,6 +114,21 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The self-referential one, and the reason it is safe: the fan-out lists the LIVE
+        // endpoints after this transaction commits, so the removed endpoint is already gone
+        // and never receives its own removal. The other endpoints do, which is the point --
+        // a delivery topology changing under them is exactly what they want told.
+        "webhook_endpoint.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "webhook_endpoint_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["webhook_endpoint_id"]
+        }"#,
+    ),
+    (
         // The WIDEST narrowing in the registry. Deleting a permission removes it from every
         // role that referenced it at once -- one row, and everybody who held it through any
         // role loses it. A receiver mirroring access has more to undo here than for any other

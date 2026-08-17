@@ -27227,6 +27227,27 @@ impl ActingWebhookEndpointRepo<'_> {
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, id: &WebhookEndpointId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `webhook_endpoint.deleted` (issue #108).
+    ///
+    /// # The removed endpoint does not receive its own removal
+    ///
+    /// The fan-out lists the live endpoints when it explodes the event, which happens after
+    /// this transaction commits -- so the deleted endpoint is already gone and is not among
+    /// them. That is the behaviour you want and it is worth stating, because the alternative
+    /// reading (an endpoint told it was deleted) is the first thing a reader assumes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -27250,6 +27271,12 @@ impl ActingWebhookEndpointRepo<'_> {
                 .bind(scope.environment().to_string())
                 .execute(&mut **tx)
                 .await?;
+                // Same transaction as the removal. Note this delete is a NO-OP SUCCESS when
+                // the endpoint is absent (no rows_affected check), so a repeated delete emits
+                // a second event -- unlike `api_key.revoke`, which returns early. The
+                // operation is idempotent in effect and not in notification, and a receiver
+                // therefore treats this type as at-least-once.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
