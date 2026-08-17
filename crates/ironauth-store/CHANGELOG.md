@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`admin_consent.revoked` has a producer (issue #108).** An admin pre-authorization lets a
+  client SKIP the consent screen; revoking it means the next authorize prompts instead -- a
+  user-visible behaviour change, and the narrowing of a standing grant. The client id travels
+  with the grant id because the pre-authorization is per-client and that is what an operator
+  revoked.
+
 - **`locale_bundle.deleted` has a producer (issue #108).** Removing a bundle changes what
   language a user is addressed in -- the hosted pages and messages fall back to the default.
   The TAG travels with the id because that is what carries the meaning: "fr went away" is
