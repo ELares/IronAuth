@@ -29489,6 +29489,20 @@ impl ActingClientAdminGrantRepo<'_> {
     /// [`StoreError::NotFound`] if `id` is out of scope or names no installed pre-authorization;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, id: &ClientAdminGrantId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `admin_consent.revoked` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &ClientAdminGrantId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -29519,6 +29533,10 @@ impl ActingClientAdminGrantRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // Same transaction, so a not-found revoke emits nothing either. Revoking a
+                // pre-authorization means the client's next authorize will PROMPT rather than
+                // skip consent, which is a user-visible change in behaviour.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

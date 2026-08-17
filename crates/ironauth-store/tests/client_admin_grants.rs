@@ -241,3 +241,119 @@ fn admin_grant_covers_scope_is_subset_containment() {
     assert!(admin_grant_covers_scope(Some("openid"), None));
     assert!(!admin_grant_covers_scope(None, Some("openid")));
 }
+
+/// Revoking an admin pre-authorization emits `admin_consent.revoked` (issue #108).
+///
+/// An admin pre-authorization lets a client SKIP the consent screen. Revoking it means the
+/// next authorize prompts instead -- a user-visible behaviour change, and the narrowing of a
+/// standing grant, which is what makes it worth announcing.
+#[tokio::test]
+async fn revoking_an_admin_consent_emits_the_registered_event() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = ClientId::generate(&env, &scope).to_string();
+    let id = ClientAdminGrantId::generate(&env, &scope);
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_admin_grants()
+        .set(&env, &id, 1_000_000, grant(&client, Some("openid profile")))
+        .await
+        .expect("set the grant");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "granting emits nothing today, so the revocation's event is unambiguous"
+    );
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_consent_revoked",
+        "admin_consent.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "client_admin_grant_id": id.to_string(),
+            "client_id": client,
+        }),
+    )
+    .expect("admin_consent.revoked is registered");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_admin_grants()
+        .delete_with_event(
+            &env,
+            &id,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_consent_revoked",
+                subject: &id.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("revoke with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(events[0]["type"], "admin_consent.revoked");
+    assert_eq!(events[0]["payload"]["client_id"], client);
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A revocation carrying no event enqueues nothing.
+#[tokio::test]
+async fn revoking_an_admin_consent_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = ClientId::generate(&env, &scope).to_string();
+    let id = ClientAdminGrantId::generate(&env, &scope);
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_admin_grants()
+        .set(&env, &id, 1_000_000, grant(&client, Some("openid")))
+        .await
+        .expect("set the grant");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_admin_grants()
+        .delete(&env, &id)
+        .await
+        .expect("revoke");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "a revocation with no event must not invent one"
+    );
+}
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}

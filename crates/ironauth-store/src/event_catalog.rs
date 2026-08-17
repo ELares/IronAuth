@@ -114,6 +114,24 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // An admin pre-authorization lets a client SKIP the consent screen. Revoking it means
+        // the next authorize prompts instead -- a user-visible behaviour change, and the
+        // narrowing of a standing grant, which is what makes it worth announcing.
+        //
+        // The client id rides along because the grant is per-client and that is what an
+        // operator revoked; the grant's own id is an internal handle.
+        "admin_consent.revoked",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "client_admin_grant_id": {"type": "string", "minLength": 1},
+                "client_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_admin_grant_id", "client_id"]
+        }"#,
+    ),
+    (
         // Removing a locale bundle changes what language a user is addressed in: the hosted
         // pages and the messages fall back to the default. The TAG is what carries that
         // meaning -- "de-DE went away" is actionable, an opaque bundle id is not -- so it

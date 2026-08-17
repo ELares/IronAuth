@@ -40,6 +40,28 @@
   },
   "event_types": [
     {
+      "domain": "admin_consent",
+      "payload_schema": {
+        "properties": {
+          "client_admin_grant_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_admin_grant_id",
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "admin_consent.revoked"
+    },
+    {
       "domain": "api_key",
       "payload_schema": {
         "properties": {
