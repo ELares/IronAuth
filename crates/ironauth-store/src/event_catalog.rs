@@ -114,6 +114,22 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The WIDEST narrowing in the registry. Deleting a permission removes it from every
+        // role that referenced it at once -- one row, and everybody who held it through any
+        // role loses it. A receiver mirroring access has more to undo here than for any other
+        // event, which is why the slug travels: that is what a policy is written against.
+        "permission.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "permission_id": {"type": "string", "minLength": 1},
+                "slug": {"type": "string", "minLength": 1}
+            },
+            "required": ["permission_id", "slug"]
+        }"#,
+    ),
+    (
         // Deleting a role removes whatever it granted from every member who held it, so this
         // is a PERMISSION change and a NARROWING one. A receiver mirroring access must not
         // learn about it late: the window between the delete and the reconcile is a window

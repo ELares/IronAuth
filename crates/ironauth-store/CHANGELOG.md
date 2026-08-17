@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`permission.deleted` has a producer (issue #108).** The widest narrowing in the registry:
+  deleting a permission removes it from every role that referenced it at once -- one row, and
+  everybody who held it through any role loses it. The slug travels with the id because that
+  is what a policy is written against, and after the delete there is no live row to resolve
+  the id from.
+
 - **`org_role.deleted` has a producer (issue #108).** Deleting a role removes whatever it
   granted from EVERY member who held it, so this is a permission change and a narrowing one.
   The window between the delete and a receiver's next reconcile is a window where it still

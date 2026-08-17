@@ -240,6 +240,28 @@
       "type": "organization.deleted"
     },
     {
+      "domain": "permission",
+      "payload_schema": {
+        "properties": {
+          "permission_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "slug": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "permission_id",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "permission.deleted"
+    },
+    {
       "domain": "signup_form",
       "payload_schema": {
         "properties": {
