@@ -2781,3 +2781,106 @@ async fn the_list_order_by_is_total_with_the_ordering_index_taken_away() {
         );
     }
 }
+
+/// Deleting a permission emits `permission.deleted`, carrying its slug (issue #108).
+///
+/// This is the WIDEST narrowing in the registry: deleting a permission removes it from every
+/// role that referenced it at once -- one row, and everybody who held it through any role
+/// loses it. A receiver mirroring access has more to undo here than for any other event,
+/// which is why the slug travels: that is what a policy is written against, and after the
+/// delete there is no live row to resolve the id from.
+#[tokio::test]
+async fn deleting_a_permission_emits_the_registered_event_with_its_slug() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let permission = create_permission(&db, &env, scope, "reports.read").await;
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "creating a permission emits nothing today, so the delete's event is unambiguous"
+    );
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_permission_deleted",
+        "permission.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "permission_id": permission.to_string(),
+            "slug": "reports.read",
+        }),
+    )
+    .expect("permission.deleted is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .permissions(scope)
+        .delete_with_event(
+            &env,
+            &permission,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_permission_deleted",
+                subject: &permission.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("delete with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the delete enqueues exactly one event");
+    assert_eq!(events[0]["type"], "permission.deleted");
+    assert_eq!(
+        events[0]["payload"]["slug"], "reports.read",
+        "the slug survives the row it came from: a policy is written against it, not the id"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A delete carrying no event enqueues nothing.
+#[tokio::test]
+async fn deleting_a_permission_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let permission = create_permission(&db, &env, scope, "reports.write").await;
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .permissions(scope)
+        .delete(&env, &permission)
+        .await
+        .expect("delete");
+
+    assert_eq!(
+        queued_events(&db, scope).await.len(),
+        0,
+        "a delete with no event must not invent one"
+    );
+}
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}

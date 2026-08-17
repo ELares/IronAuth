@@ -615,12 +615,47 @@ pub async fn delete_permission(
     // inherit the fence rather than carry a third copy of it (issues #443, #451).
     let record =
         require_live_permission(&state, scope, &permission_id, EnvironmentAccess::Write).await?;
+    let pending = permission_deleted_event(&state, scope, &record.id, &record.slug);
     state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .permissions(scope)
-        .delete(state.env(), &record.id)
+        .delete_with_event(
+            state.env(),
+            &record.id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event a permission delete emits (issue #108).
+///
+/// The SLUG travels because that is what a policy is written against; the permission's own id
+/// is an internal handle, and after the delete there is no live row to resolve it from.
+fn permission_deleted_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    permission_id: &ironauth_store::PermissionId,
+    slug: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = permission_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "permission.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "permission_id": subject, "slug": slug }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

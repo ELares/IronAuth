@@ -47347,6 +47347,20 @@ impl ActingPermissionRepo<'_> {
     /// [`StoreError::NotFound`] if the id is not in this scope, or no live permission
     /// matched.
     pub async fn delete(&self, env: &Env, id: &PermissionId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `permission.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &PermissionId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47364,7 +47378,7 @@ impl ActingPermissionRepo<'_> {
             async move |tx| {
                 require_live_permission(tx, scope, id).await?;
                 let result = sqlx::query(
-                    "UPDATE permissions SET \
+                    "UPDATE permissions /* the permission.deleted producer */ SET \
                          deleted_at = \
                              TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
                          updated_at = \
@@ -47381,6 +47395,10 @@ impl ActingPermissionRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // Same transaction. Deleting a permission narrows every role that referenced
+                // it at once, so this is the widest-blast-radius narrowing in the registry:
+                // one row, and everybody who held it through any role loses it.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
