@@ -16810,6 +16810,7 @@ impl ActingUserRepo<'_> {
         id: &UserId,
         hard_kill: bool,
         idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -16855,6 +16856,23 @@ impl ActingUserRepo<'_> {
                     &emit,
                 )
                 .await?;
+                // The domain event, in the SAME transaction as the tombstone it announces,
+                // exactly as the create does. Emitting it outside would let a rolled-back
+                // delete announce itself, and a receiver cannot un-see that.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            idempotency_key: event.id,
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
+                }
                 Ok(())
             },
             false,

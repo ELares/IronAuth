@@ -1750,7 +1750,7 @@ impl Harness {
         scoped
             .acting(actor, corr)
             .users()
-            .delete(&self.env, &id, false, None)
+            .delete(&self.env, &id, false, None, None)
             .await
             .expect("delete user");
     }

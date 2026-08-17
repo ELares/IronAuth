@@ -444,7 +444,7 @@ async fn a_soft_deleted_holder_resolves_as_nobody() {
         .users()
         // Soft delete (`hard_kill = false`): the tombstone is exactly the state the lookup
         // must read as absent.
-        .delete(&env, &user, false, None)
+        .delete(&env, &user, false, None, None)
         .await
         .expect("soft-delete the user");
 

@@ -329,7 +329,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # FULL history. The OpenAPI changelog step diffs the spec against the base branch, and
+      # the default shallow checkout has no `origin/main` to resolve -- it failed with
+      # "'origin/main' is not a revision here; nothing to compare against", which is the
+      # check reporting that it could not run rather than that the spec is unchanged.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       # This job compiles ironauth-admin and ironauth-config through the
       # openapi-check / config-schema freshness steps; cache the build so those

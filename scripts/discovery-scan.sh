@@ -21,11 +21,19 @@ generator="crates/ironauth-oidc/src/discovery.rs"
 # federation files are exempt from the self-discovery duplication check: the
 # ironauth-connector definition types, the admin connector request-body doc, and
 # the ironauth-fetch FederationDiscovery purpose doc.
+#
+# `fake_idp` is the same category and arrived here the same way. It is the emulator's fake
+# UPSTREAM provider (issue #121), so the document it assembles is that provider's, not
+# IronAuth's. It lived in the `ironauth` binary crate, outside this scan's reach, until it
+# moved beside the federation code it is a counterpart to so the federation suite could drive
+# the provider that actually ships -- which brought it into scope. Its own tests already treat
+# the served document as a foreign one.
 federation_allow=(
   "crates/ironauth-connector/src/lib.rs"
   "crates/ironauth-connector/src/discovery.rs"
   "crates/ironauth-admin/src/views.rs"
   "crates/ironauth-fetch/src/lib.rs"
+  "crates/ironauth-oidc/src/fake_idp.rs"
 )
 
 fail=0

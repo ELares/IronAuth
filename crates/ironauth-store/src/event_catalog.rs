@@ -71,18 +71,22 @@ pub fn envelope_schema() -> Value {
 ///
 /// `(wire type, payload version, payload JSON Schema)`.
 ///
-/// ONE type today, because one producer exists. `user.updated` and `user.deleted` appear as
-/// subscription FILTER strings in the webhook surface and nothing emits them, so they are
-/// deliberately absent: a registry entry for an event no producer sends is a contract a
-/// consumer would wait on forever, which is the same fiction as an invented payload schema.
+/// Every entry here has a PRODUCER. `user.updated` is still absent for that reason: it
+/// appears as a subscription filter string in the webhook surface and nothing emits it, and a
+/// registry entry for an event no producer sends is a contract a consumer would wait on
+/// forever, which is the same fiction as an invented payload schema.
+///
+/// `user.deleted` used to be in that state too. It is here now because the management delete
+/// emits it, not because the filter string existed.
 ///
 /// Adding a producer means adding a row here in the same change. The fan-out validates every
 /// envelope against this registry and REFUSES an unregistered type permanently, so a new
 /// event cannot reach the wire uncatalogued: the enforcement is the delivery path itself.
-const REGISTERED: &[(&str, u32, &str)] = &[(
-    "user.created",
-    1,
-    r#"{
+const REGISTERED: &[(&str, u32, &str)] = &[
+    (
+        "user.created",
+        1,
+        r#"{
             "type": "object",
             "properties": {
                 "user_id": {"type": "string", "minLength": 1},
@@ -90,7 +94,24 @@ const REGISTERED: &[(&str, u32, &str)] = &[(
             },
             "required": ["user_id", "state"]
         }"#,
-)];
+    ),
+    (
+        // `hard_kill` rides the payload because it changes what the delete DID, not just
+        // that it happened: a soft delete leaves the offline refresh families alive and a
+        // hard kill revokes them. A receiver reconciling its own copy needs to tell those
+        // apart, and it cannot ask afterwards -- the user reads as absent either way.
+        "user.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "hard_kill": {"type": "boolean"}
+            },
+            "required": ["user_id", "hard_kill"]
+        }"#,
+    ),
+];
 
 /// The number of event types issue #108 asks the catalog to reach before it closes.
 ///

@@ -1479,7 +1479,7 @@ async fn a_soft_deleted_user_resolves_to_no_permissions() {
         .scoped(scope)
         .acting(actor(&env), CorrelationId::generate(&env))
         .users()
-        .delete(&env, &user, false, None)
+        .delete(&env, &user, false, None, None)
         .await
         .expect("soft delete user");
 
