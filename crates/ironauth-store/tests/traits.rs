@@ -799,7 +799,7 @@ async fn set_traits_classed(
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env))
         .users()
-        .set_traits_with_visibility(env, id, traits_json, visibility)
+        .set_traits_with_visibility(env, id, traits_json, visibility, None)
         .await
 }
 

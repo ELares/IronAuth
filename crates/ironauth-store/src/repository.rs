@@ -16575,6 +16575,7 @@ impl ActingUserRepo<'_> {
         env: &Env,
         id: &UserId,
         claims_json: &str,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -16629,6 +16630,22 @@ impl ActingUserRepo<'_> {
                 .await?;
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
+                }
+                // In the SAME transaction as the write it announces, like every other
+                // producer. A claims write that rolled back must not have announced itself.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            idempotency_key: event.id,
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
                 }
                 Ok(())
             },
@@ -56955,7 +56972,7 @@ impl ActingUserRepo<'_> {
         id: &UserId,
         traits_json: &str,
     ) -> Result<i32, StoreError> {
-        self.set_traits_with_visibility(env, id, traits_json, TraitWriteVisibility::Admin)
+        self.set_traits_with_visibility(env, id, traits_json, TraitWriteVisibility::Admin, None)
             .await
     }
 
@@ -56997,6 +57014,7 @@ impl ActingUserRepo<'_> {
         id: &UserId,
         traits_json: &str,
         visibility: TraitWriteVisibility,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<i32, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -57087,6 +57105,22 @@ impl ActingUserRepo<'_> {
                     &value,
                 )
                 .await?;
+                // In the SAME transaction as the write it announces, like every other
+                // producer. A traits write that rolled back must not have announced itself.
+                if let Some(event) = event {
+                    enqueue_outbox_in_tx(
+                        tx,
+                        env,
+                        scope,
+                        &NewOutboxMessage {
+                            consumer: WEBHOOK_EVENT_CONSUMER,
+                            idempotency_key: event.id,
+                            ordering_key: event.subject,
+                            payload: event.envelope.clone(),
+                        },
+                    )
+                    .await?;
+                }
                 Ok(schema_version)
             },
             false,

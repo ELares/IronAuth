@@ -202,6 +202,37 @@ fn user_created_event(
     }
 }
 
+/// The event a management PATCH emits for ONE written field (issue #108).
+///
+/// One per write rather than one per request: the PATCH runs claims and traits as two
+/// separate audited transactions, and an event must be transactional with the write it
+/// announces. A single event after both could not be -- if the traits write failed after the
+/// claims write committed, a real change would go unannounced.
+fn user_updated_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    user_id: &ironauth_store::UserId,
+    field: &str,
+    updated_at_micros: i64,
+) -> crate::events::PendingEvent {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = crate::events::envelope(
+        &id,
+        crate::events::USER_UPDATED,
+        scope,
+        updated_at_micros / 1000,
+        &serde_json::json!({
+            "user_id": user_id.to_string(),
+            "fields": [field],
+        }),
+    );
+    crate::events::PendingEvent {
+        id,
+        subject: user_id.to_string(),
+        envelope,
+    }
+}
+
 /// The event a management delete emits (issue #108).
 ///
 /// `hard_kill` is carried because it changes what the delete DID: a soft delete leaves the
@@ -614,15 +645,24 @@ pub async fn update_user(
     };
     if let Some(claims) = request.claims.as_ref() {
         let claims_json = claims.to_string();
+        let claims_event =
+            user_updated_event(&state, scope, &id, "claims", state.now_unix_micros());
         state
             .store()
             .scoped(scope)
             .acting(actor, CorrelationId::generate(state.env()))
             .users()
-            .update_claims(state.env(), &id, &claims_json)
+            .update_claims(
+                state.env(),
+                &id,
+                &claims_json,
+                Some(&claims_event.domain_event()),
+            )
             .await?;
     }
     if let Some((traits_json, _)) = traits.as_ref() {
+        let traits_event =
+            user_updated_event(&state, scope, &id, "traits", state.now_unix_micros());
         // The ADMIN visibility class: this is the management plane, which is precisely where
         // admin-only metadata is written. `set_traits` re-validates against the active schema
         // and records the version, so the write path is the same one every flow-driven writer
@@ -632,7 +672,13 @@ pub async fn update_user(
             .scoped(scope)
             .acting(actor, CorrelationId::generate(state.env()))
             .users()
-            .set_traits(state.env(), &id, traits_json)
+            .set_traits_with_visibility(
+                state.env(),
+                &id,
+                traits_json,
+                ironauth_store::TraitWriteVisibility::Admin,
+                Some(&traits_event.domain_event()),
+            )
             .await?;
     }
     if request.claims.is_none() && request.traits.is_none() {

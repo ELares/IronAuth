@@ -2083,6 +2083,7 @@ async fn provision_federated_user(
                     &existing.id,
                     traits_json,
                     ironauth_store::TraitWriteVisibility::SelfService,
+                    None,
                 )
                 .await?;
         }

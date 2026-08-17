@@ -1299,3 +1299,146 @@ async fn webhook_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Valu
         .map(|message| message.payload)
         .collect()
 }
+
+/// A claims update emits `user.updated` naming the field it wrote (issue #108).
+///
+/// Like `user.deleted`, this was a subscription filter string the webhook surface advertised
+/// and nothing emitted. `fields` names WHAT changed because a receiver told only that "the
+/// user changed" has to re-read the whole user to find out, which is the work the event
+/// exists to save.
+#[tokio::test]
+async fn updating_claims_emits_user_updated_naming_the_field() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = create_user(
+        &db,
+        &env,
+        scope,
+        "updated-claims@example.test",
+        None,
+        UserState::Active,
+        1_000,
+    )
+    .await
+    .expect("create");
+
+    assert_eq!(
+        webhook_events(&db, scope).await.len(),
+        0,
+        "no event exists before the update"
+    );
+
+    let envelope = serde_json::json!({
+        "id": "evt_user_updated_claims",
+        "type": "user.updated",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1_i64,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        "payload": { "user_id": user.to_string(), "fields": ["claims"] },
+    });
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .update_claims(
+            &env,
+            &user,
+            r#"{"department":"engineering"}"#,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_user_updated_claims",
+                subject: &user.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("update claims");
+
+    let events = webhook_events(&db, scope).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "the claims write enqueues exactly one event"
+    );
+    assert_eq!(events[0]["type"], "user.updated");
+    assert_eq!(
+        events[0]["payload"]["fields"],
+        serde_json::json!(["claims"]),
+        "the event names the field that was written"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the emitted envelope validates against the registry the fan-out enforces");
+}
+
+/// A claims update carrying no event enqueues nothing.
+///
+/// The paired negative: without it the test above passes for a write that emits
+/// unconditionally, which would fire for every internal caller that passes `None`.
+#[tokio::test]
+async fn a_claims_update_with_no_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = create_user(
+        &db,
+        &env,
+        scope,
+        "silent-claims@example.test",
+        None,
+        UserState::Active,
+        1_000,
+    )
+    .await
+    .expect("create");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .update_claims(&env, &user, r#"{"department":"sales"}"#, None)
+        .await
+        .expect("update claims");
+
+    assert_eq!(
+        webhook_events(&db, scope).await.len(),
+        0,
+        "a write with no event must not invent one"
+    );
+}
+
+/// The registry rejects a `user.updated` whose `fields` names something that is not a field
+/// this producer writes.
+///
+/// The schema's `enum` is the contract a receiver switches on. Without this assertion the
+/// enum could be widened, or dropped, and nothing would notice until a consumer met a value
+/// it had no branch for.
+#[tokio::test]
+async fn user_updated_refuses_a_field_outside_the_declared_set() {
+    let scope_tenant = "ten_x";
+    let bad = serde_json::json!({
+        "id": "evt_bad",
+        "type": "user.updated",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1_i64,
+        "tenant_id": scope_tenant,
+        "environment_id": "env_y",
+        "payload": { "user_id": "usr_1", "fields": ["password"] },
+    });
+    assert!(
+        ironauth_store::event_catalog::validate_event(&bad).is_err(),
+        "an undeclared field must not validate"
+    );
+
+    let good = serde_json::json!({
+        "id": "evt_good",
+        "type": "user.updated",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1_i64,
+        "tenant_id": scope_tenant,
+        "environment_id": "env_y",
+        "payload": { "user_id": "usr_1", "fields": ["traits"] },
+    });
+    ironauth_store::event_catalog::validate_event(&good)
+        .expect("a declared field validates, so the refusal above is about the VALUE");
+}

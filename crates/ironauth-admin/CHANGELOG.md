@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The management PATCH emits `user.updated` (issue #108), once per field it writes.** A patch
+  carrying both claims and traits emits two events, each naming its field, because the handler
+  runs those as two separate audited transactions and each event rides the write it announces.
+
 - **Deleting a user through the management API emits `user.deleted` (issue #108).** The handler
   mints the event and hands it to the store write, which enqueues it transactionally. Subscribers
   to that type now receive one; before this they could subscribe and never hear anything.

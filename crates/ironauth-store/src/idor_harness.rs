@@ -2377,7 +2377,7 @@ impl IsolationProbe for UserAdminUpdateClaimsProbe {
                 .scoped(caller)
                 .acting(actor, correlation)
                 .users()
-                .update_claims(&env, &id, "{\"nickname\":\"idor-probe\"}")
+                .update_claims(&env, &id, "{\"nickname\":\"idor-probe\"}", None)
                 .await
             {
                 Ok(()) => ProbeOutcome::Leaked,
