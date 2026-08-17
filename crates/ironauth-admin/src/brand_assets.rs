@@ -246,12 +246,22 @@ async fn delete_asset(
         .await?
         .ok_or(ApiError::NotFound)?;
     let brand_id = BrandId::parse_in_scope(&brand.id, &scope).map_err(|_| ApiError::NotFound)?;
+    let pending = brand_asset_deleted_event(state, scope, &brand_id, slug, kind);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .brand_assets()
-        .delete(state.env(), &brand_id, slug, kind)
+        .delete_with_event(
+            state.env(),
+            &brand_id,
+            slug,
+            kind,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }
@@ -402,6 +412,38 @@ pub async fn delete_brand_favicon(
         BrandAssetKind::Favicon,
     )
     .await
+}
+
+/// The event a brand-asset delete emits (issue #108).
+///
+/// Both the brand SLUG and the KIND are needed to say WHICH asset went: there is one asset
+/// per kind per brand, so either alone identifies nothing a receiver could act on.
+fn brand_asset_deleted_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    brand_id: &ironauth_store::BrandId,
+    brand_slug: &str,
+    kind: ironauth_store::BrandAssetKind,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = brand_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "brand_asset.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "brand_id": subject,
+            "brand_slug": brand_slug,
+            "kind": kind.as_str(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }
 
 #[cfg(test)]

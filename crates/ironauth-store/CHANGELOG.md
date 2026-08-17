@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`brand_asset.deleted` has a producer (issue #108).** A brand asset is addressed by (brand
+  slug, KIND) -- one logo and one favicon per brand -- so both ride the payload. A receiver
+  mirroring the hosted pages has to know whether the favicon or the logo disappeared; either
+  field alone identifies nothing it could act on.
+
 - **Every registered payload schema now forbids undeclared fields (issue #108, criterion 1).**
   Criterion 1 says every emitted event "validates against its registered schema", and that was
   weaker than it read: JSON Schema permits undeclared properties unless a schema forbids them,

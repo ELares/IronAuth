@@ -28366,6 +28366,23 @@ impl ActingBrandAssetRepo<'_> {
         brand_slug: &str,
         kind: BrandAssetKind,
     ) -> Result<(), StoreError> {
+        self.delete_with_event(env, brand_id, brand_slug, kind, None)
+            .await
+    }
+
+    /// [`Self::delete`], additionally emitting `brand_asset.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        brand_id: &BrandId,
+        brand_slug: &str,
+        kind: BrandAssetKind,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if brand_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28398,6 +28415,8 @@ impl ActingBrandAssetRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // Same transaction, so a not-found delete emits nothing either.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
