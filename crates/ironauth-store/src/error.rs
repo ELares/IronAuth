@@ -60,6 +60,17 @@ pub enum StoreError {
     ///
     /// [`InvalidRedirectUri`]: StoreError::InvalidRedirectUri
     GuardrailViolation(GuardrailViolation),
+    /// A cursor points BEFORE the oldest retained row, so the rows between it and what
+    /// survives have been pruned (issue #107, criterion 6).
+    ///
+    /// Returned instead of the rows that DO survive. That substitution is the whole point: a
+    /// consumer resuming from a pruned cursor and receiving the surviving tail cannot tell it
+    /// from an uneventful period, so it would silently skip everything in the gap and go on
+    /// believing it had seen the stream whole. Refusing is the only answer that reaches the
+    /// consumer, because a gap has no representation in a list of rows.
+    ///
+    /// The caller reconciles: read current state directly, then resume from a fresh cursor.
+    RetentionGap,
     /// A dynamic client registration would exceed the environment's configured
     /// registered-client quota (issue #31). Enforced atomically inside the
     /// registration transaction (under a per-scope advisory lock, so a concurrent
@@ -385,6 +396,10 @@ impl StoreError {
             | StoreError::JourneyInvalid(_)
             | StoreError::OrgGroupCycle
             | StoreError::OrgGroupDepthExceeded { .. }
+            // The caller's cursor is the problem and only the caller can fix it, by
+            // reconciling and resuming. Not Internal: nothing FAILED here, the request is
+            // simply unsatisfiable.
+            | StoreError::RetentionGap
             | StoreError::OrgAuthPolicyInvalid(_) => StoreErrorWire::Unprocessable,
             StoreError::GuardrailViolation(violation) => StoreErrorWire::Guardrail(violation),
         }
@@ -395,6 +410,14 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::NotFound => f.write_str("resource not found"),
+            // The RECONCILE GUIDANCE criterion 6 asks for lives here, because this text is
+            // what the management surface renders. An error that only said "gap" would tell
+            // a consumer it had a problem without telling it the move.
+            StoreError::RetentionGap => f.write_str(
+                "the cursor is older than the oldest retained event: the rows between them \
+                 have passed their retention window and cannot be replayed. Reconcile by \
+                 reading current state directly, then resume from a fresh cursor.",
+            ),
             StoreError::Database(_) => f.write_str("database error"),
             StoreError::Migration(_) => f.write_str("migration error"),
             StoreError::IdempotencyConflict => f.write_str("idempotency-key conflict"),
@@ -469,6 +492,7 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             StoreError::NotFound
+            | StoreError::RetentionGap
             | StoreError::IdempotencyConflict
             | StoreError::Conflict
             | StoreError::InvalidRedirectUri
