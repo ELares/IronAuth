@@ -118,6 +118,28 @@
       "type": "environment.deleted"
     },
     {
+      "domain": "locale_bundle",
+      "payload_schema": {
+        "properties": {
+          "locale_bundle_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "tag": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "locale_bundle_id",
+          "tag"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "locale_bundle.deleted"
+    },
+    {
       "domain": "management_key",
       "payload_schema": {
         "properties": {
