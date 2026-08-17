@@ -307,12 +307,47 @@ pub async fn delete_key(
         .management()
         .credentials(scope)
         .parse_id(&key_id)?;
+    let pending = management_key_revoked_event(&state, scope, &id);
     state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .credentials(scope)
-        .delete(state.env(), &id)
+        .delete_with_event(
+            state.env(),
+            &id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event a management-key revocation emits (issue #108).
+///
+/// The id only. Anything derived from the secret -- material, a prefix, a hash fragment --
+/// would put part of a credential onto the very wire this event exists to tell people to
+/// stop trusting.
+fn management_key_revoked_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    key_id: &ManagementKeyId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = key_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "management_key.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "management_key_id": subject }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

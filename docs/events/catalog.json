@@ -101,6 +101,23 @@
       "type": "environment.deleted"
     },
     {
+      "domain": "management_key",
+      "payload_schema": {
+        "properties": {
+          "management_key_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "management_key_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "management_key.revoked"
+    },
+    {
       "domain": "organization",
       "payload_schema": {
         "properties": {

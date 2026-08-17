@@ -1850,3 +1850,80 @@ async fn creating_a_tenant_without_an_event_enqueues_nothing() {
         "a create with no event must not invent one"
     );
 }
+
+/// Revoking a management key emits `management_key.revoked` (issue #108).
+///
+/// This is the event a SIEM cares about most of any registered so far: a management
+/// credential losing its authority is a security fact. The transaction grouping matters in a
+/// specific direction here -- a receiver told about a revocation that then rolled back would
+/// believe a LIVE key is dead, which is the dangerous way round.
+#[tokio::test]
+async fn revoking_a_management_key_emits_the_registered_event() {
+    let fixture = Fixture::start().await;
+    let scope = fixture.create_tenant(None).await;
+    let (key, _hash) = fixture.mint_key(scope, "ci-deployer").await;
+
+    assert_eq!(
+        queued_events(&fixture, scope).await.len(),
+        0,
+        "minting a key emits nothing today, so the revocation's event is unambiguous"
+    );
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_key_revoked",
+        "management_key.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "management_key_id": key.to_string() }),
+    )
+    .expect("management_key.revoked is registered");
+
+    fixture
+        .db
+        .control_store()
+        .management()
+        .acting(fixture.actor, CorrelationId::generate(&fixture.env))
+        .credentials(scope)
+        .delete_with_event(
+            &fixture.env,
+            &key,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_key_revoked",
+                subject: &key.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("revoke with event");
+
+    let events = queued_events(&fixture, scope).await;
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(events[0]["type"], "management_key.revoked");
+    assert_eq!(events[0]["payload"]["management_key_id"], key.to_string());
+    // Nothing derived from the secret may ride along: this event exists to tell people to
+    // stop trusting that credential, and a fragment of it on this wire is the one thing it
+    // must not carry.
+    let payload = events[0]["payload"].to_string();
+    assert!(
+        !payload.contains("hash-of-"),
+        "no key material or hash fragment may appear in the payload: {payload}"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A revocation carrying no event enqueues nothing.
+#[tokio::test]
+async fn revoking_a_management_key_without_an_event_enqueues_nothing() {
+    let fixture = Fixture::start().await;
+    let scope = fixture.create_tenant(None).await;
+    let (key, _hash) = fixture.mint_key(scope, "quiet-deployer").await;
+    fixture.revoke_key(scope, &key).await;
+
+    assert_eq!(
+        queued_events(&fixture, scope).await.len(),
+        0,
+        "a revocation with no event must not invent one"
+    );
+}
