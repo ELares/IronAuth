@@ -1552,7 +1552,7 @@ dependencies = [
  "argon2",
  "base64 0.23.0",
  "bcrypt",
- "cipher 0.4.4",
+ "cipher 0.5.2",
  "ctr",
  "password-hash 0.5.0",
  "pbkdf2",
