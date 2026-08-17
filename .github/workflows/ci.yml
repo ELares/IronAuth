@@ -386,6 +386,10 @@ jobs:
         run: scripts/emulator-doc-freshness.sh
       - name: no plaintext credentials (no login path writes a token to a file)
         run: scripts/no-plaintext-credentials.sh
+      # Issue #108 criterion 4. This job already checks out full history for the OpenAPI
+      # changelog, which is the same thing this needs: a base revision to diff against.
+      - name: event registry compatibility (a breaking payload change bumps its version)
+        run: scripts/event-registry-compat.py "origin/${{ github.base_ref || 'main' }}"
       - name: discovery scan (no static discovery JSON; generated at serve time)
         run: scripts/discovery-scan.sh
       - name: rfc9700 scan (every OAuth endpoint bound to a conformance test)

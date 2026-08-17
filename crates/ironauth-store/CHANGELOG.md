@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A breaking event payload change is now REJECTED unless it bumps its version (issue #108,
+  criterion 4).** `event-catalog.sh` already failed on a stale catalog and asked a human to
+  review the diff -- its own words were "which is what this diff exists to surface". Surfacing
+  is not rejecting: once the catalog was regenerated and committed, a breaking change under an
+  unchanged version passed, and the only thing between it and a consumer was that somebody read
+  the diff carefully.
+
+  `scripts/event-registry-compat.py` diffs the committed registry against the base revision and
+  refuses a removed property, a newly required one, a changed type, a narrowed enum, or a raised
+  bound, unless `payload_schema_version` moved. It deliberately PERMITS the additive cases the
+  published policy allows -- a new optional property, a widened enum, a loosened bound -- because
+  rejecting every edit would forbid what `docs/EVENTS.md` explicitly promises and force a version
+  bump that strands every pinned consumer for no reason.
+
+  A base revision it cannot resolve is a FAILURE, not a pass: a check that compared nothing must
+  not be indistinguishable from one that found nothing.
+
 - **`organization.created` and `organization.deleted` have producers (issue #108).** Added as
   `create_with_event` / `delete_with_event` delegating variants rather than a new parameter on
   `create` / `delete`, matching `set_traits` / `set_traits_with_visibility`: nearly every caller
