@@ -4552,20 +4552,7 @@ impl ActingClientRepo<'_> {
                 // here than elsewhere: this is a HARD delete, so a receiver that learned of
                 // it from a write that then rolled back would have dropped a client that
                 // still exists and authenticates.
-                if let Some(event) = event {
-                    enqueue_outbox_in_tx(
-                        tx,
-                        env,
-                        scope,
-                        &NewOutboxMessage {
-                            consumer: WEBHOOK_EVENT_CONSUMER,
-                            idempotency_key: event.id,
-                            ordering_key: event.subject,
-                            payload: event.envelope.clone(),
-                        },
-                    )
-                    .await?;
-                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -16669,20 +16656,7 @@ impl ActingUserRepo<'_> {
                 }
                 // In the SAME transaction as the write it announces, like every other
                 // producer. A claims write that rolled back must not have announced itself.
-                if let Some(event) = event {
-                    enqueue_outbox_in_tx(
-                        tx,
-                        env,
-                        scope,
-                        &NewOutboxMessage {
-                            consumer: WEBHOOK_EVENT_CONSUMER,
-                            idempotency_key: event.id,
-                            ordering_key: event.subject,
-                            payload: event.envelope.clone(),
-                        },
-                    )
-                    .await?;
-                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -16716,6 +16690,26 @@ impl ActingUserRepo<'_> {
         schedule: OffboardingSchedule<'_>,
         hard_kill: bool,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.set_state_with_event(env, id, to, schedule, hard_kill, idempotency, None)
+            .await
+    }
+
+    /// [`Self::set_state`], additionally emitting `user.state_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_state`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_state_with_event(
+        &self,
+        env: &Env,
+        id: &UserId,
+        to: UserState,
+        schedule: OffboardingSchedule<'_>,
+        hard_kill: bool,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let OffboardingSchedule {
             at_unix_micros: scheduled_at,
@@ -16835,6 +16829,11 @@ impl ActingUserRepo<'_> {
                     )
                     .await?;
                 }
+                // In the SAME transaction as the state change AND the session cascade above.
+                // A state that ends sessions kills every live one in this transaction, so a
+                // receiver told about a suspension that then rolled back would deprovision
+                // downstream access for an account still able to log in.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -16912,20 +16911,7 @@ impl ActingUserRepo<'_> {
                 // The domain event, in the SAME transaction as the tombstone it announces,
                 // exactly as the create does. Emitting it outside would let a rolled-back
                 // delete announce itself, and a receiver cannot un-see that.
-                if let Some(event) = event {
-                    enqueue_outbox_in_tx(
-                        tx,
-                        env,
-                        scope,
-                        &NewOutboxMessage {
-                            consumer: WEBHOOK_EVENT_CONSUMER,
-                            idempotency_key: event.id,
-                            ordering_key: event.subject,
-                            payload: event.envelope.clone(),
-                        },
-                    )
-                    .await?;
-                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -20247,6 +20233,40 @@ fn outbox_message_from_row(row: &PgRow) -> OutboxMessage {
 ///
 /// [`StoreError::Database`] on a persistence fault, including the unique violation a
 /// second enqueue under the same `(consumer, idempotency_key)` raises.
+/// Enqueue a producer's [`DomainEvent`] onto the webhook event queue, inside the caller's
+/// transaction. A `None` event enqueues nothing.
+///
+/// Every producer repeated this block verbatim. Eleven identical copies is eleven chances for
+/// one of them to drift -- to use a different consumer, or to key ordering on something other
+/// than the subject, which is what keeps two events about one entity in order. Having it once
+/// means a producer can get the CALL wrong (place it on the wrong path) but not the CONTENTS.
+///
+/// # Errors
+///
+/// Whatever the enqueue returns.
+pub(crate) async fn enqueue_domain_event(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    event: Option<&DomainEvent<'_>>,
+) -> Result<(), StoreError> {
+    if let Some(event) = event {
+        enqueue_outbox_in_tx(
+            tx,
+            env,
+            scope,
+            &NewOutboxMessage {
+                consumer: WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: event.id,
+                ordering_key: event.subject,
+                payload: event.envelope.clone(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn enqueue_outbox_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     env: &Env,
@@ -29748,20 +29768,7 @@ impl ActingConnectorRepo<'_> {
                 // event is the only notice a receiver gets -- and it changes WHO CAN LOG IN,
                 // which is why announcing a removal that then rolled back would be worse
                 // here than for an ordinary entity.
-                if let Some(event) = event {
-                    enqueue_outbox_in_tx(
-                        tx,
-                        env,
-                        scope,
-                        &NewOutboxMessage {
-                            consumer: WEBHOOK_EVENT_CONSUMER,
-                            idempotency_key: event.id,
-                            ordering_key: event.subject,
-                            payload: event.envelope.clone(),
-                        },
-                    )
-                    .await?;
-                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -43984,20 +43991,7 @@ impl ActingTenantRepo<'_> {
                 // environment, and that environment's day-one signing keys. The event
                 // announces a tenant that is READY to serve, and all three are what make it
                 // ready; announcing before they commit would announce a half-built one.
-                if let Some(event) = event {
-                    enqueue_outbox_in_tx(
-                        tx,
-                        env,
-                        scope,
-                        &NewOutboxMessage {
-                            consumer: WEBHOOK_EVENT_CONSUMER,
-                            idempotency_key: event.id,
-                            ordering_key: event.subject,
-                            payload: event.envelope.clone(),
-                        },
-                    )
-                    .await?;
-                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -45270,20 +45264,7 @@ impl ActingEnvironmentRepo<'_> {
                 // fencing row above. That grouping matters: the event announces that this
                 // environment stopped serving, and the row that stops it serving is in here
                 // too, so a receiver can never be told about a fence that did not commit.
-                if let Some(event) = event {
-                    enqueue_outbox_in_tx(
-                        tx,
-                        env,
-                        scope,
-                        &NewOutboxMessage {
-                            consumer: WEBHOOK_EVENT_CONSUMER,
-                            idempotency_key: event.id,
-                            ordering_key: event.subject,
-                            payload: event.envelope.clone(),
-                        },
-                    )
-                    .await?;
-                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -45405,20 +45386,7 @@ impl ActingManagementCredentialRepo<'_> {
                 // about most of any here: a management credential losing its authority is a
                 // security fact, and a receiver told about a revocation that then rolled
                 // back would believe a live key is dead -- the dangerous direction.
-                if let Some(event) = event {
-                    enqueue_outbox_in_tx(
-                        tx,
-                        env,
-                        scope,
-                        &NewOutboxMessage {
-                            consumer: WEBHOOK_EVENT_CONSUMER,
-                            idempotency_key: event.id,
-                            ordering_key: event.subject,
-                            payload: event.envelope.clone(),
-                        },
-                    )
-                    .await?;
-                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -45515,20 +45483,7 @@ impl ActingOrganizationRepo<'_> {
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
                 // In the SAME transaction as the row it announces, like every other producer.
-                if let Some(event) = event {
-                    enqueue_outbox_in_tx(
-                        tx,
-                        env,
-                        scope,
-                        &NewOutboxMessage {
-                            consumer: WEBHOOK_EVENT_CONSUMER,
-                            idempotency_key: event.id,
-                            ordering_key: event.subject,
-                            payload: event.envelope.clone(),
-                        },
-                    )
-                    .await?;
-                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -45591,20 +45546,7 @@ impl ActingOrganizationRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 // In the SAME transaction as the tombstone it announces.
-                if let Some(event) = event {
-                    enqueue_outbox_in_tx(
-                        tx,
-                        env,
-                        scope,
-                        &NewOutboxMessage {
-                            consumer: WEBHOOK_EVENT_CONSUMER,
-                            idempotency_key: event.id,
-                            ordering_key: event.subject,
-                            payload: event.envelope.clone(),
-                        },
-                    )
-                    .await?;
-                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -57369,20 +57311,7 @@ impl ActingUserRepo<'_> {
                 .await?;
                 // In the SAME transaction as the write it announces, like every other
                 // producer. A traits write that rolled back must not have announced itself.
-                if let Some(event) = event {
-                    enqueue_outbox_in_tx(
-                        tx,
-                        env,
-                        scope,
-                        &NewOutboxMessage {
-                            consumer: WEBHOOK_EVENT_CONSUMER,
-                            idempotency_key: event.id,
-                            ordering_key: event.subject,
-                            payload: event.envelope.clone(),
-                        },
-                    )
-                    .await?;
-                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(schema_version)
             },
             false,

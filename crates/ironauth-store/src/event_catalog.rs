@@ -114,6 +114,30 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The DEPROVISIONING event. A state that ends sessions kills every live one in the
+        // same transaction, so downstream systems act on this one: it is the notice that an
+        // account stopped being able to log in.
+        //
+        // `state` is the destination only. The FROM state is deliberately absent: this write
+        // re-checks `state = from` inside the transaction, so an event carrying a transition
+        // would be asserting a pair the receiver cannot verify and does not need -- what it
+        // acts on is where the account ended up.
+        //
+        // `hard_kill` rides along because it changes what the change DID: it decides whether
+        // offline refresh families were revoked too, and a receiver cannot infer that later.
+        "user.state_changed",
+        1,
+        r#"{
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "state": {"type": "string", "minLength": 1},
+                "hard_kill": {"type": "boolean"}
+            },
+            "required": ["user_id", "state", "hard_kill"]
+        }"#,
+    ),
+    (
         // Emitted at most ONCE per credential. The revocation is idempotent -- a retried
         // revoke changes nothing and audits nothing -- and the event inherits that, so a
         // receiver counting revocations never sees two for one key because a client retried.

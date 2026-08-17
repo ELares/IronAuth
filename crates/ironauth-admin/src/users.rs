@@ -849,12 +849,13 @@ pub async fn set_user_state(
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     let wake = crate::offboarding_worker::wake_payload(&id.to_string(), &actor);
+    let pending = user_state_changed_event(&state, scope, &id, target, request.hard_kill);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .users()
-        .set_state(
+        .set_state_with_event(
             state.env(),
             &id,
             target,
@@ -874,6 +875,10 @@ pub async fn set_user_state(
                 response_status: 200,
                 response_body: &body_string,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -1005,4 +1010,36 @@ pub async fn unlink_user_external_id(
     };
     let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
+}
+
+/// The event a user state change emits (issue #108).
+///
+/// `hard_kill` rides along because it changes what the change DID -- it decides whether the
+/// offline refresh families were revoked too, and a receiver cannot infer that afterwards.
+fn user_state_changed_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    user_id: &ironauth_store::UserId,
+    to: ironauth_store::UserState,
+    hard_kill: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = user_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "user.state_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "user_id": subject,
+            "state": to.as_str(),
+            "hard_kill": hard_kill,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

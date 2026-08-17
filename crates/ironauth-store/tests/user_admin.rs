@@ -1442,3 +1442,116 @@ async fn user_updated_refuses_a_field_outside_the_declared_set() {
     ironauth_store::event_catalog::validate_event(&good)
         .expect("a declared field validates, so the refusal above is about the VALUE");
 }
+
+/// A user state change emits `user.state_changed`, in the same transaction as the session
+/// cascade it triggers (issue #108).
+///
+/// This is the DEPROVISIONING event: a state that ends sessions kills every live one in this
+/// transaction, and downstream systems act on the notice. The grouping matters in a specific
+/// direction -- a receiver told about a suspension that then rolled back would revoke
+/// downstream access for an account still able to log in.
+#[tokio::test]
+async fn a_user_state_change_emits_the_registered_event_with_the_cascade() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = create_user(
+        &db,
+        &env,
+        scope,
+        "state-change@example.test",
+        None,
+        UserState::Active,
+        1_000,
+    )
+    .await
+    .expect("create");
+
+    assert_eq!(
+        webhook_events(&db, scope).await.len(),
+        0,
+        "creating a user emits nothing here, so the state change's event is unambiguous"
+    );
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_user_state",
+        "user.state_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "user_id": user.to_string(),
+            "state": "blocked",
+            "hard_kill": false,
+        }),
+    )
+    .expect("user.state_changed is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .set_state_with_event(
+            &env,
+            &user,
+            UserState::Blocked,
+            sched(None),
+            false,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_user_state",
+                subject: &user.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("set state with event");
+
+    let events = webhook_events(&db, scope).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "the state change enqueues exactly one event"
+    );
+    assert_eq!(events[0]["type"], "user.state_changed");
+    assert_eq!(events[0]["payload"]["state"], "blocked");
+    assert_eq!(
+        events[0]["payload"]["hard_kill"], false,
+        "hard_kill records WHICH change happened, which a receiver cannot infer later"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A state change carrying no event enqueues nothing.
+#[tokio::test]
+async fn a_user_state_change_with_no_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = create_user(
+        &db,
+        &env,
+        scope,
+        "quiet-state@example.test",
+        None,
+        UserState::Active,
+        1_000,
+    )
+    .await
+    .expect("create");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .set_state(&env, &user, UserState::Blocked, sched(None), false, None)
+        .await
+        .expect("set state");
+
+    assert_eq!(
+        webhook_events(&db, scope).await.len(),
+        0,
+        "a state change with no event must not invent one"
+    );
+}

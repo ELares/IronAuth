@@ -247,6 +247,32 @@
       "domain": "user",
       "payload_schema": {
         "properties": {
+          "hard_kill": {
+            "type": "boolean"
+          },
+          "state": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "state",
+          "hard_kill"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.state_changed"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "properties": {
           "fields": {
             "items": {
               "enum": [
