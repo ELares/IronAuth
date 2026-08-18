@@ -491,3 +491,79 @@ async fn the_per_client_require_par_flag_round_trips() {
         "setting the flag audits exactly once"
     );
 }
+
+/// A PAR-requirement change announces the client and the new setting, in BOTH directions.
+///
+/// Requiring pushed authorization requests hardens that client's authorize leg, so a consumer
+/// mirroring client hardening posture acts on it. One type carrying the boolean rather than a
+/// required/not-required pair, matching the other two-direction flags in this registry -- and
+/// both directions are asserted, because a producer that hard-coded either would pass a test
+/// exercising only one.
+#[tokio::test]
+async fn a_par_requirement_change_announces_the_client_and_the_setting() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = create_client(&db, &env, scope).await;
+    let subject = client.to_string();
+
+    for (required, event_id) in [(true, "evt_par_on"), (false, "evt_par_off")] {
+        let envelope = ironauth_store::event_catalog::envelope(
+            event_id,
+            "client.par_requirement_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            1,
+            &serde_json::json!({ "client_id": subject, "required": required }),
+        )
+        .expect("client.par_requirement_changed is registered");
+
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .clients()
+            .set_require_pushed_authorization_requests_with_event(
+                &env,
+                &client,
+                required,
+                Some(&ironauth_store::DomainEvent {
+                    id: event_id,
+                    subject: &subject,
+                    envelope: &envelope,
+                }),
+            )
+            .await
+            .expect("set the flag");
+
+        // Claimed and COMPLETED each round: both events carry the client id as their ordering
+        // key, so the second is not claimable while the first is outstanding.
+        let claimed = db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "the change enqueues exactly one event");
+        assert_eq!(claimed[0].payload["type"], "client.par_requirement_changed");
+        assert_eq!(
+            claimed[0].payload["payload"]["required"], required,
+            "the event must carry the setting the write STORED, not a fixed value"
+        );
+        ironauth_store::event_catalog::validate_event(&claimed[0].payload)
+            .expect("the envelope validates against the registry the fan-out enforces");
+        for message in &claimed {
+            db.store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, message)
+                .await
+                .expect("complete");
+        }
+    }
+}

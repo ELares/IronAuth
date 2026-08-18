@@ -504,12 +504,21 @@ pub async fn abandon_migration_run(
     view.abandoned_reason = Some(reason.clone());
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
 
+    // The SAME type every other transition of this run emits (issue #108): an abandon is a
+    // state change, and the registry's one-type-with-a-state shape exists precisely so the
+    // state machine can gain an edge without a consumer having to subscribe to a new type.
+    let pending = crate::imports::identity_import_event(
+        &state,
+        scope,
+        &run_id.to_string(),
+        Some(ironauth_store::MigrationState::Abandoned.as_str()),
+    );
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .migration_runs()
-        .abandon(
+        .abandon_with_event(
             state.env(),
             &run_id,
             &reason,
@@ -520,6 +529,10 @@ pub async fn abandon_migration_run(
                 response_status: 200,
                 response_body: &body_string,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     Ok(json(StatusCode::OK, body_string))

@@ -61,6 +61,10 @@ fn normalize_custom_domain(raw: Option<&str>) -> Option<String> {
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
+// The length is the create's own: the region check, the day-one key generation, the
+// deterministic response, and the idempotency write, each with the reasoning that makes it
+// safe. The event added two lines to a handler already at the limit.
+#[allow(clippy::too_many_lines)]
 pub async fn create_environment(
     State(state): State<AdminState>,
     principal: Principal,
@@ -160,12 +164,13 @@ pub async fn create_environment(
         response_status: 201,
         response_body: &body_string,
     };
+    let pending = environment_created_event(&state, scope, kind.as_str());
     let result = state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .environments(state.bootstrap_operator_id(), tenant)
-        .create(
+        .create_with_event(
             state.env(),
             &environment_id,
             created_at_micros,
@@ -177,6 +182,10 @@ pub async fn create_environment(
             },
             &signing_keys.as_new(created_at_micros),
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -358,4 +367,36 @@ pub async fn delete_environment(
         .delete_with_event(state.env(), &environment, deleted_event.as_ref())
         .await?;
     Ok(no_content())
+}
+
+/// The event an environment create emits (issue #108).
+///
+/// A new environment is a new SCOPE: a new issuer, a disjoint JWKS, and a place tokens can be
+/// minted from. A consumer that provisions or monitors per environment cannot discover one by
+/// watching the environments it already knows, so this is the one announcement it has no
+/// other way to reach.
+///
+/// The KIND travels because it decides the guardrail class: a production environment and a
+/// development one are governed differently, and a consumer that treated them alike would
+/// apply a development posture to production.
+fn environment_created_event(
+    state: &AdminState,
+    scope: Scope,
+    kind: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = scope.environment().to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "environment.created",
+        &scope.tenant().to_string(),
+        &subject,
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "environment_id": subject, "kind": kind }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

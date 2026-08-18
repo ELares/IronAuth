@@ -74,6 +74,13 @@ echo "==> terraform provider coverage (generated from the OpenAPI document)"
 # nor tofu and runs everywhere.
 scripts/provider-coverage.sh
 
+echo "==> event producer coverage (every management write announces itself)"
+# Issue #108 criterion 6, which the owner replaced "the registry counts at least 100 event
+# types" with: a COUNT is satisfied by registering types nothing emits, which is the fiction
+# the registry's own rule forbids. A RATCHET on the uncovered set, like the provider coverage
+# above, because a check that fails from its first commit gets disabled rather than fixed.
+scripts/producer-coverage.py
+
 echo "==> SDK check() middleware (issue #100, criterion 6)"
 # The uniform authorization `check()`: one call resolving via token claims, via IronAuth's
 # AuthZEN PDP, or via a customer PDP, by configuration. It is a fail-CLOSED authorization

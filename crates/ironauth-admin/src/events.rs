@@ -259,3 +259,44 @@ impl OutboxConsumer for WebhookFanoutConsumer {
         Box::pin(async move { self.explode(env, scope, message).await })
     }
 }
+
+/// The payload half of a membership-delta event (issue #107's criterion, issue #108's
+/// registry): the added and removed arrays, whether they were truncated, and the true total.
+///
+/// ONE builder for both the organization and the group form, and it takes the store's
+/// [`ironauth_store::MembershipChange`] rather than raw vectors. That is the point of it: the
+/// cap and the truncation decision live in `ironauth_store::membership_change`, which is
+/// where issue #107 put them, and a producer that re-derived either would be a second copy of
+/// a rule whose whole value is being applied identically everywhere.
+///
+/// The store's type is an ENUM rather than arrays beside a boolean, precisely so a consumer
+/// cannot read the members without having matched on completeness. This function is the one
+/// place that flattens it for the wire, and it emits `truncated` as a REQUIRED field so the
+/// wire form keeps the same property: an absent flag is a schema violation refused at the
+/// fan-out, never a default that quietly reads as "complete".
+#[must_use]
+pub fn membership_delta_payload(change: &ironauth_store::MembershipChange) -> serde_json::Value {
+    match change {
+        ironauth_store::MembershipChange::Complete { added, removed } => serde_json::json!({
+            "added_user_ids": added,
+            "removed_user_ids": removed,
+            "truncated": false,
+            // Complete, so the total IS what was sent. Stated rather than left to the
+            // consumer to add up, so the two variants read the same way.
+            "total": added.len() + removed.len(),
+        }),
+        ironauth_store::MembershipChange::Truncated {
+            added,
+            removed,
+            total,
+        } => serde_json::json!({
+            // A PREFIX. The consumer must not apply these as a delta; it reconciles by
+            // re-reading the membership through the management API.
+            "added_user_ids": added,
+            "removed_user_ids": removed,
+            "truncated": true,
+            // How many changed in total, so a consumer can log exactly what it missed.
+            "total": total,
+        }),
+    }
+}

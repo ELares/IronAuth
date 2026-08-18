@@ -183,6 +183,12 @@ pub async fn create_project_grant(
         response_status: 201,
         response_body: &body_string,
     };
+    let pending = project_grant_event(
+        &state,
+        scope,
+        &grant_id,
+        Some((&client_id.to_string(), &org_id.to_string())),
+    );
     let result = state
         .store()
         .management()
@@ -190,7 +196,7 @@ pub async fn create_project_grant(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .project_grants(scope)
-        .create(
+        .create_with_event(
             state.env(),
             NewProjectGrant {
                 id: &grant_id,
@@ -200,6 +206,10 @@ pub async fn create_project_grant(
             },
             created_at_micros,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -322,6 +332,7 @@ pub async fn withdraw_project_grant(
         .map_err(|_| ApiError::NotFound)?;
 
     let now_micros = state.now_unix_micros();
+    let pending = project_grant_event(&state, scope, &id, None);
     let result = state
         .store()
         .management()
@@ -329,7 +340,16 @@ pub async fn withdraw_project_grant(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .project_grants(scope)
-        .withdraw(state.env(), &id, now_micros, None)
+        .withdraw_with_event(
+            state.env(),
+            &id,
+            now_micros,
+            None,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
 
     match result {
@@ -337,4 +357,50 @@ pub async fn withdraw_project_grant(
         Err(StoreError::NotFound) => Err(ApiError::NotFound),
         Err(_) => Err(ApiError::Internal),
     }
+}
+
+/// The event a project-grant change emits (issue #108).
+///
+/// `parties` present means a CREATE; absent means a WITHDRAWAL. A project grant lets a client
+/// act FOR an organization, so a consumer mirroring delegated authority acts on both -- and
+/// the withdrawal is the half a receiver DEPROVISIONS on: missing it leaves a client's
+/// authority honoured after an operator took it away.
+///
+/// The create carries both ends and the organization, because the grant id alone does not say
+/// who may act for whom.
+fn project_grant_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    grant_id: &ironauth_store::ProjectGrantId,
+    parties: Option<(&str, &str)>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = grant_id.to_string();
+    let (event_type, payload) = match parties {
+        Some((client, organization)) => (
+            "project_grant.created",
+            serde_json::json!({
+                "project_grant_id": subject,
+                "client_id": client,
+                "organization_id": organization,
+            }),
+        ),
+        None => (
+            "project_grant.withdrawn",
+            serde_json::json!({ "project_grant_id": subject }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

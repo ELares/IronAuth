@@ -492,7 +492,9 @@ async fn deleting_a_brand_asset_emits_the_registered_event_naming_the_kind() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "uploading an asset emits nothing today, so the delete's event is unambiguous"
+        "this upload passed no event, so the delete's event below is unambiguous. Uploads DO \
+         announce themselves now (`brand_asset.set`); what stays silent is the un-suffixed \
+         `set`, which is the paired-negative guarantee"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(
@@ -610,4 +612,270 @@ async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<s
         .into_iter()
         .map(|message| message.payload)
         .collect()
+}
+
+/// An asset upload emits `brand_asset.set`, carrying the digest but never the bytes.
+///
+/// SET rather than created-or-updated: the write is an upsert (one asset per brand and kind),
+/// so distinguishing the two would need the store to read the row back first, and a receiver
+/// acts identically either way by refetching.
+///
+/// The sha256 is the reason this carries more than the ids -- a consumer can decide whether
+/// the bytes it cached are stale without refetching them. The BYTES are asserted absent: a
+/// webhook is not a CDN, and an image on every subscriber's queue would dwarf every other
+/// event in the system.
+#[tokio::test]
+async fn uploading_a_brand_asset_emits_the_digest_and_never_the_bytes() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let id = BrandId::generate(&env, &scope);
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .set(&env, &id, 1_000_000, set_brand("acme", true, "Acme"))
+        .await
+        .expect("set brand");
+
+    // A recognisable byte pattern, so "the bytes are not on the wire" is a real assertion
+    // rather than one that would pass for any payload.
+    let png_bytes = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xDE, 0xAD, 0xBE, 0xEF,
+    ];
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_brand_asset_set",
+        "brand_asset.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "brand_id": id.to_string(),
+            "brand_slug": "acme",
+            "kind": "logo",
+            "sha256": "sha-of-the-logo",
+        }),
+    )
+    .expect("brand_asset.set is registered");
+    let subject = id.to_string();
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_brand_asset_set",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brand_assets()
+        .set_with_event(
+            &env,
+            &id,
+            2_000_000,
+            NewBrandAsset {
+                brand_slug: "acme",
+                kind: BrandAssetKind::Logo,
+                content_type: "image/png",
+                bytes: &png_bytes,
+                sha256: "sha-of-the-logo",
+                size_bytes: 12,
+            },
+            Some(&domain_event),
+        )
+        .await
+        .expect("upload logo asset");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the upload enqueues exactly one event");
+    assert_eq!(events[0]["type"], "brand_asset.set");
+    assert_eq!(events[0]["payload"]["kind"], "logo");
+    assert_eq!(events[0]["payload"]["sha256"], "sha-of-the-logo");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // The image itself never reaches a subscriber's queue.
+    let rendered = events[0].to_string();
+    assert!(
+        !rendered.contains("deadbeef") && !rendered.contains("DEADBEEF"),
+        "the event carried the asset BYTES: {rendered}"
+    );
+    assert!(
+        !rendered.contains("iVBORw0K"),
+        "the event carried the asset bytes base64-encoded: {rendered}"
+    );
+}
+
+/// Everything queued in `scope`, claimed AND completed, so a caller can drain twice.
+///
+/// [`queued_events`] leaves what it claims in flight, which is right for a one-shot count and
+/// wrong here: both brand events share the slug as their ordering key, and a second event on
+/// one key is not claimable until the first completes.
+async fn drain_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    let env = Env::system();
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}
+
+/// Setting and deleting a brand emit distinct types, carrying the identity but not the
+/// design document, and a delete of nothing announces nothing.
+///
+/// A brand is what an end user SEES at the login surface, so a consumer mirroring branding
+/// needs both transitions. What it does not need is the tokens, the slots, or the host
+/// pattern: those are a config document rather than a fact, and a document on the wire is one
+/// every consumer then has to version. The test asserts their ABSENCE.
+///
+/// `is_default` is the exception and travels, because flipping it changes which brand serves
+/// a request that matched no other -- something a consumer cannot learn by re-reading only
+/// the brand it was told about.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn setting_and_deleting_a_brand_emit_distinct_types() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let id = BrandId::generate(&env, &scope);
+
+    let set = ironauth_store::event_catalog::envelope(
+        "evt_brand_set",
+        "brand.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "brand_id": id.to_string(),
+            "brand_slug": "acme",
+            "is_default": true,
+        }),
+    )
+    .expect("brand.set is registered");
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .set_with_event(
+            &env,
+            &id,
+            1_000_000,
+            set_brand("acme", true, "Acme"),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_brand_set",
+                subject: "acme",
+                envelope: &set,
+            }),
+        )
+        .await
+        .expect("set the brand");
+
+    let created = drain_events(&db, scope).await;
+    assert_eq!(created.len(), 1, "the set announced {created:?}");
+    assert_eq!(created[0]["type"], "brand.set");
+    assert_eq!(created[0]["payload"]["brand_slug"], "acme");
+    assert_eq!(
+        created[0]["payload"]["is_default"], true,
+        "the default flag changes which brand serves an unmatched request, so it travels"
+    );
+    let rendered = serde_json::to_string(&created[0]).expect("json");
+    assert!(
+        !rendered.contains("color_accent") && !rendered.contains("footer_legal"),
+        "the design document reached the wire; a document there is one every consumer has \
+         to version: {rendered}"
+    );
+
+    let deleted = ironauth_store::event_catalog::envelope(
+        "evt_brand_deleted",
+        "brand.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "brand_id": id.to_string(), "brand_slug": "acme" }),
+    )
+    .expect("brand.deleted is registered");
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .delete_with_event(
+            &env,
+            &id,
+            "acme",
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_brand_deleted",
+                subject: "acme",
+                envelope: &deleted,
+            }),
+        )
+        .await
+        .expect("delete the brand");
+
+    let removed = drain_events(&db, scope).await;
+    assert_eq!(removed.len(), 1, "the delete announced {removed:?}");
+    assert_eq!(
+        removed[0]["type"], "brand.deleted",
+        "the delete takes the brand's ASSETS with it, so a consumer told nothing would keep \
+         serving logos from a brand that no longer exists"
+    );
+    assert_eq!(removed[0]["payload"]["brand_id"], id.to_string());
+
+    // The guard sits before the enqueue: deleting what is already gone destroys nothing,
+    // records no audit row, and announces nothing.
+    let repeat = ironauth_store::event_catalog::envelope(
+        "evt_brand_deleted_again",
+        "brand.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        3,
+        &serde_json::json!({ "brand_id": id.to_string(), "brand_slug": "acme" }),
+    )
+    .expect("brand.deleted is registered");
+    let error = control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .delete_with_event(
+            &env,
+            &id,
+            "acme",
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_brand_deleted_again",
+                subject: "acme",
+                envelope: &repeat,
+            }),
+        )
+        .await
+        .expect_err("an already-deleted brand is not found");
+    assert!(
+        matches!(error, ironauth_store::StoreError::NotFound),
+        "got {error:?}"
+    );
+    let quiet = drain_events(&db, scope).await;
+    assert!(
+        quiet.is_empty(),
+        "a delete that destroyed nothing must announce nothing: {quiet:?}"
+    );
 }

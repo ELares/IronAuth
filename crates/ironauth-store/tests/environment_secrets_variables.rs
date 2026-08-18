@@ -606,7 +606,9 @@ async fn deleting_an_environment_variable_emits_the_name_and_never_the_value() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "setting a variable emits nothing today, so the delete's event is unambiguous"
+        "this set passed no event, so the delete's event below is unambiguous. Setting a \
+         variable DOES announce itself now (`environment_variable.set`); what stays silent \
+         is the un-suffixed `set`, which is the paired-negative guarantee"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(
@@ -700,4 +702,197 @@ async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<s
         .into_iter()
         .map(|message| message.payload)
         .collect()
+}
+
+/// Setting an environment variable emits `environment_variable.set`, carrying the NAME and
+/// never the VALUE (issue #108).
+///
+/// The value's absence is the same rule the delete follows, and it matters MORE here: the set
+/// is the one call that has the value in hand. A variable is not a secret by type, but an
+/// operator's choice to put something in a variable rather than a secret is not a promise
+/// that every webhook subscriber may read it.
+///
+/// Asserted against the rendered envelope rather than trusted from the schema, because a
+/// payload may carry fields the schema does not forbid.
+#[tokio::test]
+async fn setting_an_environment_variable_emits_the_name_and_never_the_value() {
+    const SECRET_LOOKING_VALUE: &str = "https://api.internal.example/private-path";
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_variable_set",
+        "environment_variable.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "name": "api-base-url" }),
+    )
+    .expect("environment_variable.set is registered");
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_variable_set",
+        subject: "api-base-url",
+        envelope: &envelope,
+    };
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .environment_variables()
+        .set_with_event(
+            &env,
+            "api-base-url",
+            SECRET_LOOKING_VALUE,
+            None,
+            Some(&domain_event),
+        )
+        .await
+        .expect("set variable");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the set enqueues exactly one event");
+    assert_eq!(events[0]["type"], "environment_variable.set");
+    assert_eq!(events[0]["payload"]["name"], "api-base-url");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    assert!(
+        !events[0].to_string().contains(SECRET_LOOKING_VALUE),
+        "the event carried the variable's VALUE: {}",
+        events[0]
+    );
+}
+
+/// Setting and deleting a secret each emit the NAME and never the value (issue #108).
+///
+/// Stronger than the variable rule and for a different reason: a variable holds whatever an
+/// operator put there, but a SECRET is sealed at rest and the management read surface will not
+/// return it at all. An event is a WIDER audience than that surface, so the same refusal has
+/// to hold.
+///
+/// Nothing DERIVED from the value is asserted absent either. A digest of a low-entropy secret
+/// is guessable and a length narrows a search, so the test checks the value, its base64, and
+/// its sha256 -- none of which a consumer needs to know which reference to re-resolve.
+#[tokio::test]
+async fn secret_events_carry_the_name_and_nothing_derived_from_the_value() {
+    const SECRET_VALUE: &str = "hunter2-the-actual-upstream-password";
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let set = ironauth_store::event_catalog::envelope(
+        "evt_secret_set",
+        "environment_secret.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "name": "upstream-password" }),
+    )
+    .expect("environment_secret.set is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .environment_secrets()
+        .put_under_platform_key_with_event(
+            &env,
+            "upstream-password",
+            SECRET_VALUE.as_bytes(),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_secret_set",
+                subject: "upstream-password",
+                envelope: &set,
+            }),
+        )
+        .await
+        .expect("put secret");
+
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "the put enqueues exactly one event");
+    assert_eq!(claimed[0].payload["type"], "environment_secret.set");
+    assert_eq!(claimed[0].payload["payload"]["name"], "upstream-password");
+    ironauth_store::event_catalog::validate_event(&claimed[0].payload)
+        .expect("the envelope validates against the registry the fan-out enforces");
+    assert_no_secret_material(&claimed[0].payload.to_string(), SECRET_VALUE);
+
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete the put");
+    }
+
+    let deleted = ironauth_store::event_catalog::envelope(
+        "evt_secret_deleted",
+        "environment_secret.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "name": "upstream-password" }),
+    )
+    .expect("environment_secret.deleted is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .environment_secrets()
+        .delete_with_event(
+            &env,
+            "upstream-password",
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_secret_deleted",
+                subject: "upstream-password",
+                envelope: &deleted,
+            }),
+        )
+        .await
+        .expect("delete secret");
+
+    let after = queued_events(&db, scope).await;
+    assert_eq!(after.len(), 1, "the delete enqueues exactly one event");
+    assert_eq!(after[0]["type"], "environment_secret.deleted");
+    assert_no_secret_material(&after[0].to_string(), SECRET_VALUE);
+}
+
+/// Neither the secret, nor its base64, nor its digest appears in `rendered`.
+fn assert_no_secret_material(rendered: &str, secret: &str) {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+
+    assert!(
+        !rendered.contains(secret),
+        "the event carried the SECRET VALUE: {rendered}"
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
+    assert!(
+        !rendered.contains(&encoded),
+        "the event carried the secret base64-encoded: {rendered}"
+    );
+    // A digest of a low-entropy secret is guessable, so it is material too.
+    let mut digest = String::new();
+    for byte in sha2::Sha256::digest(secret.as_bytes()) {
+        let _ = write!(digest, "{byte:02x}");
+    }
+    assert!(
+        !rendered.contains(&digest),
+        "the event carried a DIGEST of the secret: {rendered}"
+    );
 }

@@ -153,6 +153,50 @@ pub async fn list_log_streams(
     Ok(json(StatusCode::OK, body_string))
 }
 
+/// The event a SIEM log-stream lifecycle change emits (issue #108).
+///
+/// `sink_type` present means a CREATE, absent means a DELETE. The sink type travels with the
+/// create because "audit is now shipping to S3" and "audit is now shipping to an HTTP
+/// endpoint" are different facts to anyone reconciling where a tenant's audit trail goes.
+///
+/// NEVER THE SINK CREDENTIAL. A stream carries the secret its deliveries authenticate with,
+/// sealed at rest and stripped from the read surface -- and a webhook is a wider audience than
+/// that surface.
+fn log_stream_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    stream_id: &str,
+    sink_type: Option<&str>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!(
+        "evt_{}",
+        ironauth_store::CorrelationId::generate(state.env())
+    );
+    let (event_type, payload) = match sink_type {
+        Some(sink) => (
+            "log_stream.created",
+            serde_json::json!({ "log_stream_id": stream_id, "sink_type": sink }),
+        ),
+        None => (
+            "log_stream.deleted",
+            serde_json::json!({ "log_stream_id": stream_id }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: stream_id.to_owned(),
+        envelope,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,11 +401,12 @@ pub async fn create_log_stream(
     let id = ironauth_store::LogStreamId::generate(state.env(), &scope).to_string();
     let body_string = serde_json::to_string(&LogStreamCreated { id: id.clone() })
         .map_err(|_| ApiError::Internal)?;
+    let pending = log_stream_event(&state, scope, &id, Some(sink_type.as_str()));
     state
         .store()
         .scoped(scope)
         .log_streams()
-        .create(
+        .create_with_event(
             state.env(),
             &ironauth_store::NewLogStream {
                 id: Some(&id),
@@ -380,6 +425,10 @@ pub async fn create_log_stream(
                 response_status: 201,
                 response_body: &body_string,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     Ok(json(StatusCode::CREATED, body_string))
@@ -417,11 +466,19 @@ pub async fn delete_log_stream(
 
     // No Idempotency-Key: removing an absent stream is a no-op success, so DELETE is
     // idempotent on its own.
+    let pending = log_stream_event(&state, scope, &stream_id, None);
     state
         .store()
         .scoped(scope)
         .log_streams()
-        .delete(&stream_id)
+        .delete_with_event(
+            Some(state.env()),
+            &stream_id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }

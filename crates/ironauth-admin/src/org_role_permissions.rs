@@ -435,6 +435,7 @@ pub async fn assign_org_role_permission(
         response_status: 201,
         response_body: &render,
     };
+    let pending = role_permission_event(&state, scope, &org_id, &role.id, &permission, true);
     let result = state
         .store()
         .management()
@@ -442,7 +443,7 @@ pub async fn assign_org_role_permission(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_role_permissions(scope)
-        .assign(
+        .assign_with_event(
             state.env(),
             NewOrgRolePermission {
                 id: &mapping_id,
@@ -452,6 +453,10 @@ pub async fn assign_org_role_permission(
             },
             created_at_micros,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -611,6 +616,7 @@ pub async fn unassign_org_role_permission(
         .org_role_permissions(scope)
         .get_assignment(&org_id, &role, &permission)
         .await?;
+    let pending = role_permission_event(&state, scope, &org_id, &role, &permission, false);
     state
         .store()
         .management()
@@ -618,7 +624,58 @@ pub async fn unassign_org_role_permission(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_role_permissions(scope)
-        .unassign(state.env(), &org_id, &mapping.id)
+        .unassign_with_event(
+            state.env(),
+            &org_id,
+            &mapping.id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event granting or revoking a permission on an organization role emits (issue #108).
+///
+/// This is the grant that decides what a role CAN DO, so every holder of the role gains or
+/// loses it at once -- a consumer recomputing effective permissions must act on it even
+/// though no membership changed.
+///
+/// Both ends and the organization, as with the role assignments: neither the role nor the
+/// permission alone tells a receiver what changed. The type is DERIVED from `granted`, so the
+/// payload and the direction cannot disagree.
+fn role_permission_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    organization_id: &ironauth_store::OrganizationId,
+    role_id: &ironauth_store::OrgRoleId,
+    permission_id: &ironauth_store::PermissionId,
+    granted: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = role_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        if granted {
+            "org_role.permission_granted"
+        } else {
+            "org_role.permission_revoked"
+        },
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "organization_id": organization_id.to_string(),
+            "org_role_id": subject,
+            "permission_id": permission_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The ROLE is the subject: successive permission changes to one role stay ordered.
+        subject,
+        envelope,
+    })
 }

@@ -1421,3 +1421,93 @@ async fn authorizing_audits_the_justification_and_starting_is_a_separate_event()
     .expect("exactly one start event");
     assert_eq!(start_target, redeemed.session_id.to_string());
 }
+
+/// Authorizing an impersonation announces it, carrying the code and the expiry but never the
+/// operator's prose.
+///
+/// This is the widest authority the management surface hands out: it reaches everything the
+/// target user can reach. A consumer running detection or oversight needs it, needs the
+/// EXPIRY (the authorization is time-boxed, and a receiver that cannot see the box has to
+/// treat it as permanent), and needs the registered reason CODE.
+///
+/// It does not get the reason TEXT. That is prose an operator wrote about a person's account,
+/// and it belongs in the audit trail -- a narrower audience than a webhook. The test asserts
+/// the absence, because a leak here is worse than no event at all.
+#[tokio::test]
+async fn authorizing_an_impersonation_announces_it_without_the_operator_prose() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "watched@example.test").await;
+    let id = ironauth_store::ImpersonationAuthorizationId::generate(&env, &scope);
+    let act = ironauth_store::impersonation::Impersonation::start(
+        "adm_support_engineer",
+        "support_ticket",
+        "Ticket 4417: reproducing the checkout failure as the user.",
+        now_micros(&env),
+        30 * MINUTE_MICROS,
+    )
+    .expect("justified");
+    let expires_at = act.expires_at_unix_micros();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_impersonation_authorized",
+        "impersonation.authorized",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "authorization_id": id.to_string(),
+            "user_id": user.to_string(),
+            "reason_code": "support_ticket",
+            "expires_at_unix_ms": expires_at / 1000,
+        }),
+    )
+    .expect("impersonation.authorized is registered");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .issue_with_event(
+            &env,
+            ironauth_store::NewImpersonationAuthorization {
+                id: &id,
+                user_id: &user,
+                impersonation: act,
+            },
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_impersonation_authorized",
+                subject: &user.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("issue the authorization");
+
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events");
+    assert_eq!(claimed.len(), 1, "the authorization announced {claimed:?}");
+    let payload = &claimed[0].payload;
+    assert_eq!(payload["type"], "impersonation.authorized");
+    assert_eq!(payload["payload"]["user_id"], user.to_string());
+    assert_eq!(payload["payload"]["reason_code"], "support_ticket");
+    assert_eq!(payload["payload"]["expires_at_unix_ms"], expires_at / 1000);
+    let rendered = serde_json::to_string(payload).expect("json");
+    assert!(
+        !rendered.contains("Ticket 4417") && !rendered.contains("checkout"),
+        "the operator's justification PROSE reached the wire: {rendered}"
+    );
+    ironauth_store::event_catalog::validate_event(payload)
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

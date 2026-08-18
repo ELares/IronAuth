@@ -238,12 +238,13 @@ pub async fn revoke_user_consent(
     };
     let render = |resolved: &ConsentRevocation| serde_json::to_string(&render_view(resolved));
 
+    let pending = consent_revoked_event(&state, scope, &subject.to_string(), &client.to_string());
     let revocation = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .consents()
-        .revoke(
+        .revoke_with_event(
             state.env(),
             &subject.to_string(),
             &client.to_string(),
@@ -255,9 +256,46 @@ pub async fn revoke_user_consent(
                 response_status: 200,
                 response_body: &render,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
 
     let body = serde_json::to_string(&render_view(&revocation)).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
+}
+
+/// The event a consent withdrawal emits (issue #108).
+///
+/// Withdrawing consent revokes a client's standing authority to act for this user, and it
+/// cascades to the refresh families, so a consumer mirroring delegated access that missed it
+/// would keep an application authorized after the user said no.
+///
+/// No `families_revoked` count: that is knowable only after the write, and a producer must
+/// not announce what it had to read back out of its own mutation. A grant that owned no live
+/// family is a real revocation either way.
+fn consent_revoked_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    subject: &str,
+    client_id: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "consent.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "subject": subject, "client_id": client_id }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The (subject, client) pair is the grant, so everything about one grant stays
+        // ordered behind one key.
+        subject: format!("{subject}:{client_id}"),
+        envelope,
+    })
 }

@@ -3167,6 +3167,21 @@ impl ActingClientScopePolicyRepo<'_> {
         id: &ClientId,
         allowed_scopes: Option<&[String]>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, allowed_scopes, None).await
+    }
+
+    /// [`Self::set`], additionally emitting `client.allowed_scopes_set` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        allowed_scopes: Option<&[String]>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -3199,6 +3214,9 @@ impl ActingClientScopePolicyRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction, and AFTER the rows-affected guard: a set that
+                // matched no client announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -3293,6 +3311,32 @@ impl ActingScopeStepUpPolicyRepo<'_> {
         max_auth_age_secs: Option<i64>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<ScopeStepUpPolicyId, StoreError> {
+        self.set_with_event(
+            env,
+            scope_token,
+            min_acr,
+            max_auth_age_secs,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::set`], additionally emitting `step_up_policy.set` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        scope_token: &str,
+        min_acr: Option<&str>,
+        max_auth_age_secs: Option<i64>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<ScopeStepUpPolicyId, StoreError> {
         let scope = self.scope;
         let candidate_id = ScopeStepUpPolicyId::generate(env, &scope);
         let now_micros = epoch_micros(env.clock().now_utc());
@@ -3338,6 +3382,8 @@ impl ActingScopeStepUpPolicyRepo<'_> {
         insert_audit_row(&mut tx, &spec, None).await?;
         // In the SAME transaction as the upsert and its audit row.
         insert_idempotency(&mut tx, idempotency).await?;
+        // BEFORE the commit, in the upsert's own transaction.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(live_id)
     }
@@ -3350,6 +3396,20 @@ impl ActingScopeStepUpPolicyRepo<'_> {
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn remove(&self, env: &Env, scope_token: &str) -> Result<(), StoreError> {
+        self.remove_with_event(env, scope_token, None).await
+    }
+
+    /// [`Self::remove`], additionally emitting `step_up_policy.removed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove`].
+    pub async fn remove_with_event(
+        &self,
+        env: &Env,
+        scope_token: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         // The audit target is the scope-derived policy handle; a synthetic id keeps
         // the target legible without a prior read.
@@ -3373,6 +3433,8 @@ impl ActingScopeStepUpPolicyRepo<'_> {
                 .bind(scope_token)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back removal announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -3478,6 +3540,29 @@ impl ActingAdminSudoElevationRepo<'_> {
         elevated_at_unix_micros: i64,
         expires_at_unix_micros: i64,
     ) -> Result<AdminSudoElevationId, StoreError> {
+        self.record_with_event(
+            env,
+            acr,
+            elevated_at_unix_micros,
+            expires_at_unix_micros,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::record`], additionally emitting `sudo.elevated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::record`].
+    pub async fn record_with_event(
+        &self,
+        env: &Env,
+        acr: &str,
+        elevated_at_unix_micros: i64,
+        expires_at_unix_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<AdminSudoElevationId, StoreError> {
         let scope = self.scope;
         let id = AdminSudoElevationId::generate(env, &scope);
         let actor = self.acting.actor();
@@ -3512,6 +3597,8 @@ impl ActingAdminSudoElevationRepo<'_> {
                 .bind(expires_at_unix_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back elevation announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -5128,6 +5215,27 @@ impl ActingClientRepo<'_> {
         id: &ClientId,
         alg: &str,
     ) -> Result<(), StoreError> {
+        self.set_id_token_signed_response_alg_with_event(env, id, alg, None)
+            .await
+    }
+
+    /// [`Self::set_id_token_signed_response_alg`], additionally emitting
+    /// `client.signing_algorithm_changed` (issue #108).
+    ///
+    /// This is a CHANGE-ONLY write, and the event inherits that: a same-value write commits
+    /// nothing new, writes no audit row, and announces nothing. A consumer therefore never
+    /// sees a signing-algorithm change that did not happen.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_id_token_signed_response_alg`].
+    pub async fn set_id_token_signed_response_alg_with_event(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        alg: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -5182,6 +5290,9 @@ impl ActingClientRepo<'_> {
             target: id,
         };
         insert_audit_row(&mut tx, &spec, None).await?;
+        // In the write's own transaction, and only on the CHANGED path: the no-op branch
+        // above committed and returned before reaching here.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -5333,6 +5444,22 @@ impl ActingClientRepo<'_> {
         id: &ClientId,
         required: bool,
     ) -> Result<(), StoreError> {
+        self.set_require_pushed_authorization_requests_with_event(env, id, required, None)
+            .await
+    }
+
+    /// [`Self::set_require_pushed_authorization_requests`], additionally emitting `client.par_requirement_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_require_pushed_authorization_requests`].
+    pub async fn set_require_pushed_authorization_requests_with_event(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        required: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -5360,6 +5487,8 @@ impl ActingClientRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -5783,6 +5912,22 @@ impl ActingClientRepo<'_> {
         id: &ClientId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.verify_dynamic_client_with_event(env, id, idempotency, None)
+            .await
+    }
+
+    /// [`Self::verify_dynamic_client`], additionally emitting `client.verified` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_dynamic_client`].
+    pub async fn verify_dynamic_client_with_event(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -5815,6 +5960,8 @@ impl ActingClientRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -6146,6 +6293,24 @@ impl ActingDcrPolicyRepo<'_> {
         params: NewDcrPolicy<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, id, created_at_micros, params, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `dcr_policy.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        id: &DcrPolicyId,
+        created_at_micros: i64,
+        params: NewDcrPolicy<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -6184,6 +6349,8 @@ impl ActingDcrPolicyRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -6280,6 +6447,24 @@ impl ActingInitialAccessTokenRepo<'_> {
         params: NewInitialAccessToken<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.mint_with_event(env, id, created_at_micros, params, idempotency, None)
+            .await
+    }
+
+    /// [`Self::mint`], additionally emitting `dcr_initial_access_token.minted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::mint`].
+    pub async fn mint_with_event(
+        &self,
+        env: &Env,
+        id: &InitialAccessTokenId,
+        created_at_micros: i64,
+        params: NewInitialAccessToken<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -6323,6 +6508,8 @@ impl ActingInitialAccessTokenRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -6712,6 +6899,23 @@ impl ActingAbuseRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<AbuseBanId, StoreError> {
+        self.ban_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::ban`], additionally emitting `ban.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::ban`].
+    pub async fn ban_with_event(
+        &self,
+        env: &Env,
+        spec: NewBan<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<AbuseBanId, StoreError> {
         if spec.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -6774,6 +6978,8 @@ impl ActingAbuseRepo<'_> {
                 // and every other field echoes the request), so this is the plain form
                 // rather than the resolved one.
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back ban announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -6797,6 +7003,26 @@ impl ActingAbuseRepo<'_> {
         subject: &AbuseSubject,
         path: AuthPath,
         idempotency: Option<ResolvedIdempotencyWrite<'_, bool>>,
+    ) -> Result<bool, StoreError> {
+        self.lift_with_event(env, subject, path, idempotency, None)
+            .await
+    }
+
+    /// [`Self::lift`], additionally emitting `ban.lifted` (issue #108).
+    ///
+    /// A lift that matched NOTHING is an idempotent no-op and announces nothing: that branch
+    /// returns before the audited write this enqueue lives inside.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::lift`].
+    pub async fn lift_with_event(
+        &self,
+        env: &Env,
+        subject: &AbuseSubject,
+        path: AuthPath,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, bool>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<bool, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
@@ -6848,6 +7074,8 @@ impl ActingAbuseRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_resolved_idempotency(tx, idempotency, &true).await?;
+                // In the write's transaction: a rolled-back lift announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -7572,6 +7800,23 @@ impl ActingSmsOtpRepo<'_> {
         allow_factor_downgrade: bool,
         now_micros: i64,
     ) -> Result<(), StoreError> {
+        self.set_config_with_event(env, enabled, allow_factor_downgrade, now_micros, None)
+            .await
+    }
+
+    /// [`Self::set_config`], additionally emitting `sms_otp.config_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_config`].
+    pub async fn set_config_with_event(
+        &self,
+        env: &Env,
+        enabled: bool,
+        allow_factor_downgrade: bool,
+        now_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let detail = format!("enabled={enabled} allow_downgrade={allow_factor_downgrade}");
         write_audited_detailed(
@@ -7601,6 +7846,8 @@ impl ActingSmsOtpRepo<'_> {
                 .bind(now_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -7619,6 +7866,21 @@ impl ActingSmsOtpRepo<'_> {
         &self,
         env: &Env,
         country_code: &str,
+    ) -> Result<(), StoreError> {
+        self.add_allowlist_country_with_event(env, country_code, None)
+            .await
+    }
+
+    /// [`Self::add_allowlist_country`], additionally emitting `sms_otp.allowlist_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::add_allowlist_country`].
+    pub async fn add_allowlist_country_with_event(
+        &self,
+        env: &Env,
+        country_code: &str,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
         let country_code = country_code.to_owned();
@@ -7643,6 +7905,8 @@ impl ActingSmsOtpRepo<'_> {
                 .bind(&country_code)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -7661,6 +7925,21 @@ impl ActingSmsOtpRepo<'_> {
         &self,
         env: &Env,
         country_code: &str,
+    ) -> Result<(), StoreError> {
+        self.remove_allowlist_country_with_event(env, country_code, None)
+            .await
+    }
+
+    /// [`Self::remove_allowlist_country`], additionally emitting `sms_otp.allowlist_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove_allowlist_country`].
+    pub async fn remove_allowlist_country_with_event(
+        &self,
+        env: &Env,
+        country_code: &str,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
         let country_code = country_code.to_owned();
@@ -7684,6 +7963,8 @@ impl ActingSmsOtpRepo<'_> {
                 .bind(&country_code)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -11062,6 +11343,23 @@ impl ActingResourceServerRepo<'_> {
         id: &ResourceServerId,
         enabled: bool,
     ) -> Result<(), StoreError> {
+        self.set_permission_claims_with_event(env, id, enabled, None)
+            .await
+    }
+
+    /// [`Self::set_permission_claims`], additionally emitting
+    /// `resource_server.permission_claims_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_permission_claims`].
+    pub async fn set_permission_claims_with_event(
+        &self,
+        env: &Env,
+        id: &ResourceServerId,
+        enabled: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -11089,6 +11387,9 @@ impl ActingResourceServerRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction, and AFTER the rows-affected guard: a set that
+                // matched no resource server announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -16940,6 +17241,22 @@ impl ActingUserRepo<'_> {
         id: &UserId,
         external_id: &str,
     ) -> Result<(), StoreError> {
+        self.link_external_id_with_event(env, id, external_id, None)
+            .await
+    }
+
+    /// [`Self::link_external_id`], additionally emitting `user.external_id_linked` (#108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::link_external_id`].
+    pub async fn link_external_id_with_event(
+        &self,
+        env: &Env,
+        id: &UserId,
+        external_id: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -17012,7 +17329,9 @@ impl ActingUserRepo<'_> {
                 .await;
                 match result {
                     Ok(done) if done.rows_affected() == 0 => Err(StoreError::NotFound),
-                    Ok(_) => Ok(()),
+                    // Announced on the SUCCESS arm only: a link that matched no user is the
+                    // uniform not-found and says nothing.
+                    Ok(_) => enqueue_domain_event(tx, env, scope, event).await,
                     // The external id is already claimed by another user in the scope
                     // (the per-scope partial unique index): a conflict, not a fault.
                     Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
@@ -17034,6 +17353,21 @@ impl ActingUserRepo<'_> {
     /// [`StoreError::NotFound`] if no live user matched in this scope;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn unlink_external_id(&self, env: &Env, id: &UserId) -> Result<(), StoreError> {
+        self.unlink_external_id_with_event(env, id, None).await
+    }
+
+    /// [`Self::unlink_external_id`], additionally emitting `user.external_id_unlinked`
+    /// (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::unlink_external_id`].
+    pub async fn unlink_external_id_with_event(
+        &self,
+        env: &Env,
+        id: &UserId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -17065,6 +17399,8 @@ impl ActingUserRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back unlink announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -18023,6 +18359,21 @@ impl ActingUserIdentifierRepo<'_> {
         spec: NewUserIdentifier<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.add_with_event(env, spec, idempotency, None).await
+    }
+
+    /// [`Self::add`], additionally emitting `user.identifier_added` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::add`].
+    pub async fn add_with_event(
+        &self,
+        env: &Env,
+        spec: NewUserIdentifier<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let NewUserIdentifier {
             id,
             user_id,
@@ -18115,6 +18466,8 @@ impl ActingUserIdentifierRepo<'_> {
                 // and the audit row, so a replay cannot observe one without the others
                 // and a rolled-back add leaves no key claimed.
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -18146,6 +18499,21 @@ impl ActingUserIdentifierRepo<'_> {
         user_id: &UserId,
         id: &UserIdentifierId,
     ) -> Result<(), StoreError> {
+        self.remove_with_event(env, user_id, id, None).await
+    }
+
+    /// [`Self::remove`], additionally emitting `user.identifier_removed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove`].
+    pub async fn remove_with_event(
+        &self,
+        env: &Env,
+        user_id: &UserId,
+        id: &UserIdentifierId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if user_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -18176,6 +18544,8 @@ impl ActingUserIdentifierRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -18219,6 +18589,27 @@ impl ActingUserIdentifierRepo<'_> {
         env: &Env,
         mode: UniquenessMode,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.apply_uniqueness_mode_with_event(env, mode, idempotency, None)
+            .await
+    }
+
+    /// [`Self::apply_uniqueness_mode`], additionally emitting
+    /// `environment.identifier_uniqueness_applied` (issue #108).
+    ///
+    /// ONE event for the whole environment, not one per identifier: this recomputes the
+    /// discriminator on every row at once, so there is no single subject to name and a
+    /// per-row fan-out would be a storm saying less than one line does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apply_uniqueness_mode`].
+    pub async fn apply_uniqueness_mode_with_event(
+        &self,
+        env: &Env,
+        mode: UniquenessMode,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
         let environment = scope.environment();
@@ -18275,6 +18666,8 @@ impl ActingUserIdentifierRepo<'_> {
                 // collisions and retry with the same key rather than being told the
                 // request was already made.
                 insert_idempotency(tx, idempotency).await?;
+                // In the recompute's transaction: a rolled-back apply announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -18696,6 +19089,20 @@ impl ActingImpersonationAuthorizationRepo<'_> {
         env: &Env,
         spec: NewImpersonationAuthorization<'_>,
     ) -> Result<(), StoreError> {
+        self.issue_with_event(env, spec, None).await
+    }
+
+    /// [`Self::issue`], additionally emitting `impersonation.authorized` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::issue`].
+    pub async fn issue_with_event(
+        &self,
+        env: &Env,
+        spec: NewImpersonationAuthorization<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope || spec.user_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -18751,6 +19158,8 @@ impl ActingImpersonationAuthorizationRepo<'_> {
             Some(&detail),
         )
         .await?;
+        // In the write's own transaction: a rolled-back authorization announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -19045,6 +19454,27 @@ impl ActingSessionRepo<'_> {
         hard_kill: bool,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<SessionRevocation, StoreError> {
+        self.revoke_with_event(env, id, cause, hard_kill, idempotency, None)
+            .await
+    }
+
+    /// [`Self::revoke`], additionally emitting `session.revoked` (issue #108).
+    ///
+    /// Enqueued inside the revocation's own transaction, so a receiver is never told to drop
+    /// a session that a rolled-back revoke left live.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke`].
+    pub async fn revoke_with_event(
+        &self,
+        env: &Env,
+        id: &SessionId,
+        cause: SessionEndCause,
+        hard_kill: bool,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<SessionRevocation, StoreError> {
         self.revoke_inner(
             env,
             id,
@@ -19055,6 +19485,7 @@ impl ActingSessionRepo<'_> {
                 idempotency,
                 poison_after_audit: false,
             },
+            event,
         )
         .await
     }
@@ -19085,6 +19516,9 @@ impl ActingSessionRepo<'_> {
                 idempotency: None,
                 poison_after_audit: true,
             },
+            // The atomicity probe emits nothing: it exists to force a failure, and an event
+            // there would announce a revocation that is about to be rolled back.
+            None,
         )
         .await
     }
@@ -19107,6 +19541,47 @@ impl ActingSessionRepo<'_> {
         hard_kill: bool,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<u64, StoreError> {
+        self.bulk_revoke_with_events(env, ids, hard_kill, idempotency, None)
+            .await
+    }
+
+    /// [`Self::bulk_revoke`], additionally emitting ONE `session.revoked` PER SESSION THAT
+    /// ACTUALLY FLIPPED (issue #108).
+    ///
+    /// One event per session rather than one batch event, matching what the audit trail
+    /// already does here -- "one audit row per session, so the trail names every revoked
+    /// session individually rather than reporting an opaque batch". A consumer then handles
+    /// ONE type for both the single and the bulk path instead of learning a second shape, and
+    /// nothing has to fan a batch back out to act on it.
+    ///
+    /// `events` is POSITIONAL: `events[i]` announces `ids[i]`. It is refused unless it is
+    /// exactly as long as `ids`, because a shorter or longer slice would silently attribute
+    /// one session's envelope to another -- a misattribution no later check could detect.
+    ///
+    /// Only sessions that FLIPPED are announced. A session already revoked is a no-op here,
+    /// and announcing it would tell a receiver to tear down what it has already torn down --
+    /// the same guard rule the single revoke inherits.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidName`] if `events` is present and not the same length as `ids`;
+    /// otherwise as [`Self::bulk_revoke`].
+    pub async fn bulk_revoke_with_events(
+        &self,
+        env: &Env,
+        ids: &[SessionId],
+        hard_kill: bool,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        events: Option<&[DomainEvent<'_>]>,
+    ) -> Result<u64, StoreError> {
+        if let Some(events) = events {
+            if events.len() != ids.len() {
+                // Refused rather than truncated or zipped: a length mismatch means the
+                // caller's envelopes and the sessions they describe are not aligned, and
+                // enqueuing any of them would attribute the wrong session to the wrong event.
+                return Err(StoreError::InvalidName);
+            }
+        }
         let scope = self.scope;
         let now_micros = epoch_micros(env.clock().now_utc());
         // ONE transaction: every session flip, every cascade, and every per-session
@@ -19115,7 +19590,7 @@ impl ActingSessionRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         insert_idempotency(&mut tx, idempotency).await?;
         let mut flipped = 0_u64;
-        for id in ids {
+        for (index, id) in ids.iter().enumerate() {
             // Scope-fence: a foreign-scope id is a uniform no-op (never a query).
             if id.scope() != scope {
                 continue;
@@ -19132,6 +19607,11 @@ impl ActingSessionRepo<'_> {
             .await?;
             if outcome.session_flipped {
                 flipped += 1;
+                // Only what actually changed: a session already revoked is a no-op here, and
+                // announcing it would tell a receiver to tear down what it already has.
+                if let Some(events) = events {
+                    enqueue_domain_event(&mut tx, env, scope, Some(&events[index])).await?;
+                }
             }
             // One audit row per session, so the trail names every revoked session
             // individually rather than reporting an opaque batch.
@@ -19172,6 +19652,28 @@ impl ActingSessionRepo<'_> {
         subject: &UserId,
         hard_kill: bool,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<UserRevocation, StoreError> {
+        self.revoke_all_for_user_with_event(env, subject, hard_kill, idempotency, None)
+            .await
+    }
+
+    /// [`Self::revoke_all_for_user`], additionally emitting `user.sessions_revoked` (#108).
+    ///
+    /// ONE event naming the SUBJECT, not one per session. This call is given only the user,
+    /// and the store discovers which sessions were live inside its own UPDATE, so nothing
+    /// knows the session ids when the envelope is built -- unlike [`Self::bulk_revoke`],
+    /// where the caller supplies them and gets one event each.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke_all_for_user`].
+    pub async fn revoke_all_for_user_with_event(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        hard_kill: bool,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<UserRevocation, StoreError> {
         if subject.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -19257,6 +19759,9 @@ impl ActingSessionRepo<'_> {
                 .await?;
                 cascade_families_for_subject(tx, scope, &subject_text, now_micros, hard_kill, out)
                     .await?;
+                // In the revocation's own transaction: a rolled-back revoke-all announces
+                // nothing, so no receiver tears down sessions that are still live.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -19404,6 +19909,7 @@ impl ActingSessionRepo<'_> {
         env: &Env,
         id: &SessionId,
         spec: RevokeSpec<'_>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<SessionRevocation, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -19483,6 +19989,9 @@ impl ActingSessionRepo<'_> {
                     )
                     .await?;
                 }
+                // In the revocation's own transaction: a rolled-back revoke announces
+                // nothing, so a receiver is never told to drop a session that is live.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             poison_after_audit,
@@ -20251,6 +20760,34 @@ pub(crate) async fn enqueue_domain_event(
     event: Option<&DomainEvent<'_>>,
 ) -> Result<(), StoreError> {
     if let Some(event) = event {
+        // ISSUE #108 CRITERION 1, enforced where a violation is CHEAPEST to diagnose.
+        //
+        // `ironauth_admin::events` validates every event at the fan-out, which is the one
+        // choke point production traffic passes through and is where the check belongs at
+        // run time. But its failure is a log line and a permanent consumer error, discovered
+        // by whoever is watching deliveries -- and by then the producer that built the bad
+        // envelope is long out of scope.
+        //
+        // Under the `testing` feature this panics INSIDE the producer's own transaction
+        // instead, so an unregistered type or an off-schema payload fails the test that
+        // exercised it, with that producer on the stack. Every store and admin test runs
+        // with the feature, so this covers every event the suite emits: the criterion asks
+        // that such an event fail the build, and nothing weaker than an assertion at emit
+        // time does that.
+        //
+        // Deliberately NOT compiled into release builds. A panic here would abort a real
+        // write for a payload the fan-out is already equipped to refuse, turning a
+        // deliverability problem into an outage.
+        #[cfg(feature = "testing")]
+        if let Err(error) = crate::event_catalog::validate_event(event.envelope) {
+            panic!(
+                "a producer emitted an event that does not validate against the registry: \
+                 {error:?}\n\nenvelope: {}\n\nThe fan-out refuses this permanently, so \
+                 shipping it would announce nothing while the write succeeded. Register the \
+                 type, or fix the payload to match the schema it declares.",
+                event.envelope
+            );
+        }
         enqueue_outbox_in_tx(
             tx,
             env,
@@ -24767,11 +25304,28 @@ impl ActingRecoveryApprovalRepo<'_> {
         flow_id: &RecoveryFlowId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<bool, StoreError> {
+        self.approve_with_event(env, flow_id, idempotency, None)
+            .await
+    }
+
+    /// [`Self::approve`], additionally emitting `recovery_approval.decided` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::approve`].
+    pub async fn approve_with_event(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<bool, StoreError> {
         self.approve_inner(
             env,
             flow_id,
             idempotency,
             ArmedRecoveryApproveFailure::default(),
+            event,
         )
         .await
     }
@@ -24804,7 +25358,9 @@ impl ActingRecoveryApprovalRepo<'_> {
         idempotency: Option<IdempotencyWrite<'_>>,
         at: RecoveryApproveFailurePoint,
     ) -> Result<bool, StoreError> {
-        self.approve_inner(env, flow_id, idempotency, Some(at))
+        // The atomicity probe emits nothing: it forces a failure, and an event there would
+        // announce a decision about to be rolled back.
+        self.approve_inner(env, flow_id, idempotency, Some(at), None)
             .await
     }
 
@@ -24816,6 +25372,7 @@ impl ActingRecoveryApprovalRepo<'_> {
         flow_id: &RecoveryFlowId,
         idempotency: Option<IdempotencyWrite<'_>>,
         poison: ArmedRecoveryApproveFailure,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<bool, StoreError> {
         // Without the `testing` feature the seam type has no inhabited variant, so
         // `poison` cannot be armed and every probe below is compiled out.
@@ -24887,6 +25444,9 @@ impl ActingRecoveryApprovalRepo<'_> {
         }
         #[cfg(feature = "testing")]
         poison_recovery_approve(&mut tx, poison, RecoveryApproveFailurePoint::BeforeCommit).await?;
+        // BEFORE the commit, in the decision's own transaction: a rolled-back approval never
+        // tells a receiver an account was handed back.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(completed.is_some())
     }
@@ -24908,12 +25468,29 @@ impl ActingRecoveryApprovalRepo<'_> {
         flow_id: &RecoveryFlowId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.reject_with_event(env, flow_id, idempotency, None)
+            .await
+    }
+
+    /// [`Self::reject`], additionally emitting `recovery_approval.decided` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reject`].
+    pub async fn reject_with_event(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         self.decide(
             env,
             flow_id,
             "rejected",
             Action::RecoveryApprovalRejected,
             idempotency,
+            event,
         )
         .await
     }
@@ -24926,6 +25503,7 @@ impl ActingRecoveryApprovalRepo<'_> {
         to_state: &str,
         action: Action,
         idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if flow_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -24951,6 +25529,8 @@ impl ActingRecoveryApprovalRepo<'_> {
                 {
                     return Err(StoreError::NotFound);
                 }
+                // In the decision's transaction: a rolled-back reject announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -26827,6 +27407,21 @@ impl ActingWebhookEndpointRepo<'_> {
         spec: NewWebhookEndpoint<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, spec, idempotency, None).await
+    }
+
+    /// [`Self::create`], additionally emitting `webhook_endpoint.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewWebhookEndpoint<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let NewWebhookEndpoint {
             id,
             url,
@@ -26895,6 +27490,8 @@ impl ActingWebhookEndpointRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back create announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -26927,6 +27524,31 @@ impl ActingWebhookEndpointRepo<'_> {
         secret: &[u8],
         previous_expires_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.rotate_secret_with_event(
+            env,
+            id,
+            secret,
+            previous_expires_at_micros,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::rotate_secret`], additionally emitting `webhook_endpoint.secret_rotated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::rotate_secret`].
+    pub async fn rotate_secret_with_event(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        secret: &[u8],
+        previous_expires_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -26978,6 +27600,8 @@ impl ActingWebhookEndpointRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -27020,6 +27644,23 @@ impl ActingWebhookEndpointRepo<'_> {
         since_unix_micros: Option<i64>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.request_dead_letter_replay_with_event(env, id, since_unix_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::request_dead_letter_replay`], additionally emitting `webhook_endpoint.replay_requested` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::request_dead_letter_replay`].
+    pub async fn request_dead_letter_replay_with_event(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        since_unix_micros: Option<i64>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -27061,6 +27702,8 @@ impl ActingWebhookEndpointRepo<'_> {
                 )
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -27086,6 +27729,22 @@ impl ActingWebhookEndpointRepo<'_> {
         env: &Env,
         id: &WebhookEndpointId,
         event_types: Option<&[String]>,
+    ) -> Result<(), StoreError> {
+        self.set_event_types_with_event(env, id, event_types, None)
+            .await
+    }
+
+    /// [`Self::set_event_types`], additionally emitting `webhook_endpoint.subscription_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_event_types`].
+    pub async fn set_event_types_with_event(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        event_types: Option<&[String]>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -27122,6 +27781,8 @@ impl ActingWebhookEndpointRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -27151,6 +27812,24 @@ impl ActingWebhookEndpointRepo<'_> {
         id: &WebhookEndpointId,
         active: bool,
         idempotency: Option<ResolvedIdempotencyWrite<'_, WebhookEndpointRecord>>,
+    ) -> Result<WebhookEndpointRecord, StoreError> {
+        self.set_active_with_event(env, id, active, idempotency, None)
+            .await
+    }
+
+    /// [`Self::set_active`], additionally emitting `webhook_endpoint.active_changed`
+    /// (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_active`].
+    pub async fn set_active_with_event(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        active: bool,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, WebhookEndpointRecord>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<WebhookEndpointRecord, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -27212,6 +27891,8 @@ impl ActingWebhookEndpointRepo<'_> {
                     created_at_unix_micros: row.get("created_us"),
                 };
                 insert_resolved_idempotency(tx, idempotency, &record).await?;
+                // In the write's transaction: a rolled-back flip announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(record)
             },
             false,
@@ -28093,6 +28774,23 @@ impl ActingBrandRepo<'_> {
         created_at_micros: i64,
         params: NewBrand<'_>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `brand.set` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &BrandId,
+        created_at_micros: i64,
+        params: NewBrand<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28183,6 +28881,8 @@ impl ActingBrandRepo<'_> {
                 .bind(client_id.as_deref())
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -28205,6 +28905,21 @@ impl ActingBrandRepo<'_> {
     /// [`StoreError::NotFound`] if `id` is out of scope or names no installed brand;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, id: &BrandId, slug: &str) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, slug, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `brand.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &BrandId,
+        slug: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28245,6 +28960,8 @@ impl ActingBrandRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -28297,6 +29014,26 @@ impl ActingBrandAssetRepo<'_> {
         created_at_micros: i64,
         params: NewBrandAsset<'_>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, brand_id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `brand_asset.set` (issue #108).
+    ///
+    /// Enqueued inside the upsert's transaction, so a receiver is never told to refetch an
+    /// asset that a rolled-back write never stored.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        brand_id: &BrandId,
+        created_at_micros: i64,
+        params: NewBrandAsset<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if brand_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28344,6 +29081,9 @@ impl ActingBrandAssetRepo<'_> {
                 .bind(created_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the upsert's own transaction, so a receiver is never told to refetch an
+                // asset a rolled-back write never stored.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -28570,6 +29310,26 @@ impl ActingLocaleBundleRepo<'_> {
         created_at_micros: i64,
         params: NewLocaleBundle<'_>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `locale_bundle.set` (issue #108).
+    ///
+    /// Enqueued inside the upsert's transaction, so a consumer is never told to refetch a
+    /// write that rolled back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &LocaleBundleId,
+        created_at_micros: i64,
+        params: NewLocaleBundle<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28632,6 +29392,9 @@ impl ActingLocaleBundleRepo<'_> {
                 .bind(created_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the upsert's transaction: never tell a consumer to refetch a
+                // write that rolled back.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -28809,6 +29572,26 @@ impl ActingSignupFormRepo<'_> {
         created_at_micros: i64,
         params: NewSignupForm<'_>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `signup_form.set` (issue #108).
+    ///
+    /// Enqueued inside the upsert's transaction, so a consumer is never told to refetch a
+    /// write that rolled back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &SignupFormId,
+        created_at_micros: i64,
+        params: NewSignupForm<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28851,6 +29634,9 @@ impl ActingSignupFormRepo<'_> {
                 .bind(created_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the upsert's transaction: never tell a consumer to refetch a
+                // write that rolled back.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -29169,6 +29955,34 @@ impl ActingFlowVersionRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_version_with_event(
+            env,
+            id,
+            params,
+            version,
+            created_at_micros,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create_version`], additionally emitting `flow_version.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_version`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_version_with_event(
+        &self,
+        env: &Env,
+        id: &FlowVersionId,
+        params: NewFlowVersion<'_>,
+        version: i32,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         // Prove the artifact is a load-valid, compilable journey BEFORE the transaction: a bad
         // artifact never reaches the registry, so the drive-path compile of a stored version never
         // fails.
@@ -29223,6 +30037,9 @@ impl ActingFlowVersionRepo<'_> {
                     Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
                     Err(error) => return Err(error.into()),
                 }
+                // In the write's transaction, and AFTER the unique-index guard above: a
+                // version a concurrent create already took announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -29290,6 +30107,27 @@ impl ActingFlowVersionRepo<'_> {
         now_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<FlowVersionPinId, StoreError> {
+        self.pin_with_event(env, journey_id, version, now_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::pin`], additionally emitting `flow_version.pinned` (issue #108).
+    ///
+    /// An absent version is a uniform not-found resolved BEFORE the write, so a pin that
+    /// moved nothing announces nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::pin`].
+    pub async fn pin_with_event(
+        &self,
+        env: &Env,
+        journey_id: &str,
+        version: i32,
+        now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<FlowVersionPinId, StoreError> {
         let scope = self.scope;
         // Resolve the version -> its flv_ id (a uniform not-found when the version is absent), and
         // the existing pin id (reused as the stable audit target across moves). Versions are
@@ -29332,6 +30170,8 @@ impl ActingFlowVersionRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back pin announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -29472,6 +30312,23 @@ impl ActingClientAdminGrantRepo<'_> {
         created_at_micros: i64,
         params: NewClientAdminGrant<'_>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `admin_consent.granted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &ClientAdminGrantId,
+        created_at_micros: i64,
+        params: NewClientAdminGrant<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -29518,6 +30375,8 @@ impl ActingClientAdminGrantRepo<'_> {
                 .bind(created_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back grant announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -29663,6 +30522,27 @@ impl ActingConnectorRepo<'_> {
         params: NewConnector<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, id, created_at_micros, params, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `connector.created` (issue #108).
+    ///
+    /// Enqueued inside the write's transaction, so a federation is never announced into
+    /// existence by a create that rolled back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        id: &ConnectorId,
+        created_at_micros: i64,
+        params: NewConnector<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -29723,6 +30603,8 @@ impl ActingConnectorRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -29746,6 +30628,24 @@ impl ActingConnectorRepo<'_> {
         env: &Env,
         id: &ConnectorId,
         params: NewConnector<'_>,
+    ) -> Result<(), StoreError> {
+        self.update_with_event(env, id, params, None).await
+    }
+
+    /// [`Self::update`], additionally emitting `connector.updated` (issue #108).
+    ///
+    /// Enqueued inside the write's transaction, so a receiver is never told a live
+    /// federation changed by an update that rolled back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::update`].
+    pub async fn update_with_event(
+        &self,
+        env: &Env,
+        id: &ConnectorId,
+        params: NewConnector<'_>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -29803,6 +30703,8 @@ impl ActingConnectorRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -30603,6 +31505,22 @@ impl ActingRoutingRuleRepo<'_> {
         id: &RoutingRuleId,
         verified: bool,
     ) -> Result<(), StoreError> {
+        self.record_domain_verification_with_event(env, id, verified, None)
+            .await
+    }
+
+    /// [`Self::record_domain_verification`], additionally emitting `routing_rule.domain_verification_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::record_domain_verification`].
+    pub async fn record_domain_verification_with_event(
+        &self,
+        env: &Env,
+        id: &RoutingRuleId,
+        verified: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -30644,6 +31562,8 @@ impl ActingRoutingRuleRepo<'_> {
                 if updated.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             // Not poison-after-audit: this write changes one rule's verification state and
@@ -30671,6 +31591,23 @@ impl ActingRoutingRuleRepo<'_> {
         id: &RoutingRuleId,
         created_at_micros: i64,
         params: NewRoutingRule<'_>,
+    ) -> Result<(), StoreError> {
+        self.create_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `routing_rule.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        id: &RoutingRuleId,
+        created_at_micros: i64,
+        params: NewRoutingRule<'_>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope || params.org_connection_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -30750,6 +31687,8 @@ impl ActingRoutingRuleRepo<'_> {
                     Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
                     Err(error) => return Err(error.into()),
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -32001,6 +32940,22 @@ impl ActingSignupQuarantineRepo<'_> {
         subject: &UserId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.approve_with_event(env, subject, idempotency, None)
+            .await
+    }
+
+    /// [`Self::approve`], additionally emitting `signup_quarantine.resolved` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::approve`].
+    pub async fn approve_with_event(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if subject.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -32042,6 +32997,8 @@ impl ActingSignupQuarantineRepo<'_> {
                 if !closed {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back review announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -32069,6 +33026,22 @@ impl ActingSignupQuarantineRepo<'_> {
         env: &Env,
         subject: &UserId,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.reject_with_event(env, subject, idempotency, None)
+            .await
+    }
+
+    /// [`Self::reject`], additionally emitting `signup_quarantine.resolved` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reject`].
+    pub async fn reject_with_event(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if subject.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -32130,6 +33103,8 @@ impl ActingSignupQuarantineRepo<'_> {
                     &emit,
                 )
                 .await?;
+                // In the write's transaction: a rolled-back review announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -32154,6 +33129,23 @@ impl ActingSignupQuarantineRepo<'_> {
         subject: &UserId,
         quarantined_until_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.extend_with_event(env, subject, quarantined_until_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::extend`], additionally emitting `signup_quarantine.extended` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::extend`].
+    pub async fn extend_with_event(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        quarantined_until_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if subject.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -32195,6 +33187,8 @@ impl ActingSignupQuarantineRepo<'_> {
                 if extended.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back review announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -35728,12 +36722,35 @@ impl ActingInvitationRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<UserId, StoreError> {
+        self.create_with_user_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create_with_user`], additionally emitting `invitation.created` (issue #108).
+    ///
+    /// Enqueued inside the SAME transaction as the joined user-and-invitation write, so the
+    /// announcement cannot survive a rolled-back create and tell a receiver about an invitee
+    /// that does not exist. The joined create is atomic by construction (issue #247), and the
+    /// event joins that atomicity rather than sitting beside it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_with_user`].
+    pub async fn create_with_user_with_event(
+        &self,
+        env: &Env,
+        spec: NewInvitedUser<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<UserId, StoreError> {
         self.create_with_user_inner(
             env,
             spec,
             created_at_micros,
             idempotency,
             ArmedInvitationFailure::default(),
+            event,
         )
         .await
     }
@@ -35761,7 +36778,9 @@ impl ActingInvitationRepo<'_> {
         idempotency: Option<IdempotencyWrite<'_>>,
         at: InvitationCreateFailurePoint,
     ) -> Result<UserId, StoreError> {
-        self.create_with_user_inner(env, spec, created_at_micros, idempotency, Some(at))
+        // The atomicity probe emits nothing: it exists to force a failure, and an event on
+        // that path would be announcing a create that is about to be rolled back.
+        self.create_with_user_inner(env, spec, created_at_micros, idempotency, Some(at), None)
             .await
     }
 
@@ -35774,6 +36793,7 @@ impl ActingInvitationRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
         poison: ArmedInvitationFailure,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<UserId, StoreError> {
         // Without the `testing` feature the seam type has no inhabited variant, so
         // `poison` cannot be armed and every probe below is compiled out.
@@ -35875,6 +36895,9 @@ impl ActingInvitationRepo<'_> {
         #[cfg(feature = "testing")]
         poison_invitation_create(&mut tx, poison, InvitationCreateFailurePoint::BeforeCommit)
             .await?;
+        // Inside the joined create's own transaction, so the notice shares its atomicity
+        // rather than sitting beside it: a rolled-back create announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(user_id)
     }
@@ -35894,6 +36917,31 @@ impl ActingInvitationRepo<'_> {
         env: &Env,
         id: &InvitationId,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.revoke_with_event(env, id, idempotency, None).await
+    }
+
+    /// [`Self::revoke`], additionally emitting `invitation.revoked` (issue #108).
+    ///
+    /// The event inherits this method's GUARD rather than being made idempotent separately:
+    /// the update matches only a `pending` row, so a repeat revoke (or a revoke of an
+    /// accepted invitation) affects nothing, returns the uniform not-found, and never reaches
+    /// the enqueue. A receiver counting revocations cannot see two for one invitation because
+    /// a client retried.
+    ///
+    /// Enqueued INSIDE the same transaction as the state flip, so an announcement cannot
+    /// survive a rolled-back revoke and tell a receiver a token is dead while it still
+    /// redeems.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke`].
+    pub async fn revoke_with_event(
+        &self,
+        env: &Env,
+        id: &InvitationId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -35926,6 +36974,9 @@ impl ActingInvitationRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // After the guard, so nothing is announced unless a pending row actually
+                // moved, and inside the transaction, so the notice cannot outlive a rollback.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -35952,6 +37003,38 @@ impl ActingInvitationRepo<'_> {
         new_token_digest: &str,
         new_expires_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.resend_with_event(
+            env,
+            id,
+            new_token_digest,
+            new_expires_at_micros,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::resend`], additionally emitting `invitation.resent` (issue #108).
+    ///
+    /// The event inherits the resend's GUARD: the update matches only a `pending` row, so
+    /// resending an accepted or revoked invitation affects nothing, returns the uniform
+    /// not-found, and never reaches the enqueue.
+    ///
+    /// Enqueued inside the write's transaction, so a receiver is never told a prior token
+    /// stopped working by a resend that rolled back and left it live.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resend`].
+    pub async fn resend_with_event(
+        &self,
+        env: &Env,
+        id: &InvitationId,
+        new_token_digest: &str,
+        new_expires_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -35992,6 +37075,10 @@ impl ActingInvitationRepo<'_> {
                 // token (only its digest is persisted), so a dump yields nothing
                 // replayable even for a resend.
                 insert_idempotency(tx, idempotency).await?;
+                // After the guard, so a resend that matched no pending row announces
+                // nothing, and inside the transaction, so a receiver is never told a prior
+                // token stopped working by a resend that rolled back and left it live.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -36471,6 +37558,34 @@ impl ActingConsentRepo<'_> {
         revoked_at_micros: i64,
         idempotency: Option<ResolvedIdempotencyWrite<'_, ConsentRevocation>>,
     ) -> Result<ConsentRevocation, StoreError> {
+        self.revoke_with_event(
+            env,
+            subject,
+            client_id,
+            revoked_at_micros,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::revoke`], additionally emitting `consent.revoked` (issue #108).
+    ///
+    /// An absent or already-revoked consent is an idempotent no-op SUCCESS, and that branch
+    /// returns before the enqueue: a consumer must not see a withdrawal that did not happen.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke`].
+    pub async fn revoke_with_event(
+        &self,
+        env: &Env,
+        subject: &str,
+        client_id: &str,
+        revoked_at_micros: i64,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, ConsentRevocation>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<ConsentRevocation, StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
@@ -36550,6 +37665,8 @@ impl ActingConsentRepo<'_> {
         // In the SAME transaction as the consent flip and its cascade, so the stored
         // response and the state it describes commit together or not at all.
         insert_resolved_idempotency(&mut tx, idempotency, &resolved).await?;
+        // Likewise, and only on the MUTATING branch: the no-op above returned already.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(resolved)
     }
@@ -37779,6 +38896,32 @@ async fn insert_audit_row<T: AuditTarget>(
 // UPDATEing the row it seals; see migration 0135 for why that distinction is
 // the whole point.
 
+/// What a read's cursor MEANS, which decides whether a retention gap applies to it.
+///
+/// The gap check asks one question: was the row you are resuming from pruned? That question
+/// only has an answer for a cursor that names a row, and not every cursor does.
+///
+/// Splitting this out fixed a real refusal. The dead-letter replay re-reads a recorded range
+/// and, because [`AuditChainRepo::rows_after`] is EXCLUSIVE, starts from a synthetic position
+/// just below the range's first row (same microsecond, empty id). When the range began at the
+/// stream's oldest surviving row, that position sorted below it and the read was refused as a
+/// retention gap with nothing pruned and no row missing.
+///
+/// It is a parameter rather than a sniff at the cursor's shape: a rule defeated by a spelling
+/// is not a rule, and "the id happens to be empty" is a spelling. The caller knows which kind
+/// of position it holds; nothing else does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorOrigin {
+    /// A position a consumer was HANDED and is resuming from, so it names a row that once
+    /// existed. If that row is gone, the consumer missed everything up to what remains, and
+    /// handing it the surviving tail would look exactly like an uneventful period.
+    ConsumerResume,
+    /// A synthetic lower bound the caller derived to re-read a range it ALREADY holds. It
+    /// names no row, so no row of it can have been pruned, and the range's own bounds -- not
+    /// this cursor -- are what the caller checks for completeness.
+    BoundedRange,
+}
+
 /// One `audit_log` row, in the exact shape the chain commits to.
 ///
 /// Every field here is immutable once written. `occurred_micros` is derived from
@@ -38001,6 +39144,21 @@ impl LogStreamRepo<'_> {
         new: &NewLogStream<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<String, StoreError> {
+        self.create_with_event(env, new, idempotency, None).await
+    }
+
+    /// [`Self::create`], additionally emitting `log_stream.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        new: &NewLogStream<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<String, StoreError> {
         let scope = self.scope;
         let id = new.id.map_or_else(
             || crate::id::LogStreamId::generate(env, &scope).to_string(),
@@ -38029,6 +39187,8 @@ impl LogStreamRepo<'_> {
         // stream configured with no idempotency record, and the client's retry would
         // configure a SECOND stream shipping the same events to the same sink.
         insert_idempotency(&mut tx, idempotency).await?;
+        // In the create's own transaction: a rolled-back stream announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(id)
     }
@@ -38046,6 +39206,23 @@ impl LogStreamRepo<'_> {
     /// [`StoreError`] on a persistence fault, including the permission failure a
     /// data-plane caller gets: only the control plane may remove a stream.
     pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
+        self.delete_with_event(None, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `log_stream.deleted` (issue #108).
+    ///
+    /// `env` is required only to enqueue, so the un-suffixed [`Self::delete`] passes `None`
+    /// and needs no environment it would otherwise never use.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: Option<&Env>,
+        id: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         sqlx::query(
@@ -38065,6 +39242,10 @@ impl LogStreamRepo<'_> {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        // In the delete's own transaction, alongside the dead letters it removes.
+        if let Some(env) = env {
+            enqueue_domain_event(&mut tx, env, scope, event).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -38604,6 +39785,7 @@ impl AuditChainRepo<'_> {
         &self,
         stream: &str,
         cursor: Option<(i64, &str)>,
+        origin: CursorOrigin,
         limit: i64,
         organization: Option<&str>,
     ) -> Result<Vec<ChainedAuditRow>, StoreError> {
@@ -38627,7 +39809,9 @@ impl AuditChainRepo<'_> {
         // An EMPTY stream is not a gap: there is no oldest row to be older than, and a
         // consumer resuming against a stream whose rows have all aged out but which never had
         // any is in a different situation from one that missed events. It reads as empty.
-        if let (Some(micros), Some(id)) = (cursor_micros, cursor_id) {
+        if let (Some(micros), Some(id), CursorOrigin::ConsumerResume) =
+            (cursor_micros, cursor_id, origin)
+        {
             let oldest: Option<(i64, String)> = sqlx::query(
                 "SELECT (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros, \
                         id \
@@ -44148,6 +45332,24 @@ impl ActingTenantRepo<'_> {
         id: &TenantId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.suspend_with_event(env, id, idempotency, None).await
+    }
+
+    /// [`Self::suspend`], additionally emitting `tenant.suspended` (issue #108).
+    ///
+    /// TENANT-SCOPED: one outbox row per environment, because a suspension fences every one
+    /// of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::suspend`].
+    pub async fn suspend_with_event(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         self.transition(
             env,
             id,
@@ -44156,6 +45358,7 @@ impl ActingTenantRepo<'_> {
             Action::TenantSuspend,
             EnvironmentServingState::Suspended,
             idempotency,
+            event,
         )
         .await
     }
@@ -44179,6 +45382,24 @@ impl ActingTenantRepo<'_> {
         id: &TenantId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.resume_with_event(env, id, idempotency, None).await
+    }
+
+    /// [`Self::resume`], additionally emitting `tenant.resumed` (issue #108).
+    ///
+    /// TENANT-SCOPED: one outbox row per environment, because a resume un-fences every one
+    /// of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resume`].
+    pub async fn resume_with_event(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         self.transition(
             env,
             id,
@@ -44187,6 +45408,7 @@ impl ActingTenantRepo<'_> {
             Action::TenantResume,
             EnvironmentServingState::Active,
             idempotency,
+            event,
         )
         .await
     }
@@ -44208,6 +45430,7 @@ impl ActingTenantRepo<'_> {
         action: Action,
         serving: EnvironmentServingState,
         idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let operator = self.operator;
         // Pre-read the live tenant's status for the state-machine decision: an
@@ -44330,6 +45553,15 @@ impl ActingTenantRepo<'_> {
                     .bind(now_micros)
                     .execute(&mut **tx)
                     .await?;
+                    // TENANT-SCOPED, one row per environment (issue #108). The loop has
+                    // already re-scoped to this environment, which is exactly what FORCE
+                    // row-level security on `outbox_messages` requires: a row must be
+                    // written under the environment it names, or the insert is REFUSED
+                    // rather than silently mis-scoped. In the same transaction as the
+                    // change it announces.
+                    let announced = EnvironmentId::parse(&env_id)
+                        .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+                    enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
                 }
                 // 3. Restore the audit scope's row-level-security variables so the
                 //    audited-write's audit row (and the idempotency insert) run under
@@ -44385,8 +45617,29 @@ impl ActingTenantRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if no live tenant matched under this operator.
-    #[allow(clippy::too_many_lines)]
     pub async fn delete(&self, env: &Env, id: &TenantId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `tenant.deleted` (issue #108).
+    ///
+    /// The event is TENANT-SCOPED: its envelope names no environment, because this delete
+    /// fences all of them. The outbox row is still scoped -- it needs one to be read back --
+    /// and the scope it uses is the audit scope picked below, which is an implementation
+    /// detail of storage rather than a claim about the fact.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    // The pre-existing exception, moved here with the body it describes: splitting `delete`
+    // into a wrapper left the attribute on the one-line half.
+    #[allow(clippy::too_many_lines)]
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         // The audit scope needs an environment of this tenant; pick the oldest (it is
         // retained through soft delete, so its row still satisfies the composite
         // foreign key from `audit_log` to `environments`). A tenant always has its
@@ -44607,7 +45860,39 @@ impl ActingTenantRepo<'_> {
                 .bind(id.to_string())
                 .execute(&mut **tx)
                 .await?;
-                // 6. Restore the audit scope's row-level-security variables so the
+                // 6. Announce to EVERY environment of the tenant, not just the audit
+                //    scope's. A tenant-scoped event names no single environment, but the
+                //    outbox row carrying it IS routed per environment, and the fan-out
+                //    lists endpoints `WHERE tenant_id = $1 AND environment_id = $2`. A
+                //    single row would therefore reach only the oldest environment's
+                //    subscribers, and every other environment this delete just fenced
+                //    would never be told it had been.
+                //
+                //    One row PER environment rather than widening the fan-out to the
+                //    tenant, so the delivery path keeps its isolation EXACTLY as it is: no
+                //    endpoint ever sees an event from outside its own environment. The
+                //    event id is deliberately shared across these rows -- it is one event
+                //    -- and cannot collide, because the outbox is unique on
+                //    (tenant_id, environment_id, consumer, idempotency_key).
+                //
+                //    In the SAME transaction as the tombstone and every environment fence
+                //    it just wrote. Announcing before those commit would tell a receiver
+                //    to stop trusting a tenant that is still answering.
+                for env_row in &env_rows {
+                    let env_id: String = env_row.get("id");
+                    let announced = EnvironmentId::parse(&env_id)
+                        .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+                    // FORCE row-level security on `outbox_messages` checks an INSERT
+                    // against these settings, so each row must be written while its OWN
+                    // environment is the scoped one. Without this the insert is REFUSED,
+                    // not silently mis-scoped.
+                    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                        .bind(&env_id)
+                        .execute(&mut **tx)
+                        .await?;
+                    enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
+                }
+                // 7. Restore the audit scope's row-level-security variables so the
                 //    audited-write's audit row inserts under (tenant, oldest
                 //    environment), exactly as it did before the per-environment
                 //    re-scoping above.
@@ -44697,13 +45982,33 @@ impl ActingTenantRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if no grace tenant matched under this operator;
     /// [`StoreError::Conflict`] if the retention window has already elapsed.
-    #[allow(clippy::too_many_lines)]
     pub async fn restore(
         &self,
         env: &Env,
         id: &TenantId,
         retention: Duration,
         idempotency: Option<ResolvedIdempotencyWrite<'_, TenantStatus>>,
+    ) -> Result<TenantStatus, StoreError> {
+        self.restore_with_event(env, id, retention, idempotency, None)
+            .await
+    }
+
+    /// [`Self::restore`], additionally emitting `tenant.restored` (issue #108).
+    ///
+    /// TENANT-SCOPED: one outbox row per environment, because a restore un-fences every one
+    /// of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::restore`].
+    #[allow(clippy::too_many_lines)]
+    pub async fn restore_with_event(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        retention: Duration,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, TenantStatus>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<TenantStatus, StoreError> {
         let operator = self.operator;
         // Pre-read the grace tenant's deletion instant for the window decision. A row
@@ -44916,6 +46221,15 @@ impl ActingTenantRepo<'_> {
                     .bind(now_micros)
                     .execute(&mut **tx)
                     .await?;
+                    // TENANT-SCOPED, one row per environment (issue #108). The loop has
+                    // already re-scoped to this environment, which is exactly what FORCE
+                    // row-level security on `outbox_messages` requires: a row must be
+                    // written under the environment it names, or the insert is REFUSED
+                    // rather than silently mis-scoped. In the same transaction as the
+                    // change it announces.
+                    let announced = EnvironmentId::parse(&env_id)
+                        .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+                    enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
                 }
                 // 3. Clear the tombstones this delete wrote on the environments (a
                 //    level table), matched on its instant for the reason step 2 gives.
@@ -44967,13 +46281,34 @@ impl ActingTenantRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if no grace tenant matched under this operator;
     /// [`StoreError::Conflict`] if the retention window has not yet elapsed.
-    #[allow(clippy::too_many_lines)]
     pub async fn hard_delete(
         &self,
         env: &Env,
         id: &TenantId,
         retention: Duration,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.hard_delete_with_event(env, id, retention, idempotency, None)
+            .await
+    }
+
+    /// [`Self::hard_delete`], additionally emitting `tenant.purged` (issue #108).
+    ///
+    /// TENANT-SCOPED: one outbox row per environment. The rows SURVIVE the purge -- it
+    /// crypto-shreds keys and retains the tables as erasure evidence rather than dropping
+    /// environments -- so the announcement of the terminal state is itself deliverable.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::hard_delete`].
+    #[allow(clippy::too_many_lines)]
+    pub async fn hard_delete_with_event(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        retention: Duration,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let operator = self.operator;
         // Pre-read the grace tenant's deletion instant for the window decision. Only a
@@ -45090,6 +46425,15 @@ impl ActingTenantRepo<'_> {
                     .bind(purged_micros)
                     .execute(&mut **tx)
                     .await?;
+                    // TENANT-SCOPED, one row per environment (issue #108). The loop has
+                    // already re-scoped to this environment, which is exactly what FORCE
+                    // row-level security on `outbox_messages` requires: a row must be
+                    // written under the environment it names, or the insert is REFUSED
+                    // rather than silently mis-scoped. In the same transaction as the
+                    // change it announces.
+                    let announced = EnvironmentId::parse(&env_id)
+                        .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+                    enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
                 }
                 // 3. Restore the audit scope's row-level-security variables.
                 sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
@@ -45143,6 +46487,38 @@ impl ActingEnvironmentRepo<'_> {
         environment: NewEnvironment<'_>,
         signing_keys: &[NewSigningKey<'_>],
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.create_with_event(
+            env,
+            environment_id,
+            created_at_micros,
+            environment,
+            signing_keys,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create`], additionally emitting `environment.created` (issue #108).
+    ///
+    /// The event lands in the NEW environment's own outbox. That is where it belongs, and it
+    /// is also the only place forced row-level security accepts it: an outbox row must be
+    /// written under the environment it names.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        environment_id: &EnvironmentId,
+        created_at_micros: i64,
+        environment: NewEnvironment<'_>,
+        signing_keys: &[NewSigningKey<'_>],
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let scope = Scope::new(self.tenant, *environment_id);
         // An environment must be created with at least one signing key, or its JWKS is
@@ -45244,6 +46620,10 @@ impl ActingEnvironmentRepo<'_> {
                     insert_signing_key_row(tx, &scope, signing_key).await?;
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction, into the NEW environment's own outbox: the
+                // scope above IS the new scope, which is what forced row-level security
+                // requires and what a consumer needs to see.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -45270,6 +46650,22 @@ impl ActingEnvironmentRepo<'_> {
         id: &EnvironmentId,
         posture: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.set_auto_link_posture_with_event(env, id, posture, None)
+            .await
+    }
+
+    /// [`Self::set_auto_link_posture`], additionally emitting `environment.auto_link_posture_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_auto_link_posture`].
+    pub async fn set_auto_link_posture_with_event(
+        &self,
+        env: &Env,
+        id: &EnvironmentId,
+        posture: Option<&str>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = Scope::new(self.tenant, *id);
         let tenant = self.tenant;
         let posture = posture.map(str::to_owned);
@@ -45295,6 +46691,8 @@ impl ActingEnvironmentRepo<'_> {
                 if updated.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -45427,6 +46825,34 @@ impl ActingManagementCredentialRepo<'_> {
         display_name: &str,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(
+            env,
+            id,
+            created_at_micros,
+            key_hash,
+            display_name,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create`], additionally emitting `management_key.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        id: &ManagementKeyId,
+        created_at_micros: i64,
+        key_hash: &str,
+        display_name: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -45456,6 +46882,8 @@ impl ActingManagementCredentialRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back mint announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -45704,6 +47132,23 @@ impl ActingOrganizationRepo<'_> {
         state: OrganizationState,
         idempotency: Option<ResolvedIdempotencyWrite<'_, OrganizationRecord>>,
     ) -> Result<OrganizationRecord, StoreError> {
+        self.set_state_with_event(env, id, state, idempotency, None)
+            .await
+    }
+
+    /// [`Self::set_state`], additionally emitting `organization.state_changed` (#108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_state`].
+    pub async fn set_state_with_event(
+        &self,
+        env: &Env,
+        id: &OrganizationId,
+        state: OrganizationState,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, OrganizationRecord>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<OrganizationRecord, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -45742,6 +47187,8 @@ impl ActingOrganizationRepo<'_> {
                 };
                 let record = organization_from_row(&row, &scope)?;
                 insert_resolved_idempotency(tx, idempotency, &record).await?;
+                // In the write's transaction: a rolled-back flip announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(record)
             },
             false,
@@ -45804,6 +47251,24 @@ impl ActingOrgMembershipRepo<'_> {
         spec: NewMembership<'_>,
         created_at_micros: i64,
         idempotency: Option<ResolvedIdempotencyWrite<'_, OrgMembershipRecord>>,
+    ) -> Result<OrgMembershipRecord, StoreError> {
+        self.create_with_event(env, spec, created_at_micros, idempotency, None, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `organization.member_added` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewMembership<'_>,
+        created_at_micros: i64,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, OrgMembershipRecord>>,
+        event: Option<&DomainEvent<'_>>,
+        delta_event: Option<&DomainEvent<'_>>,
     ) -> Result<OrgMembershipRecord, StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
@@ -45870,6 +47335,13 @@ impl ActingOrgMembershipRepo<'_> {
         // the write: the response and the row it describes commit together or not at
         // all.
         insert_resolved_idempotency(&mut tx, idempotency, &record).await?;
+        // BEFORE the commit, inside the write's own transaction: a rolled-back membership
+        // announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
+        // The DELTA form of the same change (issue #107), in this same
+        // transaction. A consumer subscribed to either shape sees the change
+        // exactly when the row commits, and never one form without the other.
+        enqueue_domain_event(&mut tx, env, scope, delta_event).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -45978,6 +47450,21 @@ impl ActingOrgMembershipRepo<'_> {
     /// [`StoreError::NotFound`] if the id is not in this scope, or no live membership
     /// matched.
     pub async fn remove(&self, env: &Env, id: &OrgMembershipId) -> Result<(), StoreError> {
+        self.remove_with_event(env, id, None, None).await
+    }
+
+    /// [`Self::remove`], additionally emitting `organization.member_removed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove`].
+    pub async fn remove_with_event(
+        &self,
+        env: &Env,
+        id: &OrgMembershipId,
+        event: Option<&DomainEvent<'_>>,
+        delta_event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -46059,6 +47546,12 @@ impl ActingOrgMembershipRepo<'_> {
                     tx, store, scope, &acting, env, id, now_micros,
                 )
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                // The DELTA form of the same change (issue #107), in this same
+                // transaction. A consumer subscribed to either shape sees the change
+                // exactly when the row commits, and never one form without the other.
+                enqueue_domain_event(tx, env, scope, delta_event).await?;
                 Ok(())
             },
             false,
@@ -46724,6 +48217,23 @@ impl ActingOrgRoleRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `org_role.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgRole<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope || spec.organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -46771,6 +48281,8 @@ impl ActingOrgRoleRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -46800,6 +48312,23 @@ impl ActingOrgRoleRepo<'_> {
         id: &OrgRoleId,
         display_name: Option<&str>,
         metadata: Option<&serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        self.update_with_event(env, id, display_name, metadata, None)
+            .await
+    }
+
+    /// [`Self::update`], additionally emitting `org_role.updated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::update`].
+    pub async fn update_with_event(
+        &self,
+        env: &Env,
+        id: &OrgRoleId,
+        display_name: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -46838,6 +48367,8 @@ impl ActingOrgRoleRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -46972,6 +48503,22 @@ impl ActingOrgRoleRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgRoleId,
     ) -> Result<(), StoreError> {
+        self.set_default_with_event(env, organization_id, id, None)
+            .await
+    }
+
+    /// [`Self::set_default`], additionally emitting `organization.default_role_set` (#108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_default`].
+    pub async fn set_default_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgRoleId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47027,6 +48574,8 @@ impl ActingOrgRoleRepo<'_> {
                     }
                     Err(error) => return Err(error.into()),
                 }
+                // In the write's transaction: a rolled-back designation announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -47065,6 +48614,25 @@ impl ActingOrgRoleRepo<'_> {
         env: &Env,
         organization_id: &OrganizationId,
     ) -> Result<OrgRoleId, StoreError> {
+        self.clear_default_with_event(env, organization_id, None)
+            .await
+    }
+
+    /// [`Self::clear_default`], additionally emitting
+    /// `organization.default_role_cleared` (issue #108).
+    ///
+    /// Enqueued AFTER the guard: the update matches only a live default row, so clearing an
+    /// organization that has no default is the uniform not-found and announces nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::clear_default`].
+    pub async fn clear_default_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<OrgRoleId, StoreError> {
         if organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47096,6 +48664,9 @@ impl ActingOrgRoleRepo<'_> {
             target: &cleared_id,
         };
         insert_audit_row(&mut tx, &spec, None).await?;
+        // After the guard above found a live default, so an organization with none announces
+        // nothing, and inside the transaction so a rolled-back clear stays silent.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(cleared_id)
     }
@@ -47275,6 +48846,23 @@ impl ActingPermissionRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `permission.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewPermission<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47321,6 +48909,8 @@ impl ActingPermissionRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -47364,6 +48954,23 @@ impl ActingPermissionRepo<'_> {
         display_name: Option<&str>,
         metadata: Option<&serde_json::Value>,
     ) -> Result<(), StoreError> {
+        self.update_with_event(env, id, display_name, metadata, None)
+            .await
+    }
+
+    /// [`Self::update`], additionally emitting `permission.updated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::update`].
+    pub async fn update_with_event(
+        &self,
+        env: &Env,
+        id: &PermissionId,
+        display_name: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47402,6 +49009,8 @@ impl ActingPermissionRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -47560,6 +49169,31 @@ impl ActingOrgGroupRepo<'_> {
         max_group_depth: u32,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(
+            env,
+            spec,
+            created_at_micros,
+            max_group_depth,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create`], additionally emitting `org_group.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgGroup<'_>,
+        created_at_micros: i64,
+        max_group_depth: u32,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope || spec.organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47634,6 +49268,8 @@ impl ActingOrgGroupRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -47682,6 +49318,24 @@ impl ActingOrgGroupRepo<'_> {
         display_name: Option<&str>,
         metadata: Option<&serde_json::Value>,
     ) -> Result<(), StoreError> {
+        self.update_with_event(env, organization_id, id, display_name, metadata, None)
+            .await
+    }
+
+    /// [`Self::update`], additionally emitting `org_group.updated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::update`].
+    pub async fn update_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupId,
+        display_name: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47721,6 +49375,8 @@ impl ActingOrgGroupRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -47806,6 +49462,31 @@ impl ActingOrgGroupRepo<'_> {
         group_id: &OrgGroupId,
         parent_id: Option<&OrgGroupId>,
         max_group_depth: u32,
+    ) -> Result<(), StoreError> {
+        self.reparent_with_event(
+            env,
+            organization_id,
+            group_id,
+            parent_id,
+            max_group_depth,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::reparent`], additionally emitting `org_group.reparented` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reparent`].
+    pub async fn reparent_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        group_id: &OrgGroupId,
+        parent_id: Option<&OrgGroupId>,
+        max_group_depth: u32,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || group_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -47900,6 +49581,8 @@ impl ActingOrgGroupRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -47973,6 +49656,21 @@ impl ActingOrgGroupRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgGroupId,
     ) -> Result<(), StoreError> {
+        self.delete_with_event(env, organization_id, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `org_group.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48009,6 +49707,8 @@ impl ActingOrgGroupRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -48072,6 +49772,24 @@ impl ActingOrgGroupMemberRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.add_with_event(env, spec, created_at_micros, idempotency, None, None)
+            .await
+    }
+
+    /// [`Self::add`], additionally emitting `org_group.member_added` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::add`].
+    pub async fn add_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgGroupMember<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+        delta_event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.group_id.scope() != self.scope
@@ -48122,6 +49840,12 @@ impl ActingOrgGroupMemberRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back add announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                // The DELTA form of the same change (issue #107), in this same
+                // transaction. A consumer subscribed to either shape sees the change
+                // exactly when the row commits, and never one form without the other.
+                enqueue_domain_event(tx, env, scope, delta_event).await?;
                 Ok(())
             },
             false,
@@ -48157,6 +49881,23 @@ impl ActingOrgGroupMemberRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgGroupMemberId,
     ) -> Result<(), StoreError> {
+        self.remove_with_event(env, organization_id, id, None, None)
+            .await
+    }
+
+    /// [`Self::remove`], additionally emitting `org_group.member_removed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove`].
+    pub async fn remove_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupMemberId,
+        event: Option<&DomainEvent<'_>>,
+        delta_event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48181,7 +49922,14 @@ impl ActingOrgGroupMemberRepo<'_> {
                     &id.to_string(),
                     now_micros,
                 )
-                .await
+                .await?;
+                // AFTER the delete's own guard: removing what is not a member announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                // The DELTA form of the same change (issue #107), in this same
+                // transaction. A consumer subscribed to either shape sees the change
+                // exactly when the row commits, and never one form without the other.
+                enqueue_domain_event(tx, env, scope, delta_event).await?;
+                Ok(())
             },
             false,
         )
@@ -48233,6 +49981,23 @@ impl ActingOrgGroupRoleRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.assign_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::assign`], additionally emitting `org_role.assigned_to_group` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::assign`].
+    pub async fn assign_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgGroupRole<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.group_id.scope() != self.scope
@@ -48283,6 +50048,8 @@ impl ActingOrgGroupRoleRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back grant announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -48310,6 +50077,22 @@ impl ActingOrgGroupRoleRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgGroupRoleId,
     ) -> Result<(), StoreError> {
+        self.unassign_with_event(env, organization_id, id, None)
+            .await
+    }
+
+    /// [`Self::unassign`], additionally emitting `org_role.unassigned_from_group` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::unassign`].
+    pub async fn unassign_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupRoleId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48334,7 +50117,11 @@ impl ActingOrgGroupRoleRepo<'_> {
                     &id.to_string(),
                     now_micros,
                 )
-                .await
+                .await?;
+                // AFTER the delete's own guard, so unassigning what is not assigned
+                // announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )
@@ -48381,6 +50168,23 @@ impl ActingOrgMembershipRoleRepo<'_> {
         spec: NewOrgMembershipRole<'_>,
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.assign_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::assign`], additionally emitting `org_role.assigned_to_member` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::assign`].
+    pub async fn assign_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgMembershipRole<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
@@ -48432,6 +50236,8 @@ impl ActingOrgMembershipRoleRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back grant announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -48459,6 +50265,22 @@ impl ActingOrgMembershipRoleRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgMembershipRoleId,
     ) -> Result<(), StoreError> {
+        self.unassign_with_event(env, organization_id, id, None)
+            .await
+    }
+
+    /// [`Self::unassign`], additionally emitting `org_role.unassigned_from_member` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::unassign`].
+    pub async fn unassign_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgMembershipRoleId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48483,7 +50305,11 @@ impl ActingOrgMembershipRoleRepo<'_> {
                     &id.to_string(),
                     now_micros,
                 )
-                .await
+                .await?;
+                // AFTER the delete's own guard, so unassigning what is not assigned
+                // announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )
@@ -48678,6 +50504,23 @@ impl ActingOrgRolePermissionRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<ResolvedIdempotencyWrite<'_, i64>>,
     ) -> Result<i64, StoreError> {
+        self.assign_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::assign`], additionally emitting `org_role.permission_granted` (#108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::assign`].
+    pub async fn assign_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgRolePermission<'_>,
+        created_at_micros: i64,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, i64>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<i64, StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.role_id.scope() != self.scope
@@ -48752,6 +50595,8 @@ impl ActingOrgRolePermissionRepo<'_> {
                 // transaction, so the response and every replay of it agree with the state
                 // they describe.
                 insert_resolved_idempotency(tx, idempotency, &attached).await?;
+                // In the write's transaction: a rolled-back grant announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(attached)
             },
             false,
@@ -48787,6 +50632,22 @@ impl ActingOrgRolePermissionRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgRolePermissionId,
     ) -> Result<(), StoreError> {
+        self.unassign_with_event(env, organization_id, id, None)
+            .await
+    }
+
+    /// [`Self::unassign`], additionally emitting `org_role.permission_revoked` (#108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::unassign`].
+    pub async fn unassign_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgRolePermissionId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48811,7 +50672,10 @@ impl ActingOrgRolePermissionRepo<'_> {
                     &id.to_string(),
                     now_micros,
                 )
-                .await
+                .await?;
+                // AFTER the delete's guard: revoking what is not granted announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )
@@ -53342,6 +55206,26 @@ impl ActingEnvironmentVariableRepo<'_> {
         value: &str,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<VariableId, StoreError> {
+        self.set_with_event(env, name, value, idempotency, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `environment_variable.set` (issue #108).
+    ///
+    /// Enqueued inside the write's transaction, so a consumer is never told to refetch a
+    /// value a rolled-back write never stored.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        name: &str,
+        value: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<VariableId, StoreError> {
         if !crate::esv::name_is_valid(name) {
             return Err(StoreError::InvalidName);
         }
@@ -53380,6 +55264,9 @@ impl ActingEnvironmentVariableRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: never tell a consumer to refetch a value a
+                // rolled-back write never stored.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -53528,6 +55415,24 @@ impl ActingEnvironmentSecretRepo<'_> {
         plaintext: &[u8],
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<EnvironmentSecretId, StoreError> {
+        self.put_with_event(env, master, name, plaintext, idempotency, None)
+            .await
+    }
+
+    /// [`Self::put`], additionally emitting `environment_secret.set` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put`].
+    pub async fn put_with_event(
+        &self,
+        env: &Env,
+        master: &MasterKey,
+        name: &str,
+        plaintext: &[u8],
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<EnvironmentSecretId, StoreError> {
         if !crate::esv::name_is_valid(name) {
             return Err(StoreError::InvalidName);
         }
@@ -53579,6 +55484,8 @@ impl ActingEnvironmentSecretRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back put announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -53609,6 +55516,28 @@ impl ActingEnvironmentSecretRepo<'_> {
         self.put(env, master, name, plaintext, idempotency).await
     }
 
+    /// [`Self::put_under_platform_key`], additionally emitting `environment_secret.set`
+    /// (issue #108).
+    ///
+    /// The event carries the secret's NAME and nothing derived from its value; the sealing
+    /// still happens inside the store, and the caller still never holds a key handle.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put_under_platform_key`].
+    pub async fn put_under_platform_key_with_event(
+        &self,
+        env: &Env,
+        name: &str,
+        plaintext: &[u8],
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<EnvironmentSecretId, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.put_with_event(env, master, name, plaintext, idempotency, event)
+            .await
+    }
+
     /// Delete a secret and audit `environment_secret.delete` in the same
     /// transaction (issue #45). REJECTED while a live variable value in the scope
     /// still references it (the same referent protection variables have); the
@@ -53620,6 +55549,20 @@ impl ActingEnvironmentSecretRepo<'_> {
     /// [`StoreError::Conflict`] if the secret is still referenced;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, name: &str) -> Result<(), StoreError> {
+        self.delete_with_event(env, name, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `environment_secret.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        name: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let id = self.secret_id(name).await?;
         let reference = crate::esv::Reference {
@@ -53658,6 +55601,8 @@ impl ActingEnvironmentSecretRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // AFTER the guard, so deleting a secret that is not there announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -54350,6 +56295,32 @@ impl ActingStore<'_> {
         base_revision: &str,
         poison_after_audit: bool,
     ) -> Result<crate::promotion::PromotionOutcome, crate::promotion::PromotionApplyError> {
+        self.apply_promotion_with_event(env, source, base_revision, poison_after_audit, None)
+            .await
+    }
+
+    /// [`Self::apply_promotion`], additionally emitting `config_promotion.applied`
+    /// (issue #108).
+    ///
+    /// Only an APPLIED promotion announces. The no-op branch commits and returns before the
+    /// enqueue, so a consumer never invalidates a cache over a promotion that changed nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apply_promotion`].
+    // The length is the promotion applier's own -- the drift gate, the advisory lock, and
+    // the per-kind apply, each carrying the reasoning that makes it safe. The event added
+    // two lines to a function already at the limit; splitting the applier to buy them back
+    // would move that reasoning away from the code it is about.
+    #[allow(clippy::too_many_lines)]
+    pub async fn apply_promotion_with_event(
+        &self,
+        env: &Env,
+        source: &crate::snapshot::Snapshot,
+        base_revision: &str,
+        poison_after_audit: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<crate::promotion::PromotionOutcome, crate::promotion::PromotionApplyError> {
         use crate::promotion::{ChangeKind, PromotionApplyError, PromotionOutcome};
 
         let scope = self.scope;
@@ -54506,6 +56477,8 @@ impl ActingStore<'_> {
             sqlx::query("SELECT 1 / 0").execute(&mut *tx).await?;
         }
 
+        // Only here: the no-op branch above already committed and returned.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(PromotionOutcome::Applied(plan_diff))
     }
@@ -56312,6 +58285,36 @@ impl ActingTraitSchemaRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_version_at_with_event(
+            env,
+            id,
+            schema_json,
+            version,
+            created_at_micros,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create_version_at`], additionally emitting `trait_schema.version_created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_version_at`].
+    // Its sibling already takes seven; this adds exactly one optional event and reshaping the
+    // existing signature to stay under the bound would change a public API for a lint.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_version_at_with_event(
+        &self,
+        env: &Env,
+        id: &TraitSchemaId,
+        schema_json: &str,
+        version: i32,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         // Prove the schema is well formed BEFORE the transaction: a malformed schema
         // never reaches the registry.
         TraitSchema::compile(schema_json)?;
@@ -56352,7 +58355,8 @@ impl ActingTraitSchemaRepo<'_> {
                 .execute(&mut **tx)
                 .await;
                 match result {
-                    Ok(_) => Ok(()),
+                    // Announced on the SUCCESS arm only: a refused registration says nothing.
+                    Ok(_) => enqueue_domain_event(tx, env, scope, event).await,
                     // The append-only unique index refused a concurrently-taken version.
                     Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
                     Err(error) => Err(error.into()),
@@ -56395,6 +58399,22 @@ impl ActingTraitSchemaRepo<'_> {
         env: &Env,
         version: i32,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.activate_version_idempotent_with_event(env, version, idempotency, None)
+            .await
+    }
+
+    /// [`Self::activate_version_idempotent`], additionally emitting `trait_schema.version_activated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::activate_version_idempotent`].
+    pub async fn activate_version_idempotent_with_event(
+        &self,
+        env: &Env,
+        version: i32,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
@@ -56466,6 +58486,8 @@ impl ActingTraitSchemaRepo<'_> {
                 .bind(version)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -56687,6 +58709,24 @@ impl ActingTraitMigrationJobRepo<'_> {
         created_at_micros: i64,
         start: TraitMigrationStart<'_>,
     ) -> Result<(), StoreError> {
+        self.create_with_id_with_event(env, id, spec, created_at_micros, start, None)
+            .await
+    }
+
+    /// [`Self::create_with_id`], additionally emitting `trait_migration_job.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_with_id`].
+    pub async fn create_with_id_with_event(
+        &self,
+        env: &Env,
+        id: &TraitMigrationJobId,
+        spec: NewTraitMigrationJob<'_>,
+        created_at_micros: i64,
+        start: TraitMigrationStart<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         if id.scope() != scope {
             return Err(StoreError::NotFound);
@@ -56786,6 +58826,8 @@ impl ActingTraitMigrationJobRepo<'_> {
                 )
                 .await?;
                 insert_idempotency(tx, start.idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -58241,6 +60283,24 @@ impl ActingMigrationRunRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_id_with_event(env, id, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create_with_id`], additionally emitting `identity_import.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_with_id`].
+    pub async fn create_with_id_with_event(
+        &self,
+        env: &Env,
+        id: &MigrationRunId,
+        spec: NewMigrationRun<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -58280,6 +60340,8 @@ impl ActingMigrationRunRepo<'_> {
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -58303,6 +60365,21 @@ impl ActingMigrationRunRepo<'_> {
         env: &Env,
         run_id: &MigrationRunId,
         to: MigrationState,
+    ) -> Result<(), StoreError> {
+        self.transition_with_event(env, run_id, to, None).await
+    }
+
+    /// [`Self::transition`], additionally emitting `identity_import.state_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::transition`].
+    pub async fn transition_with_event(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+        to: MigrationState,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if run_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -58339,6 +60416,8 @@ impl ActingMigrationRunRepo<'_> {
                 .bind(scope.environment().to_string())
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -58757,6 +60836,26 @@ impl ActingMigrationRunRepo<'_> {
         reason: &str,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.abandon_with_event(env, run_id, reason, idempotency, None)
+            .await
+    }
+
+    /// [`Self::abandon`], additionally emitting `identity_import.state_changed` (issue #108).
+    ///
+    /// The enqueue sits after the terminal-state guard, so an abandon the state machine
+    /// refuses announces nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::abandon`].
+    pub async fn abandon_with_event(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+        reason: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if run_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -58794,6 +60893,9 @@ impl ActingMigrationRunRepo<'_> {
                 .await?;
                 // In the SAME transaction as the state flip and its audit row.
                 insert_idempotency(tx, idempotency).await?;
+                // Likewise, and after the terminal-state guard above: a refused transition
+                // announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -58925,6 +61027,23 @@ impl ActingProjectGrantRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `project_grant.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewProjectGrant<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope
             || spec.client_id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
@@ -59023,6 +61142,8 @@ impl ActingProjectGrantRepo<'_> {
                     .await?;
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -59047,6 +61168,23 @@ impl ActingProjectGrantRepo<'_> {
         id: &ProjectGrantId,
         now_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.withdraw_with_event(env, id, now_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::withdraw`], additionally emitting `project_grant.withdrawn` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::withdraw`].
+    pub async fn withdraw_with_event(
+        &self,
+        env: &Env,
+        id: &ProjectGrantId,
+        now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -59081,6 +61219,8 @@ impl ActingProjectGrantRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -59848,6 +61988,26 @@ impl ActingApiKeyRepo<'_> {
         now_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, spec, now_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `api_key.created` (issue #108).
+    ///
+    /// Enqueued inside the write's transaction, so a credential is never announced into
+    /// existence by a create that rolled back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewApiKey<'_>,
+        now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -59907,6 +62067,9 @@ impl ActingApiKeyRepo<'_> {
                 // client that times out and retries ends up holding one key while a second,
                 // equally valid one exists that it never saw and cannot revoke.
                 insert_idempotency(tx, idempotency).await?;
+                // In the SAME transaction as the key, so a credential is never announced
+                // into existence by a create that rolled back.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             // No poison-after-audit: this write creates a credential rather than destroying
@@ -60059,6 +62222,33 @@ impl ActingApiKeyRepo<'_> {
         now_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.rotate_with_event(env, old, replacement, now_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::rotate`], additionally emitting `api_key.rotated` (issue #108).
+    ///
+    /// ONE event naming BOTH ids, not an `api_key.created` plus an `api_key.revoked`. The
+    /// rotation is one transaction precisely so that no window exists where both keys are
+    /// live; two events would put that window back on the wire, where a consumer could not
+    /// tell a real rotation from an unrelated create that happened near a revoke and would
+    /// have to infer the pairing from timing.
+    ///
+    /// Enqueued inside that same transaction, after both halves, so a rotation that rolled
+    /// back announces nothing and no receiver is told a live key is dead.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::rotate`].
+    pub async fn rotate_with_event(
+        &self,
+        env: &Env,
+        old: &ApiKeyId,
+        replacement: NewApiKey<'_>,
+        now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if old.scope() != self.scope || replacement.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -60152,6 +62342,9 @@ impl ActingApiKeyRepo<'_> {
         // key, so the retry mints a SECOND new credential and the caller cannot tell which of
         // the two is the one it was handed.
         insert_idempotency(&mut tx, idempotency).await?;
+        // After BOTH halves, in the same transaction: a rotation that rolled back announces
+        // nothing, and no receiver is ever told a still-live key is dead.
+        enqueue_domain_event(&mut tx, env, self.scope, event).await?;
         tx.commit().await?;
         Ok(())
     }

@@ -140,18 +140,30 @@ pub async fn authorize_user_impersonation(
     };
     let body_string = serde_json::to_string(&authorized).map_err(|_| ApiError::Internal)?;
 
+    let pending = impersonation_authorized_event(
+        &state,
+        scope,
+        &id,
+        &target,
+        &request.reason_code,
+        act.expires_at_unix_micros(),
+    );
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .impersonation_authorizations()
-        .issue(
+        .issue_with_event(
             state.env(),
             NewImpersonationAuthorization {
                 id: &id,
                 user_id: &target,
                 impersonation: act,
             },
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -160,4 +172,46 @@ pub async fn authorize_user_impersonation(
         Err(StoreError::NotFound) => Err(ApiError::NotFound),
         Err(_) => Err(ApiError::Internal),
     }
+}
+
+/// The event an impersonation authorization emits (issue #108).
+///
+/// An operator was authorized to BECOME a user: the widest authority this surface hands out,
+/// reaching everything that user can reach. A consumer running detection or oversight acts on
+/// this above almost anything else the management plane emits.
+///
+/// The expiry travels because the authorization is time-boxed, and a receiver that cannot see
+/// the box has to treat every authorization as permanent. The reason CODE travels because it
+/// is a registered classification. The reason TEXT does not: it is prose an operator wrote
+/// about a person's account, and it belongs in the audit trail, which is a narrower audience
+/// than a webhook.
+fn impersonation_authorized_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    authorization_id: &ImpersonationAuthorizationId,
+    user_id: &ironauth_store::UserId,
+    reason_code: &str,
+    expires_at_unix_micros: i64,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "impersonation.authorized",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "authorization_id": authorization_id.to_string(),
+            "user_id": user_id.to_string(),
+            "reason_code": reason_code,
+            "expires_at_unix_ms": expires_at_unix_micros / 1000,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The USER is the subject: every authorization against one person stays ordered, and
+        // an oversight consumer reads them as one timeline.
+        subject: user_id.to_string(),
+        envelope,
+    })
 }

@@ -751,3 +751,102 @@ fn assert_permission_denied(
         other => panic!("expected permission denied (42501) for `{what}`, got: {other:?}"),
     }
 }
+
+/// Claim the one webhook event outstanding in `scope`, completing it so the ordering key is
+/// released for the next.
+async fn claim_one_event(db: &TestDatabase, env: &Env, scope: Scope) -> serde_json::Value {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "expected exactly one queued event");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().next().expect("one message").payload
+}
+
+/// Approving and rejecting a recovery request both announce the DECISION.
+///
+/// One type carrying the decision, because approve and reject are the same review reaching
+/// opposite conclusions -- and a consumer must act on BOTH. An approval is an account takeover
+/// if the request was fraudulent, so "someone regained access" and "someone was refused" are
+/// equally worth alerting on; a producer that only announced approvals would leave the refusal
+/// side of an account-recovery audit blank.
+///
+/// TWO separate flows, because a decided flow cannot be decided again -- which is itself the
+/// reason the events are one-per-decision rather than a state stream.
+#[tokio::test]
+async fn approving_and_rejecting_a_recovery_request_announce_the_decision() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    for (seed, decision, event_id) in [
+        (21_u8, "approved", "evt_recovery_approved"),
+        (22, "rejected", "evt_recovery_rejected"),
+    ] {
+        let flow = seed_completable_flow(&db, &env, scope, seed).await;
+        let subject = flow.to_string();
+        let envelope = ironauth_store::event_catalog::envelope(
+            event_id,
+            "recovery_approval.decided",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            1,
+            &serde_json::json!({ "recovery_flow_id": subject, "decision": decision }),
+        )
+        .expect("recovery_approval.decided is registered");
+        let domain_event = ironauth_store::DomainEvent {
+            id: event_id,
+            subject: &subject,
+            envelope: &envelope,
+        };
+
+        let acting = db
+            .control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env));
+        if decision == "approved" {
+            acting
+                .recovery_approvals()
+                .approve_with_event(&env, &flow, None, Some(&domain_event))
+                .await
+                .expect("approve with event");
+        } else {
+            acting
+                .recovery_approvals()
+                .reject_with_event(&env, &flow, None, Some(&domain_event))
+                .await
+                .expect("reject with event");
+        }
+
+        let event = claim_one_event(&db, &env, scope).await;
+        assert_eq!(event["type"], "recovery_approval.decided");
+        assert_eq!(event["payload"]["recovery_flow_id"], subject);
+        assert_eq!(
+            event["payload"]["decision"], decision,
+            "the event must carry the decision the write RECORDED, not a fixed value"
+        );
+        assert!(
+            event["payload"].get("completed").is_none(),
+            "the producer cannot know whether the flow completed, so it must not claim to: \
+             {event}"
+        );
+        ironauth_store::event_catalog::validate_event(&event)
+            .expect("the envelope validates against the registry the fan-out enforces");
+    }
+}

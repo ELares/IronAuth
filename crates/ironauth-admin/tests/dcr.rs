@@ -241,3 +241,86 @@ async fn get_and_verify_are_anti_oracle_and_operator_gated() {
     let (status, _headers, _body) = h.get_as(&base, "not-a-real-token").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// Minting an initial access token announces the MINT and never the token.
+///
+/// The token is a bearer credential that lets its holder register a client, and the mint is
+/// exactly when it is live -- so this is the one moment where putting it on a webhook would
+/// hand every subscriber the ability to register clients. The id is what an operator revokes
+/// by, and it is enough.
+///
+/// The policy create is announced too, so the mint's event is identified by TYPE rather than
+/// by being the only thing in the queue -- and the token is asserted absent from EVERY queued
+/// event, not just this one.
+#[tokio::test]
+async fn minting_an_initial_access_token_announces_it_without_the_token() {
+    use ironauth_store::{EnvironmentId, Scope, TenantId};
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "iat-evt").await;
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let policies_path = format!("/v1/tenants/{tenant}/environments/{environment}/dcr/policies");
+    let iat_path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/dcr/initial-access-tokens");
+
+    let policy = json!({
+        "name": "p-evt",
+        "primitives": [force_primitive("token_endpoint_auth_method", "private_key_jwt")]
+    })
+    .to_string();
+    let (status, _, body) = h.post(&policies_path, "p-evt-key", &policy).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let mint =
+        json!({ "policy_names": ["p-evt"], "expires_in_secs": 3600, "max_uses": 5 }).to_string();
+    let (status, _, created) = h.post(&iat_path, "iat-evt-key", &mint).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let created = body_json(&created);
+    let token = created["token"]
+        .as_str()
+        .expect("plaintext token")
+        .to_owned();
+    let token_id = created["id"].as_str().expect("id").to_owned();
+
+    let events = h
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &ironauth_env::Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect::<Vec<_>>();
+
+    let minted = events
+        .iter()
+        .find(|event| event["type"] == "dcr_initial_access_token.minted")
+        .expect("the mint is announced");
+    assert_eq!(minted["payload"]["initial_access_token_id"], token_id);
+    ironauth_store::event_catalog::validate_event(minted)
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "dcr_policy.created"),
+        "the policy create is announced too: {events:?}"
+    );
+
+    for event in &events {
+        assert!(
+            !event.to_string().contains(&token),
+            "an event carried the initial access TOKEN: {event}"
+        );
+    }
+}

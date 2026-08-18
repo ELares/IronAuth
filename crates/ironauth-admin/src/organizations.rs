@@ -475,6 +475,7 @@ async fn set_organization_state(
     let render = |resolved: &OrganizationRecord| {
         serde_json::to_string(&OrganizationView::from_record(resolved.clone()))
     };
+    let pending = organization_state_changed_event(state, scope, &id, target);
     let record = state
         .store()
         .management()
@@ -485,7 +486,7 @@ async fn set_organization_state(
         // this is.
         .in_organization(id)
         .organizations(scope)
-        .set_state(
+        .set_state_with_event(
             state.env(),
             &id,
             target,
@@ -496,6 +497,10 @@ async fn set_organization_state(
                 response_status: 200,
                 response_body: &render,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     let body = serde_json::to_string(&OrganizationView::from_record(record))
@@ -590,4 +595,37 @@ pub async fn enable_organization(
         },
     )
     .await
+}
+
+/// The event enabling or disabling an organization emits (issue #108).
+///
+/// ONE type carrying the new STATE, not an `enabled` and a `disabled`. The same shape as
+/// `webhook_endpoint.active_changed` and for the same reason: these are the same transition in
+/// two directions over one value, and a consumer mirroring "is this organization serving"
+/// wants one subscription with a field to read rather than two to correlate.
+///
+/// The shared handler body already refuses to let the two paths disagree -- "enable and
+/// disable must not disagree about whose event this is" -- and one type makes that
+/// structural rather than a rule to remember.
+fn organization_state_changed_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    organization_id: &ironauth_store::OrganizationId,
+    target: ironauth_store::OrganizationState,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = organization_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "organization.state_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "organization_id": subject, "state": target.as_str() }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

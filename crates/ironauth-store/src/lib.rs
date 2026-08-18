@@ -333,8 +333,8 @@ pub use repository::{
     WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,
 };
 pub use repository::{
-    AuditChainRepo, ChainEntry, ChainFault, ChainVerified, ChainedAuditRow, LogStreamRepo,
-    NewLogStream, PruneReport, SealReport, verify_chain_entries,
+    AuditChainRepo, ChainEntry, ChainFault, ChainVerified, ChainedAuditRow, CursorOrigin,
+    LogStreamRepo, NewLogStream, PruneReport, SealReport, verify_chain_entries,
 };
 /// The testing-only atomicity probes (issue #247): the seams at which a test can force
 /// the joined invitation create and the joined recovery approve to fail INSIDE their one

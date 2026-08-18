@@ -731,16 +731,30 @@ pub async fn set_outbound_verification(
     // and no response.
     // A deployment with no platform master key cannot seal, and the store answers
     // `StoreError::Encryption` for that rather than substituting a plaintext write.
+    // The SECRET NAME only: the same producer, and the same refusal, as every other
+    // environment-secret write (issue #108). Nothing derived from the token goes on the wire
+    // -- not a digest, not a length -- because an event is a wider audience than the
+    // management read surface, which will not return the value either.
+    let pending = crate::secrets::environment_secret_event(
+        &state,
+        scope,
+        OUTBOUND_VERIFICATION_SECRET_NAME,
+        "environment_secret.set",
+    );
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .environment_secrets()
-        .put_under_platform_key(
+        .put_under_platform_key_with_event(
             state.env(),
             OUTBOUND_VERIFICATION_SECRET_NAME,
             token.as_bytes(),
             None,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
 
@@ -811,12 +825,28 @@ pub async fn delete_outbound_verification(
     // NOT fail the absent-environment sweep by way of a constraint; it fails it by way
     // of this check and nothing else.
     require_present_environment(&state, &scope).await?;
+    // Announced as the environment-secret deletion it is (issue #108). The enqueue sits after
+    // the store's own guard, so the already-disabled arm below -- a SUCCESS, not a 404 --
+    // announces nothing: a consumer must not see a disarming that did not happen.
+    let pending = crate::secrets::environment_secret_event(
+        &state,
+        scope,
+        OUTBOUND_VERIFICATION_SECRET_NAME,
+        "environment_secret.deleted",
+    );
     match state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .environment_secrets()
-        .delete(state.env(), OUTBOUND_VERIFICATION_SECRET_NAME)
+        .delete_with_event(
+            state.env(),
+            OUTBOUND_VERIFICATION_SECRET_NAME,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await
     {
         // The two success arms are deliberately the SAME answer, which is why they are

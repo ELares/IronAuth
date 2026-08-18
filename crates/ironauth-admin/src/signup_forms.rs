@@ -218,12 +218,13 @@ pub async fn set_signup_form(
 
     let created_at_micros = state.now_unix_micros();
     let id = SignupFormId::generate(state.env(), &scope);
+    let pending = signup_form_set_event(&state, scope, &client_id);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .signup_forms()
-        .set(
+        .set_with_event(
             state.env(),
             &id,
             created_at_micros,
@@ -231,6 +232,10 @@ pub async fn set_signup_form(
                 client_id: &client_id,
                 fields_json: &fields_json,
             },
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
 
@@ -369,6 +374,35 @@ fn signup_form_deleted_event(
     Some(crate::events::PendingEvent {
         id,
         subject,
+        envelope,
+    })
+}
+
+/// The event a signup form write emits (issue #108).
+///
+/// Carries the STABLE ADDRESS and deliberately not the row id. `set` is an upsert, and the
+/// store reuses the EXISTING row's id when one is already present, minting the caller's id
+/// only on a first write -- so an event built from the id the handler has in hand would name
+/// a row that does not exist on every overwrite. This field is how the record is addressed
+/// everywhere else, and it is what a consumer refetches by.
+fn signup_form_set_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    client_id: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "signup_form.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "client_id": client_id }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The stable address is the subject, so two events about one record stay ordered.
+        subject: client_id.to_owned(),
         envelope,
     })
 }

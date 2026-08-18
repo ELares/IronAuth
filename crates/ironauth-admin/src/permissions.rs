@@ -386,12 +386,13 @@ pub async fn create_permission(
         response_status: 201,
         response_body: &body_string,
     };
+    let pending = permission_event(&state, scope, &permission_id, &slug, "permission.created");
     let result = state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .permissions(scope)
-        .create(
+        .create_with_event(
             state.env(),
             NewPermission {
                 id: &permission_id,
@@ -401,6 +402,10 @@ pub async fn create_permission(
             },
             created_at_micros,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -553,17 +558,31 @@ pub async fn update_permission(
         .as_deref()
         .map(|value| require_non_empty(value, "display_name"))
         .transpose()?;
+    // Built inside the guard, so a PATCH that changes nothing announces nothing: there is no
+    // write to announce, and a receiver told a permission changed would refetch an identical
+    // row.
     if display_name.is_some() || request.metadata.is_some() {
+        let pending = permission_event(
+            &state,
+            scope,
+            &record.id,
+            &record.slug,
+            "permission.updated",
+        );
         state
             .store()
             .management()
             .acting(actor, CorrelationId::generate(state.env()))
             .permissions(scope)
-            .update(
+            .update_with_event(
                 state.env(),
                 &record.id,
                 display_name.as_deref(),
                 request.metadata.as_ref(),
+                pending
+                    .as_ref()
+                    .map(crate::events::PendingEvent::domain_event)
+                    .as_ref(),
             )
             .await?;
     }
@@ -648,6 +667,40 @@ fn permission_deleted_event(
     let envelope = ironauth_store::event_catalog::envelope(
         &id,
         "permission.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "permission_id": subject, "slug": slug }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event a permission create or update emits (issue #108).
+///
+/// ONE builder for both, because the payload is identical and only the announced fact
+/// differs. The TYPES stay separate: an update changes the DISPLAY of an existing permission
+/// and never its slug, so a consumer treating it as a create would invent a permission its
+/// authorization model does not have.
+///
+/// The id AND the slug, mirroring the delete. A permission is referenced by slug in role
+/// grants and in an application's own authorization code, so an event carrying only the id
+/// would make a receiver resolve the name before it could act.
+fn permission_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    permission_id: &ironauth_store::PermissionId,
+    slug: &str,
+    event_type: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = permission_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
         &scope.tenant().to_string(),
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,

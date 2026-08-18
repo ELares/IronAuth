@@ -944,12 +944,21 @@ pub async fn link_user_external_id(
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
     let request: LinkExternalIdRequest = parse_json(&body)?;
     let external_id = require_non_empty(&request.external_id, "external_id")?;
+    let pending = external_id_linked_event(&state, scope, &id, Some(&external_id));
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .users()
-        .link_external_id(state.env(), &id, &external_id)
+        .link_external_id_with_event(
+            state.env(),
+            &id,
+            &external_id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
     match result {
         Ok(()) => {
@@ -997,12 +1006,20 @@ pub async fn unlink_user_external_id(
     principal.require_permission(ManagementPermission::WriteUsers)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id = resolve_user(&state, scope, &user_id, EnvironmentAccess::Write).await?;
+    let pending = external_id_linked_event(&state, scope, &id, None);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .users()
-        .unlink_external_id(state.env(), &id)
+        .unlink_external_id_with_event(
+            state.env(),
+            &id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     let view = UserExternalIdView {
         id: id.to_string(),
@@ -1036,6 +1053,50 @@ fn user_state_changed_event(
             "state": to.as_str(),
             "hard_kill": hard_kill,
         }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event linking or unlinking a user's external id emits (issue #108).
+///
+/// `external_id` present means a LINK, absent means an UNLINK -- and the asymmetry is forced
+/// rather than chosen. The link is given the identifier, and a receiver reconciling against an
+/// upstream directory needs BOTH sides or it cannot update its mapping. The unlink is given
+/// only the user, because the store clears whatever was there, so nothing knows the outgoing
+/// value when the envelope is built -- exactly as with `organization.default_role_cleared`.
+///
+/// The external id is the OPERATOR'S OWN identifier for this person, supplied through the
+/// management API: not a credential and not a secret. Withholding it would make the link event
+/// unusable for the one job it exists to do.
+fn external_id_linked_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    user_id: &ironauth_store::UserId,
+    external_id: Option<&str>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = user_id.to_string();
+    let (event_type, payload) = match external_id {
+        Some(external) => (
+            "user.external_id_linked",
+            serde_json::json!({ "user_id": subject, "external_id": external }),
+        ),
+        None => (
+            "user.external_id_unlinked",
+            serde_json::json!({ "user_id": subject }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
     )?;
     Some(crate::events::PendingEvent {
         id,

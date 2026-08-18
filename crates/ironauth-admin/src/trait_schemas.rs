@@ -246,18 +246,29 @@ pub async fn create_trait_schema_version(
         response_status: 200,
         response_body: &body_string,
     };
+    let pending = trait_schema_event(
+        &state,
+        scope,
+        Some(version),
+        None,
+        "trait_schema.version_created",
+    );
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .trait_schemas()
-        .create_version_at(
+        .create_version_at_with_event(
             state.env(),
             &id,
             &schema_json,
             version,
             created_at_micros,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
     match result {
@@ -483,12 +494,27 @@ pub async fn activate_trait_schema_version(
         response_status: 200,
         response_body: &body_string,
     };
+    let pending = trait_schema_event(
+        &state,
+        scope,
+        Some(version),
+        None,
+        "trait_schema.version_activated",
+    );
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .trait_schemas()
-        .activate_version_idempotent(state.env(), version, Some(write))
+        .activate_version_idempotent_with_event(
+            state.env(),
+            version,
+            Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
     match result {
         Ok(()) => Ok(json(StatusCode::OK, body_string)),
@@ -502,6 +528,50 @@ pub async fn activate_trait_schema_version(
 // A trait-schema version is IMMUTABLE and never deleted (a change is a new version), so the
 // append-only registry deliberately exposes no update and no delete surface, exactly like the
 // journey-version registry.
+
+/// The event a trait-schema or migration-job change emits (issue #108).
+///
+/// `version` names a schema version; `job` names a migration job and its kind. Exactly one is
+/// supplied, and the caller states which type it means -- the two payload shapes have no
+/// overlap, so a mismatch would fail registry validation at the fan-out rather than reach a
+/// consumer.
+///
+/// NEVER THE SCHEMA BODY. The registry is the source of truth for the shape and refetching it
+/// is one call; putting it on every event would make the payload unbounded and duplicate a
+/// document that can already be read.
+fn trait_schema_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    version: Option<i32>,
+    job: Option<(&str, &str)>,
+    event_type: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let (subject, payload) = match (version, job) {
+        (Some(version), _) => (
+            scope.environment().to_string(),
+            serde_json::json!({ "version": version }),
+        ),
+        (None, Some((job_id, kind))) => (
+            job_id.to_owned(),
+            serde_json::json!({ "job_id": job_id, "kind": kind }),
+        ),
+        (None, None) => return None,
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -709,12 +779,19 @@ pub async fn create_trait_migration_job(
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
 
+    let pending = trait_schema_event(
+        &state,
+        scope,
+        None,
+        Some((&job_id.to_string(), kind.as_str())),
+        "trait_migration_job.created",
+    );
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .trait_migration_jobs()
-        .create_with_id(
+        .create_with_id_with_event(
             state.env(),
             &job_id,
             ironauth_store::NewTraitMigrationJob {
@@ -734,6 +811,10 @@ pub async fn create_trait_migration_job(
                     response_body: &body_string,
                 }),
             },
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     Ok(json(StatusCode::ACCEPTED, body_string))

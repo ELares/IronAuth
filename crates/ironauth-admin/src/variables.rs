@@ -256,12 +256,22 @@ pub async fn set_variable(
         response_status: 204,
         response_body: "",
     };
+    let pending = environment_variable_set_event(&state, scope, &name);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .environment_variables()
-        .set(state.env(), &name, &request.value, Some(write))
+        .set_with_event(
+            state.env(),
+            &name,
+            &request.value,
+            Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await
         .map_err(|error| match error {
             StoreError::InvalidName => {
@@ -377,6 +387,36 @@ fn environment_variable_deleted_event(
     Some(crate::events::PendingEvent {
         id,
         // The variable NAME is the subject: two events about one variable stay ordered.
+        subject: name.to_owned(),
+        envelope,
+    })
+}
+
+/// The event an environment-variable write emits (issue #108).
+///
+/// The NAME and nothing else, mirroring the delete -- and emphatically NOT the VALUE. A
+/// variable is not a secret by type, but an operator's choice to put something in a variable
+/// rather than a secret is not a promise that every webhook subscriber may read it. The name
+/// tells a consumer what to refetch through the authorized surface, which is the same answer
+/// the delete gives.
+fn environment_variable_set_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    name: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "environment_variable.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "name": name }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The variable NAME is the subject, as on the delete: two events about one variable
+        // stay ordered behind each other.
         subject: name.to_owned(),
         envelope,
     })

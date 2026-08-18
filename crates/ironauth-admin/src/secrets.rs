@@ -289,6 +289,7 @@ pub async fn set_secret(
     // 204 with NO body, for the reason `set_variable` records, plus one specific to this
     // surface: the only field a body could carry that this handler already knows is the value,
     // and echoing it back is exactly what this surface must never do.
+    let pending = environment_secret_event(&state, scope, &name, "environment_secret.set");
     data_plane_store(&state)?
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
@@ -296,7 +297,16 @@ pub async fn set_secret(
         // `put_under_platform_key` rather than `put`, and that is not a convenience. A request
         // handler holds a `Store`, not a key handle, and `Store::master` is crate-private
         // precisely so it keeps holding no key: the seal happens inside the store.
-        .put_under_platform_key(state.env(), &name, request.value.as_bytes(), None)
+        .put_under_platform_key_with_event(
+            state.env(),
+            &name,
+            request.value.as_bytes(),
+            None,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await
         .map_err(|error| match error {
             // The NAME grammar is the store's (`esv::name_is_valid`), deliberately not
@@ -376,11 +386,51 @@ pub async fn delete_secret(
     // `delete` resolves the referents of a `${secret:NAME}` reference and refuses, so a copy in
     // this handler would be a second expression of one rule: the exact shape issue #443 was
     // filed about. The refusal surfaces as a conflict either way.
+    let pending = environment_secret_event(&state, scope, &name, "environment_secret.deleted");
     data_plane_store(&state)?
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .environment_secrets()
-        .delete(state.env(), &name)
+        .delete_with_event(
+            state.env(),
+            &name,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event an environment-secret write or delete emits (issue #108).
+///
+/// THE NAME ONLY, and here that is not a judgement call: the value is a SECRET, sealed at
+/// rest, and the management read surface will not return it either. An event is a WIDER
+/// audience than that surface, so the same refusal has to hold.
+///
+/// Nothing DERIVED from the value goes on the wire either -- no digest, no length, no prefix.
+/// A digest of a low-entropy secret is guessable and a length narrows a search. The name is
+/// what tells a consumer which reference to re-resolve, and it is enough.
+pub(crate) fn environment_secret_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    name: &str,
+    event_type: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "name": name }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The secret NAME is the subject: two events about one secret stay ordered.
+        subject: name.to_owned(),
+        envelope,
+    })
 }

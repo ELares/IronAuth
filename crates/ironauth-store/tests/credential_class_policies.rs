@@ -438,3 +438,121 @@ async fn a_declined_mds3_refresh_writes_no_audit_row_at_all() {
         "both name the one cache row rather than a fresh id per refresh"
     );
 }
+
+/// Claim the one webhook event outstanding in `scope`, completing it so the ordering key is
+/// released for the next.
+async fn claim_one_event(db: &TestDatabase, env: &Env, scope: Scope) -> serde_json::Value {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "expected exactly one queued event");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().next().expect("one message").payload
+}
+
+/// Setting and removing a scope step-up policy emit distinct types.
+///
+/// A step-up policy is what a caller must satisfy before a token bearing that scope is issued,
+/// so raising it hardens the scope and REMOVING it relaxes one. Removal is its own type
+/// because a consumer must not read "policy removed" as "policy unchanged" -- that misreading
+/// leaves a relaxed scope looking guarded.
+///
+/// Each half of the requirement is OMITTED when unset rather than sent as a sentinel: the set
+/// below constrains only the ACR, and the test asserts `max_auth_age_secs` is absent.
+#[tokio::test]
+async fn setting_and_removing_a_step_up_policy_emit_distinct_types() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = "urn:example:events-scope";
+
+    let set = ironauth_store::event_catalog::envelope(
+        "evt_step_up_set",
+        "step_up_policy.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "scope_token": token, "min_acr": "aal2" }),
+    )
+    .expect("step_up_policy.set is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scope_step_up_policies()
+        .set_with_event(
+            &env,
+            token,
+            Some("aal2"),
+            None,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_step_up_set",
+                subject: token,
+                envelope: &set,
+            }),
+        )
+        .await
+        .expect("set the policy");
+
+    let first = claim_one_event(&db, &env, scope).await;
+    assert_eq!(first["type"], "step_up_policy.set");
+    assert_eq!(first["payload"]["min_acr"], "aal2");
+    assert!(
+        first["payload"].get("max_auth_age_secs").is_none(),
+        "an unset half must be OMITTED, not sent as a sentinel: {first}"
+    );
+    ironauth_store::event_catalog::validate_event(&first)
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    let removed = ironauth_store::event_catalog::envelope(
+        "evt_step_up_removed",
+        "step_up_policy.removed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "scope_token": token }),
+    )
+    .expect("step_up_policy.removed is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scope_step_up_policies()
+        .remove_with_event(
+            &env,
+            token,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_step_up_removed",
+                subject: token,
+                envelope: &removed,
+            }),
+        )
+        .await
+        .expect("remove the policy");
+
+    let second = claim_one_event(&db, &env, scope).await;
+    assert_eq!(
+        second["type"], "step_up_policy.removed",
+        "a removal RELAXES the scope; announcing it as a set would leave consumers believing \
+         the scope is still guarded"
+    );
+    ironauth_store::event_catalog::validate_event(&second)
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

@@ -990,7 +990,9 @@ async fn deleting_an_org_role_emits_the_registered_event() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "creating a role emits nothing today, so the delete's event is unambiguous"
+        "this create passed no event, so the delete's event below is unambiguous. The \
+         un-suffixed method staying silent IS the paired-negative guarantee; it is not a \
+         claim that creating never announces"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(
@@ -1078,4 +1080,284 @@ async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value
         .into_iter()
         .map(|message| message.payload)
         .collect()
+}
+
+/// Creating an organization role emits `org_role.created`, naming its organization.
+///
+/// The organization travels with the role id because an org role is scoped to one
+/// organization, and a receiver maintaining a per-organization view cannot file the event
+/// without knowing which one.
+#[tokio::test]
+async fn creating_an_org_role_emits_the_registered_event() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let role_id = OrgRoleId::generate(&env, &scope);
+    let subject = role_id.to_string();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_org_role_created",
+        "org_role.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "org_role_id": subject,
+            "organization_id": org.to_string(),
+        }),
+    )
+    .expect("org_role.created is registered");
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_roles(scope)
+        .create_with_event(
+            &env,
+            NewOrgRole {
+                id: &role_id,
+                organization_id: &org,
+                slug: "auditor",
+                display_name: "Auditor",
+                metadata: None,
+            },
+            now_micros(&env),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_org_role_created",
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("create with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "org_role.created");
+    assert_eq!(events[0]["payload"]["organization_id"], org.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Updating an organization role is announced as an UPDATE, not as a create.
+///
+/// An update changes the DISPLAY of an existing role and never its slug or its grants, so a
+/// consumer treating it as a create would invent a role the organization's authorization
+/// model does not contain. The seed uses the un-suffixed `create`, which emits nothing.
+#[tokio::test]
+async fn updating_an_org_role_is_announced_as_an_update_not_a_create() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let role = create_role(&db, &env, scope, &org, "auditor", "Auditor")
+        .await
+        .expect("create role");
+    let subject = role.to_string();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_org_role_updated",
+        "org_role.updated",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({
+            "org_role_id": subject,
+            "organization_id": org.to_string(),
+        }),
+    )
+    .expect("org_role.updated is registered");
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_roles(scope)
+        .update_with_event(
+            &env,
+            &role,
+            Some("Senior Auditor"),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_org_role_updated",
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("update with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the update enqueues exactly one event");
+    assert_eq!(
+        events[0]["type"], "org_role.updated",
+        "an update must NOT be announced as a create"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Designating and clearing an organization's default role emit ORGANIZATION events.
+///
+/// Not `org_role.updated`: what changed is WHICH role the organization hands to new members,
+/// not anything about the role, whose slug, display and grants are untouched.
+///
+/// Both carry the ORGANIZATION as their subject, so the two states of one designation stay
+/// ordered behind each other rather than behind whichever role happened to hold it -- which
+/// is why the clear below is not claimable until the set is completed.
+#[tokio::test]
+async fn designating_and_clearing_an_organization_default_role_emit_organization_events() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let role = create_role(&db, &env, scope, &org, "member", "Member")
+        .await
+        .expect("create role");
+    let subject = org.to_string();
+
+    let set = ironauth_store::event_catalog::envelope(
+        "evt_default_role_set",
+        "organization.default_role_set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "organization_id": subject,
+            "org_role_id": role.to_string(),
+        }),
+    )
+    .expect("organization.default_role_set is registered");
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_roles(scope)
+        .set_default_with_event(
+            &env,
+            &org,
+            &role,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_default_role_set",
+                subject: &subject,
+                envelope: &set,
+            }),
+        )
+        .await
+        .expect("set default with event");
+
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "the designation enqueues exactly one event"
+    );
+    assert_eq!(claimed[0].payload["type"], "organization.default_role_set");
+    assert_eq!(
+        claimed[0].payload["payload"]["org_role_id"],
+        role.to_string()
+    );
+    ironauth_store::event_catalog::validate_event(&claimed[0].payload)
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete the designation");
+    }
+
+    let cleared = ironauth_store::event_catalog::envelope(
+        "evt_default_role_cleared",
+        "organization.default_role_cleared",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "organization_id": subject }),
+    )
+    .expect("organization.default_role_cleared is registered");
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_roles(scope)
+        .clear_default_with_event(
+            &env,
+            &org,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_default_role_cleared",
+                subject: &subject,
+                envelope: &cleared,
+            }),
+        )
+        .await
+        .expect("clear default with event");
+
+    let after = queued_events(&db, scope).await;
+    assert_eq!(after.len(), 1, "the clear enqueues exactly one event");
+    assert_eq!(after[0]["type"], "organization.default_role_cleared");
+    ironauth_store::event_catalog::validate_event(&after[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Clearing an organization that has NO default announces nothing.
+///
+/// The guard, not a second spelling of the positive: the update matches only a live default
+/// row, so there is no designation to report as ended. A receiver told a default was cleared
+/// when none existed would remove an onboarding rule it never had.
+#[tokio::test]
+async fn clearing_a_default_role_that_does_not_exist_announces_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let subject = org.to_string();
+
+    let cleared = ironauth_store::event_catalog::envelope(
+        "evt_default_role_cleared",
+        "organization.default_role_cleared",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "organization_id": subject }),
+    )
+    .expect("organization.default_role_cleared is registered");
+
+    let refused = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_roles(scope)
+        .clear_default_with_event(
+            &env,
+            &org,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_default_role_cleared",
+                subject: &subject,
+                envelope: &cleared,
+            }),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::NotFound)),
+        "clearing a default that does not exist is the uniform not-found: {refused:?}"
+    );
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a clear that matched no live default must not announce one"
+    );
 }

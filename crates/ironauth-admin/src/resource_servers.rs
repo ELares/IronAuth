@@ -481,12 +481,22 @@ pub async fn update_resource_server_permission_claims(
     refuse_read_only_fields(&request)?;
     refuse_opaque_opt_in(&record, request.permission_claims_enabled)?;
 
+    let pending =
+        permission_claims_event(&state, scope, &record.id, request.permission_claims_enabled);
     state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .resource_servers(scope)
-        .set_permission_claims(state.env(), &record.id, request.permission_claims_enabled)
+        .set_permission_claims_with_event(
+            state.env(),
+            &record.id,
+            request.permission_claims_enabled,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
 
     // Re-read through the SAME address, so the response can only ever describe a
@@ -497,4 +507,34 @@ pub async fn update_resource_server_permission_claims(
     let body = serde_json::to_string(&ResourceServerView::from_record(updated))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
+}
+
+/// The event a permission-claims flip emits (issue #108).
+///
+/// Permission claims decide whether tokens for this API carry the caller's permissions INSIDE
+/// them. Turning it on changes what every downstream resource server sees in a token it
+/// already knows how to parse; turning it off silently removes a claim something may be
+/// authorizing on. The direction is the whole content, which is why the flag travels rather
+/// than a bare "something changed".
+fn permission_claims_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    resource_server_id: &ironauth_store::ResourceServerId,
+    enabled: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = resource_server_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "resource_server.permission_claims_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "resource_server_id": subject, "enabled": enabled }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

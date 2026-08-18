@@ -1015,3 +1015,362 @@ async fn the_invitation_state_wire_forms_round_trip() {
     }
     assert_eq!(InvitationCredentialType::parse("totp"), None);
 }
+
+/// Everything queued for the webhook fan-out in this scope.
+async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}
+
+/// Revoking a pending invitation emits `invitation.revoked`, and a REPEAT emits nothing.
+///
+/// The retry half is the point. The revoke matches only a `pending` row, so a second call
+/// affects nothing and returns the uniform not-found -- and the event has to inherit that
+/// guard rather than fire again. A receiver counting revocations must not see two for one
+/// invitation because a client retried.
+#[tokio::test]
+async fn revoking_an_invitation_emits_once_and_a_retry_emits_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (id, _user, _token) = create_invitation(
+        &db,
+        &env,
+        scope,
+        "revoked@example.test",
+        InvitationCredentialType::Password,
+        3_600_000_000,
+    )
+    .await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_invitation_revoked",
+        "invitation.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "invitation_id": id.to_string() }),
+    )
+    .expect("invitation.revoked is registered");
+    let subject = id.to_string();
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_invitation_revoked",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .revoke_with_event(&env, &id, None, Some(&domain_event))
+        .await
+        .expect("revoke");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(events[0]["type"], "invitation.revoked");
+    assert_eq!(events[0]["payload"]["invitation_id"], id.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // THE RETRY. No pending row matches now, so the store's guard must keep it silent.
+    let repeat = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .revoke_with_event(&env, &id, None, Some(&domain_event))
+        .await;
+    assert!(
+        matches!(repeat, Err(StoreError::NotFound)),
+        "a repeat revoke is the uniform not-found: {repeat:?}"
+    );
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a revoke that changed nothing must not announce a second revocation"
+    );
+}
+
+/// A revoke carrying no event enqueues nothing.
+///
+/// The paired negative: without it the test above passes for a revoke that emits
+/// unconditionally, which would fire for every internal path that revokes an invitation.
+#[tokio::test]
+async fn revoking_an_invitation_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (id, _user, _token) = create_invitation(
+        &db,
+        &env,
+        scope,
+        "silent@example.test",
+        InvitationCredentialType::Password,
+        3_600_000_000,
+    )
+    .await;
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .revoke(&env, &id, None)
+        .await
+        .expect("revoke");
+
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a revocation with no event must not invent one"
+    );
+}
+
+/// The joined create emits `invitation.created`, naming both rows it wrote.
+///
+/// The user id is asserted as well as the invitation id, because the joined create makes both
+/// in ONE transaction (issue #247) and an event naming only the invitation would leave a
+/// consumer unable to say which pending account it belongs to.
+#[tokio::test]
+async fn creating_an_invitation_emits_an_event_naming_the_invitation_and_its_user() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let created = now_micros(&env);
+    let MintedInvitationToken { token, digest, id } = mint_invitation_token(&env, &scope);
+    let _ = token;
+    // Minted here, exactly as the management handler does, so the envelope names the id the
+    // create will actually write. Letting the store generate it would leave the test
+    // asserting a placeholder against itself.
+    let minted_user = UserId::generate(&env, &scope);
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_invitation_created",
+        "invitation.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "invitation_id": id.to_string(),
+            "user_id": minted_user.to_string(),
+        }),
+    )
+    .expect("invitation.created is registered");
+    let subject = id.to_string();
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_invitation_created",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    let user_id = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .create_with_user_with_event(
+            &env,
+            NewInvitedUser {
+                user: NewAdminUser {
+                    id: Some(&minted_user),
+                    identifier: "invited@example.test",
+                    password_hash: None,
+                    claims_json: None,
+                    external_id: None,
+                    state: UserState::PendingVerification,
+                    foreign_password_hash: None,
+                    foreign_password_algo: None,
+                    traits: None,
+                },
+                invitation_id: &id,
+                token_digest: &digest,
+                credential_type: InvitationCredentialType::Password,
+                org_context: None,
+                expires_at_unix_micros: created.saturating_add(3_600_000_000),
+            },
+            created,
+            None,
+            Some(&domain_event),
+        )
+        .await
+        .expect("joined create");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "invitation.created");
+    assert_eq!(events[0]["payload"]["invitation_id"], id.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+    // The event names the user the create actually wrote, not merely SOME user.
+    assert_eq!(events[0]["payload"]["user_id"], user_id.to_string());
+    assert_eq!(user_id, minted_user, "the create wrote the id it was given");
+}
+
+/// A joined create carrying no event enqueues nothing.
+///
+/// The paired negative: without it the test above passes for a create that emits
+/// unconditionally, which would fire for every internal path that mints an invitation.
+#[tokio::test]
+async fn creating_an_invitation_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (_id, _user, _token) = create_invitation(
+        &db,
+        &env,
+        scope,
+        "silent-create@example.test",
+        InvitationCredentialType::Password,
+        3_600_000_000,
+    )
+    .await;
+
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a create with no event must not invent one"
+    );
+}
+
+/// Resending a pending invitation emits `invitation.resent`, and a resend of a REVOKED
+/// invitation emits nothing.
+///
+/// The negative half is the guard, not a second spelling of the positive: the update matches
+/// only a `pending` row, so a resend of an invitation that is no longer pending affects
+/// nothing and must stay silent. A receiver told a token was reissued, for an invitation that
+/// can never be redeemed, would be chasing a credential that does not exist.
+#[tokio::test]
+async fn resending_an_invitation_emits_and_a_resend_of_a_revoked_one_does_not() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (id, _user, _token) = create_invitation(
+        &db,
+        &env,
+        scope,
+        "resent@example.test",
+        InvitationCredentialType::Password,
+        3_600_000_000,
+    )
+    .await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_invitation_resent",
+        "invitation.resent",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "invitation_id": id.to_string() }),
+    )
+    .expect("invitation.resent is registered");
+    let subject = id.to_string();
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_invitation_resent",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    let fresh = mint_invitation_token_for(&env, id);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .resend_with_event(
+            &env,
+            &id,
+            &fresh.digest,
+            now_micros(&env).saturating_add(3_600_000_000),
+            None,
+            Some(&domain_event),
+        )
+        .await
+        .expect("resend");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the resend enqueues exactly one event");
+    assert_eq!(events[0]["type"], "invitation.resent");
+    assert_eq!(events[0]["payload"]["invitation_id"], id.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // No longer pending: the resend must match nothing and announce nothing.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .revoke(&env, &id, None)
+        .await
+        .expect("revoke");
+    let after_revoke = mint_invitation_token_for(&env, id);
+    let refused = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .resend_with_event(
+            &env,
+            &id,
+            &after_revoke.digest,
+            now_micros(&env).saturating_add(3_600_000_000),
+            None,
+            Some(&domain_event),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::NotFound)),
+        "resending a revoked invitation is the uniform not-found: {refused:?}"
+    );
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a resend that matched no pending row must not announce a reissue"
+    );
+}
+
+/// A resend carrying no event enqueues nothing.
+#[tokio::test]
+async fn resending_an_invitation_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (id, _user, _token) = create_invitation(
+        &db,
+        &env,
+        scope,
+        "silent-resend@example.test",
+        InvitationCredentialType::Password,
+        3_600_000_000,
+    )
+    .await;
+
+    let fresh = mint_invitation_token_for(&env, id);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .resend(
+            &env,
+            &id,
+            &fresh.digest,
+            now_micros(&env).saturating_add(3_600_000_000),
+            None,
+        )
+        .await
+        .expect("resend");
+
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a resend with no event must not invent one"
+    );
+}

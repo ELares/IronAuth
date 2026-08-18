@@ -2799,7 +2799,9 @@ async fn deleting_a_permission_emits_the_registered_event_with_its_slug() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "creating a permission emits nothing today, so the delete's event is unambiguous"
+        "this create passed no event, so the delete's event below is unambiguous. The \
+         un-suffixed method staying silent IS the paired-negative guarantee; it is not a \
+         claim that creating never announces"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(
@@ -2883,4 +2885,234 @@ async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value
         .into_iter()
         .map(|message| message.payload)
         .collect()
+}
+
+/// Creating a permission emits `permission.created`, carrying its slug (issue #108).
+///
+/// The slug travels with the id because a permission is referenced by slug in role grants and
+/// in an application's own authorization code, so an event carrying only the id would make a
+/// receiver resolve the name before it could act.
+#[tokio::test]
+async fn creating_a_permission_emits_the_registered_event_with_its_slug() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let permission = ironauth_store::PermissionId::generate(&env, &scope);
+    let subject = permission.to_string();
+
+    let created = ironauth_store::event_catalog::envelope(
+        "evt_permission_created",
+        "permission.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "permission_id": subject, "slug": "reports.read" }),
+    )
+    .expect("permission.created is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .permissions(scope)
+        .create_with_event(
+            &env,
+            NewPermission {
+                id: &permission,
+                slug: "reports.read",
+                display_name: "Read reports",
+                metadata: None,
+            },
+            1_000_000,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_permission_created",
+                subject: &subject,
+                envelope: &created,
+            }),
+        )
+        .await
+        .expect("create with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "permission.created");
+    assert_eq!(events[0]["payload"]["slug"], "reports.read");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Updating a permission is announced as an UPDATE, not as a create.
+///
+/// An update changes the DISPLAY of an existing permission and never its slug, so a consumer
+/// treating it as a create would invent a permission its authorization model does not have.
+/// The seed uses the un-suffixed `create`, which emits nothing, so the only event in the
+/// queue is the update's.
+#[tokio::test]
+async fn updating_a_permission_is_announced_as_an_update_not_a_create() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let permission = create_permission(&db, &env, scope, "reports.read").await;
+    let subject = permission.to_string();
+
+    let updated = ironauth_store::event_catalog::envelope(
+        "evt_permission_updated",
+        "permission.updated",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "permission_id": subject, "slug": "reports.read" }),
+    )
+    .expect("permission.updated is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .permissions(scope)
+        .update_with_event(
+            &env,
+            &permission,
+            Some("Read the reports"),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_permission_updated",
+                subject: &subject,
+                envelope: &updated,
+            }),
+        )
+        .await
+        .expect("update with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the update enqueues exactly one event");
+    assert_eq!(
+        events[0]["type"], "permission.updated",
+        "an update must NOT be announced as a create"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Granting a permission on a role announces both ends.
+///
+/// This is the grant that decides what a role CAN DO, so every holder of the role gains it at
+/// once -- a consumer recomputing effective permissions must act on it even though no
+/// membership changed. Neither the role nor the permission alone tells a receiver what
+/// changed, so both are on the payload.
+#[tokio::test]
+async fn granting_a_role_permission_announces_both_ends() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let role = create_role(&db, &env, scope, &org, "auditor").await;
+    let permission = create_permission(&db, &env, scope, "reports.read").await;
+    let mapping = OrgRolePermissionId::generate(&env, &scope);
+    let subject = role.to_string();
+
+    let granted = ironauth_store::event_catalog::envelope(
+        "evt_permission_granted",
+        "org_role.permission_granted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "organization_id": org.to_string(),
+            "org_role_id": subject,
+            "permission_id": permission.to_string(),
+        }),
+    )
+    .expect("org_role.permission_granted is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_role_permissions(scope)
+        .assign_with_event(
+            &env,
+            NewOrgRolePermission {
+                id: &mapping,
+                organization_id: &org,
+                role_id: &role,
+                permission_id: &permission,
+            },
+            2_000,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_permission_granted",
+                subject: &subject,
+                envelope: &granted,
+            }),
+        )
+        .await
+        .expect("grant with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the grant enqueues exactly one event");
+    assert_eq!(events[0]["type"], "org_role.permission_granted");
+    assert_eq!(events[0]["payload"]["org_role_id"], subject);
+    assert_eq!(
+        events[0]["payload"]["permission_id"],
+        permission.to_string()
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Revoking a permission from a role is announced as a REVOCATION, not a grant.
+///
+/// The seed uses the un-suffixed `attach`, which emits nothing, so the only event queued is
+/// the revocation's.
+#[tokio::test]
+async fn revoking_a_role_permission_is_announced_as_a_revocation() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let role = create_role(&db, &env, scope, &org, "auditor").await;
+    let permission = create_permission(&db, &env, scope, "reports.read").await;
+    let mapping = attach(&db, &env, scope, &org, &role, &permission)
+        .await
+        .expect("seed grant");
+    let subject = role.to_string();
+
+    let revoked = ironauth_store::event_catalog::envelope(
+        "evt_permission_revoked",
+        "org_role.permission_revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({
+            "organization_id": org.to_string(),
+            "org_role_id": subject,
+            "permission_id": permission.to_string(),
+        }),
+    )
+    .expect("org_role.permission_revoked is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_role_permissions(scope)
+        .unassign_with_event(
+            &env,
+            &org,
+            &mapping,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_permission_revoked",
+                subject: &subject,
+                envelope: &revoked,
+            }),
+        )
+        .await
+        .expect("revoke with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(
+        events[0]["type"], "org_role.permission_revoked",
+        "a revocation must NOT be announced as a grant"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
 }

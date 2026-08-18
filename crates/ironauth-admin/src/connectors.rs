@@ -251,12 +251,19 @@ pub async fn create_connector(
         response_status: 201,
         response_body: &body_string,
     };
+    let pending = connector_event(
+        &state,
+        scope,
+        &id,
+        &definition.connector_id,
+        "connector.created",
+    );
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .connectors()
-        .create(
+        .create_with_event(
             state.env(),
             &id,
             created_at_micros,
@@ -273,6 +280,10 @@ pub async fn create_connector(
                 enabled: definition.enabled,
             },
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -546,12 +557,19 @@ pub async fn update_connector(
     let definition_json = serde_json::to_string(&projection).map_err(|_| ApiError::Internal)?;
     let capabilities = definition.capabilities();
 
+    let pending = connector_event(
+        &state,
+        scope,
+        &id,
+        &definition.connector_id,
+        "connector.updated",
+    );
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .connectors()
-        .update(
+        .update_with_event(
             state.env(),
             &id,
             NewConnector {
@@ -566,6 +584,10 @@ pub async fn update_connector(
                 },
                 enabled: definition.enabled,
             },
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
 
@@ -656,6 +678,44 @@ fn connector_deleted_event(
     let envelope = ironauth_store::event_catalog::envelope(
         &id,
         "connector.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "connector_id": subject, "slug": slug }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event a connector create or update emits (issue #108).
+///
+/// ONE builder for both types, because the payload is identical and the only difference is
+/// which fact is being announced. The types are still SEPARATE: an update replaces the
+/// upstream definition of a LIVE federation, and a consumer counting new federations would
+/// otherwise count every edit as a new one.
+///
+/// The id AND the slug, mirroring the delete: the slug is how a connector is named in
+/// configuration and in the federation URLs, so an event carrying only the id would make a
+/// receiver look the name up before it could act.
+///
+/// NEVER the definition and NEVER the client secret. A connector row holds an upstream
+/// CREDENTIAL, and the whole point of the secret-free read surface is that it does not leave
+/// through the API -- a webhook is a wider audience than the API, not a narrower one.
+fn connector_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    connector_id: &ironauth_store::ConnectorId,
+    slug: &str,
+    event_type: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = connector_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
         &scope.tenant().to_string(),
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,

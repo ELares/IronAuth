@@ -104,12 +104,21 @@ pub async fn set_client_par_requirement(
 
     let request: SetClientParRequirementRequest = parse_json(&body)?;
 
+    let pending = par_requirement_event(&state, scope, &id, request.required);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .clients()
-        .set_require_pushed_authorization_requests(state.env(), &id, request.required)
+        .set_require_pushed_authorization_requests_with_event(
+            state.env(),
+            &id,
+            request.required,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
 
     // Re-read through the SAME address, so the response reports what was stored rather
@@ -191,15 +200,20 @@ pub async fn set_auto_link_posture(
         }
     }
 
+    let pending = auto_link_posture_event(&state, scope, request.posture.as_deref());
     state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .environments(state.bootstrap_operator_id(), scope.tenant())
-        .set_auto_link_posture(
+        .set_auto_link_posture_with_event(
             state.env(),
             &scope.environment(),
             request.posture.as_deref(),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
 
@@ -208,4 +222,67 @@ pub async fn set_auto_link_posture(
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
+}
+
+/// The event a client PAR-requirement change emits (issue #108).
+///
+/// Requiring pushed authorization requests hardens that client's authorize leg, so a consumer
+/// mirroring client hardening posture acts on it. One type with the boolean rather than a
+/// required/not-required pair, matching the other two-direction flags in this registry.
+fn par_requirement_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    client_id: &ironauth_store::ClientId,
+    required: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = client_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "client.par_requirement_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "client_id": subject, "required": required }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event an environment auto-link posture change emits (issue #108).
+///
+/// The auto-link posture decides what happens when a federated identity arrives matching an
+/// existing account -- whether an upstream can silently take over a local one. That is a
+/// security posture rather than a preference, which is why it is announced at all.
+///
+/// `posture` is OMITTED when the override is CLEARED and the deployment default takes over,
+/// mirroring the nullable column and matching the rule the subscription and reparent payloads
+/// set: no invented sentinel for "none".
+fn auto_link_posture_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    posture: Option<&str>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let mut payload = serde_json::json!({});
+    if let Some(posture) = posture {
+        payload["posture"] = serde_json::json!(posture);
+    }
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "environment.auto_link_posture_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The ENVIRONMENT is the subject: successive posture changes stay ordered.
+        subject: scope.environment().to_string(),
+        envelope,
+    })
 }

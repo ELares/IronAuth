@@ -387,6 +387,20 @@ pub enum UniquenessMode {
 }
 
 impl UniquenessMode {
+    /// The mode's PUBLIC name, for the event wire (issue #108).
+    ///
+    /// Deliberately NOT `uniqueness_key`, which renders "env" and an org-scoped key: that is
+    /// the storage DISCRIMINATOR the unique index is built on, and coupling a published event
+    /// to it would make a future index change a breaking payload change.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UniquenessMode::EnvironmentWide => "environment_wide",
+            UniquenessMode::OrgScoped => "org_scoped",
+            UniquenessMode::NonUnique => "non_unique",
+        }
+    }
+
     /// The uniqueness discriminator stored on a new identifier row for `self`,
     /// given the user's org membership context (`org` is the user's owning org id
     /// when org membership applies, else [`None`]).

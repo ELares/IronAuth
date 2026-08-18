@@ -236,11 +236,26 @@ pub async fn apply_config_promotion(
     let source_bytes = serde_json::to_vec(&request.source).map_err(|_| ApiError::Internal)?;
     let source: Snapshot = validated_source(&source_bytes)?;
 
+    // The revision the source WOULD install, computed from the source itself rather than read
+    // back from the write: a producer announces what it can honestly know at emit time. The
+    // store enqueues this only on the applied path, so a no-op announces nothing.
+    let pending = ironauth_store::promotion::revision(&source)
+        .ok()
+        .and_then(|revision| config_promotion_event(&state, scope, &revision));
     let outcome = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
-        .apply_promotion(state.env(), &source, &request.base_revision, false)
+        .apply_promotion_with_event(
+            state.env(),
+            &source,
+            &request.base_revision,
+            false,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
 
     match outcome {
@@ -311,4 +326,37 @@ pub async fn apply_config_promotion(
         }
         Err(PromotionApplyError::Store(error)) => Err(error.into()),
     }
+}
+
+/// The event an APPLIED config promotion emits (issue #108).
+///
+/// A promotion rewrites an environment's configuration wholesale from a snapshot: the widest
+/// configuration change this surface makes, so a consumer that caches anything about the
+/// environment has to invalidate on it.
+///
+/// The revision, not the diff. The diff is the promotion document itself -- every changed
+/// resource in the environment -- and putting it on the wire would publish a whole
+/// configuration to every subscriber. The revision identifies WHICH configuration now holds,
+/// which is exactly what a consumer needs to ask whether its copy is current.
+fn config_promotion_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    revision: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "config_promotion.applied",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "revision": revision }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The ENVIRONMENT is the subject: promotions into one environment are serial, which
+        // is the order a consumer must see them in to know which revision is current.
+        subject: scope.environment().to_string(),
+        envelope,
+    })
 }

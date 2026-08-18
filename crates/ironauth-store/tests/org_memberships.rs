@@ -992,3 +992,601 @@ async fn a_body_that_cannot_be_rendered_rolls_the_whole_add_back() {
         "the stored response describes the row the retry resolved"
     );
 }
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}
+
+/// Adding a member emits `organization.member_added`, naming BOTH ends of the join.
+///
+/// A membership is a join, and a consumer cannot act on it without both ends: this is the
+/// event an integrator PROVISIONS on, and it needs to know whose access, to what.
+#[tokio::test]
+async fn adding_a_member_emits_an_event_naming_both_ends() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let user = create_active_user(&db, &env, scope, "member@example.test").await;
+    let membership = OrgMembershipId::generate(&env, &scope);
+    let subject = membership.to_string();
+
+    let added = ironauth_store::event_catalog::envelope(
+        "evt_member_added",
+        "organization.member_added",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": org.to_string(),
+            "user_id": user.to_string(),
+        }),
+    )
+    .expect("organization.member_added is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .create_with_event(
+            &env,
+            NewMembership {
+                id: &membership,
+                organization_id: &org,
+                user_id: &user,
+                metadata: None,
+            },
+            now_micros(&env),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_member_added",
+                subject: &subject,
+                envelope: &added,
+            }),
+            // No DELTA carrier here: this test is about the per-member type, and passing
+            // none is what makes the count assertion below unambiguous.
+            None,
+        )
+        .await
+        .expect("add member with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "this add passed only the per-member event, so exactly one is queued: the delta form \
+         is a SEPARATE carrier and a store that invented one would show up here"
+    );
+    assert_eq!(events[0]["type"], "organization.member_added");
+    assert_eq!(events[0]["payload"]["organization_id"], org.to_string());
+    assert_eq!(events[0]["payload"]["user_id"], user.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Removing a member is announced as a REMOVAL, not an addition.
+///
+/// This is the event an integrator DEPROVISIONS on, so collapsing the pair into one type
+/// would make the most consequential distinction in it a field to branch on. The seed uses the
+/// un-suffixed `add_member`, which emits nothing, so the only event queued is the removal's.
+#[tokio::test]
+async fn removing_a_member_is_announced_as_a_removal_not_an_addition() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let user = create_active_user(&db, &env, scope, "member@example.test").await;
+    let membership = add_member(&db, &env, scope, &org, &user)
+        .await
+        .expect("seed membership");
+    let subject = membership.to_string();
+
+    let removed = ironauth_store::event_catalog::envelope(
+        "evt_member_removed",
+        "organization.member_removed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": org.to_string(),
+            "user_id": user.to_string(),
+        }),
+    )
+    .expect("organization.member_removed is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .remove_with_event(
+            &env,
+            &membership,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_member_removed",
+                subject: &subject,
+                envelope: &removed,
+            }),
+            // As above: no delta carrier, so the removal's own event is the only one queued.
+            None,
+        )
+        .await
+        .expect("remove member with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the removal enqueues exactly one event");
+    assert_eq!(
+        events[0]["type"], "organization.member_removed",
+        "a removal must NOT be announced as an addition"
+    );
+    assert_eq!(events[0]["payload"]["user_id"], user.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// The membership DELTA rides beside the per-member event, in ONE transaction, and carries
+/// the cap and truncation contract (issue #107 criterion, issue #108 registry).
+///
+/// The two forms answer different questions. `organization.member_added` says WHO changed,
+/// once, and is what an integrator deprovisioning a single person subscribes to.
+/// `organization.membership_changed` says what the SET did, and is what a mirror applies --
+/// and it is the only one that can ever say "there was more than I could carry, go and
+/// reconcile". A consumer of either must see the change exactly when the row commits, which
+/// is why both are enqueued inside the write rather than one of them after it.
+///
+/// The TRUNCATED case is the one worth measuring, and until now nothing did: the cap and the
+/// flag lived in `ironauth_store::membership_change` with no caller outside its own unit
+/// tests. This drives the real flattening a producer uses, at the cap boundary, and pins the
+/// three properties a consumer's correctness rests on -- the arrays are a prefix of exactly
+/// the cap, `truncated` says so, and `total` reports what actually changed.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_membership_change_carries_the_delta_beside_the_per_member_event() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Initech").await;
+    let user = create_active_user(&db, &env, scope, "delta@example.test").await;
+    let membership = OrgMembershipId::generate(&env, &scope);
+    let subject = membership.to_string();
+
+    let added = ironauth_store::event_catalog::envelope(
+        "evt_member_added_delta",
+        "organization.member_added",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": org.to_string(),
+            "user_id": user.to_string(),
+        }),
+    )
+    .expect("organization.member_added is registered");
+
+    // The delta a single-member route produces: a COMPLETE change of one id. Not a
+    // degenerate case -- the contract holding at n=1, so a consumer writes one code path.
+    let one = ironauth_store::membership_change(vec![user.to_string()], Vec::new());
+    assert!(
+        matches!(one, ironauth_store::MembershipChange::Complete { .. }),
+        "one id is under the cap and must be Complete"
+    );
+    let delta_payload = serde_json::json!({
+        "organization_id": org.to_string(),
+        "added_user_ids": [user.to_string()],
+        "removed_user_ids": [],
+        "truncated": false,
+        "total": 1,
+    });
+    let delta = ironauth_store::event_catalog::envelope(
+        "evt_membership_changed",
+        "organization.membership_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &delta_payload,
+    )
+    .expect("organization.membership_changed is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .create_with_event(
+            &env,
+            NewMembership {
+                id: &membership,
+                organization_id: &org,
+                user_id: &user,
+                metadata: None,
+            },
+            now_micros(&env),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_member_added_delta",
+                subject: &subject,
+                envelope: &added,
+            }),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_membership_changed",
+                subject: &org.to_string(),
+                envelope: &delta,
+            }),
+        )
+        .await
+        .expect("add member with both events");
+
+    let events = drain_events(&db, scope).await;
+    assert_eq!(
+        events.len(),
+        2,
+        "BOTH forms are enqueued in the write's own transaction: {events:?}"
+    );
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().expect("type"))
+        .collect();
+    assert!(
+        types.contains(&"organization.member_added")
+            && types.contains(&"organization.membership_changed"),
+        "one of each form, got {types:?}"
+    );
+    for event in &events {
+        ironauth_store::event_catalog::validate_event(event)
+            .expect("both envelopes validate against the registry the fan-out enforces");
+    }
+    let changed = events
+        .iter()
+        .find(|event| event["type"] == "organization.membership_changed")
+        .expect("the delta form");
+    assert_eq!(changed["payload"]["added_user_ids"][0], user.to_string());
+    assert_eq!(changed["payload"]["truncated"], false);
+    assert_eq!(changed["payload"]["total"], 1);
+
+    // PAST THE CAP, which is the case the contract exists for and the case nothing
+    // measured. The arrays become a prefix, and a consumer that applied them as a delta
+    // would believe everyone it was not sent is unchanged -- which is why `truncated` is a
+    // REQUIRED field rather than one that defaults to false when omitted.
+    let over = ironauth_store::membership_change(
+        (0..=ironauth_store::MEMBERSHIP_DELTA_CAP)
+            .map(|n| format!("usr_{n}"))
+            .collect(),
+        vec!["usr_removed".to_owned()],
+    );
+    let over_payload = match &over {
+        ironauth_store::MembershipChange::Truncated {
+            added,
+            removed,
+            total,
+        } => {
+            assert_eq!(
+                added.len(),
+                ironauth_store::MEMBERSHIP_DELTA_CAP,
+                "the cap is on the TOTAL ids in the event, so the added array fills it and \
+                 the removed array gets what remains -- a PER-ARRAY cap would let one event \
+                 carry twice the documented limit"
+            );
+            assert!(removed.is_empty(), "no room left after the added prefix");
+            assert_eq!(
+                *total,
+                ironauth_store::MEMBERSHIP_DELTA_CAP + 2,
+                "the total reports what actually changed, not what was sent"
+            );
+            serde_json::json!({
+                "organization_id": org.to_string(),
+                "added_user_ids": added,
+                "removed_user_ids": removed,
+                "truncated": true,
+                "total": total,
+            })
+        }
+        ironauth_store::MembershipChange::Complete { .. } => {
+            panic!("one past the cap must truncate")
+        }
+    };
+    ironauth_store::event_catalog::envelope(
+        "evt_membership_truncated",
+        "organization.membership_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &over_payload,
+    )
+    .expect("a TRUNCATED delta validates against the same registered schema");
+
+    // The REMOVAL carries the delta too, on the removed side of the arrays. A mirror that
+    // only ever saw additions would drift one way forever.
+    let removed_envelope = ironauth_store::event_catalog::envelope(
+        "evt_member_removed_delta",
+        "organization.member_removed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        3,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": org.to_string(),
+            "user_id": user.to_string(),
+        }),
+    )
+    .expect("organization.member_removed is registered");
+    let removed_delta = ironauth_store::event_catalog::envelope(
+        "evt_membership_changed_removed",
+        "organization.membership_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        3,
+        &serde_json::json!({
+            "organization_id": org.to_string(),
+            "added_user_ids": [],
+            "removed_user_ids": [user.to_string()],
+            "truncated": false,
+            "total": 1,
+        }),
+    )
+    .expect("organization.membership_changed is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .remove_with_event(
+            &env,
+            &membership,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_member_removed_delta",
+                subject: &subject,
+                envelope: &removed_envelope,
+            }),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_membership_changed_removed",
+                subject: &org.to_string(),
+                envelope: &removed_delta,
+            }),
+        )
+        .await
+        .expect("remove member with both events");
+
+    let after_removal = drain_events(&db, scope).await;
+    assert_eq!(
+        after_removal.len(),
+        2,
+        "the removal enqueues both forms too: {after_removal:?}"
+    );
+    let removal_delta = after_removal
+        .iter()
+        .find(|event| event["type"] == "organization.membership_changed")
+        .expect("the delta form on the removal");
+    assert_eq!(
+        removal_delta["payload"]["removed_user_ids"][0],
+        user.to_string(),
+        "a removal must move the id to the REMOVED array; announcing it as an addition \
+         would have a mirror grant access the operator just took away"
+    );
+    assert!(
+        removal_delta["payload"]["added_user_ids"]
+            .as_array()
+            .expect("array")
+            .is_empty()
+    );
+}
+
+/// Claim AND COMPLETE everything queued in `scope`.
+///
+/// [`queued_events`] leaves what it claims in flight, which is right for a one-shot read and
+/// wrong for a test that drains twice: both membership forms key their ordering on the entity
+/// they are about, and a second event on one key is not claimable until the first completes.
+async fn drain_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    let env = Env::system();
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}
+
+/// A GROUP membership change carries the delta beside the per-member event.
+///
+/// The group twin of the organization case, and the one the cap was written for: an
+/// enterprise group is the thing with tens of thousands of members, which is why issue #107
+/// named full group dumps as the failure mode. Both forms are enqueued in the write's own
+/// transaction, on the add and on the removal alike.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Hooli").await;
+    let user = create_active_user(&db, &env, scope, "grouped@example.test").await;
+    let membership = add_member(&db, &env, scope, &org, &user)
+        .await
+        .expect("add member");
+
+    let group = ironauth_store::OrgGroupId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_groups(scope)
+        .create(
+            &env,
+            ironauth_store::NewOrgGroup {
+                id: &group,
+                organization_id: &org,
+                parent_id: None,
+                slug: "engineering",
+                display_name: "Engineering",
+                metadata: None,
+            },
+            now_micros(&env),
+            8,
+            None,
+        )
+        .await
+        .expect("create group");
+
+    let binding = ironauth_store::OrgGroupMemberId::generate(&env, &scope);
+    let delta_of = |added: Vec<String>, removed: Vec<String>, at: i64, event_id: &str| {
+        ironauth_store::event_catalog::envelope(
+            event_id,
+            "org_group.membership_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            at,
+            &serde_json::json!({
+                "org_group_id": group.to_string(),
+                "organization_id": org.to_string(),
+                "added_user_ids": added,
+                "removed_user_ids": removed,
+                "truncated": false,
+                "total": 1,
+            }),
+        )
+        .expect("org_group.membership_changed is registered")
+    };
+    let per_member = |event_id: &str, event_type: &str, at: i64| {
+        ironauth_store::event_catalog::envelope(
+            event_id,
+            event_type,
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            at,
+            &serde_json::json!({
+                "org_group_id": group.to_string(),
+                "organization_id": org.to_string(),
+                "membership_id": membership.to_string(),
+            }),
+        )
+        .unwrap_or_else(|| panic!("{event_type} is registered"))
+    };
+
+    let added_event = per_member("evt_group_member_added", "org_group.member_added", 1);
+    let added_delta = delta_of(
+        vec![membership.to_string()],
+        Vec::new(),
+        1,
+        "evt_group_delta_add",
+    );
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_group_members(scope)
+        .add_with_event(
+            &env,
+            ironauth_store::NewOrgGroupMember {
+                id: &binding,
+                organization_id: &org,
+                group_id: &group,
+                membership_id: &membership,
+            },
+            now_micros(&env),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_group_member_added",
+                subject: &binding.to_string(),
+                envelope: &added_event,
+            }),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_group_delta_add",
+                subject: &group.to_string(),
+                envelope: &added_delta,
+            }),
+        )
+        .await
+        .expect("add group member with both events");
+
+    let events = drain_events(&db, scope).await;
+    assert_eq!(
+        events.len(),
+        2,
+        "the group add enqueues both forms: {events:?}"
+    );
+    let changed = events
+        .iter()
+        .find(|event| event["type"] == "org_group.membership_changed")
+        .expect("the delta form");
+    assert_eq!(changed["payload"]["org_group_id"], group.to_string());
+    assert_eq!(
+        changed["payload"]["added_user_ids"][0],
+        membership.to_string()
+    );
+    for event in &events {
+        ironauth_store::event_catalog::validate_event(event)
+            .expect("both envelopes validate against the registry the fan-out enforces");
+    }
+
+    let removed_event = per_member("evt_group_member_removed", "org_group.member_removed", 2);
+    let removed_delta = delta_of(
+        Vec::new(),
+        vec![membership.to_string()],
+        2,
+        "evt_group_delta_remove",
+    );
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_group_members(scope)
+        .remove_with_event(
+            &env,
+            &org,
+            &binding,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_group_member_removed",
+                subject: &binding.to_string(),
+                envelope: &removed_event,
+            }),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_group_delta_remove",
+                subject: &group.to_string(),
+                envelope: &removed_delta,
+            }),
+        )
+        .await
+        .expect("remove group member with both events");
+
+    let after = drain_events(&db, scope).await;
+    assert_eq!(
+        after.len(),
+        2,
+        "the group removal enqueues both forms: {after:?}"
+    );
+    let removal = after
+        .iter()
+        .find(|event| event["type"] == "org_group.membership_changed")
+        .expect("the delta form on the removal");
+    assert_eq!(
+        removal["payload"]["removed_user_ids"][0],
+        membership.to_string(),
+        "a group removal must move the id to the REMOVED array"
+    );
+}
