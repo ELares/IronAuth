@@ -2,7 +2,6 @@
 # SHRINK-ONLY: producer-coverage.py fails if an entry here is already covered or
 # gone, and fails if an uncovered handler is missing from this list. #108 closes
 # when this file is empty. Regenerate with: scripts/producer-coverage.py --update-baseline
-tenants::delete_tenant
 tenants::purge_tenant
 tenants::restore_tenant
 tenants::resume_tenant
