@@ -1155,6 +1155,7 @@ async fn removing_a_member_is_announced_as_a_removal_not_an_addition() {
 /// three properties a consumer's correctness rests on -- the arrays are a prefix of exactly
 /// the cap, `truncated` says so, and `total` reports what actually changed.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn a_membership_change_carries_the_delta_beside_the_per_member_event() {
     let db = TestDatabase::start().await;
     let env = Env::system();
@@ -1421,6 +1422,7 @@ async fn drain_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value>
 /// named full group dumps as the failure mode. Both forms are enqueued in the write's own
 /// transaction, on the add and on the removal alike.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event() {
     let db = TestDatabase::start().await;
     let env = Env::system();

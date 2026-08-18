@@ -20760,6 +20760,34 @@ pub(crate) async fn enqueue_domain_event(
     event: Option<&DomainEvent<'_>>,
 ) -> Result<(), StoreError> {
     if let Some(event) = event {
+        // ISSUE #108 CRITERION 1, enforced where a violation is CHEAPEST to diagnose.
+        //
+        // `ironauth_admin::events` validates every event at the fan-out, which is the one
+        // choke point production traffic passes through and is where the check belongs at
+        // run time. But its failure is a log line and a permanent consumer error, discovered
+        // by whoever is watching deliveries -- and by then the producer that built the bad
+        // envelope is long out of scope.
+        //
+        // Under the `testing` feature this panics INSIDE the producer's own transaction
+        // instead, so an unregistered type or an off-schema payload fails the test that
+        // exercised it, with that producer on the stack. Every store and admin test runs
+        // with the feature, so this covers every event the suite emits: the criterion asks
+        // that such an event fail the build, and nothing weaker than an assertion at emit
+        // time does that.
+        //
+        // Deliberately NOT compiled into release builds. A panic here would abort a real
+        // write for a payload the fan-out is already equipped to refuse, turning a
+        // deliverability problem into an outage.
+        #[cfg(feature = "testing")]
+        if let Err(error) = crate::event_catalog::validate_event(event.envelope) {
+            panic!(
+                "a producer emitted an event that does not validate against the registry: \
+                 {error:?}\n\nenvelope: {}\n\nThe fan-out refuses this permanently, so \
+                 shipping it would announce nothing while the write succeeded. Register the \
+                 type, or fix the payload to match the schema it declares.",
+                event.envelope
+            );
+        }
         enqueue_outbox_in_tx(
             tx,
             env,

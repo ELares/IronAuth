@@ -654,3 +654,67 @@ async fn placing_and_lifting_a_ban_emit_distinct_types() {
         "a lift that matched nothing must announce nothing: {quiet:?}"
     );
 }
+
+/// A producer that emits an OFF-SCHEMA payload fails the test that exercised it
+/// (issue #108 criterion 1).
+///
+/// The fan-out validates every event before delivery, which is the right place at run time
+/// but the wrong place to LEARN about it: its failure is a log line and a permanent consumer
+/// error, discovered by whoever watches deliveries, long after the producer that built the
+/// envelope went out of scope.
+///
+/// Under the `testing` feature the same check runs inside the producer's own transaction, so
+/// this is what the criterion means by "fails the build". The envelope below declares a
+/// registered type and then violates its schema -- `ban.created` requires `ban_id`, and this
+/// omits it -- which is exactly the shape a producer edited without its schema produces.
+#[tokio::test]
+#[should_panic(expected = "does not validate against the registry")]
+async fn a_producer_emitting_an_off_schema_payload_fails_the_test_that_exercised_it() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = AbuseSubject {
+        kind: ironauth_store::AbuseSubjectKind::Identifier,
+        value: "schema@events.test".to_owned(),
+    };
+    let id = ironauth_store::AbuseBanId::generate(&env, &scope);
+
+    // Built by hand rather than through `event_catalog::envelope`, because that constructor
+    // VALIDATES and would refuse this -- which is the point: the constructor is the guard a
+    // producer is supposed to go through, and this test is about what happens when an
+    // envelope reaches the enqueue without having passed one.
+    let invalid = serde_json::json!({
+        "id": "evt_off_schema",
+        "type": "ban.created",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        // `ban_id` is REQUIRED by the registered schema and is missing.
+        "payload": { "subject_kind": "identifier", "auth_path": "password" },
+    });
+
+    db.store()
+        .scoped(scope)
+        .acting(test_actor(), CorrelationId::generate(&env))
+        .abuse()
+        .ban_with_event(
+            &env,
+            ironauth_store::NewBan {
+                id: &id,
+                subject: &subject,
+                auth_path: AuthPath::Password,
+                reason: "schema check",
+                expires_at_unix_micros: None,
+            },
+            now_micros(&env),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_off_schema",
+                subject: "identifier:password",
+                envelope: &invalid,
+            }),
+        )
+        .await
+        .expect("unreachable: the enqueue panics before this resolves");
+}

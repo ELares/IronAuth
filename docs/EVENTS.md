@@ -97,6 +97,16 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "client_id": "client_id_example"
+}
+```
+
 ### `admin_consent.revoked` v1
 
 ```json
@@ -117,6 +127,17 @@ receive a different shape.
     "client_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "client_admin_grant_id": "client_admin_grant_id_example",
+  "client_id": "client_id_example"
 }
 ```
 
@@ -151,6 +172,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "api_key_id": "api_key_id_example",
+  "owner_kind": "owner_kind_example"
+}
+```
+
 ### `api_key.revoked` v1
 
 ```json
@@ -166,6 +198,16 @@ receive a different shape.
     "api_key_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "api_key_id": "api_key_id_example"
 }
 ```
 
@@ -189,6 +231,17 @@ receive a different shape.
     "created_api_key_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "revoked_api_key_id": "revoked_api_key_id_example",
+  "created_api_key_id": "created_api_key_id_example"
 }
 ```
 
@@ -230,6 +283,18 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "ban_id": "ban_id_example",
+  "subject_kind": "subject_kind_example",
+  "auth_path": "auth_path_example"
+}
+```
+
 ### `ban.lifted` v1
 
 ```json
@@ -250,6 +315,17 @@ receive a different shape.
     "auth_path"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "subject_kind": "subject_kind_example",
+  "auth_path": "auth_path_example"
 }
 ```
 
@@ -283,6 +359,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "brand_id": "brand_id_example",
+  "brand_slug": "brand_slug_example"
+}
+```
+
 ### `brand.set` v1
 
 ```json
@@ -307,6 +394,18 @@ receive a different shape.
     "is_default"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "brand_id": "brand_id_example",
+  "brand_slug": "brand_slug_example",
+  "is_default": true
 }
 ```
 
@@ -345,6 +444,18 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "brand_id": "brand_id_example",
+  "brand_slug": "brand_slug_example",
+  "kind": "kind_example"
+}
+```
+
 ### `brand_asset.set` v1
 
 ```json
@@ -375,6 +486,19 @@ receive a different shape.
     "sha256"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "brand_id": "brand_id_example",
+  "brand_slug": "brand_slug_example",
+  "kind": "kind_example",
+  "sha256": "sha256_example"
 }
 ```
 
@@ -410,6 +534,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "client_id": "client_id_example",
+  "restricted": true
+}
+```
+
 ### `client.deleted` v1
 
 ```json
@@ -425,6 +560,16 @@ receive a different shape.
     "client_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "client_id": "client_id_example"
 }
 ```
 
@@ -447,6 +592,17 @@ receive a different shape.
     "required"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "client_id": "client_id_example",
+  "required": true
 }
 ```
 
@@ -473,6 +629,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "client_id": "client_id_example",
+  "id_token_signed_response_alg": "id_token_signed_response_alg_example"
+}
+```
+
 ### `client.verified` v1
 
 ```json
@@ -488,6 +655,16 @@ receive a different shape.
     "client_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "client_id": "client_id_example"
 }
 ```
 
@@ -512,6 +689,16 @@ receive a different shape.
     "revision"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "revision": "revision_example"
 }
 ```
 
@@ -546,6 +733,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "connector_id": "connector_id_example",
+  "slug": "slug_example"
+}
+```
+
 ### `connector.deleted` v1
 
 ```json
@@ -569,6 +767,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "connector_id": "connector_id_example",
+  "slug": "slug_example"
+}
+```
+
 ### `connector.updated` v1
 
 ```json
@@ -589,6 +798,17 @@ receive a different shape.
     "slug"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "connector_id": "connector_id_example",
+  "slug": "slug_example"
 }
 ```
 
@@ -621,6 +841,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "subject": "subject_example",
+  "client_id": "client_id_example"
+}
+```
+
 ## `dcr_initial_access_token` (1)
 
 | Type | Payload version |
@@ -642,6 +873,16 @@ receive a different shape.
     "initial_access_token_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "initial_access_token_id": "initial_access_token_id_example"
 }
 ```
 
@@ -674,6 +915,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "dcr_policy_id": "dcr_policy_id_example",
+  "name": "name_example"
+}
+```
+
 ## `environment` (4)
 
 | Type | Payload version |
@@ -699,6 +951,14 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{}
+```
+
 ### `environment.created` v1
 
 ```json
@@ -719,6 +979,17 @@ receive a different shape.
     "kind"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "environment_id": "environment_id_example",
+  "kind": "kind_example"
 }
 ```
 
@@ -745,6 +1016,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "environment_id": "environment_id_example",
+  "tenant_id": "tenant_id_example"
+}
+```
+
 ### `environment.identifier_uniqueness_applied` v1
 
 ```json
@@ -760,6 +1042,16 @@ receive a different shape.
     "mode"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "mode": "mode_example"
 }
 ```
 
@@ -788,6 +1080,16 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "name": "name_example"
+}
+```
+
 ### `environment_secret.set` v1
 
 ```json
@@ -803,6 +1105,16 @@ receive a different shape.
     "name"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "name": "name_example"
 }
 ```
 
@@ -831,6 +1143,16 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "name": "name_example"
+}
+```
+
 ### `environment_variable.set` v1
 
 ```json
@@ -846,6 +1168,16 @@ receive a different shape.
     "name"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "name": "name_example"
 }
 ```
 
@@ -883,6 +1215,18 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "flow_version_id": "flow_version_id_example",
+  "journey_id": "journey_id_example",
+  "version": 1
+}
+```
+
 ### `flow_version.pinned` v1
 
 ```json
@@ -902,6 +1246,17 @@ receive a different shape.
     "version"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "journey_id": "journey_id_example",
+  "version": 1
 }
 ```
 
@@ -930,6 +1285,16 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "migration_run_id": "migration_run_id_example"
+}
+```
+
 ### `identity_import.state_changed` v1
 
 ```json
@@ -950,6 +1315,17 @@ receive a different shape.
     "state"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "migration_run_id": "migration_run_id_example",
+  "state": "state_example"
 }
 ```
 
@@ -991,6 +1367,19 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "authorization_id": "authorization_id_example",
+  "user_id": "user_id_example",
+  "reason_code": "reason_code_example",
+  "expires_at_unix_ms": 1735689600000
+}
+```
+
 ## `invitation` (3)
 
 | Type | Payload version |
@@ -1022,6 +1411,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "invitation_id": "invitation_id_example",
+  "user_id": "user_id_example"
+}
+```
+
 ### `invitation.resent` v1
 
 ```json
@@ -1040,6 +1440,16 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "invitation_id": "invitation_id_example"
+}
+```
+
 ### `invitation.revoked` v1
 
 ```json
@@ -1055,6 +1465,16 @@ receive a different shape.
     "invitation_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "invitation_id": "invitation_id_example"
 }
 ```
 
@@ -1088,6 +1508,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "locale_bundle_id": "locale_bundle_id_example",
+  "tag": "tag_example"
+}
+```
+
 ### `locale_bundle.set` v1
 
 ```json
@@ -1103,6 +1534,16 @@ receive a different shape.
     "tag"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "tag": "tag_example"
 }
 ```
 
@@ -1136,6 +1577,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "log_stream_id": "log_stream_id_example",
+  "sink_type": "sink_type_example"
+}
+```
+
 ### `log_stream.deleted` v1
 
 ```json
@@ -1151,6 +1603,16 @@ receive a different shape.
     "log_stream_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "log_stream_id": "log_stream_id_example"
 }
 ```
 
@@ -1183,6 +1645,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "management_key_id": "management_key_id_example",
+  "display_name": "display_name_example"
+}
+```
+
 ### `management_key.revoked` v1
 
 ```json
@@ -1198,6 +1671,16 @@ receive a different shape.
     "management_key_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "management_key_id": "management_key_id_example"
 }
 ```
 
@@ -1236,6 +1719,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "org_group_id": "org_group_id_example",
+  "organization_id": "organization_id_example"
+}
+```
+
 ### `org_group.deleted` v1
 
 ```json
@@ -1256,6 +1750,17 @@ receive a different shape.
     "organization_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "org_group_id": "org_group_id_example",
+  "organization_id": "organization_id_example"
 }
 ```
 
@@ -1287,6 +1792,18 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "org_group_id": "org_group_id_example",
+  "organization_id": "organization_id_example",
+  "membership_id": "membership_id_example"
+}
+```
+
 ### `org_group.member_removed` v1
 
 ```json
@@ -1312,6 +1829,18 @@ receive a different shape.
     "membership_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "org_group_id": "org_group_id_example",
+  "organization_id": "organization_id_example",
+  "membership_id": "membership_id_example"
 }
 ```
 
@@ -1363,6 +1892,25 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "org_group_id": "org_group_id_example",
+  "organization_id": "organization_id_example",
+  "added_user_ids": [
+    "added_user_id_1"
+  ],
+  "removed_user_ids": [
+    "removed_user_id_1"
+  ],
+  "truncated": true,
+  "total": 1
+}
+```
+
 ### `org_group.reparented` v1
 
 ```json
@@ -1390,6 +1938,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "org_group_id": "org_group_id_example",
+  "organization_id": "organization_id_example"
+}
+```
+
 ### `org_group.updated` v1
 
 ```json
@@ -1410,6 +1969,17 @@ receive a different shape.
     "organization_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "org_group_id": "org_group_id_example",
+  "organization_id": "organization_id_example"
 }
 ```
 
@@ -1460,6 +2030,19 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "assignment_id": "assignment_id_example",
+  "organization_id": "organization_id_example",
+  "org_role_id": "org_role_id_example",
+  "group_id": "group_id_example"
+}
+```
+
 ### `org_role.assigned_to_member` v1
 
 ```json
@@ -1493,6 +2076,19 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "assignment_id": "assignment_id_example",
+  "organization_id": "organization_id_example",
+  "org_role_id": "org_role_id_example",
+  "membership_id": "membership_id_example"
+}
+```
+
 ### `org_role.created` v1
 
 ```json
@@ -1516,6 +2112,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "org_role_id": "org_role_id_example",
+  "organization_id": "organization_id_example"
+}
+```
+
 ### `org_role.deleted` v1
 
 ```json
@@ -1536,6 +2143,17 @@ receive a different shape.
     "organization_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "org_role_id": "org_role_id_example",
+  "organization_id": "organization_id_example"
 }
 ```
 
@@ -1567,6 +2185,18 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "organization_id": "organization_id_example",
+  "org_role_id": "org_role_id_example",
+  "permission_id": "permission_id_example"
+}
+```
+
 ### `org_role.permission_revoked` v1
 
 ```json
@@ -1592,6 +2222,18 @@ receive a different shape.
     "permission_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "organization_id": "organization_id_example",
+  "org_role_id": "org_role_id_example",
+  "permission_id": "permission_id_example"
 }
 ```
 
@@ -1628,6 +2270,19 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "assignment_id": "assignment_id_example",
+  "organization_id": "organization_id_example",
+  "org_role_id": "org_role_id_example",
+  "group_id": "group_id_example"
+}
+```
+
 ### `org_role.unassigned_from_member` v1
 
 ```json
@@ -1661,6 +2316,19 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "assignment_id": "assignment_id_example",
+  "organization_id": "organization_id_example",
+  "org_role_id": "org_role_id_example",
+  "membership_id": "membership_id_example"
+}
+```
+
 ### `org_role.updated` v1
 
 ```json
@@ -1681,6 +2349,17 @@ receive a different shape.
     "organization_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "org_role_id": "org_role_id_example",
+  "organization_id": "organization_id_example"
 }
 ```
 
@@ -1720,6 +2399,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "organization_id": "organization_id_example",
+  "display_name": "display_name_example"
+}
+```
+
 ### `organization.default_role_cleared` v1
 
 ```json
@@ -1735,6 +2425,16 @@ receive a different shape.
     "organization_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "organization_id": "organization_id_example"
 }
 ```
 
@@ -1761,6 +2461,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "organization_id": "organization_id_example",
+  "org_role_id": "org_role_id_example"
+}
+```
+
 ### `organization.deleted` v1
 
 ```json
@@ -1776,6 +2487,16 @@ receive a different shape.
     "organization_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "organization_id": "organization_id_example"
 }
 ```
 
@@ -1807,6 +2528,18 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "membership_id": "membership_id_example",
+  "organization_id": "organization_id_example",
+  "user_id": "user_id_example"
+}
+```
+
 ### `organization.member_removed` v1
 
 ```json
@@ -1832,6 +2565,18 @@ receive a different shape.
     "user_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "membership_id": "membership_id_example",
+  "organization_id": "organization_id_example",
+  "user_id": "user_id_example"
 }
 ```
 
@@ -1878,6 +2623,24 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "organization_id": "organization_id_example",
+  "added_user_ids": [
+    "added_user_id_1"
+  ],
+  "removed_user_ids": [
+    "removed_user_id_1"
+  ],
+  "truncated": true,
+  "total": 1
+}
+```
+
 ### `organization.state_changed` v1
 
 ```json
@@ -1898,6 +2661,17 @@ receive a different shape.
     "state"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "organization_id": "organization_id_example",
+  "state": "state_example"
 }
 ```
 
@@ -1932,6 +2706,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "permission_id": "permission_id_example",
+  "slug": "slug_example"
+}
+```
+
 ### `permission.deleted` v1
 
 ```json
@@ -1955,6 +2740,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "permission_id": "permission_id_example",
+  "slug": "slug_example"
+}
+```
+
 ### `permission.updated` v1
 
 ```json
@@ -1975,6 +2771,17 @@ receive a different shape.
     "slug"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "permission_id": "permission_id_example",
+  "slug": "slug_example"
 }
 ```
 
@@ -2013,6 +2820,18 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "project_grant_id": "project_grant_id_example",
+  "client_id": "client_id_example",
+  "organization_id": "organization_id_example"
+}
+```
+
 ### `project_grant.withdrawn` v1
 
 ```json
@@ -2028,6 +2847,16 @@ receive a different shape.
     "project_grant_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "project_grant_id": "project_grant_id_example"
 }
 ```
 
@@ -2060,6 +2889,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "recovery_flow_id": "recovery_flow_id_example",
+  "decision": "decision_example"
+}
+```
+
 ## `resource_server` (1)
 
 | Type | Payload version |
@@ -2085,6 +2925,17 @@ receive a different shape.
     "enabled"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "resource_server_id": "resource_server_id_example",
+  "enabled": true
 }
 ```
 
@@ -2118,6 +2969,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "routing_rule_id": "routing_rule_id_example",
+  "org_connection_id": "org_connection_id_example"
+}
+```
+
 ### `routing_rule.domain_verification_changed` v1
 
 ```json
@@ -2137,6 +2999,17 @@ receive a different shape.
     "verified"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "routing_rule_id": "routing_rule_id_example",
+  "verified": true
 }
 ```
 
@@ -2166,6 +3039,17 @@ receive a different shape.
     "cause"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "session_id": "session_id_example",
+  "cause": "cause_example"
 }
 ```
 
@@ -2199,6 +3083,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "signup_form_id": "signup_form_id_example",
+  "client_id": "client_id_example"
+}
+```
+
 ### `signup_form.set` v1
 
 ```json
@@ -2214,6 +3109,16 @@ receive a different shape.
     "client_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "client_id": "client_id_example"
 }
 ```
 
@@ -2246,6 +3151,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example",
+  "quarantined_until_unix_ms": 1735689600000
+}
+```
+
 ### `signup_quarantine.resolved` v1
 
 ```json
@@ -2266,6 +3182,17 @@ receive a different shape.
     "decision"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example",
+  "decision": "decision_example"
 }
 ```
 
@@ -2298,6 +3225,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "country_code": "country_code_example",
+  "allowed": true
+}
+```
+
 ### `sms_otp.config_changed` v1
 
 ```json
@@ -2316,6 +3254,17 @@ receive a different shape.
     "allow_factor_downgrade"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "enabled": true,
+  "allow_factor_downgrade": true
 }
 ```
 
@@ -2344,6 +3293,16 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "scope_token": "scope_token_example"
+}
+```
+
 ### `step_up_policy.set` v1
 
 ```json
@@ -2366,6 +3325,16 @@ receive a different shape.
     "scope_token"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "scope_token": "scope_token_example"
 }
 ```
 
@@ -2399,6 +3368,18 @@ receive a different shape.
     "expires_at_unix_ms"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "actor_id": "actor_id_example",
+  "acr": "acr_example",
+  "expires_at_unix_ms": 1735689600000
 }
 ```
 
@@ -2441,6 +3422,18 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "tenant_id": "tenant_id_example",
+  "environment_id": "environment_id_example",
+  "display_name": "display_name_example"
+}
+```
+
 ### `tenant.deleted` v1
 
 ```json
@@ -2456,6 +3449,16 @@ receive a different shape.
     "tenant_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "tenant_id": "tenant_id_example"
 }
 ```
 
@@ -2477,6 +3480,16 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "tenant_id": "tenant_id_example"
+}
+```
+
 ### `tenant.restored` v1
 
 ```json
@@ -2492,6 +3505,16 @@ receive a different shape.
     "tenant_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "tenant_id": "tenant_id_example"
 }
 ```
 
@@ -2513,6 +3536,16 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "tenant_id": "tenant_id_example"
+}
+```
+
 ### `tenant.suspended` v1
 
 ```json
@@ -2528,6 +3561,16 @@ receive a different shape.
     "tenant_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "tenant_id": "tenant_id_example"
 }
 ```
 
@@ -2560,6 +3603,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "job_id": "job_id_example",
+  "kind": "kind_example"
+}
+```
+
 ## `trait_schema` (2)
 
 | Type | Payload version |
@@ -2584,6 +3638,16 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "version": 1
+}
+```
+
 ### `trait_schema.version_created` v1
 
 ```json
@@ -2598,6 +3662,16 @@ receive a different shape.
     "version"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "version": 1
 }
 ```
 
@@ -2638,6 +3712,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example",
+  "state": "state_example"
+}
+```
+
 ### `user.deleted` v1
 
 ```json
@@ -2657,6 +3742,17 @@ receive a different shape.
     "hard_kill"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example",
+  "hard_kill": true
 }
 ```
 
@@ -2683,6 +3779,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example",
+  "external_id": "external_id_example"
+}
+```
+
 ### `user.external_id_unlinked` v1
 
 ```json
@@ -2698,6 +3805,16 @@ receive a different shape.
     "user_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example"
 }
 ```
 
@@ -2729,6 +3846,18 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example",
+  "identifier_id": "identifier_id_example",
+  "identifier_type": "identifier_type_example"
+}
+```
+
 ### `user.identifier_removed` v1
 
 ```json
@@ -2752,6 +3881,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example",
+  "identifier_id": "identifier_id_example"
+}
+```
+
 ### `user.sessions_revoked` v1
 
 ```json
@@ -2767,6 +3907,16 @@ receive a different shape.
     "user_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example"
 }
 ```
 
@@ -2797,6 +3947,18 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example",
+  "state": "state_example",
+  "hard_kill": true
+}
+```
+
 ### `user.updated` v1
 
 ```json
@@ -2824,6 +3986,19 @@ receive a different shape.
     "fields"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "user_id": "user_id_example",
+  "fields": [
+    "field_1"
+  ]
 }
 ```
 
@@ -2860,6 +4035,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "webhook_endpoint_id": "webhook_endpoint_id_example",
+  "active": true
+}
+```
+
 ### `webhook_endpoint.created` v1
 
 ```json
@@ -2883,6 +4069,17 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "webhook_endpoint_id": "webhook_endpoint_id_example",
+  "url": "url_example"
+}
+```
+
 ### `webhook_endpoint.deleted` v1
 
 ```json
@@ -2898,6 +4095,16 @@ receive a different shape.
     "webhook_endpoint_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "webhook_endpoint_id": "webhook_endpoint_id_example"
 }
 ```
 
@@ -2919,6 +4126,16 @@ receive a different shape.
 }
 ```
 
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "webhook_endpoint_id": "webhook_endpoint_id_example"
+}
+```
+
 ### `webhook_endpoint.secret_rotated` v1
 
 ```json
@@ -2934,6 +4151,16 @@ receive a different shape.
     "webhook_endpoint_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "webhook_endpoint_id": "webhook_endpoint_id_example"
 }
 ```
 
@@ -2959,6 +4186,16 @@ receive a different shape.
     "webhook_endpoint_id"
   ],
   "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "webhook_endpoint_id": "webhook_endpoint_id_example"
 }
 ```
 
