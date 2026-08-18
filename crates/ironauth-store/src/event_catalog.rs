@@ -565,6 +565,51 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A BAN is a security mutation an operator performs believing it took effect, so a
+        // consumer mirroring blocks acts on both halves. The subject VALUE stays off the wire
+        // -- it is an IP, a canonical login identifier, or an account, the same class the
+        // `user.identifier_*` types already withhold, and an event is a wider audience than
+        // the management surface that returns it. The KIND and the auth path say which block
+        // list changed; the id and the authorized list surface say the rest.
+        //
+        // The operator's free-text `reason` is withheld for the same reason: it is prose
+        // somebody wrote ABOUT a person, and a consumer that needs it can read it there.
+        "ban.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "ban_id": {"type": "string", "minLength": 1},
+                "subject_kind": {"type": "string", "minLength": 1},
+                "auth_path": {"type": "string", "minLength": 1},
+                "expires_at_unix_ms": {"type": "integer"}
+            },
+            "required": ["ban_id", "subject_kind", "auth_path"]
+        }"#,
+    ),
+    (
+        // The RELAXING half, and its own type: a consumer that read a lift as a no-op would
+        // keep blocking a subject an operator released.
+        //
+        // NO `ban_id`, and that asymmetry with `ban.created` is deliberate rather than an
+        // omission. A create MINTS the id, so its producer knows it; a lift is ADDRESSED by
+        // (subject, path) and the producer never learns which row matched. Inventing the id
+        // here would mean reading it back out of the write, which is precisely the shape that
+        // puts a value on the wire the producer cannot honestly claim.
+        "ban.lifted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "subject_kind": {"type": "string", "minLength": 1},
+                "auth_path": {"type": "string", "minLength": 1}
+            },
+            "required": ["subject_kind", "auth_path"]
+        }"#,
+    ),
+    (
         "recovery_approval.decided",
         1,
         r#"{

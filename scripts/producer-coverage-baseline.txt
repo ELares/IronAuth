@@ -2,8 +2,6 @@
 # SHRINK-ONLY: producer-coverage.py fails if an entry here is already covered or
 # gone, and fails if an uncovered handler is missing from this list. #108 closes
 # when this file is empty. Regenerate with: scripts/producer-coverage.py --update-baseline
-bans::create_ban
-bans::lift_ban
 brands::delete_brand
 brands::set_brand
 client_admin_grants::set_client_admin_consent

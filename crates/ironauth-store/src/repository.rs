@@ -6832,6 +6832,23 @@ impl ActingAbuseRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<AbuseBanId, StoreError> {
+        self.ban_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::ban`], additionally emitting `ban.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::ban`].
+    pub async fn ban_with_event(
+        &self,
+        env: &Env,
+        spec: NewBan<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<AbuseBanId, StoreError> {
         if spec.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -6894,6 +6911,8 @@ impl ActingAbuseRepo<'_> {
                 // and every other field echoes the request), so this is the plain form
                 // rather than the resolved one.
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back ban announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -6917,6 +6936,26 @@ impl ActingAbuseRepo<'_> {
         subject: &AbuseSubject,
         path: AuthPath,
         idempotency: Option<ResolvedIdempotencyWrite<'_, bool>>,
+    ) -> Result<bool, StoreError> {
+        self.lift_with_event(env, subject, path, idempotency, None)
+            .await
+    }
+
+    /// [`Self::lift`], additionally emitting `ban.lifted` (issue #108).
+    ///
+    /// A lift that matched NOTHING is an idempotent no-op and announces nothing: that branch
+    /// returns before the audited write this enqueue lives inside.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::lift`].
+    pub async fn lift_with_event(
+        &self,
+        env: &Env,
+        subject: &AbuseSubject,
+        path: AuthPath,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, bool>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<bool, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
@@ -6968,6 +7007,8 @@ impl ActingAbuseRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_resolved_idempotency(tx, idempotency, &true).await?;
+                // In the write's transaction: a rolled-back lift announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
