@@ -81,6 +81,3 @@ trait_schemas::create_trait_migration_job
 trait_schemas::create_trait_schema_version
 users::link_user_external_id
 users::unlink_user_external_id
-webhook_endpoints::replay_webhook_dead_letters
-webhook_endpoints::rotate_webhook_endpoint_secret
-webhook_endpoints::set_webhook_event_types

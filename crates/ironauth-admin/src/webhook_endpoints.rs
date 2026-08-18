@@ -341,12 +341,14 @@ pub async fn rotate_webhook_endpoint_secret(
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
 
+    let pending =
+        webhook_endpoint_simple_event(&state, scope, &id, "webhook_endpoint.secret_rotated");
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .webhook_endpoints()
-        .rotate_secret(
+        .rotate_secret_with_event(
             state.env(),
             &id,
             &secret_bytes,
@@ -358,6 +360,10 @@ pub async fn rotate_webhook_endpoint_secret(
                 response_status: 200,
                 response_body: &body_string,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     Ok(json(StatusCode::OK, body_string))
@@ -707,12 +713,14 @@ pub async fn replay_webhook_dead_letters(
         since_unix_ms: request.since_unix_ms,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    let pending =
+        webhook_endpoint_simple_event(&state, scope, &id, "webhook_endpoint.replay_requested");
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .webhook_endpoints()
-        .request_dead_letter_replay(
+        .request_dead_letter_replay_with_event(
             state.env(),
             &id,
             request.since_unix_ms.map(|ms| ms.saturating_mul(1000)),
@@ -723,6 +731,10 @@ pub async fn replay_webhook_dead_letters(
                 response_status: 202,
                 response_body: &body_string,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     Ok(json(StatusCode::ACCEPTED, body_string))
@@ -785,12 +797,22 @@ pub async fn set_webhook_event_types(
         ));
     }
 
+    let pending =
+        webhook_endpoint_subscription_event(&state, scope, &id, request.event_types.as_deref());
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .webhook_endpoints()
-        .set_event_types(state.env(), &id, request.event_types.as_deref())
+        .set_event_types_with_event(
+            state.env(),
+            &id,
+            request.event_types.as_deref(),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
 
     // Re-read through the SAME address so the response reports what was stored.
@@ -1079,6 +1101,68 @@ fn webhook_endpoint_active_changed_event(
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,
         &serde_json::json!({ "webhook_endpoint_id": subject, "active": active }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event a webhook-endpoint change with nothing safe to describe emits (issue #108).
+///
+/// Used by the secret rotation and the replay request. A rotation's whole content is a NEW
+/// SECRET, which is exactly what may not travel, so what remains to say is that the signing
+/// material changed and an operator should expect the new key. The overlap window is not
+/// carried either: it is deployment policy a subscriber cannot act on, and carrying it would
+/// invite treating this event as the authority on when the old secret dies.
+fn webhook_endpoint_simple_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    endpoint_id: &ironauth_store::WebhookEndpointId,
+    event_type: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = endpoint_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "webhook_endpoint_id": subject }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event a subscription change emits (issue #108).
+///
+/// `event_types` is OMITTED when the endpoint subscribes to everything, mirroring the column
+/// (NULL means no filter) rather than inventing an empty-list encoding that would collide
+/// with "subscribed to nothing" -- a state the management surface refuses outright.
+fn webhook_endpoint_subscription_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    endpoint_id: &ironauth_store::WebhookEndpointId,
+    event_types: Option<&[String]>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = endpoint_id.to_string();
+    let mut payload = serde_json::json!({ "webhook_endpoint_id": subject });
+    if let Some(types) = event_types {
+        payload["event_types"] = serde_json::json!(types);
+    }
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "webhook_endpoint.subscription_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
     )?;
     Some(crate::events::PendingEvent {
         id,

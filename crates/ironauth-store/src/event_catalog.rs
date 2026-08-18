@@ -267,6 +267,56 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // THE ID ONLY. A rotation's whole content is a NEW SECRET, and that is precisely what
+        // may not travel -- so what remains to say is that the endpoint's signing material
+        // changed and an operator should expect the new key. The overlap window is not carried
+        // either: it is a deployment policy a subscriber cannot act on and would only invite
+        // treating this event as the authority on when the old secret dies.
+        "webhook_endpoint.secret_rotated",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "webhook_endpoint_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["webhook_endpoint_id"]
+        }"#,
+    ),
+    (
+        // The SUBSCRIPTION itself, because that is the fact: which types this endpoint asked
+        // for. `event_types` is absent when the endpoint subscribes to EVERYTHING, mirroring
+        // the column (NULL means no filter) rather than inventing an empty-list encoding that
+        // would collide with "subscribed to nothing" -- a state the management surface
+        // refuses.
+        "webhook_endpoint.subscription_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "webhook_endpoint_id": {"type": "string", "minLength": 1},
+                "event_types": {"type": "array", "items": {"type": "string", "minLength": 1}}
+            },
+            "required": ["webhook_endpoint_id"]
+        }"#,
+    ),
+    (
+        // An operator ASKED for a replay; the deliveries themselves are the answer. Carrying
+        // the request means a receiver can explain a burst of redeliveries it is about to see
+        // rather than mistaking it for a live spike.
+        "webhook_endpoint.replay_requested",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "webhook_endpoint_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["webhook_endpoint_id"]
+        }"#,
+    ),
+    (
         "webhook_endpoint.deleted",
         1,
         r#"{

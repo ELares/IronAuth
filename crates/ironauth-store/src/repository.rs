@@ -26945,6 +26945,31 @@ impl ActingWebhookEndpointRepo<'_> {
         previous_expires_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.rotate_secret_with_event(
+            env,
+            id,
+            secret,
+            previous_expires_at_micros,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::rotate_secret`], additionally emitting `webhook_endpoint.secret_rotated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::rotate_secret`].
+    pub async fn rotate_secret_with_event(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        secret: &[u8],
+        previous_expires_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -26995,6 +27020,8 @@ impl ActingWebhookEndpointRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -27037,6 +27064,23 @@ impl ActingWebhookEndpointRepo<'_> {
         since_unix_micros: Option<i64>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.request_dead_letter_replay_with_event(env, id, since_unix_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::request_dead_letter_replay`], additionally emitting `webhook_endpoint.replay_requested` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::request_dead_letter_replay`].
+    pub async fn request_dead_letter_replay_with_event(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        since_unix_micros: Option<i64>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -27078,6 +27122,8 @@ impl ActingWebhookEndpointRepo<'_> {
                 )
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -27103,6 +27149,22 @@ impl ActingWebhookEndpointRepo<'_> {
         env: &Env,
         id: &WebhookEndpointId,
         event_types: Option<&[String]>,
+    ) -> Result<(), StoreError> {
+        self.set_event_types_with_event(env, id, event_types, None)
+            .await
+    }
+
+    /// [`Self::set_event_types`], additionally emitting `webhook_endpoint.subscription_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_event_types`].
+    pub async fn set_event_types_with_event(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        event_types: Option<&[String]>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -27139,6 +27201,8 @@ impl ActingWebhookEndpointRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

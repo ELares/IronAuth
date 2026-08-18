@@ -940,6 +940,67 @@
       },
       "payload_schema_version": 1,
       "type": "webhook_endpoint.deleted"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.replay_requested"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.secret_rotated"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "event_types": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.subscription_changed"
     }
   ]
 }
