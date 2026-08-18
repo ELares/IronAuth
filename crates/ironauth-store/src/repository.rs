@@ -85,8 +85,8 @@ use crate::id::{
     EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
     FedcmNonceId, FederationLoginStateId, FlowId, FlowVersionId, FlowVersionPinId, GrantId,
     ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
-    LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
-    MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
+    LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MessageTemplateId,
+    MigrationRunId, MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
     OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
     OrgRolePermissionId, OrganizationId, OutboxMessageId, PermissionId, PowChallengeId,
     ProjectGrantId, ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
@@ -532,6 +532,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn outbox(&self) -> OutboxRepo<'a> {
         OutboxRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// Stored message template overrides (issue #111).
+    ///
+    /// On the SCOPED store because rendering reads templates on the send path, which runs as
+    /// the app role. Authoring is a management act and lives behind the control plane, which
+    /// migration 0144's grants enforce: the app role holds SELECT and nothing else, so an app
+    /// role that was somehow induced to write could not rewrite what recipients are sent.
+    #[must_use]
+    pub fn message_templates(&self) -> MessageTemplateRepo<'a> {
+        MessageTemplateRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -39146,6 +39160,115 @@ pub struct NewLogStream<'a> {
     pub organization_id: Option<&'a str>,
     /// Ship only these action wire strings. `None` is every action in `source`.
     pub event_type_filter: Option<Vec<String>>,
+}
+
+/// The stored message templates for a scope (issue #111).
+///
+/// READ ONLY here. `message_template::resolve_template` decides which candidate wins, and this
+/// repository's whole job is to hand it every candidate for one (scope, kind) in one pass. The
+/// split is deliberate: resolution is pure and exhaustively tested without a database, and a
+/// repository that also picked would be a second resolution path -- which is exactly what
+/// issue #619 exists to prevent for the policy engine.
+pub struct MessageTemplateRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+/// One stored template override, as the resolver needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageTemplateRecord {
+    /// The `mtp_` identifier.
+    pub id: MessageTemplateId,
+    /// Which level defined it.
+    pub level: crate::message_template::TemplateLevel,
+    /// The organization, for an organization-level override.
+    pub organization_id: Option<OrganizationId>,
+    /// Which message this templates.
+    pub kind: String,
+    /// The BCP 47 tag the body is written in.
+    pub locale: String,
+    /// The rendered subject line.
+    pub subject: String,
+    /// The plain-text body.
+    pub body_text: String,
+    /// The HTML body, when one was authored.
+    pub body_html: Option<String>,
+    /// Whether this level PINS: no narrower level may replace it (issue #619).
+    pub locked: bool,
+}
+
+impl MessageTemplateRepo<'_> {
+    /// Every LIVE candidate for one message `kind` in this scope, strongest level first.
+    ///
+    /// Ordered here rather than left to the caller because the ordering is not arbitrary: it
+    /// is `TemplateLevel::PRECEDENCE`, and a caller that re-derived it would be a second copy
+    /// of the precedence rule. The resolver still decides -- this only guarantees it sees the
+    /// candidates in the order it expects.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn candidates_for(
+        &self,
+        kind: &str,
+    ) -> Result<Vec<MessageTemplateRecord>, StoreError> {
+        let statement = sqlx::query(
+            "SELECT id, level, organization_id, kind, locale, subject, body_text, body_html, \
+                    locked \
+             FROM message_templates \
+             WHERE tenant_id = $1 AND environment_id = $2 AND kind = $3 \
+               AND deleted_at IS NULL \
+             ORDER BY CASE level \
+                        WHEN 'organization' THEN 0 \
+                        WHEN 'environment' THEN 1 \
+                        WHEN 'tenant' THEN 2 \
+                      END, locale",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(kind);
+
+        // Read inside a SCOPED transaction, not on the bare pool. `message_templates` is FORCE
+        // RLS, so a read without the scope settings returns an empty page rather than an
+        // error -- which is the failure mode that looks like "the operator never authored a
+        // template" instead of "this query forgot its scope".
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = statement.fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                let level_text: String = row.get("level");
+                let organization: Option<String> = row.get("organization_id");
+                Ok(MessageTemplateRecord {
+                    id: MessageTemplateId::parse_in_scope(&id_text, &self.scope)?,
+                    // A level the enum does not know is a DECODE failure, not a row to skip.
+                    // Skipping would silently drop an override an operator authored, which
+                    // presents as "my template did not take effect" with nothing in any log.
+                    level: match level_text.as_str() {
+                        "tenant" => crate::message_template::TemplateLevel::Tenant,
+                        "environment" => crate::message_template::TemplateLevel::Environment,
+                        "organization" => crate::message_template::TemplateLevel::Organization,
+                        other => {
+                            return Err(StoreError::Database(sqlx::Error::Decode(
+                                format!("unknown message template level: {other}").into(),
+                            )));
+                        }
+                    },
+                    organization_id: organization
+                        .map(|id| OrganizationId::parse_in_scope(&id, &self.scope))
+                        .transpose()?,
+                    kind: row.get("kind"),
+                    locale: row.get("locale"),
+                    subject: row.get("subject"),
+                    body_text: row.get("body_text"),
+                    body_html: row.get("body_html"),
+                    locked: row.get("locked"),
+                })
+            })
+            .collect()
+    }
 }
 
 /// Log stream configuration.
