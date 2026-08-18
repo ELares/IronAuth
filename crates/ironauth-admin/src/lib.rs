@@ -76,6 +76,7 @@ pub mod usage;
 /// shipper that reads audit rows forward from each stream's cursor. Public because the
 /// binary wires the shipper and a deployment may add its own sink.
 pub mod log_shipper;
+pub mod log_stream_signature;
 
 mod log_streams;
 mod mds3_health;
