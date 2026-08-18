@@ -672,6 +672,7 @@ pub async fn set_org_default_role(
     // asks again.
     let role = parse_role_id(&state, scope, &request.role_id)?;
 
+    let pending = default_role_set_event(&state, scope, &org_id, &role);
     let result = state
         .store()
         .management()
@@ -679,7 +680,15 @@ pub async fn set_org_default_role(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_roles(scope)
-        .set_default(state.env(), &org_id, &role)
+        .set_default_with_event(
+            state.env(),
+            &org_id,
+            &role,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
     match result {
         Ok(()) => {}
@@ -746,6 +755,7 @@ pub async fn clear_org_default_role(
     // The store resolves the outgoing role IN THE SAME STATEMENT that clears it, so
     // there is nothing to name here and no second read to race against. An
     // organization with no live default matches no row and is the uniform not-found.
+    let pending = default_role_cleared_event(&state, scope, &org_id);
     state
         .store()
         .management()
@@ -753,7 +763,14 @@ pub async fn clear_org_default_role(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_roles(scope)
-        .clear_default(state.env(), &org_id)
+        .clear_default_with_event(
+            state.env(),
+            &org_id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }
@@ -817,6 +834,69 @@ fn org_role_event(
             "org_role_id": subject,
             "organization_id": organization_id.to_string(),
         }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event designating an organization's default role emits (issue #108).
+///
+/// An ORGANIZATION event, not an `org_role.updated`. What changed is WHICH role the
+/// organization hands to new members, not anything about the role itself -- its slug, display
+/// and grants are untouched. A consumer syncing onboarding policy watches this; one syncing
+/// the role catalogue does not.
+fn default_role_set_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    organization_id: &ironauth_store::OrganizationId,
+    org_role_id: &ironauth_store::OrgRoleId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = organization_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "organization.default_role_set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "organization_id": subject,
+            "org_role_id": org_role_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The ORGANIZATION is the subject: set and clear are successive states of one
+        // designation, so they must stay ordered behind each other rather than behind
+        // whichever role happened to hold it.
+        subject,
+        envelope,
+    })
+}
+
+/// The event clearing an organization's default role emits (issue #108).
+///
+/// The organization ONLY, and the omission is forced rather than chosen: the store resolves
+/// the outgoing role in the SAME statement that clears it, so nothing here knows which role it
+/// was when the envelope must be built. Naming it would need either a second read (racy) or
+/// building the event in the store, which no other producer does.
+fn default_role_cleared_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    organization_id: &ironauth_store::OrganizationId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = organization_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "organization.default_role_cleared",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "organization_id": subject }),
     )?;
     Some(crate::events::PendingEvent {
         id,

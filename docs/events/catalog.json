@@ -559,6 +559,47 @@
         "type": "object"
       },
       "payload_schema_version": 1,
+      "type": "organization.default_role_cleared"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "org_role_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.default_role_set"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
       "type": "organization.deleted"
     },
     {

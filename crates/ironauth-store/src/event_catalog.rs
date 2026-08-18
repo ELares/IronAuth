@@ -297,6 +297,44 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // An ORGANIZATION event, not an `org_role.updated`. What changed is WHICH role the
+        // organization hands to new members, not anything about the role itself -- the role's
+        // slug, display and grants are untouched. A consumer syncing an organization's
+        // onboarding policy watches this; one syncing the role catalogue does not.
+        "organization.default_role_set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "organization_id": {"type": "string", "minLength": 1},
+                "org_role_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["organization_id", "org_role_id"]
+        }"#,
+    ),
+    (
+        // THE ORGANIZATION ONLY, and the omission is forced rather than chosen: `clear_default`
+        // discovers WHICH role was the default from its own RETURNING clause, so the producer
+        // does not know it when the envelope has to be built. Naming the ex-default would mean
+        // either a second read (racy) or building the event in the store (which no other
+        // producer does).
+        //
+        // It is also sufficient. The fact is that this organization now has NO default role,
+        // and a consumer syncing onboarding policy acts on that alone; which role it used to
+        // be is in the audit trail.
+        "organization.default_role_cleared",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["organization_id"]
+        }"#,
+    ),
+    (
         "org_role.deleted",
         1,
         r#"{

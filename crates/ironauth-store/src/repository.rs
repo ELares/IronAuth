@@ -47215,6 +47215,22 @@ impl ActingOrgRoleRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgRoleId,
     ) -> Result<(), StoreError> {
+        self.set_default_with_event(env, organization_id, id, None)
+            .await
+    }
+
+    /// [`Self::set_default`], additionally emitting `organization.default_role_set` (#108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_default`].
+    pub async fn set_default_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgRoleId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47270,6 +47286,8 @@ impl ActingOrgRoleRepo<'_> {
                     }
                     Err(error) => return Err(error.into()),
                 }
+                // In the write's transaction: a rolled-back designation announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -47308,6 +47326,25 @@ impl ActingOrgRoleRepo<'_> {
         env: &Env,
         organization_id: &OrganizationId,
     ) -> Result<OrgRoleId, StoreError> {
+        self.clear_default_with_event(env, organization_id, None)
+            .await
+    }
+
+    /// [`Self::clear_default`], additionally emitting
+    /// `organization.default_role_cleared` (issue #108).
+    ///
+    /// Enqueued AFTER the guard: the update matches only a live default row, so clearing an
+    /// organization that has no default is the uniform not-found and announces nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::clear_default`].
+    pub async fn clear_default_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<OrgRoleId, StoreError> {
         if organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47339,6 +47376,9 @@ impl ActingOrgRoleRepo<'_> {
             target: &cleared_id,
         };
         insert_audit_row(&mut tx, &spec, None).await?;
+        // After the guard above found a live default, so an organization with none announces
+        // nothing, and inside the transaction so a rolled-back clear stays silent.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(cleared_id)
     }
