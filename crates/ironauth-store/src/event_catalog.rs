@@ -1004,6 +1004,71 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // THE THREE TYPES METERING COUNTS (issue #107). They are registered here, beside
+        // every other type, because `UsageTally` names them as string constants and an
+        // unregistered type is refused by `validate_event` at the fan-out -- so a metering
+        // event that was not in this list could never be delivered, and the fold would read
+        // a feed that never contains what it counts.
+        //
+        // The SUBJECT is what makes an active user active, and it is the only field the fold
+        // reads. It is the pseudonymous subject identifier, not an email or a phone number:
+        // metering needs to distinguish people, not identify them, and a billing pipeline is
+        // exactly the kind of downstream system that should never have been handed a
+        // directory of its customer's users.
+        "user.signed_in",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "subject": {"type": "string", "minLength": 1}
+            },
+            "required": ["subject"]
+        }"#,
+    ),
+    (
+        // Token issuance is COUNTED, never described. No token and no jti: the fold
+        // increments a number, and the token itself would be material about a live
+        // credential handed to every subscriber of the feed in order to count to one.
+        //
+        // The GRANT and the KIND, because they are what the producer holds. An earlier draft
+        // of this schema required `client_id`, which reads better and is wrong: the issuance
+        // path carries `IssuedTokenRecord { id, kind }` and the grant, and resolving the
+        // client would mean an extra read on the token path -- the producer announcing
+        // something it had to go and look up. A consumer that wants the client resolves the
+        // grant through the management surface, which is the same trade every other payload
+        // here makes.
+        //
+        // The KIND rides along because an access token and an ID token are not
+        // interchangeable units: an operator reading issuance volume needs to know which.
+        "token.issued",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "grant_id": {"type": "string", "minLength": 1},
+                "token_kind": {"type": "string", "minLength": 1}
+            },
+            "required": ["grant_id", "token_kind"]
+        }"#,
+    ),
+    (
+        // A CONNECTION is an upstream identity provider binding. Metering counts them per
+        // tenant, and the connection id is what lets an operator reconcile a count they
+        // disagree with against the connections they can list.
+        "connection.opened",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "connection_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["connection_id"]
+        }"#,
+    ),
+    (
         "recovery_approval.decided",
         1,
         r#"{
@@ -2543,12 +2608,13 @@ mod tests {
         // `withdrawn` (withdraw/withdrew/withdrawn) and `resent` (resend/resent/resent).
         "invitation.resent",
         "project_grant.withdrawn",
-        // Compounds whose PAST form is the head verb, followed by the preposition the fact
-        // needs: `assigned to`, not `assignment`.
+        // Compounds whose PAST form is the head verb, followed by the preposition or particle
+        // the fact needs: `assigned to`, not `assignment`; `signed in`, not `signin`.
         "org_role.assigned_to_group",
         "org_role.assigned_to_member",
         "org_role.unassigned_from_group",
         "org_role.unassigned_from_member",
+        "user.signed_in",
     ];
 
     /// Every registered type is a dotted, `snake_case` token in the PAST TENSE.

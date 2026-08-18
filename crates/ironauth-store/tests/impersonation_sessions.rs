@@ -1511,3 +1511,143 @@ async fn authorizing_an_impersonation_announces_it_without_the_operator_prose() 
     ironauth_store::event_catalog::validate_event(payload)
         .expect("the envelope validates against the registry the fan-out enforces");
 }
+
+/// A REAL sign-in is metered (issue #107 criterion 4).
+///
+/// The existing metering test seeds the feed with `append_envelope`, which writes envelopes
+/// straight to the outbox. That measures the fold's arithmetic and cannot measure whether the
+/// events it folds ever exist -- and they did not: `user.signed_in` was named by a constant in
+/// `UsageTally`, registered nowhere, and emitted by nothing, so metering reported zero for
+/// every tenant on every deployment. The criterion says metering matches seeded ACTIVITY; the
+/// old fixture seeded envelopes.
+///
+/// So this drives a real session through the real path and folds what the feed actually
+/// contains. It is the only test that can fail if the producer is removed.
+#[tokio::test]
+async fn a_real_sign_in_is_metered_as_an_active_user() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "metered@example.test").await;
+    let id = issue_authorization(&db, &env, scope, &user, 30 * MINUTE_MICROS).await;
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .redeem(&env, &id, now_micros(&env))
+        .await
+        .expect("redeem into a session");
+
+    // POLLED, not read once. The feed's visibility lags the commit -- `events_cursor_ordering`
+    // waits the same way for the same reason -- so a single read passes on an idle machine and
+    // returns an empty page under concurrent load. Reading once here made this test fail only
+    // when other suites ran beside it, which is the worst way to learn about a race.
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        match db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .events_page_after(ironauth_store::EventCursor::beginning(), 100)
+            .await
+            .expect("read the feed")
+        {
+            ironauth_store::EventPage::Page(page)
+                if page.iter().any(|m| m.payload["type"] == "user.signed_in") =>
+            {
+                events = page;
+                break;
+            }
+            ironauth_store::EventPage::Page(_) => {}
+            ironauth_store::EventPage::Gone { .. } => panic!("nothing was pruned"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let signed_in: Vec<_> = events
+        .iter()
+        .filter(|m| m.payload["type"] == "user.signed_in")
+        .collect();
+    assert_eq!(
+        signed_in.len(),
+        1,
+        "a real session creation must put exactly one sign-in on the feed, or metering \
+         counts nothing: {events:?}"
+    );
+    assert_eq!(
+        signed_in[0].payload["payload"]["subject"],
+        user.to_string(),
+        "the subject is what makes an active user active, and it is the only field the fold \
+         reads"
+    );
+    ironauth_store::event_catalog::validate_event(&signed_in[0].payload)
+        .expect("the sign-in validates against the registry the fan-out enforces");
+
+    let mut tally = ironauth_store::UsageTally::new();
+    tally.absorb(&events);
+    assert_eq!(
+        tally.monthly_active_users(),
+        1,
+        "one real sign-in is one active user; this is the assertion that was structurally \
+         unreachable while nothing emitted the type"
+    );
+}
+
+/// Neither a sign-in nor a token issuance reads the event feed (issue #107 criterion 5).
+///
+/// The criterion is that metering adds no work to the hot paths. Metering is a READ of the
+/// feed folded into a `UsageTally`, so the assertion is that those paths never perform that
+/// read -- and a number is the only way to say it. A source scan would pass the moment
+/// somebody reached the fold through a helper, and a `pg_stat_*` proxy cannot separate the
+/// fold's SELECT from the enqueue's own INSERT touching the same table and its unique index.
+///
+/// Note what this does NOT claim. Both paths now WRITE one outbox row each, because the feed
+/// is the substrate metering is computed from and it only exists if activity writes to it.
+/// #107 puts the fold off the hot path, not the event; this pins the fold.
+///
+/// The counter is process-wide, so this reads it before and after rather than expecting zero:
+/// other tests in this binary fold the feed, and an absolute assertion would couple this test
+/// to their scheduling.
+#[tokio::test]
+async fn a_sign_in_reads_the_event_feed_zero_times() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "hotpath@example.test").await;
+    let id = issue_authorization(&db, &env, scope, &user, 30 * MINUTE_MICROS).await;
+
+    let before = ironauth_store::feed_reads();
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .redeem(&env, &id, now_micros(&env))
+        .await
+        .expect("redeem into a session");
+    let after = ironauth_store::feed_reads();
+
+    assert_eq!(
+        after - before,
+        0,
+        "the sign-in path read the event feed {} time(s); metering must be folded on request, \
+         never inline, or every login pays for somebody's billing report",
+        after - before
+    );
+
+    // And the counter is not simply dead: folding the feed moves it, which is what makes the
+    // zero above evidence rather than an assertion about a number nothing increments.
+    let probe_before = ironauth_store::feed_reads();
+    let _ = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .events_page_after(ironauth_store::EventCursor::beginning(), 10)
+        .await
+        .expect("read the feed");
+    assert_eq!(
+        ironauth_store::feed_reads() - probe_before,
+        1,
+        "a deliberate fold must move the counter, or the zero above measures nothing"
+    );
+}

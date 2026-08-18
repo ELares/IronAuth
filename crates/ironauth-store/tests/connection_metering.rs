@@ -191,3 +191,107 @@ fn the_connections_table_declares_no_counter_or_limit() {
          proved nothing. Extracted: {ddl}"
     );
 }
+
+/// A REAL connection open is metered, and a duplicate is not (issue #107 criterion 4).
+///
+/// `UsageTally` counts connections per tenant off `connection.opened`, and nothing emitted
+/// it: the type was named by a constant, registered nowhere, produced by nothing, so the
+/// count was zero on every deployment regardless of how many connections existed.
+///
+/// The second half is the guard. A duplicate open is a typed conflict, and the enqueue sits
+/// after that guard, so a connection a concurrent create already opened is not metered twice
+/// -- which for a per-connection count is the difference between a correct invoice and an
+/// inflated one.
+#[tokio::test]
+async fn a_real_connection_open_is_metered_once() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_organization(&db, &env, scope, 0).await;
+    let connector = seed_connector(&db, &env, scope, 0).await;
+    let id = ironauth_store::OrgConnectionId::generate(&env, &scope);
+
+    let spec = || NewOrgConnection {
+        organization_id: &org,
+        connector_id: &connector,
+        overlay_min_acr: None,
+        max_age_secs: None,
+        overlay_min_class: None,
+        capture_upstream_tokens: false,
+        enabled: true,
+    };
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(&env, &id, 1_000_000, spec())
+        .await
+        .expect("open the connection");
+
+    let events = match db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .events_page_after(ironauth_store::EventCursor::beginning(), 100)
+        .await
+        .expect("read the feed")
+    {
+        ironauth_store::EventPage::Page(events) => events,
+        ironauth_store::EventPage::Gone { .. } => panic!("nothing was pruned"),
+    };
+    let opened: Vec<_> = events
+        .iter()
+        .filter(|m| m.payload["type"] == "connection.opened")
+        .collect();
+    assert_eq!(
+        opened.len(),
+        1,
+        "a real connection open must put exactly one event on the feed, or metering counts \
+         nothing: {events:?}"
+    );
+    assert_eq!(
+        opened[0].payload["payload"]["connection_id"],
+        id.to_string()
+    );
+    ironauth_store::event_catalog::validate_event(&opened[0].payload)
+        .expect("it validates against the registry the fan-out enforces");
+
+    let mut tally = ironauth_store::UsageTally::new();
+    tally.absorb(&events);
+    assert_eq!(tally.connections(), 1, "one open is one connection");
+
+    // A duplicate open is refused, and the enqueue sits after that guard.
+    let duplicate = ironauth_store::OrgConnectionId::generate(&env, &scope);
+    let error = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(&env, &duplicate, 2_000_000, spec())
+        .await
+        .expect_err("the same organization and connector is a conflict");
+    assert!(
+        matches!(error, ironauth_store::StoreError::Conflict),
+        "got {error:?}"
+    );
+
+    let after = match db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .events_page_after(ironauth_store::EventCursor::beginning(), 100)
+        .await
+        .expect("read the feed")
+    {
+        ironauth_store::EventPage::Page(events) => events,
+        ironauth_store::EventPage::Gone { .. } => panic!("nothing was pruned"),
+    };
+    let mut after_tally = ironauth_store::UsageTally::new();
+    after_tally.absorb(&after);
+    assert_eq!(
+        after_tally.connections(),
+        1,
+        "a refused duplicate must not be metered; billing a conflict is an inflated invoice"
+    );
+}

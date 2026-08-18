@@ -321,9 +321,9 @@ pub use repository::{
     UserRecord, UserRepo, UserRevocation, UserState, WEBAUTHN_CHALLENGE_TTL_SECS,
     WebauthnAssertionTarget, WebauthnCeremony, WebauthnChallengeRepo, WebauthnCredentialDescriptor,
     WebauthnCredentialOutcome, WebauthnCredentialRecord, WebauthnCredentialRepo,
-    WebauthnFactorStrength, device_code_digest, invitation_token_digest, magic_link_binding_digest,
-    magic_link_token_digest, membership_change, mint_invitation_token, mint_invitation_token_for,
-    opaque_access_token_digest, refresh_token_digest, user_code_hash,
+    WebauthnFactorStrength, device_code_digest, feed_reads, invitation_token_digest,
+    magic_link_binding_digest, magic_link_token_digest, membership_change, mint_invitation_token,
+    mint_invitation_token_for, opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use repository::{
     ActingWebhookEndpointRepo, DeliveryAttemptRecord, DeliveryTargetLookup, DomainEvent,

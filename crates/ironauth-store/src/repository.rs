@@ -9555,6 +9555,34 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(token.kind.as_str())
                 .execute(&mut *tx)
                 .await?;
+                // METERED (issue #107), one per token, inside the redeem's own
+                // transaction. This is the LIVE issuance path -- record_issued_tokens has
+                // no caller outside this file -- so wiring only that one would have left
+                // tokens_issued at zero exactly as it was.
+                let event_id = format!("evt_{}", CorrelationId::generate(env));
+                if let Some(envelope) = crate::event_catalog::envelope(
+                    &event_id,
+                    "token.issued",
+                    &scope.tenant().to_string(),
+                    &scope.environment().to_string(),
+                    epoch_micros(env.clock().now_utc()) / 1000,
+                    &serde_json::json!({
+                        "grant_id": grant_text,
+                        "token_kind": token.kind.as_str(),
+                    }),
+                ) {
+                    enqueue_domain_event(
+                        &mut tx,
+                        env,
+                        scope,
+                        Some(&DomainEvent {
+                            id: &event_id,
+                            subject: &grant_text,
+                            envelope: &envelope,
+                        }),
+                    )
+                    .await?;
+                }
             }
             // An opaque access token (issue #29) records ONLY its digest and
             // metadata here, in the SAME transaction as the consume, so it can no
@@ -9723,6 +9751,36 @@ impl ActingAuthorizationRepo<'_> {
                     .bind(token.kind.as_str())
                     .execute(&mut **tx)
                     .await?;
+                    // METERED (issue #107), one event per token, because that is what
+                    // `tokens_issued` counts: a redeem minting an access and an ID token
+                    // really did issue two. In the write's transaction, so a rolled-back
+                    // issuance is not billed.
+                    let event_id = format!("evt_{}", CorrelationId::generate(env));
+                    if let Some(envelope) = crate::event_catalog::envelope(
+                        &event_id,
+                        "token.issued",
+                        &scope.tenant().to_string(),
+                        &scope.environment().to_string(),
+                        epoch_micros(env.clock().now_utc()) / 1000,
+                        &serde_json::json!({
+                            "grant_id": grant_id.to_string(),
+                            "token_kind": token.kind.as_str(),
+                        }),
+                    ) {
+                        enqueue_domain_event(
+                            tx,
+                            env,
+                            scope,
+                            Some(&DomainEvent {
+                                id: &event_id,
+                                // The GRANT is the ordering key: every token minted under one
+                                // grant stays ordered behind it.
+                                subject: &grant_id.to_string(),
+                                envelope: &envelope,
+                            }),
+                        )
+                        .await?;
+                    }
                 }
                 Ok(())
             },
@@ -19246,6 +19304,7 @@ impl ActingImpersonationAuthorizationRepo<'_> {
         .await?;
         insert_session_row(
             &mut tx,
+            env,
             scope,
             &session,
             NewSession {
@@ -19390,7 +19449,7 @@ impl ActingSessionRepo<'_> {
                 target: id,
             },
             async move |tx| {
-                insert_session_row(tx, scope, id, params, now_micros).await?;
+                insert_session_row(tx, env, scope, id, params, now_micros).await?;
                 if let (Some(prior_id), Some(prior_text)) = (prior, &prior_text) {
                     *out = reconcile_prior_session_at_rotation(
                         PriorReconcile {
@@ -20981,6 +21040,24 @@ pub fn membership_change(added: Vec<String>, removed: Vec<String>) -> Membership
     }
 }
 
+/// How many times the event feed has been READ in this process (issue #107 criterion 5).
+///
+/// The metering fold is a read of the feed followed by [`UsageTally::absorb`]. The criterion
+/// is that neither happens on the token-issuance or login paths, and a number is the only way
+/// to assert that without re-stating the code: a source scan would pass the moment somebody
+/// called the fold through a helper.
+///
+/// Test builds only. It exists to be asserted against, not to be observed in production.
+#[cfg(feature = "testing")]
+static FEED_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the feed-read counter (issue #107 criterion 5).
+#[cfg(feature = "testing")]
+#[must_use]
+pub fn feed_reads() -> u64 {
+    FEED_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Per-tenant usage, folded from the event feed (issue #107).
 ///
 /// # Why this is a fold over the feed rather than counters on the hot path
@@ -21556,6 +21633,14 @@ impl OutboxRepo<'_> {
         cursor: EventCursor,
         limit: i64,
     ) -> Result<EventPage, StoreError> {
+        // Issue #107 criterion 5 counts THIS, and counting it here rather than in Postgres
+        // is deliberate. A `pg_stat_*` proxy cannot separate the fold's read of
+        // `outbox_messages` from the enqueue's own insert touching the same table and its
+        // unique index, so it would answer a different question and answer it fuzzily. This
+        // counts the exact call the metering fold makes, so a fold that appears inline on a
+        // token or login path moves the number and nothing else does.
+        #[cfg(feature = "testing")]
+        FEED_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let after_sequence = cursor.sequence();
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
@@ -31457,6 +31542,36 @@ impl ActingOrgConnectionRepo<'_> {
                     Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
                     Err(error) => return Err(error.into()),
                 }
+                // METERED (issue #107). `UsageTally` counts connections per tenant off
+                // `connection.opened`, and nothing emitted it, so the count was always
+                // zero. Built here rather than by the handler because a connection open
+                // is a data-plane fact with no management producer of its own, exactly
+                // like the sign-in.
+                //
+                // AFTER the unique-violation guard above: a connection a concurrent
+                // create already opened is a typed conflict and must not be metered
+                // twice. In the write's transaction, so a rolled-back open is not billed.
+                let event_id = format!("evt_{}", CorrelationId::generate(env));
+                if let Some(envelope) = crate::event_catalog::envelope(
+                    &event_id,
+                    "connection.opened",
+                    &scope.tenant().to_string(),
+                    &scope.environment().to_string(),
+                    created_at_micros / 1000,
+                    &serde_json::json!({ "connection_id": id.to_string() }),
+                ) {
+                    enqueue_domain_event(
+                        tx,
+                        env,
+                        scope,
+                        Some(&DomainEvent {
+                            id: &event_id,
+                            subject: &id.to_string(),
+                            envelope: &envelope,
+                        }),
+                    )
+                    .await?;
+                }
                 Ok(())
             },
             false,
@@ -38734,8 +38849,26 @@ where
 ///
 /// Split out of `rotate_inner` for the function-length lint. It is also the natural unit: one
 /// statement writing one row, with the impersonation columns riding along or staying NULL.
+/// Every session in the system is inserted HERE, which is why the metering event is emitted
+/// here too (issue #107).
+///
+/// `UsageTally` counts monthly actives off `user.signed_in`, and the constant naming that
+/// type had no producer at all: the fold read a feed that never contained it, so metering
+/// reported zero for every tenant. The fix belongs at the choke point rather than at each of
+/// the three call sites above, for the same reason the fan-out validates in one place -- a
+/// producer added per call site is a producer the next call site forgets, and the failure is
+/// silent undercounting that surfaces as a billing dispute.
+///
+/// In the write's OWN transaction, so a rolled-back sign-in is not metered. That is one
+/// outbox insert on the authentication path, and it is the event stream rather than a
+/// metering query: #107 requires the FOLD to stay off the hot path, which it does -- it runs
+/// on request against the feed, and nothing aggregates here.
+///
+/// The SUBJECT and nothing else. Metering needs to tell people apart, not identify them, and
+/// a billing pipeline is exactly the downstream that should never be handed a directory.
 async fn insert_session_row(
     tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
     scope: Scope,
     id: &SessionId,
     params: NewSession<'_>,
@@ -38789,6 +38922,33 @@ async fn insert_session_row(
     )
     .execute(&mut **tx)
     .await?;
+    // METERED HERE, in the write's own transaction (issue #107). See this function's doc for
+    // why the choke point rather than the call sites, and why the subject is the whole
+    // payload. Built here rather than by a handler because there is no handler: a sign-in is
+    // a data-plane fact, and the store is its only producer.
+    let event_id = format!("evt_{}", CorrelationId::generate(env));
+    if let Some(envelope) = crate::event_catalog::envelope(
+        &event_id,
+        "user.signed_in",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now_micros / 1000,
+        &serde_json::json!({ "subject": params.subject }),
+    ) {
+        enqueue_domain_event(
+            tx,
+            env,
+            scope,
+            Some(&DomainEvent {
+                id: &event_id,
+                // The SUBJECT is the ordering key: one person's sign-ins stay ordered, which
+                // is what lets a consumer reason about a session timeline at all.
+                subject: params.subject,
+                envelope: &envelope,
+            }),
+        )
+        .await?;
+    }
     Ok(())
 }
 
