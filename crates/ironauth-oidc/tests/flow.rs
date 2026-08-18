@@ -524,3 +524,95 @@ async fn ropc_and_unknown_grant_types_are_unsupported() {
         );
     }
 }
+
+/// A REAL code redemption enqueues the `token.issued` metering event (issue #107
+/// criterion 5).
+///
+/// This test exists because nothing else in the repository covered it, which was found by
+/// disabling the producer and watching every suite stay green: `usage_export` appends
+/// `token.issued` envelopes DIRECTLY, so it measures the fold and not the wiring, and the
+/// store-side metering suites never reach the authorization-code path at all.
+///
+/// That is the difference that matters for the criterion. "Metering counts real activity"
+/// is a claim about the PRODUCER firing on the live issuance path, and a test that seeds the
+/// events it later counts cannot distinguish a wired producer from an unwired one -- which
+/// is exactly the state metering was in before #107, reporting zero for every tenant.
+#[tokio::test]
+async fn redeeming_a_code_enqueues_the_token_issued_metering_event() {
+    use std::time::Duration as StdDuration;
+
+    let harness = Harness::start().await;
+    let scope = harness.scope();
+    let env = ironauth_env::Env::system();
+
+    // Drain anything the fixture's own setup enqueued, so what is claimed below is the
+    // redemption's doing and not the harness's.
+    loop {
+        let drained = harness
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                StdDuration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("drain setup events");
+        if drained.is_empty() {
+            break;
+        }
+        for message in drained {
+            harness
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, &message)
+                .await
+                .expect("complete");
+        }
+    }
+
+    // THE REAL REDEMPTION, over the token endpoint.
+    let (_access, _refresh, _jti) = first_exchange(&harness).await;
+
+    let mut kinds: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        let claimed = harness
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                StdDuration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        for message in &claimed {
+            if let Some(kind) = message.payload["type"].as_str() {
+                kinds.push(kind.to_owned());
+            }
+        }
+        for message in claimed {
+            harness
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, &message)
+                .await
+                .expect("complete");
+        }
+        if kinds.iter().any(|k| k == "token.issued") {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+    }
+
+    assert!(
+        kinds.iter().any(|k| k == "token.issued"),
+        "redeeming a code must enqueue token.issued; saw {kinds:?}"
+    );
+}
