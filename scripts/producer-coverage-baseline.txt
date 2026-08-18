@@ -8,8 +8,6 @@ brands::delete_brand
 brands::set_brand
 client_admin_grants::set_client_admin_consent
 client_scopes::set_client_allowed_scopes
-connectors::create_connector
-connectors::update_connector
 consents::revoke_user_consent
 dcr::create_dcr_policy
 dcr::create_initial_access_token

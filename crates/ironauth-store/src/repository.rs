@@ -29732,6 +29732,27 @@ impl ActingConnectorRepo<'_> {
         params: NewConnector<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, id, created_at_micros, params, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `connector.created` (issue #108).
+    ///
+    /// Enqueued inside the write's transaction, so a federation is never announced into
+    /// existence by a create that rolled back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        id: &ConnectorId,
+        created_at_micros: i64,
+        params: NewConnector<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -29792,6 +29813,8 @@ impl ActingConnectorRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -29815,6 +29838,24 @@ impl ActingConnectorRepo<'_> {
         env: &Env,
         id: &ConnectorId,
         params: NewConnector<'_>,
+    ) -> Result<(), StoreError> {
+        self.update_with_event(env, id, params, None).await
+    }
+
+    /// [`Self::update`], additionally emitting `connector.updated` (issue #108).
+    ///
+    /// Enqueued inside the write's transaction, so a receiver is never told a live
+    /// federation changed by an update that rolled back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::update`].
+    pub async fn update_with_event(
+        &self,
+        env: &Env,
+        id: &ConnectorId,
+        params: NewConnector<'_>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -29872,6 +29913,8 @@ impl ActingConnectorRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

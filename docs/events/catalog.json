@@ -226,7 +226,53 @@
         "type": "object"
       },
       "payload_schema_version": 1,
+      "type": "connector.created"
+    },
+    {
+      "domain": "connector",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "connector_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "slug": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
       "type": "connector.deleted"
+    },
+    {
+      "domain": "connector",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "connector_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "slug": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "connector.updated"
     },
     {
       "domain": "environment",

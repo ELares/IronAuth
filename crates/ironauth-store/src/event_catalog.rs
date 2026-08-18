@@ -507,6 +507,45 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // with the id because that is what a connector is referenced by everywhere else --
         // in routing rules, in the federation URL, in an operator's own configuration -- so
         // an id alone would send the receiver looking it up in a row that no longer exists.
+        // The id and the SLUG, mirroring the delete: the slug is how a connector is named in
+        // configuration and in the federation URLs, so an event carrying only the id would
+        // make a receiver look the name up to act on it.
+        //
+        // NEVER the definition and NEVER the client secret. A connector row holds an upstream
+        // CREDENTIAL; the whole point of the secret-free read surface is that it does not
+        // leave through the API, and a webhook is a wider audience than the API.
+        "connector.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "connector_id": {"type": "string", "minLength": 1},
+                "slug": {"type": "string", "minLength": 1}
+            },
+            "required": ["connector_id", "slug"]
+        }"#,
+    ),
+    (
+        // Its own type rather than a second `connector.created`: an update REPLACES the
+        // upstream definition of a live federation, which is the change a receiver most needs
+        // to distinguish -- a consumer counting new federations would otherwise count every
+        // edit as a new one.
+        //
+        // Same payload, and the same prohibition: no definition, no client secret.
+        "connector.updated",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "connector_id": {"type": "string", "minLength": 1},
+                "slug": {"type": "string", "minLength": 1}
+            },
+            "required": ["connector_id", "slug"]
+        }"#,
+    ),
+    (
         "connector.deleted",
         1,
         r#"{
