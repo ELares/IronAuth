@@ -215,6 +215,7 @@ mod tests {
             // secret material. The credential is the thing that must not be here.
             sink_config: serde_json::json!({"endpoint": "https://sink.example/in"}),
             credential_secret_name: Some("collector_token".to_string()),
+            signing_secret_name: None,
             event_type_filter: None,
             organization_id: None,
             active: true,

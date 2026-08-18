@@ -39265,7 +39265,8 @@ impl LogStreamRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         let rows = sqlx::query(
             "SELECT id, description, source, sink_type, sink_config, \
-                    credential_secret_name, event_type_filter, active, organization_id, \
+                    credential_secret_name, signing_secret_name, event_type_filter, \
+                    active, organization_id, \
                     cursor_audit_id, last_error, consecutive_failures, \
                     (EXTRACT(EPOCH FROM cursor_occurred_at) * 1000000)::bigint \
                         AS cursor_micros, \
@@ -39301,6 +39302,7 @@ impl LogStreamRepo<'_> {
                 sink_type,
                 sink_config: row.get("sink_config"),
                 credential_secret_name: row.get("credential_secret_name"),
+                signing_secret_name: row.get("signing_secret_name"),
                 event_type_filter: row.get("event_type_filter"),
                 organization_id: row.get("organization_id"),
                 active: row.get("active"),
@@ -39344,6 +39346,38 @@ impl LogStreamRepo<'_> {
         };
         let scoped = self.store.scoped(self.scope);
         let opened = scoped
+            .environment_secrets()
+            .open_value(master, name)
+            .await?;
+        Ok(Some(opened))
+    }
+
+    /// Open this stream's SIGNING secret, or [`None`] if it ships unsigned.
+    ///
+    /// Deliberately a second method rather than a parameter on
+    /// [`Self::open_credential`]: the two secrets point in opposite directions -- the
+    /// credential authenticates IronAuth to the sink, this proves to a CONSUMER that a batch
+    /// is genuine and in order -- and a shared entry point is how a caller ends up passing
+    /// the wrong one, which would sign batches with the sink's own token and hand every
+    /// receiver the ability to forge them.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] when no platform master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn open_signing_secret(
+        &self,
+        stream: &crate::log_stream::LogStreamRecord,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(name) = stream.signing_secret_name.as_deref() else {
+            return Ok(None);
+        };
+        let Some(master) = self.store.master() else {
+            return Err(StoreError::Encryption);
+        };
+        let opened = self
+            .store
+            .scoped(self.scope)
             .environment_secrets()
             .open_value(master, name)
             .await?;

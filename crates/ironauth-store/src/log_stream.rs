@@ -148,6 +148,16 @@ pub struct LogStreamRecord {
     pub sink_config: Value,
     /// The environment-scoped secret holding the sink credential, by NAME.
     pub credential_secret_name: Option<String>,
+    /// The environment-scoped secret this stream's batches are SIGNED with, by NAME
+    /// (issue #110 criterion 5).
+    ///
+    /// Separate from `credential_secret_name` because it points the other way: the
+    /// credential authenticates IronAuth TO the sink, and this lets a CONSUMER establish
+    /// that a batch came from this deployment and arrived in order. One secret for both
+    /// would hand every party that can receive a batch the key that proves batches genuine.
+    ///
+    /// [`None`] ships UNSIGNED, which is what every stream does today.
+    pub signing_secret_name: Option<String>,
     /// Ship only these action wire strings. [`None`] is every action in `source`;
     /// `Some(empty)` is none of them.
     pub event_type_filter: Option<Vec<String>>,
@@ -248,6 +258,7 @@ mod tests {
             sink_type: SinkType::Http,
             sink_config: serde_json::json!({}),
             credential_secret_name: None,
+            signing_secret_name: None,
             event_type_filter: None,
             organization_id: None,
             active: true,

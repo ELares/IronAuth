@@ -58,6 +58,7 @@ impl LogSink for RecordingSink {
         _stream: &'a LogStreamRecord,
         _credential: Option<&'a str>,
         events: &'a [Value],
+        _signature: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let accept = self.accept;
         let recorded = events.to_vec();

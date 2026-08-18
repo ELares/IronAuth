@@ -1154,6 +1154,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0143_client_token_exchange_policy.sql"),
         },
+        Migration {
+            version: 144,
+            name: "log_stream_signing_secret",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0144_log_stream_signing_secret.sql"),
+        },
     ]
 }
 
