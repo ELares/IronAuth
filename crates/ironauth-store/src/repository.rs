@@ -38665,6 +38665,21 @@ impl LogStreamRepo<'_> {
         new: &NewLogStream<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<String, StoreError> {
+        self.create_with_event(env, new, idempotency, None).await
+    }
+
+    /// [`Self::create`], additionally emitting `log_stream.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        new: &NewLogStream<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<String, StoreError> {
         let scope = self.scope;
         let id = new.id.map_or_else(
             || crate::id::LogStreamId::generate(env, &scope).to_string(),
@@ -38693,6 +38708,8 @@ impl LogStreamRepo<'_> {
         // stream configured with no idempotency record, and the client's retry would
         // configure a SECOND stream shipping the same events to the same sink.
         insert_idempotency(&mut tx, idempotency).await?;
+        // In the create's own transaction: a rolled-back stream announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(id)
     }
@@ -38710,6 +38727,23 @@ impl LogStreamRepo<'_> {
     /// [`StoreError`] on a persistence fault, including the permission failure a
     /// data-plane caller gets: only the control plane may remove a stream.
     pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
+        self.delete_with_event(None, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `log_stream.deleted` (issue #108).
+    ///
+    /// `env` is required only to enqueue, so the un-suffixed [`Self::delete`] passes `None`
+    /// and needs no environment it would otherwise never use.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: Option<&Env>,
+        id: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         sqlx::query(
@@ -38729,6 +38763,10 @@ impl LogStreamRepo<'_> {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        // In the delete's own transaction, alongside the dead letters it removes.
+        if let Some(env) = env {
+            enqueue_domain_event(&mut tx, env, scope, event).await?;
+        }
         tx.commit().await?;
         Ok(())
     }

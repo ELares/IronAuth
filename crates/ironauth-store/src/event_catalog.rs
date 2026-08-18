@@ -496,6 +496,41 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // The SMS-OTP kill switch and its downgrade rule. Both are on the payload because the
         // pair is the policy: "enabled" alone does not tell a receiver whether a user may fall
         // back from a stronger factor, which is the part with security consequences.
+        // A SIEM stream was configured. The SINK TYPE travels with the id because "audit is
+        // now shipping to S3" and "audit is now shipping to an HTTP endpoint" are different
+        // facts to anyone reconciling where a tenant's audit trail goes.
+        //
+        // NEVER THE SINK CREDENTIAL. A stream carries the secret its deliveries authenticate
+        // with, sealed at rest and stripped from the read surface; a webhook is a wider
+        // audience than that surface.
+        "log_stream.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "log_stream_id": {"type": "string", "minLength": 1},
+                "sink_type": {"type": "string", "minLength": 1}
+            },
+            "required": ["log_stream_id", "sink_type"]
+        }"#,
+    ),
+    (
+        // The stream is gone AND so is every dead letter it recorded, which is why this
+        // matters more than a configuration tidy-up: an operator watching for undelivered
+        // audit will never see those again, and the event is the only notice they get.
+        "log_stream.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "log_stream_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["log_stream_id"]
+        }"#,
+    ),
+    (
         "sms_otp.config_changed",
         1,
         r#"{

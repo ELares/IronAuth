@@ -547,6 +547,47 @@
       "type": "locale_bundle.set"
     },
     {
+      "domain": "log_stream",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "log_stream_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "sink_type": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "log_stream_id",
+          "sink_type"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "log_stream.created"
+    },
+    {
+      "domain": "log_stream",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "log_stream_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "log_stream_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "log_stream.deleted"
+    },
+    {
       "domain": "management_key",
       "payload_schema": {
         "additionalProperties": false,

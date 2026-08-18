@@ -16,8 +16,6 @@ impersonation::authorize_user_impersonation
 imports::create_identity_import
 imports::resume_identity_import
 keys::create_key
-log_streams::create_log_stream
-log_streams::delete_log_stream
 migration::delete_outbound_verification
 migration::set_outbound_verification
 migration_runs::abandon_migration_run
