@@ -992,3 +992,139 @@ async fn a_body_that_cannot_be_rendered_rolls_the_whole_add_back() {
         "the stored response describes the row the retry resolved"
     );
 }
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}
+
+/// Adding a member emits `organization.member_added`, naming BOTH ends of the join.
+///
+/// A membership is a join, and a consumer cannot act on it without both ends: this is the
+/// event an integrator PROVISIONS on, and it needs to know whose access, to what.
+#[tokio::test]
+async fn adding_a_member_emits_an_event_naming_both_ends() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let user = create_active_user(&db, &env, scope, "member@example.test").await;
+    let membership = OrgMembershipId::generate(&env, &scope);
+    let subject = membership.to_string();
+
+    let added = ironauth_store::event_catalog::envelope(
+        "evt_member_added",
+        "organization.member_added",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": org.to_string(),
+            "user_id": user.to_string(),
+        }),
+    )
+    .expect("organization.member_added is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .create_with_event(
+            &env,
+            NewMembership {
+                id: &membership,
+                organization_id: &org,
+                user_id: &user,
+                metadata: None,
+            },
+            now_micros(&env),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_member_added",
+                subject: &subject,
+                envelope: &added,
+            }),
+        )
+        .await
+        .expect("add member with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the add enqueues exactly one event");
+    assert_eq!(events[0]["type"], "organization.member_added");
+    assert_eq!(events[0]["payload"]["organization_id"], org.to_string());
+    assert_eq!(events[0]["payload"]["user_id"], user.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Removing a member is announced as a REMOVAL, not an addition.
+///
+/// This is the event an integrator DEPROVISIONS on, so collapsing the pair into one type
+/// would make the most consequential distinction in it a field to branch on. The seed uses the
+/// un-suffixed `add_member`, which emits nothing, so the only event queued is the removal's.
+#[tokio::test]
+async fn removing_a_member_is_announced_as_a_removal_not_an_addition() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let user = create_active_user(&db, &env, scope, "member@example.test").await;
+    let membership = add_member(&db, &env, scope, &org, &user)
+        .await
+        .expect("seed membership");
+    let subject = membership.to_string();
+
+    let removed = ironauth_store::event_catalog::envelope(
+        "evt_member_removed",
+        "organization.member_removed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": org.to_string(),
+            "user_id": user.to_string(),
+        }),
+    )
+    .expect("organization.member_removed is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_memberships(scope)
+        .remove_with_event(
+            &env,
+            &membership,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_member_removed",
+                subject: &subject,
+                envelope: &removed,
+            }),
+        )
+        .await
+        .expect("remove member with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the removal enqueues exactly one event");
+    assert_eq!(
+        events[0]["type"], "organization.member_removed",
+        "a removal must NOT be announced as an addition"
+    );
+    assert_eq!(events[0]["payload"]["user_id"], user.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

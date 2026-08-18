@@ -24,8 +24,6 @@ imports::resume_identity_import
 keys::create_key
 log_streams::create_log_stream
 log_streams::delete_log_stream
-memberships::create_membership
-memberships::delete_membership
 migration::delete_outbound_verification
 migration::set_outbound_verification
 migration_runs::abandon_migration_run

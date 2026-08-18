@@ -144,6 +144,14 @@ pub async fn create_membership(
         response_status: 201,
         response_body: &render,
     };
+    let pending = membership_event(
+        &state,
+        scope,
+        &membership_id,
+        &org_id,
+        &user_id,
+        "organization.member_added",
+    );
     let result = state
         .store()
         .management()
@@ -151,7 +159,7 @@ pub async fn create_membership(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_memberships(scope)
-        .create(
+        .create_with_event(
             state.env(),
             NewMembership {
                 id: &membership_id,
@@ -161,6 +169,10 @@ pub async fn create_membership(
             },
             created_at_micros,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -294,6 +306,14 @@ pub async fn delete_membership(
     if record.organization_id != org_id {
         return Err(ApiError::NotFound);
     }
+    let pending = membership_event(
+        &state,
+        scope,
+        &id,
+        &org_id,
+        &record.user_id,
+        "organization.member_removed",
+    );
     state
         .store()
         .management()
@@ -301,7 +321,53 @@ pub async fn delete_membership(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_memberships(scope)
-        .remove(state.env(), &id)
+        .remove_with_event(
+            state.env(),
+            &id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event an organization membership change emits (issue #108).
+///
+/// ONE builder for the add and the remove, because a membership is a JOIN and both facts need
+/// the same two ends. The TYPES stay separate: an integrator PROVISIONS on one and
+/// DEPROVISIONS on the other, and collapsing them would make the most consequential
+/// distinction in the pair a field to branch on.
+///
+/// No role and no traits. A membership's role is changed through its own surface and
+/// announced there, so folding it in here would make this event go stale the moment a role
+/// moves without the membership changing.
+fn membership_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    membership_id: &ironauth_store::OrgMembershipId,
+    organization_id: &ironauth_store::OrganizationId,
+    user_id: &ironauth_store::UserId,
+    event_type: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = membership_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": organization_id.to_string(),
+            "user_id": user_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

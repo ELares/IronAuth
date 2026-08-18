@@ -639,6 +639,62 @@
       "type": "organization.deleted"
     },
     {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "membership_id",
+          "organization_id",
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.member_added"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "membership_id",
+          "organization_id",
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.member_removed"
+    },
+    {
       "domain": "permission",
       "payload_schema": {
         "additionalProperties": false,

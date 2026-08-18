@@ -46111,6 +46111,23 @@ impl ActingOrgMembershipRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<ResolvedIdempotencyWrite<'_, OrgMembershipRecord>>,
     ) -> Result<OrgMembershipRecord, StoreError> {
+        self.create_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `organization.member_added` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewMembership<'_>,
+        created_at_micros: i64,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, OrgMembershipRecord>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<OrgMembershipRecord, StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.user_id.scope() != self.scope
@@ -46176,6 +46193,9 @@ impl ActingOrgMembershipRepo<'_> {
         // the write: the response and the row it describes commit together or not at
         // all.
         insert_resolved_idempotency(&mut tx, idempotency, &record).await?;
+        // BEFORE the commit, inside the write's own transaction: a rolled-back membership
+        // announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -46284,6 +46304,20 @@ impl ActingOrgMembershipRepo<'_> {
     /// [`StoreError::NotFound`] if the id is not in this scope, or no live membership
     /// matched.
     pub async fn remove(&self, env: &Env, id: &OrgMembershipId) -> Result<(), StoreError> {
+        self.remove_with_event(env, id, None).await
+    }
+
+    /// [`Self::remove`], additionally emitting `organization.member_removed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove`].
+    pub async fn remove_with_event(
+        &self,
+        env: &Env,
+        id: &OrgMembershipId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -46365,6 +46399,8 @@ impl ActingOrgMembershipRepo<'_> {
                     tx, store, scope, &acting, env, id, now_micros,
                 )
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

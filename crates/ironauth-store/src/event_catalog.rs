@@ -388,6 +388,43 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // The role AND its organization, mirroring the delete: an org role is scoped to one
         // organization, and a receiver maintaining a per-organization view cannot file the
         // event without knowing which one.
+        // THE MEMBERSHIP, ITS ORGANIZATION AND ITS USER, because a membership is a JOIN and a
+        // consumer cannot act on it without both ends. This is the event an integrator most
+        // often wires to provisioning: someone gained access to an organization.
+        //
+        // No role and no traits: a membership's role is changed through its own surface and
+        // announced there, so folding it in here would make this event go stale the moment a
+        // role moves without the membership changing.
+        "organization.member_added",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "membership_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "user_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["membership_id", "organization_id", "user_id"]
+        }"#,
+    ),
+    (
+        // The mirror, and the one an integrator DEPROVISIONS on. Both ends again: a receiver
+        // revoking downstream access needs to know whose access, to what.
+        "organization.member_removed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "membership_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "user_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["membership_id", "organization_id", "user_id"]
+        }"#,
+    ),
+    (
         "org_role.created",
         1,
         r#"{
