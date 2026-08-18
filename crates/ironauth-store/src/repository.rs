@@ -31458,6 +31458,36 @@ impl ActingOrgConnectionRepo<'_> {
                     Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
                     Err(error) => return Err(error.into()),
                 }
+                // METERED (issue #107). `UsageTally` counts connections per tenant off
+                // `connection.opened`, and nothing emitted it, so the count was always
+                // zero. Built here rather than by the handler because a connection open
+                // is a data-plane fact with no management producer of its own, exactly
+                // like the sign-in.
+                //
+                // AFTER the unique-violation guard above: a connection a concurrent
+                // create already opened is a typed conflict and must not be metered
+                // twice. In the write's transaction, so a rolled-back open is not billed.
+                let event_id = format!("evt_{}", CorrelationId::generate(env));
+                if let Some(envelope) = crate::event_catalog::envelope(
+                    &event_id,
+                    "connection.opened",
+                    &scope.tenant().to_string(),
+                    &scope.environment().to_string(),
+                    created_at_micros / 1000,
+                    &serde_json::json!({ "connection_id": id.to_string() }),
+                ) {
+                    enqueue_domain_event(
+                        tx,
+                        env,
+                        scope,
+                        Some(&DomainEvent {
+                            id: &event_id,
+                            subject: &id.to_string(),
+                            envelope: &envelope,
+                        }),
+                    )
+                    .await?;
+                }
                 Ok(())
             },
             false,
