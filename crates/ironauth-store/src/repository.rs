@@ -53872,6 +53872,24 @@ impl ActingEnvironmentSecretRepo<'_> {
         plaintext: &[u8],
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<EnvironmentSecretId, StoreError> {
+        self.put_with_event(env, master, name, plaintext, idempotency, None)
+            .await
+    }
+
+    /// [`Self::put`], additionally emitting `environment_secret.set` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put`].
+    pub async fn put_with_event(
+        &self,
+        env: &Env,
+        master: &MasterKey,
+        name: &str,
+        plaintext: &[u8],
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<EnvironmentSecretId, StoreError> {
         if !crate::esv::name_is_valid(name) {
             return Err(StoreError::InvalidName);
         }
@@ -53923,6 +53941,8 @@ impl ActingEnvironmentSecretRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back put announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -53953,6 +53973,28 @@ impl ActingEnvironmentSecretRepo<'_> {
         self.put(env, master, name, plaintext, idempotency).await
     }
 
+    /// [`Self::put_under_platform_key`], additionally emitting `environment_secret.set`
+    /// (issue #108).
+    ///
+    /// The event carries the secret's NAME and nothing derived from its value; the sealing
+    /// still happens inside the store, and the caller still never holds a key handle.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put_under_platform_key`].
+    pub async fn put_under_platform_key_with_event(
+        &self,
+        env: &Env,
+        name: &str,
+        plaintext: &[u8],
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<EnvironmentSecretId, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.put_with_event(env, master, name, plaintext, idempotency, event)
+            .await
+    }
+
     /// Delete a secret and audit `environment_secret.delete` in the same
     /// transaction (issue #45). REJECTED while a live variable value in the scope
     /// still references it (the same referent protection variables have); the
@@ -53964,6 +54006,20 @@ impl ActingEnvironmentSecretRepo<'_> {
     /// [`StoreError::Conflict`] if the secret is still referenced;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, name: &str) -> Result<(), StoreError> {
+        self.delete_with_event(env, name, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `environment_secret.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        name: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let id = self.secret_id(name).await?;
         let reference = crate::esv::Reference {
@@ -54002,6 +54058,8 @@ impl ActingEnvironmentSecretRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // AFTER the guard, so deleting a secret that is not there announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

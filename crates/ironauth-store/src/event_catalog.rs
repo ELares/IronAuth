@@ -169,6 +169,38 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // variable rather than a secret is not a promise that every webhook subscriber may
         // read it. The name tells a consumer what to refetch through the authorized surface,
         // which is the same answer the delete gives.
+        // THE NAME ONLY, and here that is not a judgement call at all: the value is a SECRET,
+        // sealed at rest, and the management read surface will not return it either. An event
+        // is a wider audience than that surface.
+        //
+        // Nothing derived from the value goes on the wire either -- no digest, no length, no
+        // prefix. A digest of a low-entropy secret is guessable, and a length narrows a search;
+        // the name is what tells a consumer which reference to re-resolve.
+        "environment_secret.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 1}
+            },
+            "required": ["name"]
+        }"#,
+    ),
+    (
+        // As `environment_secret.set`: the name, and nothing that was ever the value.
+        "environment_secret.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 1}
+            },
+            "required": ["name"]
+        }"#,
+    ),
+    (
         "environment_variable.set",
         1,
         r#"{

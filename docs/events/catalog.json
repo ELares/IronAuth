@@ -298,6 +298,42 @@
       "type": "environment.deleted"
     },
     {
+      "domain": "environment_secret",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment_secret.deleted"
+    },
+    {
+      "domain": "environment_secret",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment_secret.set"
+    },
+    {
       "domain": "environment_variable",
       "payload_schema": {
         "additionalProperties": false,
