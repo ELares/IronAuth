@@ -855,3 +855,62 @@ async fn a_user_who_does_not_exist_is_the_uniform_not_found_for_tokens() {
         "minting a token for an absent user answered something other than not-found: {body}"
     );
 }
+
+/// Everything queued for the webhook fan-out in this scope.
+async fn queued_events(h: &Harness, scope: ironauth_store::Scope) -> Vec<Value> {
+    use std::time::Duration;
+
+    h.db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}
+
+/// Revoking an ORGANIZATION api key announces it, over the real management route.
+///
+/// `revoke_with_event` shipped with #875 and the organization-scoped handler never called it,
+/// so an operator revoking an organization credential produced an audit row and NO event
+/// while the personal-access-token path produced both. The store method was already covered;
+/// what was missing was the handler passing an event to it, which is why this test drives the
+/// HTTP route rather than the repository.
+///
+/// The SAME `api_key.revoked` type the personal path emits: an organization key and a
+/// personal one are the same credential kind under different owners, and a second type for
+/// the owner would make every consumer subscribe twice to learn one fact.
+#[tokio::test]
+async fn revoking_an_organization_api_key_announces_it() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-evt").await;
+    let (_, key_id) = issue_org_key(&h, &tenant, &environment, &org, "to be revoked").await;
+    let scope = scope_of(&tenant, &environment);
+    let management = h.create_key(&tenant, &environment, "ci", "k-mgmt").await;
+
+    // Everything the fixture's own provisioning enqueued, discarded, so the count below
+    // measures the revoke and nothing else.
+    let _ = queued_events(&h, scope).await;
+
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/api-keys/{key_id}"
+    );
+    let (status, _, body) = h.delete_as(&path, &management).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "revoke: {body}");
+
+    let events = queued_events(&h, scope).await;
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(events[0]["type"], "api_key.revoked");
+    assert_eq!(events[0]["payload"]["api_key_id"], key_id);
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

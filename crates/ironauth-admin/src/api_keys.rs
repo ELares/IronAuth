@@ -342,6 +342,7 @@ pub async fn revoke_organization_api_key(
         return Err(ApiError::NotFound);
     }
 
+    let pending = api_key_revoked_event(&state, scope, &id);
     let result = state
         .store()
         .scoped(scope)
@@ -349,7 +350,15 @@ pub async fn revoke_organization_api_key(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .api_keys()
-        .revoke(state.env(), &id, state.now_unix_micros())
+        .revoke_with_event(
+            state.env(),
+            &id,
+            state.now_unix_micros(),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
 
     match result {
@@ -491,4 +500,34 @@ pub async fn rotate_organization_api_key(
         Err(StoreError::NotFound) => Err(ApiError::NotFound),
         Err(_) => Err(ApiError::Internal),
     }
+}
+
+/// The event an organization API-key revocation emits (issue #108).
+///
+/// The SAME `api_key.revoked` type the personal-access-token revoke emits. An organization
+/// key and a personal one are the same credential kind under different owners, and minting a
+/// second type for the owner would make every consumer subscribe twice to learn one fact.
+///
+/// The id only, for the reason on `management_key.revoked`: nothing derived from the secret
+/// belongs on the wire that announces the credential is dead.
+fn api_key_revoked_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    key_id: &ApiKeyId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = key_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "api_key.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "api_key_id": subject }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

@@ -3,7 +3,6 @@
 # gone, and fails if an uncovered handler is missing from this list. #108 closes
 # when this file is empty. Regenerate with: scripts/producer-coverage.py --update-baseline
 api_keys::create_organization_api_key
-api_keys::revoke_organization_api_key
 api_keys::rotate_organization_api_key
 bans::create_ban
 bans::lift_ban
