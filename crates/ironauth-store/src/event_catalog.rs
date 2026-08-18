@@ -1027,23 +1027,30 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
-        // Token issuance is COUNTED, never described. No token, no jti, no scopes, no
-        // audience: the fold increments a number, and everything else would be material
-        // about a live credential handed to every subscriber of the feed in order to count
-        // to one.
+        // Token issuance is COUNTED, never described. No token and no jti: the fold
+        // increments a number, and the token itself would be material about a live
+        // credential handed to every subscriber of the feed in order to count to one.
         //
-        // The client rides along because issuance volume per application is the breakdown an
-        // operator actually plans capacity against, and it is not recoverable afterwards
-        // from a bare count.
+        // The GRANT and the KIND, because they are what the producer holds. An earlier draft
+        // of this schema required `client_id`, which reads better and is wrong: the issuance
+        // path carries `IssuedTokenRecord { id, kind }` and the grant, and resolving the
+        // client would mean an extra read on the token path -- the producer announcing
+        // something it had to go and look up. A consumer that wants the client resolves the
+        // grant through the management surface, which is the same trade every other payload
+        // here makes.
+        //
+        // The KIND rides along because an access token and an ID token are not
+        // interchangeable units: an operator reading issuance volume needs to know which.
         "token.issued",
         1,
         r#"{
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "client_id": {"type": "string", "minLength": 1}
+                "grant_id": {"type": "string", "minLength": 1},
+                "token_kind": {"type": "string", "minLength": 1}
             },
-            "required": ["client_id"]
+            "required": ["grant_id", "token_kind"]
         }"#,
     ),
     (

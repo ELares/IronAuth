@@ -3620,13 +3620,18 @@ as a sentinel, so an absent one means absent.
 {
   "additionalProperties": false,
   "properties": {
-    "client_id": {
+    "grant_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "token_kind": {
       "minLength": 1,
       "type": "string"
     }
   },
   "required": [
-    "client_id"
+    "grant_id",
+    "token_kind"
   ],
   "type": "object"
 }
@@ -3638,7 +3643,8 @@ as a sentinel, so an absent one means absent.
 
 ```json
 {
-  "client_id": "client_id_example"
+  "grant_id": "grant_id_example",
+  "token_kind": "token_kind_example"
 }
 ```
 

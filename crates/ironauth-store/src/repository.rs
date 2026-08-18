@@ -9555,6 +9555,34 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(token.kind.as_str())
                 .execute(&mut *tx)
                 .await?;
+                // METERED (issue #107), one per token, inside the redeem's own
+                // transaction. This is the LIVE issuance path -- record_issued_tokens has
+                // no caller outside this file -- so wiring only that one would have left
+                // tokens_issued at zero exactly as it was.
+                let event_id = format!("evt_{}", CorrelationId::generate(env));
+                if let Some(envelope) = crate::event_catalog::envelope(
+                    &event_id,
+                    "token.issued",
+                    &scope.tenant().to_string(),
+                    &scope.environment().to_string(),
+                    epoch_micros(env.clock().now_utc()) / 1000,
+                    &serde_json::json!({
+                        "grant_id": grant_text,
+                        "token_kind": token.kind.as_str(),
+                    }),
+                ) {
+                    enqueue_domain_event(
+                        &mut tx,
+                        env,
+                        scope,
+                        Some(&DomainEvent {
+                            id: &event_id,
+                            subject: &grant_text,
+                            envelope: &envelope,
+                        }),
+                    )
+                    .await?;
+                }
             }
             // An opaque access token (issue #29) records ONLY its digest and
             // metadata here, in the SAME transaction as the consume, so it can no
@@ -9723,6 +9751,36 @@ impl ActingAuthorizationRepo<'_> {
                     .bind(token.kind.as_str())
                     .execute(&mut **tx)
                     .await?;
+                    // METERED (issue #107), one event per token, because that is what
+                    // `tokens_issued` counts: a redeem minting an access and an ID token
+                    // really did issue two. In the write's transaction, so a rolled-back
+                    // issuance is not billed.
+                    let event_id = format!("evt_{}", CorrelationId::generate(env));
+                    if let Some(envelope) = crate::event_catalog::envelope(
+                        &event_id,
+                        "token.issued",
+                        &scope.tenant().to_string(),
+                        &scope.environment().to_string(),
+                        epoch_micros(env.clock().now_utc()) / 1000,
+                        &serde_json::json!({
+                            "grant_id": grant_id.to_string(),
+                            "token_kind": token.kind.as_str(),
+                        }),
+                    ) {
+                        enqueue_domain_event(
+                            tx,
+                            env,
+                            scope,
+                            Some(&DomainEvent {
+                                id: &event_id,
+                                // The GRANT is the ordering key: every token minted under one
+                                // grant stays ordered behind it.
+                                subject: &grant_id.to_string(),
+                                envelope: &envelope,
+                            }),
+                        )
+                        .await?;
+                    }
                 }
                 Ok(())
             },

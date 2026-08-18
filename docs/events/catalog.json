@@ -2250,13 +2250,18 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
-          "client_id": {
+          "grant_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "token_kind": {
             "minLength": 1,
             "type": "string"
           }
         },
         "required": [
-          "client_id"
+          "grant_id",
+          "token_kind"
         ],
         "type": "object"
       },

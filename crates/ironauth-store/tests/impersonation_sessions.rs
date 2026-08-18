@@ -1539,16 +1539,31 @@ async fn a_real_sign_in_is_metered_as_an_active_user() {
         .await
         .expect("redeem into a session");
 
-    let events = db
-        .store()
-        .scoped(scope)
-        .outbox()
-        .events_page_after(ironauth_store::EventCursor::beginning(), 100)
-        .await
-        .expect("read the feed");
-    let ironauth_store::EventPage::Page(events) = events else {
-        panic!("nothing was pruned");
-    };
+    // POLLED, not read once. The feed's visibility lags the commit -- `events_cursor_ordering`
+    // waits the same way for the same reason -- so a single read passes on an idle machine and
+    // returns an empty page under concurrent load. Reading once here made this test fail only
+    // when other suites ran beside it, which is the worst way to learn about a race.
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        match db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .events_page_after(ironauth_store::EventCursor::beginning(), 100)
+            .await
+            .expect("read the feed")
+        {
+            ironauth_store::EventPage::Page(page)
+                if page.iter().any(|m| m.payload["type"] == "user.signed_in") =>
+            {
+                events = page;
+                break;
+            }
+            ironauth_store::EventPage::Page(_) => {}
+            ironauth_store::EventPage::Gone { .. } => panic!("nothing was pruned"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     let signed_in: Vec<_> = events
         .iter()
