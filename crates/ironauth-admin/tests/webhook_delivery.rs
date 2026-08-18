@@ -133,26 +133,44 @@ fn scope_of(tenant: &str, environment: &str) -> Scope {
 /// noise has to leave, not the guarantee.
 async fn drain_setup_events(store: &ironauth_store::Store, env: &Env, scope: Scope) {
     use std::time::Duration;
-    let drained = store
-        .scoped(scope)
-        .outbox()
-        .claim(
-            env,
-            ironauth_store::WEBHOOK_EVENT_CONSUMER,
-            Duration::from_secs(30),
-            100,
-        )
-        .await
-        .expect("drain the events the fixture's own setup enqueued");
-    // COMPLETED, not merely claimed: a claimed-but-open message still counts as in-flight,
-    // and one of these tests asserts on the queue depth itself.
-    for message in drained {
-        store
+    // Drained in a LOOP, not a single pass, and this is the whole point of the helper.
+    //
+    // The outbox serializes per ORDERING KEY: a second message on a key is not claimable
+    // until the first is COMPLETED, not merely claimed. The fixture provisions an endpoint
+    // and then pauses it, which is two events on that endpoint's key, so one pass claims
+    // `webhook_endpoint.created`, completes it, and returns -- leaving `.active_changed` to
+    // become claimable immediately afterwards and land in the batch the TEST claims.
+    //
+    // That is how it failed: `creating a user emits exactly one event` saw
+    // `[webhook_endpoint.active_changed, user.created]`. The setup grew a second event per
+    // key when the producer catalog did, and a single-pass drain silently stopped being a
+    // drain. Looping to empty is correct for any number of events on any number of keys.
+    loop {
+        let drained = store
             .scoped(scope)
             .outbox()
-            .complete(env, &message)
+            .claim(
+                env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                Duration::from_secs(30),
+                100,
+            )
             .await
-            .expect("complete a drained setup event");
+            .expect("drain the events the fixture's own setup enqueued");
+        if drained.is_empty() {
+            return;
+        }
+        // COMPLETED, not merely claimed: a claimed-but-open message still counts as
+        // in-flight, one of these tests asserts on the queue depth itself, and completing is
+        // also what unblocks the next message on the same ordering key.
+        for message in drained {
+            store
+                .scoped(scope)
+                .outbox()
+                .complete(env, &message)
+                .await
+                .expect("complete a drained setup event");
+        }
     }
 }
 
