@@ -212,6 +212,14 @@ pub async fn add_org_group_member(
     // by the time the write ran, and would answer "does that group exist" a request
     // early: the ordering is what keeps the 409 reachable only by a caller who has
     // already proved they can see both endpoints.
+    let pending = org_group_member_event(
+        &state,
+        scope,
+        &group,
+        &org_id,
+        &membership,
+        "org_group.member_added",
+    );
     let result = state
         .store()
         .management()
@@ -219,7 +227,7 @@ pub async fn add_org_group_member(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_group_members(scope)
-        .add(
+        .add_with_event(
             state.env(),
             NewOrgGroupMember {
                 id: &binding_id,
@@ -229,6 +237,10 @@ pub async fn add_org_group_member(
             },
             created_at_micros,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -376,6 +388,14 @@ pub async fn remove_org_group_member(
         .await?;
     // The organization rides into the UPDATE as a predicate as well, so the write is
     // fenced independently of the read that addressed it.
+    let pending = org_group_member_event(
+        &state,
+        scope,
+        &binding.group_id,
+        &org_id,
+        &binding.membership_id,
+        "org_group.member_removed",
+    );
     state
         .store()
         .management()
@@ -383,7 +403,49 @@ pub async fn remove_org_group_member(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_group_members(scope)
-        .remove(state.env(), &org_id, &binding.id)
+        .remove_with_event(
+            state.env(),
+            &org_id,
+            &binding.id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event an organization-group membership change emits (issue #108).
+///
+/// Both ends of the join and the organization, exactly as the organization membership types
+/// carry them: an integrator PROVISIONS on the add and DEPROVISIONS on the remove, and each
+/// needs to know which membership joined or left which group.
+fn org_group_member_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    group_id: &ironauth_store::OrgGroupId,
+    organization_id: &ironauth_store::OrganizationId,
+    membership_id: &ironauth_store::OrgMembershipId,
+    event_type: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = group_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "org_group_id": subject,
+            "organization_id": organization_id.to_string(),
+            "membership_id": membership_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

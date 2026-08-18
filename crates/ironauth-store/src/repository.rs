@@ -48018,6 +48018,31 @@ impl ActingOrgGroupRepo<'_> {
         max_group_depth: u32,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(
+            env,
+            spec,
+            created_at_micros,
+            max_group_depth,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create`], additionally emitting `org_group.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgGroup<'_>,
+        created_at_micros: i64,
+        max_group_depth: u32,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope || spec.organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48092,6 +48117,8 @@ impl ActingOrgGroupRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -48140,6 +48167,24 @@ impl ActingOrgGroupRepo<'_> {
         display_name: Option<&str>,
         metadata: Option<&serde_json::Value>,
     ) -> Result<(), StoreError> {
+        self.update_with_event(env, organization_id, id, display_name, metadata, None)
+            .await
+    }
+
+    /// [`Self::update`], additionally emitting `org_group.updated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::update`].
+    pub async fn update_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupId,
+        display_name: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48179,6 +48224,8 @@ impl ActingOrgGroupRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -48264,6 +48311,31 @@ impl ActingOrgGroupRepo<'_> {
         group_id: &OrgGroupId,
         parent_id: Option<&OrgGroupId>,
         max_group_depth: u32,
+    ) -> Result<(), StoreError> {
+        self.reparent_with_event(
+            env,
+            organization_id,
+            group_id,
+            parent_id,
+            max_group_depth,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::reparent`], additionally emitting `org_group.reparented` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reparent`].
+    pub async fn reparent_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        group_id: &OrgGroupId,
+        parent_id: Option<&OrgGroupId>,
+        max_group_depth: u32,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || group_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -48358,6 +48430,8 @@ impl ActingOrgGroupRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -48431,6 +48505,21 @@ impl ActingOrgGroupRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgGroupId,
     ) -> Result<(), StoreError> {
+        self.delete_with_event(env, organization_id, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `org_group.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48467,6 +48556,8 @@ impl ActingOrgGroupRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -48530,6 +48621,23 @@ impl ActingOrgGroupMemberRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.add_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::add`], additionally emitting `org_group.member_added` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::add`].
+    pub async fn add_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgGroupMember<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.group_id.scope() != self.scope
@@ -48580,6 +48688,8 @@ impl ActingOrgGroupMemberRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back add announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -48615,6 +48725,21 @@ impl ActingOrgGroupMemberRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgGroupMemberId,
     ) -> Result<(), StoreError> {
+        self.remove_with_event(env, organization_id, id, None).await
+    }
+
+    /// [`Self::remove`], additionally emitting `org_group.member_removed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove`].
+    pub async fn remove_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupMemberId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48639,7 +48764,10 @@ impl ActingOrgGroupMemberRepo<'_> {
                     &id.to_string(),
                     now_micros,
                 )
-                .await
+                .await?;
+                // AFTER the delete's own guard: removing what is not a member announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )

@@ -429,6 +429,101 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // grant to a MEMBER reach different downstream systems, and a pair distinguished by
         // "which id is present" is the same presence-ambiguity trap the subscription payload
         // avoids: a consumer that forgot to branch would apply a group grant to one person.
+        // ORG GROUP lifecycle. The group AND its organization on every one, for the reason the
+        // role types carry it: a group is scoped to one organization and a receiver keeping a
+        // per-organization view cannot file the event without knowing which.
+        "org_group.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_group_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_group_id", "organization_id"]
+        }"#,
+    ),
+    (
+        // Display only, like `org_role.updated`: the slug and the parent are changed
+        // elsewhere and announced by their own types.
+        "org_group.updated",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_group_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_group_id", "organization_id"]
+        }"#,
+    ),
+    (
+        // ITS OWN TYPE, and the one with real consequences: reparenting moves a subtree, so
+        // every role a group INHERITS can change without any grant being touched. A consumer
+        // recomputing effective permissions must act on this, and would not if it were folded
+        // into `org_group.updated` beside a display-name edit.
+        //
+        // `parent_org_group_id` is ABSENT when the group becomes a root, mirroring the column
+        // and matching the subscription payload's rule: no invented sentinel.
+        "org_group.reparented",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_group_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "parent_org_group_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_group_id", "organization_id"]
+        }"#,
+    ),
+    (
+        "org_group.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_group_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_group_id", "organization_id"]
+        }"#,
+    ),
+    (
+        // Group MEMBERSHIP, the pair an integrator provisions and deprovisions on, carrying
+        // both ends of the join exactly as the organization membership types do.
+        "org_group.member_added",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_group_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "membership_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_group_id", "organization_id", "membership_id"]
+        }"#,
+    ),
+    (
+        "org_group.member_removed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_group_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "membership_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_group_id", "organization_id", "membership_id"]
+        }"#,
+    ),
+    (
         "org_role.assigned_to_group",
         1,
         r#"{

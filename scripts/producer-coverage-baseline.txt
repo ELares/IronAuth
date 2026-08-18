@@ -27,12 +27,6 @@ log_streams::delete_log_stream
 migration::delete_outbound_verification
 migration::set_outbound_verification
 migration_runs::abandon_migration_run
-org_group_members::add_org_group_member
-org_group_members::remove_org_group_member
-org_groups::create_org_group
-org_groups::delete_org_group
-org_groups::set_org_group_parent
-org_groups::update_org_group
 org_role_permissions::assign_org_role_permission
 org_role_permissions::unassign_org_role_permission
 organizations::disable_organization
