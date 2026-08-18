@@ -606,7 +606,9 @@ async fn deleting_an_environment_variable_emits_the_name_and_never_the_value() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "setting a variable emits nothing today, so the delete's event is unambiguous"
+        "this set passed no event, so the delete's event below is unambiguous. Setting a \
+         variable DOES announce itself now (`environment_variable.set`); what stays silent \
+         is the un-suffixed `set`, which is the paired-negative guarantee"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(
@@ -700,4 +702,65 @@ async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<s
         .into_iter()
         .map(|message| message.payload)
         .collect()
+}
+
+/// Setting an environment variable emits `environment_variable.set`, carrying the NAME and
+/// never the VALUE (issue #108).
+///
+/// The value's absence is the same rule the delete follows, and it matters MORE here: the set
+/// is the one call that has the value in hand. A variable is not a secret by type, but an
+/// operator's choice to put something in a variable rather than a secret is not a promise
+/// that every webhook subscriber may read it.
+///
+/// Asserted against the rendered envelope rather than trusted from the schema, because a
+/// payload may carry fields the schema does not forbid.
+#[tokio::test]
+async fn setting_an_environment_variable_emits_the_name_and_never_the_value() {
+    const SECRET_LOOKING_VALUE: &str = "https://api.internal.example/private-path";
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_variable_set",
+        "environment_variable.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "name": "api-base-url" }),
+    )
+    .expect("environment_variable.set is registered");
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_variable_set",
+        subject: "api-base-url",
+        envelope: &envelope,
+    };
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .environment_variables()
+        .set_with_event(
+            &env,
+            "api-base-url",
+            SECRET_LOOKING_VALUE,
+            None,
+            Some(&domain_event),
+        )
+        .await
+        .expect("set variable");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the set enqueues exactly one event");
+    assert_eq!(events[0]["type"], "environment_variable.set");
+    assert_eq!(events[0]["payload"]["name"], "api-base-url");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    assert!(
+        !events[0].to_string().contains(SECRET_LOOKING_VALUE),
+        "the event carried the variable's VALUE: {}",
+        events[0]
+    );
 }

@@ -164,6 +164,23 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // The VALUE is deliberately absent, and that is a rule rather than an omission: a
         // variable may hold anything an operator put there, and an event that echoed removed
         // values would be a channel for exfiltrating configuration by deleting it.
+        // The NAME and nothing else, mirroring the delete -- and emphatically NOT the VALUE.
+        // A variable is not a secret by TYPE, but an operator's choice to put something in a
+        // variable rather than a secret is not a promise that every webhook subscriber may
+        // read it. The name tells a consumer what to refetch through the authorized surface,
+        // which is the same answer the delete gives.
+        "environment_variable.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 1}
+            },
+            "required": ["name"]
+        }"#,
+    ),
+    (
         "environment_variable.deleted",
         1,
         r#"{

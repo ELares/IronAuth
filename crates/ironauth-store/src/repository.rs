@@ -53458,6 +53458,26 @@ impl ActingEnvironmentVariableRepo<'_> {
         value: &str,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<VariableId, StoreError> {
+        self.set_with_event(env, name, value, idempotency, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `environment_variable.set` (issue #108).
+    ///
+    /// Enqueued inside the write's transaction, so a consumer is never told to refetch a
+    /// value a rolled-back write never stored.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        name: &str,
+        value: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<VariableId, StoreError> {
         if !crate::esv::name_is_valid(name) {
             return Err(StoreError::InvalidName);
         }
@@ -53496,6 +53516,9 @@ impl ActingEnvironmentVariableRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: never tell a consumer to refetch a value a
+                // rolled-back write never stored.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

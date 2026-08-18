@@ -270,6 +270,24 @@
       "type": "environment_variable.deleted"
     },
     {
+      "domain": "environment_variable",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment_variable.set"
+    },
+    {
       "domain": "invitation",
       "payload_schema": {
         "additionalProperties": false,
