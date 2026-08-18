@@ -1593,3 +1593,61 @@ async fn a_real_sign_in_is_metered_as_an_active_user() {
          unreachable while nothing emitted the type"
     );
 }
+
+/// Neither a sign-in nor a token issuance reads the event feed (issue #107 criterion 5).
+///
+/// The criterion is that metering adds no work to the hot paths. Metering is a READ of the
+/// feed folded into a `UsageTally`, so the assertion is that those paths never perform that
+/// read -- and a number is the only way to say it. A source scan would pass the moment
+/// somebody reached the fold through a helper, and a `pg_stat_*` proxy cannot separate the
+/// fold's SELECT from the enqueue's own INSERT touching the same table and its unique index.
+///
+/// Note what this does NOT claim. Both paths now WRITE one outbox row each, because the feed
+/// is the substrate metering is computed from and it only exists if activity writes to it.
+/// #107 puts the fold off the hot path, not the event; this pins the fold.
+///
+/// The counter is process-wide, so this reads it before and after rather than expecting zero:
+/// other tests in this binary fold the feed, and an absolute assertion would couple this test
+/// to their scheduling.
+#[tokio::test]
+async fn a_sign_in_reads_the_event_feed_zero_times() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "hotpath@example.test").await;
+    let id = issue_authorization(&db, &env, scope, &user, 30 * MINUTE_MICROS).await;
+
+    let before = ironauth_store::feed_reads();
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .redeem(&env, &id, now_micros(&env))
+        .await
+        .expect("redeem into a session");
+    let after = ironauth_store::feed_reads();
+
+    assert_eq!(
+        after - before,
+        0,
+        "the sign-in path read the event feed {} time(s); metering must be folded on request, \
+         never inline, or every login pays for somebody's billing report",
+        after - before
+    );
+
+    // And the counter is not simply dead: folding the feed moves it, which is what makes the
+    // zero above evidence rather than an assertion about a number nothing increments.
+    let probe_before = ironauth_store::feed_reads();
+    let _ = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .events_page_after(ironauth_store::EventCursor::beginning(), 10)
+        .await
+        .expect("read the feed");
+    assert_eq!(
+        ironauth_store::feed_reads() - probe_before,
+        1,
+        "a deliberate fold must move the counter, or the zero above measures nothing"
+    );
+}

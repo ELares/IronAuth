@@ -21040,6 +21040,24 @@ pub fn membership_change(added: Vec<String>, removed: Vec<String>) -> Membership
     }
 }
 
+/// How many times the event feed has been READ in this process (issue #107 criterion 5).
+///
+/// The metering fold is a read of the feed followed by [`UsageTally::absorb`]. The criterion
+/// is that neither happens on the token-issuance or login paths, and a number is the only way
+/// to assert that without re-stating the code: a source scan would pass the moment somebody
+/// called the fold through a helper.
+///
+/// Test builds only. It exists to be asserted against, not to be observed in production.
+#[cfg(feature = "testing")]
+static FEED_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the feed-read counter (issue #107 criterion 5).
+#[cfg(feature = "testing")]
+#[must_use]
+pub fn feed_reads() -> u64 {
+    FEED_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Per-tenant usage, folded from the event feed (issue #107).
 ///
 /// # Why this is a fold over the feed rather than counters on the hot path
@@ -21615,6 +21633,14 @@ impl OutboxRepo<'_> {
         cursor: EventCursor,
         limit: i64,
     ) -> Result<EventPage, StoreError> {
+        // Issue #107 criterion 5 counts THIS, and counting it here rather than in Postgres
+        // is deliberate. A `pg_stat_*` proxy cannot separate the fold's read of
+        // `outbox_messages` from the enqueue's own insert touching the same table and its
+        // unique index, so it would answer a different question and answer it fuzzily. This
+        // counts the exact call the metering fold makes, so a fold that appears inline on a
+        // token or login path moves the number and nothing else does.
+        #[cfg(feature = "testing")]
+        FEED_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let after_sequence = cursor.sequence();
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
