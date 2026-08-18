@@ -874,6 +874,16 @@ pub enum Action {
     /// A per-environment LOCALE BUNDLE was deleted through the management API (issue #86,
     /// PR 2). The audit row names the locale bundle id and scope.
     LocaleDelete,
+    /// A MESSAGE TEMPLATE override was set through the management API (issue #111): a first
+    /// write or an overwrite at one (level, organization, kind, locale). The audit row names
+    /// the template id and scope; the authored body itself is not recorded here, for the same
+    /// reason a locale bundle's entries are not -- an audit row is a record that somebody
+    /// changed something, not a copy of what they wrote.
+    MessageTemplateSet,
+    /// A MESSAGE TEMPLATE override was deleted through the management API (issue #111),
+    /// restoring whatever the next level up provides. The audit row names the template id and
+    /// scope.
+    MessageTemplateDelete,
     /// A per-environment, per-client SIGNUP FORM was set through the management API (issue #87):
     /// a first write or an overwrite of the fail-fast validated field list. The audit row names
     /// the signup form id and scope; the field list itself is not recorded here.
@@ -1499,6 +1509,8 @@ impl Action {
             Action::BrandAssetDelete => "brand.asset.delete",
             Action::LocaleSet => "locale.set",
             Action::LocaleDelete => "locale.delete",
+            Action::MessageTemplateSet => "message_template.set",
+            Action::MessageTemplateDelete => "message_template.delete",
             Action::SignupFormSet => "signup_form.set",
             Action::SignupFormDelete => "signup_form.delete",
             Action::FlowVersionCreate => "flow_version.create",

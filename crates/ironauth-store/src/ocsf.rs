@@ -235,6 +235,7 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     "flow_version",
     "locale",
     "mds3",
+    "message_template",
     "migration_run",
     "org_connection",
     "resource_server",

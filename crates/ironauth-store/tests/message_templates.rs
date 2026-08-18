@@ -486,3 +486,182 @@ async fn a_locale_nobody_authored_falls_back_through_the_store() {
          'why did this recipient get English?'"
     );
 }
+
+/// Authoring through the store: a set is readable, an overwrite replaces in place, and a
+/// delete restores the next level up (issue #111 criterion 3).
+///
+/// The overwrite half matters more than it looks. The two partial unique indexes mean the
+/// conflict target differs by level, so ONE `ON CONFLICT` naming both would match neither
+/// index and every overwrite would fail as a duplicate. This drives both shapes.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn authoring_sets_overwrites_and_deletes() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope).await;
+    let acting = || {
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+
+    let tenant_id = ironauth_store::MessageTemplateId::generate(&env, &scope);
+    let spec = |subject: &'static str| ironauth_store::NewMessageTemplate {
+        level: TemplateLevel::Tenant,
+        organization_id: None,
+        kind: "invitation",
+        locale: "en",
+        subject,
+        body_text: "body",
+        body_html: None,
+        locked: false,
+    };
+
+    acting()
+        .message_templates()
+        .set(&env, &tenant_id, 1_000_000, spec("first"))
+        .await
+        .expect("author a tenant override");
+
+    // The SAME (level, kind, locale) again: an overwrite, not a duplicate.
+    acting()
+        .message_templates()
+        .set(&env, &tenant_id, 2_000_000, spec("second"))
+        .await
+        .expect("overwrite in place");
+
+    let candidates = db
+        .store()
+        .scoped(scope)
+        .message_templates()
+        .candidates_for("invitation")
+        .await
+        .expect("read");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "an overwrite replaces, it does not add: {candidates:?}"
+    );
+    assert_eq!(candidates[0].subject, "second");
+
+    // The ORGANIZATION level takes the other conflict target.
+    let org_id = ironauth_store::MessageTemplateId::generate(&env, &scope);
+    acting()
+        .message_templates()
+        .set(
+            &env,
+            &org_id,
+            3_000_000,
+            ironauth_store::NewMessageTemplate {
+                level: TemplateLevel::Organization,
+                organization_id: Some(&org),
+                kind: "invitation",
+                locale: "en",
+                subject: "org first",
+                body_text: "body",
+                body_html: None,
+                locked: false,
+            },
+        )
+        .await
+        .expect("author an organization override");
+    acting()
+        .message_templates()
+        .set(
+            &env,
+            &org_id,
+            4_000_000,
+            ironauth_store::NewMessageTemplate {
+                level: TemplateLevel::Organization,
+                organization_id: Some(&org),
+                kind: "invitation",
+                locale: "en",
+                subject: "org second",
+                body_text: "body",
+                body_html: None,
+                locked: false,
+            },
+        )
+        .await
+        .expect("overwrite the organization override in place");
+
+    let en = ironauth_store::message_template::Locale::new("en");
+    let resolved = db
+        .store()
+        .scoped(scope)
+        .message_templates()
+        .resolve("invitation", &en, &en)
+        .await
+        .expect("resolve")
+        .expect("two overrides exist");
+    assert_eq!(resolved.level, TemplateLevel::Organization);
+
+    // DELETING the organization override restores the tenant one, which is the whole point
+    // of a delete: it does not remove the template, it removes this level's opinion of it.
+    acting()
+        .message_templates()
+        .delete(&env, &org_id)
+        .await
+        .expect("delete the organization override");
+    let after = db
+        .store()
+        .scoped(scope)
+        .message_templates()
+        .resolve("invitation", &en, &en)
+        .await
+        .expect("resolve")
+        .expect("the tenant override is still there");
+    assert_eq!(
+        after.level,
+        TemplateLevel::Tenant,
+        "removing a level restores the next one up, it does not leave a hole"
+    );
+
+    // And deleting what is already gone is a uniform not-found, not a silent success.
+    let again = acting().message_templates().delete(&env, &org_id).await;
+    assert!(
+        matches!(again, Err(ironauth_store::StoreError::NotFound)),
+        "a second delete restores nothing: {again:?}"
+    );
+}
+
+/// Authoring is refused on the APP plane.
+///
+/// Migration 0144 grants the app role SELECT alone. This is the assertion that the grant is
+/// real rather than documented: an app role that could author a template could rewrite what
+/// every recipient of the environment is sent.
+#[tokio::test]
+async fn the_app_plane_cannot_author_a_template() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let id = ironauth_store::MessageTemplateId::generate(&env, &scope);
+    let refused = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .message_templates()
+        .set(
+            &env,
+            &id,
+            1_000_000,
+            ironauth_store::NewMessageTemplate {
+                level: TemplateLevel::Tenant,
+                organization_id: None,
+                kind: "invitation",
+                locale: "en",
+                subject: "from the app plane",
+                body_text: "body",
+                body_html: None,
+                locked: false,
+            },
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "the app role holds SELECT only; authoring must be refused by the engine, not by \
+         convention: {refused:?}"
+    );
+}
