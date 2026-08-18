@@ -1069,6 +1069,50 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A template override decides what an end user READS in a message they receive, so a
+        // consumer mirroring branding or compliance copy acts on it. SET rather than
+        // created-or-updated because the write is an upsert keyed on
+        // (level, organization, kind, locale): distinguishing the two would need the store to
+        // read the row back first, and a receiver re-reads the template either way.
+        //
+        // The BODY does not travel. It is authored content, arbitrarily large, and a webhook
+        // is a wider audience than the management surface that returns it -- the same refusal
+        // the brand design document gets. What travels is enough to know WHICH template
+        // changed: the level, the kind, and the locale.
+        "message_template.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "message_template_id": {"type": "string", "minLength": 1},
+                "level": {"type": "string", "minLength": 1},
+                "kind": {"type": "string", "minLength": 1},
+                "locale": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["message_template_id", "level", "kind", "locale"]
+        }"#,
+    ),
+    (
+        // Removing an override RESTORES the next level up, which is a change to what
+        // recipients read just as much as setting one was. A consumer told nothing would keep
+        // serving copy that no longer applies.
+        "message_template.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "message_template_id": {"type": "string", "minLength": 1},
+                "level": {"type": "string", "minLength": 1},
+                "kind": {"type": "string", "minLength": 1},
+                "locale": {"type": "string", "minLength": 1}
+            },
+            "required": ["message_template_id", "level", "kind", "locale"]
+        }"#,
+    ),
+    (
         "recovery_approval.decided",
         1,
         r#"{
@@ -2602,6 +2646,7 @@ mod tests {
         "environment_secret.set",
         "environment_variable.set",
         "locale_bundle.set",
+        "message_template.set",
         "organization.default_role_set",
         "signup_form.set",
         "step_up_policy.set",

@@ -791,6 +791,22 @@ impl ScopedKind for LogStreamKind {
     const PREFIX: &'static str = "lgs";
 }
 
+/// Marker for a stored message template override (`mtp_`), one row per
+/// (level, organization, kind, locale) in an environment (issue #111).
+///
+/// A tenant-scoped resource: the id embeds its (tenant, environment), so a template authored
+/// in one scope parses as a uniform not-found under another.
+///
+/// PROMOTABLE at the environment and tenant levels and NOT at the organization level, which
+/// is the split issue #111 criterion 7 asks for: environment template changes travel in a
+/// config snapshot, while a per-organization override belongs to that organization's data and
+/// would arrive in a target environment naming an organization that may not exist there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MessageTemplateKind;
+impl ScopedKind for MessageTemplateKind {
+    const PREFIX: &'static str = "mtp";
+}
+
 /// Marker for a registered Standard Webhooks delivery endpoint (`whe_`), one POST target
 /// per environment (issue #105). A tenant-scoped resource: the id embeds its (tenant,
 /// environment), so an endpoint registered in one scope parses as a uniform not-found
@@ -1827,6 +1843,9 @@ pub type ConnectorId = ScopedId<ConnectorKind>;
 
 /// A configured SIEM log stream (issue #110).
 pub type LogStreamId = ScopedId<LogStreamKind>;
+
+/// A stored message template override (issue #111).
+pub type MessageTemplateId = ScopedId<MessageTemplateKind>;
 
 /// A registered webhook delivery endpoint (issue #105).
 pub type WebhookEndpointId = ScopedId<WebhookEndpointKind>;

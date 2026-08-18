@@ -85,8 +85,8 @@ use crate::id::{
     EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
     FedcmNonceId, FederationLoginStateId, FlowId, FlowVersionId, FlowVersionPinId, GrantId,
     ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
-    LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
-    MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
+    LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MessageTemplateId,
+    MigrationRunId, MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
     OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
     OrgRolePermissionId, OrganizationId, OutboxMessageId, PermissionId, PowChallengeId,
     ProjectGrantId, ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
@@ -532,6 +532,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn outbox(&self) -> OutboxRepo<'a> {
         OutboxRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// Stored message template overrides (issue #111).
+    ///
+    /// On the SCOPED store because rendering reads templates on the send path, which runs as
+    /// the app role. Authoring is a management act and lives behind the control plane, which
+    /// migration 0144's grants enforce: the app role holds SELECT and nothing else, so an app
+    /// role that was somehow induced to write could not rewrite what recipients are sent.
+    #[must_use]
+    pub fn message_templates(&self) -> MessageTemplateRepo<'a> {
+        MessageTemplateRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1782,6 +1796,16 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn locale_bundles(&self) -> ActingLocaleBundleRepo<'a> {
         ActingLocaleBundleRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// Authoring message template overrides (issue #111). CONTROL plane.
+    #[must_use]
+    pub fn message_templates(&self) -> ActingMessageTemplateRepo<'a> {
+        ActingMessageTemplateRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -29339,6 +29363,238 @@ fn locale_bundle_from_row(row: &sqlx::postgres::PgRow) -> LocaleBundleRecord {
     }
 }
 
+/// Authoring message template overrides (issue #111).
+///
+/// CONTROL plane only, which migration 0144's grants enforce: the app role renders and holds
+/// SELECT alone. An app role that could author a template could rewrite what every recipient
+/// of that environment is sent, which is a strictly larger power than anything else the send
+/// path needs.
+pub struct ActingMessageTemplateRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+/// A template override to write.
+#[derive(Debug, Clone, Copy)]
+pub struct NewMessageTemplate<'a> {
+    /// Which level defines it.
+    pub level: crate::message_template::TemplateLevel,
+    /// The organization, required at organization level and forbidden otherwise. The database
+    /// CHECK enforces the pairing; this type carries it so a caller cannot forget to pass one.
+    pub organization_id: Option<&'a OrganizationId>,
+    /// Which message this templates.
+    pub kind: &'a str,
+    /// The BCP 47 tag the body is written in.
+    pub locale: &'a str,
+    /// The subject line.
+    pub subject: &'a str,
+    /// The plain-text body.
+    pub body_text: &'a str,
+    /// The HTML body, when one is authored.
+    pub body_html: Option<&'a str>,
+    /// Whether this level PINS, forbidding narrower overrides (issue #619).
+    pub locked: bool,
+}
+
+impl ActingMessageTemplateRepo<'_> {
+    /// Set an override, auditing `message_template.set` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure, including the CHECK that ties the level to the organization.
+    pub async fn set(
+        &self,
+        env: &Env,
+        id: &MessageTemplateId,
+        created_at_micros: i64,
+        params: NewMessageTemplate<'_>,
+    ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `message_template.set` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &MessageTemplateId,
+        created_at_micros: i64,
+        params: NewMessageTemplate<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if params
+            .organization_id
+            .is_some_and(|org| org.scope() != self.scope)
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let target = *id;
+        let level = level_wire(params.level);
+        let organization = params.organization_id.map(ToString::to_string);
+        let kind = params.kind.to_owned();
+        let locale = params.locale.to_owned();
+        let subject = params.subject.to_owned();
+        let body_text = params.body_text.to_owned();
+        let body_html = params.body_html.map(ToOwned::to_owned);
+        let locked = params.locked;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MessageTemplateSet,
+                target: &target,
+            },
+            async move |tx| {
+                // The conflict target differs by level, because the two partial unique indexes
+                // do: an organization-level row keys on the organization, and the other two key
+                // on the level. One ON CONFLICT naming both would match neither index.
+                let statement = if organization.is_some() {
+                    "INSERT INTO message_templates \
+                     (id, tenant_id, environment_id, level, organization_id, kind, locale, \
+                      subject, body_text, body_html, locked, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, organization_id, kind, locale) \
+                       WHERE deleted_at IS NULL AND organization_id IS NOT NULL \
+                     DO UPDATE SET subject = EXCLUDED.subject, \
+                                   body_text = EXCLUDED.body_text, \
+                                   body_html = EXCLUDED.body_html, \
+                                   locked = EXCLUDED.locked, \
+                                   updated_at = EXCLUDED.updated_at"
+                } else {
+                    "INSERT INTO message_templates \
+                     (id, tenant_id, environment_id, level, organization_id, kind, locale, \
+                      subject, body_text, body_html, locked, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, level, kind, locale) \
+                       WHERE deleted_at IS NULL AND organization_id IS NULL \
+                     DO UPDATE SET subject = EXCLUDED.subject, \
+                                   body_text = EXCLUDED.body_text, \
+                                   body_html = EXCLUDED.body_html, \
+                                   locked = EXCLUDED.locked, \
+                                   updated_at = EXCLUDED.updated_at"
+                };
+                sqlx::query(statement)
+                    .bind(target.to_string())
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(level)
+                    .bind(organization.as_deref())
+                    .bind(&kind)
+                    .bind(&locale)
+                    .bind(&subject)
+                    .bind(&body_text)
+                    .bind(body_html.as_deref())
+                    .bind(locked)
+                    .bind(created_at_micros)
+                    .execute(&mut **tx)
+                    .await?;
+                // In the write's transaction: a rolled-back authoring announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Soft-delete an override, restoring whatever the next level up provides.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope or names no live override;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &MessageTemplateId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `message_template.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &MessageTemplateId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let target = *id;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MessageTemplateDelete,
+                target: &target,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE message_templates SET \
+                       deleted_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                       updated_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                       AND deleted_at IS NULL",
+                )
+                .bind(target.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                // AFTER the guard: deleting an override that was already gone restores
+                // nothing, so it announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The wire spelling of a template level, in ONE place.
+///
+/// The database CHECK lists these three strings and the repository's read maps them back. A
+/// second spelling anywhere would be a row that inserts and then fails to decode, which
+/// surfaces as "my template vanished" rather than as a typo.
+fn level_wire(level: crate::message_template::TemplateLevel) -> &'static str {
+    match level {
+        crate::message_template::TemplateLevel::Tenant => "tenant",
+        crate::message_template::TemplateLevel::Environment => "environment",
+        crate::message_template::TemplateLevel::Organization => "organization",
+        // The DEFAULT level is code, not a row: it is what resolution falls back to when this
+        // table has nothing, which is why resolution is total. Storing one would create a
+        // fourth level the CHECK refuses and the resolver would never consult.
+        crate::message_template::TemplateLevel::Default => "default",
+    }
+}
+
 /// The mutating per-environment locale bundle repository for one scope and actor (issue #86,
 /// PR 2): set (create or overwrite) a locale, audited, and delete a locale, audited. The
 /// entries are stored verbatim as the caller's ALREADY-validated JSON string (the admin
@@ -39146,6 +39402,157 @@ pub struct NewLogStream<'a> {
     pub organization_id: Option<&'a str>,
     /// Ship only these action wire strings. `None` is every action in `source`.
     pub event_type_filter: Option<Vec<String>>,
+}
+
+/// The stored message templates for a scope (issue #111).
+///
+/// READ ONLY here. `message_template::resolve_template` decides which candidate wins, and this
+/// repository's whole job is to hand it every candidate for one (scope, kind) in one pass. The
+/// split is deliberate: resolution is pure and exhaustively tested without a database, and a
+/// repository that also picked would be a second resolution path -- which is exactly what
+/// issue #619 exists to prevent for the policy engine.
+pub struct MessageTemplateRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+/// One stored template override, as the resolver needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageTemplateRecord {
+    /// The `mtp_` identifier.
+    pub id: MessageTemplateId,
+    /// Which level defined it.
+    pub level: crate::message_template::TemplateLevel,
+    /// The organization, for an organization-level override.
+    pub organization_id: Option<OrganizationId>,
+    /// Which message this templates.
+    pub kind: String,
+    /// The BCP 47 tag the body is written in.
+    pub locale: String,
+    /// The rendered subject line.
+    pub subject: String,
+    /// The plain-text body.
+    pub body_text: String,
+    /// The HTML body, when one was authored.
+    pub body_html: Option<String>,
+    /// Whether this level PINS: no narrower level may replace it (issue #619).
+    pub locked: bool,
+}
+
+impl MessageTemplateRepo<'_> {
+    /// Every LIVE candidate for one message `kind` in this scope, strongest level first.
+    ///
+    /// Ordered here rather than left to the caller because the ordering is not arbitrary: it
+    /// is `TemplateLevel::PRECEDENCE`, and a caller that re-derived it would be a second copy
+    /// of the precedence rule. The resolver still decides -- this only guarantees it sees the
+    /// candidates in the order it expects.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn candidates_for(
+        &self,
+        kind: &str,
+    ) -> Result<Vec<MessageTemplateRecord>, StoreError> {
+        let statement = sqlx::query(
+            "SELECT id, level, organization_id, kind, locale, subject, body_text, body_html, \
+                    locked \
+             FROM message_templates \
+             WHERE tenant_id = $1 AND environment_id = $2 AND kind = $3 \
+               AND deleted_at IS NULL \
+             ORDER BY CASE level \
+                        WHEN 'organization' THEN 0 \
+                        WHEN 'environment' THEN 1 \
+                        WHEN 'tenant' THEN 2 \
+                      END, locale",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(kind);
+
+        // Read inside a SCOPED transaction, not on the bare pool. `message_templates` is FORCE
+        // RLS, so a read without the scope settings returns an empty page rather than an
+        // error -- which is the failure mode that looks like "the operator never authored a
+        // template" instead of "this query forgot its scope".
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = statement.fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                let level_text: String = row.get("level");
+                let organization: Option<String> = row.get("organization_id");
+                Ok(MessageTemplateRecord {
+                    id: MessageTemplateId::parse_in_scope(&id_text, &self.scope)?,
+                    // A level the enum does not know is a DECODE failure, not a row to skip.
+                    // Skipping would silently drop an override an operator authored, which
+                    // presents as "my template did not take effect" with nothing in any log.
+                    level: match level_text.as_str() {
+                        "tenant" => crate::message_template::TemplateLevel::Tenant,
+                        "environment" => crate::message_template::TemplateLevel::Environment,
+                        "organization" => crate::message_template::TemplateLevel::Organization,
+                        other => {
+                            return Err(StoreError::Database(sqlx::Error::Decode(
+                                format!("unknown message template level: {other}").into(),
+                            )));
+                        }
+                    },
+                    organization_id: organization
+                        .map(|id| OrganizationId::parse_in_scope(&id, &self.scope))
+                        .transpose()?,
+                    kind: row.get("kind"),
+                    locale: row.get("locale"),
+                    subject: row.get("subject"),
+                    body_text: row.get("body_text"),
+                    body_html: row.get("body_html"),
+                    locked: row.get("locked"),
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve the template for one `kind` and requested locale, or [`None`] when no override
+    /// exists at any level.
+    ///
+    /// [`None`] means "use the template IronAuth ships", which is why resolution cannot fail:
+    /// the DEFAULT level is code, not a row. A caller that treated `None` as an error would
+    /// refuse to send mail for the overwhelmingly common case of a tenant that never authored
+    /// an override.
+    ///
+    /// The DECISION is `message_template::resolve_template`'s, unchanged and untouched. This
+    /// method reads candidates and hands them over; it exists so a caller does not have to
+    /// know that resolution takes candidates rather than a scope, and it adds no rule of its
+    /// own. If it ever did, there would be two resolution paths and they would disagree.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve(
+        &self,
+        kind: &str,
+        requested: &crate::message_template::Locale,
+        default_locale: &crate::message_template::Locale,
+    ) -> Result<Option<crate::message_template::ResolvedTemplate>, StoreError> {
+        let stored = self.candidates_for(kind).await?;
+        // The body handle is the ROW ID. `message_template` treats it as opaque and never
+        // inspects it, so the store is free to choose what it means -- and choosing the id
+        // means a caller holding a resolution can fetch exactly the row that produced it,
+        // rather than re-running resolution and hoping it lands the same way.
+        let candidates: Vec<crate::message_template::TemplateCandidate> = stored
+            .iter()
+            .map(|record| crate::message_template::TemplateCandidate {
+                level: record.level,
+                locale: crate::message_template::Locale::new(&record.locale),
+                body_ref: record.id.to_string(),
+            })
+            .collect();
+        Ok(crate::message_template::resolve_template(
+            &candidates,
+            requested,
+            default_locale,
+        ))
+    }
 }
 
 /// Log stream configuration.

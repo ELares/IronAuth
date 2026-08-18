@@ -910,3 +910,8 @@ required-features = ["testing"]
 name = "project_grants"
 path = "tests/project_grants.rs"
 required-features = ["testing"]
+
+[[test]]
+name = "message_templates"
+path = "tests/message_templates.rs"
+required-features = ["testing"]
