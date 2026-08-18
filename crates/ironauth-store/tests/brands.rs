@@ -492,7 +492,9 @@ async fn deleting_a_brand_asset_emits_the_registered_event_naming_the_kind() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "uploading an asset emits nothing today, so the delete's event is unambiguous"
+        "this upload passed no event, so the delete's event below is unambiguous. Uploads DO \
+         announce themselves now (`brand_asset.set`); what stays silent is the un-suffixed \
+         `set`, which is the paired-negative guarantee"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(
@@ -610,4 +612,97 @@ async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<s
         .into_iter()
         .map(|message| message.payload)
         .collect()
+}
+
+/// An asset upload emits `brand_asset.set`, carrying the digest but never the bytes.
+///
+/// SET rather than created-or-updated: the write is an upsert (one asset per brand and kind),
+/// so distinguishing the two would need the store to read the row back first, and a receiver
+/// acts identically either way by refetching.
+///
+/// The sha256 is the reason this carries more than the ids -- a consumer can decide whether
+/// the bytes it cached are stale without refetching them. The BYTES are asserted absent: a
+/// webhook is not a CDN, and an image on every subscriber's queue would dwarf every other
+/// event in the system.
+#[tokio::test]
+async fn uploading_a_brand_asset_emits_the_digest_and_never_the_bytes() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let id = BrandId::generate(&env, &scope);
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .set(&env, &id, 1_000_000, set_brand("acme", true, "Acme"))
+        .await
+        .expect("set brand");
+
+    // A recognisable byte pattern, so "the bytes are not on the wire" is a real assertion
+    // rather than one that would pass for any payload.
+    let png_bytes = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xDE, 0xAD, 0xBE, 0xEF,
+    ];
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_brand_asset_set",
+        "brand_asset.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "brand_id": id.to_string(),
+            "brand_slug": "acme",
+            "kind": "logo",
+            "sha256": "sha-of-the-logo",
+        }),
+    )
+    .expect("brand_asset.set is registered");
+    let subject = id.to_string();
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_brand_asset_set",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brand_assets()
+        .set_with_event(
+            &env,
+            &id,
+            2_000_000,
+            NewBrandAsset {
+                brand_slug: "acme",
+                kind: BrandAssetKind::Logo,
+                content_type: "image/png",
+                bytes: &png_bytes,
+                sha256: "sha-of-the-logo",
+                size_bytes: 12,
+            },
+            Some(&domain_event),
+        )
+        .await
+        .expect("upload logo asset");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the upload enqueues exactly one event");
+    assert_eq!(events[0]["type"], "brand_asset.set");
+    assert_eq!(events[0]["payload"]["kind"], "logo");
+    assert_eq!(events[0]["payload"]["sha256"], "sha-of-the-logo");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // The image itself never reaches a subscriber's queue.
+    let rendered = events[0].to_string();
+    assert!(
+        !rendered.contains("deadbeef") && !rendered.contains("DEADBEEF"),
+        "the event carried the asset BYTES: {rendered}"
+    );
+    assert!(
+        !rendered.contains("iVBORw0K"),
+        "the event carried the asset bytes base64-encoded: {rendered}"
+    );
 }

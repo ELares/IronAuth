@@ -28297,6 +28297,26 @@ impl ActingBrandAssetRepo<'_> {
         created_at_micros: i64,
         params: NewBrandAsset<'_>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, brand_id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `brand_asset.set` (issue #108).
+    ///
+    /// Enqueued inside the upsert's transaction, so a receiver is never told to refetch an
+    /// asset that a rolled-back write never stored.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        brand_id: &BrandId,
+        created_at_micros: i64,
+        params: NewBrandAsset<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if brand_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28344,6 +28364,9 @@ impl ActingBrandAssetRepo<'_> {
                 .bind(created_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the upsert's own transaction, so a receiver is never told to refetch an
+                // asset a rolled-back write never stored.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

@@ -155,6 +155,39 @@
       "type": "brand_asset.deleted"
     },
     {
+      "domain": "brand_asset",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "brand_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "brand_slug": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "sha256": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "brand_id",
+          "brand_slug",
+          "kind",
+          "sha256"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "brand_asset.set"
+    },
+    {
       "domain": "client",
       "payload_schema": {
         "additionalProperties": false,

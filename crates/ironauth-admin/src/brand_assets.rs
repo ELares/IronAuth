@@ -191,12 +191,13 @@ async fn upload_asset(
     // The size is within the cap (checked above), so it fits an i32.
     let size_bytes = i32::try_from(body.len()).map_err(|_| ApiError::Internal)?;
     let created_at_micros = state.now_unix_micros();
+    let pending = brand_asset_set_event(state, scope, &brand_id, slug, kind, &sha256);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .brand_assets()
-        .set(
+        .set_with_event(
             state.env(),
             &brand_id,
             created_at_micros,
@@ -208,6 +209,10 @@ async fn upload_asset(
                 sha256: &sha256,
                 size_bytes,
             },
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
 
@@ -437,6 +442,46 @@ fn brand_asset_deleted_event(
             "brand_id": subject,
             "brand_slug": brand_slug,
             "kind": kind.as_str(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event a brand-asset upload emits (issue #108).
+///
+/// SET, not "created" or "updated": the write is an UPSERT (one asset per brand and kind), so
+/// saying which it was would need the store to read the row back first -- and a receiver acts
+/// identically either way, by refetching the asset.
+///
+/// The sha256 is why this carries more than the ids: it lets a consumer decide whether the
+/// bytes it already cached are stale WITHOUT refetching them. The bytes themselves are never
+/// on the wire; a webhook is not a CDN, and an image on every subscriber's queue would dwarf
+/// every other event in the system.
+fn brand_asset_set_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    brand_id: &ironauth_store::BrandId,
+    brand_slug: &str,
+    kind: ironauth_store::BrandAssetKind,
+    sha256: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = brand_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "brand_asset.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "brand_id": subject,
+            "brand_slug": brand_slug,
+            "kind": kind.as_str(),
+            "sha256": sha256,
         }),
     )?;
     Some(crate::events::PendingEvent {

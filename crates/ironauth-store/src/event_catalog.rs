@@ -120,6 +120,29 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // brand -- so both are needed to say WHICH asset went. A receiver mirroring the
         // hosted pages has to know whether the favicon or the logo disappeared; either alone
         // identifies nothing.
+        // SET, not "created" or "updated": the write is an UPSERT (one asset per brand and
+        // kind), so a consumer cannot be told which it was without the store reading the row
+        // back first, and a receiver acts identically either way -- refetch the asset.
+        //
+        // The sha256 is the point of carrying anything beyond the ids: it lets a consumer
+        // decide whether the bytes it already cached are stale WITHOUT refetching them. The
+        // BYTES themselves are never on the wire; a webhook is not a CDN, and an image on
+        // every subscriber's queue would dwarf every other event in the system.
+        "brand_asset.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "brand_id": {"type": "string", "minLength": 1},
+                "brand_slug": {"type": "string", "minLength": 1},
+                "kind": {"type": "string", "minLength": 1},
+                "sha256": {"type": "string", "minLength": 1}
+            },
+            "required": ["brand_id", "brand_slug", "kind", "sha256"]
+        }"#,
+    ),
+    (
         "brand_asset.deleted",
         1,
         r#"{

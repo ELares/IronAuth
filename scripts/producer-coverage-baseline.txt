@@ -4,8 +4,6 @@
 # when this file is empty. Regenerate with: scripts/producer-coverage.py --update-baseline
 bans::create_ban
 bans::lift_ban
-brand_assets::set_brand_favicon
-brand_assets::set_brand_logo
 brands::delete_brand
 brands::set_brand
 client_admin_grants::set_client_admin_consent
