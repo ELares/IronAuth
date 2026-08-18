@@ -33,12 +33,33 @@
       "payload_schema_version",
       "occurred_at_unix_ms",
       "tenant_id",
-      "environment_id",
       "payload"
     ],
     "type": "object"
   },
   "event_types": [
+    {
+      "domain": "admin_consent",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "granted_scope": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "admin_consent.granted"
+    },
     {
       "domain": "admin_consent",
       "payload_schema": {
@@ -127,6 +148,110 @@
       "type": "api_key.rotated"
     },
     {
+      "domain": "ban",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "auth_path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "ban_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "expires_at_unix_ms": {
+            "type": "integer"
+          },
+          "subject_kind": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "ban_id",
+          "subject_kind",
+          "auth_path"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "ban.created"
+    },
+    {
+      "domain": "ban",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "auth_path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "subject_kind": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject_kind",
+          "auth_path"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "ban.lifted"
+    },
+    {
+      "domain": "brand",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "brand_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "brand_slug": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "brand_id",
+          "brand_slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "brand.deleted"
+    },
+    {
+      "domain": "brand",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "brand_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "brand_slug": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "is_default": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "brand_id",
+          "brand_slug",
+          "is_default"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "brand.set"
+    },
+    {
       "domain": "brand_asset",
       "payload_schema": {
         "additionalProperties": false,
@@ -195,6 +320,28 @@
           "client_id": {
             "minLength": 1,
             "type": "string"
+          },
+          "restricted": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "client_id",
+          "restricted"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "client.allowed_scopes_set"
+    },
+    {
+      "domain": "client",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
           }
         },
         "required": [
@@ -235,6 +382,29 @@
           "client_id": {
             "minLength": 1,
             "type": "string"
+          },
+          "id_token_signed_response_alg": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id",
+          "id_token_signed_response_alg"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "client.signing_algorithm_changed"
+    },
+    {
+      "domain": "client",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
           }
         },
         "required": [
@@ -244,6 +414,24 @@
       },
       "payload_schema_version": 1,
       "type": "client.verified"
+    },
+    {
+      "domain": "config_promotion",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "revision": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "config_promotion.applied"
     },
     {
       "domain": "connector",
@@ -315,6 +503,29 @@
       "type": "connector.updated"
     },
     {
+      "domain": "consent",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "subject": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "consent.revoked"
+    },
+    {
       "domain": "dcr_initial_access_token",
       "payload_schema": {
         "additionalProperties": false,
@@ -370,6 +581,29 @@
       },
       "payload_schema_version": 1,
       "type": "environment.auto_link_posture_changed"
+    },
+    {
+      "domain": "environment",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "environment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment.created"
     },
     {
       "domain": "environment",
@@ -485,6 +719,55 @@
       "type": "environment_variable.set"
     },
     {
+      "domain": "flow_version",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "flow_version_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "journey_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "flow_version_id",
+          "journey_id",
+          "version"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "flow_version.created"
+    },
+    {
+      "domain": "flow_version",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "journey_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "journey_id",
+          "version"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "flow_version.pinned"
+    },
+    {
       "domain": "identity_import",
       "payload_schema": {
         "additionalProperties": false,
@@ -524,6 +807,38 @@
       },
       "payload_schema_version": 1,
       "type": "identity_import.state_changed"
+    },
+    {
+      "domain": "impersonation",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "expires_at_unix_ms": {
+            "type": "integer"
+          },
+          "reason_code": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "authorization_id",
+          "user_id",
+          "reason_code",
+          "expires_at_unix_ms"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "impersonation.authorized"
     },
     {
       "domain": "invitation",
@@ -665,6 +980,28 @@
       },
       "payload_schema_version": 1,
       "type": "log_stream.deleted"
+    },
+    {
+      "domain": "management_key",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "management_key_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "management_key_id",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "management_key.created"
     },
     {
       "domain": "management_key",
@@ -1324,6 +1661,52 @@
       "type": "permission.updated"
     },
     {
+      "domain": "project_grant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "project_grant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_grant_id",
+          "client_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "project_grant.created"
+    },
+    {
+      "domain": "project_grant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "project_grant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_grant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "project_grant.withdrawn"
+    },
+    {
       "domain": "recovery_approval",
       "payload_schema": {
         "additionalProperties": false,
@@ -1345,6 +1728,28 @@
       },
       "payload_schema_version": 1,
       "type": "recovery_approval.decided"
+    },
+    {
+      "domain": "resource_server",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "resource_server_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "resource_server_id",
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "resource_server.permission_claims_changed"
     },
     {
       "domain": "routing_rule",
@@ -1587,6 +1992,33 @@
       "type": "step_up_policy.set"
     },
     {
+      "domain": "sudo",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "acr": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "actor_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "expires_at_unix_ms": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "actor_id",
+          "acr",
+          "expires_at_unix_ms"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "sudo.elevated"
+    },
+    {
       "domain": "tenant",
       "payload_schema": {
         "additionalProperties": false,
@@ -1613,6 +2045,96 @@
       },
       "payload_schema_version": 1,
       "type": "tenant.created"
+    },
+    {
+      "domain": "tenant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.deleted"
+    },
+    {
+      "domain": "tenant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.purged"
+    },
+    {
+      "domain": "tenant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.restored"
+    },
+    {
+      "domain": "tenant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.resumed"
+    },
+    {
+      "domain": "tenant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.suspended"
     },
     {
       "domain": "trait_migration_job",
