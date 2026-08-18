@@ -61,6 +61,10 @@ fn normalize_custom_domain(raw: Option<&str>) -> Option<String> {
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
+// The length is the create's own: the region check, the day-one key generation, the
+// deterministic response, and the idempotency write, each with the reasoning that makes it
+// safe. The event added two lines to a handler already at the limit.
+#[allow(clippy::too_many_lines)]
 pub async fn create_environment(
     State(state): State<AdminState>,
     principal: Principal,

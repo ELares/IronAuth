@@ -45925,7 +45925,6 @@ impl ActingTenantRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if no grace tenant matched under this operator;
     /// [`StoreError::Conflict`] if the retention window has already elapsed.
-    #[allow(clippy::too_many_lines)]
     pub async fn restore(
         &self,
         env: &Env,
@@ -45945,6 +45944,7 @@ impl ActingTenantRepo<'_> {
     /// # Errors
     ///
     /// As [`Self::restore`].
+    #[allow(clippy::too_many_lines)]
     pub async fn restore_with_event(
         &self,
         env: &Env,
@@ -46224,7 +46224,6 @@ impl ActingTenantRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if no grace tenant matched under this operator;
     /// [`StoreError::Conflict`] if the retention window has not yet elapsed.
-    #[allow(clippy::too_many_lines)]
     pub async fn hard_delete(
         &self,
         env: &Env,
@@ -46245,6 +46244,7 @@ impl ActingTenantRepo<'_> {
     /// # Errors
     ///
     /// As [`Self::hard_delete`].
+    #[allow(clippy::too_many_lines)]
     pub async fn hard_delete_with_event(
         &self,
         env: &Env,
@@ -56230,6 +56230,11 @@ impl ActingStore<'_> {
     /// # Errors
     ///
     /// As [`Self::apply_promotion`].
+    // The length is the promotion applier's own -- the drift gate, the advisory lock, and
+    // the per-kind apply, each carrying the reasoning that makes it safe. The event added
+    // two lines to a function already at the limit; splitting the applier to buy them back
+    // would move that reasoning away from the code it is about.
+    #[allow(clippy::too_many_lines)]
     pub async fn apply_promotion_with_event(
         &self,
         env: &Env,

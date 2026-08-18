@@ -507,6 +507,7 @@ async fn queued_events(db: &TestDatabase, env: &Env, scope: Scope) -> Vec<serde_
 /// The create carries the minted id; the LIFT does not, because a lift is addressed by
 /// (subject, path) and its producer never learns which row matched. The test asserts that
 /// absence, so a later change that reads the id back out of the write fails here.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn placing_and_lifting_a_ban_emit_distinct_types() {
     let db = TestDatabase::start().await;

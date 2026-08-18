@@ -114,6 +114,7 @@ async fn seed_parties(
 /// Creating and withdrawing a project grant emit distinct types, and a withdrawal that
 /// changes nothing announces nothing.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn creating_and_withdrawing_a_project_grant_emit_distinct_types() {
     let db = TestDatabase::start().await;
     let env = Env::system();

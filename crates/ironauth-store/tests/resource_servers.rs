@@ -355,6 +355,7 @@ async fn drain_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value>
 /// The refusal half rides on the same `rows_affected() == 0` check the test above pins. The
 /// enqueue sits after it inside the audited write, so a write that changed nothing commits
 /// neither an audit row nor an event.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn flipping_permission_claims_announces_the_direction() {
     let db = TestDatabase::start().await;

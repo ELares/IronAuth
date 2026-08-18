@@ -336,6 +336,7 @@ async fn drain_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<se
 /// The artifact is the journey document itself, arbitrarily large and versioned by this very
 /// mechanism, so it stays off the wire and a consumer reads it back by (journey, version).
 /// The test asserts that absence.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn appending_and_pinning_a_version_emit_distinct_types() {
     let db = TestDatabase::start().await;

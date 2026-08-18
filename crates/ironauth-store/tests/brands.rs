@@ -750,6 +750,7 @@ async fn drain_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<se
 /// `is_default` is the exception and travels, because flipping it changes which brand serves
 /// a request that matched no other -- something a consumer cannot learn by re-reading only
 /// the brand it was told about.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn setting_and_deleting_a_brand_emit_distinct_types() {
     let db = TestDatabase::start().await;
