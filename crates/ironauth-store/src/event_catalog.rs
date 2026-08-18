@@ -484,6 +484,44 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // A DCR policy decides who may self-register a client and on what terms, so a
         // receiver mirroring registration policy acts on it. The NAME travels with the id
         // because a policy is referred to by name in an operator's own configuration.
+        // A quarantined signup was RESOLVED by an operator, one type carrying the decision.
+        // Approve and reject are the same review reaching opposite conclusions over one
+        // subject, so a consumer mirroring "may this person sign in" reads one field rather
+        // than correlating two subscriptions -- the same shape as
+        // `organization.state_changed`.
+        //
+        // EXTEND is deliberately NOT folded in: it resolves nothing. It moves the deadline and
+        // leaves the subject quarantined, so a consumer that treated it as a decision would
+        // admit or refuse someone still under review.
+        "signup_quarantine.resolved",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "decision": {"type": "string", "minLength": 1}
+            },
+            "required": ["user_id", "decision"]
+        }"#,
+    ),
+    (
+        // The review WINDOW moved; the subject is still quarantined. Carrying the new deadline
+        // is the point: an operator dashboard counting "reviews due today" is wrong until it
+        // knows the new instant.
+        "signup_quarantine.extended",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "quarantined_until_unix_ms": {"type": "integer"}
+            },
+            "required": ["user_id", "quarantined_until_unix_ms"]
+        }"#,
+    ),
+    (
         "dcr_policy.created",
         1,
         r#"{

@@ -287,3 +287,130 @@ async fn a_case_is_invisible_and_unreachable_from_another_tenant() {
         Err(StoreError::NotFound)
     ));
 }
+
+/// Claim the one webhook event outstanding in `scope`, completing it so the ordering key is
+/// released for the next.
+async fn claim_one_event(db: &TestDatabase, env: &Env, scope: Scope) -> serde_json::Value {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "expected exactly one queued event");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().next().expect("one message").payload
+}
+
+/// A review RESOLVES with its decision; an EXTENSION is a separate type.
+///
+/// The separation is the point. Approve and reject are the same review reaching opposite
+/// conclusions over one subject, so they share a type and a `decision` field -- a consumer
+/// mirroring "may this person sign in" reads one field rather than correlating two
+/// subscriptions.
+///
+/// An EXTENSION resolves nothing: it moves the deadline and leaves the subject quarantined. A
+/// consumer that treated it as a decision would admit or refuse someone still under review,
+/// so it is its own type carrying the new instant -- which an operator dashboard counting
+/// "reviews due today" is wrong without.
+#[tokio::test]
+async fn a_review_resolves_with_its_decision_and_an_extension_is_a_separate_type() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = quarantine_signup(&db, &env, scope, "held@example.test").await;
+    let user = subject.to_string();
+    let until_micros = 5_000_000_i64;
+
+    let extended = ironauth_store::event_catalog::envelope(
+        "evt_quarantine_extended",
+        "signup_quarantine.extended",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "user_id": user,
+            "quarantined_until_unix_ms": until_micros / 1000,
+        }),
+    )
+    .expect("signup_quarantine.extended is registered");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(admin_actor(&env), CorrelationId::generate(&env))
+        .signup_quarantines()
+        .extend_with_event(
+            &env,
+            &subject,
+            until_micros,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_quarantine_extended",
+                subject: &user,
+                envelope: &extended,
+            }),
+        )
+        .await
+        .expect("extend the window");
+
+    let first = claim_one_event(&db, &env, scope).await;
+    assert_eq!(
+        first["type"], "signup_quarantine.extended",
+        "an extension must NOT be announced as a resolution: it resolves nothing"
+    );
+    assert_eq!(
+        first["payload"]["quarantined_until_unix_ms"],
+        until_micros / 1000
+    );
+    ironauth_store::event_catalog::validate_event(&first)
+        .expect("the envelope validates against the registry the fan-out enforces");
+    // Still quarantined: the extension moved the deadline and decided nothing.
+    let (_, quarantined) = user_row(&db, scope, &subject).await;
+    assert!(quarantined, "an extension leaves the subject under review");
+
+    let resolved = ironauth_store::event_catalog::envelope(
+        "evt_quarantine_resolved",
+        "signup_quarantine.resolved",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "user_id": user, "decision": "approved" }),
+    )
+    .expect("signup_quarantine.resolved is registered");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(admin_actor(&env), CorrelationId::generate(&env))
+        .signup_quarantines()
+        .approve_with_event(
+            &env,
+            &subject,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_quarantine_resolved",
+                subject: &user,
+                envelope: &resolved,
+            }),
+        )
+        .await
+        .expect("approve the signup");
+
+    let second = claim_one_event(&db, &env, scope).await;
+    assert_eq!(second["type"], "signup_quarantine.resolved");
+    assert_eq!(second["payload"]["decision"], "approved");
+    ironauth_store::event_catalog::validate_event(&second)
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

@@ -1268,6 +1268,51 @@
       "type": "signup_form.set"
     },
     {
+      "domain": "signup_quarantine",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "quarantined_until_unix_ms": {
+            "type": "integer"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "quarantined_until_unix_ms"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "signup_quarantine.extended"
+    },
+    {
+      "domain": "signup_quarantine",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "signup_quarantine.resolved"
+    },
+    {
       "domain": "tenant",
       "payload_schema": {
         "additionalProperties": false,

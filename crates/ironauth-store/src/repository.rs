@@ -32464,6 +32464,22 @@ impl ActingSignupQuarantineRepo<'_> {
         subject: &UserId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.approve_with_event(env, subject, idempotency, None)
+            .await
+    }
+
+    /// [`Self::approve`], additionally emitting `signup_quarantine.resolved` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::approve`].
+    pub async fn approve_with_event(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if subject.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -32505,6 +32521,8 @@ impl ActingSignupQuarantineRepo<'_> {
                 if !closed {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back review announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -32532,6 +32550,22 @@ impl ActingSignupQuarantineRepo<'_> {
         env: &Env,
         subject: &UserId,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.reject_with_event(env, subject, idempotency, None)
+            .await
+    }
+
+    /// [`Self::reject`], additionally emitting `signup_quarantine.resolved` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reject`].
+    pub async fn reject_with_event(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if subject.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -32593,6 +32627,8 @@ impl ActingSignupQuarantineRepo<'_> {
                     &emit,
                 )
                 .await?;
+                // In the write's transaction: a rolled-back review announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -32617,6 +32653,23 @@ impl ActingSignupQuarantineRepo<'_> {
         subject: &UserId,
         quarantined_until_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.extend_with_event(env, subject, quarantined_until_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::extend`], additionally emitting `signup_quarantine.extended` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::extend`].
+    pub async fn extend_with_event(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        quarantined_until_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if subject.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -32658,6 +32711,8 @@ impl ActingSignupQuarantineRepo<'_> {
                 if extended.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back review announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
