@@ -266,7 +266,9 @@ async fn revoking_an_admin_consent_emits_the_registered_event() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "granting emits nothing today, so the revocation's event is unambiguous"
+        "this grant passed no event, so the revocation's event below is unambiguous. The \
+         un-suffixed method staying silent IS the paired-negative guarantee; it is not a \
+         claim that granting never announces"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(

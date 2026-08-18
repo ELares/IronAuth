@@ -990,7 +990,9 @@ async fn deleting_an_org_role_emits_the_registered_event() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "creating a role emits nothing today, so the delete's event is unambiguous"
+        "this create passed no event, so the delete's event below is unambiguous. The \
+         un-suffixed method staying silent IS the paired-negative guarantee; it is not a \
+         claim that creating never announces"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(

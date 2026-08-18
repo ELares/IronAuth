@@ -292,7 +292,9 @@ async fn deleting_a_locale_bundle_emits_the_registered_event_with_its_tag() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "setting a bundle emits nothing today, so the delete's event is unambiguous"
+        "this set passed no event, so the delete's event below is unambiguous. The \
+         un-suffixed method staying silent IS the paired-negative guarantee; it is not a \
+         claim that setting never announces"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(
