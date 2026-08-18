@@ -159,16 +159,26 @@ pub async fn set_sms_otp_config(
     sudo::require_fresh_privilege(&state, scope, actor).await?;
     require_live_environment(&state, &scope).await?;
     let request: SetSmsConfigRequest = parse_json(&body)?;
+    let pending = sms_config_event(
+        &state,
+        scope,
+        request.enabled,
+        request.allow_factor_downgrade,
+    );
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .sms_otp()
-        .set_config(
+        .set_config_with_event(
             state.env(),
             request.enabled,
             request.allow_factor_downgrade,
             state.now_unix_micros(),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     let view = SmsConfigView {
@@ -244,12 +254,20 @@ pub async fn allow_sms_country(
     sudo::require_fresh_privilege(&state, scope, actor).await?;
     require_live_environment(&state, &scope).await?;
     let country_code = require_country_code(&country_code)?;
+    let pending = sms_allowlist_event(&state, scope, &country_code, true);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .sms_otp()
-        .add_allowlist_country(state.env(), &country_code)
+        .add_allowlist_country_with_event(
+            state.env(),
+            &country_code,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }
@@ -291,12 +309,83 @@ pub async fn deny_sms_country(
     // this route into a probe for which countries an environment allows, which the list
     // read above already answers to an authorized caller and should not be inferable from
     // a delete.
+    let pending = sms_allowlist_event(&state, scope, &country_code, false);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .sms_otp()
-        .remove_allowlist_country(state.env(), &country_code)
+        .remove_allowlist_country_with_event(
+            state.env(),
+            &country_code,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event an SMS-OTP configuration change emits (issue #108).
+///
+/// BOTH flags, because the pair IS the policy: "enabled" alone does not tell a receiver
+/// whether a user may fall back from a stronger factor, and that is the part with security
+/// consequences.
+fn sms_config_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    enabled: bool,
+    allow_factor_downgrade: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "sms_otp.config_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "enabled": enabled,
+            "allow_factor_downgrade": allow_factor_downgrade,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The ENVIRONMENT is the subject: successive config changes stay ordered.
+        subject: scope.environment().to_string(),
+        envelope,
+    })
+}
+
+/// The event an SMS-OTP allowlist change emits (issue #108).
+///
+/// ONE type with the country and the direction. An allowlist is a set, and adding to it or
+/// removing from it are the same edit in two directions -- a consumer mirroring "where may we
+/// send" reads one field rather than correlating two subscriptions.
+///
+/// The COUNTRY is the payload's reason for existing: this allowlist is what stands between the
+/// SMS surface and toll fraud, so a receiver auditing it needs to know WHICH destination
+/// changed, not merely that something did.
+fn sms_allowlist_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    country_code: &str,
+    allowed: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "sms_otp.allowlist_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "country_code": country_code, "allowed": allowed }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The COUNTRY is the subject: two edits to one destination stay ordered.
+        subject: country_code.to_owned(),
+        envelope,
+    })
 }

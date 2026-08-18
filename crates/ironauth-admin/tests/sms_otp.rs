@@ -225,3 +225,178 @@ async fn the_configuration_is_invisible_to_a_sibling_environment() {
         "nor does it inherit the allowlist: {response}"
     );
 }
+
+/// Allowing and denying a country emit ONE type carrying the country and the direction.
+///
+/// An allowlist is a set, and adding to it or removing from it are the same edit in two
+/// directions -- a consumer mirroring "where may we send" reads one field rather than
+/// correlating two subscriptions.
+///
+/// The COUNTRY is why the payload exists: this allowlist is what stands between the SMS
+/// surface and toll fraud, so a receiver auditing it must know WHICH destination changed, not
+/// merely that something did. Both directions are asserted, because a producer that
+/// hard-coded either would pass a test exercising only one.
+#[tokio::test]
+async fn allowing_and_denying_a_country_announce_the_country_and_the_direction() {
+    use ironauth_store::{EnvironmentId, Scope, TenantId};
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "sms-evt").await;
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let root = allowlist_path(&tenant, &environment);
+
+    // Provisioning the tenant is itself an audited write that announces itself, so its event
+    // is drained and completed before the loop counts anything.
+    let setup = h
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &ironauth_env::Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("drain setup events");
+    for message in &setup {
+        h.db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .complete(&ironauth_env::Env::system(), message)
+            .await
+            .expect("complete a setup event");
+    }
+
+    for (path_suffix, key, allowed) in [("44", "k-allow", true), ("44", "k-deny", false)] {
+        let (status, _, response) = if allowed {
+            h.put_with_key(&format!("{root}/{path_suffix}"), key, "")
+                .await
+        } else {
+            h.delete(&format!("{root}/{path_suffix}")).await
+        };
+        assert_eq!(status, StatusCode::NO_CONTENT, "{response}");
+
+        let claimed = h
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &ironauth_env::Env::system(),
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "the edit enqueues exactly one event");
+        assert_eq!(claimed[0].payload["type"], "sms_otp.allowlist_changed");
+        assert_eq!(claimed[0].payload["payload"]["country_code"], "44");
+        assert_eq!(
+            claimed[0].payload["payload"]["allowed"], allowed,
+            "the event must carry the DIRECTION the edit took, not a fixed value"
+        );
+        ironauth_store::event_catalog::validate_event(&claimed[0].payload)
+            .expect("the envelope validates against the registry the fan-out enforces");
+        // Completed each round: both events carry the country as their ordering key, so the
+        // second is not claimable while the first is outstanding.
+        for message in &claimed {
+            h.db()
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&ironauth_env::Env::system(), message)
+                .await
+                .expect("complete");
+        }
+    }
+}
+
+/// An SMS-OTP configuration change announces BOTH flags.
+///
+/// The pair IS the policy: `enabled` alone does not tell a receiver whether a user may fall
+/// back from a stronger factor, and that is the half with security consequences. A test that
+/// asserted only `enabled` would pass for a producer that dropped the downgrade flag entirely.
+///
+/// `allow_factor_downgrade` is set to a NON-DEFAULT value here, so a producer that hard-coded
+/// the default would fail.
+#[tokio::test]
+async fn a_configuration_change_announces_both_flags() {
+    use ironauth_store::{EnvironmentId, Scope, TenantId};
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "sms-cfg-evt").await;
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+
+    // Provisioning announces itself; drain before counting.
+    let setup = h
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &ironauth_env::Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("drain setup events");
+    for message in &setup {
+        h.db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .complete(&ironauth_env::Env::system(), message)
+            .await
+            .expect("complete a setup event");
+    }
+
+    let (status, _, body) = h
+        .put_with_key(
+            &config_path(&tenant, &environment),
+            "k-sms-cfg",
+            &serde_json::json!({ "enabled": true, "allow_factor_downgrade": true }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let events = h
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &ironauth_env::Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events.len(),
+        1,
+        "the config change enqueues exactly one event"
+    );
+    assert_eq!(events[0]["type"], "sms_otp.config_changed");
+    assert_eq!(events[0]["payload"]["enabled"], true);
+    assert_eq!(
+        events[0]["payload"]["allow_factor_downgrade"], true,
+        "the downgrade rule is the half with security consequences; it must be on the wire"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

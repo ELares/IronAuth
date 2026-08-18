@@ -1313,6 +1313,49 @@
       "type": "signup_quarantine.resolved"
     },
     {
+      "domain": "sms_otp",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "allowed": {
+            "type": "boolean"
+          },
+          "country_code": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "country_code",
+          "allowed"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "sms_otp.allowlist_changed"
+    },
+    {
+      "domain": "sms_otp",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "allow_factor_downgrade": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled",
+          "allow_factor_downgrade"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "sms_otp.config_changed"
+    },
+    {
       "domain": "tenant",
       "payload_schema": {
         "additionalProperties": false,

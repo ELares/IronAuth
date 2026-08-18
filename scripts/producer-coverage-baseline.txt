@@ -32,9 +32,6 @@ resource_servers::update_resource_server_permission_claims
 routing_rules::create_routing_rule
 routing_rules::verify_routing_rule_domain
 signing_algorithm::set_client_signing_algorithm
-sms_otp::allow_sms_country
-sms_otp::deny_sms_country
-sms_otp::set_sms_otp_config
 step_up_policies::remove_step_up_policy
 step_up_policies::set_step_up_policy
 sudo::elevate_sudo

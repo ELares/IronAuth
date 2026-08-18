@@ -493,6 +493,42 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // EXTEND is deliberately NOT folded in: it resolves nothing. It moves the deadline and
         // leaves the subject quarantined, so a consumer that treated it as a decision would
         // admit or refuse someone still under review.
+        // The SMS-OTP kill switch and its downgrade rule. Both are on the payload because the
+        // pair is the policy: "enabled" alone does not tell a receiver whether a user may fall
+        // back from a stronger factor, which is the part with security consequences.
+        "sms_otp.config_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "allow_factor_downgrade": {"type": "boolean"}
+            },
+            "required": ["enabled", "allow_factor_downgrade"]
+        }"#,
+    ),
+    (
+        // ONE type with the country and the direction. An allowlist is a set, and adding to it
+        // or removing from it are the same edit in two directions -- a consumer mirroring
+        // "where may we send" reads one field rather than correlating two subscriptions.
+        //
+        // The COUNTRY is the payload's reason for existing: the allowlist is what stands
+        // between this surface and toll fraud, and a receiver auditing it needs to know which
+        // destination changed, not merely that something did.
+        "sms_otp.allowlist_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "country_code": {"type": "string", "minLength": 1},
+                "allowed": {"type": "boolean"}
+            },
+            "required": ["country_code", "allowed"]
+        }"#,
+    ),
+    (
         "signup_quarantine.resolved",
         1,
         r#"{

@@ -7630,6 +7630,23 @@ impl ActingSmsOtpRepo<'_> {
         allow_factor_downgrade: bool,
         now_micros: i64,
     ) -> Result<(), StoreError> {
+        self.set_config_with_event(env, enabled, allow_factor_downgrade, now_micros, None)
+            .await
+    }
+
+    /// [`Self::set_config`], additionally emitting `sms_otp.config_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_config`].
+    pub async fn set_config_with_event(
+        &self,
+        env: &Env,
+        enabled: bool,
+        allow_factor_downgrade: bool,
+        now_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let detail = format!("enabled={enabled} allow_downgrade={allow_factor_downgrade}");
         write_audited_detailed(
@@ -7659,6 +7676,8 @@ impl ActingSmsOtpRepo<'_> {
                 .bind(now_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -7677,6 +7696,21 @@ impl ActingSmsOtpRepo<'_> {
         &self,
         env: &Env,
         country_code: &str,
+    ) -> Result<(), StoreError> {
+        self.add_allowlist_country_with_event(env, country_code, None)
+            .await
+    }
+
+    /// [`Self::add_allowlist_country`], additionally emitting `sms_otp.allowlist_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::add_allowlist_country`].
+    pub async fn add_allowlist_country_with_event(
+        &self,
+        env: &Env,
+        country_code: &str,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
         let country_code = country_code.to_owned();
@@ -7701,6 +7735,8 @@ impl ActingSmsOtpRepo<'_> {
                 .bind(&country_code)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -7719,6 +7755,21 @@ impl ActingSmsOtpRepo<'_> {
         &self,
         env: &Env,
         country_code: &str,
+    ) -> Result<(), StoreError> {
+        self.remove_allowlist_country_with_event(env, country_code, None)
+            .await
+    }
+
+    /// [`Self::remove_allowlist_country`], additionally emitting `sms_otp.allowlist_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove_allowlist_country`].
+    pub async fn remove_allowlist_country_with_event(
+        &self,
+        env: &Env,
+        country_code: &str,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
         let country_code = country_code.to_owned();
@@ -7742,6 +7793,8 @@ impl ActingSmsOtpRepo<'_> {
                 .bind(&country_code)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
