@@ -220,12 +220,13 @@ pub async fn create_webhook_endpoint(
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
 
+    let pending = webhook_endpoint_created_event(&state, scope, &id, &url);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .webhook_endpoints()
-        .create(
+        .create_with_event(
             state.env(),
             NewWebhookEndpoint {
                 id: &id,
@@ -241,6 +242,10 @@ pub async fn create_webhook_endpoint(
                 response_status: 201,
                 response_body: &body_string,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     Ok(json(StatusCode::CREATED, body_string))
@@ -863,12 +868,13 @@ async fn set_endpoint_state(
     let render = |resolved: &ironauth_store::WebhookEndpointRecord| {
         serde_json::to_string(&into_view(resolved.clone()))
     };
+    let pending = webhook_endpoint_active_changed_event(state, scope, &id, active);
     let record = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .webhook_endpoints()
-        .set_active(
+        .set_active_with_event(
             state.env(),
             &id,
             active,
@@ -879,6 +885,10 @@ async fn set_endpoint_state(
                 response_status: 200,
                 response_body: &render,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     let body = serde_json::to_string(&into_view(record)).map_err(|_| ApiError::Internal)?;
@@ -1008,6 +1018,67 @@ fn webhook_endpoint_deleted_event(
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,
         &serde_json::json!({ "webhook_endpoint_id": subject }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event a webhook-endpoint registration emits (issue #108).
+///
+/// The id and the URL. The URL is the endpoint's identity to an operator -- what they
+/// recognise in a console and check against their own infrastructure -- and it is not a
+/// secret: they supplied it.
+///
+/// NEVER the signing secret. This is the sharpest case of that rule in the whole registry,
+/// because the secret it would leak is the one that authenticates the very deliveries this
+/// event travels on: a subscriber holding it could forge deliveries to that endpoint.
+fn webhook_endpoint_created_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    endpoint_id: &ironauth_store::WebhookEndpointId,
+    url: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = endpoint_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "webhook_endpoint.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "webhook_endpoint_id": subject, "url": url }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event pausing or resuming a webhook endpoint emits (issue #108).
+///
+/// ONE type with a state, not a `paused` and a `resumed`. Unlike the create/update pairs
+/// elsewhere in this registry these are the SAME transition in two directions over one
+/// boolean, and a consumer mirroring "is this endpoint delivering" wants one subscription
+/// with a field to read rather than two subscriptions to correlate.
+fn webhook_endpoint_active_changed_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    endpoint_id: &ironauth_store::WebhookEndpointId,
+    active: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = endpoint_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "webhook_endpoint.active_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "webhook_endpoint_id": subject, "active": active }),
     )?;
     Some(crate::events::PendingEvent {
         id,

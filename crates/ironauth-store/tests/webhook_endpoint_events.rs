@@ -179,3 +179,151 @@ async fn deleting_a_webhook_endpoint_without_an_event_enqueues_nothing() {
         "a delete with no event must not invent one"
     );
 }
+
+/// Registering an endpoint emits `webhook_endpoint.created`, and NEVER its signing secret.
+///
+/// The sharpest secret rule in the registry: the secret this event could leak is the one that
+/// authenticates the very deliveries the event travels on, so a subscriber holding it could
+/// FORGE deliveries to that endpoint. Asserted against the rendered envelope rather than
+/// trusted from the schema, because a payload may carry fields the schema does not forbid.
+///
+/// The URL is carried deliberately -- it is the endpoint's identity to an operator and it is
+/// not a secret: they supplied it.
+#[tokio::test]
+async fn registering_an_endpoint_announces_it_without_the_signing_secret() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = WebhookEndpointId::generate(&env, &scope);
+    let subject = id.to_string();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_endpoint_created",
+        "webhook_endpoint.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "webhook_endpoint_id": subject,
+            "url": "https://ops.example.test/hook",
+        }),
+    )
+    .expect("webhook_endpoint.created is registered");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .webhook_endpoints()
+        .create_with_event(
+            &env,
+            NewWebhookEndpoint {
+                id: &id,
+                url: "https://ops.example.test/hook",
+                description: "an endpoint",
+                secret: b"endpoint-signing-secret",
+                created_at_micros: 1_000_000,
+            },
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_endpoint_created",
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("create with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "webhook_endpoint.created");
+    assert_eq!(events[0]["payload"]["url"], "https://ops.example.test/hook");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+    assert!(
+        !events[0].to_string().contains("endpoint-signing-secret"),
+        "the event carried the endpoint's SIGNING SECRET: {}",
+        events[0]
+    );
+}
+
+/// Pausing and resuming emit ONE type carrying the new state.
+///
+/// Not a `paused` and a `resumed`: unlike the create/update pairs elsewhere in this registry
+/// these are the SAME transition in two directions over one boolean, and a consumer mirroring
+/// "is this endpoint delivering" wants one subscription with a field to read rather than two
+/// subscriptions to correlate.
+///
+/// Both directions are asserted, because a producer that hard-coded either value would pass a
+/// test that only checked one.
+#[tokio::test]
+async fn pausing_and_resuming_an_endpoint_announce_the_new_state() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = create_endpoint(&db, &env, scope, "https://ops.example.test/hook").await;
+    let subject = id.to_string();
+
+    for (active, event_id) in [(false, "evt_paused"), (true, "evt_resumed")] {
+        let envelope = ironauth_store::event_catalog::envelope(
+            event_id,
+            "webhook_endpoint.active_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            1,
+            &serde_json::json!({ "webhook_endpoint_id": subject, "active": active }),
+        )
+        .expect("webhook_endpoint.active_changed is registered");
+
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .webhook_endpoints()
+            .set_active_with_event(
+                &env,
+                &id,
+                active,
+                None,
+                Some(&ironauth_store::DomainEvent {
+                    id: event_id,
+                    subject: &subject,
+                    envelope: &envelope,
+                }),
+            )
+            .await
+            .expect("set active with event");
+
+        // Claimed and COMPLETED each round: both events share the endpoint id as their
+        // ordering key, so the resume is not claimable while the pause is outstanding.
+        let claimed = db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "the flip enqueues exactly one event");
+        assert_eq!(
+            claimed[0].payload["type"],
+            "webhook_endpoint.active_changed"
+        );
+        assert_eq!(
+            claimed[0].payload["payload"]["active"], active,
+            "the event must carry the state the flip WROTE, not a fixed value"
+        );
+        ironauth_store::event_catalog::validate_event(&claimed[0].payload)
+            .expect("the envelope validates against the registry the fan-out enforces");
+        for message in &claimed {
+            db.store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, message)
+                .await
+                .expect("complete");
+        }
+    }
+}

@@ -229,6 +229,44 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // endpoints after this transaction commits, so the removed endpoint is already gone
         // and never receives its own removal. The other endpoints do, which is the point --
         // a delivery topology changing under them is exactly what they want told.
+        // The id and the URL. The URL is the endpoint's identity to an operator -- it is what
+        // they recognise in a console and what they would check against their own
+        // infrastructure -- and it is not a secret: the operator supplied it.
+        //
+        // NEVER the signing secret, and this type is the sharpest case of that rule in the
+        // registry: the secret it would leak is the one that authenticates the very deliveries
+        // this event travels on. A subscriber holding it could forge deliveries to that
+        // endpoint.
+        "webhook_endpoint.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "webhook_endpoint_id": {"type": "string", "minLength": 1},
+                "url": {"type": "string", "minLength": 1}
+            },
+            "required": ["webhook_endpoint_id", "url"]
+        }"#,
+    ),
+    (
+        // PAUSED and RESUMED as one type with a state, rather than two types. Unlike the
+        // create/update pairs elsewhere in this registry, these are the SAME transition in two
+        // directions over one boolean, and a consumer mirroring "is this endpoint delivering"
+        // wants one subscription with a field to read, not two subscriptions to correlate.
+        "webhook_endpoint.active_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "webhook_endpoint_id": {"type": "string", "minLength": 1},
+                "active": {"type": "boolean"}
+            },
+            "required": ["webhook_endpoint_id", "active"]
+        }"#,
+    ),
+    (
         "webhook_endpoint.deleted",
         1,
         r#"{

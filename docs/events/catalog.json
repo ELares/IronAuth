@@ -883,6 +883,51 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id",
+          "active"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.active_changed"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id",
+          "url"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.created"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
           "webhook_endpoint_id": {
             "minLength": 1,
             "type": "string"

@@ -26827,6 +26827,21 @@ impl ActingWebhookEndpointRepo<'_> {
         spec: NewWebhookEndpoint<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, spec, idempotency, None).await
+    }
+
+    /// [`Self::create`], additionally emitting `webhook_endpoint.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewWebhookEndpoint<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let NewWebhookEndpoint {
             id,
             url,
@@ -26895,6 +26910,8 @@ impl ActingWebhookEndpointRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back create announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -27152,6 +27169,24 @@ impl ActingWebhookEndpointRepo<'_> {
         active: bool,
         idempotency: Option<ResolvedIdempotencyWrite<'_, WebhookEndpointRecord>>,
     ) -> Result<WebhookEndpointRecord, StoreError> {
+        self.set_active_with_event(env, id, active, idempotency, None)
+            .await
+    }
+
+    /// [`Self::set_active`], additionally emitting `webhook_endpoint.active_changed`
+    /// (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_active`].
+    pub async fn set_active_with_event(
+        &self,
+        env: &Env,
+        id: &WebhookEndpointId,
+        active: bool,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, WebhookEndpointRecord>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<WebhookEndpointRecord, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -27212,6 +27247,8 @@ impl ActingWebhookEndpointRepo<'_> {
                     created_at_unix_micros: row.get("created_us"),
                 };
                 insert_resolved_idempotency(tx, idempotency, &record).await?;
+                // In the write's transaction: a rolled-back flip announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(record)
             },
             false,
