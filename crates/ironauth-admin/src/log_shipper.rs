@@ -68,11 +68,16 @@ pub trait LogSink: Send + Sync {
     /// `credential` is the RESOLVED secret value the stream named, opened by the shipper.
     /// Sinks never resolve it themselves: one resolution path means one place that can
     /// leak it, and a sink that took a secret NAME would have to hold the master key.
+    /// `signature` is the batch signature when the stream carries a signing secret, and
+    /// [`None`] when it ships unsigned. Computed by the shipper, never by the sink: it must be
+    /// identical whatever carried it, and a per-sink signature would be four chances to get
+    /// the canonical form subtly different.
     fn deliver<'a>(
         &'a self,
         stream: &'a LogStreamRecord,
         credential: Option<&'a str>,
         events: &'a [Value],
+        signature: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>>;
 }
 
@@ -224,8 +229,32 @@ pub async fn replay_dead_letters(
             scoped.log_streams().mark_replayed(env, &dead.id).await?;
             continue;
         }
+        // A replay is signed over the DEAD LETTER's own position, not a fresh one: it is the
+        // same batch being delivered again, so a consumer that already verified it sees the
+        // position it already has and treats it as the replay it is.
+        let replay_signature = match scoped.log_streams().open_signing_secret(&stream).await? {
+            Some(key) => serde_json::to_string(&events).ok().map(|events_json| {
+                crate::log_stream_signature::sign(
+                    &key,
+                    &crate::log_stream_signature::canonical_string(
+                        &stream.id,
+                        dead.from.0,
+                        &dead.from.1,
+                        events.len(),
+                        &events_json,
+                    ),
+                )
+            }),
+            None => None,
+        };
         if matches!(
-            sink.deliver(&stream, credential.as_deref(), &events).await,
+            sink.deliver(
+                &stream,
+                credential.as_deref(),
+                &events,
+                replay_signature.as_deref()
+            )
+            .await,
             SinkOutcome::Accepted
         ) {
             scoped.log_streams().mark_replayed(env, &dead.id).await?;
@@ -352,7 +381,46 @@ async fn ship_stream(
     // would need the master key, which would put the ability to open every environment
     // secret behind every sink implementation including ones a deployment adds itself.
     let credential = resolve_credential(store, scope, stream).await?;
-    match sink.deliver(stream, credential.as_deref(), &events).await {
+
+    // SIGNED before delivery, over the position this batch is about to advance the cursor to
+    // (issue #110 criterion 5). Computed here rather than inside each sink because it must be
+    // identical whatever carried it: a consumer reading the S3 sink's objects and one behind
+    // the HTTP sink verify the same bytes, and a per-sink signature would be four chances to
+    // get the canonical form subtly different.
+    //
+    // A stream with no signing secret ships unsigned, exactly as every stream did before this
+    // existed. That is the deliberate default: signing with a key no consumer holds would
+    // present as every batch failing verification, which is worse than not signing.
+    let signature = match store
+        .scoped(scope)
+        .log_streams()
+        .open_signing_secret(stream)
+        .await?
+    {
+        Some(key) => {
+            // These events came out of the store as `Value`, so re-serializing them cannot
+            // fail. Handled rather than unwrapped because a panic in the shipper stops every
+            // stream, and a stream that ships unsigned is strictly better than one that
+            // stops: the operator sees an unsigned batch, not silence.
+            let Ok(events_json) = serde_json::to_string(&events) else {
+                return Ok(0);
+            };
+            let canonical = crate::log_stream_signature::canonical_string(
+                &stream.id,
+                position.0,
+                &position.1,
+                events.len(),
+                &events_json,
+            );
+            Some(crate::log_stream_signature::sign(&key, &canonical))
+        }
+        None => None,
+    };
+
+    match sink
+        .deliver(stream, credential.as_deref(), &events, signature.as_deref())
+        .await
+    {
         SinkOutcome::Accepted => {
             let accepted = u64::try_from(events.len()).unwrap_or(u64::MAX);
             scoped
@@ -507,6 +575,7 @@ impl LogSink for HttpLogSink {
         stream: &'a LogStreamRecord,
         _credential: Option<&'a str>,
         events: &'a [Value],
+        signature: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = Self::endpoint(stream).map(str::to_owned);
@@ -517,7 +586,7 @@ impl LogSink for HttpLogSink {
                     "sink_config carries no `endpoint` string".to_string(),
                 );
             };
-            let request = ironauth_fetch::FetchRequest::new(
+            let mut request = ironauth_fetch::FetchRequest::new(
                 ironauth_fetch::FetchPurpose::LogStreamDelivery,
                 http::Method::POST,
                 endpoint,
@@ -527,6 +596,19 @@ impl LogSink for HttpLogSink {
                 http::HeaderValue::from_static("application/json"),
             )
             .body(body);
+            if let Some(signature) = signature {
+                // A signature that will not encode means the batch cannot be presented with
+                // the proof a consumer verifies. Sending it WITHOUT would deliver the
+                // environment's audit trail unauthenticated to a consumer that is configured
+                // to expect authentication, so refusing is the only safe answer -- the same
+                // reasoning `post_json` applies to its own headers.
+                let Ok(value) = http::HeaderValue::from_str(signature) else {
+                    return SinkOutcome::Rejected(
+                        "the batch signature could not be encoded as a header".to_string(),
+                    );
+                };
+                request = request.header(http::HeaderName::from_static(SIGNATURE_HEADER), value);
+            }
             // Matched by VARIANT rather than rendered with `Display`, so the reason
             // stored on the stream row is operator-safe by construction. This string is
             // read back through a status API, and a rendering that ever grew to include a
@@ -689,6 +771,7 @@ impl LogSink for DatadogSink {
         stream: &'a LogStreamRecord,
         credential: Option<&'a str>,
         events: &'a [Value],
+        signature: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = configured_endpoint(stream).map(str::to_owned);
@@ -707,7 +790,11 @@ impl LogSink for DatadogSink {
                     "the datadog sink needs an API key; set credential_secret_name".to_string(),
                 );
             };
-            post_json(&fetcher, endpoint, vec![("dd-api-key", credential)], body).await
+            let mut headers = vec![("dd-api-key", credential)];
+            if let Some(signature) = signature {
+                headers.push((SIGNATURE_HEADER, signature.to_owned()));
+            }
+            post_json(&fetcher, endpoint, headers, body).await
         })
     }
 }
@@ -739,6 +826,7 @@ impl LogSink for SplunkHecSink {
         stream: &'a LogStreamRecord,
         credential: Option<&'a str>,
         events: &'a [Value],
+        signature: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = configured_endpoint(stream).map(str::to_owned);
@@ -761,13 +849,11 @@ impl LogSink for SplunkHecSink {
                     "the splunk_hec sink needs a token; set credential_secret_name".to_string(),
                 );
             };
-            post_json(
-                &fetcher,
-                endpoint,
-                vec![("authorization", format!("Splunk {credential}"))],
-                body,
-            )
-            .await
+            let mut headers = vec![("authorization", format!("Splunk {credential}"))];
+            if let Some(signature) = signature {
+                headers.push((SIGNATURE_HEADER, signature.to_owned()));
+            }
+            post_json(&fetcher, endpoint, headers, body).await
         })
     }
 }
@@ -914,6 +1000,29 @@ impl Drop for LogShipper {
 
 /// The S3-compatible object-store sink.
 ///
+/// The header a shipped batch's signature travels in (issue #110 criterion 5).
+///
+/// One name across every sink, because a consumer verifying batches from an HTTP forwarder
+/// and from a Splunk index is running the same code: a per-sink header would make the sample
+/// consumer sink-aware for no reason a SIEM operator would accept.
+pub const SIGNATURE_HEADER: &str = "x-ironauth-log-signature";
+
+/// The header carrying the cursor position the signature covers.
+///
+/// Sent BESIDE the signature rather than only inside it, because a consumer needs the
+/// position to rebuild the canonical string before it can verify anything -- and it must then
+/// check the rebuilt string against the signature, which is what stops a sender rewriting the
+/// position it claims. A position a consumer cannot see is a position it cannot check for a
+/// gap or a replay.
+pub const POSITION_HEADER: &str = "x-ironauth-log-position";
+
+/// The S3 object metadata key the batch signature travels in.
+///
+/// An S3 object carries no headers once written, so the signature has to become metadata or a
+/// consumer reading the bucket has nowhere to find it. `x-amz-meta-` is the only prefix S3
+/// preserves.
+pub const S3_SIGNATURE_METADATA: &str = "x-amz-meta-ironauth-log-signature";
+
 /// One PUT per batch, keyed by stream and cursor position, signed with AWS `SigV4`.
 ///
 /// # The key is derived from the batch, not from a clock
@@ -941,12 +1050,23 @@ impl LogSink for S3LogSink {
         SinkType::S3
     }
 
+    // The S3 delivery is one operation: build the key, hash the payload, construct the
+    // canonical request, sign it, and PUT. Splitting it would separate the canonical
+    // request from the signature computed over it, which is the one pairing in this file
+    // that must be read together to be checked.
+    #[allow(clippy::too_many_lines)]
     fn deliver<'a>(
         &'a self,
         stream: &'a LogStreamRecord,
         credential: Option<&'a str>,
         events: &'a [Value],
+        signature: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
+        // Captured under its own name because this method shadows `signature` with the
+        // SigV4 request signature further down, and the two are entirely different things:
+        // one authenticates this PUT to S3, the other proves the BATCH to whoever reads the
+        // object afterwards. Conflating them is the mistake this rename exists to prevent.
+        let batch_signature = signature.map(str::to_owned);
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = configured_endpoint(stream).map(str::to_owned);
         let region = stream
@@ -1010,11 +1130,23 @@ impl LogSink for S3LogSink {
             let canonical = crate::sigv4::CanonicalRequest {
                 method: "PUT",
                 path: &path,
-                headers: vec![
-                    ("host".to_string(), host.clone()),
-                    ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-                    ("x-amz-date".to_string(), timestamp.clone()),
-                ],
+                headers: {
+                    let mut headers = vec![
+                        ("host".to_string(), host.clone()),
+                        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+                        ("x-amz-date".to_string(), timestamp.clone()),
+                    ];
+                    // Object METADATA, because an S3 object has no headers once written and
+                    // a consumer reading the bucket later has nowhere else to find it.
+                    //
+                    // Inside the CANONICAL headers, not merely on the request: a metadata
+                    // header SigV4 did not sign can be stripped or rewritten in flight, and
+                    // the batch signature is exactly the thing an attacker would remove.
+                    if let Some(signature) = batch_signature.as_deref() {
+                        headers.push((S3_SIGNATURE_METADATA.to_string(), signature.to_owned()));
+                    }
+                    headers
+                },
                 payload_hash: &payload_hash,
             };
             let scope = crate::sigv4::credential_scope(&date, &region, "s3");
@@ -1030,11 +1162,17 @@ impl LogSink for S3LogSink {
             post_object(
                 &fetcher,
                 format!("{}{path}", endpoint.trim_end_matches('/')),
-                vec![
-                    ("x-amz-content-sha256", payload_hash),
-                    ("x-amz-date", timestamp),
-                    ("authorization", authorization),
-                ],
+                {
+                    let mut headers = vec![
+                        ("x-amz-content-sha256", payload_hash),
+                        ("x-amz-date", timestamp),
+                        ("authorization", authorization),
+                    ];
+                    if let Some(signature) = batch_signature {
+                        headers.push((S3_SIGNATURE_METADATA, signature));
+                    }
+                    headers
+                },
                 body,
             )
             .await

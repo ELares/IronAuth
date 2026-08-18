@@ -69,6 +69,11 @@ echo "==> JWT verification conformance corpus freshness (issue #118)"
 # dropping the alg_none case would make every verifier go green on an unsigned token.
 scripts/verify-vectors.sh
 
+echo "==> log-stream signature corpus freshness (issue #110)"
+# Generated from the shipped signer, so a change to what a batch signature covers surfaces as
+# a diff rather than as a SIEM that stops verifying in the field.
+scripts/log-stream-vectors.sh
+
 echo "==> terraform provider coverage (generated from the OpenAPI document)"
 # Issue #51 criterion 6. A pure python lane over the committed spec, so it needs neither Go
 # nor tofu and runs everywhere.

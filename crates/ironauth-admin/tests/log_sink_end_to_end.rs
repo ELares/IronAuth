@@ -65,6 +65,7 @@ fn stream(sink_type: SinkType, endpoint: &str) -> LogStreamRecord {
         sink_type,
         sink_config: json!({ "endpoint": endpoint, "bucket": "audit", "region": "us-east-1" }),
         credential_secret_name: None,
+        signing_secret_name: None,
         event_type_filter: None,
         organization_id: None,
         active: true,
@@ -102,7 +103,12 @@ async fn a_plaintext_endpoint_is_refused_with_a_reason_that_names_the_scheme() {
     ] {
         let endpoint = format!("http://collector.example.test:{}/ingest", addr.port());
         let outcome = sink
-            .deliver(&stream(sink_type, &endpoint), Some("token"), &events())
+            .deliver(
+                &stream(sink_type, &endpoint),
+                Some("token"),
+                &events(),
+                None,
+            )
             .await;
         match outcome {
             SinkOutcome::Rejected(reason) => {
@@ -138,7 +144,7 @@ async fn an_https_endpoint_gets_past_the_policy_and_fails_at_the_transport() {
     let sink = HttpLogSink::new(fetcher_to(addr));
     let endpoint = format!("https://collector.example.test:{}/ingest", addr.port());
     let outcome = sink
-        .deliver(&stream(SinkType::Http, &endpoint), None, &events())
+        .deliver(&stream(SinkType::Http, &endpoint), None, &events(), None)
         .await;
     match outcome {
         SinkOutcome::Rejected(reason) => {

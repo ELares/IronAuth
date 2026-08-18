@@ -51,6 +51,7 @@ fn stream(sink_type: SinkType, sink_config: Value) -> LogStreamRecord {
         sink_type,
         sink_config,
         credential_secret_name: None,
+        signing_secret_name: None,
         event_type_filter: None,
         organization_id: None,
         active: true,
@@ -100,7 +101,9 @@ async fn every_sink_reports_its_own_type() {
 async fn every_sink_refuses_a_stream_with_no_endpoint() {
     for (sink_type, sink) in sinks() {
         let configured = stream(sink_type, json!({}));
-        let outcome = sink.deliver(&configured, Some(CANARY), &events()).await;
+        let outcome = sink
+            .deliver(&configured, Some(CANARY), &events(), None)
+            .await;
         assert!(
             matches!(outcome, SinkOutcome::Rejected(_)),
             "{} accepted a batch with no endpoint configured",
@@ -124,7 +127,7 @@ async fn a_vendor_sink_refuses_without_a_credential() {
             continue;
         }
         let configured = stream(sink_type, complete_config(sink_type));
-        let outcome = sink.deliver(&configured, None, &events()).await;
+        let outcome = sink.deliver(&configured, None, &events(), None).await;
         match outcome {
             SinkOutcome::Rejected(reason) => assert!(
                 reason.contains("credential_secret_name"),
@@ -162,7 +165,7 @@ async fn no_sink_leaks_the_credential_into_its_reason() {
             for config in [json!({}), complete_config(sink_type)] {
                 let configured = stream(sink_type, config);
                 let outcome = sink
-                    .deliver(&configured, Some(credential.as_str()), &events())
+                    .deliver(&configured, Some(credential.as_str()), &events(), None)
                     .await;
                 if let SinkOutcome::Rejected(reason) = outcome {
                     assert!(
@@ -189,7 +192,7 @@ async fn an_unsendable_credential_is_refused_at_the_header() {
         json!({"endpoint": "https://sink.invalid/in"}),
     );
     let outcome = sink
-        .deliver(&configured, Some(&format!("{CANARY}\nx")), &events())
+        .deliver(&configured, Some(&format!("{CANARY}\nx")), &events(), None)
         .await;
     match outcome {
         SinkOutcome::Rejected(reason) => assert!(
