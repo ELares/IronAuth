@@ -516,6 +516,42 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // A routing rule decides WHICH UPSTREAM a login is sent to, so a consumer mirroring
         // federation topology acts on it. The rule and its organization connection are both
         // carried: the rule alone does not say where it routes.
+        // A per-scope STEP-UP requirement: what a caller must satisfy before a token bearing
+        // this scope is issued. Raising it hardens the scope and lowering it relaxes one, so
+        // a consumer mirroring authentication policy acts on both.
+        //
+        // The SCOPE TOKEN is the address, and the requirement travels with it: `min_acr` and
+        // `max_auth_age_secs` are both optional because a policy may constrain either, and
+        // each is OMITTED when unset rather than sent as a sentinel.
+        "step_up_policy.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "scope_token": {"type": "string", "minLength": 1},
+                "min_acr": {"type": "string", "minLength": 1},
+                "max_auth_age_secs": {"type": "integer"}
+            },
+            "required": ["scope_token"]
+        }"#,
+    ),
+    (
+        // The requirement is GONE, which means the scope no longer demands a step-up. That is
+        // a relaxation, and its own type: a consumer must not read "policy removed" as
+        // "policy unchanged".
+        "step_up_policy.removed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "scope_token": {"type": "string", "minLength": 1}
+            },
+            "required": ["scope_token"]
+        }"#,
+    ),
+    (
         "routing_rule.created",
         1,
         r#"{

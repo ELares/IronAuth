@@ -1521,6 +1521,49 @@
       "type": "sms_otp.config_changed"
     },
     {
+      "domain": "step_up_policy",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "scope_token": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_token"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "step_up_policy.removed"
+    },
+    {
+      "domain": "step_up_policy",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_auth_age_secs": {
+            "type": "integer"
+          },
+          "min_acr": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "scope_token": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_token"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "step_up_policy.set"
+    },
+    {
       "domain": "tenant",
       "payload_schema": {
         "additionalProperties": false,

@@ -3293,6 +3293,32 @@ impl ActingScopeStepUpPolicyRepo<'_> {
         max_auth_age_secs: Option<i64>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<ScopeStepUpPolicyId, StoreError> {
+        self.set_with_event(
+            env,
+            scope_token,
+            min_acr,
+            max_auth_age_secs,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::set`], additionally emitting `step_up_policy.set` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        scope_token: &str,
+        min_acr: Option<&str>,
+        max_auth_age_secs: Option<i64>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<ScopeStepUpPolicyId, StoreError> {
         let scope = self.scope;
         let candidate_id = ScopeStepUpPolicyId::generate(env, &scope);
         let now_micros = epoch_micros(env.clock().now_utc());
@@ -3338,6 +3364,8 @@ impl ActingScopeStepUpPolicyRepo<'_> {
         insert_audit_row(&mut tx, &spec, None).await?;
         // In the SAME transaction as the upsert and its audit row.
         insert_idempotency(&mut tx, idempotency).await?;
+        // BEFORE the commit, in the upsert's own transaction.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(live_id)
     }
@@ -3350,6 +3378,20 @@ impl ActingScopeStepUpPolicyRepo<'_> {
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn remove(&self, env: &Env, scope_token: &str) -> Result<(), StoreError> {
+        self.remove_with_event(env, scope_token, None).await
+    }
+
+    /// [`Self::remove`], additionally emitting `step_up_policy.removed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove`].
+    pub async fn remove_with_event(
+        &self,
+        env: &Env,
+        scope_token: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         // The audit target is the scope-derived policy handle; a synthetic id keeps
         // the target legible without a prior read.
@@ -3373,6 +3415,8 @@ impl ActingScopeStepUpPolicyRepo<'_> {
                 .bind(scope_token)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back removal announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
