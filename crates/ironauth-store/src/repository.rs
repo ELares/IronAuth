@@ -9555,34 +9555,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(token.kind.as_str())
                 .execute(&mut *tx)
                 .await?;
-                // METERED (issue #107), one per token, inside the redeem's own
-                // transaction. This is the LIVE issuance path -- record_issued_tokens has
-                // no caller outside this file -- so wiring only that one would have left
-                // tokens_issued at zero exactly as it was.
-                let event_id = format!("evt_{}", CorrelationId::generate(env));
-                if let Some(envelope) = crate::event_catalog::envelope(
-                    &event_id,
-                    "token.issued",
-                    &scope.tenant().to_string(),
-                    &scope.environment().to_string(),
-                    epoch_micros(env.clock().now_utc()) / 1000,
-                    &serde_json::json!({
-                        "grant_id": grant_text,
-                        "token_kind": token.kind.as_str(),
-                    }),
-                ) {
-                    enqueue_domain_event(
-                        &mut tx,
-                        env,
-                        scope,
-                        Some(&DomainEvent {
-                            id: &event_id,
-                            subject: &grant_text,
-                            envelope: &envelope,
-                        }),
-                    )
-                    .await?;
-                }
+                meter_token_issued(&mut tx, env, scope, &grant_text, token.kind.as_str()).await?;
             }
             // An opaque access token (issue #29) records ONLY its digest and
             // metadata here, in the SAME transaction as the consume, so it can no
@@ -62768,4 +62741,53 @@ mod usage_tally {
 
         assert_eq!(forward, backward);
     }
+}
+
+/// Enqueue the `token.issued` metering event for one issued token (issue #107).
+///
+/// Extracted from `redeem` rather than inlined: it is a cohesive unit, and inlining it is
+/// what pushed that function past the readable-length lint. Behaviour is unchanged -- same
+/// transaction, same ordering subject, same payload.
+///
+/// It is enqueued INSIDE the redeem's own transaction, so a token that was issued and a token
+/// that was counted are the same set: a rollback drops both. This is the LIVE issuance path
+/// (`record_issued_tokens` has no caller outside this file), so wiring only that one would
+/// have left `tokens_issued` at zero exactly as it already was.
+///
+/// The payload is what the producer HOLDS at emit time: the grant and the token kind. An
+/// earlier draft required `client_id`, which reads better and is wrong -- resolving the client
+/// would mean an extra read on the token path, the producer announcing something it had to go
+/// and look up.
+async fn meter_token_issued(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    env: &Env,
+    scope: Scope,
+    grant_text: &str,
+    token_kind: &str,
+) -> Result<(), StoreError> {
+    let event_id = format!("evt_{}", CorrelationId::generate(env));
+    if let Some(envelope) = crate::event_catalog::envelope(
+        &event_id,
+        "token.issued",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        epoch_micros(env.clock().now_utc()) / 1000,
+        &serde_json::json!({
+            "grant_id": grant_text,
+            "token_kind": token_kind,
+        }),
+    ) {
+        enqueue_domain_event(
+            tx,
+            env,
+            scope,
+            Some(&DomainEvent {
+                id: &event_id,
+                subject: grant_text,
+                envelope: &envelope,
+            }),
+        )
+        .await?;
+    }
+    Ok(())
 }
