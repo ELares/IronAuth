@@ -905,3 +905,8 @@ required-features = ["testing"]
 name = "events_cursor_ordering"
 path = "tests/events_cursor_ordering.rs"
 required-features = ["testing"]
+
+[[test]]
+name = "project_grants"
+path = "tests/project_grants.rs"
+required-features = ["testing"]

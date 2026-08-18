@@ -3394,14 +3394,28 @@ fn documented_write_exceptions() -> BTreeMap<&'static str, StatusCode> {
 /// the movement is RECORDED instead, exactly, per table. That turns the assertion from a
 /// weaker one into a STRONGER one: it now also pins that the disarm at a soft-deleted
 /// environment really did destroy the secret (`environment_secrets` falls by exactly
-/// one) and really did audit it (`audit_log` rises by exactly one). A fence quietly
-/// reintroduced on that route would leave both at zero and fail here.
+/// one), really did audit it (`audit_log` rises by exactly one), and really did ANNOUNCE
+/// it (`outbox_messages` rises by exactly one). A fence quietly reintroduced on that
+/// route would leave all three at zero and fail here.
 fn documented_write_row_effects() -> BTreeMap<String, i64> {
     BTreeMap::from([
         // The disarm destroys THIS environment's outbound-verification secret.
         ("environment_secrets".to_owned(), -1),
         // And audits `environment_secret.delete` in the same transaction.
         ("audit_log".to_owned(), 1),
+        // And ANNOUNCES it in the same transaction (issue #108), which belongs here for
+        // the same reason the exception itself does. A soft-deleted environment KEEPS
+        // answering the verify endpoint -- that is why the off switch must not be fenced
+        // -- so a consumer mirroring which environments are armed has to learn about the
+        // disarm precisely in this case. An event that fired only for LIVE environments
+        // would go silent on the one state where the oracle outlives the environment,
+        // which is the surprising case rather than the ignorable one.
+        //
+        // Recorded exactly, like its two neighbours, so this stays an instrument: a
+        // producer quietly dropped from the disarm leaves this at zero and fails here,
+        // and a write that starts announcing something ELSE shows up as an unexpected
+        // row rather than being absorbed by a tolerance.
+        ("outbox_messages".to_owned(), 1),
     ])
 }
 

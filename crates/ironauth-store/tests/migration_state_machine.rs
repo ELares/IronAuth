@@ -894,3 +894,254 @@ async fn a_schema_migration_job_wrapped_in_the_machine_blocks_on_failed_identiti
     let named: HashSet<String> = offenders.into_iter().map(|o| o.subject).collect();
     assert_eq!(named, failed, "the API names exactly the failed identities");
 }
+
+/// Claim the one webhook event outstanding in `scope`, completing it so the ordering key is
+/// released for the next.
+async fn claim_one_event(db: &TestDatabase, env: &Env, scope: Scope) -> serde_json::Value {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "expected exactly one queued event");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().next().expect("one message").payload
+}
+
+/// A run's acceptance and its transitions are distinct types.
+///
+/// The create announces the run BEGINNING, not its outcome, which is not knowable when the
+/// request returns. The transition carries the state it moved TO -- one type with a state
+/// rather than one per edge, so the state machine can gain a state without minting a new event
+/// type and making a purely internal addition a breaking registry change.
+///
+/// No counts on either: an import's progress belongs to the run resource an operator polls,
+/// and a snapshot on the wire would publish a number that is stale before it is delivered. The
+/// test asserts the declared totals are absent.
+#[tokio::test]
+async fn a_runs_acceptance_and_its_transitions_are_distinct_types() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let run = MigrationRunId::generate(&env, &scope);
+    let run_text = run.to_string();
+
+    let created = ironauth_store::event_catalog::envelope(
+        "evt_import_created",
+        "identity_import.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "migration_run_id": run_text }),
+    )
+    .expect("identity_import.created is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(
+            actor(db.store(), &env, scope),
+            CorrelationId::generate(&env),
+        )
+        .migration_runs()
+        .create_with_id_with_event(
+            &env,
+            &run,
+            NewMigrationRun {
+                kind: MigrationKind::BulkImport,
+                source_total: 4242,
+                backfill_expected: 0,
+                subject_ref: None,
+            },
+            NOW_MICROS,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_import_created",
+                subject: &run_text,
+                envelope: &created,
+            }),
+        )
+        .await
+        .expect("create run with event");
+
+    let first = claim_one_event(&db, &env, scope).await;
+    assert_eq!(first["type"], "identity_import.created");
+    assert_eq!(first["payload"]["migration_run_id"], run_text);
+    ironauth_store::event_catalog::validate_event(&first)
+        .expect("the envelope validates against the registry the fan-out enforces");
+    assert!(
+        !first.to_string().contains("4242"),
+        "the event published the declared total, which is stale before delivery: {first}"
+    );
+
+    let moved = ironauth_store::event_catalog::envelope(
+        "evt_import_moved",
+        "identity_import.state_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({
+            "migration_run_id": run_text,
+            "state": MigrationState::Validating.as_str(),
+        }),
+    )
+    .expect("identity_import.state_changed is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(
+            actor(db.store(), &env, scope),
+            CorrelationId::generate(&env),
+        )
+        .migration_runs()
+        .transition_with_event(
+            &env,
+            &run,
+            MigrationState::Validating,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_import_moved",
+                subject: &run_text,
+                envelope: &moved,
+            }),
+        )
+        .await
+        .expect("transition with event");
+
+    let second = claim_one_event(&db, &env, scope).await;
+    assert_eq!(
+        second["type"], "identity_import.state_changed",
+        "a transition must NOT be announced as an acceptance"
+    );
+    assert_eq!(
+        second["payload"]["state"],
+        MigrationState::Validating.as_str(),
+        "the event must carry the state the transition WROTE, not a fixed value"
+    );
+    ironauth_store::event_catalog::validate_event(&second)
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Abandoning a run announces the SAME type every other transition does, and a refused
+/// abandon announces nothing.
+///
+/// One type carrying a state, not one per edge: that is the registry's shape, and it exists
+/// so the state machine can gain an edge without every consumer subscribing to a new type. An
+/// abandon is an edge like any other, so it reuses it.
+///
+/// The second half is the guard. A terminal run refuses the transition, and the refusal comes
+/// from inside the audited write -- the same transaction the enqueue lives in -- so the roll
+/// back takes the event with it. A consumer must not be told a run was abandoned when the
+/// state machine said no.
+#[tokio::test]
+async fn abandoning_a_run_announces_the_state_change_and_a_refused_abandon_does_not() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x5e);
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+
+    let run = create_run(store, &env, scope, MigrationKind::BulkImport, 100, 0).await;
+    drive_to_running(store, &env, scope, &run).await;
+    let run_text = run.to_string();
+
+    let announce = |event_id: &str, at: i64| {
+        ironauth_store::event_catalog::envelope(
+            event_id,
+            "identity_import.state_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            at,
+            &serde_json::json!({
+                "migration_run_id": run_text,
+                "state": MigrationState::Abandoned.as_str(),
+            }),
+        )
+        .expect("identity_import.state_changed is registered")
+    };
+
+    let first = announce("evt_run_abandoned", 1);
+    store
+        .scoped(scope)
+        .acting(actor(store, &env, scope), CorrelationId::generate(&env))
+        .migration_runs()
+        .abandon_with_event(
+            &env,
+            &run,
+            "source export corrupted; restarting from scratch",
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_run_abandoned",
+                subject: &run_text,
+                envelope: &first,
+            }),
+        )
+        .await
+        .expect("abandon");
+
+    let announced = claim_one_event(&db, &env, scope).await;
+    assert_eq!(
+        announced["type"], "identity_import.state_changed",
+        "an abandon is a state change like any other; a type of its own would make a purely \
+         internal edge a breaking registry addition"
+    );
+    assert_eq!(
+        announced["payload"]["state"],
+        MigrationState::Abandoned.as_str()
+    );
+    ironauth_store::event_catalog::validate_event(&announced)
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // The run is now terminal, so a second abandon is refused from inside the audited write
+    // and rolls the enqueue back with it.
+    let repeat = announce("evt_run_abandoned_again", 2);
+    let error = store
+        .scoped(scope)
+        .acting(actor(store, &env, scope), CorrelationId::generate(&env))
+        .migration_runs()
+        .abandon_with_event(
+            &env,
+            &run,
+            "a second attempt",
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_run_abandoned_again",
+                subject: &run_text,
+                envelope: &repeat,
+            }),
+        )
+        .await
+        .expect_err("a terminal run refuses further transitions");
+    assert!(
+        matches!(error, StoreError::IllegalMigrationTransition { .. }),
+        "got {error:?}"
+    );
+
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert!(
+        claimed.is_empty(),
+        "a refused transition must announce nothing: {claimed:?}"
+    );
+}

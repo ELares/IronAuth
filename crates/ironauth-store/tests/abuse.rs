@@ -469,3 +469,252 @@ async fn expired_pow_challenges_are_reclaimed_on_the_issue_path_and_live_ones_ar
         "the previously-live challenge is reclaimed only after it expires"
     );
 }
+
+/// Claim and complete everything queued for the webhook fan-out in this scope.
+async fn queued_events(db: &TestDatabase, env: &Env, scope: Scope) -> Vec<serde_json::Value> {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}
+
+/// Placing and lifting a ban emit distinct types, carrying no subject and no reason, and a
+/// lift that matched nothing announces nothing.
+///
+/// A ban is a security mutation, so a consumer mirroring blocks needs both halves and must
+/// not read a lift as a no-op. What it must NOT get is the subject: an IP, a canonical login
+/// identifier, or an account, the same class the identifier events already withhold, and an
+/// event reaches a wider audience than the management surface that returns it. The operator's
+/// free-text reason is withheld for the same reason.
+///
+/// The create carries the minted id; the LIFT does not, because a lift is addressed by
+/// (subject, path) and its producer never learns which row matched. The test asserts that
+/// absence, so a later change that reads the id back out of the write fails here.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn placing_and_lifting_a_ban_emit_distinct_types() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = AbuseSubject {
+        kind: ironauth_store::AbuseSubjectKind::Identifier,
+        value: "ada@events.test".to_owned(),
+    };
+    let id = ironauth_store::AbuseBanId::generate(&env, &scope);
+    let expires_at = now_micros(&env) + 3_600_000_000;
+
+    let created = ironauth_store::event_catalog::envelope(
+        "evt_ban_created",
+        "ban.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "ban_id": id.to_string(),
+            "subject_kind": "identifier",
+            "auth_path": "password",
+            "expires_at_unix_ms": expires_at / 1000,
+        }),
+    )
+    .expect("ban.created is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(test_actor(), CorrelationId::generate(&env))
+        .abuse()
+        .ban_with_event(
+            &env,
+            ironauth_store::NewBan {
+                id: &id,
+                subject: &subject,
+                auth_path: AuthPath::Password,
+                reason: "operator suspects credential stuffing from ada@events.test",
+                expires_at_unix_micros: Some(expires_at),
+            },
+            now_micros(&env),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_ban_created",
+                subject: "identifier:password",
+                envelope: &created,
+            }),
+        )
+        .await
+        .expect("place ban");
+
+    let placed = queued_events(&db, &env, scope).await;
+    assert_eq!(placed.len(), 1, "placing announced {placed:?}");
+    assert_eq!(placed[0]["type"], "ban.created");
+    assert_eq!(placed[0]["payload"]["ban_id"], id.to_string());
+    assert_eq!(placed[0]["payload"]["subject_kind"], "identifier");
+    assert_eq!(placed[0]["payload"]["auth_path"], "password");
+    let rendered = serde_json::to_string(&placed[0]).expect("json");
+    assert!(
+        !rendered.contains("ada@events.test"),
+        "the ban SUBJECT reached the wire: {rendered}"
+    );
+    assert!(
+        !rendered.contains("credential stuffing"),
+        "the operator's free-text reason reached the wire: {rendered}"
+    );
+
+    let lifted_envelope = ironauth_store::event_catalog::envelope(
+        "evt_ban_lifted",
+        "ban.lifted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "subject_kind": "identifier", "auth_path": "password" }),
+    )
+    .expect("ban.lifted is registered");
+
+    let lifted = db
+        .store()
+        .scoped(scope)
+        .acting(test_actor(), CorrelationId::generate(&env))
+        .abuse()
+        .lift_with_event(
+            &env,
+            &subject,
+            AuthPath::Password,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_ban_lifted",
+                subject: "identifier:password",
+                envelope: &lifted_envelope,
+            }),
+        )
+        .await
+        .expect("lift");
+    assert!(lifted, "the first lift removed the ban");
+
+    let released = queued_events(&db, &env, scope).await;
+    assert_eq!(released.len(), 1, "lifting announced {released:?}");
+    assert_eq!(
+        released[0]["type"], "ban.lifted",
+        "a lift announced as a placement, or not at all, leaves a consumer blocking a \
+         subject an operator released"
+    );
+    assert!(
+        released[0]["payload"].get("ban_id").is_none(),
+        "a lift is addressed by (subject, path) and never learns which row matched, so an id \
+         here could only have been read back out of the write: {released:?}"
+    );
+
+    // The no-op branch returns before the audited write the enqueue lives inside, so a
+    // repeat lift announces nothing: a consumer must not see a release that did not happen.
+    let repeat_envelope = ironauth_store::event_catalog::envelope(
+        "evt_ban_lifted_again",
+        "ban.lifted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        3,
+        &serde_json::json!({ "subject_kind": "identifier", "auth_path": "password" }),
+    )
+    .expect("ban.lifted is registered");
+    let again = db
+        .store()
+        .scoped(scope)
+        .acting(test_actor(), CorrelationId::generate(&env))
+        .abuse()
+        .lift_with_event(
+            &env,
+            &subject,
+            AuthPath::Password,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_ban_lifted_again",
+                subject: "identifier:password",
+                envelope: &repeat_envelope,
+            }),
+        )
+        .await
+        .expect("repeat lift");
+    assert!(!again, "the repeat lift matched nothing");
+    let quiet = queued_events(&db, &env, scope).await;
+    assert!(
+        quiet.is_empty(),
+        "a lift that matched nothing must announce nothing: {quiet:?}"
+    );
+}
+
+/// A producer that emits an OFF-SCHEMA payload fails the test that exercised it
+/// (issue #108 criterion 1).
+///
+/// The fan-out validates every event before delivery, which is the right place at run time
+/// but the wrong place to LEARN about it: its failure is a log line and a permanent consumer
+/// error, discovered by whoever watches deliveries, long after the producer that built the
+/// envelope went out of scope.
+///
+/// Under the `testing` feature the same check runs inside the producer's own transaction, so
+/// this is what the criterion means by "fails the build". The envelope below declares a
+/// registered type and then violates its schema -- `ban.created` requires `ban_id`, and this
+/// omits it -- which is exactly the shape a producer edited without its schema produces.
+#[tokio::test]
+#[should_panic(expected = "does not validate against the registry")]
+async fn a_producer_emitting_an_off_schema_payload_fails_the_test_that_exercised_it() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = AbuseSubject {
+        kind: ironauth_store::AbuseSubjectKind::Identifier,
+        value: "schema@events.test".to_owned(),
+    };
+    let id = ironauth_store::AbuseBanId::generate(&env, &scope);
+
+    // Built by hand rather than through `event_catalog::envelope`, because that constructor
+    // VALIDATES and would refuse this -- which is the point: the constructor is the guard a
+    // producer is supposed to go through, and this test is about what happens when an
+    // envelope reaches the enqueue without having passed one.
+    let invalid = serde_json::json!({
+        "id": "evt_off_schema",
+        "type": "ban.created",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        // `ban_id` is REQUIRED by the registered schema and is missing.
+        "payload": { "subject_kind": "identifier", "auth_path": "password" },
+    });
+
+    db.store()
+        .scoped(scope)
+        .acting(test_actor(), CorrelationId::generate(&env))
+        .abuse()
+        .ban_with_event(
+            &env,
+            ironauth_store::NewBan {
+                id: &id,
+                subject: &subject,
+                auth_path: AuthPath::Password,
+                reason: "schema check",
+                expires_at_unix_micros: None,
+            },
+            now_micros(&env),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_off_schema",
+                subject: "identifier:password",
+                envelope: &invalid,
+            }),
+        )
+        .await
+        .expect("unreachable: the enqueue panics before this resolves");
+}

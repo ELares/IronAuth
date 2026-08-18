@@ -174,12 +174,18 @@ pub async fn set_step_up_policy(
     // its own id), so returning it would force either a resolved write or a second
     // transaction. The operator reads the policy back through the list endpoint, which is
     // the same shape `applyIdentifierUniqueness` uses.
+    let pending = step_up_policy_event(
+        &state,
+        scope,
+        &scope_token,
+        Some((request.min_acr.as_deref(), request.max_auth_age_secs)),
+    );
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .scope_step_up_policies()
-        .set(
+        .set_with_event(
             state.env(),
             &scope_token,
             request.min_acr.as_deref(),
@@ -191,6 +197,10 @@ pub async fn set_step_up_policy(
                 response_status: 204,
                 response_body: "",
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     Ok(no_content())
@@ -230,12 +240,68 @@ pub async fn remove_step_up_policy(
     // No Idempotency-Key: DELETE is the idempotent removal, as it is on every other
     // delete route here. The store writes its audit row either way, because the
     // management action was attempted whether or not a policy matched.
+    let pending = step_up_policy_event(&state, scope, &scope_token, None);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .scope_step_up_policies()
-        .remove(state.env(), &scope_token)
+        .remove_with_event(
+            state.env(),
+            &scope_token,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event a scope step-up policy change emits (issue #108).
+///
+/// `requirement` present means the policy was SET; absent means it was REMOVED. Removal is its
+/// own type because it is a RELAXATION -- the scope no longer demands a step-up -- and a
+/// consumer must not read "policy removed" as "policy unchanged".
+///
+/// Each half of the requirement is OMITTED when unset rather than sent as a sentinel, matching
+/// the rule the subscription, reparent and auto-link payloads set: a policy may constrain the
+/// ACR, the auth age, or both.
+fn step_up_policy_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    scope_token: &str,
+    requirement: Option<(Option<&str>, Option<i64>)>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let (event_type, payload) = match requirement {
+        Some((min_acr, max_auth_age_secs)) => {
+            let mut payload = serde_json::json!({ "scope_token": scope_token });
+            if let Some(acr) = min_acr {
+                payload["min_acr"] = serde_json::json!(acr);
+            }
+            if let Some(age) = max_auth_age_secs {
+                payload["max_auth_age_secs"] = serde_json::json!(age);
+            }
+            ("step_up_policy.set", payload)
+        }
+        None => (
+            "step_up_policy.removed",
+            serde_json::json!({ "scope_token": scope_token }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The SCOPE TOKEN is the subject: successive policy edits to one scope stay ordered.
+        subject: scope_token.to_owned(),
+        envelope,
+    })
 }

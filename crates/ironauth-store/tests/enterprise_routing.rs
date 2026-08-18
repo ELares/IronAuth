@@ -881,3 +881,134 @@ async fn disabling_the_connection_stops_its_domain_routing() {
          off locks those users out instead. Got {routed:?}"
     );
 }
+
+/// Claim the one webhook event outstanding in `scope`, completing it so the ordering key is
+/// released for the next.
+async fn claim_one_event(db: &TestDatabase, env: &Env, scope: Scope) -> serde_json::Value {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "expected exactly one queued event");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().next().expect("one message").payload
+}
+
+/// Creating a rule announces where it ROUTES; verifying its domain announces the gate.
+///
+/// A routing rule decides which UPSTREAM a login is sent to, so a consumer mirroring
+/// federation topology acts on both. The create carries the org connection because the rule
+/// alone does not say where it routes.
+///
+/// Domain verification is the GATE on the rule taking effect -- an unverified domain must not
+/// silently route anyone's login to an upstream. BOTH directions are asserted, because LOSING
+/// verification is what stops a rule routing, and a consumer must act on that as much as on
+/// gaining it.
+#[tokio::test]
+async fn creating_a_rule_and_verifying_its_domain_emit_distinct_types() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let ocn_id = seed_binding(&db, &env, scope).await;
+    let rule_id = RoutingRuleId::generate(&env, &scope);
+    let subject = rule_id.to_string();
+
+    let created = ironauth_store::event_catalog::envelope(
+        "evt_rule_created",
+        "routing_rule.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "routing_rule_id": subject,
+            "org_connection_id": ocn_id.to_string(),
+        }),
+    )
+    .expect("routing_rule.created is registered");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .routing_rules()
+        .create_with_event(
+            &env,
+            &rule_id,
+            1_000_000,
+            NewRoutingRule {
+                selector: RoutingSelector::Domain(ROUTED_DOMAIN),
+                org_connection_id: &ocn_id,
+                priority: 0,
+                enabled: true,
+            },
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_rule_created",
+                subject: &subject,
+                envelope: &created,
+            }),
+        )
+        .await
+        .expect("create domain rule");
+
+    let first = claim_one_event(&db, &env, scope).await;
+    assert_eq!(first["type"], "routing_rule.created");
+    assert_eq!(first["payload"]["org_connection_id"], ocn_id.to_string());
+    ironauth_store::event_catalog::validate_event(&first)
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // BOTH directions of the gate.
+    for (verified, event_id) in [
+        (true, "evt_domain_verified"),
+        (false, "evt_domain_unverified"),
+    ] {
+        let envelope = ironauth_store::event_catalog::envelope(
+            event_id,
+            "routing_rule.domain_verification_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            2,
+            &serde_json::json!({ "routing_rule_id": subject, "verified": verified }),
+        )
+        .expect("routing_rule.domain_verification_changed is registered");
+
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .routing_rules()
+            .record_domain_verification_with_event(
+                &env,
+                &rule_id,
+                verified,
+                Some(&ironauth_store::DomainEvent {
+                    id: event_id,
+                    subject: &subject,
+                    envelope: &envelope,
+                }),
+            )
+            .await
+            .expect("record verification");
+
+        let event = claim_one_event(&db, &env, scope).await;
+        assert_eq!(event["type"], "routing_rule.domain_verification_changed");
+        assert_eq!(
+            event["payload"]["verified"], verified,
+            "the event must carry the verdict the write STORED, not a fixed value"
+        );
+        ironauth_store::event_catalog::validate_event(&event)
+            .expect("the envelope validates against the registry the fan-out enforces");
+    }
+}

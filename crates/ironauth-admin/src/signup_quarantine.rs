@@ -215,12 +215,21 @@ pub async fn approve_signup_quarantine(
         response_status: 200,
         response_body: &body_string,
     };
+    let pending = quarantine_event(&state, scope, &subject, Some("approved"), None);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .signup_quarantines()
-        .approve(state.env(), &subject, Some(write))
+        .approve_with_event(
+            state.env(),
+            &subject,
+            Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
     match result {
         Ok(()) => Ok(json(StatusCode::OK, body_string)),
@@ -287,12 +296,21 @@ pub async fn reject_signup_quarantine(
         response_status: 200,
         response_body: &body_string,
     };
+    let pending = quarantine_event(&state, scope, &subject, Some("rejected"), None);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .signup_quarantines()
-        .reject(state.env(), &subject, Some(write))
+        .reject_with_event(
+            state.env(),
+            &subject,
+            Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
     match result {
         Ok(()) => Ok(json(StatusCode::OK, body_string)),
@@ -401,12 +419,28 @@ pub async fn extend_signup_quarantine(
         response_status: 200,
         response_body: &body_string,
     };
+    let pending = quarantine_event(
+        &state,
+        scope,
+        &subject,
+        None,
+        Some(quarantined_until_micros),
+    );
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .signup_quarantines()
-        .extend(state.env(), &subject, quarantined_until_micros, Some(write))
+        .extend_with_event(
+            state.env(),
+            &subject,
+            quarantined_until_micros,
+            Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
     match result {
         Ok(()) => Ok(json(StatusCode::OK, body_string)),
@@ -415,4 +449,52 @@ pub async fn extend_signup_quarantine(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// The event a signup-quarantine review emits (issue #108).
+///
+/// `decision` present means the review RESOLVED; `until` present means the window MOVED. They
+/// are separate types on purpose: an extension resolves nothing, so a consumer that treated it
+/// as a decision would admit or refuse someone still under review.
+///
+/// Approve and reject share one type carrying the decision, because they are the same review
+/// reaching opposite conclusions over one subject -- a consumer mirroring "may this person
+/// sign in" reads one field rather than correlating two subscriptions.
+fn quarantine_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    subject: &ironauth_store::UserId,
+    decision: Option<&str>,
+    quarantined_until_micros: Option<i64>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let user = subject.to_string();
+    let (event_type, payload) = match (decision, quarantined_until_micros) {
+        (Some(decision), _) => (
+            "signup_quarantine.resolved",
+            serde_json::json!({ "user_id": user, "decision": decision }),
+        ),
+        (None, Some(until)) => (
+            "signup_quarantine.extended",
+            serde_json::json!({
+                "user_id": user,
+                "quarantined_until_unix_ms": until / 1000,
+            }),
+        ),
+        (None, None) => return None,
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The SUBJECT is the subject: successive reviews of one person stay ordered.
+        subject: user,
+        envelope,
+    })
 }

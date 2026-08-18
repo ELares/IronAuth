@@ -339,12 +339,21 @@ pub async fn set_client_allowed_scopes(
         refuse_unmatchable_entries(entries)?;
     }
 
+    let pending = allowed_scopes_event(&state, scope, &id, allowed_scopes.is_some());
     state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .client_scope_policies(scope)
-        .set(state.env(), &id, allowed_scopes.as_deref())
+        .set_with_event(
+            state.env(),
+            &id,
+            allowed_scopes.as_deref(),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
 
     // Re-read through the SAME address, so the response can only ever describe a
@@ -354,4 +363,36 @@ pub async fn set_client_allowed_scopes(
     let body = serde_json::to_string(&ClientAllowedScopesView::new(id.to_string(), updated))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
+}
+
+/// The event a per-client scope-allowlist write emits (issue #108).
+///
+/// Whether the client is RESTRICTED, not which scopes it may request. The allowlist itself is
+/// config a consumer re-reads through the authorized surface; what it cannot re-derive is
+/// that the restriction was turned on or off at all.
+///
+/// An EMPTY allowlist counts as restricted, and maximally so: it is a real stored value,
+/// distinct from the NULL clear, and a consumer that conflated the two would read the most
+/// restrictive client in the environment as the least.
+fn allowed_scopes_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    client_id: &ironauth_store::ClientId,
+    restricted: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = client_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "client.allowed_scopes_set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "client_id": subject, "restricted": restricted }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

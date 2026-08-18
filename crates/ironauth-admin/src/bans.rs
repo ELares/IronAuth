@@ -259,12 +259,13 @@ pub async fn create_ban(
         created_at_unix_ms: now / 1000,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    let pending = ban_event(&state, scope, kind, path, Some((&id.to_string(), expires)));
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .abuse()
-        .ban(
+        .ban_with_event(
             state.env(),
             NewBan {
                 id: &id,
@@ -281,6 +282,10 @@ pub async fn create_ban(
                 response_status: 201,
                 response_body: &body_string,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
     match result {
@@ -358,12 +363,13 @@ pub async fn lift_ban(
         return Ok(replay);
     }
     let render = |lifted: &bool| serde_json::to_string(&LiftBanView { lifted: *lifted });
+    let pending = ban_event(&state, scope, kind, path, None);
     let lifted = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .abuse()
-        .lift(
+        .lift_with_event(
             state.env(),
             &subject,
             path,
@@ -374,6 +380,10 @@ pub async fn lift_ban(
                 response_status: 200,
                 response_body: &render,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
     let view = LiftBanView { lifted };
@@ -430,4 +440,64 @@ pub async fn list_bans(
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
+}
+
+/// The event a ban placement or lift emits (issue #108).
+///
+/// `minted` present means a CREATE, carrying the id this handler just minted and the expiry
+/// it computed; absent means a LIFT, which is addressed by (subject, path) and never learns
+/// which row matched. That asymmetry is the point: a producer puts on the wire what it can
+/// honestly know at emit time, and nothing it would have to read back out of the write.
+///
+/// The subject VALUE never travels, on either half. It is an IP, a canonical login
+/// identifier, or an account -- the same class the `user.identifier_*` types already withhold
+/// -- and an event reaches a wider audience than the management surface that returns it. So
+/// does the operator's free-text `reason`, which is prose written ABOUT a person. The KIND
+/// and the auth path say which block list changed; the authorized list surface says the rest.
+///
+/// Both halves take the (kind, path) pair as the ordering key, so a placement and a lift on
+/// one block list cannot be delivered out of order.
+fn ban_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    kind: AbuseSubjectKind,
+    path: AuthPath,
+    minted: Option<(&str, Option<i64>)>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let (event_type, payload) = match minted {
+        Some((ban_id, expires)) => {
+            let mut payload = serde_json::json!({
+                "ban_id": ban_id,
+                "subject_kind": kind.as_str(),
+                "auth_path": path.as_str(),
+            });
+            // OMITTED rather than sent as a sentinel: a permanent ban has no expiry, and a
+            // consumer must not read an invented one as a scheduled release.
+            if let Some(expires) = expires {
+                payload["expires_at_unix_ms"] = serde_json::json!(expires / 1000);
+            }
+            ("ban.created", payload)
+        }
+        None => (
+            "ban.lifted",
+            serde_json::json!({
+                "subject_kind": kind.as_str(),
+                "auth_path": path.as_str(),
+            }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: format!("{}:{}", kind.as_str(), path.as_str()),
+        envelope,
+    })
 }

@@ -33,12 +33,33 @@
       "payload_schema_version",
       "occurred_at_unix_ms",
       "tenant_id",
-      "environment_id",
       "payload"
     ],
     "type": "object"
   },
   "event_types": [
+    {
+      "domain": "admin_consent",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "granted_scope": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "admin_consent.granted"
+    },
     {
       "domain": "admin_consent",
       "payload_schema": {
@@ -70,6 +91,29 @@
           "api_key_id": {
             "minLength": 1,
             "type": "string"
+          },
+          "owner_kind": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "api_key_id",
+          "owner_kind"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "api_key.created"
+    },
+    {
+      "domain": "api_key",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "api_key_id": {
+            "minLength": 1,
+            "type": "string"
           }
         },
         "required": [
@@ -79,6 +123,133 @@
       },
       "payload_schema_version": 1,
       "type": "api_key.revoked"
+    },
+    {
+      "domain": "api_key",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "created_api_key_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "revoked_api_key_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "revoked_api_key_id",
+          "created_api_key_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "api_key.rotated"
+    },
+    {
+      "domain": "ban",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "auth_path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "ban_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "expires_at_unix_ms": {
+            "type": "integer"
+          },
+          "subject_kind": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "ban_id",
+          "subject_kind",
+          "auth_path"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "ban.created"
+    },
+    {
+      "domain": "ban",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "auth_path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "subject_kind": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject_kind",
+          "auth_path"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "ban.lifted"
+    },
+    {
+      "domain": "brand",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "brand_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "brand_slug": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "brand_id",
+          "brand_slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "brand.deleted"
+    },
+    {
+      "domain": "brand",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "brand_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "brand_slug": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "is_default": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "brand_id",
+          "brand_slug",
+          "is_default"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "brand.set"
     },
     {
       "domain": "brand_asset",
@@ -109,6 +280,61 @@
       "type": "brand_asset.deleted"
     },
     {
+      "domain": "brand_asset",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "brand_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "brand_slug": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "sha256": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "brand_id",
+          "brand_slug",
+          "kind",
+          "sha256"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "brand_asset.set"
+    },
+    {
+      "domain": "client",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "restricted": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "client_id",
+          "restricted"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "client.allowed_scopes_set"
+    },
+    {
       "domain": "client",
       "payload_schema": {
         "additionalProperties": false,
@@ -125,6 +351,110 @@
       },
       "payload_schema_version": 1,
       "type": "client.deleted"
+    },
+    {
+      "domain": "client",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "client_id",
+          "required"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "client.par_requirement_changed"
+    },
+    {
+      "domain": "client",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "id_token_signed_response_alg": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id",
+          "id_token_signed_response_alg"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "client.signing_algorithm_changed"
+    },
+    {
+      "domain": "client",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "client.verified"
+    },
+    {
+      "domain": "config_promotion",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "revision": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "config_promotion.applied"
+    },
+    {
+      "domain": "connector",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "connector_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "slug": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "connector.created"
     },
     {
       "domain": "connector",
@@ -150,6 +480,132 @@
       "type": "connector.deleted"
     },
     {
+      "domain": "connector",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "connector_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "slug": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "connector.updated"
+    },
+    {
+      "domain": "consent",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "subject": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "consent.revoked"
+    },
+    {
+      "domain": "dcr_initial_access_token",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "initial_access_token_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "initial_access_token_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "dcr_initial_access_token.minted"
+    },
+    {
+      "domain": "dcr_policy",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dcr_policy_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "dcr_policy_id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "dcr_policy.created"
+    },
+    {
+      "domain": "environment",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "posture": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment.auto_link_posture_changed"
+    },
+    {
+      "domain": "environment",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "environment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment.created"
+    },
+    {
       "domain": "environment",
       "payload_schema": {
         "additionalProperties": false,
@@ -173,6 +629,60 @@
       "type": "environment.deleted"
     },
     {
+      "domain": "environment",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment.identifier_uniqueness_applied"
+    },
+    {
+      "domain": "environment_secret",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment_secret.deleted"
+    },
+    {
+      "domain": "environment_secret",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment_secret.set"
+    },
+    {
       "domain": "environment_variable",
       "payload_schema": {
         "additionalProperties": false,
@@ -189,6 +699,205 @@
       },
       "payload_schema_version": 1,
       "type": "environment_variable.deleted"
+    },
+    {
+      "domain": "environment_variable",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment_variable.set"
+    },
+    {
+      "domain": "flow_version",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "flow_version_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "journey_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "flow_version_id",
+          "journey_id",
+          "version"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "flow_version.created"
+    },
+    {
+      "domain": "flow_version",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "journey_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "journey_id",
+          "version"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "flow_version.pinned"
+    },
+    {
+      "domain": "identity_import",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "migration_run_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "migration_run_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "identity_import.created"
+    },
+    {
+      "domain": "identity_import",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "migration_run_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "state": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "migration_run_id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "identity_import.state_changed"
+    },
+    {
+      "domain": "impersonation",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "expires_at_unix_ms": {
+            "type": "integer"
+          },
+          "reason_code": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "authorization_id",
+          "user_id",
+          "reason_code",
+          "expires_at_unix_ms"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "impersonation.authorized"
+    },
+    {
+      "domain": "invitation",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "invitation_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "invitation_id",
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "invitation.created"
+    },
+    {
+      "domain": "invitation",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "invitation_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "invitation_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "invitation.resent"
+    },
+    {
+      "domain": "invitation",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "invitation_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "invitation_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "invitation.revoked"
     },
     {
       "domain": "locale_bundle",
@@ -214,6 +923,87 @@
       "type": "locale_bundle.deleted"
     },
     {
+      "domain": "locale_bundle",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tag": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "locale_bundle.set"
+    },
+    {
+      "domain": "log_stream",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "log_stream_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "sink_type": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "log_stream_id",
+          "sink_type"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "log_stream.created"
+    },
+    {
+      "domain": "log_stream",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "log_stream_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "log_stream_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "log_stream.deleted"
+    },
+    {
+      "domain": "management_key",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "management_key_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "management_key_id",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "management_key.created"
+    },
+    {
       "domain": "management_key",
       "payload_schema": {
         "additionalProperties": false,
@@ -230,6 +1020,295 @@
       },
       "payload_schema_version": 1,
       "type": "management_key.revoked"
+    },
+    {
+      "domain": "org_group",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_group_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_group.created"
+    },
+    {
+      "domain": "org_group",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_group_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_group.deleted"
+    },
+    {
+      "domain": "org_group",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_group_id",
+          "organization_id",
+          "membership_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_group.member_added"
+    },
+    {
+      "domain": "org_group",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_group_id",
+          "organization_id",
+          "membership_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_group.member_removed"
+    },
+    {
+      "domain": "org_group",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "added_user_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "org_group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "removed_user_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "total": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "org_group_id",
+          "organization_id",
+          "added_user_ids",
+          "removed_user_ids",
+          "truncated",
+          "total"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_group.membership_changed"
+    },
+    {
+      "domain": "org_group",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "parent_org_group_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_group_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_group.reparented"
+    },
+    {
+      "domain": "org_group",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_group_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_group.updated"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "organization_id",
+          "org_role_id",
+          "group_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.assigned_to_group"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "organization_id",
+          "org_role_id",
+          "membership_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.assigned_to_member"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_role_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.created"
     },
     {
       "domain": "org_role",
@@ -253,6 +1332,151 @@
       },
       "payload_schema_version": 1,
       "type": "org_role.deleted"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "permission_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "org_role_id",
+          "permission_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.permission_granted"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "permission_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "org_role_id",
+          "permission_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.permission_revoked"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "organization_id",
+          "org_role_id",
+          "group_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.unassigned_from_group"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "organization_id",
+          "org_role_id",
+          "membership_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.unassigned_from_member"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_role_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.updated"
     },
     {
       "domain": "organization",
@@ -293,7 +1517,193 @@
         "type": "object"
       },
       "payload_schema_version": 1,
+      "type": "organization.default_role_cleared"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "org_role_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.default_role_set"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
       "type": "organization.deleted"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "membership_id",
+          "organization_id",
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.member_added"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "membership_id",
+          "organization_id",
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.member_removed"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "added_user_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "removed_user_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "total": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "organization_id",
+          "added_user_ids",
+          "removed_user_ids",
+          "truncated",
+          "total"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.membership_changed"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "state": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.state_changed"
+    },
+    {
+      "domain": "permission",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "permission_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "slug": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "permission_id",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "permission.created"
     },
     {
       "domain": "permission",
@@ -319,6 +1729,188 @@
       "type": "permission.deleted"
     },
     {
+      "domain": "permission",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "permission_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "slug": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "permission_id",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "permission.updated"
+    },
+    {
+      "domain": "project_grant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "project_grant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_grant_id",
+          "client_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "project_grant.created"
+    },
+    {
+      "domain": "project_grant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "project_grant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_grant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "project_grant.withdrawn"
+    },
+    {
+      "domain": "recovery_approval",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "recovery_flow_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "recovery_flow_id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "recovery_approval.decided"
+    },
+    {
+      "domain": "resource_server",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "resource_server_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "resource_server_id",
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "resource_server.permission_claims_changed"
+    },
+    {
+      "domain": "routing_rule",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_connection_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "routing_rule_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "routing_rule_id",
+          "org_connection_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "routing_rule.created"
+    },
+    {
+      "domain": "routing_rule",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "routing_rule_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "verified": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "routing_rule_id",
+          "verified"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "routing_rule.domain_verification_changed"
+    },
+    {
+      "domain": "session",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "cause": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "session_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "cause"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "session.revoked"
+    },
+    {
       "domain": "signup_form",
       "payload_schema": {
         "additionalProperties": false,
@@ -340,6 +1932,182 @@
       },
       "payload_schema_version": 1,
       "type": "signup_form.deleted"
+    },
+    {
+      "domain": "signup_form",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "signup_form.set"
+    },
+    {
+      "domain": "signup_quarantine",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "quarantined_until_unix_ms": {
+            "type": "integer"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "quarantined_until_unix_ms"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "signup_quarantine.extended"
+    },
+    {
+      "domain": "signup_quarantine",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "signup_quarantine.resolved"
+    },
+    {
+      "domain": "sms_otp",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "allowed": {
+            "type": "boolean"
+          },
+          "country_code": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "country_code",
+          "allowed"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "sms_otp.allowlist_changed"
+    },
+    {
+      "domain": "sms_otp",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "allow_factor_downgrade": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled",
+          "allow_factor_downgrade"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "sms_otp.config_changed"
+    },
+    {
+      "domain": "step_up_policy",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "scope_token": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_token"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "step_up_policy.removed"
+    },
+    {
+      "domain": "step_up_policy",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_auth_age_secs": {
+            "type": "integer"
+          },
+          "min_acr": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "scope_token": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_token"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "step_up_policy.set"
+    },
+    {
+      "domain": "sudo",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "acr": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "actor_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "expires_at_unix_ms": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "actor_id",
+          "acr",
+          "expires_at_unix_ms"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "sudo.elevated"
     },
     {
       "domain": "tenant",
@@ -368,6 +2136,153 @@
       },
       "payload_schema_version": 1,
       "type": "tenant.created"
+    },
+    {
+      "domain": "tenant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.deleted"
+    },
+    {
+      "domain": "tenant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.purged"
+    },
+    {
+      "domain": "tenant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.restored"
+    },
+    {
+      "domain": "tenant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.resumed"
+    },
+    {
+      "domain": "tenant",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "tenant.suspended"
+    },
+    {
+      "domain": "trait_migration_job",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "job_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "trait_migration_job.created"
+    },
+    {
+      "domain": "trait_schema",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "trait_schema.version_activated"
+    },
+    {
+      "domain": "trait_schema",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "trait_schema.version_created"
     },
     {
       "domain": "user",
@@ -413,6 +2328,116 @@
       },
       "payload_schema_version": 1,
       "type": "user.deleted"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "external_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "external_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.external_id_linked"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.external_id_unlinked"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "identifier_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "identifier_type": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "identifier_id",
+          "identifier_type"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.identifier_added"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "identifier_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "identifier_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.identifier_removed"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.sessions_revoked"
     },
     {
       "domain": "user",
@@ -476,6 +2501,51 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id",
+          "active"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.active_changed"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id",
+          "url"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.created"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
           "webhook_endpoint_id": {
             "minLength": 1,
             "type": "string"
@@ -488,6 +2558,67 @@
       },
       "payload_schema_version": 1,
       "type": "webhook_endpoint.deleted"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.replay_requested"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.secret_rotated"
+    },
+    {
+      "domain": "webhook_endpoint",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "event_types": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "webhook_endpoint_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook_endpoint_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "webhook_endpoint.subscription_changed"
     }
   ]
 }

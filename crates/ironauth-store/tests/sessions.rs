@@ -1362,3 +1362,329 @@ async fn a_storm_of_session_bound_opens_never_orphans_a_family_onto_a_revoked_se
          the test is not exercising the race it claims to",
     );
 }
+
+/// Revoking a session emits `session.revoked`, carrying the CAUSE and no token.
+///
+/// The cause is the point: an operator ending a session and a session ended by a policy fence
+/// are the same row change and very different facts to a SIEM. It is the store's own
+/// `SessionEndCause`, rendered, so the wire cannot disagree with the audit row -- and the test
+/// uses a NON-default cause so a producer that hard-coded one would fail.
+///
+/// No user id, and that is a constraint rather than an omission: the revoke handler performs
+/// no pre-read by design, so nothing knows whose session it was when the envelope is built.
+#[tokio::test]
+async fn revoking_a_session_emits_the_cause_and_never_a_token() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let session = create_session(&db, &env, scope, &subject, None).await;
+    let session_subject = session.to_string();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_session_revoked",
+        "session.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "session_id": session_subject,
+            "cause": SessionEndCause::LoggedOut.as_str(),
+        }),
+    )
+    .expect("session.revoked is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke_with_event(
+            &env,
+            &session,
+            SessionEndCause::LoggedOut,
+            false,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_session_revoked",
+                subject: &session_subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("revoke with event");
+
+    let events = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(events[0]["type"], "session.revoked");
+    assert_eq!(events[0]["payload"]["session_id"], session_subject);
+    assert_eq!(
+        events[0]["payload"]["cause"],
+        SessionEndCause::LoggedOut.as_str(),
+        "the event must carry the cause the revoke was given, not a fixed one"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// A bulk revoke emits ONE event per session that actually flipped, never one per request.
+///
+/// One event per session matches what the audit trail here already does -- "one audit row per
+/// session, so the trail names every revoked session individually rather than reporting an
+/// opaque batch" -- so a consumer handles ONE type for both the single and the bulk path
+/// instead of learning a second shape and fanning a batch back out.
+///
+/// The ALREADY-REVOKED session in the middle is the point: it is a no-op, and announcing it
+/// would tell a receiver to tear down what it has already torn down. Its envelope is still
+/// SUPPLIED, so this proves the store filters on the actual flip rather than on what it was
+/// handed.
+#[tokio::test]
+async fn a_bulk_revoke_announces_only_the_sessions_that_flipped() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let first = create_session(&db, &env, scope, &subject, None).await;
+    let already = create_session(&db, &env, scope, &subject, None).await;
+    let third = create_session(&db, &env, scope, &subject, None).await;
+
+    // Revoke the middle one up front, WITHOUT an event, so it is a no-op in the batch below.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke(&env, &already, SessionEndCause::LoggedOut, false, None)
+        .await
+        .expect("pre-revoke");
+
+    let ids = vec![first, already, third];
+    let subjects: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    let envelopes: Vec<serde_json::Value> = subjects
+        .iter()
+        .map(|session| {
+            ironauth_store::event_catalog::envelope(
+                "evt_bulk",
+                "session.revoked",
+                &scope.tenant().to_string(),
+                &scope.environment().to_string(),
+                1,
+                &serde_json::json!({
+                    "session_id": session,
+                    "cause": SessionEndCause::BulkRevoked.as_str(),
+                }),
+            )
+            .expect("session.revoked is registered")
+        })
+        .collect();
+    // Distinct event ids: the outbox is unique on (scope, consumer, idempotency_key) and the
+    // key IS the event id, so a real producer mints one per emit.
+    let event_ids: Vec<String> = (0..ids.len()).map(|i| format!("evt_bulk_{i}")).collect();
+    let events: Vec<ironauth_store::DomainEvent<'_>> = (0..ids.len())
+        .map(|i| ironauth_store::DomainEvent {
+            id: &event_ids[i],
+            subject: &subjects[i],
+            envelope: &envelopes[i],
+        })
+        .collect();
+
+    let flipped = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .bulk_revoke_with_events(&env, &ids, false, None, Some(&events))
+        .await
+        .expect("bulk revoke with events");
+    assert_eq!(flipped, 2, "only the two live sessions flip");
+
+    let queued = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued.len(),
+        2,
+        "the already-revoked session is a no-op and must not be announced: {queued:?}"
+    );
+    let announced: Vec<String> = queued
+        .iter()
+        .map(|event| {
+            event["payload"]["session_id"]
+                .as_str()
+                .expect("id")
+                .to_owned()
+        })
+        .collect();
+    assert!(
+        !announced.contains(&subjects[1]),
+        "the no-op session was announced: {announced:?}"
+    );
+    for event in &queued {
+        assert_eq!(event["type"], "session.revoked");
+        ironauth_store::event_catalog::validate_event(event)
+            .expect("the envelope validates against the registry the fan-out enforces");
+    }
+}
+
+/// A misaligned envelope slice is REFUSED, not truncated.
+///
+/// `events` is positional, so a slice of the wrong length means the caller's envelopes and the
+/// sessions they describe do not correspond. Zipping or truncating would attribute one
+/// session's envelope to another -- a misattribution no later check could detect, because
+/// every envelope would still be individually valid.
+#[tokio::test]
+async fn a_bulk_revoke_refuses_an_envelope_slice_of_the_wrong_length() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let first = create_session(&db, &env, scope, &subject, None).await;
+    let second = create_session(&db, &env, scope, &subject, None).await;
+
+    let one = first.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_short",
+        "session.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "session_id": one,
+            "cause": SessionEndCause::BulkRevoked.as_str(),
+        }),
+    )
+    .expect("session.revoked is registered");
+    let events = vec![ironauth_store::DomainEvent {
+        id: "evt_short",
+        subject: &one,
+        envelope: &envelope,
+    }];
+
+    let refused = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .bulk_revoke_with_events(&env, &[first, second], false, None, Some(&events))
+        .await;
+    assert!(refused.is_err(), "a short envelope slice must be refused");
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim")
+            .is_empty(),
+        "a refused bulk revoke must announce nothing at all"
+    );
+}
+
+/// Revoking every session of a user emits ONE event naming the USER, not one per session.
+///
+/// The opposite choice from the bulk revoke, and for a reason in the code rather than a
+/// preference: this call is given only the subject, and the store discovers which sessions
+/// were live inside its own UPDATE, so nothing knows the session ids when the envelope is
+/// built. The bulk path is handed its ids and therefore emits one event each.
+///
+/// TWO live sessions, so "one event" is a real assertion rather than one that would hold for
+/// any fixture.
+#[tokio::test]
+async fn revoking_every_session_of_a_user_emits_one_event_naming_the_user() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope);
+    let subject_id = subject.to_string();
+    let _first = create_session(&db, &env, scope, &subject_id, None).await;
+    let _second = create_session(&db, &env, scope, &subject_id, None).await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_user_sessions_revoked",
+        "user.sessions_revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "user_id": subject_id }),
+    )
+    .expect("user.sessions_revoked is registered");
+
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke_all_for_user_with_event(
+            &env,
+            &subject,
+            false,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_user_sessions_revoked",
+                subject: &subject_id,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("revoke all with event");
+    assert_eq!(
+        outcome.revoked_session_ids.len(),
+        2,
+        "the fixture must have two live sessions or 'one event' proves nothing"
+    );
+
+    let events = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events.len(),
+        1,
+        "two sessions ended, but the fact is ONE user-scoped revocation: {events:?}"
+    );
+    assert_eq!(events[0]["type"], "user.sessions_revoked");
+    assert_eq!(events[0]["payload"]["user_id"], subject_id);
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

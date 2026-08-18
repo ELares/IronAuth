@@ -250,11 +250,20 @@ pub async fn set_client_signing_algorithm(
         ApiError::Unprocessable("the environment signing capability cannot be verified".to_owned())
     })?;
     let id = data_store.scoped(scope).clients().parse_id(&client_id)?;
+    let pending = signing_algorithm_event(&state, scope, &id, alg.as_jose_name());
     data_store
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .clients()
-        .set_id_token_signed_response_alg(state.env(), &id, alg.as_jose_name())
+        .set_id_token_signed_response_alg_with_event(
+            state.env(),
+            &id,
+            alg.as_jose_name(),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
 
     let view = ClientSigningAlgorithmView {
@@ -300,4 +309,41 @@ fn scope_from_path(
         .environments(state.bootstrap_operator_id(), tenant)
         .parse_id(environment_id)?;
     Ok((tenant, Scope::new(tenant, environment)))
+}
+
+/// The event a per-client id-token signing-algorithm change emits (issue #108).
+///
+/// The algorithm is what a RELYING PARTY must verify with, so a consumer that missed the
+/// change keeps verifying with the old one and rejects every token the client is now issued.
+///
+/// The JOSE name travels because it IS the fact: a short registered identifier rather than a
+/// document, and a consumer told only that something changed would have to refetch to learn
+/// the one thing this event exists to say.
+///
+/// The store's write is CHANGE-ONLY, so a same-value write announces nothing: a consumer
+/// never sees a rotation that did not happen.
+fn signing_algorithm_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    client_id: &ironauth_store::ClientId,
+    alg: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = client_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "client.signing_algorithm_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "client_id": subject,
+            "id_token_signed_response_alg": alg,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

@@ -422,7 +422,9 @@ async fn deleting_a_connector_emits_the_registered_event_with_its_slug() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "creating a connector emits nothing today, so the delete's event is unambiguous"
+        "this create passed no event, so the delete's event below is unambiguous. The \
+         un-suffixed method staying silent IS the paired-negative guarantee; it is not a \
+         claim that creating never announces"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(
@@ -527,4 +529,155 @@ async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<s
         .into_iter()
         .map(|message| message.payload)
         .collect()
+}
+
+/// Creating a connector emits `connector.created`, and NEVER the upstream client secret.
+///
+/// The secret assertion is why this matters more than most producer tests. A connector row
+/// holds an upstream CREDENTIAL, and the management read surface strips it deliberately. A
+/// webhook is a WIDER audience than that API, so the same stripping has to hold here -- and
+/// it is asserted against the rendered envelope rather than trusted from the schema, because
+/// a payload may carry fields the schema does not forbid.
+#[tokio::test]
+async fn creating_a_connector_announces_it_without_the_secret() {
+    use ironauth_store::ConnectorId;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = ConnectorId::generate(&env, &scope);
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_connector_created",
+        "connector.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "connector_id": id.to_string(), "slug": "acme-oidc" }),
+    )
+    .expect("connector.created is registered");
+    let subject = id.to_string();
+    let event = ironauth_store::DomainEvent {
+        id: "evt_connector_created",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create_with_event(
+            &env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug: "acme-oidc",
+                definition_json: &definition_json("acme-oidc"),
+                client_secret: SECRET_MARKER.as_bytes(),
+                capabilities: conservative_caps(),
+                enabled: true,
+            },
+            None,
+            Some(&event),
+        )
+        .await
+        .expect("create connector");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "connector.created");
+    assert_eq!(events[0]["payload"]["slug"], "acme-oidc");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+    assert!(
+        !events[0].to_string().contains(SECRET_MARKER),
+        "the event carried the upstream CLIENT SECRET: {}",
+        events[0]
+    );
+}
+
+/// Updating a connector is announced as an UPDATE, not as a create.
+///
+/// Two types rather than one: an update REPLACES the upstream definition of a live
+/// federation, so a consumer counting new federations would count every edit as a new one if
+/// both were `connector.created`. The seed uses the un-suffixed `create`, which emits
+/// nothing, so the only event in the queue is the update's.
+#[tokio::test]
+async fn updating_a_connector_is_announced_as_an_update_not_a_create() {
+    use ironauth_store::ConnectorId;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = ConnectorId::generate(&env, &scope);
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug: "acme-oidc",
+                definition_json: &definition_json("acme-oidc"),
+                client_secret: SECRET_MARKER.as_bytes(),
+                capabilities: conservative_caps(),
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("seed connector");
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_connector_updated",
+        "connector.updated",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "connector_id": id.to_string(), "slug": "acme-oidc" }),
+    )
+    .expect("connector.updated is registered");
+    let subject = id.to_string();
+    let event = ironauth_store::DomainEvent {
+        id: "evt_connector_updated",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .update_with_event(
+            &env,
+            &id,
+            NewConnector {
+                slug: "acme-oidc",
+                definition_json: &definition_json("acme-oidc"),
+                client_secret: SECRET_MARKER.as_bytes(),
+                capabilities: conservative_caps(),
+                enabled: false,
+            },
+            Some(&event),
+        )
+        .await
+        .expect("update connector");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the update enqueues exactly one event");
+    assert_eq!(
+        events[0]["type"], "connector.updated",
+        "an update must NOT be announced as a create"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+    assert!(
+        !events[0].to_string().contains(SECRET_MARKER),
+        "the event carried the upstream CLIENT SECRET: {}",
+        events[0]
+    );
 }

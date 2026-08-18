@@ -1271,3 +1271,124 @@ async fn a_trait_write_cannot_straddle_a_cutover() {
         .expect("restore the racer");
     }
 }
+
+/// Claim the one webhook event outstanding in `scope`, completing it so the ordering key is
+/// released for the next.
+async fn claim_one_event(db: &TestDatabase, env: &Env, scope: Scope) -> serde_json::Value {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "expected exactly one queued event");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().next().expect("one message").payload
+}
+
+/// Registering a schema version and ACTIVATING it emit distinct types.
+///
+/// The distinction is the point: creating a version changes nothing a user can observe,
+/// whereas ACTIVATING it changes how every trait in the environment is validated from that
+/// moment. A consumer that treated the two alike would apply a schema before it was in force.
+///
+/// Neither event carries the schema BODY. The registry is the source of truth for the shape
+/// and refetching it is one call; putting it on every event would make the payload unbounded
+/// and duplicate a document that can already be read.
+#[tokio::test]
+async fn registering_and_activating_a_schema_version_emit_distinct_types() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = ironauth_store::TraitSchemaId::generate(&env, &scope);
+    let subject = scope.environment().to_string();
+
+    let created = ironauth_store::event_catalog::envelope(
+        "evt_schema_created",
+        "trait_schema.version_created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "version": 7 }),
+    )
+    .expect("trait_schema.version_created is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .trait_schemas()
+        .create_version_at_with_event(
+            &env,
+            &id,
+            &schema_v2(),
+            7,
+            NOW_MICROS,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_schema_created",
+                subject: &subject,
+                envelope: &created,
+            }),
+        )
+        .await
+        .expect("register version");
+
+    let first = claim_one_event(&db, &env, scope).await;
+    assert_eq!(first["type"], "trait_schema.version_created");
+    assert_eq!(first["payload"]["version"], 7);
+    ironauth_store::event_catalog::validate_event(&first)
+        .expect("the envelope validates against the registry the fan-out enforces");
+    assert!(
+        !first.to_string().contains("properties"),
+        "the event carried the schema BODY: {first}"
+    );
+
+    let activated = ironauth_store::event_catalog::envelope(
+        "evt_schema_activated",
+        "trait_schema.version_activated",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "version": 7 }),
+    )
+    .expect("trait_schema.version_activated is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .trait_schemas()
+        .activate_version_idempotent_with_event(
+            &env,
+            7,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_schema_activated",
+                subject: &subject,
+                envelope: &activated,
+            }),
+        )
+        .await
+        .expect("activate version");
+
+    let second = claim_one_event(&db, &env, scope).await;
+    assert_eq!(
+        second["type"], "trait_schema.version_activated",
+        "an activation must NOT be announced as a registration: one changes nothing a user \
+         can observe, the other changes how every trait is validated"
+    );
+    ironauth_store::event_catalog::validate_event(&second)
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

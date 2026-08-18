@@ -283,6 +283,15 @@ pub async fn assign_org_group_role(
     // THIS organization inside the audited write transaction and BEFORE any conflict
     // reasoning, which is what keeps the 409 reachable only by a caller who can
     // already see both endpoints.
+    let pending = assignment_event(
+        &state,
+        scope,
+        &assignment_id,
+        &org_id,
+        &role,
+        &AssignmentHolder::Group(&group),
+        true,
+    );
     let result = state
         .store()
         .management()
@@ -290,7 +299,7 @@ pub async fn assign_org_group_role(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_group_roles(scope)
-        .assign(
+        .assign_with_event(
             state.env(),
             NewOrgGroupRole {
                 id: &assignment_id,
@@ -300,6 +309,10 @@ pub async fn assign_org_group_role(
             },
             created_at_micros,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -442,6 +455,15 @@ pub async fn unassign_org_group_role(
         .org_group_roles(scope)
         .get_assignment(&org_id, &group, &role)
         .await?;
+    let pending = assignment_event(
+        &state,
+        scope,
+        &assignment.id,
+        &org_id,
+        &role,
+        &AssignmentHolder::Group(&group),
+        false,
+    );
     state
         .store()
         .management()
@@ -449,7 +471,15 @@ pub async fn unassign_org_group_role(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_group_roles(scope)
-        .unassign(state.env(), &org_id, &assignment.id)
+        .unassign_with_event(
+            state.env(),
+            &org_id,
+            &assignment.id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }
@@ -542,6 +572,15 @@ pub async fn assign_org_membership_role(
         response_status: 201,
         response_body: &body_string,
     };
+    let pending = assignment_event(
+        &state,
+        scope,
+        &assignment_id,
+        &org_id,
+        &role,
+        &AssignmentHolder::Member(&membership),
+        true,
+    );
     let result = state
         .store()
         .management()
@@ -549,7 +588,7 @@ pub async fn assign_org_membership_role(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_membership_roles(scope)
-        .assign(
+        .assign_with_event(
             state.env(),
             NewOrgMembershipRole {
                 id: &assignment_id,
@@ -559,6 +598,10 @@ pub async fn assign_org_membership_role(
             },
             created_at_micros,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -698,6 +741,15 @@ pub async fn unassign_org_membership_role(
         .org_membership_roles(scope)
         .get_assignment(&org_id, &membership, &role)
         .await?;
+    let pending = assignment_event(
+        &state,
+        scope,
+        &assignment.id,
+        &org_id,
+        &role,
+        &AssignmentHolder::Member(&membership),
+        false,
+    );
     state
         .store()
         .management()
@@ -705,7 +757,15 @@ pub async fn unassign_org_membership_role(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_membership_roles(scope)
-        .unassign(state.env(), &org_id, &assignment.id)
+        .unassign_with_event(
+            state.env(),
+            &org_id,
+            &assignment.id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }
@@ -763,5 +823,83 @@ async fn require_role_assignable(
         message: "a project grant bounds which roles this organization's administrators \
                   may assign, and it does not include that role"
             .to_owned(),
+    })
+}
+
+/// WHO a role was granted to, which decides both the payload field and the event type.
+///
+/// An enum rather than two string parameters, and that is a correctness point rather than
+/// tidiness: with a `holder_field` and an `event_type` passed independently, a caller could
+/// put a `group_id` on the wire under `org_role.assigned_to_member`. Here that pairing is
+/// inexpressible -- the field name and the type are both derived from this one value.
+enum AssignmentHolder<'a> {
+    Group(&'a ironauth_store::OrgGroupId),
+    Member(&'a ironauth_store::OrgMembershipId),
+}
+
+impl AssignmentHolder<'_> {
+    /// The payload field naming this holder.
+    fn field(&self) -> &'static str {
+        match self {
+            Self::Group(_) => "group_id",
+            Self::Member(_) => "membership_id",
+        }
+    }
+
+    /// The holder's id, rendered.
+    fn id(&self) -> String {
+        match self {
+            Self::Group(id) => id.to_string(),
+            Self::Member(id) => id.to_string(),
+        }
+    }
+
+    /// The registered type for this holder and direction.
+    fn event_type(&self, granted: bool) -> &'static str {
+        match (self, granted) {
+            (Self::Group(_), true) => "org_role.assigned_to_group",
+            (Self::Group(_), false) => "org_role.unassigned_from_group",
+            (Self::Member(_), true) => "org_role.assigned_to_member",
+            (Self::Member(_), false) => "org_role.unassigned_from_member",
+        }
+    }
+}
+
+/// The event an organization role assignment or revocation emits (issue #108).
+///
+/// ONE builder for all four types, because the payload differs only in which HOLDER field it
+/// carries. The four TYPES stay separate: a grant to a GROUP and a grant to a MEMBER reach
+/// different downstream systems, and a pair distinguished by "which id is present" is the
+/// same presence-ambiguity trap the subscription payload avoids -- a consumer that forgot to
+/// branch would apply a group grant to one person.
+fn assignment_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    assignment_id: &impl std::fmt::Display,
+    organization_id: &ironauth_store::OrganizationId,
+    role_id: &ironauth_store::OrgRoleId,
+    holder: &AssignmentHolder<'_>,
+    granted: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = assignment_id.to_string();
+    let mut payload = serde_json::json!({
+        "assignment_id": subject,
+        "organization_id": organization_id.to_string(),
+        "org_role_id": role_id.to_string(),
+    });
+    payload[holder.field()] = serde_json::json!(holder.id());
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        holder.event_type(granted),
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
     })
 }

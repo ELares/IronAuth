@@ -304,16 +304,33 @@ async fn decide(
     // decision, a failed completion left an approved-but-unfinished flow the replay store
     // could not see: a retry under the same key replayed the stored 200 and never
     // re-attempted the completion, so only a FRESH key could ever finish that flow.
+    let pending = recovery_decision_event(state, scope, &flow, decision);
     let result = match decision {
         RecoveryApprovalStateView::Approved => acting
             .recovery_approvals()
-            .approve(state.env(), &flow, Some(write))
+            .approve_with_event(
+                state.env(),
+                &flow,
+                Some(write),
+                pending
+                    .as_ref()
+                    .map(crate::events::PendingEvent::domain_event)
+                    .as_ref(),
+            )
             .await
             .map(|_completed| ()),
         _ => {
             acting
                 .recovery_approvals()
-                .reject(state.env(), &flow, Some(write))
+                .reject_with_event(
+                    state.env(),
+                    &flow,
+                    Some(write),
+                    pending
+                        .as_ref()
+                        .map(crate::events::PendingEvent::domain_event)
+                        .as_ref(),
+                )
                 .await
         }
     };
@@ -324,4 +341,42 @@ async fn decide(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// The event a recovery-approval decision emits (issue #108).
+///
+/// ONE type carrying the decision: approve and reject are the same review reaching opposite
+/// conclusions, and a consumer must act on BOTH -- an approval is an account takeover if the
+/// request was fraudulent, so "someone regained access" and "someone was refused" are equally
+/// worth alerting on.
+///
+/// NO `completed` FIELD. Whether the approval also finished the recovery flow is the store's
+/// RETURN VALUE, discovered inside the write; this builds its envelope before the call and
+/// cannot know it. A field nothing can populate is worse than no field, because a consumer
+/// would read its absence as "not completed" rather than "not stated".
+fn recovery_decision_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    flow_id: &ironauth_store::RecoveryFlowId,
+    decision: RecoveryApprovalStateView,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = flow_id.to_string();
+    let rendered = match decision {
+        RecoveryApprovalStateView::Approved => "approved",
+        _ => "rejected",
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "recovery_approval.decided",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "recovery_flow_id": subject, "decision": rendered }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

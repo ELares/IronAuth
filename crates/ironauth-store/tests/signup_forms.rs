@@ -236,7 +236,9 @@ async fn deleting_a_signup_form_emits_the_registered_event() {
     assert_eq!(
         queued_events(&db, scope).await.len(),
         0,
-        "setting a form emits nothing today, so the delete's event is unambiguous"
+        "this set passed no event, so the delete's event below is unambiguous. The \
+         un-suffixed method staying silent IS the paired-negative guarantee; it is not a \
+         claim that setting never announces"
     );
 
     let envelope = ironauth_store::event_catalog::envelope(
@@ -332,4 +334,57 @@ async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<s
         .into_iter()
         .map(|message| message.payload)
         .collect()
+}
+
+/// Setting a signup form emits `signup_form.set`, addressed by CLIENT.
+///
+/// The client rather than the form id, for the reason on `locale_bundle.set`: the write is an
+/// upsert keyed on the client, and the store reuses the existing row's id, so a caller-minted
+/// id would name a row that does not exist on every overwrite.
+#[tokio::test]
+async fn setting_a_signup_form_emits_an_event_addressed_by_client() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = ClientId::generate(&env, &scope).to_string();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_signup_form_set",
+        "signup_form.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "client_id": client }),
+    )
+    .expect("signup_form.set is registered");
+    let subject = client.clone();
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_signup_form_set",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .signup_forms()
+        .set_with_event(
+            &env,
+            &SignupFormId::generate(&env, &scope),
+            1_000_000,
+            NewSignupForm {
+                client_id: &client,
+                fields_json: FIELDS,
+            },
+            Some(&domain_event),
+        )
+        .await
+        .expect("set signup form");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the set enqueues exactly one event");
+    assert_eq!(events[0]["type"], "signup_form.set");
+    assert_eq!(events[0]["payload"]["client_id"], client);
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
 }

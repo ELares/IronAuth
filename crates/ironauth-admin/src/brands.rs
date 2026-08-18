@@ -445,12 +445,13 @@ pub async fn set_brand(
 
     let created_at_micros = state.now_unix_micros();
     let id = BrandId::generate(state.env(), &scope);
+    let pending = brand_event(&state, scope, &id, &slug, Some(request.is_default));
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .brands()
-        .set(
+        .set_with_event(
             state.env(),
             &id,
             created_at_micros,
@@ -466,6 +467,10 @@ pub async fn set_brand(
                 host_pattern: request.host_pattern.as_deref(),
                 client_id: client_id.as_deref(),
             },
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
 
@@ -566,14 +571,74 @@ pub async fn delete_brand(
         .await?
         .ok_or(ApiError::NotFound)?;
     let id = BrandId::parse_in_scope(&record.id, &scope).map_err(|_| ApiError::NotFound)?;
+    let pending = brand_event(&state, scope, &id, &slug, None);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .brands()
-        .delete(state.env(), &id, &slug)
+        .delete_with_event(
+            state.env(),
+            &id,
+            &slug,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event a brand write or delete emits (issue #108).
+///
+/// `is_default` present means a SET; absent means a DELETE.
+///
+/// The id and the slug, and for a set the default flag. The tokens, the slots, and the host
+/// pattern do NOT travel: they are a config document rather than a fact, and putting a
+/// document on the wire means every consumer has to version it. `is_default` is not part of
+/// that document -- flipping it changes which brand serves a request that matched no other,
+/// which a consumer cannot learn by re-reading only the brand it was told about.
+fn brand_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    brand_id: &BrandId,
+    slug: &str,
+    is_default: Option<bool>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let (event_type, payload) = match is_default {
+        Some(is_default) => (
+            "brand.set",
+            serde_json::json!({
+                "brand_id": brand_id.to_string(),
+                "brand_slug": slug,
+                "is_default": is_default,
+            }),
+        ),
+        None => (
+            "brand.deleted",
+            serde_json::json!({
+                "brand_id": brand_id.to_string(),
+                "brand_slug": slug,
+            }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The SLUG is the subject, matching the asset events: everything about one brand,
+        // including its assets, stays ordered behind the same key.
+        subject: slug.to_owned(),
+        envelope,
+    })
 }
 
 #[cfg(test)]

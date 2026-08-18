@@ -195,12 +195,19 @@ pub async fn create_dcr_policy(
         response_status: 201,
         response_body: &body_string,
     };
+    let pending = dcr_event(
+        &state,
+        scope,
+        "dcr_policy.created",
+        &id.to_string(),
+        Some(&name),
+    );
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .dcr_policies()
-        .create(
+        .create_with_event(
             state.env(),
             &id,
             created_at_micros,
@@ -209,6 +216,10 @@ pub async fn create_dcr_policy(
                 primitives: &primitives_text,
             },
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -385,12 +396,19 @@ pub async fn create_initial_access_token(
         response_status: 200,
         response_body: &stored_body,
     };
+    let pending = dcr_event(
+        &state,
+        scope,
+        "dcr_initial_access_token.minted",
+        &id.to_string(),
+        None,
+    );
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .initial_access_tokens()
-        .mint(
+        .mint_with_event(
             state.env(),
             &id,
             created_at_micros,
@@ -401,6 +419,10 @@ pub async fn create_initial_access_token(
                 max_uses,
             },
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -523,12 +545,21 @@ pub async fn verify_dcr_client(
         response_status: 200,
         response_body: &body_string,
     };
+    let pending = dcr_event(&state, scope, "client.verified", &id.to_string(), None);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .clients()
-        .verify_dynamic_client(state.env(), &id, Some(write))
+        .verify_dynamic_client_with_event(
+            state.env(),
+            &id,
+            Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
 
     match result {
@@ -538,4 +569,48 @@ pub async fn verify_dcr_client(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// The event a dynamic-client-registration change emits (issue #108).
+///
+/// One builder for the three, whose payloads differ only in the id field's NAME and whether a
+/// display name travels with it. The field name is chosen from the event type, so a payload
+/// cannot be built under the wrong one -- the registry's `additionalProperties: false` would
+/// refuse it at the fan-out, but refusing here means the write never happens.
+///
+/// NEVER THE INITIAL ACCESS TOKEN. That token is a bearer credential which lets its holder
+/// register a client, and the mint is exactly when it is live. The id is what an operator
+/// revokes by, and it is enough.
+fn dcr_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    event_type: &str,
+    subject_id: &str,
+    name: Option<&str>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let field = match event_type {
+        "dcr_policy.created" => "dcr_policy_id",
+        "dcr_initial_access_token.minted" => "initial_access_token_id",
+        "client.verified" => "client_id",
+        _ => return None,
+    };
+    let mut payload = serde_json::json!({});
+    payload[field] = serde_json::json!(subject_id);
+    if let Some(name) = name {
+        payload["name"] = serde_json::json!(name);
+    }
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: subject_id.to_owned(),
+        envelope,
+    })
 }

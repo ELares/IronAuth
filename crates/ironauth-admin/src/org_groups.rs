@@ -308,6 +308,7 @@ pub async fn create_org_group(
         response_status: 201,
         response_body: &body_string,
     };
+    let pending = org_group_event(&state, scope, &group_id, &org_id, None, "org_group.created");
     let result = state
         .store()
         .management()
@@ -315,7 +316,7 @@ pub async fn create_org_group(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_groups(scope)
-        .create(
+        .create_with_event(
             state.env(),
             NewOrgGroup {
                 id: &group_id,
@@ -328,6 +329,10 @@ pub async fn create_org_group(
             created_at_micros,
             state.max_group_depth(),
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -516,6 +521,7 @@ pub async fn update_org_group(
         // a predicate: a group of a sibling organization matches no row and is the
         // uniform not-found. This is the store's own containment, not a check this
         // layer performs and then races; do not replace it with an id-only address.
+        let pending = org_group_event(&state, scope, &id, &org_id, None, "org_group.updated");
         state
             .store()
             .management()
@@ -523,12 +529,16 @@ pub async fn update_org_group(
             // Attribute the audit row to this organization (issue #110).
             .in_organization(org_id)
             .org_groups(scope)
-            .update(
+            .update_with_event(
                 state.env(),
                 &org_id,
                 &id,
                 display_name.as_deref(),
                 request.metadata.as_ref(),
+                pending
+                    .as_ref()
+                    .map(crate::events::PendingEvent::domain_event)
+                    .as_ref(),
             )
             .await?;
     }
@@ -603,6 +613,14 @@ pub async fn set_org_group_parent(
     // organization, so a pre-read in this layer would be both redundant and stale,
     // and an early "does the parent exist" answer here is precisely the oracle the
     // ordering exists to prevent.
+    let pending = org_group_event(
+        &state,
+        scope,
+        &id,
+        &org_id,
+        parent.as_ref(),
+        "org_group.reparented",
+    );
     state
         .store()
         .management()
@@ -610,12 +628,16 @@ pub async fn set_org_group_parent(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_groups(scope)
-        .reparent(
+        .reparent_with_event(
             state.env(),
             &org_id,
             &id,
             parent.as_ref(),
             state.max_group_depth(),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
 
@@ -673,6 +695,7 @@ pub async fn delete_org_group(
     // The organization rides into the DELETE statement as a predicate: a group of a
     // sibling organization matches no row, is the uniform not-found, and is not
     // deleted.
+    let pending = org_group_event(&state, scope, &id, &org_id, None, "org_group.deleted");
     state
         .store()
         .management()
@@ -680,7 +703,57 @@ pub async fn delete_org_group(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .org_groups(scope)
-        .delete(state.env(), &org_id, &id)
+        .delete_with_event(
+            state.env(),
+            &org_id,
+            &id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event an organization-group lifecycle change emits (issue #108).
+///
+/// ONE builder for the four types, whose payloads differ only in whether a parent is named.
+/// The group AND its organization on every one, for the reason the role types carry it: a
+/// group is scoped to one organization and a receiver keeping a per-organization view cannot
+/// file the event without knowing which.
+///
+/// `parent` is passed only by the reparent, and is OMITTED from the payload when the group
+/// becomes a ROOT -- mirroring the column, and matching the subscription payload's rule: no
+/// invented sentinel for "none".
+fn org_group_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    group_id: &ironauth_store::OrgGroupId,
+    organization_id: &ironauth_store::OrganizationId,
+    parent: Option<&ironauth_store::OrgGroupId>,
+    event_type: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = group_id.to_string();
+    let mut payload = serde_json::json!({
+        "org_group_id": subject,
+        "organization_id": organization_id.to_string(),
+    });
+    if let Some(parent) = parent {
+        payload["parent_org_group_id"] = serde_json::json!(parent.to_string());
+    }
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

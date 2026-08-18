@@ -1862,3 +1862,128 @@ async fn bind_scope(
         .await
         .expect("bind environment scope");
 }
+
+/// Reparent `group` under `parent` carrying an event, then claim and complete the one
+/// message it enqueues, returning its envelope.
+///
+/// Extracted so the test below can exercise BOTH directions without repeating the
+/// envelope-build-write-claim sequence twice; the contrast between them is the point of the
+/// test and splitting it would lose that.
+async fn reparent_announcing(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+    group: &OrgGroupId,
+    parent: Option<&OrgGroupId>,
+    event_id: &str,
+) -> serde_json::Value {
+    let subject = group.to_string();
+    let mut payload = serde_json::json!({
+        "org_group_id": subject,
+        "organization_id": org.to_string(),
+    });
+    if let Some(parent) = parent {
+        payload["parent_org_group_id"] = serde_json::json!(parent.to_string());
+    }
+    let envelope = ironauth_store::event_catalog::envelope(
+        event_id,
+        "org_group.reparented",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &payload,
+    )
+    .expect("org_group.reparented is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .org_groups(scope)
+        .reparent_with_event(
+            env,
+            org,
+            group,
+            parent,
+            DEFAULT_DEPTH,
+            Some(&ironauth_store::DomainEvent {
+                id: event_id,
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("reparent with event");
+
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "the reparent enqueues exactly one event");
+    // Completed so the next reparent is claimable: both carry the group id as ordering key.
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().next().expect("one message").payload
+}
+
+/// Reparenting a group announces the NEW parent, and omits it when the group becomes a root.
+///
+/// Its own type rather than an `org_group.updated`, and this is the group event with real
+/// consequences: reparenting moves a SUBTREE, so every role a group INHERITS can change
+/// without any grant being touched. A consumer recomputing effective permissions must act on
+/// it, and would not if it arrived as a display-name edit.
+///
+/// Both shapes are asserted. The parent field is OMITTED for a root rather than sent as a
+/// sentinel, matching the subscription payload's rule -- and a producer that always wrote the
+/// field, or never wrote it, would pass a test that exercised only one direction.
+#[tokio::test]
+async fn reparenting_a_group_announces_the_new_parent_and_omits_it_for_a_root() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let parent = create_group(&db, &env, scope, &org, "engineering", None)
+        .await
+        .expect("create parent");
+    let child = create_group(&db, &env, scope, &org, "platform", None)
+        .await
+        .expect("create child");
+
+    let under = reparent_announcing(
+        &db,
+        &env,
+        scope,
+        &org,
+        &child,
+        Some(&parent),
+        "evt_group_reparented",
+    )
+    .await;
+    assert_eq!(under["type"], "org_group.reparented");
+    assert_eq!(under["payload"]["parent_org_group_id"], parent.to_string());
+    ironauth_store::event_catalog::validate_event(&under)
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    let rooted =
+        reparent_announcing(&db, &env, scope, &org, &child, None, "evt_group_rooted").await;
+    assert!(
+        rooted["payload"].get("parent_org_group_id").is_none(),
+        "becoming a ROOT must omit the parent field, not send a sentinel: {rooted}"
+    );
+    ironauth_store::event_catalog::validate_event(&rooted)
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

@@ -855,3 +855,271 @@ async fn a_user_who_does_not_exist_is_the_uniform_not_found_for_tokens() {
         "minting a token for an absent user answered something other than not-found: {body}"
     );
 }
+
+/// Everything queued for the webhook fan-out in this scope.
+async fn queued_events(h: &Harness, scope: ironauth_store::Scope) -> Vec<Value> {
+    use std::time::Duration;
+
+    h.db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}
+
+/// Revoking an ORGANIZATION api key announces it, over the real management route.
+///
+/// `revoke_with_event` shipped with #875 and the organization-scoped handler never called it,
+/// so an operator revoking an organization credential produced an audit row and NO event
+/// while the personal-access-token path produced both. The store method was already covered;
+/// what was missing was the handler passing an event to it, which is why this test drives the
+/// HTTP route rather than the repository.
+///
+/// The SAME `api_key.revoked` type the personal path emits: an organization key and a
+/// personal one are the same credential kind under different owners, and a second type for
+/// the owner would make every consumer subscribe twice to learn one fact.
+#[tokio::test]
+async fn revoking_an_organization_api_key_announces_it() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-evt").await;
+    let (_, key_id) = issue_org_key(&h, &tenant, &environment, &org, "to be revoked").await;
+    let scope = scope_of(&tenant, &environment);
+    let management = h.create_key(&tenant, &environment, "ci", "k-mgmt").await;
+
+    // Everything the fixture's own provisioning enqueued, discarded, so the count below
+    // measures the revoke and nothing else.
+    let _ = queued_events(&h, scope).await;
+
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/api-keys/{key_id}"
+    );
+    let (status, _, body) = h.delete_as(&path, &management).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "revoke: {body}");
+
+    let events = queued_events(&h, scope).await;
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(events[0]["type"], "api_key.revoked");
+    assert_eq!(events[0]["payload"]["api_key_id"], key_id);
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Creating an organization api key announces it, WITHOUT the key.
+///
+/// The payload carries the owner kind as well as the id, because an api key is the same
+/// credential kind under three different owners and a consumer routing on "who gained a
+/// credential" cannot get that from the id alone.
+///
+/// The negative half is the important one: the event must not carry the key, its secret half,
+/// or its digest -- the digest verifies exactly as well as the key does, so shipping it to
+/// every subscriber to announce that the credential exists would BE the leak.
+#[tokio::test]
+async fn creating_an_organization_api_key_announces_it_without_the_key() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-created").await;
+    let scope = scope_of(&tenant, &environment);
+    let management = h.create_key(&tenant, &environment, "ci", "k-mgmt").await;
+    let _ = queued_events(&h, scope).await;
+
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/api-keys");
+    let (status, _, body) = h
+        .post_as(
+            &path,
+            &management,
+            "k-create-evt",
+            &serde_json::json!({ "display_name": "ci deploy" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let created = serde_json::from_str::<Value>(&body).expect("json");
+    let key_id = created["id"].as_str().expect("id").to_owned();
+    let plaintext = created["key"].as_str().expect("key").to_owned();
+
+    let events = queued_events(&h, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "api_key.created");
+    assert_eq!(events[0]["payload"]["api_key_id"], key_id);
+    assert_eq!(events[0]["payload"]["owner_kind"], "organization");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // Nothing that verifies as the credential is on the wire.
+    let rendered = events[0].to_string();
+    assert!(!rendered.contains(&plaintext), "the event carried the KEY");
+    let (_, secret) = plaintext.split_once('~').expect("delimiter");
+    assert!(
+        !rendered.contains(secret),
+        "the event carried the key's secret"
+    );
+    let digest = ironauth_store::api_key::api_key_digest(&plaintext);
+    assert!(
+        !rendered.contains(&digest),
+        "the event carried the digest, which verifies as well as the key does"
+    );
+}
+
+/// A rotation announces ONE event naming BOTH keys, not a create plus a revoke.
+///
+/// The rotation is one transaction precisely so that no window exists where both keys are
+/// live. Two events would put that window back on the wire: a consumer could not tell a real
+/// rotation from an unrelated create that happened near a revoke, and would have to infer the
+/// pairing from timing. So the count is exact, and both ids are asserted.
+#[tokio::test]
+async fn rotating_an_organization_api_key_announces_one_event_naming_both_keys() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-rotated").await;
+    let (_, old_id) = issue_org_key(&h, &tenant, &environment, &org, "to be rotated").await;
+    let scope = scope_of(&tenant, &environment);
+    let management = h.create_key(&tenant, &environment, "ci", "k-mgmt").await;
+    let _ = queued_events(&h, scope).await;
+
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/api-keys/{old_id}/rotate"
+    );
+    let (status, _, body) = h.post_as(&path, &management, "k-rotate-evt", "").await;
+    assert_eq!(status, StatusCode::CREATED, "rotate: {body}");
+    let new_id = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    assert_ne!(new_id, old_id, "a rotation issues a DIFFERENT key");
+
+    let events = queued_events(&h, scope).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "a rotation is ONE fact: two events would put the both-live window back on the wire"
+    );
+    assert_eq!(events[0]["type"], "api_key.rotated");
+    assert_eq!(events[0]["payload"]["revoked_api_key_id"], old_id);
+    assert_eq!(events[0]["payload"]["created_api_key_id"], new_id);
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Minting a personal access token announces it as `api_key.created` with owner `user`.
+///
+/// The SAME type the organization path emits: a personal access token and an organization key
+/// are the same credential kind under different owners, and a second type for the owner would
+/// make every consumer subscribe twice to learn one fact. The OWNER KIND is what tells them
+/// apart, so it is asserted here -- a producer that hard-coded "organization" would pass every
+/// other assertion in this test.
+///
+/// The token is pulled from the response and asserted ABSENT from the envelope, along with its
+/// secret half and its digest.
+#[tokio::test]
+async fn minting_a_personal_access_token_announces_it_as_a_user_owned_key() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "pat-tenant").await;
+    let user = seed_user(&h, &tenant, &environment, "pat-evt@example.test").await;
+    let scope = scope_of(&tenant, &environment);
+    let _ = queued_events(&h, scope).await;
+
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/users/{user}/personal-access-tokens"
+    );
+    let (status, _, body) = h
+        .post(
+            &base,
+            "pat-evt-create",
+            &serde_json::json!({ "display_name": "laptop" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let created = serde_json::from_str::<Value>(&body).expect("json");
+    let key_id = created["id"].as_str().expect("id").to_owned();
+    let plaintext = created["key"].as_str().expect("key").to_owned();
+
+    let events = queued_events(&h, scope).await;
+    assert_eq!(events.len(), 1, "the mint enqueues exactly one event");
+    assert_eq!(events[0]["type"], "api_key.created");
+    assert_eq!(events[0]["payload"]["api_key_id"], key_id);
+    assert_eq!(
+        events[0]["payload"]["owner_kind"], "user",
+        "a personal access token is a USER-owned key; the owner kind is what distinguishes \
+         it from the organization path, which emits the same type"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    let rendered = events[0].to_string();
+    assert!(
+        !rendered.contains(&plaintext),
+        "the event carried the TOKEN"
+    );
+    let (_, secret) = plaintext.split_once('~').expect("delimiter");
+    assert!(
+        !rendered.contains(secret),
+        "the event carried the token's secret"
+    );
+    let digest = ironauth_store::api_key::api_key_digest(&plaintext);
+    assert!(
+        !rendered.contains(&digest),
+        "the event carried the digest, which verifies as well as the token does"
+    );
+}
+
+/// A service-account key is announced as the THIRD owner of one credential kind.
+///
+/// The same `api_key.created` the organization and personal paths emit: a service-account key
+/// is a third OWNER, not a third kind, so a third set of types would make every consumer
+/// subscribe three times to learn one fact. `owner_kind` is what tells them apart, and it is
+/// asserted here -- a producer that copied "user" or "organization" from either sibling would
+/// pass every other assertion.
+#[tokio::test]
+async fn a_service_account_key_is_announced_with_its_own_owner_kind() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "sk-tenant").await;
+    let scope = scope_of(&tenant, &environment);
+    let principal = seed_service_account(&h, scope, "a machine client").await;
+    let _ = queued_events(&h, scope).await;
+
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/service-accounts/{principal}/api-keys"
+    );
+    let (status, _, body) = h
+        .post(
+            &base,
+            "sk-evt-create",
+            &serde_json::json!({ "display_name": "ci runner" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let created = serde_json::from_str::<Value>(&body).expect("json");
+    let key_id = created["id"].as_str().expect("id").to_owned();
+    let plaintext = created["key"].as_str().expect("key").to_owned();
+
+    let events = queued_events(&h, scope).await;
+    assert_eq!(events.len(), 1, "the mint enqueues exactly one event");
+    assert_eq!(events[0]["type"], "api_key.created");
+    assert_eq!(events[0]["payload"]["api_key_id"], key_id);
+    assert_eq!(
+        events[0]["payload"]["owner_kind"], "service_account",
+        "a service-account key is neither user-owned nor organization-owned; the owner kind \
+         is the only thing distinguishing the three paths, which share one type"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    let rendered = events[0].to_string();
+    assert!(!rendered.contains(&plaintext), "the event carried the KEY");
+    let digest = ironauth_store::api_key::api_key_digest(&plaintext);
+    assert!(
+        !rendered.contains(&digest),
+        "the event carried the digest, which verifies as well as the key does"
+    );
+}

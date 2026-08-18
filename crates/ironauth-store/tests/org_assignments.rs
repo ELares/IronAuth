@@ -3263,3 +3263,154 @@ async fn bind_scope(
         .await
         .expect("bind environment scope");
 }
+
+/// Every webhook-event envelope queued in `scope`.
+async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}
+
+/// Granting a role to a GROUP is announced with the group on the payload.
+///
+/// Four types rather than one pair with a nullable holder: a grant to a group and a grant to a
+/// member reach different downstream systems, and a pair distinguished by "which id is
+/// present" is the presence-ambiguity trap the subscription payload avoids. A consumer that
+/// forgot to branch would apply a GROUP grant to one person.
+#[tokio::test]
+async fn granting_a_role_to_a_group_announces_the_group() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let group = create_group(&db, &env, scope, &org, "engineers", None).await;
+    let role = create_role(&db, &env, scope, &org, "auditor").await;
+    let assignment = OrgGroupRoleId::generate(&env, &scope);
+    let subject = assignment.to_string();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_group_role_assigned",
+        "org_role.assigned_to_group",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "assignment_id": subject,
+            "organization_id": org.to_string(),
+            "org_role_id": role.to_string(),
+            "group_id": group.to_string(),
+        }),
+    )
+    .expect("org_role.assigned_to_group is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_group_roles(scope)
+        .assign_with_event(
+            &env,
+            NewOrgGroupRole {
+                id: &assignment,
+                organization_id: &org,
+                group_id: &group,
+                role_id: &role,
+            },
+            now_micros(&env),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_group_role_assigned",
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("assign with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the grant enqueues exactly one event");
+    assert_eq!(events[0]["type"], "org_role.assigned_to_group");
+    assert_eq!(events[0]["payload"]["group_id"], group.to_string());
+    assert!(
+        events[0]["payload"].get("membership_id").is_none(),
+        "a GROUP grant must not carry a membership: {}",
+        events[0]
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Revoking a role from a MEMBER is announced as a revocation, with the membership.
+///
+/// The seed uses the un-suffixed `grant_membership_role`, which emits nothing, so the only
+/// event queued is the revocation's.
+#[tokio::test]
+async fn revoking_a_role_from_a_member_announces_the_membership() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let (_user, member) = create_member(&db, &env, scope, &org, "member@example.test").await;
+    let role = create_role(&db, &env, scope, &org, "auditor").await;
+    let assignment = grant_direct_role(&db, &env, scope, &org, &member, &role)
+        .await
+        .expect("seed grant");
+    let subject = assignment.to_string();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_member_role_revoked",
+        "org_role.unassigned_from_member",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({
+            "assignment_id": subject,
+            "organization_id": org.to_string(),
+            "org_role_id": role.to_string(),
+            "membership_id": member.to_string(),
+        }),
+    )
+    .expect("org_role.unassigned_from_member is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_membership_roles(scope)
+        .unassign_with_event(
+            &env,
+            &org,
+            &assignment,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_member_role_revoked",
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("unassign with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(
+        events[0]["type"], "org_role.unassigned_from_member",
+        "a revocation must NOT be announced as a grant"
+    );
+    assert_eq!(events[0]["payload"]["membership_id"], member.to_string());
+    assert!(
+        events[0]["payload"].get("group_id").is_none(),
+        "a MEMBER revocation must not carry a group: {}",
+        events[0]
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

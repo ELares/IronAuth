@@ -12,9 +12,9 @@
 //! see a stream that simply is not there rather than one that is failing.
 
 use ironauth_env::Env;
-use ironauth_store::NewLogStream;
 use ironauth_store::log_stream::{SinkType, StreamSource, StreamStatus};
 use ironauth_store::test_support::TestDatabase;
+use ironauth_store::{CursorOrigin, NewLogStream, Scope};
 
 fn new_stream() -> NewLogStream<'static> {
     NewLogStream {
@@ -308,7 +308,13 @@ async fn a_per_organization_stream_never_sees_another_organizations_rows() {
         .store()
         .scoped(scope)
         .audit_chain()
-        .rows_after("admin_action", None, 100, Some(mine.to_string().as_str()))
+        .rows_after(
+            "admin_action",
+            None,
+            CursorOrigin::ConsumerResume,
+            100,
+            Some(mine.to_string().as_str()),
+        )
         .await
         .expect("read this organization's rows");
 
@@ -366,7 +372,13 @@ async fn a_cursor_before_the_oldest_retained_row_is_refused_with_guidance() {
         .store()
         .scoped(scope)
         .audit_chain()
-        .rows_after("admin_action", None, 100, None)
+        .rows_after(
+            "admin_action",
+            None,
+            CursorOrigin::ConsumerResume,
+            100,
+            None,
+        )
         .await
         .expect("read from the start");
     assert!(!rows.is_empty(), "the stream has rows to be read past");
@@ -379,6 +391,7 @@ async fn a_cursor_before_the_oldest_retained_row_is_refused_with_guidance() {
         .rows_after(
             "admin_action",
             Some((oldest.occurred_micros, oldest.audit_id.as_str())),
+            CursorOrigin::ConsumerResume,
             100,
             None,
         )
@@ -393,6 +406,7 @@ async fn a_cursor_before_the_oldest_retained_row_is_refused_with_guidance() {
         .rows_after(
             "admin_action",
             Some((oldest.occurred_micros - 1, "aud_pruned_away")),
+            CursorOrigin::ConsumerResume,
             100,
             None,
         )
@@ -417,6 +431,90 @@ async fn a_cursor_before_the_oldest_retained_row_is_refused_with_guidance() {
     );
 }
 
+/// The SAME below-the-oldest cursor is refused as a resume and answered as a bounded range.
+///
+/// The regression this pins: the gap check refused the dead-letter replay. `rows_after` is
+/// exclusive, so the replay derives a position just below the range's first row, and when
+/// that range began at the stream's oldest surviving row the derived position sorted below it
+/// and the read was refused -- with nothing pruned and no row missing. Two shipped tests in
+/// `log_shipper` went red on a live feature.
+///
+/// Both halves are asserted with ONE cursor value, so nothing but the origin can account for
+/// the difference in outcome. Asserting only the permissive half would pass just as well if
+/// the check had been deleted outright, which is the thing that must not happen: a consumer
+/// resuming from a pruned cursor still has to be told.
+#[tokio::test]
+async fn a_bounded_range_cursor_is_not_a_retention_gap() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // Something to read, so the outcome below is about the CURSOR and not an empty stream --
+    // an empty stream is answered as empty for either origin and would prove nothing.
+    db.store()
+        .scoped(scope)
+        .acting(
+            db.test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .clients()
+        .create(&env, "survivor-bounded")
+        .await
+        .expect("create a client");
+
+    let rows = db
+        .store()
+        .scoped(scope)
+        .audit_chain()
+        .rows_after(
+            "admin_action",
+            None,
+            CursorOrigin::ConsumerResume,
+            100,
+            None,
+        )
+        .await
+        .expect("read from the start");
+    assert!(
+        !rows.is_empty(),
+        "the stream must have rows or this proves nothing"
+    );
+
+    // Exactly what `predecessor_of` derives: the same microsecond, an empty id, which sorts
+    // below every real id and therefore below the oldest row itself.
+    let below = (rows[0].occurred_micros, "");
+
+    db.store()
+        .scoped(scope)
+        .audit_chain()
+        .rows_after(
+            "admin_action",
+            Some(below),
+            CursorOrigin::BoundedRange,
+            100,
+            None,
+        )
+        .await
+        .expect("a bounded range names no row, so no row of it can have been pruned");
+
+    let refusal = db
+        .store()
+        .scoped(scope)
+        .audit_chain()
+        .rows_after(
+            "admin_action",
+            Some(below),
+            CursorOrigin::ConsumerResume,
+            100,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(refusal, Err(ironauth_store::StoreError::RetentionGap)),
+        "the same position, claimed as a resume, still has to be refused"
+    );
+}
+
 /// An EMPTY stream reads as empty rather than as a gap.
 ///
 /// The paired negative, and it guards a real confusion: a consumer resuming against a stream
@@ -435,10 +533,142 @@ async fn a_cursor_against_an_empty_stream_is_not_a_retention_gap() {
         .rows_after(
             "a_stream_with_no_rows",
             Some((1, "aud_anything")),
+            CursorOrigin::ConsumerResume,
             100,
             None,
         )
         .await
         .expect("an empty stream is empty, not a gap");
     assert!(rows.is_empty(), "and it reads as empty: {rows:?}");
+}
+
+/// Claim the one webhook event outstanding in `scope`, completing it so the ordering key is
+/// released for the next.
+async fn claim_one_event(db: &TestDatabase, env: &Env, scope: Scope) -> serde_json::Value {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "expected exactly one queued event");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().next().expect("one message").payload
+}
+
+/// Configuring and removing a SIEM stream emit distinct types.
+///
+/// The create carries the SINK TYPE because "audit is now shipping to S3" and "audit is now
+/// shipping to an HTTP endpoint" are different facts to anyone reconciling where a tenant's
+/// audit trail goes. The delete matters more than a configuration tidy-up: it removes every
+/// DEAD LETTER the stream recorded too, so an operator watching for undelivered audit will
+/// never see those again and this event is the only notice they get.
+///
+/// The sink CREDENTIAL name is asserted absent: a stream carries the secret its deliveries
+/// authenticate with, and a webhook is a wider audience than the read surface that strips it.
+#[tokio::test]
+async fn configuring_and_removing_a_stream_emit_distinct_types() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // The id is minted by the store, so the envelope is built after the create -- which is
+    // why this uses a placeholder id and asserts on the TYPE and sink, not on the id.
+    let created_id = db
+        .control_store()
+        .scoped(scope)
+        .log_streams()
+        .create(&env, &new_stream(), None)
+        .await
+        .expect("configure a stream");
+
+    let created = ironauth_store::event_catalog::envelope(
+        "evt_stream_created",
+        "log_stream.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "log_stream_id": created_id,
+            "sink_type": SinkType::Http.as_str(),
+        }),
+    )
+    .expect("log_stream.created is registered");
+
+    // A SECOND stream, carrying an event this time.
+    let second = db
+        .control_store()
+        .scoped(scope)
+        .log_streams()
+        .create_with_event(
+            &env,
+            &new_stream(),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_stream_created",
+                subject: &created_id,
+                envelope: &created,
+            }),
+        )
+        .await
+        .expect("configure a second stream");
+
+    let created_event = claim_one_event(&db, &env, scope).await;
+    assert_eq!(created_event["type"], "log_stream.created");
+    assert_eq!(
+        created_event["payload"]["sink_type"],
+        SinkType::Http.as_str()
+    );
+    ironauth_store::event_catalog::validate_event(&created_event)
+        .expect("the envelope validates against the registry the fan-out enforces");
+    assert!(
+        !created_event.to_string().contains("collector_token"),
+        "the event named the sink CREDENTIAL: {created_event}"
+    );
+
+    let deleted = ironauth_store::event_catalog::envelope(
+        "evt_stream_deleted",
+        "log_stream.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "log_stream_id": second }),
+    )
+    .expect("log_stream.deleted is registered");
+
+    db.control_store()
+        .scoped(scope)
+        .log_streams()
+        .delete_with_event(
+            Some(&env),
+            &second,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_stream_deleted",
+                subject: &second,
+                envelope: &deleted,
+            }),
+        )
+        .await
+        .expect("remove the stream");
+
+    let after = claim_one_event(&db, &env, scope).await;
+    assert_eq!(
+        after["type"], "log_stream.deleted",
+        "a removal must NOT be announced as a configuration"
+    );
+    ironauth_store::event_catalog::validate_event(&after)
+        .expect("the envelope validates against the registry the fan-out enforces");
 }

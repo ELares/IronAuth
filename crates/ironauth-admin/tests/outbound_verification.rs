@@ -917,3 +917,108 @@ async fn the_management_half_requires_the_management_credential() {
     let (status, _h, body) = harness.get_as(&path, OPERATOR_TOKEN).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+/// Everything queued for the webhook fan-out in this scope, claimed and completed.
+async fn queued_events(harness: &Harness, scope: Scope) -> Vec<serde_json::Value> {
+    let env = Env::system();
+    let claimed = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events");
+    for message in &claimed {
+        harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}
+
+/// Arming and disarming outbound verification announce themselves, over the real routes.
+///
+/// The token is a live credential-verification oracle for an environment's whole user base,
+/// so a consumer mirroring which environments are armed has to learn both transitions. This
+/// drives the HTTP routes rather than the store because the store methods were already
+/// covered by the environment-secret tests; what is new here is these two handlers PASSING an
+/// event to them.
+///
+/// The announced payload is the secret NAME and nothing else -- no digest, no length, no
+/// prefix -- because an event reaches a wider audience than the management read surface,
+/// which will not return the value either. The test asserts the absence, not just the
+/// presence: a leak is what would make this endpoint's event worse than no event.
+///
+/// The last third is the guard: disabling an ALREADY-disabled environment is a success (204,
+/// deliberately not a 404), and a success that changed nothing must announce nothing.
+#[tokio::test]
+async fn arming_and_disarming_outbound_verification_announce_themselves() {
+    let harness = Harness::start_with_outbound_verification(TOKEN_A).await;
+    let scope = harness.outbound_scope();
+
+    // Everything the fixture's own provisioning enqueued, discarded, so the counts below
+    // are about these two routes alone.
+    let _ = queued_events(&harness, scope).await;
+
+    let (status, _h, body) = harness
+        .put(
+            &manage_path(scope),
+            &serde_json::json!({ "token": TOKEN_B }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let armed = queued_events(&harness, scope).await;
+    assert_eq!(armed.len(), 1, "arming announced {armed:?}");
+    assert_eq!(armed[0]["type"], "environment_secret.set");
+    assert_eq!(
+        armed[0]["payload"]["name"], "ironauth.outbound_verification_token",
+        "the NAME is what tells a consumer which reference to re-resolve: {armed:?}"
+    );
+    let rendered = serde_json::to_string(&armed[0]).expect("json");
+    assert!(
+        !rendered.contains(TOKEN_B) && !rendered.contains(TOKEN_A),
+        "the token itself reached the wire: {rendered}"
+    );
+    assert!(
+        armed[0]["payload"].get("value").is_none()
+            && armed[0]["payload"].get("digest").is_none()
+            && armed[0]["payload"].get("length").is_none(),
+        "nothing DERIVED from the value may travel either: a digest of a low-entropy secret \
+         is guessable and a length narrows a search: {armed:?}"
+    );
+
+    let (status, _h, body) = harness.delete(&manage_path(scope)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let disarmed = queued_events(&harness, scope).await;
+    assert_eq!(disarmed.len(), 1, "disarming announced {disarmed:?}");
+    assert_eq!(
+        disarmed[0]["type"], "environment_secret.deleted",
+        "a disarm announced as a set would leave a consumer believing the oracle is still live"
+    );
+    assert_eq!(
+        disarmed[0]["payload"]["name"],
+        "ironauth.outbound_verification_token"
+    );
+
+    // A second disable is the same 204, and changes nothing.
+    let (status, _h, body) = harness.delete(&manage_path(scope)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let again = queued_events(&harness, scope).await;
+    assert!(
+        again.is_empty(),
+        "a success that changed no row must announce nothing: {again:?}"
+    );
+}

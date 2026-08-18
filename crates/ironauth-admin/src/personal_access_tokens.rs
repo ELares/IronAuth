@@ -213,12 +213,13 @@ pub async fn create_user_personal_access_token(
     };
     let stored_body = serde_json::to_string(&stored).map_err(|_| ApiError::Internal)?;
 
+    let pending = api_key_lifecycle_event(&state, scope, &minted.id, None);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .api_keys()
-        .create(
+        .create_with_event(
             state.env(),
             NewApiKey {
                 id: &minted.id,
@@ -235,6 +236,10 @@ pub async fn create_user_personal_access_token(
                 response_status: 200,
                 response_body: &stored_body,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -393,12 +398,13 @@ pub async fn rotate_user_personal_access_token(
     };
     let stored_body = serde_json::to_string(&stored).map_err(|_| ApiError::Internal)?;
 
+    let pending = api_key_lifecycle_event(&state, scope, &minted.id, Some(&old));
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .api_keys()
-        .rotate(
+        .rotate_with_event(
             state.env(),
             &old,
             NewApiKey {
@@ -416,6 +422,10 @@ pub async fn rotate_user_personal_access_token(
                 response_status: 200,
                 response_body: &stored_body,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -444,6 +454,57 @@ fn api_key_revoked_event(
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,
         &serde_json::json!({ "api_key_id": subject }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event a personal-access-token create or rotation emits (issue #108).
+///
+/// The SAME `api_key.created` and `api_key.rotated` types the organization path emits: a
+/// personal access token and an organization key are the same credential kind under different
+/// owners, and a second pair of types for the owner would make every consumer subscribe twice
+/// to learn one fact. The OWNER KIND on the create payload is what tells them apart.
+///
+/// `revoked` present means a ROTATION, absent means a CREATE, and the type is derived from it
+/// so payload and type cannot disagree.
+///
+/// NO KEY MATERIAL and no digest: the digest verifies exactly as well as the key does.
+fn api_key_lifecycle_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    created: &ApiKeyId,
+    revoked: Option<&ApiKeyId>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let (event_type, subject, payload) = match revoked {
+        Some(old) => (
+            "api_key.rotated",
+            old.to_string(),
+            serde_json::json!({
+                "revoked_api_key_id": old.to_string(),
+                "created_api_key_id": created.to_string(),
+            }),
+        ),
+        None => (
+            "api_key.created",
+            created.to_string(),
+            serde_json::json!({
+                "api_key_id": created.to_string(),
+                "owner_kind": "user",
+            }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
     )?;
     Some(crate::events::PendingEvent {
         id,

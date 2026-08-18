@@ -39,14 +39,21 @@ silently excuse real writes, which is the failure this check exists to prevent. 
 denominator stays the full mounted write surface, and anything genuinely non-mutating is
 named in `EXEMPT` with a reason a reviewer can check.
 
-THE BASELINE IS A RATCHET. Coverage is far from complete, and a check that fails from the
-first commit gets disabled rather than fixed. So the currently-uncovered handlers are recorded
-in `producer-coverage-baseline.txt`, and this fails on:
+THE BASELINE IS A RATCHET, and it deliberately states no coverage figure. It was introduced
+while most handlers were uncovered, because a check that fails from its first commit gets
+disabled rather than fixed; the uncovered handlers went into
+`producer-coverage-baseline.txt` so the check could pass on day one and tighten from there.
+The live figure is PRINTED by this script on every run, which is the only place it cannot go
+stale. This fails on:
 
   * a handler that is uncovered and NOT in the baseline -- a NEW management write that
     announces nothing, which is the regression worth blocking; and
-  * a baseline entry that is now covered or no longer exists -- so the file shrinks as the
-    campaign lands producers and cannot rot into a permanent excuse.
+  * a baseline entry that is now covered or no longer exists -- so the file shrinks as
+    producers land and cannot rot into a permanent excuse.
+
+An EMPTY baseline is the strongest state this can be in and not a reason to delete it: with
+no entries left, the first rule alone means every management write handler must reach a
+producer, and any new one that does not fails on the pull request that adds it.
 
 Issue #108 closes when the baseline is EMPTY. The file's length is the remaining work, stated
 in the repository rather than in a status report.

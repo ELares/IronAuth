@@ -120,6 +120,42 @@ fn scope_of(tenant: &str, environment: &str) -> Scope {
     )
 }
 
+/// Discard every event the FIXTURE's own setup enqueued, so a later count measures only the
+/// write under test.
+///
+/// Provisioning a tenant is itself an audited domain write, and once `tenant.created` gained a
+/// producer (#872) it began leaving a real event in the outbox before any test had acted.
+/// Four tests here then read `[tenant.created, user.created]` where they asserted one event
+/// and failed -- on the fixture, not on the behaviour they exist to check.
+///
+/// Draining rather than relaxing the counts to `>= 1`: the exact count is what catches a
+/// producer that fires TWICE, which is the defect these assertions were written for. Setup
+/// noise has to leave, not the guarantee.
+async fn drain_setup_events(store: &ironauth_store::Store, env: &Env, scope: Scope) {
+    use std::time::Duration;
+    let drained = store
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("drain the events the fixture's own setup enqueued");
+    // COMPLETED, not merely claimed: a claimed-but-open message still counts as in-flight,
+    // and one of these tests asserts on the queue depth itself.
+    for message in drained {
+        store
+            .scoped(scope)
+            .outbox()
+            .complete(env, &message)
+            .await
+            .expect("complete a drained setup event");
+    }
+}
+
 /// Register an endpoint through the REAL management API and return `(id, secret, base)`.
 ///
 /// Registration goes over HTTP deliberately: a helper that seeded the row directly would
@@ -1113,6 +1149,8 @@ async fn queue_depth_reports_the_backlog_a_dead_letter_leaves_behind() {
     let scope = scope_of(&tenant, &environment);
     let env = Env::system();
     let store = h.store().clone();
+    // The fixture's own provisioning is an audited write that now emits events of its own.
+    drain_setup_events(&store, &env, scope).await;
     let queues = format!("/v1/tenants/{tenant}/environments/{environment}/queues");
 
     // Before: the webhook queue either is absent or reports nothing dead-lettered.
@@ -1150,13 +1188,24 @@ async fn queue_depth_reports_the_backlog_a_dead_letter_leaves_behind() {
     // The listing enumerates the consumers that HAVE rows rather than a hard-coded list,
     // so a queue this binary does not run still shows its backlog. Nothing has enqueued
     // for the replay consumer, so it is absent rather than reported as an empty row.
+    //
+    // Asserted as "the empty consumer is ABSENT" rather than "every row is the delivery
+    // consumer". The latter was a proxy that held only while nothing else had rows, and it
+    // broke the moment provisioning began emitting `tenant.created` -- failing on the
+    // fixture rather than on the property. The property itself has not changed.
+    let items = after["items"].as_array().expect("items");
     assert!(
-        after["items"]
-            .as_array()
-            .expect("items")
+        items
             .iter()
-            .all(|item| item["consumer"] == WEBHOOK_DELIVERY_CONSUMER),
-        "only queues with rows are listed: {body}"
+            .all(|item| item["consumer"] != ironauth_store::WEBHOOK_REPLAY_CONSUMER),
+        "a consumer with no rows must be absent, not reported empty: {body}"
+    );
+    // Non-vacuity: the check above passes trivially against an empty listing.
+    assert!(
+        items
+            .iter()
+            .any(|item| item["consumer"] == WEBHOOK_DELIVERY_CONSUMER),
+        "the listing must actually contain the delivery queue: {body}"
     );
 }
 
@@ -1190,6 +1239,8 @@ async fn creating_a_user_delivers_a_signed_event_to_every_active_endpoint() {
     let scope = scope_of(&tenant, &environment);
     let env = Env::system();
     let store = h.store().clone();
+    // The fixture's own provisioning is an audited write that now emits events of its own.
+    drain_setup_events(&store, &env, scope).await;
 
     // THE DOMAIN WRITE, over the real management surface.
     let (status, _, created) = h
@@ -1352,6 +1403,8 @@ async fn an_endpoint_receives_only_the_event_types_it_subscribed_to() {
     let scope = scope_of(&tenant, &environment);
     let env = Env::system();
     let store = h.store().clone();
+    // The fixture's own provisioning is an audited write that now emits events of its own.
+    drain_setup_events(&store, &env, scope).await;
 
     let (status, _, created) = h
         .post(
@@ -1438,6 +1491,8 @@ async fn an_event_outside_the_catalog_is_refused_permanently_and_reaches_no_endp
     let scope = scope_of(&tenant, &environment);
     let env = Env::system();
     let store = h.store().clone();
+    // The fixture's own provisioning is an audited write that now emits events of its own.
+    drain_setup_events(&store, &env, scope).await;
 
     // An envelope of the right SHAPE carrying a type nothing registers. Shape-valid on
     // purpose: a malformed envelope is already refused for a different reason, and this

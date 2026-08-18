@@ -291,3 +291,21 @@ opt-level = 3
 
 [profile.dev.package.rsa]
 opt-level = 3
+
+# RUSTSEC-2026-0041 (lz4_flex <= 0.11.5): decompressing invalid data can leak information
+# from uninitialized memory or a reused output buffer. It reaches this workspace
+# transitively, and ONLY transitively: ironbus-client -> ironbus-core -> lz4_flex 0.10.0.
+# Nothing here declares lz4_flex, so no bump in this repo can move it -- the requirement
+# lives in ironbus-core, which is published from a repository we own.
+#
+# Fixed AT THE SOURCE rather than ignored: ELares/IronBus#1203 bumps both crates that
+# declare it to 0.11.6, keeping the same pure-Rust feature set. This pin points at that
+# commit so cargo-deny is honestly clean here instead of carrying an advisory ignore that
+# claims a reachability nobody measured.
+#
+# TEMPORARY BY CONSTRUCTION. It comes out the moment ironbus-core publishes a version
+# carrying the bump; at that point this whole block is deleted and the ordinary version
+# requirement resolves to a patched release. Tracked by ELares/IronAuth#892.
+[patch.crates-io]
+ironbus-core = { git = "https://github.com/ELares/IronBus.git", rev = "8cb429c89b79604c1bf7291b6e92ee4b5476cfcc" }
+ironbus-proto = { git = "https://github.com/ELares/IronBus.git", rev = "8cb429c89b79604c1bf7291b6e92ee4b5476cfcc" }

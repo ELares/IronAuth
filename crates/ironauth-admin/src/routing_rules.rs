@@ -236,12 +236,13 @@ pub async fn create_routing_rule(
 
     let created_at_micros = state.now_unix_micros();
     let id = RoutingRuleId::generate(state.env(), &scope);
+    let pending = routing_rule_event(&state, scope, &id, Some(&connection.to_string()), None);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .routing_rules()
-        .create(
+        .create_with_event(
             state.env(),
             &id,
             created_at_micros,
@@ -251,6 +252,10 @@ pub async fn create_routing_rule(
                 priority: request.priority,
                 enabled: request.enabled,
             },
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
     match result {
@@ -362,12 +367,21 @@ pub async fn verify_routing_rule_domain(
     // merely quotes the token in a comment.
     let verified = published.iter().any(|record| record == &token);
 
+    let pending = routing_rule_event(&state, scope, &id, None, Some(verified));
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .routing_rules()
-        .record_domain_verification(state.env(), &id, verified)
+        .record_domain_verification_with_event(
+            state.env(),
+            &id,
+            verified,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await
         .map_err(|error| match error {
             StoreError::NotFound => ApiError::NotFound,
@@ -390,4 +404,51 @@ pub async fn verify_routing_rule_domain(
     let body = serde_json::to_string(&RoutingRuleView::from_record(updated))
         .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
+}
+
+/// The event a routing-rule change emits (issue #108).
+///
+/// `connection` present means a CREATE; `verified` present means a domain-verification
+/// change. A routing rule decides WHICH UPSTREAM a login is sent to, so a consumer mirroring
+/// federation topology acts on both.
+///
+/// The create carries the org connection because the rule alone does not say WHERE it routes.
+/// The verification carries the boolean because losing verification is what stops a rule
+/// routing -- a consumer must act on that direction as much as on gaining it.
+fn routing_rule_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    rule_id: &ironauth_store::RoutingRuleId,
+    org_connection_id: Option<&str>,
+    verified: Option<bool>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = rule_id.to_string();
+    let (event_type, payload) = match (org_connection_id, verified) {
+        (Some(connection), _) => (
+            "routing_rule.created",
+            serde_json::json!({
+                "routing_rule_id": subject,
+                "org_connection_id": connection,
+            }),
+        ),
+        (None, Some(verified)) => (
+            "routing_rule.domain_verification_changed",
+            serde_json::json!({ "routing_rule_id": subject, "verified": verified }),
+        ),
+        (None, None) => return None,
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }

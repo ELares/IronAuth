@@ -31,6 +31,41 @@ cargo run --quiet -p ironauth-store --example event-catalog > docs/events/catalo
 python3 - <<'PY'
 import json, pathlib
 doc = json.loads(pathlib.Path("docs/events/catalog.json").read_text(encoding="utf-8"))
+
+
+def example_payload(schema, event_type):
+    """A minimal instance of `schema`: every REQUIRED field, and nothing else.
+
+    DERIVED, never hand written. An example typed out beside a generated schema is the
+    defect this whole file exists to avoid: the schema stays fresh because it is
+    regenerated, the example rots because nobody regenerates prose, and a consumer reading
+    both believes the stale one. Deriving it means the example cannot disagree with the
+    contract -- if a required field is added, the example grows it in the same commit.
+
+    Only the required fields, because that is the smallest thing a producer may legally
+    emit, and it is what a consumer must be able to parse. Optional fields are visible in
+    the schema immediately above; showing them here would suggest they are always present,
+    which is the exact misreading the omit-don't-sentinel convention guards against.
+    """
+    properties = schema.get("properties", {})
+    example = {}
+    for name in schema.get("required", []):
+        spec = properties.get(name, {})
+        kind = spec.get("type")
+        if kind == "array":
+            item = spec.get("items", {}).get("type")
+            example[name] = [f"{name[:-1] if name.endswith('s') else name}_1"] if item == "string" else []
+        elif kind == "boolean":
+            example[name] = True
+        elif kind == "integer":
+            # A real-looking epoch in ms for the time-shaped fields, so a reader does not
+            # copy a placeholder that would not round trip.
+            example[name] = 1735689600000 if name.endswith("_unix_ms") else 1
+        elif kind == "object":
+            example[name] = {}
+        else:
+            example[name] = f"{name}_example"
+    return example
 types = doc["event_types"]
 domains = {}
 for entry in types:
@@ -87,6 +122,18 @@ for domain in sorted(domains):
         lines.append("")
         lines.append("```json")
         lines.append(json.dumps(entry["payload_schema"], indent=2))
+        lines.append("```")
+        lines.append("")
+        lines.append("A minimal payload, derived from the schema above: every required")
+        lines.append("field and nothing else. Optional fields are OMITTED rather than sent")
+        lines.append("as a sentinel, so an absent one means absent.")
+        lines.append("")
+        lines.append("```json")
+        lines.append(
+            json.dumps(
+                example_payload(entry["payload_schema"], entry["type"]), indent=2
+            )
+        )
         lines.append("```")
         lines.append("")
 pathlib.Path("docs/EVENTS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

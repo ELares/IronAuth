@@ -141,12 +141,13 @@ pub async fn set_client_admin_consent(
 
     let created_at_micros = state.now_unix_micros();
     let id = ClientAdminGrantId::generate(state.env(), &scope);
+    let pending = admin_consent_granted_event(&state, scope, &client_id, &scope_value);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .client_admin_grants()
-        .set(
+        .set_with_event(
             state.env(),
             &id,
             created_at_micros,
@@ -155,6 +156,10 @@ pub async fn set_client_admin_consent(
                 granted_scope: Some(&scope_value),
                 granted_by: &granted_by,
             },
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
 
@@ -300,7 +305,43 @@ fn admin_consent_revoked_event(
     )?;
     Some(crate::events::PendingEvent {
         id,
-        subject,
+        // The CLIENT is the ordering key, not the grant. A set REUSES the existing row's id
+        // inside the write, so keying on the grant would put a grant and the revoke that
+        // follows it on different keys, and a consumer could be told of the revocation of a
+        // pre-authorization it had never been told about.
+        subject: client_id.to_owned(),
+        envelope,
+    })
+}
+
+/// The event an admin-consent GRANT emits (issue #108), the counterpart of
+/// [`admin_consent_revoked_event`].
+///
+/// No grant id, and the asymmetry with the revoke is deliberate. A set is an upsert that
+/// reuses the EXISTING row's id, resolved inside the write, so this producer holds only the
+/// id it minted -- the row id on a first write and a stale invention on an overwrite. The
+/// client is what an operator addressed, and what identifies the pre-authorization.
+fn admin_consent_granted_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    client_id: &str,
+    granted_scope: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "admin_consent.granted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "client_id": client_id,
+            "granted_scope": granted_scope,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: client_id.to_owned(),
         envelope,
     })
 }
