@@ -242,12 +242,13 @@ pub async fn create_flow_version(
         response_body: &body_string,
     };
     let created_at_micros = state.now_unix_micros();
+    let pending = flow_version_event(&state, scope, &journey_id, version, Some(&id.to_string()));
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .flow_versions()
-        .create_version(
+        .create_version_with_event(
             state.env(),
             &id,
             NewFlowVersion {
@@ -257,6 +258,10 @@ pub async fn create_flow_version(
             version,
             created_at_micros,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
     match result {
@@ -443,12 +448,23 @@ pub async fn pin_flow_version(
         response_body: &body_string,
     };
     let now_micros = state.now_unix_micros();
+    let pending = flow_version_event(&state, scope, &journey_id, version, None);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .flow_versions()
-        .pin(state.env(), &journey_id, version, now_micros, Some(write))
+        .pin_with_event(
+            state.env(),
+            &journey_id,
+            version,
+            now_micros,
+            Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
     match result {
         Ok(_) => Ok(json(StatusCode::OK, body_string)),
@@ -461,6 +477,56 @@ pub async fn pin_flow_version(
 
 // A version is immutable and never deleted (a change is a new version), so the append-only
 // registry deliberately exposes no delete surface.
+
+/// The event a flow-version append or pin emits (issue #108).
+///
+/// `minted` present means an APPEND; absent means a PIN. They are separate types because
+/// appending a version changes nothing an end user reaches until it is pinned: a consumer
+/// that treated an append as a rollout would announce a change nobody can see, and one that
+/// treated a pin as an append would miss the only moment the live journey actually changed.
+///
+/// The ARTIFACT never travels. It is the journey document itself, arbitrarily large and
+/// versioned by this very mechanism; a consumer that wants it reads it back by (journey,
+/// version), which is exactly what these payloads name.
+fn flow_version_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    journey_id: &str,
+    version: i32,
+    minted: Option<&str>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let (event_type, payload) = match minted {
+        Some(flow_version_id) => (
+            "flow_version.created",
+            serde_json::json!({
+                "flow_version_id": flow_version_id,
+                "journey_id": journey_id,
+                "version": version,
+            }),
+        ),
+        None => (
+            "flow_version.pinned",
+            serde_json::json!({ "journey_id": journey_id, "version": version }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The JOURNEY is the subject: an append and the pin that rolls it out must not be
+        // delivered out of order, or a consumer sees a pin to a version it has not been told
+        // about.
+        subject: journey_id.to_owned(),
+        envelope,
+    })
+}
 
 #[cfg(test)]
 mod tests {

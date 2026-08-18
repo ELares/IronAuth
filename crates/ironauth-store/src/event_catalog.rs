@@ -647,6 +647,44 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A journey VERSION is authored config: appending one changes nothing a user reaches
+        // until it is pinned, and that is exactly why the two are separate types. A consumer
+        // that treated an append as a rollout would announce a change no end user can see.
+        //
+        // The ARTIFACT does not travel. It is the journey document itself -- arbitrarily large
+        // and versioned by this very mechanism -- and a consumer that wants it reads it back
+        // by (journey, version), which is what this payload names.
+        "flow_version.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "flow_version_id": {"type": "string", "minLength": 1},
+                "journey_id": {"type": "string", "minLength": 1},
+                "version": {"type": "integer"}
+            },
+            "required": ["flow_version_id", "journey_id", "version"]
+        }"#,
+    ),
+    (
+        // The ROLLOUT half: this is the one that changes what an end user walks through, so
+        // it is the one a consumer mirroring live journey config acts on. Versions are
+        // append-only, so the pinned version is the whole of the state -- there is no
+        // unpinning, and a move is another pin.
+        "flow_version.pinned",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "journey_id": {"type": "string", "minLength": 1},
+                "version": {"type": "integer"}
+            },
+            "required": ["journey_id", "version"]
+        }"#,
+    ),
+    (
         "recovery_approval.decided",
         1,
         r#"{

@@ -29824,6 +29824,34 @@ impl ActingFlowVersionRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_version_with_event(
+            env,
+            id,
+            params,
+            version,
+            created_at_micros,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create_version`], additionally emitting `flow_version.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_version`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_version_with_event(
+        &self,
+        env: &Env,
+        id: &FlowVersionId,
+        params: NewFlowVersion<'_>,
+        version: i32,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         // Prove the artifact is a load-valid, compilable journey BEFORE the transaction: a bad
         // artifact never reaches the registry, so the drive-path compile of a stored version never
         // fails.
@@ -29878,6 +29906,9 @@ impl ActingFlowVersionRepo<'_> {
                     Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
                     Err(error) => return Err(error.into()),
                 }
+                // In the write's transaction, and AFTER the unique-index guard above: a
+                // version a concurrent create already took announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -29945,6 +29976,27 @@ impl ActingFlowVersionRepo<'_> {
         now_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<FlowVersionPinId, StoreError> {
+        self.pin_with_event(env, journey_id, version, now_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::pin`], additionally emitting `flow_version.pinned` (issue #108).
+    ///
+    /// An absent version is a uniform not-found resolved BEFORE the write, so a pin that
+    /// moved nothing announces nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::pin`].
+    pub async fn pin_with_event(
+        &self,
+        env: &Env,
+        journey_id: &str,
+        version: i32,
+        now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<FlowVersionPinId, StoreError> {
         let scope = self.scope;
         // Resolve the version -> its flv_ id (a uniform not-found when the version is absent), and
         // the existing pin id (reused as the stable audit target across moves). Versions are
@@ -29987,6 +30039,8 @@ impl ActingFlowVersionRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back pin announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
