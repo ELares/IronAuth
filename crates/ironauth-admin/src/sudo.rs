@@ -212,12 +212,22 @@ pub async fn elevate_sudo(
         .saturating_mul(1_000_000);
     let expires = now.saturating_add(window_micros);
 
+    let pending = sudo_elevated_event(&state, scope, &actor.id_string(), expires);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .admin_sudo_elevations()
-        .record(state.env(), ADMIN_REAUTH_ACR, now, expires)
+        .record_with_event(
+            state.env(),
+            ADMIN_REAUTH_ACR,
+            now,
+            expires,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
 
     let view = SudoElevationView {
@@ -229,4 +239,44 @@ pub async fn elevate_sudo(
     };
     let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
+}
+
+/// The event a sudo elevation emits (issue #108).
+///
+/// A management credential just gained sudo: for the length of the window it may make the
+/// mutations the freshness gate otherwise refuses. That is a privilege escalation by design,
+/// and it is what an oversight consumer watches for.
+///
+/// The EXPIRY travels because an elevation is a window, not a state, and a receiver that
+/// could not see the window would have to treat every elevation as permanent. The achieved
+/// `acr` travels because it says what the re-authentication actually proved.
+///
+/// No elevation id: the store mints it inside the write, so naming one here would mean
+/// announcing a handle this producer does not hold.
+fn sudo_elevated_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    actor_id: &str,
+    expires_at_unix_micros: i64,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "sudo.elevated",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "actor_id": actor_id,
+            "acr": ADMIN_REAUTH_ACR,
+            "expires_at_unix_ms": expires_at_unix_micros / 1000,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The ACTOR is the subject: successive elevations by one credential stay ordered, and
+        // an oversight consumer reads them as one timeline.
+        subject: actor_id.to_owned(),
+        envelope,
+    })
 }

@@ -776,6 +776,69 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // Permission claims decide whether tokens for this API carry the caller's permissions
+        // INSIDE them. Turning it on changes what every downstream resource server sees in a
+        // token it already knows how to parse; turning it off silently removes a claim
+        // something may be authorizing on. Either way a consumer mirroring API config has to
+        // learn it, and the direction is the whole content -- which is why the flag travels
+        // rather than a bare "something changed".
+        "resource_server.permission_claims_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "resource_server_id": {"type": "string", "minLength": 1},
+                "enabled": {"type": "boolean"}
+            },
+            "required": ["resource_server_id", "enabled"]
+        }"#,
+    ),
+    (
+        // A CONFIG PROMOTION rewrites an environment's configuration wholesale from a
+        // snapshot. It is the widest configuration change this surface makes, so a consumer
+        // that caches anything about the environment has to invalidate on it.
+        //
+        // The revision, not the diff. The diff is the promotion document itself -- every
+        // changed resource in the environment -- and putting it on the wire would publish a
+        // whole configuration to every subscriber. The revision is what identifies WHICH
+        // configuration now holds, and it is exactly what a consumer needs to ask whether the
+        // copy it has is current.
+        //
+        // Only an APPLIED promotion announces. A no-op changed nothing.
+        "config_promotion.applied",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "revision": {"type": "string", "minLength": 1}
+            },
+            "required": ["revision"]
+        }"#,
+    ),
+    (
+        // A management credential just gained SUDO: for the length of the window it may make
+        // the mutations the freshness gate otherwise refuses. That is a privilege escalation
+        // by design, and it is what an oversight consumer watches for.
+        //
+        // The EXPIRY travels because the elevation is a window, not a state: a receiver that
+        // could not see the window would have to treat every elevation as permanent. The
+        // achieved `acr` travels because it says what the re-authentication actually proved.
+        "sudo.elevated",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "actor_id": {"type": "string", "minLength": 1},
+                "acr": {"type": "string", "minLength": 1},
+                "expires_at_unix_ms": {"type": "integer"}
+            },
+            "required": ["actor_id", "acr", "expires_at_unix_ms"]
+        }"#,
+    ),
+    (
         "recovery_approval.decided",
         1,
         r#"{

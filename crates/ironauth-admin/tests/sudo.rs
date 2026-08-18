@@ -1576,3 +1576,79 @@ async fn the_trait_schema_create_and_activate_are_sudo_gated() {
         "the activation landed: {activated}"
     );
 }
+
+/// Elevating to sudo announces it, over the real route, carrying the window and the acr.
+///
+/// A management credential just gained the authority the freshness gate otherwise refuses:
+/// a privilege escalation by design, and what an oversight consumer watches for.
+///
+/// The EXPIRY is the load-bearing field. An elevation is a WINDOW, not a state, so a receiver
+/// that could not see the window would have to treat every elevation as permanent -- and the
+/// whole point of sudo mode is that the authority lapses. The test asserts the announced
+/// expiry agrees with the window the response reports, so a producer that shipped a
+/// plausible-looking constant instead of the real one fails here.
+#[tokio::test]
+async fn elevating_to_sudo_announces_the_elevation_with_its_window() {
+    let (harness, _clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k-sudo-evt").await;
+    let scope = scope_of(&tenant, &env);
+
+    // Anything the fixture's own provisioning enqueued, discarded.
+    let _ = queued_events(&harness, scope).await;
+
+    let (status, _, body) = harness
+        .post(&elevate_path(&tenant, &env), "e-evt", "{}")
+        .await;
+    assert_eq!(status, StatusCode::OK, "elevate: {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let expires_micros = view["expires_at_unix_micros"].as_i64().expect("expiry");
+
+    let events = queued_events(&harness, scope).await;
+    assert_eq!(events.len(), 1, "the elevation announced {events:?}");
+    assert_eq!(events[0]["type"], "sudo.elevated");
+    assert_eq!(
+        events[0]["payload"]["acr"], view["acr"],
+        "the announced acr must be what the re-authentication actually proved"
+    );
+    assert_eq!(
+        events[0]["payload"]["expires_at_unix_ms"],
+        expires_micros / 1000,
+        "the announced window must be the window the elevation actually got; a constant \
+         here would look right and expire at the wrong time for every consumer"
+    );
+    assert!(
+        events[0]["payload"]["actor_id"]
+            .as_str()
+            .is_some_and(|actor| !actor.is_empty()),
+        "the elevation must say WHO gained the authority: {events:?}"
+    );
+}
+
+/// Everything queued for the webhook fan-out in this scope, claimed and completed.
+async fn queued_events(harness: &Harness, scope: Scope) -> Vec<serde_json::Value> {
+    let env = ironauth_env::Env::system();
+    let claimed = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events");
+    for message in &claimed {
+        harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}

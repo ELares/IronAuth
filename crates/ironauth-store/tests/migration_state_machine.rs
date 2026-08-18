@@ -1033,3 +1033,115 @@ async fn a_runs_acceptance_and_its_transitions_are_distinct_types() {
     ironauth_store::event_catalog::validate_event(&second)
         .expect("the envelope validates against the registry the fan-out enforces");
 }
+
+/// Abandoning a run announces the SAME type every other transition does, and a refused
+/// abandon announces nothing.
+///
+/// One type carrying a state, not one per edge: that is the registry's shape, and it exists
+/// so the state machine can gain an edge without every consumer subscribing to a new type. An
+/// abandon is an edge like any other, so it reuses it.
+///
+/// The second half is the guard. A terminal run refuses the transition, and the refusal comes
+/// from inside the audited write -- the same transaction the enqueue lives in -- so the roll
+/// back takes the event with it. A consumer must not be told a run was abandoned when the
+/// state machine said no.
+#[tokio::test]
+async fn abandoning_a_run_announces_the_state_change_and_a_refused_abandon_does_not() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x5e);
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+
+    let run = create_run(store, &env, scope, MigrationKind::BulkImport, 100, 0).await;
+    drive_to_running(store, &env, scope, &run).await;
+    let run_text = run.to_string();
+
+    let announce = |event_id: &str, at: i64| {
+        ironauth_store::event_catalog::envelope(
+            event_id,
+            "identity_import.state_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            at,
+            &serde_json::json!({
+                "migration_run_id": run_text,
+                "state": MigrationState::Abandoned.as_str(),
+            }),
+        )
+        .expect("identity_import.state_changed is registered")
+    };
+
+    let first = announce("evt_run_abandoned", 1);
+    store
+        .scoped(scope)
+        .acting(actor(store, &env, scope), CorrelationId::generate(&env))
+        .migration_runs()
+        .abandon_with_event(
+            &env,
+            &run,
+            "source export corrupted; restarting from scratch",
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_run_abandoned",
+                subject: &run_text,
+                envelope: &first,
+            }),
+        )
+        .await
+        .expect("abandon");
+
+    let announced = claim_one_event(&db, &env, scope).await;
+    assert_eq!(
+        announced["type"], "identity_import.state_changed",
+        "an abandon is a state change like any other; a type of its own would make a purely \
+         internal edge a breaking registry addition"
+    );
+    assert_eq!(
+        announced["payload"]["state"],
+        MigrationState::Abandoned.as_str()
+    );
+    ironauth_store::event_catalog::validate_event(&announced)
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // The run is now terminal, so a second abandon is refused from inside the audited write
+    // and rolls the enqueue back with it.
+    let repeat = announce("evt_run_abandoned_again", 2);
+    let error = store
+        .scoped(scope)
+        .acting(actor(store, &env, scope), CorrelationId::generate(&env))
+        .migration_runs()
+        .abandon_with_event(
+            &env,
+            &run,
+            "a second attempt",
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_run_abandoned_again",
+                subject: &run_text,
+                envelope: &repeat,
+            }),
+        )
+        .await
+        .expect_err("a terminal run refuses further transitions");
+    assert!(
+        matches!(error, StoreError::IllegalMigrationTransition { .. }),
+        "got {error:?}"
+    );
+
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert!(
+        claimed.is_empty(),
+        "a refused transition must announce nothing: {claimed:?}"
+    );
+}

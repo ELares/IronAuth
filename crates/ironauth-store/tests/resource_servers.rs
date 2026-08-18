@@ -316,3 +316,155 @@ async fn a_write_matching_no_row_is_not_found_and_audits_nothing() {
         "the refused write must not have flipped some other row"
     );
 }
+
+/// Everything queued for the webhook fan-out in `scope`, claimed AND completed.
+async fn drain_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    let env = Env::system();
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}
+
+/// Flipping permission claims announces the DIRECTION, and a write matching no row announces
+/// nothing.
+///
+/// Permission claims decide whether tokens for this API carry the caller's permissions inside
+/// them, so turning it on changes what every downstream resource server sees in a token it
+/// already knows how to parse, and turning it off silently removes a claim something may be
+/// authorizing on. The direction is the whole content: a bare "something changed" would leave
+/// a consumer unable to act without a refetch.
+///
+/// The refusal half rides on the same `rows_affected() == 0` check the test above pins. The
+/// enqueue sits after it inside the audited write, so a write that changed nothing commits
+/// neither an audit row nor an event.
+#[tokio::test]
+async fn flipping_permission_claims_announces_the_direction() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = register(
+        &db,
+        &env,
+        scope,
+        "https://api.example/claims-events",
+        TokenFormat::AtJwt,
+        None,
+    )
+    .await;
+
+    let announce = |enabled: bool, event_id: &str, at: i64, target: &ResourceServerId| {
+        ironauth_store::event_catalog::envelope(
+            event_id,
+            "resource_server.permission_claims_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            at,
+            &serde_json::json!({
+                "resource_server_id": target.to_string(),
+                "enabled": enabled,
+            }),
+        )
+        .expect("resource_server.permission_claims_changed is registered")
+    };
+
+    let on = announce(true, "evt_claims_on", 1, &id);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .resource_servers(scope)
+        .set_permission_claims_with_event(
+            &env,
+            &id,
+            true,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_claims_on",
+                subject: &id.to_string(),
+                envelope: &on,
+            }),
+        )
+        .await
+        .expect("enable permission claims");
+
+    let enabled = drain_events(&db, scope).await;
+    assert_eq!(enabled.len(), 1, "the opt-in announced {enabled:?}");
+    assert_eq!(
+        enabled[0]["type"],
+        "resource_server.permission_claims_changed"
+    );
+    assert_eq!(
+        enabled[0]["payload"]["enabled"], true,
+        "the DIRECTION is the content; without it a consumer cannot act without refetching"
+    );
+
+    let off = announce(false, "evt_claims_off", 2, &id);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .resource_servers(scope)
+        .set_permission_claims_with_event(
+            &env,
+            &id,
+            false,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_claims_off",
+                subject: &id.to_string(),
+                envelope: &off,
+            }),
+        )
+        .await
+        .expect("disable permission claims");
+
+    let disabled = drain_events(&db, scope).await;
+    assert_eq!(disabled.len(), 1, "the opt-out announced {disabled:?}");
+    assert_eq!(
+        disabled[0]["payload"]["enabled"], false,
+        "an opt-OUT announced as an opt-in would leave a consumer expecting a claim that is \
+         no longer minted"
+    );
+
+    // A well-formed id of this scope that was never registered: the rows-affected guard
+    // refuses it, and takes the enqueue with it.
+    let absent = ResourceServerId::generate(&env, &scope);
+    let stray = announce(true, "evt_claims_absent", 3, &absent);
+    let error = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .resource_servers(scope)
+        .set_permission_claims_with_event(
+            &env,
+            &absent,
+            true,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_claims_absent",
+                subject: &absent.to_string(),
+                envelope: &stray,
+            }),
+        )
+        .await
+        .expect_err("a write that matches no row must be refused");
+    assert!(matches!(error, StoreError::NotFound), "got {error:?}");
+    let quiet = drain_events(&db, scope).await;
+    assert!(
+        quiet.is_empty(),
+        "a write that changed nothing must announce nothing: {quiet:?}"
+    );
+}

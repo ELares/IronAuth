@@ -3540,6 +3540,29 @@ impl ActingAdminSudoElevationRepo<'_> {
         elevated_at_unix_micros: i64,
         expires_at_unix_micros: i64,
     ) -> Result<AdminSudoElevationId, StoreError> {
+        self.record_with_event(
+            env,
+            acr,
+            elevated_at_unix_micros,
+            expires_at_unix_micros,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::record`], additionally emitting `sudo.elevated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::record`].
+    pub async fn record_with_event(
+        &self,
+        env: &Env,
+        acr: &str,
+        elevated_at_unix_micros: i64,
+        expires_at_unix_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<AdminSudoElevationId, StoreError> {
         let scope = self.scope;
         let id = AdminSudoElevationId::generate(env, &scope);
         let actor = self.acting.actor();
@@ -3574,6 +3597,8 @@ impl ActingAdminSudoElevationRepo<'_> {
                 .bind(expires_at_unix_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back elevation announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -11318,6 +11343,23 @@ impl ActingResourceServerRepo<'_> {
         id: &ResourceServerId,
         enabled: bool,
     ) -> Result<(), StoreError> {
+        self.set_permission_claims_with_event(env, id, enabled, None)
+            .await
+    }
+
+    /// [`Self::set_permission_claims`], additionally emitting
+    /// `resource_server.permission_claims_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_permission_claims`].
+    pub async fn set_permission_claims_with_event(
+        &self,
+        env: &Env,
+        id: &ResourceServerId,
+        enabled: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -11345,6 +11387,9 @@ impl ActingResourceServerRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction, and AFTER the rows-affected guard: a set that
+                // matched no resource server announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -56012,6 +56057,27 @@ impl ActingStore<'_> {
         base_revision: &str,
         poison_after_audit: bool,
     ) -> Result<crate::promotion::PromotionOutcome, crate::promotion::PromotionApplyError> {
+        self.apply_promotion_with_event(env, source, base_revision, poison_after_audit, None)
+            .await
+    }
+
+    /// [`Self::apply_promotion`], additionally emitting `config_promotion.applied`
+    /// (issue #108).
+    ///
+    /// Only an APPLIED promotion announces. The no-op branch commits and returns before the
+    /// enqueue, so a consumer never invalidates a cache over a promotion that changed nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apply_promotion`].
+    pub async fn apply_promotion_with_event(
+        &self,
+        env: &Env,
+        source: &crate::snapshot::Snapshot,
+        base_revision: &str,
+        poison_after_audit: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<crate::promotion::PromotionOutcome, crate::promotion::PromotionApplyError> {
         use crate::promotion::{ChangeKind, PromotionApplyError, PromotionOutcome};
 
         let scope = self.scope;
@@ -56168,6 +56234,10 @@ impl ActingStore<'_> {
             sqlx::query("SELECT 1 / 0").execute(&mut *tx).await?;
         }
 
+        // In the promotion's own transaction, and ONLY here: the no-op branch above
+        // committed and returned already, so a promotion that changed nothing announces
+        // nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(PromotionOutcome::Applied(plan_diff))
     }
@@ -60525,6 +60595,26 @@ impl ActingMigrationRunRepo<'_> {
         reason: &str,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.abandon_with_event(env, run_id, reason, idempotency, None)
+            .await
+    }
+
+    /// [`Self::abandon`], additionally emitting `identity_import.state_changed` (issue #108).
+    ///
+    /// The enqueue sits after the terminal-state guard, so an abandon the state machine
+    /// refuses announces nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::abandon`].
+    pub async fn abandon_with_event(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+        reason: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if run_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -60562,6 +60652,9 @@ impl ActingMigrationRunRepo<'_> {
                 .await?;
                 // In the SAME transaction as the state flip and its audit row.
                 insert_idempotency(tx, idempotency).await?;
+                // Likewise, and after the terminal-state guard above: a refused transition
+                // announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

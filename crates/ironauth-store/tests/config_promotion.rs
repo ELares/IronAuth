@@ -2558,3 +2558,149 @@ async fn a_promoted_brand_rename_keeps_its_logo_whatever_the_slug_order() {
     // The donor sorts last: this direction already worked, and is the control.
     promote_a_rename_that_keeps_its_logo("aaa", "zzz").await;
 }
+
+/// Everything queued for the webhook fan-out in `scope`, claimed AND completed.
+async fn drain_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    let env = Env::system();
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}
+
+/// An APPLIED promotion announces its revision; a NO-OP re-apply announces nothing.
+///
+/// A promotion rewrites an environment's configuration wholesale, so a consumer that caches
+/// anything about the environment has to invalidate on it. The re-apply is the case that
+/// makes the guard load-bearing: it is a SUCCESS, indistinguishable in the return type from a
+/// change except for the outcome variant, and the store's no-op branch commits and returns
+/// before the enqueue. A consumer that invalidated on every apply would be doing it for
+/// promotions that changed nothing at all.
+///
+/// The DIFF stays off the wire, and the test asserts it: the diff is every changed resource
+/// in the environment, so publishing it means publishing a whole configuration to every
+/// subscriber. The revision is what says WHICH configuration now holds.
+#[tokio::test]
+async fn an_applied_promotion_announces_its_revision_and_a_no_op_announces_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    register_rs(
+        &db,
+        &env,
+        source,
+        "https://api.example/promoted",
+        TokenFormat::AtJwt,
+    )
+    .await;
+    set_var(&db, &env, source, "feature_flag", "on").await;
+    let source_snapshot = export(&db, source).await;
+    let revision = promotion_revision(&source_snapshot).expect("rev");
+
+    let plan = plan_promotion(&control(&db).scoped(target), &source_snapshot)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    let base = plan.base_revision().to_owned();
+
+    // Anything the target's own seeding enqueued, discarded, so the counts below are about
+    // the promotion alone.
+    let _ = drain_events(&db, target).await;
+
+    let announce = |event_id: &str, at: i64| {
+        ironauth_store::event_catalog::envelope(
+            event_id,
+            "config_promotion.applied",
+            &target.tenant().to_string(),
+            &target.environment().to_string(),
+            at,
+            &serde_json::json!({ "revision": revision }),
+        )
+        .expect("config_promotion.applied is registered")
+    };
+
+    let first = announce("evt_promotion_applied", 1);
+    let (actor, corr) = acting(&db, &env);
+    let outcome = control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion_with_event(
+            &env,
+            &source_snapshot,
+            &base,
+            false,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_promotion_applied",
+                subject: &target.environment().to_string(),
+                envelope: &first,
+            }),
+        )
+        .await
+        .expect("apply");
+    assert!(
+        matches!(outcome, PromotionOutcome::Applied(_)),
+        "expected an applied promotion, got {outcome:?}"
+    );
+
+    let applied = drain_events(&db, target).await;
+    assert_eq!(applied.len(), 1, "the promotion announced {applied:?}");
+    assert_eq!(applied[0]["type"], "config_promotion.applied");
+    assert_eq!(applied[0]["payload"]["revision"], revision);
+    let rendered = serde_json::to_string(&applied[0]).expect("json");
+    assert!(
+        !rendered.contains("feature_flag") && !rendered.contains("api.example/promoted"),
+        "the promotion DIFF reached the wire; that is a whole configuration published to \
+         every subscriber: {rendered}"
+    );
+
+    // The re-apply is a no-op SUCCESS. Only the outcome variant distinguishes it, and the
+    // store's no-op branch returns before the enqueue.
+    let repeat = announce("evt_promotion_applied_again", 2);
+    let (actor, corr) = acting(&db, &env);
+    let again = control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion_with_event(
+            &env,
+            &source_snapshot,
+            &base,
+            false,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_promotion_applied_again",
+                subject: &target.environment().to_string(),
+                envelope: &repeat,
+            }),
+        )
+        .await
+        .expect("re-apply");
+    assert_eq!(again, PromotionOutcome::NoOp, "re-apply is a no-op");
+
+    let quiet = drain_events(&db, target).await;
+    assert!(
+        quiet.is_empty(),
+        "a promotion that changed nothing must announce nothing, or every consumer \
+         invalidates a cache for no reason: {quiet:?}"
+    );
+}

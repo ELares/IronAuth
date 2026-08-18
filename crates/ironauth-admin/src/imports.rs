@@ -765,7 +765,7 @@ pub async fn resume_identity_import(
 /// The transition is ONE type with a state rather than one per edge, so the state machine can
 /// gain a state without minting a new event type -- which would otherwise make a purely
 /// internal addition a breaking registry change.
-fn identity_import_event(
+pub(crate) fn identity_import_event(
     state: &AdminState,
     scope: ironauth_store::Scope,
     run_id: &str,
