@@ -47224,7 +47224,7 @@ impl ActingOrgMembershipRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<ResolvedIdempotencyWrite<'_, OrgMembershipRecord>>,
     ) -> Result<OrgMembershipRecord, StoreError> {
-        self.create_with_event(env, spec, created_at_micros, idempotency, None)
+        self.create_with_event(env, spec, created_at_micros, idempotency, None, None)
             .await
     }
 
@@ -47240,6 +47240,7 @@ impl ActingOrgMembershipRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<ResolvedIdempotencyWrite<'_, OrgMembershipRecord>>,
         event: Option<&DomainEvent<'_>>,
+        delta_event: Option<&DomainEvent<'_>>,
     ) -> Result<OrgMembershipRecord, StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
@@ -47309,6 +47310,10 @@ impl ActingOrgMembershipRepo<'_> {
         // BEFORE the commit, inside the write's own transaction: a rolled-back membership
         // announces nothing.
         enqueue_domain_event(&mut tx, env, scope, event).await?;
+        // The DELTA form of the same change (issue #107), in this same
+        // transaction. A consumer subscribed to either shape sees the change
+        // exactly when the row commits, and never one form without the other.
+        enqueue_domain_event(&mut tx, env, scope, delta_event).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -47417,7 +47422,7 @@ impl ActingOrgMembershipRepo<'_> {
     /// [`StoreError::NotFound`] if the id is not in this scope, or no live membership
     /// matched.
     pub async fn remove(&self, env: &Env, id: &OrgMembershipId) -> Result<(), StoreError> {
-        self.remove_with_event(env, id, None).await
+        self.remove_with_event(env, id, None, None).await
     }
 
     /// [`Self::remove`], additionally emitting `organization.member_removed` (issue #108).
@@ -47430,6 +47435,7 @@ impl ActingOrgMembershipRepo<'_> {
         env: &Env,
         id: &OrgMembershipId,
         event: Option<&DomainEvent<'_>>,
+        delta_event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -47514,6 +47520,10 @@ impl ActingOrgMembershipRepo<'_> {
                 .await?;
                 // In the write's transaction: a rolled-back change announces nothing.
                 enqueue_domain_event(tx, env, scope, event).await?;
+                // The DELTA form of the same change (issue #107), in this same
+                // transaction. A consumer subscribed to either shape sees the change
+                // exactly when the row commits, and never one form without the other.
+                enqueue_domain_event(tx, env, scope, delta_event).await?;
                 Ok(())
             },
             false,
@@ -49734,7 +49744,7 @@ impl ActingOrgGroupMemberRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
-        self.add_with_event(env, spec, created_at_micros, idempotency, None)
+        self.add_with_event(env, spec, created_at_micros, idempotency, None, None)
             .await
     }
 
@@ -49750,6 +49760,7 @@ impl ActingOrgGroupMemberRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
         event: Option<&DomainEvent<'_>>,
+        delta_event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
@@ -49803,6 +49814,10 @@ impl ActingOrgGroupMemberRepo<'_> {
                 insert_idempotency(tx, idempotency).await?;
                 // In the write's transaction: a rolled-back add announces nothing.
                 enqueue_domain_event(tx, env, scope, event).await?;
+                // The DELTA form of the same change (issue #107), in this same
+                // transaction. A consumer subscribed to either shape sees the change
+                // exactly when the row commits, and never one form without the other.
+                enqueue_domain_event(tx, env, scope, delta_event).await?;
                 Ok(())
             },
             false,
@@ -49838,7 +49853,8 @@ impl ActingOrgGroupMemberRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgGroupMemberId,
     ) -> Result<(), StoreError> {
-        self.remove_with_event(env, organization_id, id, None).await
+        self.remove_with_event(env, organization_id, id, None, None)
+            .await
     }
 
     /// [`Self::remove`], additionally emitting `org_group.member_removed` (issue #108).
@@ -49852,6 +49868,7 @@ impl ActingOrgGroupMemberRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgGroupMemberId,
         event: Option<&DomainEvent<'_>>,
+        delta_event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -49880,6 +49897,10 @@ impl ActingOrgGroupMemberRepo<'_> {
                 .await?;
                 // AFTER the delete's own guard: removing what is not a member announces nothing.
                 enqueue_domain_event(tx, env, scope, event).await?;
+                // The DELTA form of the same change (issue #107), in this same
+                // transaction. A consumer subscribed to either shape sees the change
+                // exactly when the row commits, and never one form without the other.
+                enqueue_domain_event(tx, env, scope, delta_event).await?;
                 Ok(())
             },
             false,

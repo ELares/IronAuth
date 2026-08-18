@@ -529,6 +529,74 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // No role and no traits: a membership's role is changed through its own surface and
         // announced there, so folding it in here would make this event go stale the moment a
         // role moves without the membership changing.
+        // THE DELTA-BEARING FORM (issue #107's criterion, issue #108's registry). It exists
+        // beside the per-member types rather than replacing them, because they answer
+        // different questions: `member_added` says WHO, once, and this says WHAT THE SET DID.
+        //
+        // Arrays and a cap, because full-state group dumps melt at enterprise group sizes.
+        // The cap is on the TOTAL ids in the event, not per array -- a per-array cap lets one
+        // event carry twice the documented limit, which gets discovered by a consumer's
+        // allocator rather than by a reviewer.
+        //
+        // `truncated` is REQUIRED, not optional, and that is the whole safety property. A
+        // truncated delta applied as though it were complete CORRUPTS the consumer: it
+        // believes the members it was not sent are unchanged, and they are not. Making the
+        // flag required means a consumer cannot read the arrays without having seen it, and
+        // an omitted flag is a schema violation refused at the fan-out rather than a default
+        // that silently reads as "complete".
+        //
+        // `total` rides along on every event, so a consumer that truncated can log exactly
+        // how much it missed, and reconciles by re-reading the membership through the
+        // management API -- the path `membership_reconcile.rs` measures to exhaustion.
+        "organization.membership_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "organization_id": {"type": "string", "minLength": 1},
+                "added_user_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "removed_user_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "truncated": {"type": "boolean"},
+                "total": {"type": "integer", "minimum": 0}
+            },
+            "required": [
+                "organization_id",
+                "added_user_ids",
+                "removed_user_ids",
+                "truncated",
+                "total"
+            ]
+        }"#,
+    ),
+    (
+        // The GROUP twin, same contract. Groups are where the cap actually bites: an
+        // enterprise group is the thing with tens of thousands of members, which is why
+        // issue #107 named group dumps as the failure mode.
+        "org_group.membership_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_group_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "added_user_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "removed_user_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "truncated": {"type": "boolean"},
+                "total": {"type": "integer", "minimum": 0}
+            },
+            "required": [
+                "org_group_id",
+                "organization_id",
+                "added_user_ids",
+                "removed_user_ids",
+                "truncated",
+                "total"
+            ]
+        }"#,
+    ),
+    (
         "organization.member_added",
         1,
         r#"{

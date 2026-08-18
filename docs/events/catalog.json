@@ -1128,6 +1128,54 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
+          "added_user_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "org_group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "removed_user_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "total": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "org_group_id",
+          "organization_id",
+          "added_user_ids",
+          "removed_user_ids",
+          "truncated",
+          "total"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_group.membership_changed"
+    },
+    {
+      "domain": "org_group",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
           "org_group_id": {
             "minLength": 1,
             "type": "string"
@@ -1567,6 +1615,49 @@
       },
       "payload_schema_version": 1,
       "type": "organization.member_removed"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "added_user_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "removed_user_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "total": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "organization_id",
+          "added_user_ids",
+          "removed_user_ids",
+          "truncated",
+          "total"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.membership_changed"
     },
     {
       "domain": "organization",

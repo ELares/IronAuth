@@ -212,6 +212,14 @@ pub async fn add_org_group_member(
     // by the time the write ran, and would answer "does that group exist" a request
     // early: the ordering is what keeps the 409 reachable only by a caller who has
     // already proved they can see both endpoints.
+    let delta = group_membership_delta_event(
+        &state,
+        scope,
+        &group,
+        &org_id,
+        vec![membership.to_string()],
+        Vec::new(),
+    );
     let pending = org_group_member_event(
         &state,
         scope,
@@ -238,6 +246,10 @@ pub async fn add_org_group_member(
             created_at_micros,
             Some(write),
             pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+            delta
                 .as_ref()
                 .map(crate::events::PendingEvent::domain_event)
                 .as_ref(),
@@ -388,6 +400,14 @@ pub async fn remove_org_group_member(
         .await?;
     // The organization rides into the UPDATE as a predicate as well, so the write is
     // fenced independently of the read that addressed it.
+    let delta = group_membership_delta_event(
+        &state,
+        scope,
+        &binding.group_id,
+        &org_id,
+        Vec::new(),
+        vec![binding.membership_id.to_string()],
+    );
     let pending = org_group_member_event(
         &state,
         scope,
@@ -408,6 +428,10 @@ pub async fn remove_org_group_member(
             &org_id,
             &binding.id,
             pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+            delta
                 .as_ref()
                 .map(crate::events::PendingEvent::domain_event)
                 .as_ref(),
@@ -445,6 +469,49 @@ fn org_group_member_event(
     )?;
     Some(crate::events::PendingEvent {
         id,
+        subject,
+        envelope,
+    })
+}
+
+/// The GROUP membership delta (issue #107's criterion, issue #108's registry), the twin of
+/// the organization form.
+///
+/// Groups are where the cap actually bites. An enterprise group is the thing with tens of
+/// thousands of members, and issue #107 named full group dumps as the failure mode this
+/// contract exists to avoid: past the cap the arrays become a PREFIX, `truncated` says so,
+/// and the consumer re-reads the membership through the management API rather than applying
+/// a delta that would leave it confidently wrong about everyone it was not sent.
+///
+/// Emitted beside `org_group.member_added`/`member_removed`, in the same transaction, for the
+/// reason the organization twin documents: the per-member type says WHO, this says what the
+/// SET did, and only this one can say "there was more than I could carry".
+fn group_membership_delta_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    group_id: &ironauth_store::OrgGroupId,
+    organization_id: &ironauth_store::OrganizationId,
+    added: Vec<String>,
+    removed: Vec<String>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let change = ironauth_store::membership_change(added, removed);
+    let mut payload = crate::events::membership_delta_payload(&change);
+    let subject = group_id.to_string();
+    payload["org_group_id"] = serde_json::json!(subject);
+    payload["organization_id"] = serde_json::json!(organization_id.to_string());
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "org_group.membership_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The GROUP is the subject: changes to one group stay ordered, which is what lets a
+        // consumer apply them as a sequence at all.
         subject,
         envelope,
     })

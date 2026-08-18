@@ -144,6 +144,13 @@ pub async fn create_membership(
         response_status: 201,
         response_body: &render,
     };
+    let delta = membership_delta_event(
+        &state,
+        scope,
+        &org_id,
+        vec![user_id.to_string()],
+        Vec::new(),
+    );
     let pending = membership_event(
         &state,
         scope,
@@ -170,6 +177,10 @@ pub async fn create_membership(
             created_at_micros,
             Some(write),
             pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+            delta
                 .as_ref()
                 .map(crate::events::PendingEvent::domain_event)
                 .as_ref(),
@@ -306,6 +317,13 @@ pub async fn delete_membership(
     if record.organization_id != org_id {
         return Err(ApiError::NotFound);
     }
+    let delta = membership_delta_event(
+        &state,
+        scope,
+        &org_id,
+        Vec::new(),
+        vec![record.user_id.to_string()],
+    );
     let pending = membership_event(
         &state,
         scope,
@@ -325,6 +343,10 @@ pub async fn delete_membership(
             state.env(),
             &id,
             pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+            delta
                 .as_ref()
                 .map(crate::events::PendingEvent::domain_event)
                 .as_ref(),
@@ -367,6 +389,52 @@ fn membership_event(
     )?;
     Some(crate::events::PendingEvent {
         id,
+        subject,
+        envelope,
+    })
+}
+
+/// The membership DELTA event (issue #107's criterion, issue #108's registry): the same
+/// change as `organization.member_added`/`member_removed`, expressed as the added/removed
+/// arrays a data-sync consumer applies, with the cap and truncation contract.
+///
+/// Both forms are emitted, in one transaction, because they answer different questions. The
+/// per-member type says WHO changed, once, and is what an integrator deprovisioning a single
+/// person subscribes to. This one says what the SET did, and is what a mirror applies -- and
+/// it is the only one that can ever say "I could not fit it all, go and reconcile".
+///
+/// A single-member route produces a Complete delta of one id, which is not a degenerate case
+/// but the contract holding at n=1: the cap and the truncation flag mean the same thing at
+/// every size, so a consumer writes one code path rather than two. The truncation branch
+/// engages when a bulk path exceeds the cap, and needs no new type when it lands.
+///
+/// The cap decision is NOT re-derived here. It comes from
+/// `ironauth_store::membership_change`, which is where issue #107 put it, so there is one
+/// expression of the rule rather than a copy per producer.
+fn membership_delta_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    organization_id: &ironauth_store::OrganizationId,
+    added: Vec<String>,
+    removed: Vec<String>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let change = ironauth_store::membership_change(added, removed);
+    let mut payload = crate::events::membership_delta_payload(&change);
+    let subject = organization_id.to_string();
+    payload["organization_id"] = serde_json::json!(subject);
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "organization.membership_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The ORGANIZATION is the subject: every membership change to one organization stays
+        // ordered, which is what lets a consumer apply them as a sequence of deltas at all.
         subject,
         envelope,
     })
