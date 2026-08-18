@@ -5333,6 +5333,22 @@ impl ActingClientRepo<'_> {
         id: &ClientId,
         required: bool,
     ) -> Result<(), StoreError> {
+        self.set_require_pushed_authorization_requests_with_event(env, id, required, None)
+            .await
+    }
+
+    /// [`Self::set_require_pushed_authorization_requests`], additionally emitting `client.par_requirement_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_require_pushed_authorization_requests`].
+    pub async fn set_require_pushed_authorization_requests_with_event(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        required: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -5360,6 +5376,8 @@ impl ActingClientRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -45972,6 +45990,22 @@ impl ActingEnvironmentRepo<'_> {
         id: &EnvironmentId,
         posture: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.set_auto_link_posture_with_event(env, id, posture, None)
+            .await
+    }
+
+    /// [`Self::set_auto_link_posture`], additionally emitting `environment.auto_link_posture_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_auto_link_posture`].
+    pub async fn set_auto_link_posture_with_event(
+        &self,
+        env: &Env,
+        id: &EnvironmentId,
+        posture: Option<&str>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = Scope::new(self.tenant, *id);
         let tenant = self.tenant;
         let posture = posture.map(str::to_owned);
@@ -45997,6 +46031,8 @@ impl ActingEnvironmentRepo<'_> {
                 if updated.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

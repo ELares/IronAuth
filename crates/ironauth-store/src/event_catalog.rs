@@ -509,6 +509,42 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // No counts and no records: an import's progress belongs to the run resource an
         // operator polls, and putting a snapshot of it on the wire would publish a number
         // that is stale before it is delivered.
+        // A client-level PAR requirement. Requiring pushed authorization requests hardens
+        // that client's authorize leg, so a consumer mirroring client hardening posture acts
+        // on it -- and one type with the boolean rather than a required/not-required pair,
+        // matching the other two-direction flags in this registry.
+        "client.par_requirement_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1},
+                "required": {"type": "boolean"}
+            },
+            "required": ["client_id", "required"]
+        }"#,
+    ),
+    (
+        // The environment's AUTO-LINK posture: what happens when a federated identity arrives
+        // matching an existing account. It decides whether an upstream can silently take over
+        // a local account, so it is squarely a security posture rather than a preference.
+        //
+        // `posture` is ABSENT when the override is CLEARED and the deployment default takes
+        // over -- mirroring the nullable column, and matching the rule the subscription and
+        // reparent payloads set: no invented sentinel for "none".
+        "environment.auto_link_posture_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "posture": {"type": "string", "minLength": 1}
+            },
+            "required": []
+        }"#,
+    ),
+    (
         "identity_import.created",
         1,
         r#"{

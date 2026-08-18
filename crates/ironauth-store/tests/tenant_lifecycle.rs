@@ -1929,3 +1929,103 @@ async fn revoking_a_management_key_without_an_event_enqueues_nothing() {
         "a revocation with no event must not invent one"
     );
 }
+
+/// Setting and CLEARING the auto-link posture emit the same type, with the field omitted when
+/// cleared.
+///
+/// The auto-link posture decides what happens when a federated identity arrives matching an
+/// existing account -- whether an upstream can silently take over a local one. That is a
+/// security posture rather than a preference, which is why it is announced at all.
+///
+/// The CLEAR is the case that matters: `posture` is OMITTED rather than sent as a sentinel,
+/// mirroring the nullable column and matching the rule the subscription and reparent payloads
+/// set. A consumer reading an invented "none" string could not tell it from a posture actually
+/// named "none".
+#[tokio::test]
+async fn setting_and_clearing_the_auto_link_posture_omit_the_field_when_cleared() {
+    let fixture = Fixture::start().await;
+    let scope = fixture.create_tenant(None).await;
+
+    // The tenant create announces itself; drain before counting.
+    let _ = queued_events(&fixture, scope).await;
+
+    for (posture, event_id) in [
+        (Some("verified_to_verified"), "evt_posture_set"),
+        (None, "evt_posture_clear"),
+    ] {
+        let mut payload = serde_json::json!({});
+        if let Some(posture) = posture {
+            payload["posture"] = serde_json::json!(posture);
+        }
+        let envelope = ironauth_store::event_catalog::envelope(
+            event_id,
+            "environment.auto_link_posture_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            1,
+            &payload,
+        )
+        .expect("environment.auto_link_posture_changed is registered");
+        let subject = scope.environment().to_string();
+
+        fixture
+            .db
+            .control_store()
+            .management()
+            .acting(fixture.actor, CorrelationId::generate(&fixture.env))
+            .environments(fixture.operator, scope.tenant())
+            .set_auto_link_posture_with_event(
+                &fixture.env,
+                &scope.environment(),
+                posture,
+                Some(&ironauth_store::DomainEvent {
+                    id: event_id,
+                    subject: &subject,
+                    envelope: &envelope,
+                }),
+            )
+            .await
+            .expect("set the posture");
+
+        let claimed = fixture
+            .db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &fixture.env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "the change enqueues exactly one event");
+        assert_eq!(
+            claimed[0].payload["type"],
+            "environment.auto_link_posture_changed"
+        );
+        match posture {
+            Some(expected) => {
+                assert_eq!(claimed[0].payload["payload"]["posture"], expected);
+            }
+            None => assert!(
+                claimed[0].payload["payload"].get("posture").is_none(),
+                "a CLEARED posture must omit the field, not send a sentinel: {}",
+                claimed[0].payload
+            ),
+        }
+        ironauth_store::event_catalog::validate_event(&claimed[0].payload)
+            .expect("the envelope validates against the registry the fan-out enforces");
+        for message in &claimed {
+            fixture
+                .db
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&fixture.env, message)
+                .await
+                .expect("complete");
+        }
+    }
+}

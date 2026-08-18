@@ -213,6 +213,28 @@
           "client_id": {
             "minLength": 1,
             "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "client_id",
+          "required"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "client.par_requirement_changed"
+    },
+    {
+      "domain": "client",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
           }
         },
         "required": [
@@ -332,6 +354,22 @@
       },
       "payload_schema_version": 1,
       "type": "dcr_policy.created"
+    },
+    {
+      "domain": "environment",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "posture": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment.auto_link_posture_changed"
     },
     {
       "domain": "environment",

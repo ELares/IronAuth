@@ -17,8 +17,6 @@ keys::create_key
 migration::delete_outbound_verification
 migration::set_outbound_verification
 migration_runs::abandon_migration_run
-postures::set_auto_link_posture
-postures::set_client_par_requirement
 project_grants::create_project_grant
 project_grants::withdraw_project_grant
 promotion::apply_config_promotion
