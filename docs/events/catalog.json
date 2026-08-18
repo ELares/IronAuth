@@ -206,6 +206,24 @@
       "type": "client.deleted"
     },
     {
+      "domain": "client",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "client.verified"
+    },
+    {
       "domain": "connector",
       "payload_schema": {
         "additionalProperties": false,
@@ -273,6 +291,47 @@
       },
       "payload_schema_version": 1,
       "type": "connector.updated"
+    },
+    {
+      "domain": "dcr_initial_access_token",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "initial_access_token_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "initial_access_token_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "dcr_initial_access_token.minted"
+    },
+    {
+      "domain": "dcr_policy",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dcr_policy_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "dcr_policy_id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "dcr_policy.created"
     },
     {
       "domain": "environment",

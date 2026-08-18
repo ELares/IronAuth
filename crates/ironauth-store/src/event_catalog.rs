@@ -481,6 +481,53 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // A schema VERSION was registered, not yet in force. Publishing the version alone --
         // and never the schema body -- keeps the event small and keeps a consumer honest: the
         // registry is the source of truth for the shape, and refetching it is one call.
+        // A DCR policy decides who may self-register a client and on what terms, so a
+        // receiver mirroring registration policy acts on it. The NAME travels with the id
+        // because a policy is referred to by name in an operator's own configuration.
+        "dcr_policy.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "dcr_policy_id": {"type": "string", "minLength": 1},
+                "name": {"type": "string", "minLength": 1}
+            },
+            "required": ["dcr_policy_id", "name"]
+        }"#,
+    ),
+    (
+        // An initial access token was MINTED: a bearer credential that lets its holder
+        // register a client. THE TOKEN ITSELF IS NEVER ON THE WIRE -- it is the credential,
+        // and it is live at exactly this moment. The id is what an operator revokes by.
+        "dcr_initial_access_token.minted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "initial_access_token_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["initial_access_token_id"]
+        }"#,
+    ),
+    (
+        // A dynamically registered client was VERIFIED by an operator: it moves from
+        // self-asserted to vouched-for, which is the transition a downstream policy engine
+        // would gate on. Distinct from `client.deleted` and from any registration event
+        // because nothing about the client CHANGED except an operator's judgement of it.
+        "client.verified",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_id"]
+        }"#,
+    ),
+    (
         "trait_schema.version_created",
         1,
         r#"{

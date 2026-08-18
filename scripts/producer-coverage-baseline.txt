@@ -9,9 +9,6 @@ brands::set_brand
 client_admin_grants::set_client_admin_consent
 client_scopes::set_client_allowed_scopes
 consents::revoke_user_consent
-dcr::create_dcr_policy
-dcr::create_initial_access_token
-dcr::verify_dcr_client
 environments::create_environment
 flow_versions::create_flow_version
 flow_versions::pin_flow_version

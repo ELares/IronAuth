@@ -5783,6 +5783,22 @@ impl ActingClientRepo<'_> {
         id: &ClientId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.verify_dynamic_client_with_event(env, id, idempotency, None)
+            .await
+    }
+
+    /// [`Self::verify_dynamic_client`], additionally emitting `client.verified` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_dynamic_client`].
+    pub async fn verify_dynamic_client_with_event(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -5815,6 +5831,8 @@ impl ActingClientRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -6146,6 +6164,24 @@ impl ActingDcrPolicyRepo<'_> {
         params: NewDcrPolicy<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, id, created_at_micros, params, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `dcr_policy.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        id: &DcrPolicyId,
+        created_at_micros: i64,
+        params: NewDcrPolicy<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -6184,6 +6220,8 @@ impl ActingDcrPolicyRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -6280,6 +6318,24 @@ impl ActingInitialAccessTokenRepo<'_> {
         params: NewInitialAccessToken<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.mint_with_event(env, id, created_at_micros, params, idempotency, None)
+            .await
+    }
+
+    /// [`Self::mint`], additionally emitting `dcr_initial_access_token.minted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::mint`].
+    pub async fn mint_with_event(
+        &self,
+        env: &Env,
+        id: &InitialAccessTokenId,
+        created_at_micros: i64,
+        params: NewInitialAccessToken<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -6323,6 +6379,8 @@ impl ActingInitialAccessTokenRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
