@@ -758,6 +758,70 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The pre-authorization GRANT, the counterpart of `admin_consent.revoked`: it lets a
+        // client SKIP the consent screen, so a consumer mirroring standing authority needs
+        // the widening as well as the narrowing.
+        //
+        // NO grant id, and the asymmetry with the revoke is deliberate. A set is an upsert
+        // that REUSES the existing row's id, resolved inside the write, so the producer holds
+        // only the id it minted -- which is the row id on a first write and a stale invention
+        // on an overwrite. The client is what an operator addressed and what identifies the
+        // pre-authorization; the grant id is an internal handle.
+        "admin_consent.granted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1},
+                "granted_scope": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_id"]
+        }"#,
+    ),
+    (
+        // Whether the client is RESTRICTED, not which scopes it may request. The allowlist is
+        // config a consumer re-reads through the authorized surface; what it cannot re-derive
+        // is that the restriction was turned on or off at all, because a client with no
+        // allowlist and a client allowlisted for everything read the same from a single
+        // scope's point of view.
+        //
+        // An EMPTY allowlist is restricted, and maximally so. It is a real stored value,
+        // distinct from the NULL clear, and a consumer that conflated the two would read the
+        // most restrictive client in the environment as the least.
+        "client.allowed_scopes_set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1},
+                "restricted": {"type": "boolean"}
+            },
+            "required": ["client_id", "restricted"]
+        }"#,
+    ),
+    (
+        // The id-token signing algorithm is what a RELYING PARTY must verify with, so a
+        // consumer that mirrors client config has to learn the change or it keeps verifying
+        // with the old algorithm and rejects every token the client is now issued.
+        //
+        // The JOSE name travels because it IS the fact: a short registered identifier, not a
+        // document, and a consumer told only "something changed" would have to refetch to
+        // learn the one thing this event exists to say.
+        "client.signing_algorithm_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1},
+                "id_token_signed_response_alg": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_id", "id_token_signed_response_alg"]
+        }"#,
+    ),
+    (
         "client.par_requirement_changed",
         1,
         r#"{

@@ -359,3 +359,62 @@ async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<s
         .map(|message| message.payload)
         .collect()
 }
+
+/// Granting an admin pre-authorization emits `admin_consent.granted`, carrying the CLIENT and
+/// not the grant id.
+///
+/// The grant is the widening half of the pair the revocation narrows, so a consumer mirroring
+/// standing authority needs both or it keeps prompting for consent a client may now skip.
+///
+/// No grant id, and the test pins that absence. A set is an upsert that reuses the EXISTING
+/// row's id, resolved inside the write, so a producer that named an id could only be naming
+/// the one it minted -- correct on a first write and a stale invention on an overwrite.
+#[tokio::test]
+async fn granting_an_admin_consent_emits_the_registered_event() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = ClientId::generate(&env, &scope).to_string();
+    let id = ClientAdminGrantId::generate(&env, &scope);
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_consent_granted",
+        "admin_consent.granted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "client_id": client, "granted_scope": "openid profile" }),
+    )
+    .expect("admin_consent.granted is registered");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_admin_grants()
+        .set_with_event(
+            &env,
+            &id,
+            1_000_000,
+            grant(&client, Some("openid profile")),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_consent_granted",
+                subject: &client,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("grant with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the grant enqueues exactly one event");
+    assert_eq!(events[0]["type"], "admin_consent.granted");
+    assert_eq!(events[0]["payload"]["client_id"], client);
+    assert_eq!(events[0]["payload"]["granted_scope"], "openid profile");
+    assert!(
+        events[0]["payload"].get("client_admin_grant_id").is_none(),
+        "a set reuses the existing row id inside the write, so an id here could only be the \
+         one the caller minted: {events:?}"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

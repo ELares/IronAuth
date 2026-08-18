@@ -2012,3 +2012,241 @@ async fn the_control_column_grant_is_load_bearing_for_allowed_scopes() {
     .expect("count audit rows");
     assert_eq!(rows, 1, "only the successful write is audited");
 }
+
+/// Everything queued for the webhook fan-out in `scope`, claimed AND completed.
+async fn drain_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<serde_json::Value> {
+    let env = Env::system();
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}
+
+/// Setting and clearing a client's scope allowlist announce the RESTRICTION, not the list,
+/// and an EMPTY allowlist is announced as restricted.
+///
+/// A consumer can re-read which scopes a client may request through the authorized surface.
+/// What it cannot re-derive is whether the restriction exists at all, because a client with
+/// no allowlist and a client allowlisted for a scope look identical from that scope's point
+/// of view. The empty case is the sharp one: it is a real stored value, maximally
+/// restrictive, and a consumer that read it as the NULL clear would treat the most
+/// restricted client in the environment as the least.
+#[tokio::test]
+async fn setting_and_clearing_a_client_scope_allowlist_announce_the_restriction() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let id = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "allowlist events")
+        .await
+        .expect("create");
+
+    let announce = |restricted: bool, event_id: &str, at: i64| {
+        ironauth_store::event_catalog::envelope(
+            event_id,
+            "client.allowed_scopes_set",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            at,
+            &serde_json::json!({ "client_id": id.to_string(), "restricted": restricted }),
+        )
+        .expect("client.allowed_scopes_set is registered")
+    };
+
+    let setter = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_scope_policies(scope);
+
+    // An EMPTY allowlist: restricted, and maximally so.
+    let empty = announce(true, "evt_allowlist_empty", 1);
+    setter
+        .set_with_event(
+            &env,
+            &id,
+            Some(&[]),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_allowlist_empty",
+                subject: &id.to_string(),
+                envelope: &empty,
+            }),
+        )
+        .await
+        .expect("set an empty allowlist");
+
+    let restricted = drain_events(&db, scope).await;
+    assert_eq!(restricted.len(), 1, "the set announced {restricted:?}");
+    assert_eq!(restricted[0]["type"], "client.allowed_scopes_set");
+    assert_eq!(
+        restricted[0]["payload"]["restricted"], true,
+        "an EMPTY allowlist is a real value and the most restrictive one there is; \
+         announcing it as unrestricted inverts the client's whole policy: {restricted:?}"
+    );
+
+    // The CLEAR: no allowlist, so the client may request anything the floor permits.
+    let cleared_envelope = announce(false, "evt_allowlist_cleared", 2);
+    setter
+        .set_with_event(
+            &env,
+            &id,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_allowlist_cleared",
+                subject: &id.to_string(),
+                envelope: &cleared_envelope,
+            }),
+        )
+        .await
+        .expect("clear the allowlist");
+
+    let cleared = drain_events(&db, scope).await;
+    assert_eq!(cleared.len(), 1, "the clear announced {cleared:?}");
+    assert_eq!(cleared[0]["payload"]["restricted"], false);
+
+    // A set against a client that is not in this scope matches no row, so the store's
+    // rows-affected guard refuses it and nothing is announced.
+    let other = ironauth_store::ClientId::generate(&env, &db.seed_scope(&env).await);
+    let absent = ironauth_store::event_catalog::envelope(
+        "evt_allowlist_absent",
+        "client.allowed_scopes_set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        3,
+        &serde_json::json!({ "client_id": other.to_string(), "restricted": true }),
+    )
+    .expect("client.allowed_scopes_set is registered");
+    let error = setter
+        .set_with_event(
+            &env,
+            &other,
+            Some(&["read:orders".to_owned()]),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_allowlist_absent",
+                subject: &other.to_string(),
+                envelope: &absent,
+            }),
+        )
+        .await
+        .expect_err("a client of another scope is not found");
+    assert!(
+        matches!(error, ironauth_store::StoreError::NotFound),
+        "got {error:?}"
+    );
+    let quiet = drain_events(&db, scope).await;
+    assert!(
+        quiet.is_empty(),
+        "a set that matched no client must announce nothing: {quiet:?}"
+    );
+}
+
+/// A client's id-token signing algorithm announces only a REAL change.
+///
+/// The algorithm is what a relying party verifies with, so a consumer that missed the change
+/// keeps verifying with the old one. The store's write is change-only, and the event inherits
+/// that: writing the same algorithm twice commits nothing new, writes no audit row, and
+/// announces nothing -- a consumer must not see a rotation that did not happen.
+#[tokio::test]
+async fn a_client_signing_algorithm_announces_only_a_real_change() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let id = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "signing events")
+        .await
+        .expect("create");
+
+    let announce = |event_id: &str, at: i64| {
+        ironauth_store::event_catalog::envelope(
+            event_id,
+            "client.signing_algorithm_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            at,
+            &serde_json::json!({
+                "client_id": id.to_string(),
+                "id_token_signed_response_alg": "ES256",
+            }),
+        )
+        .expect("client.signing_algorithm_changed is registered")
+    };
+
+    let first = announce("evt_alg_changed", 1);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .set_id_token_signed_response_alg_with_event(
+            &env,
+            &id,
+            "ES256",
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_alg_changed",
+                subject: &id.to_string(),
+                envelope: &first,
+            }),
+        )
+        .await
+        .expect("set the algorithm");
+
+    let changed = drain_events(&db, scope).await;
+    assert_eq!(changed.len(), 1, "the change announced {changed:?}");
+    assert_eq!(changed[0]["type"], "client.signing_algorithm_changed");
+    assert_eq!(
+        changed[0]["payload"]["id_token_signed_response_alg"], "ES256",
+        "the JOSE name IS the fact; a consumer told only that something changed would have \
+         to refetch to learn the one thing this event exists to say"
+    );
+
+    // The same value again: the change-only write commits nothing new.
+    let repeat = announce("evt_alg_unchanged", 2);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .set_id_token_signed_response_alg_with_event(
+            &env,
+            &id,
+            "ES256",
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_alg_unchanged",
+                subject: &id.to_string(),
+                envelope: &repeat,
+            }),
+        )
+        .await
+        .expect("set the same algorithm again");
+
+    let quiet = drain_events(&db, scope).await;
+    assert!(
+        quiet.is_empty(),
+        "a same-value write changed nothing and must announce nothing: {quiet:?}"
+    );
+}

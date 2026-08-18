@@ -2,8 +2,6 @@
 # SHRINK-ONLY: producer-coverage.py fails if an entry here is already covered or
 # gone, and fails if an uncovered handler is missing from this list. #108 closes
 # when this file is empty. Regenerate with: scripts/producer-coverage.py --update-baseline
-client_admin_grants::set_client_admin_consent
-client_scopes::set_client_allowed_scopes
 consents::revoke_user_consent
 environments::create_environment
 impersonation::authorize_user_impersonation
@@ -11,7 +9,6 @@ keys::create_key
 migration_runs::abandon_migration_run
 promotion::apply_config_promotion
 resource_servers::update_resource_server_permission_claims
-signing_algorithm::set_client_signing_algorithm
 sudo::elevate_sudo
 tenants::delete_tenant
 tenants::purge_tenant

@@ -3167,6 +3167,21 @@ impl ActingClientScopePolicyRepo<'_> {
         id: &ClientId,
         allowed_scopes: Option<&[String]>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, allowed_scopes, None).await
+    }
+
+    /// [`Self::set`], additionally emitting `client.allowed_scopes_set` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        allowed_scopes: Option<&[String]>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -3199,6 +3214,9 @@ impl ActingClientScopePolicyRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction, and AFTER the rows-affected guard: a set that
+                // matched no client announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -5172,6 +5190,27 @@ impl ActingClientRepo<'_> {
         id: &ClientId,
         alg: &str,
     ) -> Result<(), StoreError> {
+        self.set_id_token_signed_response_alg_with_event(env, id, alg, None)
+            .await
+    }
+
+    /// [`Self::set_id_token_signed_response_alg`], additionally emitting
+    /// `client.signing_algorithm_changed` (issue #108).
+    ///
+    /// This is a CHANGE-ONLY write, and the event inherits that: a same-value write commits
+    /// nothing new, writes no audit row, and announces nothing. A consumer therefore never
+    /// sees a signing-algorithm change that did not happen.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_id_token_signed_response_alg`].
+    pub async fn set_id_token_signed_response_alg_with_event(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        alg: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -5226,6 +5265,9 @@ impl ActingClientRepo<'_> {
             target: id,
         };
         insert_audit_row(&mut tx, &spec, None).await?;
+        // In the write's own transaction, and only on the CHANGED path: the no-op branch
+        // above committed and returned before reaching here.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -30181,6 +30223,23 @@ impl ActingClientAdminGrantRepo<'_> {
         created_at_micros: i64,
         params: NewClientAdminGrant<'_>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `admin_consent.granted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &ClientAdminGrantId,
+        created_at_micros: i64,
+        params: NewClientAdminGrant<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -30227,6 +30286,8 @@ impl ActingClientAdminGrantRepo<'_> {
                 .bind(created_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back grant announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
