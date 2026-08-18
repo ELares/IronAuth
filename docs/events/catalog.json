@@ -1324,6 +1324,29 @@
       "type": "permission.updated"
     },
     {
+      "domain": "recovery_approval",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "recovery_flow_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "recovery_flow_id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "recovery_approval.decided"
+    },
+    {
       "domain": "routing_rule",
       "payload_schema": {
         "additionalProperties": false,

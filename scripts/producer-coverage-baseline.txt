@@ -20,8 +20,6 @@ migration_runs::abandon_migration_run
 project_grants::create_project_grant
 project_grants::withdraw_project_grant
 promotion::apply_config_promotion
-recovery_approvals::approve_recovery_approval
-recovery_approvals::reject_recovery_approval
 resource_servers::update_resource_server_permission_claims
 signing_algorithm::set_client_signing_algorithm
 sudo::elevate_sudo

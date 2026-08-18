@@ -523,6 +523,29 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // The SCOPE TOKEN is the address, and the requirement travels with it: `min_acr` and
         // `max_auth_age_secs` are both optional because a policy may constrain either, and
         // each is OMITTED when unset rather than sent as a sentinel.
+        // An operator DECIDED a recovery request: someone locked out of their account either
+        // regains access or does not. One type carrying the decision, because approve and
+        // reject are the same review reaching opposite conclusions -- and a consumer must act
+        // on both, since an approval is an account takeover if the request was fraudulent.
+        //
+        // NO `completed` FIELD, and the omission is forced rather than chosen. Whether the
+        // approval also FINISHED the flow is the store's return value, discovered inside the
+        // write; the producer builds its envelope BEFORE the call and cannot know it. A field
+        // nothing can populate is worse than no field: a consumer would read its absence as
+        // "not completed" rather than "not stated".
+        "recovery_approval.decided",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "recovery_flow_id": {"type": "string", "minLength": 1},
+                "decision": {"type": "string", "minLength": 1}
+            },
+            "required": ["recovery_flow_id", "decision"]
+        }"#,
+    ),
+    (
         "step_up_policy.set",
         1,
         r#"{

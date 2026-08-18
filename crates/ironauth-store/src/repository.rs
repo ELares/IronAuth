@@ -25132,11 +25132,28 @@ impl ActingRecoveryApprovalRepo<'_> {
         flow_id: &RecoveryFlowId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<bool, StoreError> {
+        self.approve_with_event(env, flow_id, idempotency, None)
+            .await
+    }
+
+    /// [`Self::approve`], additionally emitting `recovery_approval.decided` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::approve`].
+    pub async fn approve_with_event(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<bool, StoreError> {
         self.approve_inner(
             env,
             flow_id,
             idempotency,
             ArmedRecoveryApproveFailure::default(),
+            event,
         )
         .await
     }
@@ -25169,7 +25186,9 @@ impl ActingRecoveryApprovalRepo<'_> {
         idempotency: Option<IdempotencyWrite<'_>>,
         at: RecoveryApproveFailurePoint,
     ) -> Result<bool, StoreError> {
-        self.approve_inner(env, flow_id, idempotency, Some(at))
+        // The atomicity probe emits nothing: it forces a failure, and an event there would
+        // announce a decision about to be rolled back.
+        self.approve_inner(env, flow_id, idempotency, Some(at), None)
             .await
     }
 
@@ -25181,6 +25200,7 @@ impl ActingRecoveryApprovalRepo<'_> {
         flow_id: &RecoveryFlowId,
         idempotency: Option<IdempotencyWrite<'_>>,
         poison: ArmedRecoveryApproveFailure,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<bool, StoreError> {
         // Without the `testing` feature the seam type has no inhabited variant, so
         // `poison` cannot be armed and every probe below is compiled out.
@@ -25252,6 +25272,9 @@ impl ActingRecoveryApprovalRepo<'_> {
         }
         #[cfg(feature = "testing")]
         poison_recovery_approve(&mut tx, poison, RecoveryApproveFailurePoint::BeforeCommit).await?;
+        // BEFORE the commit, in the decision's own transaction: a rolled-back approval never
+        // tells a receiver an account was handed back.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(completed.is_some())
     }
@@ -25273,12 +25296,29 @@ impl ActingRecoveryApprovalRepo<'_> {
         flow_id: &RecoveryFlowId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.reject_with_event(env, flow_id, idempotency, None)
+            .await
+    }
+
+    /// [`Self::reject`], additionally emitting `recovery_approval.decided` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reject`].
+    pub async fn reject_with_event(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         self.decide(
             env,
             flow_id,
             "rejected",
             Action::RecoveryApprovalRejected,
             idempotency,
+            event,
         )
         .await
     }
@@ -25291,6 +25331,7 @@ impl ActingRecoveryApprovalRepo<'_> {
         to_state: &str,
         action: Action,
         idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if flow_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -25316,6 +25357,8 @@ impl ActingRecoveryApprovalRepo<'_> {
                 {
                     return Err(StoreError::NotFound);
                 }
+                // In the decision's transaction: a rolled-back reject announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
