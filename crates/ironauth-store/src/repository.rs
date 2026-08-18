@@ -60389,6 +60389,23 @@ impl ActingProjectGrantRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `project_grant.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewProjectGrant<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope
             || spec.client_id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
@@ -60487,6 +60504,8 @@ impl ActingProjectGrantRepo<'_> {
                     .await?;
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -60511,6 +60530,23 @@ impl ActingProjectGrantRepo<'_> {
         id: &ProjectGrantId,
         now_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.withdraw_with_event(env, id, now_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::withdraw`], additionally emitting `project_grant.withdrawn` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::withdraw`].
+    pub async fn withdraw_with_event(
+        &self,
+        env: &Env,
+        id: &ProjectGrantId,
+        now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -60545,6 +60581,8 @@ impl ActingProjectGrantRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

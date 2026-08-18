@@ -533,6 +533,38 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // write; the producer builds its envelope BEFORE the call and cannot know it. A field
         // nothing can populate is worse than no field: a consumer would read its absence as
         // "not completed" rather than "not stated".
+        // A PROJECT GRANT lets a client act for an organization, so a consumer mirroring
+        // delegated authority acts on it. Both ends and the organization: the grant alone does
+        // not say WHO may act for WHOM.
+        "project_grant.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "project_grant_id": {"type": "string", "minLength": 1},
+                "client_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["project_grant_id", "client_id", "organization_id"]
+        }"#,
+    ),
+    (
+        // WITHDRAWN, and its own type: this is the REVOCATION half, the one a receiver
+        // deprovisions on. A consumer that missed it would keep honouring a client's authority
+        // over an organization after an operator took it away.
+        "project_grant.withdrawn",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "project_grant_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["project_grant_id"]
+        }"#,
+    ),
+    (
         "recovery_approval.decided",
         1,
         r#"{
