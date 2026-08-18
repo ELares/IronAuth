@@ -749,7 +749,13 @@ jobs:
             if (raw.trim() === "") { throw new Error("workerd never answered"); }
             const body = JSON.parse(raw);
             if (!body.ok) { throw new Error("failed in workerd: " + body.failed.join(", ")); }
-            if (body.count !== 7) { throw new Error("wrong check count: " + body.count); }
+            // NO hardcoded count here. `smoke.mjs` already compares its run against the
+            // EXPECTED_CHECKS it imports from the suite and reports the mismatch as
+            // `short`, which the next line checks -- so the number is DERIVED from the
+            // suite that defines it and cannot go stale when a check is added. The
+            // literal that used to sit here said 7 while the suite had grown to 22, which
+            // is how this lane came to fail on every branch: the three sibling greps were
+            // removed for exactly this reason and this one was missed.
             if (body.short) { throw new Error("the worker reported a short run"); }
           '
 

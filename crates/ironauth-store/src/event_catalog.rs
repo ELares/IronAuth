@@ -17,9 +17,13 @@
 //! nobody validated.
 //!
 //! So the registry is the list of types PRODUCERS actually emit, declared here beside their
-//! schemas. That makes the count small and honest rather than large and fictional: issue
-//! #108 asks for 100+ types, and reaching it means writing ~100 producers, not renaming an
-//! audit list.
+//! schemas. That makes the count honest rather than large and fictional: every entry cost a
+//! producer, and none of it could have been reached by renaming the audit list.
+//!
+//! The count is no longer the measure, and this module no longer states one -- see the
+//! retirement note on the constant that used to hold it. Coverage is measured against the
+//! management ROUTER by `scripts/producer-coverage.py`, which is the direction that
+//! matters: not how many types exist, but whether any write handler announces nothing.
 //!
 //! # What a registered event promises
 //!
