@@ -47480,6 +47480,23 @@ impl ActingPermissionRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `permission.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewPermission<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47526,6 +47543,8 @@ impl ActingPermissionRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -47569,6 +47588,23 @@ impl ActingPermissionRepo<'_> {
         display_name: Option<&str>,
         metadata: Option<&serde_json::Value>,
     ) -> Result<(), StoreError> {
+        self.update_with_event(env, id, display_name, metadata, None)
+            .await
+    }
+
+    /// [`Self::update`], additionally emitting `permission.updated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::update`].
+    pub async fn update_with_event(
+        &self,
+        env: &Env,
+        id: &PermissionId,
+        display_name: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -47607,6 +47643,8 @@ impl ActingPermissionRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

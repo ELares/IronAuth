@@ -2886,3 +2886,109 @@ async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value
         .map(|message| message.payload)
         .collect()
 }
+
+/// Creating a permission emits `permission.created`, carrying its slug (issue #108).
+///
+/// The slug travels with the id because a permission is referenced by slug in role grants and
+/// in an application's own authorization code, so an event carrying only the id would make a
+/// receiver resolve the name before it could act.
+#[tokio::test]
+async fn creating_a_permission_emits_the_registered_event_with_its_slug() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let permission = ironauth_store::PermissionId::generate(&env, &scope);
+    let subject = permission.to_string();
+
+    let created = ironauth_store::event_catalog::envelope(
+        "evt_permission_created",
+        "permission.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "permission_id": subject, "slug": "reports.read" }),
+    )
+    .expect("permission.created is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .permissions(scope)
+        .create_with_event(
+            &env,
+            NewPermission {
+                id: &permission,
+                slug: "reports.read",
+                display_name: "Read reports",
+                metadata: None,
+            },
+            1_000_000,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_permission_created",
+                subject: &subject,
+                envelope: &created,
+            }),
+        )
+        .await
+        .expect("create with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "permission.created");
+    assert_eq!(events[0]["payload"]["slug"], "reports.read");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Updating a permission is announced as an UPDATE, not as a create.
+///
+/// An update changes the DISPLAY of an existing permission and never its slug, so a consumer
+/// treating it as a create would invent a permission its authorization model does not have.
+/// The seed uses the un-suffixed `create`, which emits nothing, so the only event in the
+/// queue is the update's.
+#[tokio::test]
+async fn updating_a_permission_is_announced_as_an_update_not_a_create() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let permission = create_permission(&db, &env, scope, "reports.read").await;
+    let subject = permission.to_string();
+
+    let updated = ironauth_store::event_catalog::envelope(
+        "evt_permission_updated",
+        "permission.updated",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "permission_id": subject, "slug": "reports.read" }),
+    )
+    .expect("permission.updated is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .permissions(scope)
+        .update_with_event(
+            &env,
+            &permission,
+            Some("Read the reports"),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_permission_updated",
+                subject: &subject,
+                envelope: &updated,
+            }),
+        )
+        .await
+        .expect("update with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the update enqueues exactly one event");
+    assert_eq!(
+        events[0]["type"], "permission.updated",
+        "an update must NOT be announced as a create"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

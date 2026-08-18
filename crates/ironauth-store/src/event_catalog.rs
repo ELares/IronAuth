@@ -213,6 +213,38 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // role that referenced it at once -- one row, and everybody who held it through any
         // role loses it. A receiver mirroring access has more to undo here than for any other
         // event, which is why the slug travels: that is what a policy is written against.
+        // The id and the SLUG, mirroring the delete: a permission is referenced by slug in
+        // role grants and in an application's own authorization code, so an event carrying
+        // only the id would make a receiver resolve the name before it could act.
+        "permission.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "permission_id": {"type": "string", "minLength": 1},
+                "slug": {"type": "string", "minLength": 1}
+            },
+            "required": ["permission_id", "slug"]
+        }"#,
+    ),
+    (
+        // Its own type: an update changes the DISPLAY of an existing permission and never its
+        // slug, so a consumer that treated this as a create would invent a permission its
+        // authorization model does not have.
+        "permission.updated",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "permission_id": {"type": "string", "minLength": 1},
+                "slug": {"type": "string", "minLength": 1}
+            },
+            "required": ["permission_id", "slug"]
+        }"#,
+    ),
+    (
         "permission.deleted",
         1,
         r#"{

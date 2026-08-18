@@ -47,8 +47,6 @@ org_roles::set_org_default_role
 org_roles::update_org_role
 organizations::disable_organization
 organizations::enable_organization
-permissions::create_permission
-permissions::update_permission
 personal_access_tokens::create_user_personal_access_token
 personal_access_tokens::rotate_user_personal_access_token
 postures::set_auto_link_posture
