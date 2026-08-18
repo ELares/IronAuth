@@ -568,12 +568,13 @@ pub async fn create_identity_import(
             response_status: 202,
             response_body: &body_string,
         };
+        let pending = identity_import_event(&state, scope, &minted.to_string(), None);
         match state
             .store()
             .scoped(scope)
             .acting(actor, CorrelationId::generate(state.env()))
             .migration_runs()
-            .create_with_id(
+            .create_with_id_with_event(
                 state.env(),
                 &minted,
                 NewMigrationRun {
@@ -587,6 +588,10 @@ pub async fn create_identity_import(
                 },
                 created_at_micros,
                 Some(write),
+                pending
+                    .as_ref()
+                    .map(crate::events::PendingEvent::domain_event)
+                    .as_ref(),
             )
             .await
         {
@@ -714,12 +719,26 @@ pub async fn resume_identity_import(
     // every declared record but could not complete) takes the state machine's own back
     // edge before more records are ingested.
     if run.state == MigrationState::Reconciling {
+        let pending = identity_import_event(
+            &state,
+            scope,
+            &run_id.to_string(),
+            Some(MigrationState::Running.as_str()),
+        );
         state
             .store()
             .scoped(scope)
             .acting(actor, CorrelationId::generate(state.env()))
             .migration_runs()
-            .transition(state.env(), &run_id, MigrationState::Running)
+            .transition_with_event(
+                state.env(),
+                &run_id,
+                MigrationState::Running,
+                pending
+                    .as_ref()
+                    .map(crate::events::PendingEvent::domain_event)
+                    .as_ref(),
+            )
             .await?;
     }
 
@@ -732,6 +751,53 @@ pub async fn resume_identity_import(
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::ACCEPTED, body_string))
+}
+
+/// The event a bulk identity import emits (issue #108).
+///
+/// `state` present means the run MOVED; absent means it was ACCEPTED. The create announces the
+/// run beginning rather than its outcome, which is not knowable when the request returns.
+///
+/// NO COUNTS AND NO RECORDS. An import's progress belongs to the run resource an operator
+/// polls; putting a snapshot on the wire would publish a number that is stale before it is
+/// delivered, and the records themselves are the identities being imported.
+///
+/// The transition is ONE type with a state rather than one per edge, so the state machine can
+/// gain a state without minting a new event type -- which would otherwise make a purely
+/// internal addition a breaking registry change.
+fn identity_import_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    run_id: &str,
+    to_state: Option<&str>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!(
+        "evt_{}",
+        ironauth_store::CorrelationId::generate(state.env())
+    );
+    let (event_type, payload) = match to_state {
+        Some(to) => (
+            "identity_import.state_changed",
+            serde_json::json!({ "migration_run_id": run_id, "state": to }),
+        ),
+        None => (
+            "identity_import.created",
+            serde_json::json!({ "migration_run_id": run_id }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: run_id.to_owned(),
+        envelope,
+    })
 }
 
 #[cfg(test)]

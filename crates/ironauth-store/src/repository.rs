@@ -59508,6 +59508,24 @@ impl ActingMigrationRunRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_id_with_event(env, id, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create_with_id`], additionally emitting `identity_import.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_with_id`].
+    pub async fn create_with_id_with_event(
+        &self,
+        env: &Env,
+        id: &MigrationRunId,
+        spec: NewMigrationRun<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -59547,6 +59565,8 @@ impl ActingMigrationRunRepo<'_> {
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -59570,6 +59590,21 @@ impl ActingMigrationRunRepo<'_> {
         env: &Env,
         run_id: &MigrationRunId,
         to: MigrationState,
+    ) -> Result<(), StoreError> {
+        self.transition_with_event(env, run_id, to, None).await
+    }
+
+    /// [`Self::transition`], additionally emitting `identity_import.state_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::transition`].
+    pub async fn transition_with_event(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+        to: MigrationState,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if run_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -59606,6 +59641,8 @@ impl ActingMigrationRunRepo<'_> {
                 .bind(scope.environment().to_string())
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

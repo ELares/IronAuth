@@ -894,3 +894,142 @@ async fn a_schema_migration_job_wrapped_in_the_machine_blocks_on_failed_identiti
     let named: HashSet<String> = offenders.into_iter().map(|o| o.subject).collect();
     assert_eq!(named, failed, "the API names exactly the failed identities");
 }
+
+/// Claim the one webhook event outstanding in `scope`, completing it so the ordering key is
+/// released for the next.
+async fn claim_one_event(db: &TestDatabase, env: &Env, scope: Scope) -> serde_json::Value {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "expected exactly one queued event");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().next().expect("one message").payload
+}
+
+/// A run's acceptance and its transitions are distinct types.
+///
+/// The create announces the run BEGINNING, not its outcome, which is not knowable when the
+/// request returns. The transition carries the state it moved TO -- one type with a state
+/// rather than one per edge, so the state machine can gain a state without minting a new event
+/// type and making a purely internal addition a breaking registry change.
+///
+/// No counts on either: an import's progress belongs to the run resource an operator polls,
+/// and a snapshot on the wire would publish a number that is stale before it is delivered. The
+/// test asserts the declared totals are absent.
+#[tokio::test]
+async fn a_runs_acceptance_and_its_transitions_are_distinct_types() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let run = MigrationRunId::generate(&env, &scope);
+    let run_text = run.to_string();
+
+    let created = ironauth_store::event_catalog::envelope(
+        "evt_import_created",
+        "identity_import.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "migration_run_id": run_text }),
+    )
+    .expect("identity_import.created is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(
+            actor(db.store(), &env, scope),
+            CorrelationId::generate(&env),
+        )
+        .migration_runs()
+        .create_with_id_with_event(
+            &env,
+            &run,
+            NewMigrationRun {
+                kind: MigrationKind::BulkImport,
+                source_total: 4242,
+                backfill_expected: 0,
+                subject_ref: None,
+            },
+            NOW_MICROS,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_import_created",
+                subject: &run_text,
+                envelope: &created,
+            }),
+        )
+        .await
+        .expect("create run with event");
+
+    let first = claim_one_event(&db, &env, scope).await;
+    assert_eq!(first["type"], "identity_import.created");
+    assert_eq!(first["payload"]["migration_run_id"], run_text);
+    ironauth_store::event_catalog::validate_event(&first)
+        .expect("the envelope validates against the registry the fan-out enforces");
+    assert!(
+        !first.to_string().contains("4242"),
+        "the event published the declared total, which is stale before delivery: {first}"
+    );
+
+    let moved = ironauth_store::event_catalog::envelope(
+        "evt_import_moved",
+        "identity_import.state_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({
+            "migration_run_id": run_text,
+            "state": MigrationState::Validating.as_str(),
+        }),
+    )
+    .expect("identity_import.state_changed is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(
+            actor(db.store(), &env, scope),
+            CorrelationId::generate(&env),
+        )
+        .migration_runs()
+        .transition_with_event(
+            &env,
+            &run,
+            MigrationState::Validating,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_import_moved",
+                subject: &run_text,
+                envelope: &moved,
+            }),
+        )
+        .await
+        .expect("transition with event");
+
+    let second = claim_one_event(&db, &env, scope).await;
+    assert_eq!(
+        second["type"], "identity_import.state_changed",
+        "a transition must NOT be announced as an acceptance"
+    );
+    assert_eq!(
+        second["payload"]["state"],
+        MigrationState::Validating.as_str(),
+        "the event must carry the state the transition WROTE, not a fixed value"
+    );
+    ironauth_store::event_catalog::validate_event(&second)
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

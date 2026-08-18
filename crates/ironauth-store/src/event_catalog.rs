@@ -503,6 +503,41 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // NEVER THE SINK CREDENTIAL. A stream carries the secret its deliveries authenticate
         // with, sealed at rest and stripped from the read surface; a webhook is a wider
         // audience than that surface.
+        // A bulk identity import was ACCEPTED. Long-running, so this announces the run
+        // beginning rather than its outcome -- which is not knowable when the request returns.
+        //
+        // No counts and no records: an import's progress belongs to the run resource an
+        // operator polls, and putting a snapshot of it on the wire would publish a number
+        // that is stale before it is delivered.
+        "identity_import.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "migration_run_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["migration_run_id"]
+        }"#,
+    ),
+    (
+        // The run MOVED, carrying the state it moved to. One type with a state rather than one
+        // per transition: a consumer tracking "is this import still going" reads one field,
+        // and the state machine can gain a state without minting a new event type -- which
+        // would otherwise be a breaking registry change for a purely internal addition.
+        "identity_import.state_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "migration_run_id": {"type": "string", "minLength": 1},
+                "state": {"type": "string", "minLength": 1}
+            },
+            "required": ["migration_run_id", "state"]
+        }"#,
+    ),
+    (
         "log_stream.created",
         1,
         r#"{

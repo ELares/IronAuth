@@ -13,8 +13,6 @@ environments::create_environment
 flow_versions::create_flow_version
 flow_versions::pin_flow_version
 impersonation::authorize_user_impersonation
-imports::create_identity_import
-imports::resume_identity_import
 keys::create_key
 migration::delete_outbound_verification
 migration::set_outbound_verification

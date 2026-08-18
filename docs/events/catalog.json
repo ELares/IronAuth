@@ -447,6 +447,47 @@
       "type": "environment_variable.set"
     },
     {
+      "domain": "identity_import",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "migration_run_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "migration_run_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "identity_import.created"
+    },
+    {
+      "domain": "identity_import",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "migration_run_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "state": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "migration_run_id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "identity_import.state_changed"
+    },
+    {
       "domain": "invitation",
       "payload_schema": {
         "additionalProperties": false,
