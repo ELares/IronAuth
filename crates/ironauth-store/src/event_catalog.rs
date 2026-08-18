@@ -2215,12 +2215,21 @@ const TENANT_SCOPED: &[&str] = &[
     "tenant.suspended",
 ];
 
-/// The number of event types issue #108 asks the catalog to reach before it closes.
-///
-/// Stated as a constant the tests read so the gap is a NUMBER somebody can see rather than a
-/// sentence in an issue. Reaching it means writing producers; see the module note on why it
-/// cannot be reached by renaming the audit list.
-pub const TARGET_REGISTERED_TYPES: usize = 100;
+// RETIRED: `TARGET_REGISTERED_TYPES`, issue #108's count-based reminder that the catalog was
+// incomplete. It was reached, which is exactly the moment its own failure message said to
+// retire it rather than raise it.
+//
+// A COUNT was the right instrument while the catalog was empty and the question was "has
+// anybody written producers yet". It is the wrong one now, and raising it would have been
+// worse than useless: a higher number is not a stronger claim, because nothing ties any
+// particular count to coverage. Twenty more types about one subsystem would clear any bar a
+// count can set while leaving a whole surface silent.
+//
+// What replaced it measures the thing the count was standing in for. `scripts/producer-
+// coverage.py` walks the management router, finds every write handler, and requires each one
+// to reach a producer; it is a shrink-only ratchet wired into `scripts/gate.sh` and CI, and
+// its baseline is now EMPTY (126/126). A new write handler that announces nothing fails that
+// gate on the pull request that adds it -- which is the guarantee a number never gave.
 
 /// One registered event type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2418,7 +2427,7 @@ mod tests {
     /// PRODUCERS, and this fails loudly the day somebody believes it was reached by
     /// renaming something.
     #[test]
-    fn the_registry_is_non_empty_distinct_and_reports_its_distance_to_the_target() {
+    fn the_registry_is_non_empty_and_no_two_types_share_a_wire_string() {
         let types = event_types();
         assert!(!types.is_empty(), "the registry is empty");
         let mut sorted = types.clone();
@@ -2429,21 +2438,55 @@ mod tests {
             types.len(),
             "two event types share a wire string"
         );
-        assert!(
-            types.len() < TARGET_REGISTERED_TYPES,
-            "the registry reached {} types, at or past issue #108's target of \
-             {TARGET_REGISTERED_TYPES}. Raise or retire TARGET_REGISTERED_TYPES and say so \
-             in the issue: the target is a reminder that the catalog is incomplete, and a \
-             reminder nobody updates is a reminder that lies.",
-            types.len()
-        );
+        // No count assertion here any more; see the retirement note on the constant it used
+        // to read. Coverage is measured against the ROUTER by `scripts/producer-coverage.py`,
+        // which a count could never do. What stays here is what a registry can check about
+        // itself: it is non-empty, and no two types share a wire string.
     }
+
+    /// English past forms that do NOT end in `-ed`, listed exactly.
+    ///
+    /// The rule below tests PAST TENSE and, for its first twenty types, tested it by asking
+    /// whether the word ended in `-ed`. That proxy was right about those twenty and is wrong
+    /// about English: `set`, `withdrawn`, `resent` and `sent` are past forms, and a
+    /// compound like `assigned_to_group` carries its past form in the head verb. A guard
+    /// that rejects them is not enforcing the rule it states -- it is enforcing a spelling.
+    ///
+    /// Listed as EXACT wire strings rather than relaxed into a smarter pattern, because the
+    /// defect the rule exists to catch is a type slipping back into the audit vocabulary
+    /// (`user.create`, `brand.delete`). An exception has to be typed out here, where a
+    /// reviewer reads it beside the others, and `create` never will be.
+    const IRREGULAR_PAST_FORMS: &[&str] = &[
+        // `set` (set/set/set), for the upsert family: these writes install a value rather
+        // than distinguishing a create from an update, and the type says so.
+        "brand.set",
+        "brand_asset.set",
+        "client.allowed_scopes_set",
+        "environment_secret.set",
+        "environment_variable.set",
+        "locale_bundle.set",
+        "organization.default_role_set",
+        "signup_form.set",
+        "step_up_policy.set",
+        // `withdrawn` (withdraw/withdrew/withdrawn) and `resent` (resend/resent/resent).
+        "invitation.resent",
+        "project_grant.withdrawn",
+        // Compounds whose PAST form is the head verb, followed by the preposition the fact
+        // needs: `assigned to`, not `assignment`.
+        "org_role.assigned_to_group",
+        "org_role.assigned_to_member",
+        "org_role.unassigned_from_group",
+        "org_role.unassigned_from_member",
+    ];
 
     /// Every registered type is a dotted, `snake_case` token in the PAST TENSE.
     ///
     /// The past tense is the vocabulary rule that keeps this list from drifting back into
     /// the audit vocabulary, which is imperative (`user.create`). Asserted rather than
     /// documented, because that drift is the defect this module was born from.
+    ///
+    /// Regular forms are checked by their `-ed` ending; irregular ones are listed in
+    /// [`IRREGULAR_PAST_FORMS`], which is where the reasoning for each lives.
     #[test]
     fn every_registered_type_is_a_dotted_past_tense_token() {
         for wire in event_types() {
@@ -2460,10 +2503,12 @@ mod tests {
                 "`{wire}` is not a snake_case dotted token"
             );
             assert!(
-                rest.ends_with("ed"),
+                rest.ends_with("ed") || IRREGULAR_PAST_FORMS.contains(&wire.as_str()),
                 "`{wire}` is not past tense. An event records what BECAME TRUE; the \
                  imperative form is the AUDIT vocabulary, and conflating the two is the \
-                 defect this rule exists to prevent."
+                 defect this rule exists to prevent. If this IS a past form that simply \
+                 does not end in -ed, add it to IRREGULAR_PAST_FORMS with the verb it comes \
+                 from -- do not relax the ending test, which is what stops `create` here."
             );
         }
     }
