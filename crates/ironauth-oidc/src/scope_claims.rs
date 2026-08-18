@@ -118,6 +118,29 @@ pub fn parse_scope_set(scope: Option<&str>) -> BTreeSet<String> {
         .collect()
 }
 
+/// The claims no mapping, hook or target may set (issue #113 criterion 5).
+///
+/// These five are the token's IDENTITY and its VALIDITY WINDOW, and every verifier in the
+/// world checks them. If a mapping could set `iss`, a token could claim to come from another
+/// issuer; if it could set `aud`, a token minted for one resource server would be accepted by
+/// another; if it could set `exp` or `iat`, an expiry becomes whatever the caller wants,
+/// which is the same as no expiry at all. `sub` decides WHO the token is about.
+///
+/// Enforced HERE because this is the one shared claim-release function every surface uses.
+/// Criterion 5 says protected claims cannot be overridden "by any mapping or hook" -- the
+/// declarative mapper, a CEL expression and a sync flow target returning mutated data are
+/// three different paths, and a check per path is a check the next path forgets. One choke
+/// point is the only shape that makes "any" true.
+///
+/// `sub` was already refused here, in two separate places. The other four were not.
+pub const PROTECTED_CLAIMS: [&str; 5] = ["iss", "sub", "aud", "exp", "iat"];
+
+/// Whether `name` is a claim no mapping may set.
+#[must_use]
+pub fn is_protected_claim(name: &str) -> bool {
+    PROTECTED_CLAIMS.contains(&name)
+}
+
 /// Assemble the released standard claims (OIDC Core 5.4 and 5.5), from the user's
 /// stored claim `bag`, the `granted_scopes`, and the matching `claims`-request
 /// member (`requested`, empty when the request carried no `claims` parameter).
@@ -148,7 +171,9 @@ pub fn assemble_claims(
 
     // 1. Scope-derived claims: release each present member (no value filter).
     for name in scope_claim_names(granted_scopes) {
-        if name == "sub" {
+        // Refused rather than released: see PROTECTED_CLAIMS. A scope that named one of
+        // these would otherwise let scope configuration rewrite the token's identity.
+        if is_protected_claim(name) {
             continue;
         }
         if let Some(value) = bag.get(name) {
@@ -160,7 +185,10 @@ pub fn assemble_claims(
     //    any pinned value/values filter. This can add a claim no scope selected,
     //    or narrow one a scope already released.
     for (name, spec) in requested {
-        if name == "sub" {
+        // The same refusal on the explicit-request path. This is the one an attacker
+        // actually reaches: a claims request is caller-supplied, so without this a client
+        // could ask for `aud` and have it released from the bag.
+        if is_protected_claim(name) {
             continue;
         }
         match bag.get(name) {
@@ -310,6 +338,123 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for name in &all {
             assert!(seen.insert(name), "duplicate {name}");
+        }
+    }
+
+    /// NO protected claim is released, whichever path asks for it (issue #113 criterion 5).
+    ///
+    /// Driven over all five and over BOTH paths, because they are reached differently: a
+    /// scope-derived release comes from configuration, and an explicitly requested claim comes
+    /// from the CALLER. The second is the one an attacker actually controls -- a claims
+    /// request is caller-supplied, so without the guard a client could ask for `aud` and have
+    /// it released from the bag.
+    ///
+    /// Asserted as a loop over the constant rather than five hand-written cases, so a claim
+    /// added to `PROTECTED_CLAIMS` is covered the moment it is added. A hand-written list beside
+    /// an exhaustive constant is the shape that silently stops covering what it names.
+    #[test]
+    fn no_protected_claim_is_ever_released() {
+        let mut bag = Map::new();
+        for name in PROTECTED_CLAIMS {
+            bag.insert(name.to_owned(), Value::String(format!("attacker-{name}")));
+        }
+        // A claim that is NOT protected, so the test cannot pass by releasing nothing at all.
+        bag.insert(
+            "email".to_owned(),
+            Value::String("person@example.test".to_owned()),
+        );
+
+        // Path 1: scope-derived. Note what this can and cannot prove -- see the
+        // scope-table test below, which is what actually establishes this path's safety.
+        let scopes: BTreeSet<String> = ["openid", "profile", "email"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let released = assemble_claims(&bag, &scopes, &std::collections::BTreeMap::new());
+        for name in PROTECTED_CLAIMS {
+            assert!(
+                !released.contains_key(name),
+                "{name} was released through the scope path; a mapping that can set it can \
+                 rewrite the token's identity or its expiry"
+            );
+        }
+        assert_eq!(
+            released.get("email"),
+            Some(&Value::String("person@example.test".to_owned())),
+            "an unprotected claim must still be released, or this test passes for a function \
+             that releases nothing"
+        );
+
+        // Path 2: EXPLICITLY requested, which is the caller-controlled one.
+        let requested: std::collections::BTreeMap<String, ClaimSpec> = PROTECTED_CLAIMS
+            .iter()
+            .map(|name| ((*name).to_owned(), ClaimSpec::default()))
+            .collect();
+        let released = assemble_claims(&bag, &BTreeSet::new(), &requested);
+        for name in PROTECTED_CLAIMS {
+            assert!(
+                !released.contains_key(name),
+                "{name} was released through the explicit claims request, which is the path a \
+                 client controls"
+            );
+        }
+    }
+
+    /// The floor holds in the two OTHER places that already carry a protected-claim list.
+    ///
+    /// Three lists guard overlapping things and they were written independently: this
+    /// module's `PROTECTED_CLAIMS` (the five criterion 5 names, at the claim-RELEASE point),
+    /// `tokens::PROTECTED_ACCESS_TOKEN_CLAIMS` (the token-MINT fold), and
+    /// `ironauth_config::RESERVED_ENRICHMENT_CLAIMS` (refused at CONFIG LOAD for the
+    /// enrichment hook). Both of the others are supersets today. Nothing said they had to
+    /// stay that way, and a list is exactly the artifact that gets edited by someone solving
+    /// a different problem -- a name removed from the mint fold to let some claim through
+    /// would silently drop the floor with it.
+    ///
+    /// Asserted as a subset relation rather than by copying names, so this keeps meaning what
+    /// it says as all three lists grow. It deliberately does NOT require them to be EQUAL:
+    /// the other two are broader on purpose (they cover `jti`, `cnf`, `permissions` and more),
+    /// and demanding equality would force unrelated names into the criterion's five.
+    #[test]
+    fn the_other_protected_claim_lists_are_supersets_of_this_floor() {
+        for name in PROTECTED_CLAIMS {
+            assert!(
+                crate::tokens::PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name),
+                "{name} is a protected claim at release but not at the token-mint fold; the \
+                 mint fold is the second fence and must not be narrower than the first"
+            );
+            assert!(
+                ironauth_config::RESERVED_ENRICHMENT_CLAIMS.contains(&name),
+                "{name} is a protected claim at release but an enrichment allowlist could \
+                 name it; config load is where that hook is refused, and it must not be \
+                 narrower than the floor"
+            );
+        }
+    }
+
+    /// No scope's claim table names a protected claim.
+    ///
+    /// This is what actually makes the scope-derived path safe TODAY, and it is worth stating
+    /// separately because the guard inside `assemble_claims` cannot be observed to fire on
+    /// that path: `scope_claim_names` returns `&'static str` drawn from these fixed tables, so
+    /// a protected claim can never reach the guard there. An assertion that the scope path
+    /// releases no protected claim is therefore VACUOUS -- it passes whether or not the guard
+    /// exists, which makes it worse than no test, since it reads like coverage.
+    ///
+    /// This assertion is not vacuous: it fails the moment someone adds `exp` to a scope's
+    /// claim set. The guard in `assemble_claims` stays regardless, because #113's declarative
+    /// mapping layer makes claim placement CONFIGURABLE, and on that day the scope path stops
+    /// being static and the guard becomes the thing standing between config and the token.
+    #[test]
+    fn no_scope_claim_table_names_a_protected_claim() {
+        for scope in CLAIM_BEARING_SCOPES {
+            for name in claims_for_scope(scope) {
+                assert!(
+                    !is_protected_claim(name),
+                    "scope `{scope}` releases the protected claim `{name}`; a scope grant \
+                     would then rewrite the token's identity or its validity window"
+                );
+            }
         }
     }
 }

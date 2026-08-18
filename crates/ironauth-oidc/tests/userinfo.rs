@@ -46,9 +46,20 @@ async fn issue_tokens(
     scope: &str,
     claims_param: Option<&str>,
 ) -> (String, String, String) {
+    issue_tokens_with_document(harness, scope, claims_param, CLAIMS_JSON).await
+}
+
+/// As [`issue_tokens`], but with the user's stored claim DOCUMENT chosen by the caller,
+/// so a test can seed a document that tries to state protected claims.
+async fn issue_tokens_with_document(
+    harness: &Harness,
+    scope: &str,
+    claims_param: Option<&str>,
+    claims_json: &str,
+) -> (String, String, String) {
     let client_id = harness.client_id().to_string();
     let subject = harness
-        .seed_user_with_claims(&unique_identifier(harness), SEED_PASSWORD, CLAIMS_JSON)
+        .seed_user_with_claims(&unique_identifier(harness), SEED_PASSWORD, claims_json)
         .await;
     harness.grant_consent(&subject, &client_id).await;
     let cookie = harness.session_cookie(&subject).await;
@@ -749,4 +760,74 @@ async fn seed_opaque_token_with_audience(
         .expect("record opaque token");
     assert!(matches!(outcome, ironauth_store::RedeemOutcome::Consumed));
     token
+}
+
+/// A user's stored claim document cannot state a protected claim, on either release path
+/// (issue #113 criterion 5).
+///
+/// The document is the part of the claim bag furthest from the issuer's control: it is
+/// per-user data, and any federation mapper, admin write or self-service profile edit that
+/// lands in it becomes an input to claim release. So it is the honest adversary for the
+/// "cannot be overridden by any mapping" requirement.
+///
+/// Checked at `UserInfo` specifically. The ID token has a SECOND fence -- the mint fold filters
+/// `PROTECTED_ACCESS_TOKEN_CLAIMS` out of the extra bag -- so an ID-token assertion would pass
+/// even with the release-point guard removed, and would be measuring the wrong fence. `UserInfo`
+/// has no such fold: what `assemble_claims` releases is what the response carries. `exp` is
+/// the one that mattered in practice, since a client reading `exp` from a `UserInfo` response
+/// gets a lifetime the issuer never stated.
+#[tokio::test]
+async fn a_stored_claim_document_cannot_state_protected_claims_at_userinfo() {
+    let harness = Harness::start().await;
+    // A document that tries to state all five, plus a legitimate `name` so the assertions
+    // cannot pass by releasing nothing at all.
+    let poisoned = r#"{
+        "name": "Ada Lovelace",
+        "iss": "https://evil.test",
+        "sub": "attacker-chosen-subject",
+        "aud": "some-other-resource-server",
+        "exp": 99999999999,
+        "iat": 1
+    }"#;
+    let (_subject, access, id_token) =
+        issue_tokens_with_document(&harness, "openid profile", None, poisoned).await;
+
+    // Path 1: scope-derived release only.
+    let (status, _, body) = userinfo(&harness, "GET", Some(&access), None, None).await;
+    assert_eq!(status, StatusCode::OK, "userinfo: {body}");
+    let claims = json(&body);
+    assert_eq!(
+        claims["name"], "Ada Lovelace",
+        "an unprotected claim must still be released, or this test proves nothing"
+    );
+    for name in ["iss", "aud", "exp", "iat"] {
+        assert!(
+            claims.get(name).is_none(),
+            "{name} reached the UserInfo response from the user's stored document: {body}"
+        );
+    }
+    // `sub` is present but is the ISSUER's, derived through the shared subject function --
+    // never the document's. Asserted against the ID token's, which is byte-identical.
+    let id_sub = payload_claims(&id_token)["sub"]
+        .as_str()
+        .expect("id sub")
+        .to_owned();
+    assert_eq!(claims["sub"].as_str(), Some(id_sub.as_str()));
+    assert_ne!(claims["sub"], "attacker-chosen-subject");
+
+    // Path 2: the CALLER-CONTROLLED one -- an explicit claims request naming all five.
+    let requested = r#"{"userinfo":{"iss":null,"sub":null,"aud":null,"exp":null,"iat":null}}"#;
+    let (_subject, access, _id) =
+        issue_tokens_with_document(&harness, "openid profile", Some(requested), poisoned).await;
+    let (status, _, body) = userinfo(&harness, "GET", Some(&access), None, None).await;
+    assert_eq!(status, StatusCode::OK, "userinfo: {body}");
+    let claims = json(&body);
+    for name in ["iss", "aud", "exp", "iat"] {
+        assert!(
+            claims.get(name).is_none(),
+            "{name} was released through an explicit claims request, the path a client \
+             controls: {body}"
+        );
+    }
+    assert_ne!(claims["sub"], "attacker-chosen-subject");
 }
