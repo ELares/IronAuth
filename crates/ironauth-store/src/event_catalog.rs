@@ -513,6 +513,40 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // that client's authorize leg, so a consumer mirroring client hardening posture acts
         // on it -- and one type with the boolean rather than a required/not-required pair,
         // matching the other two-direction flags in this registry.
+        // A routing rule decides WHICH UPSTREAM a login is sent to, so a consumer mirroring
+        // federation topology acts on it. The rule and its organization connection are both
+        // carried: the rule alone does not say where it routes.
+        "routing_rule.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "routing_rule_id": {"type": "string", "minLength": 1},
+                "org_connection_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["routing_rule_id", "org_connection_id"]
+        }"#,
+    ),
+    (
+        // Domain verification is the GATE on a routing rule taking effect: an unverified
+        // domain must not silently route anyone's login to an upstream. One type with the
+        // boolean, because verifying and un-verifying are the same check reaching opposite
+        // conclusions -- and a consumer needs to act on BOTH, since losing verification is
+        // what stops a rule routing.
+        "routing_rule.domain_verification_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "routing_rule_id": {"type": "string", "minLength": 1},
+                "verified": {"type": "boolean"}
+            },
+            "required": ["routing_rule_id", "verified"]
+        }"#,
+    ),
+    (
         "client.par_requirement_changed",
         1,
         r#"{

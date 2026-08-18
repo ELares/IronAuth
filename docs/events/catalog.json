@@ -1324,6 +1324,51 @@
       "type": "permission.updated"
     },
     {
+      "domain": "routing_rule",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "org_connection_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "routing_rule_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "routing_rule_id",
+          "org_connection_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "routing_rule.created"
+    },
+    {
+      "domain": "routing_rule",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "routing_rule_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "verified": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "routing_rule_id",
+          "verified"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "routing_rule.domain_verification_changed"
+    },
+    {
       "domain": "session",
       "payload_schema": {
         "additionalProperties": false,

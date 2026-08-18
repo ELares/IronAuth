@@ -31137,6 +31137,22 @@ impl ActingRoutingRuleRepo<'_> {
         id: &RoutingRuleId,
         verified: bool,
     ) -> Result<(), StoreError> {
+        self.record_domain_verification_with_event(env, id, verified, None)
+            .await
+    }
+
+    /// [`Self::record_domain_verification`], additionally emitting `routing_rule.domain_verification_changed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::record_domain_verification`].
+    pub async fn record_domain_verification_with_event(
+        &self,
+        env: &Env,
+        id: &RoutingRuleId,
+        verified: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -31178,6 +31194,8 @@ impl ActingRoutingRuleRepo<'_> {
                 if updated.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             // Not poison-after-audit: this write changes one rule's verification state and
@@ -31205,6 +31223,23 @@ impl ActingRoutingRuleRepo<'_> {
         id: &RoutingRuleId,
         created_at_micros: i64,
         params: NewRoutingRule<'_>,
+    ) -> Result<(), StoreError> {
+        self.create_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `routing_rule.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        id: &RoutingRuleId,
+        created_at_micros: i64,
+        params: NewRoutingRule<'_>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope || params.org_connection_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -31284,6 +31319,8 @@ impl ActingRoutingRuleRepo<'_> {
                     Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
                     Err(error) => return Err(error.into()),
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
