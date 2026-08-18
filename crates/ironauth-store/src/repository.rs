@@ -39269,6 +39269,48 @@ impl MessageTemplateRepo<'_> {
             })
             .collect()
     }
+
+    /// Resolve the template for one `kind` and requested locale, or [`None`] when no override
+    /// exists at any level.
+    ///
+    /// [`None`] means "use the template IronAuth ships", which is why resolution cannot fail:
+    /// the DEFAULT level is code, not a row. A caller that treated `None` as an error would
+    /// refuse to send mail for the overwhelmingly common case of a tenant that never authored
+    /// an override.
+    ///
+    /// The DECISION is `message_template::resolve_template`'s, unchanged and untouched. This
+    /// method reads candidates and hands them over; it exists so a caller does not have to
+    /// know that resolution takes candidates rather than a scope, and it adds no rule of its
+    /// own. If it ever did, there would be two resolution paths and they would disagree.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve(
+        &self,
+        kind: &str,
+        requested: &crate::message_template::Locale,
+        default_locale: &crate::message_template::Locale,
+    ) -> Result<Option<crate::message_template::ResolvedTemplate>, StoreError> {
+        let stored = self.candidates_for(kind).await?;
+        // The body handle is the ROW ID. `message_template` treats it as opaque and never
+        // inspects it, so the store is free to choose what it means -- and choosing the id
+        // means a caller holding a resolution can fetch exactly the row that produced it,
+        // rather than re-running resolution and hoping it lands the same way.
+        let candidates: Vec<crate::message_template::TemplateCandidate> = stored
+            .iter()
+            .map(|record| crate::message_template::TemplateCandidate {
+                level: record.level,
+                locale: crate::message_template::Locale::new(&record.locale),
+                body_ref: record.id.to_string(),
+            })
+            .collect();
+        Ok(crate::message_template::resolve_template(
+            &candidates,
+            requested,
+            default_locale,
+        ))
+    }
 }
 
 /// Log stream configuration.

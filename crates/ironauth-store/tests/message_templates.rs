@@ -341,3 +341,148 @@ async fn the_lock_flag_round_trips() {
         "a locked override must read back locked, or #619's combinator has nothing to act on"
     );
 }
+
+/// The store resolves end to end: an ORGANIZATION override beats the environment and tenant
+/// ones for the same kind and locale (issue #111 criterion 3).
+///
+/// This is the assertion the resolver could never make on its own. `resolve_template` has
+/// always been correct about candidates it was handed; what nothing measured was that the
+/// store hands it the right ones, in the right order, with the right levels attached.
+#[tokio::test]
+async fn the_organization_override_wins_end_to_end() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope).await;
+
+    insert_template(
+        &db,
+        &env,
+        scope,
+        "tenant",
+        None,
+        "invitation",
+        "en",
+        "tenant",
+        false,
+    )
+    .await
+    .expect("tenant override");
+    insert_template(
+        &db,
+        &env,
+        scope,
+        "environment",
+        None,
+        "invitation",
+        "en",
+        "env",
+        false,
+    )
+    .await
+    .expect("environment override");
+    insert_template(
+        &db,
+        &env,
+        scope,
+        "organization",
+        Some(&org),
+        "invitation",
+        "en",
+        "org",
+        false,
+    )
+    .await
+    .expect("organization override");
+
+    let en = ironauth_store::message_template::Locale::new("en");
+    let resolved = db
+        .store()
+        .scoped(scope)
+        .message_templates()
+        .resolve("invitation", &en, &en)
+        .await
+        .expect("resolve")
+        .expect("an override exists at three levels, so one must be chosen");
+
+    assert_eq!(
+        resolved.level,
+        TemplateLevel::Organization,
+        "the narrowest level wins; if this ever reports Environment the store handed the \
+         resolver its candidates in an order that lost the organization row"
+    );
+}
+
+/// With NO override authored, resolution answers `None` -- which means "use the shipped
+/// template", not "something went wrong".
+///
+/// Worth asserting because it is the overwhelmingly common case: almost every tenant never
+/// authors an override, and a caller that treated `None` as an error would refuse to send mail
+/// for all of them. It is also what makes resolution total, since the default level is code
+/// rather than a row.
+#[tokio::test]
+async fn no_override_resolves_to_none_rather_than_an_error() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let en = ironauth_store::message_template::Locale::new("en");
+    let resolved = db
+        .store()
+        .scoped(scope)
+        .message_templates()
+        .resolve("invitation", &en, &en)
+        .await
+        .expect("resolution must not fail when nothing is authored");
+    assert!(
+        resolved.is_none(),
+        "no override means fall back to the shipped template: {resolved:?}"
+    );
+}
+
+/// Locale fallback runs through the store: a request for a locale nobody authored falls back
+/// to the default locale at the same level.
+///
+/// The fallback rules are the resolver's and are tested exhaustively there. What this measures
+/// is that the store preserves the locale each row was authored in -- a store that returned a
+/// normalized or defaulted locale would make every fallback decision on data the operator did
+/// not write.
+#[tokio::test]
+async fn a_locale_nobody_authored_falls_back_through_the_store() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    insert_template(
+        &db,
+        &env,
+        scope,
+        "tenant",
+        None,
+        "invitation",
+        "en",
+        "english",
+        false,
+    )
+    .await
+    .expect("english override");
+
+    let resolved = db
+        .store()
+        .scoped(scope)
+        .message_templates()
+        .resolve(
+            "invitation",
+            &ironauth_store::message_template::Locale::new("fr"),
+            &ironauth_store::message_template::Locale::new("en"),
+        )
+        .await
+        .expect("resolve")
+        .expect("the english override is reachable by fallback");
+    assert_eq!(
+        resolved.locale.as_str(),
+        "en",
+        "the resolution reports the locale it actually landed on, which is what answers \
+         'why did this recipient get English?'"
+    );
+}
