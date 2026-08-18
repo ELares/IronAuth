@@ -492,6 +492,72 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
+          "assignment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "organization_id",
+          "org_role_id",
+          "group_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.assigned_to_group"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "organization_id",
+          "org_role_id",
+          "membership_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.assigned_to_member"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
           "org_role_id": {
             "minLength": 1,
             "type": "string"
@@ -532,6 +598,72 @@
       },
       "payload_schema_version": 1,
       "type": "org_role.deleted"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "group_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "organization_id",
+          "org_role_id",
+          "group_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.unassigned_from_group"
+    },
+    {
+      "domain": "org_role",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_role_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "organization_id",
+          "org_role_id",
+          "membership_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_role.unassigned_from_member"
     },
     {
       "domain": "org_role",

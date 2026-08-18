@@ -425,6 +425,82 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // FOUR types rather than one pair with a nullable holder. A grant to a GROUP and a
+        // grant to a MEMBER reach different downstream systems, and a pair distinguished by
+        // "which id is present" is the same presence-ambiguity trap the subscription payload
+        // avoids: a consumer that forgot to branch would apply a group grant to one person.
+        "org_role.assigned_to_group",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "assignment_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "org_role_id": {"type": "string", "minLength": 1},
+                "group_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["assignment_id", "organization_id", "org_role_id", "group_id"]
+        }"#,
+    ),
+    (
+        // FOUR types rather than one pair with a nullable holder. A grant to a GROUP and a
+        // grant to a MEMBER reach different downstream systems, and a pair distinguished by
+        // "which id is present" is the same presence-ambiguity trap the subscription payload
+        // avoids: a consumer that forgot to branch would apply a group grant to one person.
+        "org_role.unassigned_from_group",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "assignment_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "org_role_id": {"type": "string", "minLength": 1},
+                "group_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["assignment_id", "organization_id", "org_role_id", "group_id"]
+        }"#,
+    ),
+    (
+        // FOUR types rather than one pair with a nullable holder. A grant to a GROUP and a
+        // grant to a MEMBER reach different downstream systems, and a pair distinguished by
+        // "which id is present" is the same presence-ambiguity trap the subscription payload
+        // avoids: a consumer that forgot to branch would apply a group grant to one person.
+        "org_role.assigned_to_member",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "assignment_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "org_role_id": {"type": "string", "minLength": 1},
+                "membership_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["assignment_id", "organization_id", "org_role_id", "membership_id"]
+        }"#,
+    ),
+    (
+        // FOUR types rather than one pair with a nullable holder. A grant to a GROUP and a
+        // grant to a MEMBER reach different downstream systems, and a pair distinguished by
+        // "which id is present" is the same presence-ambiguity trap the subscription payload
+        // avoids: a consumer that forgot to branch would apply a group grant to one person.
+        "org_role.unassigned_from_member",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "assignment_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "org_role_id": {"type": "string", "minLength": 1},
+                "membership_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["assignment_id", "organization_id", "org_role_id", "membership_id"]
+        }"#,
+    ),
+    (
         "org_role.created",
         1,
         r#"{

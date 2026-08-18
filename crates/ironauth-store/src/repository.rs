@@ -48691,6 +48691,23 @@ impl ActingOrgGroupRoleRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.assign_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::assign`], additionally emitting `org_role.assigned_to_group` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::assign`].
+    pub async fn assign_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgGroupRole<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.group_id.scope() != self.scope
@@ -48741,6 +48758,8 @@ impl ActingOrgGroupRoleRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back grant announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -48768,6 +48787,22 @@ impl ActingOrgGroupRoleRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgGroupRoleId,
     ) -> Result<(), StoreError> {
+        self.unassign_with_event(env, organization_id, id, None)
+            .await
+    }
+
+    /// [`Self::unassign`], additionally emitting `org_role.unassigned_from_group` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::unassign`].
+    pub async fn unassign_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgGroupRoleId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48792,7 +48827,11 @@ impl ActingOrgGroupRoleRepo<'_> {
                     &id.to_string(),
                     now_micros,
                 )
-                .await
+                .await?;
+                // AFTER the delete's own guard, so unassigning what is not assigned
+                // announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )
@@ -48839,6 +48878,23 @@ impl ActingOrgMembershipRoleRepo<'_> {
         spec: NewOrgMembershipRole<'_>,
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.assign_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::assign`], additionally emitting `org_role.assigned_to_member` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::assign`].
+    pub async fn assign_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgMembershipRole<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
@@ -48890,6 +48946,8 @@ impl ActingOrgMembershipRoleRepo<'_> {
                     Err(error) => return Err(error.into()),
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back grant announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -48917,6 +48975,22 @@ impl ActingOrgMembershipRoleRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgMembershipRoleId,
     ) -> Result<(), StoreError> {
+        self.unassign_with_event(env, organization_id, id, None)
+            .await
+    }
+
+    /// [`Self::unassign`], additionally emitting `org_role.unassigned_from_member` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::unassign`].
+    pub async fn unassign_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgMembershipRoleId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -48941,7 +49015,11 @@ impl ActingOrgMembershipRoleRepo<'_> {
                     &id.to_string(),
                     now_micros,
                 )
-                .await
+                .await?;
+                // AFTER the delete's own guard, so unassigning what is not assigned
+                // announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )
