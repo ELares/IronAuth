@@ -1010,3 +1010,65 @@ async fn rotating_an_organization_api_key_announces_one_event_naming_both_keys()
     ironauth_store::event_catalog::validate_event(&events[0])
         .expect("the envelope validates against the registry the fan-out enforces");
 }
+
+/// Minting a personal access token announces it as `api_key.created` with owner `user`.
+///
+/// The SAME type the organization path emits: a personal access token and an organization key
+/// are the same credential kind under different owners, and a second type for the owner would
+/// make every consumer subscribe twice to learn one fact. The OWNER KIND is what tells them
+/// apart, so it is asserted here -- a producer that hard-coded "organization" would pass every
+/// other assertion in this test.
+///
+/// The token is pulled from the response and asserted ABSENT from the envelope, along with its
+/// secret half and its digest.
+#[tokio::test]
+async fn minting_a_personal_access_token_announces_it_as_a_user_owned_key() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "pat-tenant").await;
+    let user = seed_user(&h, &tenant, &environment, "pat-evt@example.test").await;
+    let scope = scope_of(&tenant, &environment);
+    let _ = queued_events(&h, scope).await;
+
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/users/{user}/personal-access-tokens"
+    );
+    let (status, _, body) = h
+        .post(
+            &base,
+            "pat-evt-create",
+            &serde_json::json!({ "display_name": "laptop" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let created = serde_json::from_str::<Value>(&body).expect("json");
+    let key_id = created["id"].as_str().expect("id").to_owned();
+    let plaintext = created["key"].as_str().expect("key").to_owned();
+
+    let events = queued_events(&h, scope).await;
+    assert_eq!(events.len(), 1, "the mint enqueues exactly one event");
+    assert_eq!(events[0]["type"], "api_key.created");
+    assert_eq!(events[0]["payload"]["api_key_id"], key_id);
+    assert_eq!(
+        events[0]["payload"]["owner_kind"], "user",
+        "a personal access token is a USER-owned key; the owner kind is what distinguishes \
+         it from the organization path, which emits the same type"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    let rendered = events[0].to_string();
+    assert!(
+        !rendered.contains(&plaintext),
+        "the event carried the TOKEN"
+    );
+    let (_, secret) = plaintext.split_once('~').expect("delimiter");
+    assert!(
+        !rendered.contains(secret),
+        "the event carried the token's secret"
+    );
+    let digest = ironauth_store::api_key::api_key_digest(&plaintext);
+    assert!(
+        !rendered.contains(&digest),
+        "the event carried the digest, which verifies as well as the token does"
+    );
+}
