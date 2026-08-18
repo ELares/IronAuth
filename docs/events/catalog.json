@@ -198,6 +198,29 @@
           "invitation_id": {
             "minLength": 1,
             "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "invitation_id",
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "invitation.created"
+    },
+    {
+      "domain": "invitation",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "invitation_id": {
+            "minLength": 1,
+            "type": "string"
           }
         },
         "required": [

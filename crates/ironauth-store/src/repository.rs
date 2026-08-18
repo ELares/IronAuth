@@ -35728,12 +35728,35 @@ impl ActingInvitationRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<UserId, StoreError> {
+        self.create_with_user_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create_with_user`], additionally emitting `invitation.created` (issue #108).
+    ///
+    /// Enqueued inside the SAME transaction as the joined user-and-invitation write, so the
+    /// announcement cannot survive a rolled-back create and tell a receiver about an invitee
+    /// that does not exist. The joined create is atomic by construction (issue #247), and the
+    /// event joins that atomicity rather than sitting beside it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_with_user`].
+    pub async fn create_with_user_with_event(
+        &self,
+        env: &Env,
+        spec: NewInvitedUser<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<UserId, StoreError> {
         self.create_with_user_inner(
             env,
             spec,
             created_at_micros,
             idempotency,
             ArmedInvitationFailure::default(),
+            event,
         )
         .await
     }
@@ -35761,7 +35784,9 @@ impl ActingInvitationRepo<'_> {
         idempotency: Option<IdempotencyWrite<'_>>,
         at: InvitationCreateFailurePoint,
     ) -> Result<UserId, StoreError> {
-        self.create_with_user_inner(env, spec, created_at_micros, idempotency, Some(at))
+        // The atomicity probe emits nothing: it exists to force a failure, and an event on
+        // that path would be announcing a create that is about to be rolled back.
+        self.create_with_user_inner(env, spec, created_at_micros, idempotency, Some(at), None)
             .await
     }
 
@@ -35774,6 +35799,7 @@ impl ActingInvitationRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
         poison: ArmedInvitationFailure,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<UserId, StoreError> {
         // Without the `testing` feature the seam type has no inhabited variant, so
         // `poison` cannot be armed and every probe below is compiled out.
@@ -35875,6 +35901,9 @@ impl ActingInvitationRepo<'_> {
         #[cfg(feature = "testing")]
         poison_invitation_create(&mut tx, poison, InvitationCreateFailurePoint::BeforeCommit)
             .await?;
+        // Inside the joined create's own transaction, so the notice shares its atomicity
+        // rather than sitting beside it: a rolled-back create announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(user_id)
     }

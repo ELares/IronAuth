@@ -1138,3 +1138,108 @@ async fn revoking_an_invitation_without_an_event_enqueues_nothing() {
         "a revocation with no event must not invent one"
     );
 }
+
+/// The joined create emits `invitation.created`, naming both rows it wrote.
+///
+/// The user id is asserted as well as the invitation id, because the joined create makes both
+/// in ONE transaction (issue #247) and an event naming only the invitation would leave a
+/// consumer unable to say which pending account it belongs to.
+#[tokio::test]
+async fn creating_an_invitation_emits_an_event_naming_the_invitation_and_its_user() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let created = now_micros(&env);
+    let MintedInvitationToken { token, digest, id } = mint_invitation_token(&env, &scope);
+    let _ = token;
+    // Minted here, exactly as the management handler does, so the envelope names the id the
+    // create will actually write. Letting the store generate it would leave the test
+    // asserting a placeholder against itself.
+    let minted_user = UserId::generate(&env, &scope);
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_invitation_created",
+        "invitation.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "invitation_id": id.to_string(),
+            "user_id": minted_user.to_string(),
+        }),
+    )
+    .expect("invitation.created is registered");
+    let subject = id.to_string();
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_invitation_created",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    let user_id = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .create_with_user_with_event(
+            &env,
+            NewInvitedUser {
+                user: NewAdminUser {
+                    id: Some(&minted_user),
+                    identifier: "invited@example.test",
+                    password_hash: None,
+                    claims_json: None,
+                    external_id: None,
+                    state: UserState::PendingVerification,
+                    foreign_password_hash: None,
+                    foreign_password_algo: None,
+                    traits: None,
+                },
+                invitation_id: &id,
+                token_digest: &digest,
+                credential_type: InvitationCredentialType::Password,
+                org_context: None,
+                expires_at_unix_micros: created.saturating_add(3_600_000_000),
+            },
+            created,
+            None,
+            Some(&domain_event),
+        )
+        .await
+        .expect("joined create");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "invitation.created");
+    assert_eq!(events[0]["payload"]["invitation_id"], id.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+    // The event names the user the create actually wrote, not merely SOME user.
+    assert_eq!(events[0]["payload"]["user_id"], user_id.to_string());
+    assert_eq!(user_id, minted_user, "the create wrote the id it was given");
+}
+
+/// A joined create carrying no event enqueues nothing.
+///
+/// The paired negative: without it the test above passes for a create that emits
+/// unconditionally, which would fire for every internal path that mints an invitation.
+#[tokio::test]
+async fn creating_an_invitation_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (_id, _user, _token) = create_invitation(
+        &db,
+        &env,
+        scope,
+        "silent-create@example.test",
+        InvitationCredentialType::Password,
+        3_600_000_000,
+    )
+    .await;
+
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a create with no event must not invent one"
+    );
+}

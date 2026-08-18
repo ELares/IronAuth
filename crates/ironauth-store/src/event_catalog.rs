@@ -283,6 +283,26 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The INVITATION and the USER it was minted for, because the joined create makes
+        // both in one transaction and a consumer that saw only the invitation could not tell
+        // which pending account it belongs to without a second read.
+        //
+        // NO TOKEN, for the reason on `invitation.revoked`: the token is the credential, and
+        // the create is exactly when it is still live. A subscriber that received it could
+        // accept the invitation as the invitee.
+        "invitation.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "invitation_id": {"type": "string", "minLength": 1},
+                "user_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["invitation_id", "user_id"]
+        }"#,
+    ),
+    (
         // REVOKED, not "deleted": the invitation row survives as a tombstone in the
         // `revoked` state, and a receiver treating this as a row deletion would drop the
         // record an operator needs to answer "who was invited, and what became of it".
