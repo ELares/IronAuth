@@ -997,6 +997,29 @@
       "type": "organization.member_removed"
     },
     {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "state": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.state_changed"
+    },
+    {
       "domain": "permission",
       "payload_schema": {
         "additionalProperties": false,

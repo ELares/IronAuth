@@ -46202,6 +46202,23 @@ impl ActingOrganizationRepo<'_> {
         state: OrganizationState,
         idempotency: Option<ResolvedIdempotencyWrite<'_, OrganizationRecord>>,
     ) -> Result<OrganizationRecord, StoreError> {
+        self.set_state_with_event(env, id, state, idempotency, None)
+            .await
+    }
+
+    /// [`Self::set_state`], additionally emitting `organization.state_changed` (#108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_state`].
+    pub async fn set_state_with_event(
+        &self,
+        env: &Env,
+        id: &OrganizationId,
+        state: OrganizationState,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, OrganizationRecord>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<OrganizationRecord, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -46240,6 +46257,8 @@ impl ActingOrganizationRepo<'_> {
                 };
                 let record = organization_from_row(&row, &scope)?;
                 insert_resolved_idempotency(tx, idempotency, &record).await?;
+                // In the write's transaction: a rolled-back flip announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(record)
             },
             false,

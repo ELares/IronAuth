@@ -770,6 +770,26 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // organization hands to new members, not anything about the role itself -- the role's
         // slug, display and grants are untouched. A consumer syncing an organization's
         // onboarding policy watches this; one syncing the role catalogue does not.
+        // ONE type carrying the new STATE, not an `enabled` and a `disabled` -- the same
+        // shape as `webhook_endpoint.active_changed` and for the same reason: these are the
+        // same transition in two directions over one value, and a consumer mirroring "is this
+        // organization serving" wants one subscription with a field to read.
+        //
+        // The handler already refuses to let the two disagree ("enable and disable must not
+        // disagree about whose event this is"), and one type makes that structural.
+        "organization.state_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "organization_id": {"type": "string", "minLength": 1},
+                "state": {"type": "string", "minLength": 1}
+            },
+            "required": ["organization_id", "state"]
+        }"#,
+    ),
+    (
         "organization.default_role_set",
         1,
         r#"{

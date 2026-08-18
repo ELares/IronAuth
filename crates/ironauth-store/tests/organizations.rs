@@ -9,7 +9,8 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, IdempotencyWrite, OrganizationId, Scope, ServiceId, StoreError,
+    ActorRef, CorrelationId, IdempotencyWrite, OrganizationId, OrganizationState, Scope, ServiceId,
+    StoreError,
 };
 use sqlx::Row;
 
@@ -664,5 +665,87 @@ async fn no_registered_payload_accepts_an_undeclared_field() {
             "{} accepted an undeclared `smuggled` field: {envelope}",
             registered.wire
         );
+    }
+}
+
+/// Disabling and enabling an organization emit ONE type carrying the new state.
+///
+/// Not a `disabled` and an `enabled`: these are the same transition in two directions over one
+/// value, so a consumer mirroring "is this organization serving" wants one subscription with a
+/// field to read rather than two to correlate.
+///
+/// BOTH directions are asserted, because a producer that hard-coded either state would pass a
+/// test that exercised only one.
+#[tokio::test]
+async fn changing_an_organization_state_announces_the_new_state_both_ways() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex", 1_000_000).await;
+    let subject = org.to_string();
+
+    for (target, event_id) in [
+        (OrganizationState::Disabled, "evt_org_disabled"),
+        (OrganizationState::Active, "evt_org_enabled"),
+    ] {
+        let envelope = ironauth_store::event_catalog::envelope(
+            event_id,
+            "organization.state_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            1,
+            &serde_json::json!({ "organization_id": subject, "state": target.as_str() }),
+        )
+        .expect("organization.state_changed is registered");
+
+        db.control_store()
+            .management()
+            .acting(actor(&env), CorrelationId::generate(&env))
+            .organizations(scope)
+            .set_state_with_event(
+                &env,
+                &org,
+                target,
+                None,
+                Some(&ironauth_store::DomainEvent {
+                    id: event_id,
+                    subject: &subject,
+                    envelope: &envelope,
+                }),
+            )
+            .await
+            .expect("set state with event");
+
+        // Claimed and COMPLETED each round: both events carry the organization id as their
+        // ordering key, so the second is not claimable while the first is outstanding.
+        let claimed = db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "the flip enqueues exactly one event");
+        assert_eq!(claimed[0].payload["type"], "organization.state_changed");
+        assert_eq!(
+            claimed[0].payload["payload"]["state"],
+            target.as_str(),
+            "the event must carry the state the flip WROTE, not a fixed value"
+        );
+        ironauth_store::event_catalog::validate_event(&claimed[0].payload)
+            .expect("the envelope validates against the registry the fan-out enforces");
+        for message in &claimed {
+            db.store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, message)
+                .await
+                .expect("complete");
+        }
     }
 }
