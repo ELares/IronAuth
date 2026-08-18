@@ -493,12 +493,13 @@ pub async fn revoke_user_sessions(
         hard_kill: request.hard_kill,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    let pending = user_sessions_revoked_event(&state, scope, &subject);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .sessions()
-        .revoke_all_for_user(
+        .revoke_all_for_user_with_event(
             state.env(),
             &subject,
             request.hard_kill,
@@ -509,6 +510,10 @@ pub async fn revoke_user_sessions(
                 response_status: 200,
                 response_body: &body_string,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -640,6 +645,39 @@ fn session_revoked_event(
     Some(crate::events::PendingEvent {
         id,
         subject,
+        envelope,
+    })
+}
+
+/// The event revoking every session of a user emits (issue #108).
+///
+/// ONE event naming the SUBJECT, not one per session. This call is given only the user, and
+/// the store discovers which sessions were live inside its own UPDATE -- so nothing here
+/// knows the session ids when the envelope is built. That is the opposite of the BULK revoke,
+/// where the caller supplies the ids and therefore gets one event each.
+///
+/// It is also the better fact: "every session of this user is gone" is what a receiver acts
+/// on, and it can tear down everything for that subject without an enumeration it would
+/// otherwise have to reconcile against its own view.
+fn user_sessions_revoked_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    subject: &ironauth_store::UserId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject_id = subject.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "user.sessions_revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "user_id": subject_id }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The USER is the subject: successive revoke-alls for one user stay ordered.
+        subject: subject_id,
         envelope,
     })
 }

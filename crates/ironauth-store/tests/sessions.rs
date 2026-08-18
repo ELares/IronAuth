@@ -1609,3 +1609,82 @@ async fn a_bulk_revoke_refuses_an_envelope_slice_of_the_wrong_length() {
         "a refused bulk revoke must announce nothing at all"
     );
 }
+
+/// Revoking every session of a user emits ONE event naming the USER, not one per session.
+///
+/// The opposite choice from the bulk revoke, and for a reason in the code rather than a
+/// preference: this call is given only the subject, and the store discovers which sessions
+/// were live inside its own UPDATE, so nothing knows the session ids when the envelope is
+/// built. The bulk path is handed its ids and therefore emits one event each.
+///
+/// TWO live sessions, so "one event" is a real assertion rather than one that would hold for
+/// any fixture.
+#[tokio::test]
+async fn revoking_every_session_of_a_user_emits_one_event_naming_the_user() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope);
+    let subject_id = subject.to_string();
+    let _first = create_session(&db, &env, scope, &subject_id, None).await;
+    let _second = create_session(&db, &env, scope, &subject_id, None).await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_user_sessions_revoked",
+        "user.sessions_revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "user_id": subject_id }),
+    )
+    .expect("user.sessions_revoked is registered");
+
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke_all_for_user_with_event(
+            &env,
+            &subject,
+            false,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_user_sessions_revoked",
+                subject: &subject_id,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("revoke all with event");
+    assert_eq!(
+        outcome.revoked_session_ids.len(),
+        2,
+        "the fixture must have two live sessions or 'one event' proves nothing"
+    );
+
+    let events = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events.len(),
+        1,
+        "two sessions ended, but the fact is ONE user-scoped revocation: {events:?}"
+    );
+    assert_eq!(events[0]["type"], "user.sessions_revoked");
+    assert_eq!(events[0]["payload"]["user_id"], subject_id);
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

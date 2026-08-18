@@ -449,6 +449,26 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         //
         // NO SESSION TOKEN and nothing derived from one. A session id is an opaque handle the
         // holder already presented; the token is a credential.
+        // THE USER, not the sessions. Unlike the bulk revoke -- where the caller supplies the
+        // session ids and can build one envelope each -- this call supplies only the SUBJECT,
+        // and the store discovers which sessions were live inside its own UPDATE. Nothing
+        // knows them when the envelope must be built.
+        //
+        // It is also the better fact. "Every session of this user is gone" is what a receiver
+        // acts on: it tears down everything for that subject, which it can do without an
+        // enumeration it would otherwise have to reconcile against its own view.
+        "user.sessions_revoked",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["user_id"]
+        }"#,
+    ),
+    (
         "session.revoked",
         1,
         r#"{

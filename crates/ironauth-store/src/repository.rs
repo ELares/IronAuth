@@ -19244,6 +19244,28 @@ impl ActingSessionRepo<'_> {
         hard_kill: bool,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<UserRevocation, StoreError> {
+        self.revoke_all_for_user_with_event(env, subject, hard_kill, idempotency, None)
+            .await
+    }
+
+    /// [`Self::revoke_all_for_user`], additionally emitting `user.sessions_revoked` (#108).
+    ///
+    /// ONE event naming the SUBJECT, not one per session. This call is given only the user,
+    /// and the store discovers which sessions were live inside its own UPDATE, so nothing
+    /// knows the session ids when the envelope is built -- unlike [`Self::bulk_revoke`],
+    /// where the caller supplies them and gets one event each.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke_all_for_user`].
+    pub async fn revoke_all_for_user_with_event(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        hard_kill: bool,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<UserRevocation, StoreError> {
         if subject.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -19328,6 +19350,9 @@ impl ActingSessionRepo<'_> {
                 .await?;
                 cascade_families_for_subject(tx, scope, &subject_text, now_micros, hard_kill, out)
                     .await?;
+                // In the revocation's own transaction: a rolled-back revoke-all announces
+                // nothing, so no receiver tears down sessions that are still live.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

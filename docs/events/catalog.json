@@ -1189,6 +1189,24 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.sessions_revoked"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
           "hard_kill": {
             "type": "boolean"
           },
