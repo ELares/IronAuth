@@ -240,6 +240,7 @@ pub async fn create_organization_api_key(
     };
     let stored_body = serde_json::to_string(&stored).map_err(|_| ApiError::Internal)?;
 
+    let pending = api_key_created_event(&state, scope, &minted.id, "organization");
     let result = state
         .store()
         .scoped(scope)
@@ -247,7 +248,7 @@ pub async fn create_organization_api_key(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .api_keys()
-        .create(
+        .create_with_event(
             state.env(),
             NewApiKey {
                 id: &minted.id,
@@ -264,6 +265,10 @@ pub async fn create_organization_api_key(
                 response_status: 200,
                 response_body: &stored_body,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -467,6 +472,7 @@ pub async fn rotate_organization_api_key(
     // over two calls would hand the window back: a client that crashed between them would
     // leave the old key live alongside the new one, which is the failure a rotation performed
     // to contain a leak exists to prevent.
+    let pending = api_key_rotated_event(&state, scope, &old, &minted.id);
     let result = state
         .store()
         .scoped(scope)
@@ -474,7 +480,7 @@ pub async fn rotate_organization_api_key(
         // Attribute the audit row to this organization (issue #110).
         .in_organization(org_id)
         .api_keys()
-        .rotate(
+        .rotate_with_event(
             state.env(),
             &old,
             NewApiKey {
@@ -492,6 +498,10 @@ pub async fn rotate_organization_api_key(
                 response_status: 200,
                 response_body: &stored_body,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -524,6 +534,72 @@ fn api_key_revoked_event(
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,
         &serde_json::json!({ "api_key_id": subject }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event an organization api-key create emits (issue #108).
+///
+/// Carries the OWNER KIND as well as the id, because an api key is the same credential kind
+/// under three different owners (user, service account, organization) and a consumer routing
+/// on "who gained a credential" cannot get that from the id alone.
+///
+/// NO KEY MATERIAL and no digest: the digest verifies exactly as well as the key does, so
+/// putting it on the wire that announces the credential exists would BE the leak.
+fn api_key_created_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    key_id: &ApiKeyId,
+    owner_kind: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = key_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "api_key.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "api_key_id": subject, "owner_kind": owner_kind }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event an organization api-key rotation emits (issue #108).
+///
+/// ONE event naming BOTH ids rather than a create plus a revoke. The rotation is one
+/// transaction precisely so no window exists where both keys are live; two events would put
+/// that window back on the wire, and a consumer could not tell a real rotation from an
+/// unrelated create that happened near a revoke without inferring the pairing from timing.
+///
+/// The SUBJECT is the OLD key, so the rotation orders behind that credential's own history
+/// rather than starting a fresh ordering key under an id no consumer has seen yet.
+fn api_key_rotated_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    revoked: &ApiKeyId,
+    created: &ApiKeyId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = revoked.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "api_key.rotated",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "revoked_api_key_id": subject,
+            "created_api_key_id": created.to_string(),
+        }),
     )?;
     Some(crate::events::PendingEvent {
         id,

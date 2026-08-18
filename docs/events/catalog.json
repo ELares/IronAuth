@@ -70,6 +70,29 @@
           "api_key_id": {
             "minLength": 1,
             "type": "string"
+          },
+          "owner_kind": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "api_key_id",
+          "owner_kind"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "api_key.created"
+    },
+    {
+      "domain": "api_key",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "api_key_id": {
+            "minLength": 1,
+            "type": "string"
           }
         },
         "required": [
@@ -79,6 +102,29 @@
       },
       "payload_schema_version": 1,
       "type": "api_key.revoked"
+    },
+    {
+      "domain": "api_key",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "created_api_key_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "revoked_api_key_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "revoked_api_key_id",
+          "created_api_key_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "api_key.rotated"
     },
     {
       "domain": "brand_asset",

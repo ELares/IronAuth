@@ -59941,6 +59941,26 @@ impl ActingApiKeyRepo<'_> {
         now_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, spec, now_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::create`], additionally emitting `api_key.created` (issue #108).
+    ///
+    /// Enqueued inside the write's transaction, so a credential is never announced into
+    /// existence by a create that rolled back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewApiKey<'_>,
+        now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -60000,6 +60020,9 @@ impl ActingApiKeyRepo<'_> {
                 // client that times out and retries ends up holding one key while a second,
                 // equally valid one exists that it never saw and cannot revoke.
                 insert_idempotency(tx, idempotency).await?;
+                // In the SAME transaction as the key, so a credential is never announced
+                // into existence by a create that rolled back.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             // No poison-after-audit: this write creates a credential rather than destroying
@@ -60152,6 +60175,33 @@ impl ActingApiKeyRepo<'_> {
         now_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.rotate_with_event(env, old, replacement, now_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::rotate`], additionally emitting `api_key.rotated` (issue #108).
+    ///
+    /// ONE event naming BOTH ids, not an `api_key.created` plus an `api_key.revoked`. The
+    /// rotation is one transaction precisely so that no window exists where both keys are
+    /// live; two events would put that window back on the wire, where a consumer could not
+    /// tell a real rotation from an unrelated create that happened near a revoke and would
+    /// have to infer the pairing from timing.
+    ///
+    /// Enqueued inside that same transaction, after both halves, so a rotation that rolled
+    /// back announces nothing and no receiver is told a live key is dead.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::rotate`].
+    pub async fn rotate_with_event(
+        &self,
+        env: &Env,
+        old: &ApiKeyId,
+        replacement: NewApiKey<'_>,
+        now_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if old.scope() != self.scope || replacement.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -60245,6 +60295,9 @@ impl ActingApiKeyRepo<'_> {
         // key, so the retry mints a SECOND new credential and the caller cannot tell which of
         // the two is the one it was handed.
         insert_idempotency(&mut tx, idempotency).await?;
+        // After BOTH halves, in the same transaction: a rotation that rolled back announces
+        // nothing, and no receiver is ever told a still-live key is dead.
+        enqueue_domain_event(&mut tx, env, self.scope, event).await?;
         tx.commit().await?;
         Ok(())
     }

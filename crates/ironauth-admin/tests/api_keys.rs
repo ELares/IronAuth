@@ -914,3 +914,99 @@ async fn revoking_an_organization_api_key_announces_it() {
     ironauth_store::event_catalog::validate_event(&events[0])
         .expect("the envelope validates against the registry the fan-out enforces");
 }
+
+/// Creating an organization api key announces it, WITHOUT the key.
+///
+/// The payload carries the owner kind as well as the id, because an api key is the same
+/// credential kind under three different owners and a consumer routing on "who gained a
+/// credential" cannot get that from the id alone.
+///
+/// The negative half is the important one: the event must not carry the key, its secret half,
+/// or its digest -- the digest verifies exactly as well as the key does, so shipping it to
+/// every subscriber to announce that the credential exists would BE the leak.
+#[tokio::test]
+async fn creating_an_organization_api_key_announces_it_without_the_key() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-created").await;
+    let scope = scope_of(&tenant, &environment);
+    let management = h.create_key(&tenant, &environment, "ci", "k-mgmt").await;
+    let _ = queued_events(&h, scope).await;
+
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/api-keys");
+    let (status, _, body) = h
+        .post_as(
+            &path,
+            &management,
+            "k-create-evt",
+            &serde_json::json!({ "display_name": "ci deploy" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let created = serde_json::from_str::<Value>(&body).expect("json");
+    let key_id = created["id"].as_str().expect("id").to_owned();
+    let plaintext = created["key"].as_str().expect("key").to_owned();
+
+    let events = queued_events(&h, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "api_key.created");
+    assert_eq!(events[0]["payload"]["api_key_id"], key_id);
+    assert_eq!(events[0]["payload"]["owner_kind"], "organization");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // Nothing that verifies as the credential is on the wire.
+    let rendered = events[0].to_string();
+    assert!(!rendered.contains(&plaintext), "the event carried the KEY");
+    let (_, secret) = plaintext.split_once('~').expect("delimiter");
+    assert!(
+        !rendered.contains(secret),
+        "the event carried the key's secret"
+    );
+    let digest = ironauth_store::api_key::api_key_digest(&plaintext);
+    assert!(
+        !rendered.contains(&digest),
+        "the event carried the digest, which verifies as well as the key does"
+    );
+}
+
+/// A rotation announces ONE event naming BOTH keys, not a create plus a revoke.
+///
+/// The rotation is one transaction precisely so that no window exists where both keys are
+/// live. Two events would put that window back on the wire: a consumer could not tell a real
+/// rotation from an unrelated create that happened near a revoke, and would have to infer the
+/// pairing from timing. So the count is exact, and both ids are asserted.
+#[tokio::test]
+async fn rotating_an_organization_api_key_announces_one_event_naming_both_keys() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-rotated").await;
+    let (_, old_id) = issue_org_key(&h, &tenant, &environment, &org, "to be rotated").await;
+    let scope = scope_of(&tenant, &environment);
+    let management = h.create_key(&tenant, &environment, "ci", "k-mgmt").await;
+    let _ = queued_events(&h, scope).await;
+
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/api-keys/{old_id}/rotate"
+    );
+    let (status, _, body) = h.post_as(&path, &management, "k-rotate-evt", "").await;
+    assert_eq!(status, StatusCode::CREATED, "rotate: {body}");
+    let new_id = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    assert_ne!(new_id, old_id, "a rotation issues a DIFFERENT key");
+
+    let events = queued_events(&h, scope).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "a rotation is ONE fact: two events would put the both-live window back on the wire"
+    );
+    assert_eq!(events[0]["type"], "api_key.rotated");
+    assert_eq!(events[0]["payload"]["revoked_api_key_id"], old_id);
+    assert_eq!(events[0]["payload"]["created_api_key_id"], new_id);
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

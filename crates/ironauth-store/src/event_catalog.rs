@@ -346,6 +346,50 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The id and the OWNER, because an api key is the same credential kind under three
+        // different owners (user, service account, organization) and a consumer routing on
+        // "who gained a credential" cannot get that from the id alone.
+        //
+        // NO KEY MATERIAL and no digest: the digest verifies exactly as well as the key does,
+        // so putting it on the wire that announces the credential exists would BE the leak.
+        "api_key.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "api_key_id": {"type": "string", "minLength": 1},
+                "owner_kind": {"type": "string", "minLength": 1}
+            },
+            "required": ["api_key_id", "owner_kind"]
+        }"#,
+    ),
+    (
+        // ONE type naming BOTH ids, not a `created` plus a `revoked`.
+        //
+        // A rotation is ONE transaction (the store's `rotate`), and that is the whole point:
+        // exposing it as create-then-revoke would hand back the window where both keys are
+        // live, which is the failure a rotation performed to contain a leak exists to
+        // prevent. Two events would recreate that fiction on the wire -- a consumer could
+        // not tell a real rotation from an unrelated create that happened near a revoke, and
+        // would have to infer the pairing from timing.
+        //
+        // Same reasoning as `invitation.resent`: the credential was not born and it did not
+        // merely die, it was REPLACED, and a consumer counting creates or revocations would
+        // otherwise double-count one operation.
+        "api_key.rotated",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "revoked_api_key_id": {"type": "string", "minLength": 1},
+                "created_api_key_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["revoked_api_key_id", "created_api_key_id"]
+        }"#,
+    ),
+    (
         // Emitted at most ONCE per credential. The revocation is idempotent -- a retried
         // revoke changes nothing and audits nothing -- and the event inherits that, so a
         // receiver counting revocations never sees two for one key because a client retried.
