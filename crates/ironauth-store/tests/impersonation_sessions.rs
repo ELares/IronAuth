@@ -1511,3 +1511,70 @@ async fn authorizing_an_impersonation_announces_it_without_the_operator_prose() 
     ironauth_store::event_catalog::validate_event(payload)
         .expect("the envelope validates against the registry the fan-out enforces");
 }
+
+/// A REAL sign-in is metered (issue #107 criterion 4).
+///
+/// The existing metering test seeds the feed with `append_envelope`, which writes envelopes
+/// straight to the outbox. That measures the fold's arithmetic and cannot measure whether the
+/// events it folds ever exist -- and they did not: `user.signed_in` was named by a constant in
+/// `UsageTally`, registered nowhere, and emitted by nothing, so metering reported zero for
+/// every tenant on every deployment. The criterion says metering matches seeded ACTIVITY; the
+/// old fixture seeded envelopes.
+///
+/// So this drives a real session through the real path and folds what the feed actually
+/// contains. It is the only test that can fail if the producer is removed.
+#[tokio::test]
+async fn a_real_sign_in_is_metered_as_an_active_user() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = seed_user(&db, &env, scope, "metered@example.test").await;
+    let id = issue_authorization(&db, &env, scope, &user, 30 * MINUTE_MICROS).await;
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .impersonation_authorizations()
+        .redeem(&env, &id, now_micros(&env))
+        .await
+        .expect("redeem into a session");
+
+    let events = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .events_page_after(ironauth_store::EventCursor::beginning(), 100)
+        .await
+        .expect("read the feed");
+    let ironauth_store::EventPage::Page(events) = events else {
+        panic!("nothing was pruned");
+    };
+
+    let signed_in: Vec<_> = events
+        .iter()
+        .filter(|m| m.payload["type"] == "user.signed_in")
+        .collect();
+    assert_eq!(
+        signed_in.len(),
+        1,
+        "a real session creation must put exactly one sign-in on the feed, or metering \
+         counts nothing: {events:?}"
+    );
+    assert_eq!(
+        signed_in[0].payload["payload"]["subject"],
+        user.to_string(),
+        "the subject is what makes an active user active, and it is the only field the fold \
+         reads"
+    );
+    ironauth_store::event_catalog::validate_event(&signed_in[0].payload)
+        .expect("the sign-in validates against the registry the fan-out enforces");
+
+    let mut tally = ironauth_store::UsageTally::new();
+    tally.absorb(&events);
+    assert_eq!(
+        tally.monthly_active_users(),
+        1,
+        "one real sign-in is one active user; this is the assertion that was structurally \
+         unreachable while nothing emitted the type"
+    );
+}

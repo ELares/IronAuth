@@ -19246,6 +19246,7 @@ impl ActingImpersonationAuthorizationRepo<'_> {
         .await?;
         insert_session_row(
             &mut tx,
+            env,
             scope,
             &session,
             NewSession {
@@ -19390,7 +19391,7 @@ impl ActingSessionRepo<'_> {
                 target: id,
             },
             async move |tx| {
-                insert_session_row(tx, scope, id, params, now_micros).await?;
+                insert_session_row(tx, env, scope, id, params, now_micros).await?;
                 if let (Some(prior_id), Some(prior_text)) = (prior, &prior_text) {
                     *out = reconcile_prior_session_at_rotation(
                         PriorReconcile {
@@ -38734,8 +38735,26 @@ where
 ///
 /// Split out of `rotate_inner` for the function-length lint. It is also the natural unit: one
 /// statement writing one row, with the impersonation columns riding along or staying NULL.
+/// Every session in the system is inserted HERE, which is why the metering event is emitted
+/// here too (issue #107).
+///
+/// `UsageTally` counts monthly actives off `user.signed_in`, and the constant naming that
+/// type had no producer at all: the fold read a feed that never contained it, so metering
+/// reported zero for every tenant. The fix belongs at the choke point rather than at each of
+/// the three call sites above, for the same reason the fan-out validates in one place -- a
+/// producer added per call site is a producer the next call site forgets, and the failure is
+/// silent undercounting that surfaces as a billing dispute.
+///
+/// In the write's OWN transaction, so a rolled-back sign-in is not metered. That is one
+/// outbox insert on the authentication path, and it is the event stream rather than a
+/// metering query: #107 requires the FOLD to stay off the hot path, which it does -- it runs
+/// on request against the feed, and nothing aggregates here.
+///
+/// The SUBJECT and nothing else. Metering needs to tell people apart, not identify them, and
+/// a billing pipeline is exactly the downstream that should never be handed a directory.
 async fn insert_session_row(
     tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
     scope: Scope,
     id: &SessionId,
     params: NewSession<'_>,
@@ -38789,6 +38808,33 @@ async fn insert_session_row(
     )
     .execute(&mut **tx)
     .await?;
+    // METERED HERE, in the write's own transaction (issue #107). See this function's doc for
+    // why the choke point rather than the call sites, and why the subject is the whole
+    // payload. Built here rather than by a handler because there is no handler: a sign-in is
+    // a data-plane fact, and the store is its only producer.
+    let event_id = format!("evt_{}", CorrelationId::generate(env));
+    if let Some(envelope) = crate::event_catalog::envelope(
+        &event_id,
+        "user.signed_in",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now_micros / 1000,
+        &serde_json::json!({ "subject": params.subject }),
+    ) {
+        enqueue_domain_event(
+            tx,
+            env,
+            scope,
+            Some(&DomainEvent {
+                id: &event_id,
+                // The SUBJECT is the ordering key: one person's sign-ins stay ordered, which
+                // is what lets a consumer reason about a session timeline at all.
+                subject: params.subject,
+                envelope: &envelope,
+            }),
+        )
+        .await?;
+    }
     Ok(())
 }
 

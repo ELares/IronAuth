@@ -434,6 +434,24 @@
       "type": "config_promotion.applied"
     },
     {
+      "domain": "connection",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "connection_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "connection.opened"
+    },
+    {
       "domain": "connector",
       "payload_schema": {
         "additionalProperties": false,
@@ -2228,6 +2246,24 @@
       "type": "tenant.suspended"
     },
     {
+      "domain": "token",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "token.issued"
+    },
+    {
       "domain": "trait_migration_job",
       "payload_schema": {
         "additionalProperties": false,
@@ -2438,6 +2474,24 @@
       },
       "payload_schema_version": 1,
       "type": "user.sessions_revoked"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "subject": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.signed_in"
     },
     {
       "domain": "user",
