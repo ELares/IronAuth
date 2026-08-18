@@ -19132,6 +19132,47 @@ impl ActingSessionRepo<'_> {
         hard_kill: bool,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<u64, StoreError> {
+        self.bulk_revoke_with_events(env, ids, hard_kill, idempotency, None)
+            .await
+    }
+
+    /// [`Self::bulk_revoke`], additionally emitting ONE `session.revoked` PER SESSION THAT
+    /// ACTUALLY FLIPPED (issue #108).
+    ///
+    /// One event per session rather than one batch event, matching what the audit trail
+    /// already does here -- "one audit row per session, so the trail names every revoked
+    /// session individually rather than reporting an opaque batch". A consumer then handles
+    /// ONE type for both the single and the bulk path instead of learning a second shape, and
+    /// nothing has to fan a batch back out to act on it.
+    ///
+    /// `events` is POSITIONAL: `events[i]` announces `ids[i]`. It is refused unless it is
+    /// exactly as long as `ids`, because a shorter or longer slice would silently attribute
+    /// one session's envelope to another -- a misattribution no later check could detect.
+    ///
+    /// Only sessions that FLIPPED are announced. A session already revoked is a no-op here,
+    /// and announcing it would tell a receiver to tear down what it has already torn down --
+    /// the same guard rule the single revoke inherits.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidName`] if `events` is present and not the same length as `ids`;
+    /// otherwise as [`Self::bulk_revoke`].
+    pub async fn bulk_revoke_with_events(
+        &self,
+        env: &Env,
+        ids: &[SessionId],
+        hard_kill: bool,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        events: Option<&[DomainEvent<'_>]>,
+    ) -> Result<u64, StoreError> {
+        if let Some(events) = events {
+            if events.len() != ids.len() {
+                // Refused rather than truncated or zipped: a length mismatch means the
+                // caller's envelopes and the sessions they describe are not aligned, and
+                // enqueuing any of them would attribute the wrong session to the wrong event.
+                return Err(StoreError::InvalidName);
+            }
+        }
         let scope = self.scope;
         let now_micros = epoch_micros(env.clock().now_utc());
         // ONE transaction: every session flip, every cascade, and every per-session
@@ -19140,7 +19181,7 @@ impl ActingSessionRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         insert_idempotency(&mut tx, idempotency).await?;
         let mut flipped = 0_u64;
-        for id in ids {
+        for (index, id) in ids.iter().enumerate() {
             // Scope-fence: a foreign-scope id is a uniform no-op (never a query).
             if id.scope() != scope {
                 continue;
@@ -19157,6 +19198,11 @@ impl ActingSessionRepo<'_> {
             .await?;
             if outcome.session_flipped {
                 flipped += 1;
+                // Only what actually changed: a session already revoked is a no-op here, and
+                // announcing it would tell a receiver to tear down what it already has.
+                if let Some(events) = events {
+                    enqueue_domain_event(&mut tx, env, scope, Some(&events[index])).await?;
+                }
             }
             // One audit row per session, so the trail names every revoked session
             // individually rather than reporting an opaque batch.

@@ -378,12 +378,29 @@ pub async fn bulk_revoke_sessions(
         hard_kill: request.hard_kill,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    // ONE envelope per REQUESTED id, positionally aligned with `ids`: the store enqueues
+    // only those whose session actually flipped, so nothing announces a no-op.
+    //
+    // COLLECTED ALL-OR-NOTHING, not filtered. `Option<Vec<_>>` from an iterator of options
+    // yields `None` if ANY envelope fails to build; a `filter_map` would drop that one and
+    // shift every later envelope onto the wrong session, which the store's length check could
+    // not catch because the slice would still be shorter rather than misaligned.
+    let built: Option<Vec<crate::events::PendingEvent>> = ids
+        .iter()
+        .map(|id| session_revoked_event(&state, scope, id, SessionEndCause::BulkRevoked))
+        .collect();
+    let pending: Option<Vec<ironauth_store::DomainEvent<'_>>> = built.as_ref().map(|events| {
+        events
+            .iter()
+            .map(crate::events::PendingEvent::domain_event)
+            .collect()
+    });
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .sessions()
-        .bulk_revoke(
+        .bulk_revoke_with_events(
             state.env(),
             &ids,
             request.hard_kill,
@@ -394,6 +411,7 @@ pub async fn bulk_revoke_sessions(
                 response_status: 200,
                 response_body: &body_string,
             }),
+            pending.as_deref(),
         )
         .await;
 

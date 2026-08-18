@@ -1439,3 +1439,173 @@ async fn revoking_a_session_emits_the_cause_and_never_a_token() {
     ironauth_store::event_catalog::validate_event(&events[0])
         .expect("the envelope validates against the registry the fan-out enforces");
 }
+
+/// A bulk revoke emits ONE event per session that actually flipped, never one per request.
+///
+/// One event per session matches what the audit trail here already does -- "one audit row per
+/// session, so the trail names every revoked session individually rather than reporting an
+/// opaque batch" -- so a consumer handles ONE type for both the single and the bulk path
+/// instead of learning a second shape and fanning a batch back out.
+///
+/// The ALREADY-REVOKED session in the middle is the point: it is a no-op, and announcing it
+/// would tell a receiver to tear down what it has already torn down. Its envelope is still
+/// SUPPLIED, so this proves the store filters on the actual flip rather than on what it was
+/// handed.
+#[tokio::test]
+async fn a_bulk_revoke_announces_only_the_sessions_that_flipped() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let first = create_session(&db, &env, scope, &subject, None).await;
+    let already = create_session(&db, &env, scope, &subject, None).await;
+    let third = create_session(&db, &env, scope, &subject, None).await;
+
+    // Revoke the middle one up front, WITHOUT an event, so it is a no-op in the batch below.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke(&env, &already, SessionEndCause::LoggedOut, false, None)
+        .await
+        .expect("pre-revoke");
+
+    let ids = vec![first, already, third];
+    let subjects: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    let envelopes: Vec<serde_json::Value> = subjects
+        .iter()
+        .map(|session| {
+            ironauth_store::event_catalog::envelope(
+                "evt_bulk",
+                "session.revoked",
+                &scope.tenant().to_string(),
+                &scope.environment().to_string(),
+                1,
+                &serde_json::json!({
+                    "session_id": session,
+                    "cause": SessionEndCause::BulkRevoked.as_str(),
+                }),
+            )
+            .expect("session.revoked is registered")
+        })
+        .collect();
+    // Distinct event ids: the outbox is unique on (scope, consumer, idempotency_key) and the
+    // key IS the event id, so a real producer mints one per emit.
+    let event_ids: Vec<String> = (0..ids.len()).map(|i| format!("evt_bulk_{i}")).collect();
+    let events: Vec<ironauth_store::DomainEvent<'_>> = (0..ids.len())
+        .map(|i| ironauth_store::DomainEvent {
+            id: &event_ids[i],
+            subject: &subjects[i],
+            envelope: &envelopes[i],
+        })
+        .collect();
+
+    let flipped = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .bulk_revoke_with_events(&env, &ids, false, None, Some(&events))
+        .await
+        .expect("bulk revoke with events");
+    assert_eq!(flipped, 2, "only the two live sessions flip");
+
+    let queued = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued.len(),
+        2,
+        "the already-revoked session is a no-op and must not be announced: {queued:?}"
+    );
+    let announced: Vec<String> = queued
+        .iter()
+        .map(|event| {
+            event["payload"]["session_id"]
+                .as_str()
+                .expect("id")
+                .to_owned()
+        })
+        .collect();
+    assert!(
+        !announced.contains(&subjects[1]),
+        "the no-op session was announced: {announced:?}"
+    );
+    for event in &queued {
+        assert_eq!(event["type"], "session.revoked");
+        ironauth_store::event_catalog::validate_event(event)
+            .expect("the envelope validates against the registry the fan-out enforces");
+    }
+}
+
+/// A misaligned envelope slice is REFUSED, not truncated.
+///
+/// `events` is positional, so a slice of the wrong length means the caller's envelopes and the
+/// sessions they describe do not correspond. Zipping or truncating would attribute one
+/// session's envelope to another -- a misattribution no later check could detect, because
+/// every envelope would still be individually valid.
+#[tokio::test]
+async fn a_bulk_revoke_refuses_an_envelope_slice_of_the_wrong_length() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let first = create_session(&db, &env, scope, &subject, None).await;
+    let second = create_session(&db, &env, scope, &subject, None).await;
+
+    let one = first.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_short",
+        "session.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "session_id": one,
+            "cause": SessionEndCause::BulkRevoked.as_str(),
+        }),
+    )
+    .expect("session.revoked is registered");
+    let events = vec![ironauth_store::DomainEvent {
+        id: "evt_short",
+        subject: &one,
+        envelope: &envelope,
+    }];
+
+    let refused = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .bulk_revoke_with_events(&env, &[first, second], false, None, Some(&events))
+        .await;
+    assert!(refused.is_err(), "a short envelope slice must be refused");
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim")
+            .is_empty(),
+        "a refused bulk revoke must announce nothing at all"
+    );
+}

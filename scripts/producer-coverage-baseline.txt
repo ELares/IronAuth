@@ -46,7 +46,6 @@ routing_rules::verify_routing_rule_domain
 service_account_keys::create_service_account_api_key
 service_account_keys::revoke_service_account_api_key
 service_account_keys::rotate_service_account_api_key
-sessions::bulk_revoke_sessions
 sessions::revoke_user_sessions
 signing_algorithm::set_client_signing_algorithm
 signup_quarantine::approve_signup_quarantine
