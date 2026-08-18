@@ -63647,6 +63647,20 @@ pub struct NewBackchannelRequest<'a> {
     pub expires_at_micros: i64,
 }
 
+/// A client's REGISTERED CIBA delivery settings (issue #131 criteria 2 and 6).
+///
+/// Read as its own narrow row rather than widened onto `ClientRecord`: the backchannel
+/// endpoint needs exactly these two fields, and every other caller of `ClientRecord` would
+/// otherwise carry two columns it never reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientBackchannelProfile {
+    /// `poll` or `ping`, as registered. `push` is not representable -- the column's CHECK
+    /// vocabulary excludes it, so this parse cannot observe one.
+    pub delivery_mode: crate::ciba::DeliveryMode,
+    /// Where a ping is sent. Always `Some` for ping and `None` for poll, paired by a CHECK.
+    pub notification_endpoint: Option<String>,
+}
+
 /// A pending request as the approval surface needs to render it (#131 criterion 1).
 ///
 /// Carries `binding_message` because that is the whole point of the surface: the user must
@@ -63707,6 +63721,50 @@ impl BackchannelAuthRepo<'_> {
     /// [`StoreError::NotFound`] if malformed or out of scope.
     pub fn parse_request_id(&self, raw: &str) -> Result<BackchannelAuthRequestId, StoreError> {
         Ok(BackchannelAuthRequestId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// A client's registered CIBA delivery settings (#131 criteria 2 and 6).
+    ///
+    /// Returns [`None`] when the client is absent or out of scope, which the endpoint answers
+    /// the same way it answers an unauthenticated client -- there is no existence oracle here.
+    ///
+    /// The mode is READ, never inferred from the request. CIBA Core makes it a registered
+    /// property, and inferring it would let a client that registered for poll talk the server
+    /// into calling a URL by adding a parameter.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or [`StoreError::NotFound`] if the
+    /// stored mode is not one this build knows -- which the column's CHECK already prevents,
+    /// so it is a fail-closed guard against a schema that drifted rather than an expected path.
+    pub async fn client_profile(
+        &self,
+        client_id: &ClientId,
+    ) -> Result<Option<ClientBackchannelProfile>, StoreError> {
+        if client_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT backchannel_delivery_mode, backchannel_client_notification_endpoint \
+             FROM clients WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(client_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mode_text: String = row.get("backchannel_delivery_mode");
+        let delivery_mode =
+            crate::ciba::DeliveryMode::parse(&mode_text).map_err(|_| StoreError::NotFound)?;
+        Ok(Some(ClientBackchannelProfile {
+            delivery_mode,
+            notification_endpoint: row.get("backchannel_client_notification_endpoint"),
+        }))
     }
 
     /// Persist a new backchannel authentication request (#131 criterion 5).

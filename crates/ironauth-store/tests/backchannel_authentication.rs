@@ -772,3 +772,91 @@ async fn approval_makes_a_request_redeemable_and_denial_does_not() {
     assert!(redeemed.is_some(), "approval makes it redeemable");
     assert_eq!(redeemed.expect("some").subject, "usr_ada");
 }
+
+/// A client cannot register push mode, and cannot hold a mismatched notification endpoint
+/// (#131 criteria 2 and 6).
+///
+/// Asserted against the SCHEMA, because that is what makes the refusal survive a caller that
+/// forgets to ask. The application refuses push in `DeliveryMode::parse`; this proves there is
+/// no state of the database in which a push-mode client exists.
+///
+/// The poll-WITH-an-endpoint direction is the one worth having. Such a row is inert today,
+/// and the first future reader that consults the endpoint column before checking the mode
+/// turns a poll registration into a server-side request to an attacker-chosen URL. An unused
+/// URL on a row is exactly the latent capability that becomes an SSRF the day someone wires
+/// it up.
+#[tokio::test]
+async fn a_client_cannot_register_push_or_a_mismatched_notification_endpoint() {
+    async fn set(
+        db: &TestDatabase,
+        scope: Scope,
+        mode: &str,
+        endpoint: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = db.app_pool().begin().await.expect("begin");
+        bind_scope(&mut tx, scope).await;
+        let result = sqlx::query(
+            "UPDATE clients SET backchannel_delivery_mode = $1, \
+             backchannel_client_notification_endpoint = $2",
+        )
+        .bind(mode)
+        .bind(endpoint)
+        .execute(&mut *tx)
+        .await
+        .map(|done| {
+            assert_eq!(
+                done.rows_affected(),
+                1,
+                "the statement must touch exactly one client row; zero rows would make every \
+                 assertion in this test vacuous"
+            );
+        });
+        if result.is_ok() {
+            tx.commit().await.expect("commit");
+        }
+        result
+    }
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    // A REAL client row. Without one every UPDATE below touches zero rows and succeeds
+    // trivially -- which is exactly how this test first passed its positive controls while
+    // proving nothing. A CHECK constraint only fires on a row that exists.
+    let client_id = db
+        .store()
+        .scoped(scope)
+        .acting(
+            db.test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .clients()
+        .create(&env, "ciba delivery test client")
+        .await
+        .expect("create a client");
+    assert_eq!(client_id.scope(), scope);
+
+    // Positive controls first: both legitimate shapes must be accepted, or every refusal
+    // below could be passing for an unrelated reason.
+    set(&db, scope, "poll", None).await.expect("poll is valid");
+    set(&db, scope, "ping", Some("https://client.test/ciba"))
+        .await
+        .expect("ping with an endpoint is valid");
+
+    let error = set(&db, scope, "push", Some("https://client.test/ciba"))
+        .await
+        .expect_err("push must be refused by the schema, not only by the parser");
+    assert!(
+        error.to_string().contains("delivery_mode_known"),
+        "the closed vocabulary should be what refuses it: {error}"
+    );
+
+    let error = set(&db, scope, "ping", None)
+        .await
+        .expect_err("ping with nowhere to ping must be refused");
+    assert!(error.to_string().contains("ping_has_endpoint"), "{error}");
+
+    let error = set(&db, scope, "poll", Some("https://attacker.test/"))
+        .await
+        .expect_err("a poll client must not carry a notification endpoint");
+    assert!(error.to_string().contains("ping_has_endpoint"), "{error}");
+}
