@@ -245,12 +245,13 @@ pub async fn add_user_identifier(
         response_status: 201,
         response_body: &body_string,
     };
+    let pending = identifier_event(&state, scope, &id, &record_id, Some(kind.as_str()));
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .user_identifiers()
-        .add(
+        .add_with_event(
             state.env(),
             NewUserIdentifier {
                 id: &record_id,
@@ -270,6 +271,10 @@ pub async fn add_user_identifier(
                 org: None,
             },
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await
         .map_err(|error| match error {
@@ -330,12 +335,21 @@ pub async fn remove_user_identifier(
     // the add, this statement writes no foreign key and reads no sealed value, so an
     // absent user simply removes zero rows and lands on the same not-found. A probe here
     // would be a second query that could only agree with the one below.
+    let pending = identifier_event(&state, scope, &id, &record_id, None);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .user_identifiers()
-        .remove(state.env(), &id, &record_id)
+        .remove_with_event(
+            state.env(),
+            &id,
+            &record_id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }
@@ -516,4 +530,56 @@ pub async fn apply_identifier_uniqueness(
             other => other.into(),
         })?;
     Ok(no_content())
+}
+
+/// The event adding or removing a user identifier emits (issue #108).
+///
+/// `identifier_type` present means an ADD, absent means a REMOVE: the add knows the kind it
+/// is writing, and the remove is given only a row id.
+///
+/// NEVER THE IDENTIFIER VALUE. An identifier is an email address or a phone number -- PII,
+/// sealed at rest, and the reason this store keeps blind indexes rather than plaintext
+/// columns. A webhook is a wider audience than the management read surface, so the same
+/// refusal holds. The TYPE is carried on the add because "an email was added" and "a phone
+/// was added" are different facts to a receiver deciding whether to re-verify.
+fn identifier_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    user_id: &ironauth_store::UserId,
+    identifier_id: &ironauth_store::UserIdentifierId,
+    identifier_type: Option<&str>,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = user_id.to_string();
+    let (event_type, payload) = match identifier_type {
+        Some(kind) => (
+            "user.identifier_added",
+            serde_json::json!({
+                "user_id": subject,
+                "identifier_id": identifier_id.to_string(),
+                "identifier_type": kind,
+            }),
+        ),
+        None => (
+            "user.identifier_removed",
+            serde_json::json!({
+                "user_id": subject,
+                "identifier_id": identifier_id.to_string(),
+            }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The USER is the subject: identifier changes for one person stay ordered.
+        subject,
+        envelope,
+    })
 }

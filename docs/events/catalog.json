@@ -1230,6 +1230,57 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
+          "identifier_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "identifier_type": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "identifier_id",
+          "identifier_type"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.identifier_added"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "identifier_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "identifier_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.identifier_removed"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
           "user_id": {
             "minLength": 1,
             "type": "string"

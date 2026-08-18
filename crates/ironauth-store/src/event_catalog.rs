@@ -464,6 +464,42 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // The external id is the OPERATOR'S OWN identifier for this person, supplied through
         // the management API -- not a credential and not a secret. Withholding it would make
         // the event unusable for the one job it exists to do.
+        // The user and the identifier's ROW ID and TYPE -- and never the identifier VALUE.
+        //
+        // An identifier is an email address or a phone number: PII, sealed at rest, and the
+        // reason this store keeps blind indexes rather than plaintext columns. A webhook is a
+        // wider audience than the management read surface, so the same refusal holds. The
+        // TYPE is carried because "an email was added" and "a phone was added" are different
+        // facts to a receiver deciding whether to re-verify.
+        "user.identifier_added",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "identifier_id": {"type": "string", "minLength": 1},
+                "identifier_type": {"type": "string", "minLength": 1}
+            },
+            "required": ["user_id", "identifier_id", "identifier_type"]
+        }"#,
+    ),
+    (
+        // The row id only, beside the user: the remove is given the id, not the value, and the
+        // value would not belong on the wire even if it had it.
+        "user.identifier_removed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "identifier_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["user_id", "identifier_id"]
+        }"#,
+    ),
+    (
         "user.external_id_linked",
         1,
         r#"{

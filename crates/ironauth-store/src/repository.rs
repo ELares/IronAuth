@@ -18058,6 +18058,21 @@ impl ActingUserIdentifierRepo<'_> {
         spec: NewUserIdentifier<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.add_with_event(env, spec, idempotency, None).await
+    }
+
+    /// [`Self::add`], additionally emitting `user.identifier_added` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::add`].
+    pub async fn add_with_event(
+        &self,
+        env: &Env,
+        spec: NewUserIdentifier<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let NewUserIdentifier {
             id,
             user_id,
@@ -18150,6 +18165,8 @@ impl ActingUserIdentifierRepo<'_> {
                 // and the audit row, so a replay cannot observe one without the others
                 // and a rolled-back add leaves no key claimed.
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -18181,6 +18198,21 @@ impl ActingUserIdentifierRepo<'_> {
         user_id: &UserId,
         id: &UserIdentifierId,
     ) -> Result<(), StoreError> {
+        self.remove_with_event(env, user_id, id, None).await
+    }
+
+    /// [`Self::remove`], additionally emitting `user.identifier_removed` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove`].
+    pub async fn remove_with_event(
+        &self,
+        env: &Env,
+        user_id: &UserId,
+        id: &UserIdentifierId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if user_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -18211,6 +18243,8 @@ impl ActingUserIdentifierRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
