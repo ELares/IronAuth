@@ -432,6 +432,36 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // ORG GROUP lifecycle. The group AND its organization on every one, for the reason the
         // role types carry it: a group is scoped to one organization and a receiver keeping a
         // per-organization view cannot file the event without knowing which.
+        // THE SESSION AND THE CAUSE, and deliberately NOT the user -- which is a constraint
+        // the producer has rather than a preference. The revoke handler performs no pre-read
+        // by design: "a revoke is idempotent over the session itself, so an absent session is
+        // deliberately a 200 rather than a refusal". Nothing there knows whose session it was
+        // when the envelope must be built, and adding a read to find out would reintroduce
+        // exactly the refusal that comment rules out.
+        //
+        // A consumer that needs the subject resolves the session id, which it must be able to
+        // do anyway to act on the revocation.
+        //
+        // The CAUSE is carried because revocations are not alike: an operator ending a session
+        // and a session ended by a policy fence are the same row change and very different
+        // facts to a SIEM. It is the store's own `SessionEndCause`, rendered, so the wire
+        // cannot disagree with the audit row.
+        //
+        // NO SESSION TOKEN and nothing derived from one. A session id is an opaque handle the
+        // holder already presented; the token is a credential.
+        "session.revoked",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "session_id": {"type": "string", "minLength": 1},
+                "cause": {"type": "string", "minLength": 1}
+            },
+            "required": ["session_id", "cause"]
+        }"#,
+    ),
+    (
         "org_group.created",
         1,
         r#"{

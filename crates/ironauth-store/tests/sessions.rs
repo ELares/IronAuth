@@ -1362,3 +1362,80 @@ async fn a_storm_of_session_bound_opens_never_orphans_a_family_onto_a_revoked_se
          the test is not exercising the race it claims to",
     );
 }
+
+/// Revoking a session emits `session.revoked`, carrying the CAUSE and no token.
+///
+/// The cause is the point: an operator ending a session and a session ended by a policy fence
+/// are the same row change and very different facts to a SIEM. It is the store's own
+/// `SessionEndCause`, rendered, so the wire cannot disagree with the audit row -- and the test
+/// uses a NON-default cause so a producer that hard-coded one would fail.
+///
+/// No user id, and that is a constraint rather than an omission: the revoke handler performs
+/// no pre-read by design, so nothing knows whose session it was when the envelope is built.
+#[tokio::test]
+async fn revoking_a_session_emits_the_cause_and_never_a_token() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let session = create_session(&db, &env, scope, &subject, None).await;
+    let session_subject = session.to_string();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_session_revoked",
+        "session.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "session_id": session_subject,
+            "cause": SessionEndCause::LoggedOut.as_str(),
+        }),
+    )
+    .expect("session.revoked is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke_with_event(
+            &env,
+            &session,
+            SessionEndCause::LoggedOut,
+            false,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_session_revoked",
+                subject: &session_subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("revoke with event");
+
+    let events = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "the revocation enqueues exactly one event");
+    assert_eq!(events[0]["type"], "session.revoked");
+    assert_eq!(events[0]["payload"]["session_id"], session_subject);
+    assert_eq!(
+        events[0]["payload"]["cause"],
+        SessionEndCause::LoggedOut.as_str(),
+        "the event must carry the cause the revoke was given, not a fixed one"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

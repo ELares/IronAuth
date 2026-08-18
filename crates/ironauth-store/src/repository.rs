@@ -19045,6 +19045,27 @@ impl ActingSessionRepo<'_> {
         hard_kill: bool,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<SessionRevocation, StoreError> {
+        self.revoke_with_event(env, id, cause, hard_kill, idempotency, None)
+            .await
+    }
+
+    /// [`Self::revoke`], additionally emitting `session.revoked` (issue #108).
+    ///
+    /// Enqueued inside the revocation's own transaction, so a receiver is never told to drop
+    /// a session that a rolled-back revoke left live.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke`].
+    pub async fn revoke_with_event(
+        &self,
+        env: &Env,
+        id: &SessionId,
+        cause: SessionEndCause,
+        hard_kill: bool,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<SessionRevocation, StoreError> {
         self.revoke_inner(
             env,
             id,
@@ -19055,6 +19076,7 @@ impl ActingSessionRepo<'_> {
                 idempotency,
                 poison_after_audit: false,
             },
+            event,
         )
         .await
     }
@@ -19085,6 +19107,9 @@ impl ActingSessionRepo<'_> {
                 idempotency: None,
                 poison_after_audit: true,
             },
+            // The atomicity probe emits nothing: it exists to force a failure, and an event
+            // there would announce a revocation that is about to be rolled back.
+            None,
         )
         .await
     }
@@ -19404,6 +19429,7 @@ impl ActingSessionRepo<'_> {
         env: &Env,
         id: &SessionId,
         spec: RevokeSpec<'_>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<SessionRevocation, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -19483,6 +19509,9 @@ impl ActingSessionRepo<'_> {
                     )
                     .await?;
                 }
+                // In the revocation's own transaction: a rolled-back revoke announces
+                // nothing, so a receiver is never told to drop a session that is live.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             poison_after_audit,

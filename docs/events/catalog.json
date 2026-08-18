@@ -1048,6 +1048,29 @@
       "type": "permission.updated"
     },
     {
+      "domain": "session",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "cause": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "session_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "cause"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "session.revoked"
+    },
+    {
       "domain": "signup_form",
       "payload_schema": {
         "additionalProperties": false,
