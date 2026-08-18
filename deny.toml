@@ -57,3 +57,19 @@ ignore = [{ id = "RUSTSEC-2023-0071", reason = "rsa crate used only for RS256 ke
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# ONE git source, and it is a repository we publish from ourselves.
+#
+# RUSTSEC-2026-0041 reaches this workspace only through ironbus-core -> lz4_flex 0.10.0.
+# Nothing here declares lz4_flex, so the fix had to happen in IronBus (ELares/IronBus#1203,
+# bumping to the patched 0.11.6); the `[patch.crates-io]` block in the workspace Cargo.toml
+# points at that commit until a release carries it.
+#
+# The alternative was an advisory ignore, and this is the better trade: an ignore asserts a
+# reachability nobody measured and stays silently true forever, while this makes the
+# workspace actually run patched code and leaves a `[patch]` block that is obvious in every
+# `cargo update`.
+#
+# THIS ENTRY ALLOWS THE REPOSITORY, NOT A COMMIT. What pins the code is the `rev` in the
+# patch block; this line only says the host is one we control. Both come out together the
+# moment ironbus-core publishes a version carrying the bump (ELares/IronAuth#892).
+allow-git = ["https://github.com/ELares/IronBus"]
