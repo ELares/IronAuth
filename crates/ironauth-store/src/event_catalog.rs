@@ -478,6 +478,53 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         //
         // The MODE is the payload, because a receiver mirroring identity policy needs to know
         // which rule now holds -- whether an address may repeat across organizations.
+        // A schema VERSION was registered, not yet in force. Publishing the version alone --
+        // and never the schema body -- keeps the event small and keeps a consumer honest: the
+        // registry is the source of truth for the shape, and refetching it is one call.
+        "trait_schema.version_created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "version": {"type": "integer"}
+            },
+            "required": ["version"]
+        }"#,
+    ),
+    (
+        // ITS OWN TYPE, and the consequential one of the pair: creating a version changes
+        // nothing a user can observe, ACTIVATING it changes how every trait in the
+        // environment is validated from that moment. A consumer that treated the two alike
+        // would apply a schema before it was in force.
+        "trait_schema.version_activated",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "version": {"type": "integer"}
+            },
+            "required": ["version"]
+        }"#,
+    ),
+    (
+        // A long-running JOB was accepted, not completed. The KIND is carried because a dry
+        // run and a real migration are very different things to a receiver watching for trait
+        // changes: one will rewrite rows, the other never will.
+        "trait_migration_job.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "job_id": {"type": "string", "minLength": 1},
+                "kind": {"type": "string", "minLength": 1}
+            },
+            "required": ["job_id", "kind"]
+        }"#,
+    ),
+    (
         "environment.identifier_uniqueness_applied",
         1,
         r#"{

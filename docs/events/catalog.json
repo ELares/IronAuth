@@ -1237,6 +1237,63 @@
       "type": "tenant.created"
     },
     {
+      "domain": "trait_migration_job",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "job_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "trait_migration_job.created"
+    },
+    {
+      "domain": "trait_schema",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "trait_schema.version_activated"
+    },
+    {
+      "domain": "trait_schema",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "trait_schema.version_created"
+    },
+    {
       "domain": "user",
       "payload_schema": {
         "additionalProperties": false,

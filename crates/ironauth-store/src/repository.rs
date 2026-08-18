@@ -57306,6 +57306,36 @@ impl ActingTraitSchemaRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_version_at_with_event(
+            env,
+            id,
+            schema_json,
+            version,
+            created_at_micros,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create_version_at`], additionally emitting `trait_schema.version_created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_version_at`].
+    // Its sibling already takes seven; this adds exactly one optional event and reshaping the
+    // existing signature to stay under the bound would change a public API for a lint.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_version_at_with_event(
+        &self,
+        env: &Env,
+        id: &TraitSchemaId,
+        schema_json: &str,
+        version: i32,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         // Prove the schema is well formed BEFORE the transaction: a malformed schema
         // never reaches the registry.
         TraitSchema::compile(schema_json)?;
@@ -57346,7 +57376,8 @@ impl ActingTraitSchemaRepo<'_> {
                 .execute(&mut **tx)
                 .await;
                 match result {
-                    Ok(_) => Ok(()),
+                    // Announced on the SUCCESS arm only: a refused registration says nothing.
+                    Ok(_) => enqueue_domain_event(tx, env, scope, event).await,
                     // The append-only unique index refused a concurrently-taken version.
                     Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
                     Err(error) => Err(error.into()),
@@ -57389,6 +57420,22 @@ impl ActingTraitSchemaRepo<'_> {
         env: &Env,
         version: i32,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.activate_version_idempotent_with_event(env, version, idempotency, None)
+            .await
+    }
+
+    /// [`Self::activate_version_idempotent`], additionally emitting `trait_schema.version_activated` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::activate_version_idempotent`].
+    pub async fn activate_version_idempotent_with_event(
+        &self,
+        env: &Env,
+        version: i32,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
@@ -57460,6 +57507,8 @@ impl ActingTraitSchemaRepo<'_> {
                 .bind(version)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -57681,6 +57730,24 @@ impl ActingTraitMigrationJobRepo<'_> {
         created_at_micros: i64,
         start: TraitMigrationStart<'_>,
     ) -> Result<(), StoreError> {
+        self.create_with_id_with_event(env, id, spec, created_at_micros, start, None)
+            .await
+    }
+
+    /// [`Self::create_with_id`], additionally emitting `trait_migration_job.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_with_id`].
+    pub async fn create_with_id_with_event(
+        &self,
+        env: &Env,
+        id: &TraitMigrationJobId,
+        spec: NewTraitMigrationJob<'_>,
+        created_at_micros: i64,
+        start: TraitMigrationStart<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         if id.scope() != scope {
             return Err(StoreError::NotFound);
@@ -57780,6 +57847,8 @@ impl ActingTraitMigrationJobRepo<'_> {
                 )
                 .await?;
                 insert_idempotency(tx, start.idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

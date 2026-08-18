@@ -49,6 +49,3 @@ tenants::purge_tenant
 tenants::restore_tenant
 tenants::resume_tenant
 tenants::suspend_tenant
-trait_schemas::activate_trait_schema_version
-trait_schemas::create_trait_migration_job
-trait_schemas::create_trait_schema_version
