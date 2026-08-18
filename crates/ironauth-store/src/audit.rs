@@ -880,6 +880,14 @@ pub enum Action {
     /// reason a locale bundle's entries are not -- an audit row is a record that somebody
     /// changed something, not a copy of what they wrote.
     MessageTemplateSet,
+    /// An HTTP FLOW TARGET was registered or reconfigured through the management API
+    /// (issue #112). The audit row names the target id and scope; the target's config is not
+    /// recorded here, for the reason a locale bundle's entries are not -- an audit row records
+    /// that somebody changed something, not a copy of what they wrote.
+    FlowTargetSet,
+    /// An HTTP FLOW TARGET was deregistered through the management API (issue #112), so it
+    /// stops being dispatched. The audit row names the target id and scope.
+    FlowTargetDelete,
     /// A MESSAGE TEMPLATE override was deleted through the management API (issue #111),
     /// restoring whatever the next level up provides. The audit row names the template id and
     /// scope.
@@ -1510,6 +1518,8 @@ impl Action {
             Action::LocaleSet => "locale.set",
             Action::LocaleDelete => "locale.delete",
             Action::MessageTemplateSet => "message_template.set",
+            Action::FlowTargetSet => "flow_target.set",
+            Action::FlowTargetDelete => "flow_target.delete",
             Action::MessageTemplateDelete => "message_template.delete",
             Action::SignupFormSet => "signup_form.set",
             Action::SignupFormDelete => "signup_form.delete",

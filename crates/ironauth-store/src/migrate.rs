@@ -1166,6 +1166,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0145_message_templates.sql"),
         },
+        Migration {
+            version: 146,
+            name: "flow_targets",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0146_flow_targets.sql"),
+        },
     ]
 }
 

@@ -912,6 +912,11 @@ path = "tests/project_grants.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "flow_targets"
+path = "tests/flow_targets.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "message_templates"
 path = "tests/message_templates.rs"
 required-features = ["testing"]

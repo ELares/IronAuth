@@ -232,6 +232,7 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     "environment",
     "environment_secret",
     "environment_variable",
+    "flow_target",
     "flow_version",
     "locale",
     "mds3",

@@ -807,6 +807,19 @@ impl ScopedKind for MessageTemplateKind {
     const PREFIX: &'static str = "mtp";
 }
 
+/// Marker for a registered HTTP flow target (`ftg_`), one configured extension endpoint per
+/// environment (issue #112).
+///
+/// A tenant-scoped resource: the id embeds its (tenant, environment), so a target registered
+/// in one scope parses as a uniform not-found under another. NOT promotable -- a target names
+/// a signing secret and an endpoint, and both mean something different in another
+/// environment, which is the same reason a log stream is not promotable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlowTargetKind;
+impl ScopedKind for FlowTargetKind {
+    const PREFIX: &'static str = "ftg";
+}
+
 /// Marker for a registered Standard Webhooks delivery endpoint (`whe_`), one POST target
 /// per environment (issue #105). A tenant-scoped resource: the id embeds its (tenant,
 /// environment), so an endpoint registered in one scope parses as a uniform not-found
@@ -1846,6 +1859,9 @@ pub type LogStreamId = ScopedId<LogStreamKind>;
 
 /// A stored message template override (issue #111).
 pub type MessageTemplateId = ScopedId<MessageTemplateKind>;
+
+/// A registered HTTP flow target (issue #112).
+pub type FlowTargetId = ScopedId<FlowTargetKind>;
 
 /// A registered webhook delivery endpoint (issue #105).
 pub type WebhookEndpointId = ScopedId<WebhookEndpointKind>;

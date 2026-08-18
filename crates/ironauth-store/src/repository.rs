@@ -83,9 +83,9 @@ use crate::id::{
     ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId,
     CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId,
     EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
-    FedcmNonceId, FederationLoginStateId, FlowId, FlowVersionId, FlowVersionPinId, GrantId,
-    ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
-    LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MessageTemplateId,
+    FedcmNonceId, FederationLoginStateId, FlowId, FlowTargetId, FlowVersionId, FlowVersionPinId,
+    GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId,
+    KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MessageTemplateId,
     MigrationRunId, MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
     OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
     OrgRolePermissionId, OrganizationId, OutboxMessageId, PermissionId, PowChallengeId,
@@ -555,6 +555,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn log_streams(&self) -> LogStreamRepo<'a> {
         LogStreamRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// Registered HTTP flow targets (issue #112).
+    ///
+    /// On the SCOPED store because DISPATCH reads them, and dispatch runs as the app role.
+    /// Registration is a management act: migration 0144 grants the app role SELECT alone, so
+    /// an app role that was somehow induced to write could not point a flow's data at an
+    /// endpoint it chose.
+    #[must_use]
+    pub fn flow_targets(&self) -> FlowTargetRepo<'a> {
+        FlowTargetRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1806,6 +1820,16 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn message_templates(&self) -> ActingMessageTemplateRepo<'a> {
         ActingMessageTemplateRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// Registering HTTP flow targets (issue #112). CONTROL plane.
+    #[must_use]
+    pub fn flow_targets(&self) -> ActingFlowTargetRepo<'a> {
+        ActingFlowTargetRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -20509,6 +20533,25 @@ pub const WEBHOOK_DELIVERY_CONSUMER: &str = "webhook.delivery";
 /// that failed should not consume a delivery's retry budget, and a command sitting at the
 /// head of an ordering group must not block the deliveries it is about to revive.
 pub const WEBHOOK_REPLAY_CONSUMER: &str = "webhook.replay";
+
+/// The registered consumer name an ASYNC flow target delivery drains under (issue #112).
+///
+/// Issue #112 says async targets "deliver through the webhook machinery, inheriting retries,
+/// DLQ, and replay". That inheritance is REAL rather than nominal: the outbox itself provides
+/// the bounded backoff, the dead-lettering once the attempts bound is reached, and the replay,
+/// so routing a target delivery through it gets all three without reimplementing any of them.
+/// This is why #112's out-of-scope list can name "webhook retries, DLQ, and replay" as
+/// somebody else's issue and still claim the behaviour.
+///
+/// A SEPARATE consumer from [`WEBHOOK_DELIVERY_CONSUMER`], for the reason
+/// [`WEBHOOK_REPLAY_CONSUMER`] is separate: a target that keeps failing must not consume the
+/// retry budget of an unrelated webhook endpoint, and a stuck target at the head of an
+/// ordering group must not block deliveries it has nothing to do with.
+///
+/// Exported so the producer and the consumer read the SAME bytes. A consumer whose name does
+/// not equal the discriminator its producers write drains NOTHING, silently -- the claim
+/// matches no rows, the pool reports healthy, and the only symptom is targets that never fire.
+pub const FLOW_TARGET_DELIVERY_CONSUMER: &str = "flow_target.delivery";
 
 /// The consumer name ONE batch of a trait MIGRATION JOB drains under (issue #53).
 ///
@@ -39553,6 +39596,384 @@ impl MessageTemplateRepo<'_> {
             default_locale,
         ))
     }
+}
+
+/// Registering and deregistering HTTP flow targets (issue #112).
+///
+/// CONTROL plane, which migration 0144's grants enforce: the app role dispatches and holds
+/// SELECT alone. An app role that could register a target could point a flow's data at an
+/// endpoint it chose, which is a strictly larger power than dispatch needs.
+pub struct ActingFlowTargetRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+/// A target to register, or the new configuration for an existing one.
+#[derive(Debug, Clone, Copy)]
+pub struct NewFlowTarget<'a> {
+    /// The operator-facing name, unique among live targets in the environment.
+    pub name: &'a str,
+    /// Which class of flow point invokes it.
+    pub target_class: crate::flow_target::TargetClass,
+    /// Whether the flow waits.
+    pub invocation: crate::flow_target::Invocation,
+    /// When it runs relative to the write.
+    pub timing: crate::flow_target::Timing,
+    /// Where it POSTs.
+    pub endpoint: &'a str,
+    /// The bound on a sync call. The database refuses a sync target without one.
+    pub timeout_ms: Option<i32>,
+    /// What to do when a sync target does not answer.
+    pub failure_policy: crate::flow_target::FailurePolicy,
+    /// Plain JSON. Never code.
+    pub config: &'a serde_json::Value,
+    /// The per-target signing secret, by NAME.
+    pub signing_secret_name: Option<&'a str>,
+    /// Whether it is dispatched.
+    pub enabled: bool,
+}
+
+impl ActingFlowTargetRepo<'_> {
+    /// Register a target, or replace the configuration of the one with this name.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure, including the CHECKs that keep an async target post-persist and a
+    /// sync target bounded.
+    pub async fn set(
+        &self,
+        env: &Env,
+        id: &FlowTargetId,
+        created_at_micros: i64,
+        params: NewFlowTarget<'_>,
+    ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `flow_target.set` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &FlowTargetId,
+        created_at_micros: i64,
+        params: NewFlowTarget<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let target = *id;
+        let name = params.name.to_owned();
+        let class = target_class_wire(params.target_class);
+        let invocation = match params.invocation {
+            crate::flow_target::Invocation::Sync => "sync",
+            crate::flow_target::Invocation::Async => "async",
+        };
+        let timing = match params.timing {
+            crate::flow_target::Timing::PrePersist => "pre_persist",
+            crate::flow_target::Timing::PostPersist => "post_persist",
+        };
+        let policy = match params.failure_policy {
+            crate::flow_target::FailurePolicy::FailOpen => "fail_open",
+            crate::flow_target::FailurePolicy::FailClosed => "fail_closed",
+        };
+        let endpoint = params.endpoint.to_owned();
+        let timeout = params.timeout_ms;
+        let config = params.config.clone();
+        let secret = params.signing_secret_name.map(ToOwned::to_owned);
+        let enabled = params.enabled;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::FlowTargetSet,
+                target: &target,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO flow_targets \
+                     (id, tenant_id, environment_id, name, target_class, invocation, timing, \
+                      endpoint, timeout_ms, failure_policy, config, signing_secret_name, \
+                      enabled, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, \
+                             TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, name) WHERE deleted_at IS NULL \
+                     DO UPDATE SET target_class = EXCLUDED.target_class, \
+                                   invocation = EXCLUDED.invocation, \
+                                   timing = EXCLUDED.timing, \
+                                   endpoint = EXCLUDED.endpoint, \
+                                   timeout_ms = EXCLUDED.timeout_ms, \
+                                   failure_policy = EXCLUDED.failure_policy, \
+                                   config = EXCLUDED.config, \
+                                   signing_secret_name = EXCLUDED.signing_secret_name, \
+                                   enabled = EXCLUDED.enabled, \
+                                   updated_at = EXCLUDED.updated_at",
+                )
+                .bind(target.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name)
+                .bind(class)
+                .bind(invocation)
+                .bind(timing)
+                .bind(&endpoint)
+                .bind(timeout)
+                .bind(policy)
+                .bind(&config)
+                .bind(secret.as_deref())
+                .bind(enabled)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                // In the write's transaction: a rolled-back registration announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Enqueue an ASYNC target delivery, inheriting the outbox's retries and dead-lettering
+    /// (issue #112 criterion 2).
+    ///
+    /// In the CALLER'S transaction, which is the whole point: a target fires because something
+    /// happened, and a delivery that committed while the thing it announces rolled back would
+    /// tell an integration about a signup that never existed. Taking the transaction rather
+    /// than opening one is what makes that impossible.
+    ///
+    /// Refuses a SYNC target. A sync target is one the flow waits for, so enqueueing it would
+    /// mean nothing ever waits and the flow proceeds as though the target had approved --
+    /// silently converting a blocking fraud check into a fire-and-forget one. Refused rather
+    /// than accepted-and-ignored, because the second is indistinguishable from working.
+    ///
+    /// Returns the enqueued message id, so a caller can correlate the delivery it just
+    /// scheduled with the attempt rows and dead letters it may later produce -- rather than
+    /// re-deriving it from the idempotency key and hoping the derivation matches.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidName`] if the target is synchronous; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn enqueue_async_delivery(
+        tx: &mut Transaction<'_, Postgres>,
+        env: &Env,
+        scope: Scope,
+        target: &crate::flow_target::FlowTargetRecord,
+        idempotency_key: &str,
+        payload: &serde_json::Value,
+    ) -> Result<OutboxMessageId, StoreError> {
+        if matches!(target.invocation, crate::flow_target::Invocation::Sync) {
+            return Err(StoreError::InvalidName);
+        }
+        enqueue_outbox_in_tx(
+            tx,
+            env,
+            scope,
+            &NewOutboxMessage {
+                consumer: FLOW_TARGET_DELIVERY_CONSUMER,
+                // The TARGET is the ordering key, so deliveries to one target stay ordered and
+                // a target that is slow or failing cannot delay another's.
+                ordering_key: &target.id.to_string(),
+                idempotency_key,
+                payload: payload.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Deregister a target, so it stops being dispatched.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope or names no live target;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &FlowTargetId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `flow_target.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &FlowTargetId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let target = *id;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::FlowTargetDelete,
+                target: &target,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE flow_targets SET \
+                       deleted_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                       updated_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                       AND deleted_at IS NULL",
+                )
+                .bind(target.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                // AFTER the guard: deregistering something already gone stops nothing, so it
+                // announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The registered HTTP flow targets for a scope (issue #112).
+///
+/// READ ONLY. The dispatcher asks "which targets fire at this point", and the answer has to be
+/// available BEFORE a transaction is opened, because a pre-persist target runs inside that
+/// transaction. Registration is a management act and lives behind the control plane.
+pub struct FlowTargetRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl FlowTargetRepo<'_> {
+    /// Every ENABLED target of one class in this scope, by name.
+    ///
+    /// Disabled targets are excluded HERE rather than by the caller, so a target an operator
+    /// switched off cannot be dispatched by a code path that forgot to check -- which for a
+    /// pre-persist target would mean a flow rejected by an integration nobody thought was
+    /// running.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, including a column carrying a value
+    /// outside its closed vocabulary.
+    pub async fn enabled_for_class(
+        &self,
+        class: crate::flow_target::TargetClass,
+    ) -> Result<Vec<crate::flow_target::FlowTargetRecord>, StoreError> {
+        let statement = sqlx::query(
+            "SELECT id, name, target_class, invocation, timing, endpoint, timeout_ms, \
+                    failure_policy, config, signing_secret_name \
+             FROM flow_targets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND target_class = $3 \
+               AND deleted_at IS NULL AND enabled \
+             ORDER BY name",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(target_class_wire(class));
+
+        // Scoped, because `flow_targets` is FORCE RLS: an unscoped read returns an EMPTY set
+        // rather than an error, which presents as "no targets are configured" and skips every
+        // integration silently.
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = statement.fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                let class_text: String = row.get("target_class");
+                let invocation_text: String = row.get("invocation");
+                let timing_text: String = row.get("timing");
+                let policy_text: String = row.get("failure_policy");
+                Ok(crate::flow_target::FlowTargetRecord {
+                    id: FlowTargetId::parse_in_scope(&id_text, &self.scope)?,
+                    name: row.get("name"),
+                    // A value the enum does not know is a DECODE failure, never a row to skip.
+                    // Skipping would drop a configured integration with nothing in any log,
+                    // which is the silent misconfiguration the closed vocabulary prevents.
+                    target_class: parse_target_class(&class_text)?,
+                    invocation: match invocation_text.as_str() {
+                        "sync" => crate::flow_target::Invocation::Sync,
+                        "async" => crate::flow_target::Invocation::Async,
+                        other => return Err(decode_error("flow target invocation", other)),
+                    },
+                    timing: match timing_text.as_str() {
+                        "pre_persist" => crate::flow_target::Timing::PrePersist,
+                        "post_persist" => crate::flow_target::Timing::PostPersist,
+                        other => return Err(decode_error("flow target timing", other)),
+                    },
+                    endpoint: row.get("endpoint"),
+                    timeout_ms: row.get("timeout_ms"),
+                    failure_policy: match policy_text.as_str() {
+                        "fail_open" => crate::flow_target::FailurePolicy::FailOpen,
+                        "fail_closed" => crate::flow_target::FailurePolicy::FailClosed,
+                        other => return Err(decode_error("flow target failure policy", other)),
+                    },
+                    config: row.get("config"),
+                    signing_secret_name: row.get("signing_secret_name"),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The wire spelling of a target class, in ONE place beside its parser.
+///
+/// Migration 0144's CHECK lists these four strings. A second spelling anywhere would be a row
+/// that inserts and then fails to decode, which reads as "my target vanished".
+fn target_class_wire(class: crate::flow_target::TargetClass) -> &'static str {
+    match class {
+        crate::flow_target::TargetClass::Request => "request",
+        crate::flow_target::TargetClass::Response => "response",
+        crate::flow_target::TargetClass::Function => "function",
+        crate::flow_target::TargetClass::Event => "event",
+    }
+}
+
+/// The inverse of [`target_class_wire`], refusing anything the dispatcher does not know.
+fn parse_target_class(wire: &str) -> Result<crate::flow_target::TargetClass, StoreError> {
+    match wire {
+        "request" => Ok(crate::flow_target::TargetClass::Request),
+        "response" => Ok(crate::flow_target::TargetClass::Response),
+        "function" => Ok(crate::flow_target::TargetClass::Function),
+        "event" => Ok(crate::flow_target::TargetClass::Event),
+        other => Err(decode_error("flow target class", other)),
+    }
+}
+
+/// A decode failure naming the column and the offending value.
+///
+/// Named rather than inlined so every arm reports the same shape: an error saying only
+/// "invalid value" sends whoever reads it back to the schema to work out which column.
+fn decode_error(what: &str, value: &str) -> StoreError {
+    StoreError::Database(sqlx::Error::Decode(
+        format!("unknown {what}: {value}").into(),
+    ))
 }
 
 /// Log stream configuration.
