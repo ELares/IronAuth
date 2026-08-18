@@ -34,9 +34,6 @@ recovery_approvals::reject_recovery_approval
 resource_servers::update_resource_server_permission_claims
 routing_rules::create_routing_rule
 routing_rules::verify_routing_rule_domain
-service_account_keys::create_service_account_api_key
-service_account_keys::revoke_service_account_api_key
-service_account_keys::rotate_service_account_api_key
 signing_algorithm::set_client_signing_algorithm
 signup_quarantine::approve_signup_quarantine
 signup_quarantine::extend_signup_quarantine

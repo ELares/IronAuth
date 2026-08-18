@@ -1072,3 +1072,54 @@ async fn minting_a_personal_access_token_announces_it_as_a_user_owned_key() {
         "the event carried the digest, which verifies as well as the token does"
     );
 }
+
+/// A service-account key is announced as the THIRD owner of one credential kind.
+///
+/// The same `api_key.created` the organization and personal paths emit: a service-account key
+/// is a third OWNER, not a third kind, so a third set of types would make every consumer
+/// subscribe three times to learn one fact. `owner_kind` is what tells them apart, and it is
+/// asserted here -- a producer that copied "user" or "organization" from either sibling would
+/// pass every other assertion.
+#[tokio::test]
+async fn a_service_account_key_is_announced_with_its_own_owner_kind() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "sk-tenant").await;
+    let scope = scope_of(&tenant, &environment);
+    let principal = seed_service_account(&h, scope, "a machine client").await;
+    let _ = queued_events(&h, scope).await;
+
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/service-accounts/{principal}/api-keys"
+    );
+    let (status, _, body) = h
+        .post(
+            &base,
+            "sk-evt-create",
+            &serde_json::json!({ "display_name": "ci runner" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let created = serde_json::from_str::<Value>(&body).expect("json");
+    let key_id = created["id"].as_str().expect("id").to_owned();
+    let plaintext = created["key"].as_str().expect("key").to_owned();
+
+    let events = queued_events(&h, scope).await;
+    assert_eq!(events.len(), 1, "the mint enqueues exactly one event");
+    assert_eq!(events[0]["type"], "api_key.created");
+    assert_eq!(events[0]["payload"]["api_key_id"], key_id);
+    assert_eq!(
+        events[0]["payload"]["owner_kind"], "service_account",
+        "a service-account key is neither user-owned nor organization-owned; the owner kind \
+         is the only thing distinguishing the three paths, which share one type"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    let rendered = events[0].to_string();
+    assert!(!rendered.contains(&plaintext), "the event carried the KEY");
+    let digest = ironauth_store::api_key::api_key_digest(&plaintext);
+    assert!(
+        !rendered.contains(&digest),
+        "the event carried the digest, which verifies as well as the key does"
+    );
+}

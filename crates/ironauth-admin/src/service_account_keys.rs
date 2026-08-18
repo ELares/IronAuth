@@ -298,12 +298,13 @@ pub async fn create_service_account_api_key(
     };
     let stored_body = serde_json::to_string(&stored).map_err(|_| ApiError::Internal)?;
 
+    let pending = service_account_key_event(&state, scope, &minted.id, None, false);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .api_keys()
-        .create(
+        .create_with_event(
             state.env(),
             NewApiKey {
                 id: &minted.id,
@@ -320,6 +321,10 @@ pub async fn create_service_account_api_key(
                 response_status: 200,
                 response_body: &stored_body,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -396,12 +401,21 @@ pub async fn revoke_service_account_api_key(
     let id = ApiKeyId::parse_in_scope(&key_id, &scope).map_err(|_| ApiError::NotFound)?;
     owned_by(&state, scope, owner, &id).await?;
 
+    let pending = service_account_key_event(&state, scope, &id, None, true);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .api_keys()
-        .revoke(state.env(), &id, state.now_unix_micros())
+        .revoke_with_event(
+            state.env(),
+            &id,
+            state.now_unix_micros(),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
     match result {
         Ok(()) => Ok(no_content()),
@@ -484,12 +498,13 @@ pub async fn rotate_service_account_api_key(
     };
     let stored_body = serde_json::to_string(&stored).map_err(|_| ApiError::Internal)?;
 
+    let pending = service_account_key_event(&state, scope, &minted.id, Some(&old), false);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .api_keys()
-        .rotate(
+        .rotate_with_event(
             state.env(),
             &old,
             NewApiKey {
@@ -507,6 +522,10 @@ pub async fn rotate_service_account_api_key(
                 response_status: 200,
                 response_body: &stored_body,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -515,4 +534,61 @@ pub async fn rotate_service_account_api_key(
         Err(StoreError::NotFound) => Err(ApiError::NotFound),
         Err(_) => Err(ApiError::Internal),
     }
+}
+
+/// The event a service-account key lifecycle change emits (issue #108).
+///
+/// The SAME `api_key.*` types the organization and personal paths emit. A service-account key
+/// is the third OWNER of one credential kind, not a third kind, so a third set of types would
+/// make every consumer subscribe three times to learn one fact. `owner_kind` on the create is
+/// what tells them apart.
+///
+/// The three cases are derived from the two flags rather than passed as a type string, so the
+/// payload and the announced fact cannot disagree.
+///
+/// NO KEY MATERIAL and no digest, as everywhere else in this family.
+fn service_account_key_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    subject_key: &ApiKeyId,
+    rotated_from: Option<&ApiKeyId>,
+    revoked: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let (event_type, subject, payload) = match (rotated_from, revoked) {
+        (Some(old), _) => (
+            "api_key.rotated",
+            old.to_string(),
+            serde_json::json!({
+                "revoked_api_key_id": old.to_string(),
+                "created_api_key_id": subject_key.to_string(),
+            }),
+        ),
+        (None, true) => (
+            "api_key.revoked",
+            subject_key.to_string(),
+            serde_json::json!({ "api_key_id": subject_key.to_string() }),
+        ),
+        (None, false) => (
+            "api_key.created",
+            subject_key.to_string(),
+            serde_json::json!({
+                "api_key_id": subject_key.to_string(),
+                "owner_kind": "service_account",
+            }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }
