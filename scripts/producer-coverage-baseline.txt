@@ -64,5 +64,3 @@ tenants::suspend_tenant
 trait_schemas::activate_trait_schema_version
 trait_schemas::create_trait_migration_job
 trait_schemas::create_trait_schema_version
-users::link_user_external_id
-users::unlink_user_external_id

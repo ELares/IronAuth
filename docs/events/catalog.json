@@ -1189,6 +1189,47 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
+          "external_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "external_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.external_id_linked"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.external_id_unlinked"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
           "user_id": {
             "minLength": 1,
             "type": "string"

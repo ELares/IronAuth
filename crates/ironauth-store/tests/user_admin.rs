@@ -1555,3 +1555,122 @@ async fn a_user_state_change_with_no_event_enqueues_nothing() {
         "a state change with no event must not invent one"
     );
 }
+
+/// Linking an external id announces BOTH sides; unlinking announces only the user.
+///
+/// The asymmetry is forced rather than chosen. The link is GIVEN the identifier and a
+/// receiver reconciling against an upstream directory needs both sides or it cannot update its
+/// mapping. The unlink is given only the user -- the store clears whatever was there -- so
+/// nothing knows the outgoing value when the envelope is built.
+///
+/// Both halves are asserted, because a producer that always carried the field, or never did,
+/// would pass a test that exercised only one.
+#[tokio::test]
+async fn linking_an_external_id_announces_both_sides_and_unlinking_announces_the_user() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let user = create_user(
+        &db,
+        &env,
+        scope,
+        "linked@example.test",
+        None,
+        UserState::Active,
+        1_000_000,
+    )
+    .await
+    .expect("create user");
+    let subject = user.to_string();
+
+    let linked = ironauth_store::event_catalog::envelope(
+        "evt_external_linked",
+        "user.external_id_linked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "user_id": subject, "external_id": "upstream-42" }),
+    )
+    .expect("user.external_id_linked is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .link_external_id_with_event(
+            &env,
+            &user,
+            "upstream-42",
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_external_linked",
+                subject: &subject,
+                envelope: &linked,
+            }),
+        )
+        .await
+        .expect("link with event");
+
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "the link enqueues exactly one event");
+    assert_eq!(claimed[0].payload["type"], "user.external_id_linked");
+    assert_eq!(claimed[0].payload["payload"]["external_id"], "upstream-42");
+    ironauth_store::event_catalog::validate_event(&claimed[0].payload)
+        .expect("the envelope validates against the registry the fan-out enforces");
+    // Completed so the unlink is claimable: both carry the user id as ordering key.
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete");
+    }
+
+    let unlinked = ironauth_store::event_catalog::envelope(
+        "evt_external_unlinked",
+        "user.external_id_unlinked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "user_id": subject }),
+    )
+    .expect("user.external_id_unlinked is registered");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .unlink_external_id_with_event(
+            &env,
+            &user,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_external_unlinked",
+                subject: &subject,
+                envelope: &unlinked,
+            }),
+        )
+        .await
+        .expect("unlink with event");
+
+    let after = webhook_events(&db, scope).await;
+    assert_eq!(after.len(), 1, "the unlink enqueues exactly one event");
+    assert_eq!(after[0]["type"], "user.external_id_unlinked");
+    assert!(
+        after[0]["payload"].get("external_id").is_none(),
+        "the unlink cannot name an id it was never given: {}",
+        after[0]
+    );
+    ironauth_store::event_catalog::validate_event(&after[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

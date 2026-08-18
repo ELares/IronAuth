@@ -457,6 +457,42 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // It is also the better fact. "Every session of this user is gone" is what a receiver
         // acts on: it tears down everything for that subject, which it can do without an
         // enumeration it would otherwise have to reconcile against its own view.
+        // The user AND the external id, because the whole content of the fact is the
+        // CORRESPONDENCE: a receiver reconciling against an upstream directory needs both
+        // sides or it cannot update its mapping.
+        //
+        // The external id is the OPERATOR'S OWN identifier for this person, supplied through
+        // the management API -- not a credential and not a secret. Withholding it would make
+        // the event unusable for the one job it exists to do.
+        "user.external_id_linked",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "external_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["user_id", "external_id"]
+        }"#,
+    ),
+    (
+        // THE USER ONLY. The unlink is given just the user -- the store clears whatever was
+        // there -- so nothing knows the outgoing external id when the envelope is built,
+        // exactly as with `organization.default_role_cleared`. "This user no longer
+        // corresponds to anything upstream" is also the whole of what a receiver acts on.
+        "user.external_id_unlinked",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["user_id"]
+        }"#,
+    ),
+    (
         "user.sessions_revoked",
         1,
         r#"{

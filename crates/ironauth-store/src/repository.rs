@@ -16940,6 +16940,22 @@ impl ActingUserRepo<'_> {
         id: &UserId,
         external_id: &str,
     ) -> Result<(), StoreError> {
+        self.link_external_id_with_event(env, id, external_id, None)
+            .await
+    }
+
+    /// [`Self::link_external_id`], additionally emitting `user.external_id_linked` (#108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::link_external_id`].
+    pub async fn link_external_id_with_event(
+        &self,
+        env: &Env,
+        id: &UserId,
+        external_id: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -17012,7 +17028,9 @@ impl ActingUserRepo<'_> {
                 .await;
                 match result {
                     Ok(done) if done.rows_affected() == 0 => Err(StoreError::NotFound),
-                    Ok(_) => Ok(()),
+                    // Announced on the SUCCESS arm only: a link that matched no user is the
+                    // uniform not-found and says nothing.
+                    Ok(_) => enqueue_domain_event(tx, env, scope, event).await,
                     // The external id is already claimed by another user in the scope
                     // (the per-scope partial unique index): a conflict, not a fault.
                     Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
@@ -17034,6 +17052,21 @@ impl ActingUserRepo<'_> {
     /// [`StoreError::NotFound`] if no live user matched in this scope;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn unlink_external_id(&self, env: &Env, id: &UserId) -> Result<(), StoreError> {
+        self.unlink_external_id_with_event(env, id, None).await
+    }
+
+    /// [`Self::unlink_external_id`], additionally emitting `user.external_id_unlinked`
+    /// (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::unlink_external_id`].
+    pub async fn unlink_external_id_with_event(
+        &self,
+        env: &Env,
+        id: &UserId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -17065,6 +17098,8 @@ impl ActingUserRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back unlink announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
