@@ -2029,3 +2029,75 @@ async fn setting_and_clearing_the_auto_link_posture_omit_the_field_when_cleared(
         }
     }
 }
+
+/// Minting a management key announces it, and announces neither the secret nor its hash.
+///
+/// A credential that can administer the environment now exists, and this is the moment
+/// credential oversight has to act on: the secret is shown once and never again.
+///
+/// The HASH is the sharp exclusion, sharper than the secret. A verifier on the wire hands
+/// every receiver the ability to check guesses offline, which is the whole property hashing
+/// exists to deny -- so the database stores only the hash, and the event stores less. The
+/// test drives a hash whose plaintext form it knows and asserts neither appears.
+#[tokio::test]
+async fn minting_a_management_key_announces_it_without_the_secret_or_its_hash() {
+    let harness = Fixture::start().await;
+    let scope = harness.create_tenant(None).await;
+
+    assert_eq!(
+        queued_events(&harness, scope).await.len(),
+        0,
+        "the tenant create passed no event, so the mint's event below is unambiguous"
+    );
+
+    let id = ManagementKeyId::generate(&harness.env, &scope);
+    let key_hash = "hash-of-the-one-time-secret";
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_management_key_created",
+        "management_key.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "management_key_id": id.to_string(),
+            "display_name": "ci deploy",
+        }),
+    )
+    .expect("management_key.created is registered");
+
+    harness
+        .db
+        .control_store()
+        .management()
+        .acting(harness.actor, CorrelationId::generate(&harness.env))
+        .credentials(scope)
+        .create_with_event(
+            &harness.env,
+            &id,
+            3_000_000,
+            key_hash,
+            "ci deploy",
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_management_key_created",
+                subject: &id.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("mint the key");
+
+    let events = queued_events(&harness, scope).await;
+    assert_eq!(events.len(), 1, "the mint announced {events:?}");
+    assert_eq!(events[0]["type"], "management_key.created");
+    assert_eq!(events[0]["payload"]["management_key_id"], id.to_string());
+    assert_eq!(events[0]["payload"]["display_name"], "ci deploy");
+    let rendered = serde_json::to_string(&events[0]).expect("json");
+    assert!(
+        !rendered.contains(key_hash) && !rendered.contains("one-time-secret"),
+        "the credential VERIFIER reached the wire; a receiver holding it can check guesses \
+         offline, which is what hashing exists to prevent: {rendered}"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

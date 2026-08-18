@@ -171,18 +171,23 @@ pub async fn create_key(
         response_status: 200,
         response_body: &stored_body,
     };
+    let pending = management_key_created_event(&state, scope, &id, &display_name);
     let result = state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .credentials(scope)
-        .create(
+        .create_with_event(
             state.env(),
             &id,
             created_at_micros,
             &key_hash,
             &display_name,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -344,6 +349,41 @@ fn management_key_revoked_event(
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,
         &serde_json::json!({ "management_key_id": subject }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event a management-key mint emits (issue #108).
+///
+/// A credential that can administer this environment now exists, and this is the moment a
+/// consumer running credential oversight has to act: the secret is shown once and never
+/// again.
+///
+/// The secret does not travel, and neither does its HASH. The hash is a verifier, and an
+/// event carrying it hands every receiver the ability to check guesses offline -- the exact
+/// property hashing exists to deny. The database stores only the hash; the event stores less.
+fn management_key_created_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    key_id: &ManagementKeyId,
+    display_name: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = key_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "management_key.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "management_key_id": subject,
+            "display_name": display_name,
+        }),
     )?;
     Some(crate::events::PendingEvent {
         id,

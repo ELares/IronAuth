@@ -46226,6 +46226,38 @@ impl ActingEnvironmentRepo<'_> {
         signing_keys: &[NewSigningKey<'_>],
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(
+            env,
+            environment_id,
+            created_at_micros,
+            environment,
+            signing_keys,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create`], additionally emitting `environment.created` (issue #108).
+    ///
+    /// The event lands in the NEW environment's own outbox. That is where it belongs, and it
+    /// is also the only place forced row-level security accepts it: an outbox row must be
+    /// written under the environment it names.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        environment_id: &EnvironmentId,
+        created_at_micros: i64,
+        environment: NewEnvironment<'_>,
+        signing_keys: &[NewSigningKey<'_>],
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = Scope::new(self.tenant, *environment_id);
         // An environment must be created with at least one signing key, or its JWKS is
         // empty and it can issue no tokens; the slice parameter (issue #93) makes a
@@ -46326,6 +46358,10 @@ impl ActingEnvironmentRepo<'_> {
                     insert_signing_key_row(tx, &scope, signing_key).await?;
                 }
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction, into the NEW environment's own outbox: the
+                // scope above IS the new scope, which is what forced row-level security
+                // requires and what a consumer needs to see.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -46527,6 +46563,34 @@ impl ActingManagementCredentialRepo<'_> {
         display_name: &str,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(
+            env,
+            id,
+            created_at_micros,
+            key_hash,
+            display_name,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create`], additionally emitting `management_key.created` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        id: &ManagementKeyId,
+        created_at_micros: i64,
+        key_hash: &str,
+        display_name: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -46556,6 +46620,8 @@ impl ActingManagementCredentialRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back mint announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

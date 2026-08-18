@@ -508,3 +508,110 @@ fn environment_signing_key_and_management_credential_are_environment_identity() 
         );
     }
 }
+
+/// Creating an environment announces it INTO THAT NEW ENVIRONMENT'S own outbox.
+///
+/// A new environment is a new scope: a new issuer, a disjoint JWKS, a place tokens can be
+/// minted from. A consumer that provisions or monitors per environment cannot discover one by
+/// watching the environments it already knows, so this is the one announcement it has no
+/// other way to reach.
+///
+/// The destination is the load-bearing half. An outbox row must be written under the
+/// environment it names -- forced row-level security refuses anything else -- and it is also
+/// where a per-environment consumer will look. The test claims from the NEW scope and asserts
+/// the parent tenant's other environment saw nothing.
+///
+/// The KIND travels because it decides the guardrail class: a consumer that read a production
+/// environment as a development one would apply the wrong posture to the wrong place.
+#[tokio::test]
+async fn creating_an_environment_announces_it_in_the_new_environments_own_outbox() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (_operator, tenant, first) =
+        create_tenant_with_first_environment(&db, &env, EnvironmentType::Dev, None).await;
+
+    let environment_id = EnvironmentId::generate(&env);
+    let scope = Scope::new(tenant, environment_id);
+    let key = DayOneKey::generate(&env, &scope);
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_environment_created",
+        "environment.created",
+        &tenant.to_string(),
+        &environment_id.to_string(),
+        1,
+        &serde_json::json!({
+            "environment_id": environment_id.to_string(),
+            "kind": "prod",
+        }),
+    )
+    .expect("environment.created is registered");
+
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .environments(db.owning_operator(&tenant).await, tenant)
+        .create_with_event(
+            &env,
+            &environment_id,
+            2_000_000,
+            NewEnvironment {
+                display_name: "announced",
+                kind: EnvironmentType::Prod,
+                custom_domain: None,
+                region: None,
+            },
+            &[key.as_new()],
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_environment_created",
+                subject: &environment_id.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("create the environment");
+
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim in the new scope");
+    assert_eq!(claimed.len(), 1, "the create announced {claimed:?}");
+    assert_eq!(claimed[0].payload["type"], "environment.created");
+    assert_eq!(
+        claimed[0].payload["payload"]["environment_id"],
+        environment_id.to_string()
+    );
+    assert_eq!(
+        claimed[0].payload["payload"]["kind"], "prod",
+        "the kind decides the guardrail class, so a consumer that lost it would apply a \
+         development posture to production"
+    );
+
+    // The sibling environment under the SAME tenant saw nothing: the row lives under the
+    // environment it names, which is both what the engine enforces and what a
+    // per-environment consumer expects.
+    let sibling = db
+        .store()
+        .scoped(Scope::new(tenant, first))
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim in the sibling scope");
+    assert!(
+        sibling.is_empty(),
+        "the sibling environment must not receive another environment's create: {sibling:?}"
+    );
+}

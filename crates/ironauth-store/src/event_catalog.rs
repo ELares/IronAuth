@@ -730,6 +730,52 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A NEW environment is a new scope: a new issuer, a disjoint JWKS, and a place
+        // tokens can be minted from. A consumer that provisions or monitors per environment
+        // cannot discover one by watching the environments it already knows, so this is the
+        // one announcement it has no other way to reach.
+        //
+        // Enqueued into the NEW environment's own outbox, which is where it belongs and also
+        // the only place forced row-level security will accept it: the row must be written
+        // under the environment it names.
+        //
+        // The KIND travels because it decides the guardrail class -- a production environment
+        // and a development one are governed differently, and a consumer that treated them
+        // alike would apply a development posture to production.
+        "environment.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "environment_id": {"type": "string", "minLength": 1},
+                "kind": {"type": "string", "minLength": 1}
+            },
+            "required": ["environment_id", "kind"]
+        }"#,
+    ),
+    (
+        // A MANAGEMENT credential was minted: something that can now administer this
+        // environment. A consumer running credential oversight acts on it, and this is the
+        // moment to act -- the secret is shown once and never again.
+        //
+        // The secret does not travel, and neither does its HASH. The hash is a verifier: an
+        // event carrying it hands every receiver the ability to check guesses offline, which
+        // is the whole property hashing exists to deny. The database itself stores only the
+        // hash, and the event stores less.
+        "management_key.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "management_key_id": {"type": "string", "minLength": 1},
+                "display_name": {"type": "string"}
+            },
+            "required": ["management_key_id", "display_name"]
+        }"#,
+    ),
+    (
         "recovery_approval.decided",
         1,
         r#"{
