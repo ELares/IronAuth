@@ -30,7 +30,9 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::ciba::{DeliveryMode, bounded_expiry};
 use ironauth_store::rar::validate_authorization_details;
-use ironauth_store::{BackchannelAuthRequestId, ClientId, NewBackchannelRequest};
+use ironauth_store::{
+    BackchannelAuthRequestId, ClientBackchannelProfile, ClientId, NewBackchannelRequest, Scope,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
@@ -99,8 +101,6 @@ pub enum CibaError {
     InvalidRequest(&'static str),
     /// The hint named nobody this deployment knows.
     UnknownUserId,
-    /// A ping-mode request arrived without somewhere to send the notification.
-    InvalidNotificationEndpoint,
     /// The `authorization_details` document is malformed, oversized, or names a type this
     /// deployment has not registered (#131 criterion 4).
     InvalidAuthorizationDetails,
@@ -113,10 +113,9 @@ impl CibaError {
         match self {
             Self::InvalidClient { .. } => StatusCode::UNAUTHORIZED,
             Self::UnauthorizedClient => StatusCode::FORBIDDEN,
-            Self::InvalidRequest(_)
-            | Self::UnknownUserId
-            | Self::InvalidNotificationEndpoint
-            | Self::InvalidAuthorizationDetails => StatusCode::BAD_REQUEST,
+            Self::InvalidRequest(_) | Self::UnknownUserId | Self::InvalidAuthorizationDetails => {
+                StatusCode::BAD_REQUEST
+            }
             Self::ServerError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -127,7 +126,6 @@ impl CibaError {
             Self::UnauthorizedClient => "unauthorized_client",
             Self::InvalidRequest(_) => "invalid_request",
             Self::UnknownUserId => "unknown_user_id",
-            Self::InvalidNotificationEndpoint => "invalid_notification_endpoint",
             // RFC 9396 section 5 names this exact code for a rejected document.
             Self::InvalidAuthorizationDetails => "invalid_authorization_details",
             Self::ServerError => "server_error",
@@ -141,9 +139,6 @@ impl CibaError {
             Self::InvalidRequest(why) => why,
             // Deliberately the same words for every unresolvable hint. See the handler.
             Self::UnknownUserId => "the request did not identify a user",
-            Self::InvalidNotificationEndpoint => {
-                "ping delivery requires a registered client notification endpoint"
-            }
             Self::InvalidAuthorizationDetails => {
                 "authorization_details is malformed or names an unregistered type"
             }
@@ -237,21 +232,77 @@ fn validate_shape(params: &BackchannelAuthParams) -> Result<&str, CibaError> {
             ));
         }
     }
-    // Ping mode is selected by the PRESENCE of a client notification token, and requires a
-    // registered notification endpoint to send it to. That endpoint is not modelled on the
-    // client record yet, so ping is refused EXPLICITLY rather than silently downgraded to
-    // poll: a client that asked to be notified and is instead never contacted waits forever.
-    if params.client_notification_token.is_some() {
-        return Err(CibaError::InvalidNotificationEndpoint);
-    }
     Ok(hint)
 }
 
-async fn backchannel_authenticate_inner(
+/// Reconcile the client's REGISTERED delivery mode with what this request carries.
+///
+/// The mode is read from the registration, never inferred from the request. CIBA Core makes
+/// it a registered property, and inferring it would let a client registered for poll talk the
+/// server into calling a URL simply by adding a parameter.
+///
+/// Both mismatches are refused, and the second is the one worth stating:
+///
+/// * **Ping without a `client_notification_token`.** The token is what lets the client
+///   authenticate the ping as genuinely ours. Sending an unauthenticated notification would
+///   train the client to accept pings from anyone who knows its endpoint.
+/// * **Poll WITH a `client_notification_token`.** Nothing would ever be sent, so the client
+///   has handed us a bearer credential we store and never use -- a secret held for no reason,
+///   which is the kind of thing that leaks in a dump and buys the holder something later.
+fn reconcile_delivery(
+    params: &BackchannelAuthParams,
+    profile: &ClientBackchannelProfile,
+) -> Result<(), CibaError> {
+    match (
+        profile.delivery_mode,
+        params.client_notification_token.as_deref(),
+    ) {
+        (DeliveryMode::Ping, Some(token)) if !token.trim().is_empty() => Ok(()),
+        (DeliveryMode::Ping, _) => Err(CibaError::InvalidRequest(
+            "a ping-mode client must send a client_notification_token",
+        )),
+        (DeliveryMode::Poll, None) => Ok(()),
+        (DeliveryMode::Poll, Some(_)) => Err(CibaError::InvalidRequest(
+            "this client is registered for poll delivery and must not send a \
+             client_notification_token",
+        )),
+    }
+}
+
+/// Parse and validate the RFC 9396 `authorization_details` document (#131 criterion 4).
+///
+/// Runs BEFORE the user lookup, for the same reason the shape checks do: a refusable request
+/// must not cause a lookup that could be timed.
+///
+/// Unknown types are refused by DEFAULT. The document travels inside an issued token and
+/// resource servers act on it, so a type nobody in this deployment has defined is an
+/// authorization statement with no agreed meaning riding in a trusted credential.
+fn parse_authorization_details(
+    state: &OidcState,
+    params: &BackchannelAuthParams,
+) -> Result<Option<serde_json::Value>, CibaError> {
+    let details = match params.authorization_details.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            serde_json::from_str::<serde_json::Value>(raw)
+                .map_err(|_| CibaError::InvalidAuthorizationDetails)?,
+        ),
+    };
+    validate_authorization_details(details.as_ref(), state.registered_rar_types())
+        .map_err(|_| CibaError::InvalidAuthorizationDetails)?;
+    Ok(details)
+}
+
+/// Authenticate the caller and gate it on the CIBA grant.
+///
+/// One function because it answers a single question -- "who is asking, and may they ask" --
+/// and because every refusal it produces must happen before the request is examined or any
+/// user is looked up.
+async fn authenticated_caller(
     state: &OidcState,
     headers: &HeaderMap,
     params: &BackchannelAuthParams,
-) -> Result<Response, CibaError> {
+) -> Result<(ClientId, Scope), CibaError> {
     // Authenticate the client and recover its scope from the presented client_id: the
     // endpoint is global, exactly like the token endpoint's self-scoped auth.
     let authorization = headers
@@ -283,22 +334,31 @@ async fn backchannel_authenticate_inner(
         return Err(CibaError::UnauthorizedClient);
     }
 
+    Ok((client_id, scope))
+}
+
+async fn backchannel_authenticate_inner(
+    state: &OidcState,
+    headers: &HeaderMap,
+    params: &BackchannelAuthParams,
+) -> Result<Response, CibaError> {
+    let (client_id, scope) = authenticated_caller(state, headers, params).await?;
+
     let hint = validate_shape(params)?;
 
-    // RFC 9396: parse and validate against the deployment's registered types BEFORE the user
-    // lookup, for the same reason the shape checks run first -- a refusable request must not
-    // cause a lookup. Unknown types are refused by DEFAULT (#131 criterion 4): the document
-    // travels inside an issued token and resource servers act on it, so a type nobody here
-    // has defined is an authorization statement with no agreed meaning.
-    let details = match params.authorization_details.as_deref() {
-        None => None,
-        Some(raw) => Some(
-            serde_json::from_str::<serde_json::Value>(raw)
-                .map_err(|_| CibaError::InvalidAuthorizationDetails)?,
-        ),
-    };
-    validate_authorization_details(details.as_ref(), state.registered_rar_types())
-        .map_err(|_| CibaError::InvalidAuthorizationDetails)?;
+    let details = parse_authorization_details(state, params)?;
+
+    // The REGISTERED delivery settings. A client this endpoint authenticated but which has
+    // no row here is answered as `invalid_client`, exactly like an unauthenticated one.
+    let profile = state
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .client_profile(&client_id)
+        .await
+        .map_err(|_| CibaError::ServerError)?
+        .ok_or(CibaError::InvalidClient { via_basic: false })?;
+    reconcile_delivery(params, &profile)?;
 
     let user = state
         .store()
@@ -318,6 +378,15 @@ async fn backchannel_authenticate_inner(
     let lifetime = bounded_expiry(requested, Duration::from_secs(30), state.device_code_ttl());
     let expires_micros = epoch_micros(now.checked_add(lifetime).unwrap_or(now));
 
+    // The client's notification token, sealed for storage. It is the ONE credential here
+    // that cannot be reduced to a digest: it must be REPLAYED to the client's endpoint so the
+    // client can authenticate the ping, and a digest cannot be replayed. Stored as bytes and
+    // never logged; the column is write-once at INSERT (see migration 0147).
+    let notification_token: Option<Vec<u8>> = params
+        .client_notification_token
+        .as_deref()
+        .map(|t| t.as_bytes().to_vec());
+
     let id = BackchannelAuthRequestId::generate(state.env(), &scope);
     let (auth_req_id, digest) = mint_auth_req_id(state, &id);
 
@@ -329,11 +398,9 @@ async fn backchannel_authenticate_inner(
             auth_req_id_digest: &digest,
             id: &id,
             client_id: &client_id.to_string(),
-            // Ping is refused in `validate_shape` until the notification endpoint is
-            // modelled, so anything reaching here is poll.
-            delivery_mode: DeliveryMode::Poll,
-            client_notification_url: None,
-            client_notification_token: None,
+            delivery_mode: profile.delivery_mode,
+            client_notification_url: profile.notification_endpoint.as_deref(),
+            client_notification_token: notification_token.as_deref(),
             requested_scope: params
                 .scope
                 .as_deref()
@@ -515,11 +582,6 @@ mod tests {
                 "unknown_user_id",
             ),
             (
-                CibaError::InvalidNotificationEndpoint,
-                StatusCode::BAD_REQUEST,
-                "invalid_notification_endpoint",
-            ),
-            (
                 CibaError::ServerError,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
@@ -529,5 +591,64 @@ mod tests {
             assert_eq!(error.status(), status, "{code}");
             assert_eq!(error.code(), code);
         }
+    }
+
+    fn profile(mode: DeliveryMode) -> ClientBackchannelProfile {
+        ClientBackchannelProfile {
+            delivery_mode: mode,
+            notification_endpoint: match mode {
+                DeliveryMode::Ping => Some("https://client.test/ciba".to_owned()),
+                DeliveryMode::Poll => None,
+            },
+        }
+    }
+
+    /// The registered mode decides, and BOTH mismatches are refused (#131 criterion 2).
+    ///
+    /// Driven over the full (mode x token-present) table rather than the two happy cases,
+    /// because the interesting cells are the mismatches and a hand-picked pair would cover
+    /// only one of them.
+    #[test]
+    fn the_registered_mode_decides_and_both_mismatches_are_refused() {
+        // Ping + token: the only shape that can actually be delivered.
+        let mut p = params();
+        p.client_notification_token = Some("nt-secret".to_owned());
+        assert_eq!(reconcile_delivery(&p, &profile(DeliveryMode::Ping)), Ok(()));
+
+        // Ping without a token: we would send an UNAUTHENTICATED notification, training the
+        // client to accept pings from anyone who learns its endpoint.
+        let bare = params();
+        assert!(matches!(
+            reconcile_delivery(&bare, &profile(DeliveryMode::Ping)),
+            Err(CibaError::InvalidRequest(_))
+        ));
+
+        // Poll with no token: ordinary.
+        assert_eq!(
+            reconcile_delivery(&bare, &profile(DeliveryMode::Poll)),
+            Ok(())
+        );
+
+        // Poll WITH a token: nothing would ever be sent, so we would be holding a bearer
+        // credential for no reason -- refused rather than stored and ignored.
+        assert!(matches!(
+            reconcile_delivery(&p, &profile(DeliveryMode::Poll)),
+            Err(CibaError::InvalidRequest(_))
+        ));
+    }
+
+    /// A blank notification token does not satisfy ping.
+    ///
+    /// `client_notification_token=` is a present-but-empty form field. Without the trim it
+    /// would count as a token, and the ping would carry an empty credential the client cannot
+    /// distinguish from an attacker's.
+    #[test]
+    fn a_blank_notification_token_does_not_satisfy_ping() {
+        let mut blank = params();
+        blank.client_notification_token = Some("   ".to_owned());
+        assert!(matches!(
+            reconcile_delivery(&blank, &profile(DeliveryMode::Ping)),
+            Err(CibaError::InvalidRequest(_))
+        ));
     }
 }
