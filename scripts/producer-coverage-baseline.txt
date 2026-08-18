@@ -14,8 +14,6 @@ flow_versions::create_flow_version
 flow_versions::pin_flow_version
 impersonation::authorize_user_impersonation
 keys::create_key
-migration::delete_outbound_verification
-migration::set_outbound_verification
 migration_runs::abandon_migration_run
 promotion::apply_config_promotion
 resource_servers::update_resource_server_permission_claims

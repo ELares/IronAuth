@@ -412,7 +412,7 @@ pub async fn delete_secret(
 /// Nothing DERIVED from the value goes on the wire either -- no digest, no length, no prefix.
 /// A digest of a low-entropy secret is guessable and a length narrows a search. The name is
 /// what tells a consumer which reference to re-resolve, and it is enough.
-fn environment_secret_event(
+pub(crate) fn environment_secret_event(
     state: &AdminState,
     scope: ironauth_store::Scope,
     name: &str,

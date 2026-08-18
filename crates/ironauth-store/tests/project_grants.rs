@@ -161,11 +161,13 @@ async fn creating_and_withdrawing_a_project_grant_emit_distinct_types() {
     let first = claim_one_event(&db, &env, scope).await;
     assert_eq!(first["type"], "project_grant.created");
     assert_eq!(
-        first["payload"]["client_id"], client.to_string(),
+        first["payload"]["client_id"],
+        client.to_string(),
         "the grant id alone does not say WHO may act, so the client must be on the wire"
     );
     assert_eq!(
-        first["payload"]["organization_id"], org.to_string(),
+        first["payload"]["organization_id"],
+        org.to_string(),
         "nor for WHOM, so the organization must be on the wire"
     );
     assert!(
