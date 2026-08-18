@@ -2250,3 +2250,108 @@ async fn a_client_signing_algorithm_announces_only_a_real_change() {
         "a same-value write changed nothing and must announce nothing: {quiet:?}"
     );
 }
+
+/// Withdrawing consent announces it, and a withdrawal that changed nothing does not.
+///
+/// A withdrawal revokes a client's standing authority to act for a user and cascades to the
+/// refresh families, so a consumer mirroring delegated access that missed it would keep an
+/// application authorized after the user said no.
+///
+/// The second withdrawal is the sharp case: it is an idempotent no-op SUCCESS, not an error,
+/// so nothing in the return value distinguishes it. The store's no-op branch returns before
+/// the enqueue, which is what keeps a consumer from seeing a withdrawal that did not happen.
+///
+/// No `families_revoked` count on the wire: it is knowable only after the write, and a
+/// producer must not announce what it read back out of its own mutation.
+#[tokio::test]
+async fn withdrawing_consent_announces_it_and_a_repeat_withdrawal_does_not() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = "usr_consent-events";
+    let client_id = "cli_consent-events";
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid"))
+        .await
+        .expect("grant consent");
+
+    let announce = |event_id: &str, at: i64| {
+        ironauth_store::event_catalog::envelope(
+            event_id,
+            "consent.revoked",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            at,
+            &serde_json::json!({ "subject": subject, "client_id": client_id }),
+        )
+        .expect("consent.revoked is registered")
+    };
+
+    let first = announce("evt_consent_revoked", 1);
+    let revocation = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke_with_event(
+            &env,
+            subject,
+            client_id,
+            2_000_000,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_consent_revoked",
+                subject: "usr_consent-events:cli_consent-events",
+                envelope: &first,
+            }),
+        )
+        .await
+        .expect("revoke");
+    assert!(revocation.consent_revoked, "the first revocation mutated");
+
+    let announced = drain_events(&db, scope).await;
+    assert_eq!(announced.len(), 1, "the withdrawal announced {announced:?}");
+    assert_eq!(announced[0]["type"], "consent.revoked");
+    assert_eq!(announced[0]["payload"]["subject"], subject);
+    assert_eq!(announced[0]["payload"]["client_id"], client_id);
+    assert!(
+        announced[0]["payload"].get("families_revoked").is_none(),
+        "the cascade count is knowable only AFTER the write: {announced:?}"
+    );
+
+    let repeat = announce("evt_consent_revoked_again", 2);
+    let again = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .revoke_with_event(
+            &env,
+            subject,
+            client_id,
+            3_000_000,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_consent_revoked_again",
+                subject: "usr_consent-events:cli_consent-events",
+                envelope: &repeat,
+            }),
+        )
+        .await
+        .expect("a repeat withdrawal is an idempotent success");
+    assert!(
+        !again.consent_revoked,
+        "the repeat withdrawal mutated nothing"
+    );
+
+    let quiet = drain_events(&db, scope).await;
+    assert!(
+        quiet.is_empty(),
+        "a withdrawal that changed nothing must announce nothing, and it succeeds, so the \
+         return value alone cannot tell a consumer that: {quiet:?}"
+    );
+}

@@ -685,6 +685,51 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // Withdrawing consent revokes the client's standing authority to act for this user,
+        // and it cascades: the refresh families go with it. A consumer mirroring delegated
+        // access that missed this would keep an application authorized after the user said no.
+        //
+        // NO `families_revoked` count. It is knowable only AFTER the write, so a producer that
+        // put it on the wire would be announcing something it read back out of its own
+        // mutation -- and a grant that owned no live family is a real revocation either way.
+        "consent.revoked",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "subject": {"type": "string", "minLength": 1},
+                "client_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["subject", "client_id"]
+        }"#,
+    ),
+    (
+        // An operator was authorized to BECOME a user. This is the widest authority the
+        // management surface hands out -- it reaches everything that user can reach -- so a
+        // consumer running detection or oversight acts on it above almost anything else here.
+        //
+        // The expiry travels because the authorization is time-boxed and a receiver that
+        // cannot see the box would have to treat every authorization as permanent. The
+        // reason CODE travels because it is a registered classification. The reason TEXT does
+        // not: it is prose an operator wrote about a person's account, the same class as a
+        // ban's reason, and a consumer that needs it can read it in the audit trail where it
+        // belongs.
+        "impersonation.authorized",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "authorization_id": {"type": "string", "minLength": 1},
+                "user_id": {"type": "string", "minLength": 1},
+                "reason_code": {"type": "string", "minLength": 1},
+                "expires_at_unix_ms": {"type": "integer"}
+            },
+            "required": ["authorization_id", "user_id", "reason_code", "expires_at_unix_ms"]
+        }"#,
+    ),
+    (
         "recovery_approval.decided",
         1,
         r#"{

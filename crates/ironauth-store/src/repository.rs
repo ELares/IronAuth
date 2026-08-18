@@ -19044,6 +19044,20 @@ impl ActingImpersonationAuthorizationRepo<'_> {
         env: &Env,
         spec: NewImpersonationAuthorization<'_>,
     ) -> Result<(), StoreError> {
+        self.issue_with_event(env, spec, None).await
+    }
+
+    /// [`Self::issue`], additionally emitting `impersonation.authorized` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::issue`].
+    pub async fn issue_with_event(
+        &self,
+        env: &Env,
+        spec: NewImpersonationAuthorization<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope || spec.user_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -19099,6 +19113,8 @@ impl ActingImpersonationAuthorizationRepo<'_> {
             Some(&detail),
         )
         .await?;
+        // In the write's own transaction: a rolled-back authorization announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -37469,6 +37485,34 @@ impl ActingConsentRepo<'_> {
         revoked_at_micros: i64,
         idempotency: Option<ResolvedIdempotencyWrite<'_, ConsentRevocation>>,
     ) -> Result<ConsentRevocation, StoreError> {
+        self.revoke_with_event(
+            env,
+            subject,
+            client_id,
+            revoked_at_micros,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::revoke`], additionally emitting `consent.revoked` (issue #108).
+    ///
+    /// An absent or already-revoked consent is an idempotent no-op SUCCESS, and that branch
+    /// returns before the enqueue: a consumer must not see a withdrawal that did not happen.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke`].
+    pub async fn revoke_with_event(
+        &self,
+        env: &Env,
+        subject: &str,
+        client_id: &str,
+        revoked_at_micros: i64,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, ConsentRevocation>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<ConsentRevocation, StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
@@ -37548,6 +37592,8 @@ impl ActingConsentRepo<'_> {
         // In the SAME transaction as the consent flip and its cascade, so the stored
         // response and the state it describes commit together or not at all.
         insert_resolved_idempotency(&mut tx, idempotency, &resolved).await?;
+        // Likewise, and only on the MUTATING branch: the no-op above returned already.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(resolved)
     }
