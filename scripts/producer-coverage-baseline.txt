@@ -24,7 +24,6 @@ impersonation::authorize_user_impersonation
 imports::create_identity_import
 imports::resume_identity_import
 keys::create_key
-locales::set_locale
 log_streams::create_log_stream
 log_streams::delete_log_stream
 memberships::create_membership
@@ -73,7 +72,6 @@ sessions::bulk_revoke_sessions
 sessions::revoke_session
 sessions::revoke_user_sessions
 signing_algorithm::set_client_signing_algorithm
-signup_forms::set_signup_form
 signup_quarantine::approve_signup_quarantine
 signup_quarantine::extend_signup_quarantine
 signup_quarantine::reject_signup_quarantine

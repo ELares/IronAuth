@@ -384,3 +384,139 @@ async fn queued_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<s
         .map(|message| message.payload)
         .collect()
 }
+
+/// Setting a locale bundle emits `locale_bundle.set`, addressed by TAG.
+///
+/// The tag rather than the bundle id, and the OVERWRITE is what proves why: `set` is an
+/// upsert, and the store reuses the EXISTING row's id when the tag is already present. A
+/// caller-minted id would therefore name a row that does not exist on every overwrite. The
+/// second write below mints a fresh id and the event still addresses the same bundle.
+#[tokio::test]
+async fn setting_a_locale_bundle_emits_an_event_addressed_by_tag() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_locale_set",
+        "locale_bundle.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "tag": "fr" }),
+    )
+    .expect("locale_bundle.set is registered");
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_locale_set",
+        subject: "fr",
+        envelope: &envelope,
+    };
+
+    let first = LocaleBundleId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .locale_bundles()
+        .set_with_event(
+            &env,
+            &first,
+            1_000_000,
+            set_locale("fr", true, FR_ENTRIES),
+            Some(&domain_event),
+        )
+        .await
+        .expect("set bundle");
+
+    // Claimed as MESSAGES rather than payloads, because completing the first is what
+    // releases its ordering key for the overwrite below.
+    let claimed = claim_messages(&db, scope).await;
+    assert_eq!(claimed.len(), 1, "the set enqueues exactly one event");
+    assert_eq!(claimed[0].payload["type"], "locale_bundle.set");
+    assert_eq!(claimed[0].payload["tag"], serde_json::Value::Null);
+    assert_eq!(claimed[0].payload["payload"]["tag"], "fr");
+    ironauth_store::event_catalog::validate_event(&claimed[0].payload)
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // THE OVERWRITE: a DIFFERENT minted id, the same tag. The event still addresses the
+    // bundle that exists, which a payload carrying the caller's id could not do.
+    //
+    // A FRESH event id, as a real producer mints per emit: the outbox is unique on
+    // (tenant, environment, consumer, idempotency_key) and the key IS the event id, so
+    // reusing it is refused by the queue rather than silently duplicated.
+    let second_envelope = ironauth_store::event_catalog::envelope(
+        "evt_locale_set_again",
+        "locale_bundle.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "tag": "fr" }),
+    )
+    .expect("locale_bundle.set is registered");
+    let second_event = ironauth_store::DomainEvent {
+        id: "evt_locale_set_again",
+        subject: "fr",
+        envelope: &second_envelope,
+    };
+    let second = LocaleBundleId::generate(&env, &scope);
+    assert_ne!(first, second, "the fixture must mint a distinct id");
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .locale_bundles()
+        .set_with_event(
+            &env,
+            &second,
+            2_000_000,
+            set_locale("fr", true, FR_ENTRIES),
+            Some(&second_event),
+        )
+        .await
+        .expect("overwrite bundle");
+
+    // The overwrite is NOT deliverable yet, and that is the subject choice working: both
+    // events carry the tag as their ordering key, and the outbox refuses to hand out a
+    // message whose predecessor on the same key is still outstanding. A consumer therefore
+    // cannot see the second state of a bundle before the first.
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "the overwrite must wait behind the set it follows on the same tag"
+    );
+
+    // Complete the first, and the second becomes available -- in order.
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete the first");
+    }
+    let after = queued_events(&db, scope).await;
+    assert_eq!(
+        after.len(),
+        1,
+        "the overwrite announces itself once released"
+    );
+    assert_eq!(after[0]["payload"]["tag"], "fr");
+}
+
+/// Claim the webhook consumer's outstanding messages, keeping the HANDLES so a caller can
+/// complete them (which is what releases an ordering key for the next message on it).
+async fn claim_messages(
+    db: &TestDatabase,
+    scope: ironauth_store::Scope,
+) -> Vec<ironauth_store::OutboxMessage> {
+    use std::time::Duration;
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+}

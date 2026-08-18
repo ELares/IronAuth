@@ -28593,6 +28593,26 @@ impl ActingLocaleBundleRepo<'_> {
         created_at_micros: i64,
         params: NewLocaleBundle<'_>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `locale_bundle.set` (issue #108).
+    ///
+    /// Enqueued inside the upsert's transaction, so a consumer is never told to refetch a
+    /// write that rolled back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &LocaleBundleId,
+        created_at_micros: i64,
+        params: NewLocaleBundle<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28655,6 +28675,9 @@ impl ActingLocaleBundleRepo<'_> {
                 .bind(created_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the upsert's transaction: never tell a consumer to refetch a
+                // write that rolled back.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -28832,6 +28855,26 @@ impl ActingSignupFormRepo<'_> {
         created_at_micros: i64,
         params: NewSignupForm<'_>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `signup_form.set` (issue #108).
+    ///
+    /// Enqueued inside the upsert's transaction, so a consumer is never told to refetch a
+    /// write that rolled back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &SignupFormId,
+        created_at_micros: i64,
+        params: NewSignupForm<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28874,6 +28917,9 @@ impl ActingSignupFormRepo<'_> {
                 .bind(created_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the upsert's transaction: never tell a consumer to refetch a
+                // write that rolled back.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

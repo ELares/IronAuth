@@ -370,6 +370,24 @@
       "type": "locale_bundle.deleted"
     },
     {
+      "domain": "locale_bundle",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "tag": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "locale_bundle.set"
+    },
+    {
       "domain": "management_key",
       "payload_schema": {
         "additionalProperties": false,
@@ -496,6 +514,24 @@
       },
       "payload_schema_version": 1,
       "type": "signup_form.deleted"
+    },
+    {
+      "domain": "signup_form",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "signup_form.set"
     },
     {
       "domain": "tenant",

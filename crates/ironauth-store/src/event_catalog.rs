@@ -269,6 +269,26 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // pages and the messages fall back to the default. The TAG is what carries that
         // meaning -- "de-DE went away" is actionable, an opaque bundle id is not -- so it
         // rides along and the handler reads it before the row goes.
+        // THE TAG ONLY, and deliberately NOT the bundle id, which the delete does carry.
+        //
+        // `set` is an UPSERT and the store reuses the EXISTING row's id when the tag is
+        // already present, minting the caller's id only on a first write. So the id the
+        // caller has in hand is the stored id only sometimes, and an event built from it
+        // would name a row that does not exist on every overwrite. The tag is how a bundle is
+        // addressed everywhere else, it is stable across the upsert, and it is what a
+        // consumer refetches by.
+        "locale_bundle.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tag": {"type": "string", "minLength": 1}
+            },
+            "required": ["tag"]
+        }"#,
+    ),
+    (
         "locale_bundle.deleted",
         1,
         r#"{
@@ -285,6 +305,21 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // A signup form governs what a self-service REGISTRATION collects and requires, so
         // removing one changes who can sign up and with what. The client id rides along
         // because a signup form is per-client and that is how an operator refers to it.
+        // THE CLIENT ONLY, for the reason on `locale_bundle.set`: the write is an upsert
+        // keyed on the client, the store reuses the existing row's id, and the caller-minted
+        // id is the stored one only on a first write. The client is the stable address.
+        "signup_form.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_id"]
+        }"#,
+    ),
+    (
         "signup_form.deleted",
         1,
         r#"{
