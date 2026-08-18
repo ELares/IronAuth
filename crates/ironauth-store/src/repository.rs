@@ -79,24 +79,25 @@ use crate::flow::{FlowRecord, NewFlow};
 use crate::flow_version::{FlowVersionRecord, NewFlowVersion};
 use crate::id::{
     AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId, ApiKeyId,
-    AssertionMappingId, AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId, BrandId,
-    ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId,
-    CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId,
-    EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
-    FedcmNonceId, FederationLoginStateId, FlowId, FlowTargetId, FlowVersionId, FlowVersionPinId,
-    GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId,
-    KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MessageTemplateId,
-    MigrationRunId, MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
-    OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
-    OrgRolePermissionId, OrganizationId, OutboxMessageId, PermissionId, PowChallengeId,
-    ProjectGrantId, ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
-    RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
-    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
-    RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
-    SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId,
-    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId,
-    UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    AssertionMappingId, AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId,
+    BackchannelAuthRequestId, BrandId, ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId,
+    ConsentId, CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId,
+    DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
+    ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, FlowTargetId, FlowVersionId,
+    FlowVersionPinId, GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId,
+    IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
+    MessageTemplateId, MigrationRunId, MigrationRunRecordId, OperatorId, OrgAuthPolicyId,
+    OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId,
+    OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId, OutboxMessageId,
+    PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId, PushedRequestId,
+    RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId, RecoveryFlowId,
+    RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId, RefreshTokenId,
+    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId,
+    ScopeStepUpPolicyId, ServiceAccountId, SessionId, SigningKeyId, SignupFormId,
+    SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId,
+    TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId,
+    UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -1293,6 +1294,16 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn device_codes(&self) -> DeviceCodeRepo<'a> {
         DeviceCodeRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The CIBA backchannel-authentication repository for this scope (issue #131): the
+    /// atomic, client-filtered redemption that makes an `auth_req_id` single-use.
+    #[must_use]
+    pub fn backchannel_auth(&self) -> BackchannelAuthRepo<'a> {
+        BackchannelAuthRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -63568,6 +63579,434 @@ mod usage_tally {
         backward.merge(&a);
 
         assert_eq!(forward, backward);
+    }
+}
+
+/// CIBA backchannel authentication requests (issue #131).
+///
+/// The redemption is the interesting method; everything else here exists to support it.
+pub struct BackchannelAuthRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+/// What a poll of a CIBA request answers (issue #131 criterion 1).
+///
+/// A total enum rather than a status plus flags, because the caller maps each variant to a
+/// DIFFERENT token-endpoint response and a combination that means nothing ("approved and
+/// slow down") should be unrepresentable rather than merely unused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackchannelPoll {
+    /// Still awaiting the user's decision: `authorization_pending`.
+    Pending,
+    /// Polled faster than the current interval: `slow_down`, and the interval has been
+    /// INCREASED in place. Carries the new interval so the caller can tell the client what
+    /// it now has to respect.
+    SlowDown {
+        /// The new minimum interval in seconds.
+        interval_secs: i32,
+    },
+    /// The user approved. The caller redeems to obtain the request's details.
+    Approved,
+    /// The user refused: `access_denied`.
+    Denied,
+    /// Past its TTL: `expired_token`.
+    Expired,
+    /// No such request for this client. Also the answer for a request belonging to ANOTHER
+    /// client, so polling is not an existence oracle either.
+    NotFound,
+}
+
+/// A new CIBA request to persist.
+#[derive(Debug, Clone)]
+pub struct NewBackchannelRequest<'a> {
+    /// The SHA-256 hex digest of the whole `auth_req_id`. The plaintext is never stored.
+    pub auth_req_id_digest: &'a str,
+    /// The request's logical id (`bar_`).
+    pub id: &'a BackchannelAuthRequestId,
+    /// The client the request is bound to, and the only one that may redeem it.
+    pub client_id: &'a str,
+    /// `poll` or `ping`. `push` is not representable.
+    pub delivery_mode: crate::ciba::DeliveryMode,
+    /// Where to ping, for ping mode. Must be `None` for poll.
+    pub client_notification_url: Option<&'a str>,
+    /// The sealed notification credential, for ping mode. Must be `None` for poll.
+    pub client_notification_token: Option<&'a [u8]>,
+    /// The OAuth scope requested.
+    pub requested_scope: Option<&'a str>,
+    /// The RFC 9396 `authorization_details` requested, held verbatim.
+    pub authorization_details: Option<&'a serde_json::Value>,
+    /// The message to render on the authentication device, binding the approval to THIS
+    /// request.
+    pub binding_message: Option<&'a str>,
+    /// The subject the client named, resolved before the request is created.
+    pub subject: &'a str,
+    /// The starting minimum polling interval in seconds.
+    pub interval_secs: i32,
+    /// The expiry, already bounded by [`crate::ciba::bounded_expiry`].
+    pub expires_at_micros: i64,
+}
+
+/// A pending request as the approval surface needs to render it (#131 criterion 1).
+///
+/// Carries `binding_message` because that is the whole point of the surface: the user must
+/// be able to tell WHICH request they are approving, and a prompt that cannot say so is one
+/// a user can be tricked into answering for a request they did not start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBackchannelRequest {
+    /// The request's logical id (`bar_`), which the approval decision is submitted against.
+    pub id: BackchannelAuthRequestId,
+    /// The client that asked, so the surface can name it.
+    pub client_id: String,
+    /// The scope requested, for display.
+    pub requested_scope: Option<String>,
+    /// The message the client asked to have rendered.
+    pub binding_message: Option<String>,
+}
+
+/// The approval linkage an approved CIBA request carries into its issued tokens.
+///
+/// One struct rather than five positional arguments, because four of the five are optional
+/// strings and a call site that transposed two of them would compile.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackchannelApprovalLinkage<'a> {
+    /// The grant opened at approval, the revocation spine the tokens hang off.
+    pub grant_id: Option<&'a str>,
+    /// The consent decision recorded at approval.
+    pub consent_ref: Option<&'a str>,
+    /// The RFC 8176 authentication methods frozen from the approving session.
+    pub auth_methods: Option<&'a str>,
+    /// The approving user's authentication instant, so the ID token's `auth_time` is
+    /// truthful.
+    pub auth_time_micros: Option<i64>,
+}
+
+/// A request whose tokens have just been issued, returned by a successful redemption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeemedBackchannelRequest {
+    /// The request's logical id (`bar_`).
+    pub id: BackchannelAuthRequestId,
+    /// The subject the tokens are for.
+    pub subject: String,
+    /// The grant opened at approval, the revocation spine the tokens hang off.
+    pub grant_id: Option<String>,
+    /// The OAuth scope to echo into the issued tokens.
+    pub requested_scope: Option<String>,
+    /// The RFC 9396 `authorization_details` to echo into the issued tokens.
+    pub authorization_details: Option<serde_json::Value>,
+    /// The frozen authentication methods the ID token's `amr` derives from.
+    pub auth_methods: Option<String>,
+}
+
+impl BackchannelAuthRepo<'_> {
+    /// Parse an untrusted `bar_` id under this scope. A malformed id and one minted in
+    /// another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_request_id(&self, raw: &str) -> Result<BackchannelAuthRequestId, StoreError> {
+        Ok(BackchannelAuthRequestId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Persist a new backchannel authentication request (#131 criterion 5).
+    ///
+    /// The expiry arrives already bounded: clamping belongs to
+    /// [`crate::ciba::bounded_expiry`], which is testable without a database, and doing it
+    /// here as well would be a second place for the rule to live.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, including the CHECK that pairs a
+    /// notification target with the delivery mode -- so a ping request built without one is
+    /// refused by the database rather than silently stored.
+    pub async fn create(&self, new: &NewBackchannelRequest<'_>) -> Result<(), StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO backchannel_authentication_requests (
+                 auth_req_id_digest, tenant_id, environment_id, id, client_id,
+                 delivery_mode, client_notification_url, client_notification_token,
+                 requested_scope, authorization_details, binding_message,
+                 status, interval_secs, subject, expires_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13, \
+                       to_timestamp($14::double precision / 1000000.0))",
+        )
+        .bind(new.auth_req_id_digest)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(new.id.to_string())
+        .bind(new.client_id)
+        .bind(new.delivery_mode.as_str())
+        .bind(new.client_notification_url)
+        .bind(new.client_notification_token)
+        .bind(new.requested_scope)
+        .bind(new.authorization_details)
+        .bind(new.binding_message)
+        .bind(new.interval_secs)
+        .bind(new.subject)
+        .bind(new.expires_at_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Poll a request, enforcing the minimum interval (#131 criterion 1).
+    ///
+    /// One statement again, for the same reason redemption is: the "did this client poll too
+    /// soon" decision and the bookkeeping that follows from it must not be separated by a
+    /// window in which a second poll slips through. The prior `last_poll_at` is captured in a
+    /// CTE because `RETURNING` sees the NEW row and the decision needs the OLD one.
+    ///
+    /// A too-soon poll INCREASES the interval and still advances `last_poll_at`, so a client
+    /// that ignores `slow_down` and hammers the endpoint gets progressively slower rather
+    /// than merely being told off. That is the point of the mechanism; a client that respects
+    /// the interval never sees it.
+    ///
+    /// Expiry is judged BEFORE the pending answer, so a request past its TTL reports
+    /// `Expired` rather than `Pending` forever. The status column is not rewritten to
+    /// `expired` here: that would be a write on every poll of a dead request, and the
+    /// timestamp is already the authority.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn poll(
+        &self,
+        auth_req_id_digest: &str,
+        presenting_client_id: &str,
+        now_micros: i64,
+        slow_down_increment_secs: i32,
+    ) -> Result<BackchannelPoll, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "WITH prior AS ( \
+                 SELECT auth_req_id_digest, \
+                        status, \
+                        (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
+                        ( last_poll_at IS NOT NULL \
+                          AND $3 < (EXTRACT(EPOCH FROM last_poll_at) * 1000000)::bigint \
+                                   + interval_secs::bigint * 1000000 ) AS too_soon \
+                 FROM backchannel_authentication_requests \
+                 WHERE auth_req_id_digest = $1 AND client_id = $2 \
+                   AND tenant_id = $4 AND environment_id = $5 \
+             ) \
+             UPDATE backchannel_authentication_requests AS r \
+             SET last_poll_at = to_timestamp($3::double precision / 1000000.0), \
+                 interval_secs = CASE WHEN prior.too_soon \
+                                      THEN r.interval_secs + $6 \
+                                      ELSE r.interval_secs END \
+             FROM prior \
+             WHERE r.auth_req_id_digest = prior.auth_req_id_digest \
+               AND r.tenant_id = $4 AND r.environment_id = $5 \
+             RETURNING prior.status AS prior_status, prior.expires_us, prior.too_soon, \
+                       r.interval_secs AS new_interval",
+        )
+        .bind(auth_req_id_digest)
+        .bind(presenting_client_id)
+        .bind(now_micros)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(slow_down_increment_secs)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(BackchannelPoll::NotFound);
+        };
+        let too_soon: bool = row.get("too_soon");
+        if too_soon {
+            return Ok(BackchannelPoll::SlowDown {
+                interval_secs: row.get("new_interval"),
+            });
+        }
+        let expires_us: i64 = row.get("expires_us");
+        if expires_us <= now_micros {
+            return Ok(BackchannelPoll::Expired);
+        }
+        let status: String = row.get("prior_status");
+        Ok(match crate::ciba::RequestStatus::parse(&status) {
+            Some(crate::ciba::RequestStatus::Pending) => BackchannelPoll::Pending,
+            Some(crate::ciba::RequestStatus::Approved) => BackchannelPoll::Approved,
+            Some(crate::ciba::RequestStatus::Denied) => BackchannelPoll::Denied,
+            // `expired` recorded in the column, and `redeemed` -- a request whose tokens
+            // were already issued is spent, and the client is told the same thing it would
+            // be told about one that timed out rather than being handed a distinction it
+            // cannot act on.
+            _ => BackchannelPoll::Expired,
+        })
+    }
+
+    /// The requests awaiting THIS subject's decision (#131 criterion 1).
+    ///
+    /// Subject-bound in the query, so the surface cannot render a request belonging to
+    /// another user even if handed its id. Expired requests are excluded by the timestamp
+    /// rather than by their status column, because nothing rewrites that column on a
+    /// schedule and a prompt for a dead request is one a user can approve to no effect.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn pending_for_subject(
+        &self,
+        subject: &str,
+        now_micros: i64,
+    ) -> Result<Vec<PendingBackchannelRequest>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, client_id, requested_scope, binding_message \
+             FROM backchannel_authentication_requests \
+             WHERE subject = $1 AND tenant_id = $2 AND environment_id = $3 \
+               AND status = 'pending' \
+               AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $4 \
+             ORDER BY created_at",
+        )
+        .bind(subject)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                Ok(PendingBackchannelRequest {
+                    id: BackchannelAuthRequestId::parse_in_scope(&id_text, &self.scope)?,
+                    client_id: row.get("client_id"),
+                    requested_scope: row.get("requested_scope"),
+                    binding_message: row.get("binding_message"),
+                })
+            })
+            .collect()
+    }
+
+    /// Record the subject's decision on a pending request (#131 criterion 1).
+    ///
+    /// `approve` carries the approval linkage the issued tokens derive from; a denial
+    /// carries none, which is why one method takes them all as options rather than two
+    /// methods duplicating the guard.
+    ///
+    /// Three things are enforced by the statement rather than around it:
+    ///
+    /// * **Only the named subject may decide.** `subject = $2` is a filter, so a decision
+    ///   submitted by anyone else matches no row. A user cannot approve a request that was
+    ///   never for them, even holding its id.
+    /// * **Only from pending.** `status = 'pending'` means a second decision on an
+    ///   already-decided request changes nothing, so a late click cannot flip a denial into
+    ///   an approval, or re-approve something already redeemed.
+    /// * **Not after expiry**, judged against the passed-in clock seam.
+    ///
+    /// Returns whether a row was decided. `false` covers every refusal, because the surface
+    /// answers all of them the same way rather than telling a user which of them applied.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn decide(
+        &self,
+        id: &BackchannelAuthRequestId,
+        subject: &str,
+        approved: bool,
+        linkage: BackchannelApprovalLinkage<'_>,
+        now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let result = sqlx::query(
+            "UPDATE backchannel_authentication_requests \
+             SET status = CASE WHEN $3 THEN 'approved' ELSE 'denied' END, \
+                 grant_id = $4, consent_ref = $5, auth_methods = $6, \
+                 auth_time = CASE WHEN $7::bigint IS NULL THEN NULL \
+                                  ELSE to_timestamp($7::double precision / 1000000.0) END \
+             WHERE id = $1 AND subject = $2 \
+               AND tenant_id = $8 AND environment_id = $9 \
+               AND status = 'pending' \
+               AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $10",
+        )
+        .bind(id.to_string())
+        .bind(subject)
+        .bind(approved)
+        .bind(linkage.grant_id)
+        .bind(linkage.consent_ref)
+        .bind(linkage.auth_methods)
+        .bind(linkage.auth_time_micros)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Redeem an approved request exactly once, for the client it belongs to (#131
+    /// criterion 3).
+    ///
+    /// Three properties, and all three are carried by the single statement rather than by
+    /// checks around it:
+    ///
+    /// * **Single-use.** The `status = 'approved'` predicate is in the UPDATE's own WHERE
+    ///   clause, so two concurrent redemptions cannot both match: the first transitions the
+    ///   row to `redeemed` and the second finds nothing. A read-then-write would leave a
+    ///   window in which both callers saw `approved`, and that window is exactly the one an
+    ///   attacker races.
+    ///
+    /// * **Client binding.** `client_id = $2` is a filter, not a comparison made afterwards.
+    ///   A request presented by the wrong client therefore matches no row and is
+    ///   indistinguishable from one that never existed -- there is no existence oracle -- and,
+    ///   just as importantly, it does NOT burn the request. A wrong-client presentation must
+    ///   not be able to destroy a legitimate client's pending redemption.
+    ///
+    /// * **Expiry.** Compared against the application clock seam passed in, never the
+    ///   database clock, so a test and a deployment agree about what "now" means.
+    ///
+    /// Returns [`None`] for every failure -- absent, wrong client, not approved, already
+    /// redeemed, expired -- because the caller answers all of them with the same
+    /// `invalid_grant`, and a richer return type here would be a distinction waiting to leak
+    /// into a response.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn redeem(
+        &self,
+        auth_req_id_digest: &str,
+        presenting_client_id: &str,
+        now_micros: i64,
+    ) -> Result<Option<RedeemedBackchannelRequest>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "UPDATE backchannel_authentication_requests \
+             SET status = 'redeemed' \
+             WHERE auth_req_id_digest = $1 \
+               AND client_id = $2 \
+               AND tenant_id = $3 \
+               AND environment_id = $4 \
+               AND status = 'approved' \
+               AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $5 \
+             RETURNING id, subject, grant_id, requested_scope, authorization_details, \
+                       auth_methods",
+        )
+        .bind(auth_req_id_digest)
+        .bind(presenting_client_id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id_text: String = row.get("id");
+        Ok(Some(RedeemedBackchannelRequest {
+            id: BackchannelAuthRequestId::parse_in_scope(&id_text, &self.scope)?,
+            subject: row.get("subject"),
+            grant_id: row.get("grant_id"),
+            requested_scope: row.get("requested_scope"),
+            authorization_details: row.get("authorization_details"),
+            auth_methods: row.get("auth_methods"),
+        }))
     }
 }
 

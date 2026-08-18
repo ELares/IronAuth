@@ -2745,6 +2745,23 @@ impl OidcState {
         self.inner.device_poll_interval_secs
     }
 
+    /// The RFC 9396 `authorization_details` types this deployment has registered (issue
+    /// #131 criterion 4).
+    ///
+    /// Empty by default, and empty means REFUSE EVERY TYPE rather than allow any. A
+    /// deployment that has registered no RAR types has defined the meaning of none of them,
+    /// and the opposite reading would make the safe configuration the one an operator has to
+    /// remember to type. A client sending no `authorization_details` at all is unaffected,
+    /// which is what keeps the default-deny from breaking every existing client.
+    #[must_use]
+    pub fn registered_rar_types(&self) -> &[&'static str] {
+        // Deliberately a fixed empty slice rather than config today: the vocabulary is
+        // per-deployment domain language, and inventing a config key before anything can
+        // consume it would ship a knob with no effect. The seam is here so the knob has one
+        // place to land.
+        &[]
+    }
+
     /// The seconds the enforced polling interval grows by on each too-fast poll (issue
     /// #24, RFC 8628 3.5 `slow_down`).
     #[must_use]

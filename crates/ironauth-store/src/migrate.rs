@@ -1172,6 +1172,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0146_flow_targets.sql"),
         },
+        Migration {
+            version: 147,
+            name: "backchannel_authentication",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0147_backchannel_authentication.sql"),
+        },
     ]
 }
 
