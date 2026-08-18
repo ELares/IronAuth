@@ -128,6 +128,43 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // decide whether the bytes it already cached are stale WITHOUT refetching them. The
         // BYTES themselves are never on the wire; a webhook is not a CDN, and an image on
         // every subscriber's queue would dwarf every other event in the system.
+        // A brand is what an end user SEES at the login surface, so a consumer mirroring
+        // branding acts on the id and the slug and re-reads the rest: the tokens, the slots,
+        // and the host pattern are a config document, not a fact, and putting a document on
+        // the wire means every consumer has to version it.
+        //
+        // `is_default` DOES travel, because it is not part of that document: flipping it
+        // changes which brand serves a request that matched no other, which is a behavioural
+        // change a consumer cannot see by re-reading only the brand it was told about.
+        "brand.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "brand_id": {"type": "string", "minLength": 1},
+                "brand_slug": {"type": "string", "minLength": 1},
+                "is_default": {"type": "boolean"}
+            },
+            "required": ["brand_id", "brand_slug", "is_default"]
+        }"#,
+    ),
+    (
+        // The delete takes the brand's ASSETS with it, so a consumer that read this as a
+        // brand-only removal would keep serving logos from a brand that no longer exists.
+        "brand.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "brand_id": {"type": "string", "minLength": 1},
+                "brand_slug": {"type": "string", "minLength": 1}
+            },
+            "required": ["brand_id", "brand_slug"]
+        }"#,
+    ),
+    (
         "brand_asset.set",
         1,
         r#"{

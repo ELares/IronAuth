@@ -706,3 +706,175 @@ async fn uploading_a_brand_asset_emits_the_digest_and_never_the_bytes() {
         "the event carried the asset bytes base64-encoded: {rendered}"
     );
 }
+
+/// Everything queued in `scope`, claimed AND completed, so a caller can drain twice.
+///
+/// [`queued_events`] leaves what it claims in flight, which is right for a one-shot count and
+/// wrong here: both brand events share the slug as their ordering key, and a second event on
+/// one key is not claimable until the first completes.
+async fn drain_events(db: &TestDatabase, scope: ironauth_store::Scope) -> Vec<serde_json::Value> {
+    use std::time::Duration;
+
+    let env = Env::system();
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}
+
+/// Setting and deleting a brand emit distinct types, carrying the identity but not the
+/// design document, and a delete of nothing announces nothing.
+///
+/// A brand is what an end user SEES at the login surface, so a consumer mirroring branding
+/// needs both transitions. What it does not need is the tokens, the slots, or the host
+/// pattern: those are a config document rather than a fact, and a document on the wire is one
+/// every consumer then has to version. The test asserts their ABSENCE.
+///
+/// `is_default` is the exception and travels, because flipping it changes which brand serves
+/// a request that matched no other -- something a consumer cannot learn by re-reading only
+/// the brand it was told about.
+#[tokio::test]
+async fn setting_and_deleting_a_brand_emit_distinct_types() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let id = BrandId::generate(&env, &scope);
+
+    let set = ironauth_store::event_catalog::envelope(
+        "evt_brand_set",
+        "brand.set",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "brand_id": id.to_string(),
+            "brand_slug": "acme",
+            "is_default": true,
+        }),
+    )
+    .expect("brand.set is registered");
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .set_with_event(
+            &env,
+            &id,
+            1_000_000,
+            set_brand("acme", true, "Acme"),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_brand_set",
+                subject: "acme",
+                envelope: &set,
+            }),
+        )
+        .await
+        .expect("set the brand");
+
+    let created = drain_events(&db, scope).await;
+    assert_eq!(created.len(), 1, "the set announced {created:?}");
+    assert_eq!(created[0]["type"], "brand.set");
+    assert_eq!(created[0]["payload"]["brand_slug"], "acme");
+    assert_eq!(
+        created[0]["payload"]["is_default"], true,
+        "the default flag changes which brand serves an unmatched request, so it travels"
+    );
+    let rendered = serde_json::to_string(&created[0]).expect("json");
+    assert!(
+        !rendered.contains("color_accent") && !rendered.contains("footer_legal"),
+        "the design document reached the wire; a document there is one every consumer has \
+         to version: {rendered}"
+    );
+
+    let deleted = ironauth_store::event_catalog::envelope(
+        "evt_brand_deleted",
+        "brand.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({ "brand_id": id.to_string(), "brand_slug": "acme" }),
+    )
+    .expect("brand.deleted is registered");
+
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .delete_with_event(
+            &env,
+            &id,
+            "acme",
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_brand_deleted",
+                subject: "acme",
+                envelope: &deleted,
+            }),
+        )
+        .await
+        .expect("delete the brand");
+
+    let removed = drain_events(&db, scope).await;
+    assert_eq!(removed.len(), 1, "the delete announced {removed:?}");
+    assert_eq!(
+        removed[0]["type"], "brand.deleted",
+        "the delete takes the brand's ASSETS with it, so a consumer told nothing would keep \
+         serving logos from a brand that no longer exists"
+    );
+    assert_eq!(removed[0]["payload"]["brand_id"], id.to_string());
+
+    // The guard sits before the enqueue: deleting what is already gone destroys nothing,
+    // records no audit row, and announces nothing.
+    let repeat = ironauth_store::event_catalog::envelope(
+        "evt_brand_deleted_again",
+        "brand.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        3,
+        &serde_json::json!({ "brand_id": id.to_string(), "brand_slug": "acme" }),
+    )
+    .expect("brand.deleted is registered");
+    let error = control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .brands()
+        .delete_with_event(
+            &env,
+            &id,
+            "acme",
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_brand_deleted_again",
+                subject: "acme",
+                envelope: &repeat,
+            }),
+        )
+        .await
+        .expect_err("an already-deleted brand is not found");
+    assert!(
+        matches!(error, ironauth_store::StoreError::NotFound),
+        "got {error:?}"
+    );
+    let quiet = drain_events(&db, scope).await;
+    assert!(
+        quiet.is_empty(),
+        "a delete that destroyed nothing must announce nothing: {quiet:?}"
+    );
+}

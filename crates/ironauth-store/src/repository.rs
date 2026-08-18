@@ -28643,6 +28643,23 @@ impl ActingBrandRepo<'_> {
         created_at_micros: i64,
         params: NewBrand<'_>,
     ) -> Result<(), StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `brand.set` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        id: &BrandId,
+        created_at_micros: i64,
+        params: NewBrand<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28733,6 +28750,8 @@ impl ActingBrandRepo<'_> {
                 .bind(client_id.as_deref())
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -28755,6 +28774,21 @@ impl ActingBrandRepo<'_> {
     /// [`StoreError::NotFound`] if `id` is out of scope or names no installed brand;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, id: &BrandId, slug: &str) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, slug, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `brand.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &BrandId,
+        slug: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -28795,6 +28829,8 @@ impl ActingBrandRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
