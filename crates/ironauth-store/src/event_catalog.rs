@@ -265,6 +265,38 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         //
         // The organization travels with it because a role is org-scoped and a receiver
         // mirrors access per organization.
+        // The role AND its organization, mirroring the delete: an org role is scoped to one
+        // organization, and a receiver maintaining a per-organization view cannot file the
+        // event without knowing which one.
+        "org_role.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_role_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_role_id", "organization_id"]
+        }"#,
+    ),
+    (
+        // Its own type: an update changes the DISPLAY of an existing role and never its slug
+        // or its grants, so a consumer treating it as a create would invent a role that the
+        // organization's authorization model does not contain.
+        "org_role.updated",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_role_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_role_id", "organization_id"]
+        }"#,
+    ),
+    (
         "org_role.deleted",
         1,
         r#"{

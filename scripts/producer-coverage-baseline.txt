@@ -42,9 +42,7 @@ org_role_assignments::unassign_org_membership_role
 org_role_permissions::assign_org_role_permission
 org_role_permissions::unassign_org_role_permission
 org_roles::clear_org_default_role
-org_roles::create_org_role
 org_roles::set_org_default_role
-org_roles::update_org_role
 organizations::disable_organization
 organizations::enable_organization
 personal_access_tokens::create_user_personal_access_token

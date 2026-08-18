@@ -1081,3 +1081,119 @@ async fn queued_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value
         .map(|message| message.payload)
         .collect()
 }
+
+/// Creating an organization role emits `org_role.created`, naming its organization.
+///
+/// The organization travels with the role id because an org role is scoped to one
+/// organization, and a receiver maintaining a per-organization view cannot file the event
+/// without knowing which one.
+#[tokio::test]
+async fn creating_an_org_role_emits_the_registered_event() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let role_id = OrgRoleId::generate(&env, &scope);
+    let subject = role_id.to_string();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_org_role_created",
+        "org_role.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({
+            "org_role_id": subject,
+            "organization_id": org.to_string(),
+        }),
+    )
+    .expect("org_role.created is registered");
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_roles(scope)
+        .create_with_event(
+            &env,
+            NewOrgRole {
+                id: &role_id,
+                organization_id: &org,
+                slug: "auditor",
+                display_name: "Auditor",
+                metadata: None,
+            },
+            now_micros(&env),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_org_role_created",
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("create with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the create enqueues exactly one event");
+    assert_eq!(events[0]["type"], "org_role.created");
+    assert_eq!(events[0]["payload"]["organization_id"], org.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Updating an organization role is announced as an UPDATE, not as a create.
+///
+/// An update changes the DISPLAY of an existing role and never its slug or its grants, so a
+/// consumer treating it as a create would invent a role the organization's authorization
+/// model does not contain. The seed uses the un-suffixed `create`, which emits nothing.
+#[tokio::test]
+async fn updating_an_org_role_is_announced_as_an_update_not_a_create() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Globex").await;
+    let role = create_role(&db, &env, scope, &org, "auditor", "Auditor")
+        .await
+        .expect("create role");
+    let subject = role.to_string();
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_org_role_updated",
+        "org_role.updated",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        2,
+        &serde_json::json!({
+            "org_role_id": subject,
+            "organization_id": org.to_string(),
+        }),
+    )
+    .expect("org_role.updated is registered");
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_roles(scope)
+        .update_with_event(
+            &env,
+            &role,
+            Some("Senior Auditor"),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_org_role_updated",
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("update with event");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the update enqueues exactly one event");
+    assert_eq!(
+        events[0]["type"], "org_role.updated",
+        "an update must NOT be announced as a create"
+    );
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

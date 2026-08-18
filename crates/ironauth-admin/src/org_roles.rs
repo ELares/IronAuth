@@ -314,6 +314,7 @@ pub async fn create_org_role(
         response_status: 201,
         response_body: &body_string,
     };
+    let pending = org_role_event(&state, scope, &role_id, &org_id, "org_role.created");
     let result = state
         .store()
         .management()
@@ -322,7 +323,7 @@ pub async fn create_org_role(
         // so a per-organization SIEM stream can select it.
         .in_organization(org_id)
         .org_roles(scope)
-        .create(
+        .create_with_event(
             state.env(),
             NewOrgRole {
                 id: &role_id,
@@ -333,6 +334,10 @@ pub async fn create_org_role(
             },
             created_at_micros,
             Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -513,7 +518,10 @@ pub async fn update_org_role(
         .as_deref()
         .map(|value| require_non_empty(value, "display_name"))
         .transpose()?;
+    // Built INSIDE the guard, so a PATCH that changes nothing announces nothing: there is no
+    // write to announce, and a receiver told a role changed would refetch an identical row.
     if display_name.is_some() || request.metadata.is_some() {
+        let pending = org_role_event(&state, scope, &record.id, &org_id, "org_role.updated");
         state
             .store()
             .management()
@@ -521,11 +529,15 @@ pub async fn update_org_role(
             // Attribute the audit row to this organization (issue #110).
             .in_organization(org_id)
             .org_roles(scope)
-            .update(
+            .update_with_event(
                 state.env(),
                 &record.id,
                 display_name.as_deref(),
                 request.metadata.as_ref(),
+                pending
+                    .as_ref()
+                    .map(crate::events::PendingEvent::domain_event)
+                    .as_ref(),
             )
             .await?;
     }
@@ -761,6 +773,43 @@ fn org_role_deleted_event(
     let envelope = ironauth_store::event_catalog::envelope(
         &id,
         "org_role.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "org_role_id": subject,
+            "organization_id": organization_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event an organization-role create or update emits (issue #108).
+///
+/// ONE builder for both, because the payload is identical and only the announced fact
+/// differs. The TYPES stay separate: an update changes the DISPLAY of an existing role and
+/// never its slug or its grants, so a consumer treating it as a create would invent a role the
+/// organization's authorization model does not contain.
+///
+/// The role AND its organization, mirroring the delete: an org role is scoped to one
+/// organization, and a receiver maintaining a per-organization view cannot file the event
+/// without knowing which one.
+fn org_role_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    org_role_id: &ironauth_store::OrgRoleId,
+    organization_id: &ironauth_store::OrganizationId,
+    event_type: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = org_role_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
         &scope.tenant().to_string(),
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,
