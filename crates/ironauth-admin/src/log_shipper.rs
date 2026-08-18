@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use ironauth_env::Env;
 use ironauth_store::log_stream::{LogStreamRecord, SinkType};
-use ironauth_store::{ChainedAuditRow, Scope, Store, StoreError, ocsf};
+use ironauth_store::{ChainedAuditRow, CursorOrigin, Scope, Store, StoreError, ocsf};
 use serde_json::{Value, json};
 
 /// The most rows one stream ships in one pass.
@@ -201,6 +201,10 @@ pub async fn replay_dead_letters(
                 .rows_after(
                     audit_stream,
                     Some((cursor.0, cursor.1.as_str())),
+                    // Synthetic: `predecessor_of` names no row, and the range this walks is
+                    // one the dead letter already recorded. A retention gap is not a
+                    // question this position can answer.
+                    CursorOrigin::BoundedRange,
                     SHIP_BATCH,
                     stream.organization_id.as_deref(),
                 )
@@ -242,6 +246,11 @@ fn predecessor_of(at: &(i64, String)) -> (i64, String) {
 }
 
 /// Ship ONE stream once, returning how many events the sink accepted.
+// Sat at exactly the 100-line limit, and the retention-gap fix adds ONE argument line at the
+// `rows_after` call. Allowed rather than split: the natural seam is the two-stream read loop,
+// and lifting it out would put the cursor handling in one function and the ordering that
+// depends on it in another, which is how the two get changed apart.
+#[allow(clippy::too_many_lines)]
 async fn ship_stream(
     store: &Store,
     env: &Env,
@@ -280,6 +289,10 @@ async fn ship_stream(
                 .rows_after(
                     audit_stream,
                     cursor,
+                    // The shipper's own resume position: a row this stream was handed and
+                    // recorded. If it has been pruned the stream MUST be told, which is the
+                    // refusal this discriminator preserves.
+                    CursorOrigin::ConsumerResume,
                     SHIP_BATCH,
                     // A per-organization stream filters in SQL rather than in the loop
                     // below. Filtering here is what makes the isolation a property of the

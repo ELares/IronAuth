@@ -38868,6 +38868,32 @@ async fn insert_audit_row<T: AuditTarget>(
 // UPDATEing the row it seals; see migration 0135 for why that distinction is
 // the whole point.
 
+/// What a read's cursor MEANS, which decides whether a retention gap applies to it.
+///
+/// The gap check asks one question: was the row you are resuming from pruned? That question
+/// only has an answer for a cursor that names a row, and not every cursor does.
+///
+/// Splitting this out fixed a real refusal. The dead-letter replay re-reads a recorded range
+/// and, because [`AuditChainRepo::rows_after`] is EXCLUSIVE, starts from a synthetic position
+/// just below the range's first row (same microsecond, empty id). When the range began at the
+/// stream's oldest surviving row, that position sorted below it and the read was refused as a
+/// retention gap with nothing pruned and no row missing.
+///
+/// It is a parameter rather than a sniff at the cursor's shape: a rule defeated by a spelling
+/// is not a rule, and "the id happens to be empty" is a spelling. The caller knows which kind
+/// of position it holds; nothing else does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorOrigin {
+    /// A position a consumer was HANDED and is resuming from, so it names a row that once
+    /// existed. If that row is gone, the consumer missed everything up to what remains, and
+    /// handing it the surviving tail would look exactly like an uneventful period.
+    ConsumerResume,
+    /// A synthetic lower bound the caller derived to re-read a range it ALREADY holds. It
+    /// names no row, so no row of it can have been pruned, and the range's own bounds -- not
+    /// this cursor -- are what the caller checks for completeness.
+    BoundedRange,
+}
+
 /// One `audit_log` row, in the exact shape the chain commits to.
 ///
 /// Every field here is immutable once written. `occurred_micros` is derived from
@@ -39731,6 +39757,7 @@ impl AuditChainRepo<'_> {
         &self,
         stream: &str,
         cursor: Option<(i64, &str)>,
+        origin: CursorOrigin,
         limit: i64,
         organization: Option<&str>,
     ) -> Result<Vec<ChainedAuditRow>, StoreError> {
@@ -39754,7 +39781,9 @@ impl AuditChainRepo<'_> {
         // An EMPTY stream is not a gap: there is no oldest row to be older than, and a
         // consumer resuming against a stream whose rows have all aged out but which never had
         // any is in a different situation from one that missed events. It reads as empty.
-        if let (Some(micros), Some(id)) = (cursor_micros, cursor_id) {
+        if let (Some(micros), Some(id), CursorOrigin::ConsumerResume) =
+            (cursor_micros, cursor_id, origin)
+        {
             let oldest: Option<(i64, String)> = sqlx::query(
                 "SELECT (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros, \
                         id \
