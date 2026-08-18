@@ -49553,6 +49553,23 @@ impl ActingOrgRolePermissionRepo<'_> {
         created_at_micros: i64,
         idempotency: Option<ResolvedIdempotencyWrite<'_, i64>>,
     ) -> Result<i64, StoreError> {
+        self.assign_with_event(env, spec, created_at_micros, idempotency, None)
+            .await
+    }
+
+    /// [`Self::assign`], additionally emitting `org_role.permission_granted` (#108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::assign`].
+    pub async fn assign_with_event(
+        &self,
+        env: &Env,
+        spec: NewOrgRolePermission<'_>,
+        created_at_micros: i64,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, i64>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<i64, StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.role_id.scope() != self.scope
@@ -49627,6 +49644,8 @@ impl ActingOrgRolePermissionRepo<'_> {
                 // transaction, so the response and every replay of it agree with the state
                 // they describe.
                 insert_resolved_idempotency(tx, idempotency, &attached).await?;
+                // In the write's transaction: a rolled-back grant announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(attached)
             },
             false,
@@ -49662,6 +49681,22 @@ impl ActingOrgRolePermissionRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgRolePermissionId,
     ) -> Result<(), StoreError> {
+        self.unassign_with_event(env, organization_id, id, None)
+            .await
+    }
+
+    /// [`Self::unassign`], additionally emitting `org_role.permission_revoked` (#108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::unassign`].
+    pub async fn unassign_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgRolePermissionId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if organization_id.scope() != self.scope || id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -49686,7 +49721,10 @@ impl ActingOrgRolePermissionRepo<'_> {
                     &id.to_string(),
                     now_micros,
                 )
-                .await
+                .await?;
+                // AFTER the delete's guard: revoking what is not granted announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )

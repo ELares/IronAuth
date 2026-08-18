@@ -665,6 +665,40 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A PERMISSION on a ROLE: the grant that actually decides what a role can do. Every
+        // holder of the role gains or loses it at once, so a consumer recomputing effective
+        // permissions acts on this even though no membership changed.
+        //
+        // Both ends and the organization, as with the role assignments: neither the role nor
+        // the permission alone tells a receiver what changed.
+        "org_role.permission_granted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "organization_id": {"type": "string", "minLength": 1},
+                "org_role_id": {"type": "string", "minLength": 1},
+                "permission_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["organization_id", "org_role_id", "permission_id"]
+        }"#,
+    ),
+    (
+        "org_role.permission_revoked",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "organization_id": {"type": "string", "minLength": 1},
+                "org_role_id": {"type": "string", "minLength": 1},
+                "permission_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["organization_id", "org_role_id", "permission_id"]
+        }"#,
+    ),
+    (
         "org_role.assigned_to_group",
         1,
         r#"{

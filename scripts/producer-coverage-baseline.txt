@@ -24,8 +24,6 @@ log_streams::delete_log_stream
 migration::delete_outbound_verification
 migration::set_outbound_verification
 migration_runs::abandon_migration_run
-org_role_permissions::assign_org_role_permission
-org_role_permissions::unassign_org_role_permission
 postures::set_auto_link_posture
 postures::set_client_par_requirement
 project_grants::create_project_grant
