@@ -911,6 +911,16 @@ name = "project_grants"
 path = "tests/project_grants.rs"
 required-features = ["testing"]
 
+# The CIBA table's own guarantees (issue #131): the closed delivery-mode vocabulary that
+# makes the push refusal structural, the both-directions notification pairing, and -- the
+# reason the file exists -- that the client binding and the expiry are write-once for the
+# data plane, which is what makes criterion 3 a property of the schema rather than a promise
+# of the application code.
+[[test]]
+name = "backchannel_authentication"
+path = "tests/backchannel_authentication.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "flow_targets"
 path = "tests/flow_targets.rs"

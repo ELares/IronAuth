@@ -82,6 +82,7 @@ mod broker_overlay;
 mod challenge;
 /// Client ID Metadata Document hardening (issue #128): the pure rules a URL `client_id`
 /// and its fetched document must satisfy before either is trusted.
+mod ciba;
 pub mod cimd;
 mod claims_request;
 mod client_auth;
@@ -442,6 +443,13 @@ pub fn oidc_router(state: OidcState) -> Router {
         // the per-environment issuer path is where a human enters the user code, signs
         // in, and EXPLICITLY approves before the device is issued any token.
         .route("/device_authorization", post(device::device_authorization))
+        // CIBA backchannel authentication (issue #131, CIBA Core section 7.1). Global and
+        // self-scoped, exactly like the device-authorization endpoint beside it: the client
+        // presents its client_id and the scope is recovered from it.
+        .route(
+            "/backchannel_authenticate",
+            post(ciba::backchannel_authenticate),
+        )
         .route(
             "/t/{tenant_id}/e/{environment_id}/device",
             get(device_verify::device_get).post(device_verify::device_post),

@@ -452,6 +452,20 @@ impl ScopedKind for DeviceCodeKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// Marker for a CIBA backchannel authentication request (`bar_`), the scope-declaring
+/// routing handle embedded in the `ira_bar_<jti>~<secret>` wire `auth_req_id` (issue #131,
+/// OpenID CIBA Core). It declares the request's `(tenant, environment)` in the clear so the
+/// GLOBAL `/token` endpoint recovers the scope from a presented `auth_req_id` and runs the
+/// RLS-scoped digest resolve, exactly as the device grant does with `dc_`. Because it is one
+/// segment of a live bearer credential, its debug form REDACTS the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BackchannelAuthRequestKind;
+impl ScopedKind for BackchannelAuthRequestKind {
+    const PREFIX: &'static str = "bar";
+    // The `bar_` id is embedded in the presented auth_req_id; keep it out of logs.
+    const REDACT_DEBUG: bool = true;
+}
+
 /// Marker for a bootstrap end user (`usr_`), the account the login and
 /// registration surfaces authenticate (issue #20). A tenant-scoped resource: the
 /// user id embeds its `(tenant, environment)`, and its string is the stable
@@ -1725,6 +1739,11 @@ pub type RefreshTokenId = ScopedId<RefreshTokenKind>;
 /// #24, RFC 8628). It declares the code's `(tenant, environment)` so the GLOBAL
 /// `/token` endpoint recovers the scope and runs the RLS-scoped digest resolve.
 pub type DeviceCodeId = ScopedId<DeviceCodeKind>;
+/// A CIBA backchannel authentication request identifier (`bar_...`), the scope-declaring
+/// routing handle embedded in the `ira_bar_<jti>~<secret>` wire `auth_req_id` (issue #131).
+/// It declares the request's `(tenant, environment)` so the GLOBAL `/token` endpoint
+/// recovers the scope and runs the RLS-scoped digest resolve.
+pub type BackchannelAuthRequestId = ScopedId<BackchannelAuthRequestKind>;
 /// A bootstrap end-user identifier (`usr_...`), the account the login and
 /// registration surfaces authenticate (issue #20).
 pub type UserId = ScopedId<UserKind>;
