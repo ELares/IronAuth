@@ -298,6 +298,24 @@
       "type": "environment.deleted"
     },
     {
+      "domain": "environment",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "environment.identifier_uniqueness_applied"
+    },
+    {
       "domain": "environment_secret",
       "payload_schema": {
         "additionalProperties": false,

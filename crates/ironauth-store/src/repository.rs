@@ -18289,6 +18289,27 @@ impl ActingUserIdentifierRepo<'_> {
         mode: UniquenessMode,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.apply_uniqueness_mode_with_event(env, mode, idempotency, None)
+            .await
+    }
+
+    /// [`Self::apply_uniqueness_mode`], additionally emitting
+    /// `environment.identifier_uniqueness_applied` (issue #108).
+    ///
+    /// ONE event for the whole environment, not one per identifier: this recomputes the
+    /// discriminator on every row at once, so there is no single subject to name and a
+    /// per-row fan-out would be a storm saying less than one line does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apply_uniqueness_mode`].
+    pub async fn apply_uniqueness_mode_with_event(
+        &self,
+        env: &Env,
+        mode: UniquenessMode,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let environment = scope.environment();
         let target_key = mode_target_key_sql(mode);
@@ -18344,6 +18365,8 @@ impl ActingUserIdentifierRepo<'_> {
                 // collisions and retry with the same key rather than being told the
                 // request was already made.
                 insert_idempotency(tx, idempotency).await?;
+                // In the recompute's transaction: a rolled-back apply announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

@@ -15,7 +15,6 @@ dcr::verify_dcr_client
 environments::create_environment
 flow_versions::create_flow_version
 flow_versions::pin_flow_version
-identifiers::apply_identifier_uniqueness
 impersonation::authorize_user_impersonation
 imports::create_identity_import
 imports::resume_identity_import

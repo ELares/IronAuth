@@ -471,6 +471,25 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // wider audience than the management read surface, so the same refusal holds. The
         // TYPE is carried because "an email was added" and "a phone was added" are different
         // facts to a receiver deciding whether to re-verify.
+        // A CONFIG-PLANE recompute, not a per-user write: applying a uniqueness mode
+        // recomputes the discriminator on EVERY identifier in the environment at once. There
+        // is no single subject to name, and one event per affected row would be a storm that
+        // says less than this one line does.
+        //
+        // The MODE is the payload, because a receiver mirroring identity policy needs to know
+        // which rule now holds -- whether an address may repeat across organizations.
+        "environment.identifier_uniqueness_applied",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "mode": {"type": "string", "minLength": 1}
+            },
+            "required": ["mode"]
+        }"#,
+    ),
+    (
         "user.identifier_added",
         1,
         r#"{

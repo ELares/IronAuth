@@ -1478,3 +1478,101 @@ async fn adding_an_identifier_announces_the_type_and_never_the_value() {
         events[0]
     );
 }
+
+/// Applying a uniqueness mode emits ONE environment-scoped event carrying the mode.
+///
+/// One event for the environment, not one per identifier: the apply recomputes the
+/// discriminator on EVERY row at once, so there is no single subject to name and a per-row
+/// fan-out would be a storm saying less than one line does. The fixture holds TWO identifiers
+/// so "one event" is a real assertion.
+///
+/// The mode's wire name is `UniquenessMode::as_str`, deliberately NOT the storage
+/// discriminator `uniqueness_key` renders -- coupling a published event to the index's
+/// internal key would make a future index change a breaking payload change.
+#[tokio::test]
+async fn applying_a_uniqueness_mode_emits_one_event_carrying_the_mode() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let first = register_user(&db, &env, scope, "first").await;
+    let second = register_user(&db, &env, scope, "second").await;
+    add_identifier(
+        &db,
+        &env,
+        scope,
+        &first,
+        IdentifierType::Email,
+        "one@example.test",
+        UniquenessMode::EnvironmentWide,
+    )
+    .await
+    .expect("add first");
+    add_identifier(
+        &db,
+        &env,
+        scope,
+        &second,
+        IdentifierType::Email,
+        "two@example.test",
+        UniquenessMode::EnvironmentWide,
+    )
+    .await
+    .expect("add second");
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_uniqueness_applied",
+        "environment.identifier_uniqueness_applied",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "mode": UniquenessMode::EnvironmentWide.as_str() }),
+    )
+    .expect("environment.identifier_uniqueness_applied is registered");
+    let subject = scope.environment().to_string();
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .user_identifiers()
+        .apply_uniqueness_mode_with_event(
+            &env,
+            UniquenessMode::EnvironmentWide,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_uniqueness_applied",
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("apply with event");
+
+    let events = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events.len(),
+        1,
+        "two identifiers were recomputed, but the fact is ONE environment-wide apply: \
+         {events:?}"
+    );
+    assert_eq!(
+        events[0]["type"],
+        "environment.identifier_uniqueness_applied"
+    );
+    assert_eq!(events[0]["payload"]["mode"], "environment_wide");
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}

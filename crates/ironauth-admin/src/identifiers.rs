@@ -513,12 +513,21 @@ pub async fn apply_identifier_uniqueness(
         response_status: 204,
         response_body: "",
     };
+    let pending = identifier_uniqueness_applied_event(&state, scope, mode);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .user_identifiers()
-        .apply_uniqueness_mode(state.env(), mode, Some(write))
+        .apply_uniqueness_mode_with_event(
+            state.env(),
+            mode,
+            Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await
         .map_err(|error| match error {
             StoreError::Conflict => ApiError::Conflict(
@@ -580,6 +589,37 @@ fn identifier_event(
         id,
         // The USER is the subject: identifier changes for one person stay ordered.
         subject,
+        envelope,
+    })
+}
+
+/// The event applying an identifier-uniqueness mode emits (issue #108).
+///
+/// ONE event for the environment, not one per identifier. Applying a mode recomputes the
+/// discriminator on EVERY identifier in the environment at once, so there is no single
+/// subject to name -- and a per-row fan-out would be a storm that says less than this one
+/// line does.
+///
+/// The MODE is the payload: a receiver mirroring identity policy needs to know which rule now
+/// holds, whether an address may repeat across organizations.
+fn identifier_uniqueness_applied_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    mode: ironauth_store::identifier::UniquenessMode,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "environment.identifier_uniqueness_applied",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "mode": mode.as_str() }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The ENVIRONMENT is the subject: successive policy applications stay ordered.
+        subject: scope.environment().to_string(),
         envelope,
     })
 }
