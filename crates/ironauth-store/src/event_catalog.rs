@@ -112,6 +112,73 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // something untrue about the rest -- and the store picks the audit scope itself (the
         // oldest environment) after the call begins, so a producer could not name the right
         // one even if there were one. This is the type the per-type envelope rule exists for.
+        // TENANT-SCOPED, for the same reason as `tenant.deleted`: suspending fences EVERY one
+        // of the tenant's environments in one transaction, so naming one would assert
+        // something untrue about the rest.
+        //
+        // Its own type rather than a state field, and separate from the resume: a suspension
+        // STOPS a tenant's data plane serving and a resume starts it again. A consumer that
+        // read one as the other would fence a live tenant or serve a fenced one, and there is
+        // no reading of a shared "state changed" that fails safe.
+        "tenant.suspended",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tenant_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["tenant_id"]
+        }"#,
+    ),
+    (
+        // The reversing half. No data was lost by the suspension, so this is the announcement
+        // that a consumer may resume trusting the tenant.
+        "tenant.resumed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tenant_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["tenant_id"]
+        }"#,
+    ),
+    (
+        // The UNDELETE, inside the retention window. It carries no status, deliberately: a
+        // restore commits the status the tenant HELD before it was deleted, which the store
+        // resolves inside the write, so a producer naming one would be announcing a value it
+        // could not know. A receiver reads the status back through the management surface,
+        // which is the same answer the endpoint gives its caller.
+        "tenant.restored",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tenant_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["tenant_id"]
+        }"#,
+    ),
+    (
+        // TERMINAL, and its own type for that reason above all. A purge crypto-shreds the
+        // tenant's keys: there is no restore after it, and a consumer that read it as the
+        // soft delete would wait out a retention window that will never end in a recovery.
+        // This is the event that says "stop holding anything for this tenant".
+        "tenant.purged",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tenant_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["tenant_id"]
+        }"#,
+    ),
+    (
         "tenant.deleted",
         1,
         r#"{
@@ -2140,7 +2207,13 @@ pub fn envelope_tenant_scoped(
 /// Listing means a new tenant-scoped type must be added here. Forgetting fails LOUDLY at the
 /// first emit rather than silently: `validate_event` requires an environment id for anything
 /// not on this list, so a producer that omits one is refused before delivery.
-const TENANT_SCOPED: &[&str] = &["tenant.deleted"];
+const TENANT_SCOPED: &[&str] = &[
+    "tenant.deleted",
+    "tenant.purged",
+    "tenant.restored",
+    "tenant.resumed",
+    "tenant.suspended",
+];
 
 /// The number of event types issue #108 asks the catalog to reach before it closes.
 ///

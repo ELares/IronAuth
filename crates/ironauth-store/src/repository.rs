@@ -45275,6 +45275,24 @@ impl ActingTenantRepo<'_> {
         id: &TenantId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.suspend_with_event(env, id, idempotency, None).await
+    }
+
+    /// [`Self::suspend`], additionally emitting `tenant.suspended` (issue #108).
+    ///
+    /// TENANT-SCOPED: one outbox row per environment, because a suspension fences every one
+    /// of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::suspend`].
+    pub async fn suspend_with_event(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         self.transition(
             env,
             id,
@@ -45283,6 +45301,7 @@ impl ActingTenantRepo<'_> {
             Action::TenantSuspend,
             EnvironmentServingState::Suspended,
             idempotency,
+            event,
         )
         .await
     }
@@ -45306,6 +45325,24 @@ impl ActingTenantRepo<'_> {
         id: &TenantId,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.resume_with_event(env, id, idempotency, None).await
+    }
+
+    /// [`Self::resume`], additionally emitting `tenant.resumed` (issue #108).
+    ///
+    /// TENANT-SCOPED: one outbox row per environment, because a resume un-fences every one
+    /// of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resume`].
+    pub async fn resume_with_event(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         self.transition(
             env,
             id,
@@ -45314,6 +45351,7 @@ impl ActingTenantRepo<'_> {
             Action::TenantResume,
             EnvironmentServingState::Active,
             idempotency,
+            event,
         )
         .await
     }
@@ -45335,6 +45373,7 @@ impl ActingTenantRepo<'_> {
         action: Action,
         serving: EnvironmentServingState,
         idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let operator = self.operator;
         // Pre-read the live tenant's status for the state-machine decision: an
@@ -45457,6 +45496,15 @@ impl ActingTenantRepo<'_> {
                     .bind(now_micros)
                     .execute(&mut **tx)
                     .await?;
+                    // TENANT-SCOPED, one row per environment (issue #108). The loop has
+                    // already re-scoped to this environment, which is exactly what FORCE
+                    // row-level security on `outbox_messages` requires: a row must be
+                    // written under the environment it names, or the insert is REFUSED
+                    // rather than silently mis-scoped. In the same transaction as the
+                    // change it announces.
+                    let announced = EnvironmentId::parse(&env_id)
+                        .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+                    enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
                 }
                 // 3. Restore the audit scope's row-level-security variables so the
                 //    audited-write's audit row (and the idempotency insert) run under
@@ -45885,6 +45933,26 @@ impl ActingTenantRepo<'_> {
         retention: Duration,
         idempotency: Option<ResolvedIdempotencyWrite<'_, TenantStatus>>,
     ) -> Result<TenantStatus, StoreError> {
+        self.restore_with_event(env, id, retention, idempotency, None)
+            .await
+    }
+
+    /// [`Self::restore`], additionally emitting `tenant.restored` (issue #108).
+    ///
+    /// TENANT-SCOPED: one outbox row per environment, because a restore un-fences every one
+    /// of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::restore`].
+    pub async fn restore_with_event(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        retention: Duration,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, TenantStatus>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<TenantStatus, StoreError> {
         let operator = self.operator;
         // Pre-read the grace tenant's deletion instant for the window decision. A row
         // that is not in grace (never deleted, already restored, or purged) is a clean
@@ -46096,6 +46164,15 @@ impl ActingTenantRepo<'_> {
                     .bind(now_micros)
                     .execute(&mut **tx)
                     .await?;
+                    // TENANT-SCOPED, one row per environment (issue #108). The loop has
+                    // already re-scoped to this environment, which is exactly what FORCE
+                    // row-level security on `outbox_messages` requires: a row must be
+                    // written under the environment it names, or the insert is REFUSED
+                    // rather than silently mis-scoped. In the same transaction as the
+                    // change it announces.
+                    let announced = EnvironmentId::parse(&env_id)
+                        .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+                    enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
                 }
                 // 3. Clear the tombstones this delete wrote on the environments (a
                 //    level table), matched on its instant for the reason step 2 gives.
@@ -46154,6 +46231,27 @@ impl ActingTenantRepo<'_> {
         id: &TenantId,
         retention: Duration,
         idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.hard_delete_with_event(env, id, retention, idempotency, None)
+            .await
+    }
+
+    /// [`Self::hard_delete`], additionally emitting `tenant.purged` (issue #108).
+    ///
+    /// TENANT-SCOPED: one outbox row per environment. The rows SURVIVE the purge -- it
+    /// crypto-shreds keys and retains the tables as erasure evidence rather than dropping
+    /// environments -- so the announcement of the terminal state is itself deliverable.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::hard_delete`].
+    pub async fn hard_delete_with_event(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        retention: Duration,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let operator = self.operator;
         // Pre-read the grace tenant's deletion instant for the window decision. Only a
@@ -46270,6 +46368,15 @@ impl ActingTenantRepo<'_> {
                     .bind(purged_micros)
                     .execute(&mut **tx)
                     .await?;
+                    // TENANT-SCOPED, one row per environment (issue #108). The loop has
+                    // already re-scoped to this environment, which is exactly what FORCE
+                    // row-level security on `outbox_messages` requires: a row must be
+                    // written under the environment it names, or the insert is REFUSED
+                    // rather than silently mis-scoped. In the same transaction as the
+                    // change it announces.
+                    let announced = EnvironmentId::parse(&env_id)
+                        .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+                    enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
                 }
                 // 3. Restore the audit scope's row-level-security variables.
                 sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")

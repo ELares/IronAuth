@@ -2295,3 +2295,310 @@ async fn an_environment_scoped_type_still_refuses_an_envelope_without_one() {
         "the refusal must name the missing field: {refusal:?}"
     );
 }
+
+/// The four remaining tenant lifecycle transitions announce themselves, each as its OWN type,
+/// each fanned out to every environment of the tenant.
+///
+/// One type per transition rather than a shared one carrying a state, and this test is what
+/// pins that. A suspension STOPS a tenant's data plane and a resume starts it; a purge is
+/// TERMINAL where the delete before it was reversible. There is no reading of "the state
+/// changed" that fails safe across those: a consumer that mistook the purge for the delete
+/// would wait out a retention window that never ends in a recovery.
+///
+/// The fan-out matters for the same reason it matters for the delete. Each of these fences or
+/// un-fences EVERY environment the tenant owns in one transaction, and the webhook fan-out
+/// lists endpoints per (tenant, environment) -- so a single outbox row would reach only the
+/// oldest environment's subscribers and leave every other one silently untold. The tenant
+/// here holds TWO environments, and each transition is checked in both.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn every_tenant_lifecycle_transition_announces_its_own_type_to_every_environment() {
+    let fixture = Fixture::start().await;
+    let first = fixture.create_tenant(None).await;
+    let second = fixture.create_environment(first.tenant(), None).await;
+    let tenant = first.tenant();
+    assert_ne!(
+        first.environment(),
+        second.environment(),
+        "the fixture must hold two distinct environments or the fan-out proves nothing"
+    );
+
+    let tenant_text = tenant.to_string();
+    let announce = |event_id: &'static str, event_type: &str, at: i64| {
+        ironauth_store::event_catalog::envelope_tenant_scoped(
+            event_id,
+            event_type,
+            &tenant_text,
+            at,
+            &serde_json::json!({ "tenant_id": tenant_text }),
+        )
+        .unwrap_or_else(|| panic!("{event_type} is registered as tenant-scoped"))
+    };
+
+    // Every transition's events, drained per environment so each step's count is its own.
+    //
+    // COMPLETED, not merely claimed. Every event here shares the tenant as its ordering key,
+    // and a second event on one key is not claimable until the first completes -- so a drain
+    // that only claimed would make each transition after the first look silent.
+    let drain = async |fixture: &Fixture| {
+        let mut seen = Vec::new();
+        for scope in [first, second] {
+            let claimed = fixture
+                .db
+                .store()
+                .scoped(scope)
+                .outbox()
+                .claim(
+                    &fixture.env,
+                    ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                    Duration::from_secs(30),
+                    100,
+                )
+                .await
+                .expect("claim webhook events");
+            for message in &claimed {
+                fixture
+                    .db
+                    .store()
+                    .scoped(scope)
+                    .outbox()
+                    .complete(&fixture.env, message)
+                    .await
+                    .expect("complete");
+            }
+            let events: Vec<serde_json::Value> =
+                claimed.into_iter().map(|message| message.payload).collect();
+            for event in &events {
+                assert!(
+                    event.get("environment_id").is_none(),
+                    "a tenant-scoped envelope must name no environment: {event}"
+                );
+                ironauth_store::event_catalog::validate_event(event)
+                    .expect("the envelope validates in every environment it is queued for");
+            }
+            seen.push(events);
+        }
+        seen
+    };
+
+    // Anything the fixture's own provisioning enqueued, discarded.
+    let _ = drain(&fixture).await;
+
+    // SUSPEND: the data plane is fenced in both environments, and both are told.
+    let suspended = announce("evt_tenant_suspended", "tenant.suspended", 1);
+    fixture
+        .db
+        .control_store()
+        .management()
+        .acting(fixture.actor, CorrelationId::generate(&fixture.env))
+        .tenants(fixture.operator)
+        .suspend_with_event(
+            &fixture.env,
+            &tenant,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_tenant_suspended",
+                subject: &tenant_text,
+                envelope: &suspended,
+            }),
+        )
+        .await
+        .expect("suspend");
+    for (label, events) in ["the audit scope's", "the second"]
+        .into_iter()
+        .zip(drain(&fixture).await)
+    {
+        assert_eq!(events.len(), 1, "{label} environment: {events:?}");
+        assert_eq!(events[0]["type"], "tenant.suspended");
+    }
+
+    // RESUME: the reversing half, and NOT the same type. A consumer that read a resume as a
+    // suspension would fence a tenant that is serving again.
+    let resumed = announce("evt_tenant_resumed", "tenant.resumed", 2);
+    fixture
+        .db
+        .control_store()
+        .management()
+        .acting(fixture.actor, CorrelationId::generate(&fixture.env))
+        .tenants(fixture.operator)
+        .resume_with_event(
+            &fixture.env,
+            &tenant,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_tenant_resumed",
+                subject: &tenant_text,
+                envelope: &resumed,
+            }),
+        )
+        .await
+        .expect("resume");
+    for (label, events) in ["the audit scope's", "the second"]
+        .into_iter()
+        .zip(drain(&fixture).await)
+    {
+        assert_eq!(events.len(), 1, "{label} environment: {events:?}");
+        assert_eq!(
+            events[0]["type"], "tenant.resumed",
+            "a resume announced as a suspension would fence a tenant that serves again"
+        );
+    }
+
+    // DELETE, then RESTORE inside the retention window.
+    let deleted = announce("evt_tenant_deleted_lifecycle", "tenant.deleted", 3);
+    fixture
+        .db
+        .control_store()
+        .management()
+        .acting(fixture.actor, CorrelationId::generate(&fixture.env))
+        .tenants(fixture.operator)
+        .delete_with_event(
+            &fixture.env,
+            &tenant,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_tenant_deleted_lifecycle",
+                subject: &tenant_text,
+                envelope: &deleted,
+            }),
+        )
+        .await
+        .expect("delete");
+    let _ = drain(&fixture).await;
+
+    let restored = announce("evt_tenant_restored", "tenant.restored", 4);
+    let status = fixture
+        .db
+        .control_store()
+        .management()
+        .acting(fixture.actor, CorrelationId::generate(&fixture.env))
+        .tenants(fixture.operator)
+        .restore_with_event(
+            &fixture.env,
+            &tenant,
+            Duration::from_secs(3600),
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_tenant_restored",
+                subject: &tenant_text,
+                envelope: &restored,
+            }),
+        )
+        .await
+        .expect("restore");
+    for (label, events) in ["the audit scope's", "the second"]
+        .into_iter()
+        .zip(drain(&fixture).await)
+    {
+        assert_eq!(events.len(), 1, "{label} environment: {events:?}");
+        assert_eq!(events[0]["type"], "tenant.restored");
+        assert!(
+            events[0]["payload"].get("status").is_none(),
+            "a restore commits the status the tenant HELD, which the store resolves inside \
+             the write; a producer naming one would be announcing a value it cannot know \
+             (the store returned {status:?}): {events:?}"
+        );
+    }
+}
+
+/// A PURGE announces its own terminal type, to every environment of the tenant.
+///
+/// The purge is separated from the other transitions because reaching it needs the retention
+/// window to elapse, and it is the transition whose type matters most. A purge crypto-shreds
+/// the tenant's keys: there is no restore after it. A consumer that read it as the reversible
+/// delete that preceded it would wait out a window that never ends in a recovery, which is
+/// why this is its own type and not a second `tenant.deleted`.
+///
+/// The outbox rows SURVIVE the purge, and that is not incidental: the purge shreds keys and
+/// retains its tables as erasure evidence rather than dropping environments, so the
+/// announcement of the terminal state is itself deliverable. A purge that dropped the rows it
+/// had just enqueued would be a notice nobody could ever receive.
+#[tokio::test]
+async fn purging_a_tenant_announces_its_own_terminal_type_to_every_environment() {
+    let fixture = Fixture::start().await;
+    let first = fixture.create_tenant(None).await;
+    let second = fixture.create_environment(first.tenant(), None).await;
+    let tenant = first.tenant();
+    let tenant_text = tenant.to_string();
+
+    fixture.delete(&tenant).await.expect("delete");
+    fixture.clock.advance(RETENTION + Duration::from_secs(1));
+
+    // Drain and COMPLETE whatever the delete and the fixture enqueued: every event here
+    // shares the tenant as its ordering key, so an uncompleted one blocks the purge's.
+    for scope in [first, second] {
+        let claimed = fixture
+            .db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &fixture.env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        for message in &claimed {
+            fixture
+                .db
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&fixture.env, message)
+                .await
+                .expect("complete");
+        }
+    }
+
+    let purged = ironauth_store::event_catalog::envelope_tenant_scoped(
+        "evt_tenant_purged",
+        "tenant.purged",
+        &tenant_text,
+        5,
+        &serde_json::json!({ "tenant_id": tenant_text }),
+    )
+    .expect("tenant.purged is registered as tenant-scoped");
+
+    fixture
+        .db
+        .control_store()
+        .management()
+        .acting(fixture.actor, CorrelationId::generate(&fixture.env))
+        .tenants(fixture.operator)
+        .hard_delete_with_event(
+            &fixture.env,
+            &tenant,
+            RETENTION,
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_tenant_purged",
+                subject: &tenant_text,
+                envelope: &purged,
+            }),
+        )
+        .await
+        .expect("purge after the window");
+
+    for (label, scope) in [("the audit scope's", first), ("the second", second)] {
+        let events = queued_events(&fixture, scope).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "{label} environment must have exactly one queued event, found {events:?}"
+        );
+        assert_eq!(
+            events[0]["type"], "tenant.purged",
+            "a purge announced as the reversible delete would leave a consumer waiting out a \
+             retention window that never ends in a recovery"
+        );
+        assert_eq!(events[0]["payload"]["tenant_id"], tenant_text);
+        assert!(
+            events[0].get("environment_id").is_none(),
+            "a purge fences every environment, so the envelope names none: {}",
+            events[0]
+        );
+        ironauth_store::event_catalog::validate_event(&events[0])
+            .expect("the envelope validates in every environment it is queued for");
+    }
+}

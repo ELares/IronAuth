@@ -482,12 +482,22 @@ pub async fn restore_tenant(
         response_body: &render,
     };
 
+    let pending = tenant_lifecycle_event(&state, &id, "tenant.restored");
     let result = state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .tenants(state.bootstrap_operator_id())
-        .restore(state.env(), &id, state.offboarding_retention(), Some(write))
+        .restore_with_event(
+            state.env(),
+            &id,
+            state.offboarding_retention(),
+            Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await;
 
     match result {
@@ -552,12 +562,13 @@ pub async fn purge_tenant(
         .tenants(state.bootstrap_operator_id())
         .parse_id(&tenant_id)?;
 
+    let pending = tenant_lifecycle_event(&state, &id, "tenant.purged");
     let result = state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .tenants(state.bootstrap_operator_id())
-        .hard_delete(
+        .hard_delete_with_event(
             state.env(),
             &id,
             state.offboarding_retention(),
@@ -568,6 +579,10 @@ pub async fn purge_tenant(
                 response_status: 204,
                 response_body: "",
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
 
@@ -638,10 +653,26 @@ async fn transition_tenant(
         .management()
         .acting(actor, CorrelationId::generate(state.env()));
     let tenants = acting.tenants(state.bootstrap_operator_id());
+    let pending = tenant_lifecycle_event(
+        &state,
+        &id,
+        if suspend {
+            "tenant.suspended"
+        } else {
+            "tenant.resumed"
+        },
+    );
+    let announced = pending
+        .as_ref()
+        .map(crate::events::PendingEvent::domain_event);
     let result = if suspend {
-        tenants.suspend(state.env(), &id, Some(write)).await
+        tenants
+            .suspend_with_event(state.env(), &id, Some(write), announced.as_ref())
+            .await
     } else {
-        tenants.resume(state.env(), &id, Some(write)).await
+        tenants
+            .resume_with_event(state.env(), &id, Some(write), announced.as_ref())
+            .await
     };
 
     match result {
@@ -673,11 +704,35 @@ fn tenant_deleted_event(
     state: &AdminState,
     tenant_id: &ironauth_store::TenantId,
 ) -> Option<crate::events::PendingEvent> {
+    tenant_lifecycle_event(state, tenant_id, "tenant.deleted")
+}
+
+/// The event a tenant LIFECYCLE transition emits (issue #108).
+///
+/// Every one of these is TENANT-SCOPED, and for the same reason: each fences or un-fences
+/// EVERY environment the tenant owns in one transaction, so an envelope naming one would
+/// assert something untrue about the rest. The store fans the announcement out to one outbox
+/// row per environment.
+///
+/// One type per transition rather than a shared type with a state field. A suspension STOPS a
+/// tenant's data plane and a resume starts it; a purge is TERMINAL where a delete is
+/// reversible. There is no reading of "the state changed" that fails safe across those, and a
+/// consumer that mistook the purge for the delete would wait out a retention window that
+/// never ends in a recovery.
+///
+/// The payload is the tenant and nothing else. In particular the RESTORE carries no status:
+/// a restore commits the status the tenant held before it was deleted, which the store
+/// resolves inside the write, so a producer naming one would announce a value it cannot know.
+fn tenant_lifecycle_event(
+    state: &AdminState,
+    tenant_id: &ironauth_store::TenantId,
+    event_type: &str,
+) -> Option<crate::events::PendingEvent> {
     let id = format!("evt_{}", CorrelationId::generate(state.env()));
     let subject = tenant_id.to_string();
     let envelope = ironauth_store::event_catalog::envelope_tenant_scoped(
         &id,
-        "tenant.deleted",
+        event_type,
         &subject,
         state.now_unix_micros() / 1000,
         &serde_json::json!({ "tenant_id": subject }),
