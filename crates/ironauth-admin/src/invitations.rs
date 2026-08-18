@@ -638,12 +638,13 @@ pub async fn resend_invitation(
     };
     let live_body = serde_json::to_string(&live_view).map_err(|_| ApiError::Internal)?;
 
+    let pending = invitation_resent_event(&state, scope, &id);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .invitations()
-        .resend(
+        .resend_with_event(
             state.env(),
             &id,
             &digest,
@@ -655,6 +656,10 @@ pub async fn resend_invitation(
                 response_status: 200,
                 response_body: &stored_body,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
     match result {
@@ -723,6 +728,36 @@ fn invitation_created_event(
             "invitation_id": subject,
             "user_id": user_id.to_string(),
         }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event an invitation resend emits (issue #108).
+///
+/// Its own type rather than a second `invitation.created`: a resend invalidates the prior
+/// token and issues a fresh one, so the invitation did not begin, it was reissued -- and a
+/// consumer counting creates would double-count one invitation.
+///
+/// NO TOKEN and no digest. The fresh token is live at exactly this moment, so a subscriber
+/// holding it could accept as the invitee.
+fn invitation_resent_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    invitation_id: &InvitationId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = invitation_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "invitation.resent",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "invitation_id": subject }),
     )?;
     Some(crate::events::PendingEvent {
         id,

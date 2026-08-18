@@ -283,6 +283,25 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A RESEND invalidates the prior token and issues a fresh one, so the news is that
+        // any token a holder already has stopped working. That is why it is its own type and
+        // not a second `invitation.created`: the invitation did not begin, it was reissued,
+        // and a consumer counting creates would double-count one invitation.
+        //
+        // NO TOKEN and no digest, for the reason on the create: the fresh token is live at
+        // exactly this moment, and a subscriber holding it could accept as the invitee.
+        "invitation.resent",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "invitation_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["invitation_id"]
+        }"#,
+    ),
+    (
         // The INVITATION and the USER it was minted for, because the joined create makes
         // both in one transaction and a consumer that saw only the invitation could not tell
         // which pending account it belongs to without a second read.

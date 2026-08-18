@@ -28,7 +28,6 @@ identifiers::remove_user_identifier
 impersonation::authorize_user_impersonation
 imports::create_identity_import
 imports::resume_identity_import
-invitations::resend_invitation
 keys::create_key
 locales::set_locale
 log_streams::create_log_stream

@@ -229,6 +229,24 @@
         "type": "object"
       },
       "payload_schema_version": 1,
+      "type": "invitation.resent"
+    },
+    {
+      "domain": "invitation",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "invitation_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "invitation_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
       "type": "invitation.revoked"
     },
     {

@@ -1243,3 +1243,134 @@ async fn creating_an_invitation_without_an_event_enqueues_nothing() {
         "a create with no event must not invent one"
     );
 }
+
+/// Resending a pending invitation emits `invitation.resent`, and a resend of a REVOKED
+/// invitation emits nothing.
+///
+/// The negative half is the guard, not a second spelling of the positive: the update matches
+/// only a `pending` row, so a resend of an invitation that is no longer pending affects
+/// nothing and must stay silent. A receiver told a token was reissued, for an invitation that
+/// can never be redeemed, would be chasing a credential that does not exist.
+#[tokio::test]
+async fn resending_an_invitation_emits_and_a_resend_of_a_revoked_one_does_not() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (id, _user, _token) = create_invitation(
+        &db,
+        &env,
+        scope,
+        "resent@example.test",
+        InvitationCredentialType::Password,
+        3_600_000_000,
+    )
+    .await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_invitation_resent",
+        "invitation.resent",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "invitation_id": id.to_string() }),
+    )
+    .expect("invitation.resent is registered");
+    let subject = id.to_string();
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_invitation_resent",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    let fresh = mint_invitation_token_for(&env, id);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .resend_with_event(
+            &env,
+            &id,
+            &fresh.digest,
+            now_micros(&env).saturating_add(3_600_000_000),
+            None,
+            Some(&domain_event),
+        )
+        .await
+        .expect("resend");
+
+    let events = queued_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the resend enqueues exactly one event");
+    assert_eq!(events[0]["type"], "invitation.resent");
+    assert_eq!(events[0]["payload"]["invitation_id"], id.to_string());
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // No longer pending: the resend must match nothing and announce nothing.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .revoke(&env, &id, None)
+        .await
+        .expect("revoke");
+    let after_revoke = mint_invitation_token_for(&env, id);
+    let refused = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .resend_with_event(
+            &env,
+            &id,
+            &after_revoke.digest,
+            now_micros(&env).saturating_add(3_600_000_000),
+            None,
+            Some(&domain_event),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::NotFound)),
+        "resending a revoked invitation is the uniform not-found: {refused:?}"
+    );
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a resend that matched no pending row must not announce a reissue"
+    );
+}
+
+/// A resend carrying no event enqueues nothing.
+#[tokio::test]
+async fn resending_an_invitation_without_an_event_enqueues_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (id, _user, _token) = create_invitation(
+        &db,
+        &env,
+        scope,
+        "silent-resend@example.test",
+        InvitationCredentialType::Password,
+        3_600_000_000,
+    )
+    .await;
+
+    let fresh = mint_invitation_token_for(&env, id);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .invitations()
+        .resend(
+            &env,
+            &id,
+            &fresh.digest,
+            now_micros(&env).saturating_add(3_600_000_000),
+            None,
+        )
+        .await
+        .expect("resend");
+
+    assert!(
+        queued_events(&db, scope).await.is_empty(),
+        "a resend with no event must not invent one"
+    );
+}

@@ -36010,6 +36010,38 @@ impl ActingInvitationRepo<'_> {
         new_expires_at_micros: i64,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.resend_with_event(
+            env,
+            id,
+            new_token_digest,
+            new_expires_at_micros,
+            idempotency,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::resend`], additionally emitting `invitation.resent` (issue #108).
+    ///
+    /// The event inherits the resend's GUARD: the update matches only a `pending` row, so
+    /// resending an accepted or revoked invitation affects nothing, returns the uniform
+    /// not-found, and never reaches the enqueue.
+    ///
+    /// Enqueued inside the write's transaction, so a receiver is never told a prior token
+    /// stopped working by a resend that rolled back and left it live.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resend`].
+    pub async fn resend_with_event(
+        &self,
+        env: &Env,
+        id: &InvitationId,
+        new_token_digest: &str,
+        new_expires_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -36049,6 +36081,10 @@ impl ActingInvitationRepo<'_> {
                 // token (only its digest is persisted), so a dump yields nothing
                 // replayable even for a resend.
                 insert_idempotency(tx, idempotency).await?;
+                // After the guard, so a resend that matched no pending row announces
+                // nothing, and inside the transaction, so a receiver is never told a prior
+                // token stopped working by a resend that rolled back and left it live.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
