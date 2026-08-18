@@ -14,6 +14,10 @@
 use ironauth_admin::log_stream_signature::{canonical_string, sign};
 use serde_json::json;
 
+// The length is a DATA TABLE, not logic: one entry per adversarial substitution, each with
+// the reason it exists. Splitting it to satisfy the line count would scatter a table whose
+// whole value is being read top to bottom in one place.
+#[allow(clippy::too_many_lines)]
 fn main() {
     // A fixed key, because the corpus is a CONFORMANCE artifact and not a secret: it exists
     // so two implementations can be compared, and a random key would make the file churn on
