@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+/**
+ * The sample consumer against the corpus the Rust signer generated (issue #110 criterion 5).
+ *
+ * The corpus is not hand written: `cargo run -p ironauth-admin --example log-stream-vectors`
+ * emits what the shipped signer actually produces. So this asserts the two implementations
+ * agree with each other, not that both agree with somebody's understanding of the format.
+ *
+ * Every vector carries its own `expect`, so a case that stopped being adversarial -- because
+ * the canonical form quietly stopped covering one of its fields -- shows up as a vector that
+ * now verifies when the corpus says it must not.
+ */
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+import { CANONICAL_VERSION, verifyBatch } from './verify-log-stream.mjs';
+
+const corpus = JSON.parse(
+  readFileSync(fileURLToPath(new URL('../vectors/log-stream-vectors.json', import.meta.url))),
+);
+
+test('the consumer understands the corpus version', () => {
+  assert.equal(
+    CANONICAL_VERSION,
+    corpus.canonical_version,
+    'a consumer on a different canonical version must not silently verify: the version is ' +
+      'inside the MAC, so disagreeing here means every vector would fail for the wrong reason',
+  );
+});
+
+test('the corpus is not all one answer', () => {
+  const verify = corpus.vectors.filter((v) => v.expect === 'verify').length;
+  const refuse = corpus.vectors.filter((v) => v.expect === 'refuse').length;
+  assert.ok(verify > 0, 'a corpus with no accepting vector passes for a verifier that always refuses');
+  assert.ok(refuse > 0, 'a corpus with no refusing vector passes for a verifier that always accepts');
+});
+
+for (const vector of corpus.vectors) {
+  test(`${vector.expect}: ${vector.name}`, async () => {
+    const result = await verifyBatch({
+      key: corpus.key_utf8,
+      signature: vector.signature,
+      streamId: vector.stream_id,
+      cursorSequence: vector.cursor_sequence,
+      cursorId: vector.cursor_id,
+      eventCount: vector.event_count,
+      eventsJson: vector.events_json,
+    });
+    assert.equal(result.ok, vector.expect === 'verify', vector.why);
+  });
+}
+
+test('a replayed position is refused even when the signature is valid', async () => {
+  const good = corpus.vectors.find((v) => v.expect === 'verify');
+  const shared = {
+    key: corpus.key_utf8,
+    signature: good.signature,
+    streamId: good.stream_id,
+    cursorSequence: good.cursor_sequence,
+    cursorId: good.cursor_id,
+    eventCount: good.event_count,
+    eventsJson: good.events_json,
+  };
+
+  const first = await verifyBatch({ ...shared, lastVerifiedSequence: good.cursor_sequence - 1 });
+  assert.equal(first.ok, true, 'the batch after the last verified position is accepted');
+  assert.equal(first.position, good.cursor_sequence, 'it reports the position it verified');
+
+  // The SAME batch, presented again to a consumer that has already applied it. The signature
+  // is genuine -- that is the whole point. Only the position catches this.
+  const again = await verifyBatch({ ...shared, lastVerifiedSequence: good.cursor_sequence });
+  assert.equal(again.ok, false, 'a batch at a position already applied is a replay');
+  assert.equal(again.reason, 'replay');
+});
+
+test('a malformed signature is refused rather than thrown on', async () => {
+  for (const signature of ['', 'zz', 'abc', 'not-hex-at-all', null, 42]) {
+    const result = await verifyBatch({
+      key: corpus.key_utf8,
+      signature,
+      streamId: 'lst_conformance',
+      cursorSequence: 1,
+      cursorId: 'out_00000000',
+      eventCount: 1,
+      eventsJson: '[]',
+    });
+    assert.equal(result.ok, false, `${JSON.stringify(signature)} must be refused, not thrown on`);
+  }
+});
