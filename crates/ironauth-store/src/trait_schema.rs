@@ -571,6 +571,11 @@ fn escape_token(token: &str) -> String {
 
 /// Push a reference token onto a JSON Pointer, returning the length to truncate
 /// back to afterwards (so a single mutable `String` walks the whole tree).
+pub(crate) fn push_pointer_token(pointer: &mut String, token: &str) {
+    push_token(pointer, token);
+}
+
+/// Push a reference token onto a JSON Pointer, returning the length to truncate back to.
 fn push_token(pointer: &mut String, token: &str) -> usize {
     let restore = pointer.len();
     pointer.push('/');

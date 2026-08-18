@@ -1113,6 +1113,55 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A flow target is an EXTENSION POINT: registering one means an external endpoint now
+        // sees, and for a sync target can reject, data flowing through this environment. A
+        // consumer running configuration oversight acts on that above most things here.
+        //
+        // The TIMING and INVOCATION travel because they are what makes a target consequential:
+        // a sync pre-persist target can refuse a signup, and an async post-persist one cannot.
+        // A consumer told only "a target changed" cannot tell those apart.
+        //
+        // The ENDPOINT does not travel. It is operator-configured infrastructure detail, often
+        // an internal address, and a webhook is a wider audience than the management surface
+        // that returns it.
+        "flow_target.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "flow_target_id": {"type": "string", "minLength": 1},
+                "name": {"type": "string", "minLength": 1},
+                "target_class": {"type": "string", "minLength": 1},
+                "invocation": {"type": "string", "minLength": 1},
+                "timing": {"type": "string", "minLength": 1}
+            },
+            "required": [
+                "flow_target_id",
+                "name",
+                "target_class",
+                "invocation",
+                "timing"
+            ]
+        }"#,
+    ),
+    (
+        // Deregistering STOPS an extension point. A consumer that missed it would keep
+        // believing an integration is inspecting flows that nothing inspects any more, which
+        // for a fraud or compliance target is a control believed to be in place and absent.
+        "flow_target.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "flow_target_id": {"type": "string", "minLength": 1},
+                "name": {"type": "string", "minLength": 1}
+            },
+            "required": ["flow_target_id", "name"]
+        }"#,
+    ),
+    (
         "recovery_approval.decided",
         1,
         r#"{
@@ -2645,6 +2694,7 @@ mod tests {
         "client.allowed_scopes_set",
         "environment_secret.set",
         "environment_variable.set",
+        "flow_target.set",
         "locale_bundle.set",
         "message_template.set",
         "organization.default_role_set",
