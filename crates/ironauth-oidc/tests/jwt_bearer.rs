@@ -1737,26 +1737,27 @@ async fn a_successful_issuance_names_the_external_issuer_and_subject_in_the_audi
 ///
 /// # Every negative here is load-bearing, and that was MEASURED
 ///
-/// An earlier version of this test carried five near-misses and asserted in its own doc that
-/// each caught something the others did not. That was false: deleting `refs/heads/feature`
-/// and `repo:acme/service-staging` changed no mutant outcome at all -- the first is strictly
-/// subsumed by `main-old` (both are "same repo, different ref", and `main-old` additionally
-/// kills a prefix comparison), and the second was already a case I had "fixed" once and which
-/// still proved nothing. They are gone. What remains is the set where each entry kills a
-/// mutant no other entry kills:
+/// An earlier version carried five near-misses and asserted in its own doc that each caught
+/// something the others did not. That was false: deleting `refs/heads/feature` and
+/// `repo:acme/service-staging` changed no mutant outcome at all. They are gone.
 ///
-/// * `refs/heads/main-old` -- the mapped subject EXTENDED. Kills a prefix and a substring
-///   comparison. The realistic escalation: a branch whose name extends main's.
-/// * `refs/tags/main` -- a TAG named `main`. Kills a comparison that matches on the trailing
-///   component, and it is the genuine attack: tag creation is usually far less protected
-///   than branch protection.
-/// * `Xrepo:acme/service:ref:refs/heads/main` -- the mapped subject as a SUFFIX. Kills a
-///   suffix comparison.
-/// * `refs/heads/Main` -- case variation. Kills a case-insensitive comparison. Currently safe
-///   only because the column is `text` under a deterministic collation, which nothing else
-///   pins.
-/// * `repo:acme/other` -- a different repository under the same owner.
-/// * `repo:evil/service` -- the same repository name under a different OWNER.
+/// What remains was verified against a 17-mutant family by deleting each case and re-running
+/// every mutant. Each entry below names the ONE mutant only it kills -- naming it is what
+/// makes the claim checkable rather than asserted, which is the failure the first version
+/// shipped:
+///
+/// * `refs/heads/main-old` (mapped subject EXTENDED) -- a PREFIX comparison. The realistic
+///   escalation: a branch whose name extends main's.
+/// * `refs/tags/main` -- a comparison that CONFLATES a tag ref with a branch ref. Tag
+///   creation is usually far less protected than branch protection. (It does not uniquely
+///   kill a trailing-component comparison, which an earlier draft of this comment claimed --
+///   three other entries kill that one too.)
+/// * `Xrepo:acme/service:...` (mapped subject as a SUFFIX) -- a SUFFIX comparison.
+/// * `refs/heads/Main` -- a CASE-INSENSITIVE comparison. Currently safe only because the
+///   column is `text` under a deterministic collation, which nothing else pins.
+/// * `repo:acme/other` -- a comparison that IGNORES the repository name.
+/// * `repo:evil/service` -- a comparison that IGNORES the owner.
+///
 #[tokio::test]
 async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_ref() {
     const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
@@ -1842,6 +1843,9 @@ async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_r
 async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
     const ISSUER_A: &str = "https://token.actions.githubusercontent.com";
     const ISSUER_B: &str = "https://kubernetes.default.svc.cluster.local";
+    // An issuer that EXTENDS ISSUER_A. A domain an attacker can genuinely register, and it
+    // extends the real issuer exactly the way a prefix comparison accepts.
+    const ISSUER_A_EXTENDED: &str = "https://token.actions.githubusercontent.com.evil.test";
     const SHARED_SUBJECT: &str = "repo:acme/service:ref:refs/heads/main";
 
     let harness = Harness::start().await;
@@ -1878,6 +1882,31 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
         status,
         StatusCode::BAD_REQUEST,
         "a mapping registered for one issuer must not fire for another: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+
+    // An issuer that EXTENDS the mapped one. ISSUER_A and ISSUER_B are unrelated strings, so
+    // neither can detect an issuer comparison that matches on a PREFIX. The domain shape is
+    // the point: `token.actions.githubusercontent.com.evil.test` is a domain an attacker can
+    // genuinely register, and it extends the real issuer exactly the way a prefix comparison
+    // accepts. Reaching it requires an operator to have registered that anchor as enabled --
+    // which is the multi-anchor deployment criterion 3 contemplates.
+    harness
+        .register_external_issuer(ISSUER_A_EXTENDED, Some(&jwks), None, None, true)
+        .await;
+    let extended = assertion(
+        &key,
+        ISSUER_A_EXTENDED,
+        SHARED_SUBJECT,
+        &aud,
+        3600,
+        "jti-xiss-ext",
+    );
+    let (status, _h, body) = present(&harness, &client_id, &extended).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an issuer that merely EXTENDS the mapped one must not inherit its mappings: {body}"
     );
     assert_eq!(json(&body)["error"], "invalid_grant");
 }
