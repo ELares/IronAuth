@@ -1212,7 +1212,8 @@ async fn an_assertion_missing_sub_is_rejected_with_invalid_grant() {
         "a missing sub is diagnosed as an invalid assertion"
     );
 
-    // An empty/whitespace sub is rejected the same way.
+    // An empty/whitespace sub is rejected the same way, and for the same STATED reason.
+    let invalid_before = assertion_invalid_count(&h, &client_id).await;
     let empty_sub = sign_assertion(
         &key,
         &serde_json::json!({
@@ -1227,6 +1228,41 @@ async fn an_assertion_missing_sub_is_rejected_with_invalid_grant() {
         "an empty sub rejects: {body}"
     );
     assert_eq!(json(&body)["error"], "invalid_grant");
+    // AND IT WAS REFUSED AS AN INVALID ASSERTION, not as an unmapped subject.
+    //
+    // 400 + `invalid_grant` alone does not pin the trim. Without it, a whitespace `sub` is
+    // not empty, so it survives this check and is refused further down as
+    // `assertion_subject_unmapped`, which is also 400 + `invalid_grant` and passes the two
+    // assertions above. Measured: deleting `.trim()` from the emptiness test leaves the
+    // whole binary green without this line. The diagnostic is the only thing that separates
+    // "rejected for the stated reason" from "rejected by luck further along".
+    // AND IT WAS THIS ATTEMPT that was diagnosed so. A COUNT DELTA, not `any`: the
+    // missing-sub attempt above already left an `assertion_invalid` row on this same client,
+    // so `any` is satisfied before the whitespace assertion is ever presented and passes
+    // under the mutant too. Measured, both ways round.
+    //
+    // Not the newest row either. `for_client` orders by `occurred_at`, the two attempts can
+    // land in the same microsecond, and reading the tie the wrong way is how an earlier fix
+    // in this file introduced a flake. A delta is ordering-independent.
+    let invalid_after = assertion_invalid_count(&h, &client_id).await;
+    assert_eq!(
+        invalid_after,
+        invalid_before + 1,
+        "an all-whitespace sub is diagnosed as an invalid assertion, not as an unmapped \
+         subject further down the grant: both refuse with 400 + invalid_grant, so the \
+         diagnostic is the only thing that tells them apart"
+    );
+}
+
+/// How many attempts on `client_id` were refused as an invalid assertion.
+///
+/// Extracted so the two readings around a single presentation are literally the same query.
+async fn assertion_invalid_count(h: &common::Harness, client_id: &str) -> usize {
+    h.client_auth_diagnostics(client_id)
+        .await
+        .iter()
+        .filter(|d| d.failure_reason == "assertion_invalid")
+        .count()
 }
 
 /// Start an in-process loopback HTTP server that serves `body` as a JSON JWKS to
@@ -2020,33 +2056,37 @@ async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_r
 /// who can mint a token from the WEAKER anchor with the stronger one's subject string gets
 /// the stronger one's identity. Federating to a second issuer would silently widen the first.
 ///
-/// # The one shape left OPEN, stated precisely
+/// # The issuer-SUFFIX shape, and the two sites it has to be read at
 ///
-/// An issuer-SUFFIX comparison, `$1 LIKE '%' || issuer`, is not closed. Applying that mutant
-/// leaves this binary green. Stating the gap precisely matters, because the obvious statement
-/// of it is wrong in the reassuring direction.
+/// An issuer-suffix comparison, `$1 LIKE '%' || issuer`, behaves DIFFERENTLY at the two
+/// places an issuer string is compared, and an earlier version of this block reported one
+/// site's result as if it were the whole answer. Both are measured here.
 ///
-/// GIVEN THE SCHEME-BEARING ANCHORS THIS TEST REGISTERS, the shape is unreachable: a
-/// triggering issuer would have to end with the entire stored string INCLUDING the
-/// `https://`, so the anchor would be something like
-/// `https://evil.test/https://token.actions.githubusercontent.com`, which nothing publishes.
-/// An early draft used `https://evil.test/token.actions.githubusercontent.com`, which LOOKS
-/// like it exercises the shape and does not: it lacks the inner scheme, matches nothing, and
-/// was decoration.
+/// AT THE MAPPING LOOKUP (`external_assertion_subject_mappings`, `repository.rs`) the shape
+/// is CLOSED. `ISSUER_A_LIKE_PATTERN` below is the stored issuer
+/// `https://token.actions.githubusercontent.co_`, and the presented `ISSUER_A` ends with
+/// `...co` plus one character, so `_` matches `m` and the wildcard-bearing anchor's mapping
+/// fires for an issuer that merely resembles it. Applying that mutant turns this binary red
+/// at the assertion below: 30 passed, 1 failed,
+/// `a_mapping_for_one_issuer_does_not_fire_for_another`.
 ///
-/// That is a fact about THIS ANCHOR, not about the shape, and the difference is the whole
-/// point. Nothing makes a stored issuer carry a scheme: `external_assertion_issuers.issuer`
-/// is plain `text NOT NULL`
-/// (`crates/ironauth-store/migrations/0020_jwt_bearer_assertion.sql`), `register()` parses no
-/// URL, and the grant passes the presented `iss` through as an opaque string. Against a
-/// scheme-less anchor -- a bare host, or the LEGACY Kubernetes service-account issuer
-/// `kubernetes/serviceaccount`, which predates the projected token this file's own fixture
-/// uses -- the trigger is an ordinary URL: `https://evil.test/kubernetes/serviceaccount` ends
-/// with `kubernetes/serviceaccount`, and a suffix comparison would hand over its principal.
+/// AT THE ISSUER LOOKUP (`external_assertion_issuers`, `by_issuer`) the same mutant leaves
+/// the binary GREEN, ten runs out of ten, and stays green even when the query is forced to
+/// hand back a non-exact match first (`ORDER BY (issuer = $1) ASC`, so row order cannot be
+/// what is carrying it). That is not a coverage gap. A loose issuer lookup fails CLOSED,
+/// because the record it returns is then handed to `VerificationPolicy`, which enforces
+/// `iss == record.issuer` exactly; a wrongly-matched issuer record is rejected there rather
+/// than minting anything. The second gate is what makes it inert, so no anchor is needed and
+/// adding one would pin a property the code does not depend on.
 ///
-/// The shipped query uses `=`, so this is a COVERAGE GAP and not a live defect. It stays open
-/// rather than being closed with a second anchor because "should `register()` demand a URL at
-/// all" is its own question, and answering it inside a fixture test would bury it.
+/// WHAT REMAINS TRUE about scheme-less registration, which is why the anchors matter at all:
+/// nothing makes a stored issuer carry a scheme. `external_assertion_issuers.issuer` is plain
+/// `text NOT NULL` (`crates/ironauth-store/migrations/0020_jwt_bearer_assertion.sql`),
+/// `register()` parses no URL, and the grant passes the presented `iss` through as an opaque
+/// string. So a suffix comparison at a site with no second gate would be reachable with an
+/// ordinary URL: against the LEGACY Kubernetes service-account issuer
+/// `kubernetes/serviceaccount`, `https://evil.test/kubernetes/serviceaccount` ends with the
+/// stored string. The mapping lookup is such a site, which is why the anchor above is kept.
 ///
 /// Its MIRROR is closed. `issuer LIKE '%' || $1` survived every earlier round and is killed
 /// by `ISSUER_A_BARE_HOST` below, which is cheaper to reach than the shape above: it needs
@@ -2150,7 +2190,7 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
     );
     assert_eq!(json(&body)["error"], "invalid_grant");
 
-    // SEVEN ADJACENT ANCHORS, each registered as its own enabled issuer with no mapping of
+    // NINE ADJACENT ANCHORS, each registered as its own enabled issuer with no mapping of
     // its own, so only the mapping lookup's exact `=` on the issuer can refuse it. The
     // anchors mirror the comparisons a reader could plausibly write, in both directions.
     //
@@ -2160,7 +2200,7 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
     // stored issuer, so it kills the PREFIX and SUBSTRING shapes as well as the whitespace
     // one, and `ISSUER_A_EXTENDED` therefore uniquely closes nothing. The per-shape
     // attribution is in the table on `a_github_actions_shaped_workload_token_...` for the
-    // subject axis; on this axis the honest statement is that all seven are kept, every
+    // subject axis; on this axis the honest statement is that all nine are kept, every
     // issuer shape measured is caught, and no anchor here is claimed to be the sole killer
     // of anything.
     //

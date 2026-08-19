@@ -6,6 +6,27 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The JWT bearer grant normalized the presented subject before comparing it against a mapping,
+  so a subject the operator never registered could mint that mapping's principal (issue #107).**
+  The grant read `sub` with `.map(str::trim)` and then compared the TRIMMED value against
+  `external_assertion_subject_mappings.external_subject` with SQL `=`. `str::trim` strips the whole
+  Unicode `White_Space` set, so every padded spelling of a registered subject collapsed onto it:
+  `...:ref:refs/heads/main` followed by U+00A0, U+2028 or U+3000 each exchanged successfully and
+  minted the mapped principal, verified against a live grant rather than reasoned about. A
+  federation anchor is an identity boundary, and the only string an operator can audit is the one
+  they registered.
+
+  The trim now applies to the EMPTINESS TEST only, not to the value that is compared: an
+  all-whitespace `sub` is still rejected as an invalid assertion, and a padded one is refused as
+  unmapped instead of silently matching. Nothing legitimate changes: GitHub Actions, Kubernetes
+  projected tokens and SPIRE all emit whitespace-free subjects, so a working deployment had to have
+  registered the untrimmed form already. A provider that did emit padding now fails closed at
+  registration time rather than minting on a string the operator never saw.
+
+  The adjacent `jti` replay cache keeps its trim deliberately: it records and looks up the SAME
+  trimmed value, so whitespace variants collapse to one cache key and a second presentation is
+  refused as a replay. That asymmetry is now stated where it lives.
+
 - **The emulator's fake upstream IdP could never have completed a federation login, and now does
   (issue #121, criterion 4).** The provider `ironauth dev` ships was written, wired, seeded as a
   connector, and reachable, and no test ever drove a login through it. Two defects were sitting in
