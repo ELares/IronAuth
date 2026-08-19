@@ -1054,3 +1054,150 @@ async fn denying_a_ping_request_enqueues_no_notification() {
         .expect("claim");
     assert!(claimed.is_empty(), "a denial notifies nobody");
 }
+
+/// Approving with a grant id opens a REAL grant, for the request's own client and subject
+/// (#131 criterion 5).
+///
+/// The CLIENT is the part that can only come from the request: there is no client parameter,
+/// and a grant must name the client whose tokens will hang off it. The subject is read from
+/// the same row for consistency rather than for safety -- the decision filters on `subject`,
+/// so on any committing path the two are provably equal. Asserted here anyway, because the
+/// grant is the revocation spine every issued token hangs off and "it names the right client
+/// and subject" is the property that makes revocation reach the right tokens.
+#[tokio::test]
+async fn approving_with_a_grant_opens_it_for_the_requests_own_client_and_subject() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (_digest, id) = create_pending_with_id(&db, &env, scope, "cli_owner", "usr_ada").await;
+    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .decide(
+                &env,
+                &id,
+                "usr_ada",
+                true,
+                BackchannelApprovalLinkage {
+                    grant_id: Some(&grant_id.to_string()),
+                    consent_ref: None,
+                    auth_methods: Some("pwd"),
+                    auth_time_micros: Some(NOW_MICROS),
+                },
+                NOW_MICROS,
+            )
+            .await
+            .expect("decide")
+    );
+
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let row = sqlx::query("SELECT client_id, subject FROM grants WHERE id = $1")
+        .bind(grant_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .expect("read grant")
+        .expect("the grant must exist");
+    assert_eq!(row.get::<String, _>("client_id"), "cli_owner");
+    assert_eq!(row.get::<String, _>("subject"), "usr_ada");
+}
+
+/// A REFUSED decision opens no grant.
+///
+/// This is what makes the single transaction load-bearing rather than incidental. The grant
+/// is inserted BEFORE the decision statement (the composite foreign key demands that order),
+/// so if the decision then matches nothing the transaction must be dropped rather than
+/// committed -- otherwise every rejected approval attempt would leave a live grant behind,
+/// and a grant is exactly what a token hangs off.
+#[tokio::test]
+async fn a_refused_decision_leaves_no_grant_behind() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (_digest, id) = create_pending_with_id(&db, &env, scope, "cli_owner", "usr_ada").await;
+    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
+
+    // The WRONG subject: the decision matches no row.
+    assert!(
+        !db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .decide(
+                &env,
+                &id,
+                "usr_grace",
+                true,
+                BackchannelApprovalLinkage {
+                    grant_id: Some(&grant_id.to_string()),
+                    consent_ref: None,
+                    auth_methods: None,
+                    auth_time_micros: None,
+                },
+                NOW_MICROS,
+            )
+            .await
+            .expect("decide")
+    );
+
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let count: i64 = sqlx::query("SELECT count(*) FROM grants WHERE id = $1")
+        .bind(grant_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(
+        count, 0,
+        "a decision that did not happen must not leave a grant behind"
+    );
+}
+
+/// The opened grant is what a redemption reports (#131 criterion 5).
+///
+/// Ties the two halves together: the grant the approval opened is the grant the client's
+/// tokens will hang off, rather than a value that merely round-trips through a column.
+#[tokio::test]
+async fn the_opened_grant_is_the_one_redemption_reports() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (digest, id) = create_pending_with_id(&db, &env, scope, "cli_owner", "usr_ada").await;
+    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
+    let repo = db.store().scoped(scope);
+
+    assert!(
+        repo.backchannel_auth()
+            .decide(
+                &env,
+                &id,
+                "usr_ada",
+                true,
+                BackchannelApprovalLinkage {
+                    grant_id: Some(&grant_id.to_string()),
+                    consent_ref: None,
+                    auth_methods: Some("pwd otp"),
+                    auth_time_micros: Some(NOW_MICROS),
+                },
+                NOW_MICROS,
+            )
+            .await
+            .expect("decide")
+    );
+
+    let redeemed = repo
+        .backchannel_auth()
+        .redeem(&digest, "cli_owner", NOW_MICROS)
+        .await
+        .expect("redeem")
+        .expect("an approved request redeems");
+    assert_eq!(
+        redeemed.grant_id.as_deref(),
+        Some(grant_id.to_string().as_str())
+    );
+    assert_eq!(redeemed.auth_methods.as_deref(), Some("pwd otp"));
+    assert_eq!(redeemed.subject, "usr_ada");
+}

@@ -64006,6 +64006,57 @@ impl BackchannelAuthRepo<'_> {
         now_micros: i64,
     ) -> Result<bool, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
+
+        // Open the grant FIRST when one is being bound: the composite foreign key requires
+        // the grant row to exist before `grant_id` is written, exactly as the device flow
+        // orders it.
+        //
+        // The grant's CLIENT comes from the request because nothing else supplies it -- there
+        // is no client parameter, and a grant must name the client its tokens will be issued
+        // to. The SUBJECT is read from the same row for consistency rather than for safety:
+        // the decision statement below filters on `subject = $2`, so on any path that
+        // actually commits, the caller's subject and the request's are provably equal. That
+        // is worth stating plainly, because reading it from the request LOOKS like a guard
+        // against a mismatched caller and is not one -- the filter is.
+        //
+        // If the decision below then matches no row (wrong subject, already decided, expired)
+        // the transaction is dropped WITHOUT committing, so the grant never lands. That
+        // ordering is the reason this is one transaction and not two.
+        if approved {
+            if let Some(grant_id) = linkage.grant_id {
+                let Some(request) = sqlx::query(
+                    "SELECT client_id, subject FROM backchannel_authentication_requests \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 FOR UPDATE",
+                )
+                .bind(id.to_string())
+                .bind(self.scope.tenant().to_string())
+                .bind(self.scope.environment().to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                else {
+                    return Ok(false);
+                };
+                let request_client: String = request.get("client_id");
+                let request_subject: String = request.get("subject");
+                sqlx::query(
+                    "INSERT INTO grants \
+                     (id, tenant_id, environment_id, client_id, subject, session_ref, \
+                      consent_ref, claims_request, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(grant_id)
+                .bind(self.scope.tenant().to_string())
+                .bind(self.scope.environment().to_string())
+                .bind(&request_client)
+                .bind(&request_subject)
+                .bind(linkage.consent_ref)
+                .bind(now_micros)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
         let decided = sqlx::query(
             "UPDATE backchannel_authentication_requests \
              SET status = CASE WHEN $3 THEN 'approved' ELSE 'denied' END, \
@@ -64037,7 +64088,8 @@ impl BackchannelAuthRepo<'_> {
         // difference between "the client is told once the approval is durable" and "the
         // client is told about an approval that did not happen".
         let Some(row) = decided else {
-            tx.commit().await?;
+            // DROPPED, not committed. A grant opened above must not survive a decision that
+            // did not happen; committing here would leave a grant with no request behind it.
             return Ok(false);
         };
         if approved {
