@@ -57,6 +57,11 @@ pub struct LogStreamView {
     pub sink_type: String,
     /// The NAME of the environment secret holding the sink credential, never its value.
     pub credential_secret_name: Option<String>,
+    /// The NAME of the environment secret batches are signed with, never its value, and
+    /// absent when the stream ships unsigned. An operator has to be able to see WHICH
+    /// streams are signed and with what, or they cannot tell a stream that lost its
+    /// signature from one that never had one.
+    pub signing_secret_name: Option<String>,
     /// The action wire strings this ships, or absent for every action in `source`.
     ///
     /// An EMPTY list is not the same as absent: it ships nothing, which is how a stream is
@@ -112,6 +117,7 @@ pub fn into_view(record: LogStreamRecord) -> LogStreamView {
         source: record.source.as_str().to_string(),
         sink_type: record.sink_type.as_str().to_string(),
         credential_secret_name: record.credential_secret_name,
+        signing_secret_name: record.signing_secret_name,
         event_type_filter: record.event_type_filter,
         organization_id: record.organization_id,
         active: record.active,
@@ -330,6 +336,14 @@ pub struct CreateLogStreamRequest {
     /// The NAME of the environment secret holding the sink credential.
     #[serde(default)]
     pub credential_secret_name: Option<String>,
+    /// The NAME of the environment secret to SIGN batches with. Absent ships unsigned.
+    ///
+    /// Signing is what lets a SIEM check authenticity and replay once a batch has left TLS
+    /// and landed in an object store or a log index. See `docs/log-stream-verification.md`.
+    /// Setting it here is a control-plane act by design: the app role that ships batches can
+    /// read this name and cannot change it, or it could sign with a key it chose.
+    #[serde(default)]
+    pub signing_secret_name: Option<String>,
     /// Ship only these action wire strings. Absent means all; empty ships none.
     #[serde(default)]
     pub event_type_filter: Option<Vec<String>>,
@@ -428,6 +442,7 @@ pub async fn create_log_stream(
                 sink_type,
                 sink_config,
                 credential_secret_name: request.credential_secret_name.as_deref(),
+                signing_secret_name: request.signing_secret_name.as_deref(),
                 event_type_filter: request.event_type_filter,
                 organization_id: request.organization_id.as_deref(),
             },

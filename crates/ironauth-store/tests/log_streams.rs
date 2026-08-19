@@ -24,6 +24,7 @@ fn new_stream() -> NewLogStream<'static> {
         sink_type: SinkType::Http,
         sink_config: serde_json::json!({ "endpoint": "https://collector.example/ingest" }),
         credential_secret_name: Some("collector_token"),
+        signing_secret_name: None,
         event_type_filter: None,
         organization_id: None,
     }

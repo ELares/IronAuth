@@ -23841,6 +23841,13 @@
             ],
             "description": "Scope the stream to one organization. Absent means environment-wide."
           },
+          "signing_secret_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The NAME of the environment secret to SIGN batches with. Absent ships unsigned.\n\nSigning is what lets a SIEM check authenticity and replay once a batch has left TLS\nand landed in an object store or a log index. See `docs/log-stream-verification.md`.\nSetting it here is a control-plane act by design: the app role that ships batches can\nread this name and cannot change it, or it could sign with a key it chose."
+          },
           "sink_config": {
             "type": [
               "object",
@@ -25598,6 +25605,13 @@
               "null"
             ],
             "description": "The organization this stream is scoped to, or absent for the whole environment."
+          },
+          "signing_secret_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The NAME of the environment secret batches are signed with, never its value, and\nabsent when the stream ships unsigned. An operator has to be able to see WHICH\nstreams are signed and with what, or they cannot tell a stream that lost its\nsignature from one that never had one."
           },
           "sink_type": {
             "type": "string",

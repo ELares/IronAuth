@@ -39817,6 +39817,19 @@ pub struct NewLogStream<'a> {
     pub sink_config: serde_json::Value,
     /// The environment-scoped secret holding the sink credential, by NAME.
     pub credential_secret_name: Option<&'a str>,
+    /// The environment-scoped secret this stream SIGNS its batches with, by NAME, or `None`
+    /// to ship unsigned.
+    ///
+    /// It was missing from this struct and from the INSERT below, so the column migration
+    /// 0144 added was written by nothing: `open_signing_secret` returned `None` for every
+    /// stream on every deployment, and the whole signed-stream feature (canonical string,
+    /// HMAC, conformance corpus, published verifier and its suite) sat behind one absent
+    /// column. Nothing failed, because an unsigned batch is a legitimate configuration.
+    ///
+    /// CONTROL PLANE ONLY, which is what 0144's grants already say: the app role gets
+    /// `SELECT` on this column and nothing else, because an app role that could rewrite it
+    /// could sign with a key it chose.
+    pub signing_secret_name: Option<&'a str>,
     /// Ship only this organization's events, or `None` for the whole environment.
     pub organization_id: Option<&'a str>,
     /// Ship only these action wire strings. `None` is every action in `source`.
@@ -40505,8 +40518,9 @@ impl LogStreamRepo<'_> {
         sqlx::query(
             "INSERT INTO log_streams \
              (id, tenant_id, environment_id, description, source, sink_type, \
-              sink_config, credential_secret_name, event_type_filter, organization_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+              sink_config, credential_secret_name, event_type_filter, organization_id, \
+              signing_secret_name) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(&id)
         .bind(scope.tenant().to_string())
@@ -40518,6 +40532,7 @@ impl LogStreamRepo<'_> {
         .bind(new.credential_secret_name)
         .bind(new.event_type_filter.as_deref())
         .bind(new.organization_id)
+        .bind(new.signing_secret_name)
         .execute(&mut *tx)
         .await?;
         // In the SAME transaction as the create. A crash between the two would leave a

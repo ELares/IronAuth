@@ -13,9 +13,9 @@
 //!
 //! 1. **Authenticity.** Did this batch come from this deployment, or from anyone who could
 //!    write to the bucket the S3 sink writes into?
-//! 2. **Ordering.** Is this the batch that follows the one I last verified, or has something
-//!    been dropped in between?
-//! 3. **Replay.** Have I already applied this batch under a different name?
+//! 2. **Replay.** Have I already applied this batch under a different name?
+//!
+//! Ordering is the third question a SIEM asks and this does NOT answer it. See below.
 //!
 //! The AWS `SigV4` signing already in [`crate::log_shipper`] answers none of these. It
 //! authenticates the *request to S3* -- it is transport authentication to one sink, discarded
@@ -42,9 +42,16 @@
 //! **The cursor position** is what makes ORDERING part of the signature rather than a
 //! property a consumer has to trust the transport for. The shipper advances the cursor only
 //! on success and only to what was accepted, so positions are monotonic per stream: a
-//! consumer that records the last position it verified detects both a gap (a position beyond
-//! the expected next one) and a REPLAY (a position it has already seen) without any
-//! server-side state. That is the whole reason the position is signed rather than merely
+//! consumer that records the last position it verified detects a REPLAY (a position it has
+//! already seen) without any server-side state.
+//!
+//! IT DOES NOT DETECT A GAP, and an earlier version of this paragraph claimed it did. The
+//! position is `occurred_micros`, a wall-clock microsecond timestamp of the batch's last row,
+//! not a counter, so there is no "expected next one" to compare against. A consumer can prove
+//! it has not seen a position before; it cannot prove it has missed nothing in between.
+//! Closing that would mean signing the batch's START position too, so positions chain, and
+//! that is a wire change rather than a documentation one. That is the whole reason the
+//! position is signed rather than merely
 //! sent.
 //!
 //! **The count and the digest of the events** are separate on purpose. The digest alone would

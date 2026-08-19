@@ -124,3 +124,42 @@ test('a batch verified without a position is refused as such, not as a bad signa
   });
   assert.equal(present.ok, true);
 });
+
+test('every canonical input is refused by name, and a bad key is refused rather than thrown', async () => {
+  // One shape, three inputs: an omitted input must be reported as the integration bug it is,
+  // not as `bad-signature`, which reads to an operator as a forged batch. Review found the
+  // first version of this guard covered only the position, so the other two still reported an
+  // attack when the caller had simply not wired the field.
+  const vector = corpus.vectors.find((v) => v.expect === 'verify');
+  const good = {
+    key: corpus.key_utf8,
+    signature: vector.signature,
+    streamId: vector.stream_id,
+    cursorSequence: vector.cursor_sequence,
+    cursorId: vector.cursor_id,
+    eventCount: vector.event_count,
+    eventsJson: vector.events_json,
+  };
+  assert.equal((await verifyBatch(good)).ok, true, 'the fixture must verify, or the rest proves nothing');
+
+  for (const [field, reason] of [
+    ['streamId', 'missing-position'],
+    ['cursorSequence', 'missing-position'],
+    ['cursorId', 'missing-position'],
+    ['eventCount', 'missing-batch'],
+    ['eventsJson', 'missing-batch'],
+  ]) {
+    const without = { ...good };
+    delete without[field];
+    const result = await verifyBatch(without);
+    assert.equal(result.reason, reason, `omitting ${field} must be reported as ${reason}`);
+  }
+
+  // A key that is not key material REFUSES. `crypto.subtle.importKey` throws an uncaught
+  // TypeError on each of these, and an unset environment variable is exactly how `undefined`
+  // arrives in practice. This file promises malformed input is never a throw.
+  for (const key of [undefined, null, 42, {}]) {
+    const result = await verifyBatch({ ...good, key });
+    assert.equal(result.reason, 'malformed-key', `a ${typeof key} key must refuse, not throw`);
+  }
+});

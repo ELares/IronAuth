@@ -1527,6 +1527,55 @@ async fn the_log_stream_status_read_demands_read_and_never_answers_unauthenticat
     );
 }
 
+/// Configure one stream per SINK TYPE, each naming a credential secret.
+///
+/// One per type because a view field resolved only for some sink types renders no key for the
+/// others: a single-fixture key set is a claim about that fixture rather than about the view,
+/// and review demonstrated a `skip_serializing_if` field that leaks on Datadog while an HTTP
+/// fixture reports clean.
+async fn seed_one_stream_per_sink_type(h: &Harness, scope: Scope) {
+    let env = ironauth_env::Env::system();
+    for (sink_type, sink_config) in [
+        (
+            SinkType::Http,
+            serde_json::json!({ "endpoint": "https://sink.example/in" }),
+        ),
+        (
+            SinkType::Datadog,
+            serde_json::json!({ "endpoint": "https://http-intake.example/api/v2/logs" }),
+        ),
+        (
+            SinkType::SplunkHec,
+            serde_json::json!({ "endpoint": "https://splunk.example/services/collector" }),
+        ),
+        (
+            SinkType::S3,
+            serde_json::json!({ "endpoint": "https://s3.example", "bucket": "audit", "region": "us-east-1" }),
+        ),
+    ] {
+        h.control_store()
+            .scoped(scope)
+            .log_streams()
+            .create(
+                &env,
+                &NewLogStream {
+                    id: None,
+                    description: "redaction fixture",
+                    source: StreamSource::Both,
+                    sink_type,
+                    sink_config,
+                    credential_secret_name: Some("collector_token"),
+                    signing_secret_name: None,
+                    event_type_filter: None,
+                    organization_id: None,
+                },
+                None,
+            )
+            .await
+            .expect("configure a stream that names a credential");
+    }
+}
+
 /// The status read carries the credential secret's NAME and never a resolved value, over
 /// HTTP (issue #110 criterion 6).
 ///
@@ -1572,48 +1621,7 @@ async fn a_log_stream_read_names_the_credential_secret_and_renders_no_value() {
         TenantId::parse(&tenant).expect("tenant id"),
         EnvironmentId::parse(&environment).expect("environment id"),
     );
-    let env = ironauth_env::Env::system();
-    // ONE STREAM PER SINK TYPE. A view field resolved only for some sink types renders no key
-    // for the others, so a single-fixture key set is a claim about that fixture and not about
-    // the view.
-    for (sink_type, sink_config) in [
-        (
-            SinkType::Http,
-            serde_json::json!({ "endpoint": "https://sink.example/in" }),
-        ),
-        (
-            SinkType::Datadog,
-            serde_json::json!({ "endpoint": "https://http-intake.example/api/v2/logs" }),
-        ),
-        (
-            SinkType::SplunkHec,
-            serde_json::json!({ "endpoint": "https://splunk.example/services/collector" }),
-        ),
-        (
-            SinkType::S3,
-            serde_json::json!({ "endpoint": "https://s3.example", "bucket": "audit", "region": "us-east-1" }),
-        ),
-    ] {
-        h.control_store()
-            .scoped(scope)
-            .log_streams()
-            .create(
-                &env,
-                &NewLogStream {
-                    id: None,
-                    description: "redaction fixture",
-                    source: StreamSource::Both,
-                    sink_type,
-                    sink_config,
-                    credential_secret_name: Some("collector_token"),
-                    event_type_filter: None,
-                    organization_id: None,
-                },
-                None,
-            )
-            .await
-            .expect("configure a stream that names a credential");
-    }
+    seed_one_stream_per_sink_type(&h, scope).await;
 
     let streams = format!("/v1/tenants/{tenant}/environments/{environment}/log-streams");
     let (status, _, body) = h.get_as(&streams, &secret).await;
@@ -1661,6 +1669,7 @@ async fn a_log_stream_read_names_the_credential_secret_and_renders_no_value() {
                 "last_error_at_unix_micros",
                 "last_success_at_unix_micros",
                 "organization_id",
+                "signing_secret_name",
                 "sink_type",
                 "source",
                 "status",

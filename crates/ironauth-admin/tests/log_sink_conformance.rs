@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use ironauth_admin::log_shipper::{
     DatadogSink, HttpLogSink, LogSink, S3LogSink, SinkOutcome, SplunkHecSink, datadog_body,
-    signed_batch_headers, splunk_body,
+    s3_batch_metadata, signed_batch_headers, splunk_body,
 };
 use ironauth_store::log_stream::{LogStreamRecord, SinkType, StreamHealth, StreamSource};
 use serde_json::{Value, json};
@@ -333,4 +333,44 @@ fn an_unsigned_batch_carries_no_signature_and_no_position() {
         signed_batch_headers("lgs_stream", None, (4242, "aud_01J8ZQ")).is_empty(),
         "an unsigned batch must not advertise a position to verify against"
     );
+}
+
+/// The S3 sink's object metadata carries the signature AND the position (issue #110).
+///
+/// # Why this exists as a unit test rather than a wire test
+///
+/// The S3 metadata is built twice: once into the `SigV4` canonical headers that get signed,
+/// and once onto the outgoing request. Review mutated each half independently and both
+/// survived the suite, because the two lists were built separately: it was possible to sign
+/// metadata that was not sent, or send metadata that was not signed, and nothing noticed.
+///
+/// The fix is that both halves now call one function, so the two cannot diverge and deleting
+/// the position is a single edit in one place. This pins that function by value, which is the
+/// same shape that already catches the HTTP-side header pair.
+#[test]
+fn an_s3_batch_carries_the_signature_and_position_as_object_metadata() {
+    let metadata = s3_batch_metadata("lgs_stream", Some("deadbeefcafe"), (4242, "aud_01J8ZQ"));
+    assert_eq!(
+        metadata,
+        vec![
+            (
+                "x-amz-meta-ironauth-log-signature",
+                "deadbeefcafe".to_string()
+            ),
+            (
+                "x-amz-meta-ironauth-log-position",
+                "lgs_stream 4242 aud_01J8ZQ".to_string()
+            ),
+        ],
+        "an object has no headers once written, so both travel as metadata or a consumer \
+         reading the bucket cannot verify"
+    );
+}
+
+/// An UNSIGNED S3 batch carries neither metadata key, for the same reason the HTTP pair is
+/// absent: advertising a position to verify against when there is nothing to verify is worse
+/// than silence.
+#[test]
+fn an_unsigned_s3_batch_carries_no_metadata() {
+    assert!(s3_batch_metadata("lgs_stream", None, (4242, "aud_01J8ZQ")).is_empty());
 }

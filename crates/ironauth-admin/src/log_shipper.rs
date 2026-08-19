@@ -1042,7 +1042,8 @@ pub const SIGNATURE_HEADER: &str = "x-ironauth-log-signature";
 /// position to rebuild the canonical string before it can verify anything -- and it must then
 /// check the rebuilt string against the signature, which is what stops a sender rewriting the
 /// position it claims. A position a consumer cannot see is a position it cannot check for a
-/// gap or a replay.
+/// replay at all. (Not a gap: the position is a timestamp rather than a counter, so gaps are
+/// not detectable with what a batch carries. See `log_stream_signature`.)
 pub const POSITION_HEADER: &str = "x-ironauth-log-position";
 
 /// Render the position header's value.
@@ -1100,6 +1101,31 @@ pub const S3_SIGNATURE_METADATA: &str = "x-amz-meta-ironauth-log-signature";
 /// header `SigV4` did not sign can be stripped or rewritten in flight, and a position an
 /// attacker can rewrite is a gap and replay check an attacker controls.
 pub const S3_POSITION_METADATA: &str = "x-amz-meta-ironauth-log-position";
+
+/// The S3 object metadata a signed batch carries: the signature, and the position it covers.
+/// Empty when the batch ships unsigned.
+///
+/// ONE function, called by both the canonical-header block and the outgoing-request block,
+/// because those two lists must agree. Building them independently made it possible to sign
+/// metadata that was not sent, or send metadata that was not signed, and both survived the
+/// suite: two edits where there should be one. This is the S3 twin of
+/// [`signed_batch_headers`], for the same reason.
+#[must_use]
+pub fn s3_batch_metadata(
+    stream_id: &str,
+    signature: Option<&str>,
+    position: (i64, &str),
+) -> Vec<(&'static str, String)> {
+    signature.map_or_else(Vec::new, |signature| {
+        vec![
+            (S3_SIGNATURE_METADATA, signature.to_owned()),
+            (
+                S3_POSITION_METADATA,
+                position_header_value(stream_id, position.0, position.1),
+            ),
+        ]
+    })
+}
 
 /// One PUT per batch, keyed by stream and cursor position, signed with AWS `SigV4`.
 ///
@@ -1226,13 +1252,15 @@ impl LogSink for S3LogSink {
                     // Inside the CANONICAL headers, not merely on the request: a metadata
                     // header SigV4 did not sign can be stripped or rewritten in flight, and
                     // the batch signature is exactly the thing an attacker would remove.
-                    if let Some(signature) = batch_signature.as_deref() {
-                        headers.push((S3_SIGNATURE_METADATA.to_string(), signature.to_owned()));
-                        headers.push((
-                            S3_POSITION_METADATA.to_string(),
-                            position_header_value(&stream_id, position_sequence, &position_cursor),
-                        ));
-                    }
+                    headers.extend(
+                        s3_batch_metadata(
+                            &stream_id,
+                            batch_signature.as_deref(),
+                            (position_sequence, &position_cursor),
+                        )
+                        .into_iter()
+                        .map(|(name, value)| (name.to_string(), value)),
+                    );
                     headers
                 },
                 payload_hash: &payload_hash,
@@ -1256,13 +1284,11 @@ impl LogSink for S3LogSink {
                         ("x-amz-date", timestamp),
                         ("authorization", authorization),
                     ];
-                    if let Some(signature) = batch_signature {
-                        headers.push((S3_SIGNATURE_METADATA, signature));
-                        headers.push((
-                            S3_POSITION_METADATA,
-                            position_header_value(&stream_id, position_sequence, &position_cursor),
-                        ));
-                    }
+                    headers.extend(s3_batch_metadata(
+                        &stream_id,
+                        batch_signature.as_deref(),
+                        (position_sequence, &position_cursor),
+                    ));
                     headers
                 },
                 body,

@@ -120,10 +120,28 @@ export async function verifyBatch({
   // "refuses to be used without a position" while doing exactly that, which was measured.
   if (
     typeof streamId !== 'string' || streamId.length === 0 ||
-    !Number.isInteger(cursorSequence) ||
+    !(Number.isInteger(cursorSequence) || typeof cursorSequence === 'bigint') ||
     typeof cursorId !== 'string' || cursorId.length === 0
   ) {
     return { ok: false, reason: 'missing-position', position: null };
+  }
+
+  // The other two canonical inputs get the same treatment, for the same reason. Omitting
+  // `eventCount` or `eventsJson` also built the canonical string with `undefined` in it and
+  // reported `bad-signature`, so the guard above closed one third of the failure mode it was
+  // written for.
+  if (!Number.isInteger(eventCount) || typeof eventsJson !== 'string') {
+    return { ok: false, reason: 'missing-batch', position: null };
+  }
+
+  // A KEY THAT IS NOT KEY MATERIAL IS A REFUSAL, not a throw. `crypto.subtle.importKey`
+  // raises an uncaught TypeError on `undefined` (an unset environment variable is the common
+  // way), on `null`, and on a number or a plain object. This file promises above that
+  // malformed input is refused rather than thrown on, because a verifier that throws hands
+  // anyone who can reach it a denial of service in place of a `false`, and that promise was
+  // not kept for the one input most likely to arrive unset.
+  if (!(key instanceof Uint8Array || key instanceof ArrayBuffer || typeof key === 'string')) {
+    return { ok: false, reason: 'malformed-key', position: null };
   }
 
   const canonical = await canonicalString({

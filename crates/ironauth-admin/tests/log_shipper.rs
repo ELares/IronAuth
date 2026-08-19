@@ -139,6 +139,7 @@ async fn configure_for_org(
                 sink_type,
                 sink_config: serde_json::json!({ "endpoint": "https://sink.example/in" }),
                 credential_secret_name: None,
+                signing_secret_name: None,
                 event_type_filter: filter,
                 organization_id,
             },
@@ -719,5 +720,95 @@ async fn the_metrics_observation_reports_status_and_the_outstanding_gap() {
     assert_eq!(
         after[0].outstanding_dead_letters, 1,
         "the export gap must be visible as a number, not only as a status: {after:?}"
+    );
+}
+
+/// A stream configured with a signing secret actually SIGNS, and ships the position that
+/// signature covers (issue #110 criterion 5).
+///
+/// # Why nothing caught this before
+///
+/// Review mutated the shipper so that a stream WITH a signing secret shipped every batch
+/// unsigned, and the whole suite stayed green. The reason was not a missing assertion: no
+/// fixture in this file could set `signing_secret_name`, because `NewLogStream` did not carry
+/// it and the INSERT did not write it. The column migration 0144 added was written by
+/// nothing, so `open_signing_secret` returned `None` for every stream on every deployment and
+/// every batch shipped unsigned. An unsigned batch is a legitimate configuration, so nothing
+/// failed anywhere.
+///
+/// That is why this test asserts the signature is PRESENT before asserting anything about it:
+/// the interesting failure is not a wrong signature, it is no signature at all on a stream
+/// the operator configured to sign.
+///
+/// It then rebuilds the canonical string from what the sink was handed and checks the
+/// signature verifies under the same secret. That is what makes the position assertion
+/// meaningful rather than decorative: a position that does not reconstruct the signed string
+/// is exactly as useless to a consumer as no position.
+#[tokio::test]
+async fn a_signing_stream_signs_its_batches_and_ships_the_position_it_signed() {
+    const SECRET_NAME: &str = "siem-signing-key";
+    const SECRET: &[u8] = b"a-shared-signing-secret";
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .environment_secrets()
+        .put(&env, &db.master_key(), SECRET_NAME, SECRET, None)
+        .await
+        .expect("put the signing secret");
+
+    let id = db
+        .control_store()
+        .scoped(scope)
+        .log_streams()
+        .create(
+            &env,
+            &NewLogStream {
+                id: None,
+                description: "signing stream",
+                source: StreamSource::Both,
+                sink_type: SinkType::Http,
+                sink_config: serde_json::json!({ "endpoint": "https://sink.example/in" }),
+                credential_secret_name: None,
+                signing_secret_name: Some(SECRET_NAME),
+                event_type_filter: None,
+                organization_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("configure a signing stream");
+
+    seed_admin(&db, &env, scope, 2, "signed").await;
+    let sink = RecordingSink::new(SinkType::Http, true);
+    let sinks: Vec<Arc<dyn LogSink>> = vec![sink.clone()];
+    let shipped = ship_once(db.store(), &env, scope, &sinks)
+        .await
+        .expect("ship");
+    assert!(shipped >= 2, "the seeded rows must ship: {shipped}");
+
+    let handed = sink.signed();
+    let (signature, sequence, cursor_id) = handed.last().expect("a batch was delivered").clone();
+    let signature = signature.expect(
+        "a stream configured with a signing secret must sign: an absent signature here is the          whole feature being inert, not a wrong value",
+    );
+
+    // The batch as the sink received it, which is what the digest is taken over.
+    let events = sink.events();
+    let events_json = serde_json::to_string(&events).expect("serializes");
+    let canonical = ironauth_admin::log_stream_signature::canonical_string(
+        &id,
+        sequence,
+        &cursor_id,
+        events.len(),
+        &events_json,
+    );
+    assert!(
+        ironauth_admin::log_stream_signature::verify(SECRET, &canonical, &signature),
+        "the signature must verify against the position the sink was handed, or a consumer          holding both cannot check anything"
     );
 }

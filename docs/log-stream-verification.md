@@ -35,7 +35,7 @@ Two headers travel with every signed batch, and a consumer needs **both**:
 The S3 sink carries the same two as object metadata, `x-amz-meta-ironauth-log-signature` and
 `x-amz-meta-ironauth-log-position`, because an object has no headers once it is written. Both
 are inside the SigV4 canonical headers, so neither can be stripped or rewritten in flight: a
-position an attacker can rewrite is a gap and replay check the attacker controls.
+position an attacker can rewrite is a replay check the attacker controls.
 
 **The position is not a convenience.** The signature covers the stream id and the cursor
 position, and neither is derivable from the payload, so a consumer that has only the body and
