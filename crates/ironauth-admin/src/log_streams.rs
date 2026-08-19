@@ -10,8 +10,14 @@
 //!
 //! The sink credential, in any form. `log_streams` never holds one (it holds the NAME of
 //! an environment secret), and this view carries the name rather than resolving it, so
-//! there is no path from this endpoint to a secret value. A test asserts the rendered view
-//! contains no resolved credential even when the stream names one.
+//! there is no path from this endpoint to a secret value.
+//!
+//! `delegated_admin::a_log_stream_read_names_the_credential_secret_and_renders_no_value`
+//! asserts that, and is named here because this paragraph claimed such a test for a while
+//! before one existed. The only test reading this endpoint asserted `items` was present on
+//! an EMPTY listing, which cannot observe a credential either way. The guarantee is
+//! structural, which is precisely why it needs a test: it lives in the SHAPE of this view
+//! rather than in a check, and a shape is what a later field quietly changes.
 //!
 //! `last_error` DOES leave the system here, which is why the shipper builds it from error
 //! variants rather than from a sink's response body: a status read is exactly the place a

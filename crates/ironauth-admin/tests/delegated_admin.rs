@@ -11,6 +11,8 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{Harness, OPERATOR_TOKEN};
+use ironauth_store::log_stream::{SinkType, StreamSource};
+use ironauth_store::{EnvironmentId, NewLogStream, Scope, TenantId};
 use serde_json::Value;
 
 /// Mint a management key through the API and return `(key_id, secret)`.
@@ -1431,6 +1433,91 @@ async fn assert_each_missing_justification_names_its_rule(h: &Harness, route: &s
 /// The status surface reports where each export is up to and why it is failing, which is
 /// operational intelligence about an environment's audit pipeline. It is a read, not a
 /// public one.
+/// The status read carries the credential secret's NAME and never a resolved value
+/// (issue #110 criterion 6).
+///
+/// # Why this test had to be written rather than assumed
+///
+/// `crates/ironauth-admin/src/log_streams.rs` states, in its module doc, that "a test
+/// asserts the rendered view contains no resolved credential even when the stream names
+/// one". No such test existed. The only test that read this endpoint asserted `items` was
+/// present on an EMPTY listing, so it could not have observed a credential either way.
+///
+/// The property is true by construction today, and that is exactly why it needs a test: the
+/// record holds `credential_secret_name` and has no field to put a value in, so the guarantee
+/// lives in a SHAPE rather than in a check, and a shape is what a later field quietly
+/// changes. `last_error` already leaves the system through this view, which is the precedent
+/// for a value arriving here by accident.
+///
+/// Two assertions, and the first is what stops the second passing vacuously: the rendered
+/// item must NAME the credential (so a listing that silently lost the stream fails here
+/// rather than reporting a clean redaction), and its key set must be exactly the documented
+/// one (so a future resolved-credential field fails even if it is not called what I guessed).
+#[tokio::test]
+async fn a_log_stream_read_names_the_credential_secret_and_renders_no_value() {
+    let h = Harness::start(56).await;
+    let (tenant, environment) = h.create_tenant("acme", "lgs-redact").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "lgs-redact-mint").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let env = ironauth_env::Env::system();
+    h.control_store()
+        .scoped(scope)
+        .log_streams()
+        .create(
+            &env,
+            &NewLogStream {
+                id: None,
+                description: "redaction fixture",
+                source: StreamSource::Both,
+                sink_type: SinkType::Http,
+                sink_config: serde_json::json!({ "endpoint": "https://sink.example/in" }),
+                credential_secret_name: Some("collector_token"),
+                event_type_filter: None,
+                organization_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("configure a stream that names a credential");
+
+    let streams = format!("/v1/tenants/{tenant}/environments/{environment}/log-streams");
+    let (status, _, body) = h.get_as(&streams, &secret).await;
+    assert_eq!(status, StatusCode::OK, "log streams under read: {body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    let items = document["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "the fixture stream must be listed: {body}");
+
+    assert_eq!(
+        items[0]["credential_secret_name"], "collector_token",
+        "the view must carry the NAME, and this assertion is also what keeps the one below \
+         from passing on a listing that lost the stream: {body}"
+    );
+
+    let mut keys: Vec<&str> = items[0]
+        .as_object()
+        .expect("the item is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert!(
+        !keys.iter().any(|key| key.contains("secret_value")
+            || *key == "credential"
+            || key.ends_with("_secret")),
+        "the rendered stream grew a field that reads like a resolved credential: {keys:?}"
+    );
+
+    assert!(
+        !body.contains("\"credential\":"),
+        "no resolved credential may appear in a status read: {body}"
+    );
+}
+
 #[tokio::test]
 async fn the_log_stream_status_read_demands_read_and_never_answers_unauthenticated() {
     let h = Harness::start(50).await;
