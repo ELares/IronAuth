@@ -64,6 +64,12 @@ jobs:
     # still unknown -- which is exactly why the ceiling has to be generous rather than
     # tight. 90 leaves room for a complete run to be measured for the first time; the
     # honest next step is to read the duration off a green run and bring this down to it.
+    #
+    # STILL UNPROVEN, and this branch's own run says by how much: job 96119283012 ran the
+    # tests step for 55m36s and died at `absent_scope`, which is `ironauth-store` target 1 of
+    # 88. So 238 non-store binaries plus one store binary cost 55.6 minutes, and the 87
+    # remaining store targets, the database-dense ones, plus the doctests are unmeasured. 90
+    # is room to find out, not a figure anyone has confirmed fits.
     timeout-minutes: 90
     # The ironauth-store isolation tests (rls, idor, repository) require a real
     # Postgres. The harness creates a fresh per-run database and provisions the
@@ -155,11 +161,17 @@ jobs:
       #   3  every step has a conclusion and a full log is uploaded.
       #   1  every step has a conclusion and the log endpoint answers `BlobNotFound`.
       #
-      # INFERRED, and marked as such because the two are not the same kind of statement:
-      # the group of 4 is read as dying in the RUNNER's own diagnostic writer, which would
-      # kill the runner process before it uploads. The evidence is the blankness itself
-      # plus one logged job (95968133506) whose ONLY ENOSPC is the runner's writer path
-      # (`.../actions-runner/cached/.../_diag/...`) with zero Postgres 53100 lines.
+      # ALSO READ, not inferred, and an earlier version of this comment under-claimed it.
+      # The check-run ANNOTATIONS endpoint survives when the log blob does not, and every one
+      # of the five no-log jobs carries the runner's own writer path there:
+      #
+      #   System.IO.IOException: No space left on device :
+      #     '/home/runner/actions-runner/cached/2.336.0/_diag/Worker_...log'
+      #
+      # So "dies in the runner's diagnostic writer" is measured for all of them, not deduced
+      # from the blankness. Corroborated by one LOGGED job (95968133506) whose only ENOSPC is
+      # that same writer path with zero Postgres 53100 lines, which is why it belongs
+      # causally with the blank group.
       #
       # So the middle group is not homogeneous either. TWO of its three carry Postgres
       # 53100 (`could not extend file ...`) inside the tests and end with exit code 101;
@@ -249,7 +261,9 @@ jobs:
           #
           # The floor does not rest on it. `target` is fully built at 24 G before the first
           # test runs and does not grow during the run, and docker held between 4.6 and
-          # 5.4 G across both measured runs. Those two are what 60 is twice over, and the
+          # 5.4 G across two measured runs and 3.3 G on a third (this branch's own job
+          # 96119283012, which put the volume at 2.5 GB). Those are what 60 is twice over,
+          # and the
           # per-test databases the reclaim now sweeps are the term that was unbounded. 60
           # also tolerates a runner image growing by 50 G; a floor of 100 against 113 G
           # free left 13 G of tolerance to an image that grows routinely, which turns a

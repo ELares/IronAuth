@@ -630,14 +630,27 @@ const RECLAIM_MIN_AGE_SECS: u64 = 6 * 60 * 60;
 /// this floor only bounds how low a SETTING is permitted to push it. Worth naming because
 /// the two numbers are two directories apart and neither end says so.
 const RECLAIM_MIN_AGE_FLOOR_SECS: u64 = 300;
-// WHAT WOULD CATCH A CHANGE TO IT, stated because the coupling is not obvious. The
-// integration fixture is staged at TEN MINUTES, so this floor can drift to 600 with the
-// whole suite green and only starts failing at 900. That is the bound; a change inside it
-// is caught by the unit tests on `reclaim_min_age_from` alone, which assert the clamped
-// value directly rather than through a fixture.
+// WHAT CATCHES A CHANGE TO IT, and an earlier version of this comment got the second half
+// wrong. The integration fixture is staged at TEN MINUTES, so this floor could drift to 600
+// with the whole suite green and only started failing at 900. That much was right. The claim
+// that "a change inside it is caught by the unit tests alone" was NOT: five of the seven
+// cases in `the_reclaim_threshold_override_is_clamped_at_its_floor` build their expectation
+// FROM these constants, so moving one moves both sides of the assertion. Only the literal
+// case had grip, and it does not bite until the floor exceeds 600, which is exactly why 900
+// died and 600 did not.
+//
+// The literal assertions below close it: the constants are pinned to their values, so any
+// drift costs a test edit and somebody noticing.
 
 /// The environment variable that lowers [`RECLAIM_MIN_AGE_SECS`].
 const RECLAIM_MIN_AGE_ENV: &str = "IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS";
+
+/// The marker an operator sets to say "every database in this cluster is mine to reclaim".
+///
+/// Only consulted when the override LOWERS the threshold below the six-hour default, which
+/// is the behaviour this crate added and the only part that is this crate's to guard. A
+/// sweep at the default is the behaviour that predates it.
+const DISPOSABLE_ENV: &str = "IRONAUTH_TEST_DB_DISPOSABLE";
 
 /// How old a leftover per-test database must be before this process reclaims it.
 ///
@@ -683,7 +696,31 @@ const RECLAIM_MIN_AGE_ENV: &str = "IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS";
 /// (sqlx closes idle connections after ten minutes with `min_connections` at zero). Set
 /// this in CI, or in a throwaway cluster, and nowhere else.
 fn reclaim_min_age_secs() -> u64 {
-    reclaim_min_age_from(std::env::var(RECLAIM_MIN_AGE_ENV).ok().as_deref())
+    let secs = reclaim_min_age_from(std::env::var(RECLAIM_MIN_AGE_ENV).ok().as_deref());
+    // THE GUARD LIVES HERE, not in one test, and that placement is the whole of it.
+    //
+    // It was on a single test in `test_db_reclaim.rs`. The other three tests in that binary
+    // drive the same cluster-wide sweep, and `TestDatabase::start` drives it once per
+    // process from 103 test files, none of which consulted the marker. Review reproduced a
+    // colleague's six-minute-old database being dropped by an UNGUARDED test while the
+    // guarded one refused afterwards, which is the same shape as the round-5 finding one
+    // level out.
+    //
+    // Gated on the override having LOWERED the threshold, because that is the part this
+    // crate added. Sweeping at the six-hour default is behaviour that predates it and is
+    // not this guard's to change; lowering it to five minutes across somebody else's
+    // cluster is.
+    if secs < RECLAIM_MIN_AGE_SECS {
+        assert!(
+            std::env::var(DISPOSABLE_ENV).is_ok_and(|value| value == "1"),
+            "{RECLAIM_MIN_AGE_ENV} lowers the leftover sweep to {secs}s across EVERY \
+             database in this cluster, so it runs only where that is known to be safe. Set \
+             {DISPOSABLE_ENV}=1 if the cluster is disposable (a CI service container, or one \
+             you created for this run); `scripts/with-test-db.sh` sets it for a cluster it \
+             starts itself, but not when you pass your own DATABASE_URL"
+        );
+    }
+    secs
 }
 
 /// The decision itself, over the raw setting rather than over the environment.
@@ -884,6 +921,19 @@ mod reclaim_threshold_tests {
     /// the sweep more aggressive than it was.
     #[test]
     fn the_reclaim_threshold_override_is_clamped_at_its_floor() {
+        // THE CONSTANTS THEMSELVES, pinned to literals. Every case below builds its
+        // expectation FROM these values, so without this a change to either moves both sides
+        // of the assertion and passes: measured, the floor could drift 300 to 600 with the
+        // whole suite green. Pinning them means a deliberate change costs a test edit.
+        assert_eq!(
+            RECLAIM_MIN_AGE_FLOOR_SECS, 300,
+            "five minutes, and the comment at the constant reasons about that number"
+        );
+        assert_eq!(
+            RECLAIM_MIN_AGE_SECS,
+            6 * 60 * 60,
+            "six hours, which is what makes the CI override a LOWERING and therefore guarded"
+        );
         assert_eq!(
             reclaim_min_age_from(None),
             RECLAIM_MIN_AGE_SECS,

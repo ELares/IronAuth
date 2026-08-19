@@ -377,10 +377,14 @@ run "clippy (pedantic, -D warnings)" cargo clippy --workspace --all-targets --al
 # a throwaway local cluster and tears it down. All other tests are unaffected.
 #
 # IF YOU EXPORT DATABASE_URL, export IRONAUTH_TEST_DB_DISPOSABLE=1 with it when the cluster
-# is yours to reclaim. `test_db_reclaim` sweeps every database in the cluster and refuses
-# without that marker, so this lane goes red otherwise. Leaving the gate red is the intended
-# outcome for a cluster nobody has vouched for: the alternative is a test that quietly drops
-# somebody else's databases.
+# is yours to reclaim. CI sets `IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS`, which LOWERS the
+# leftover sweep from six hours to five minutes across every database in the cluster, and the
+# store harness refuses that without the marker, so this lane goes red otherwise. Leaving it
+# red is the intended outcome for a cluster nobody has vouched for.
+#
+# Note the scope precisely: the marker guards the LOWERED threshold, which is what that
+# variable added. A sweep at the six-hour default is behaviour that predates it and still
+# runs, so a cluster you share with a run older than six hours is not protected by this.
 run "test" scripts/with-test-db.sh cargo test --workspace --all-features
 
 run "invariant lints" scripts/invariant-lints.sh

@@ -25,11 +25,18 @@ range per docs/RELEASING.md.
   as `cargo nextest` breaks it). An unparseable value falls back to the DEFAULT rather than
   the floor, so a typo cannot silently make the sweep more aggressive.
 
-  The test that exercises the override enforces the first of those rather than trusting it:
-  it refuses to run unless `IRONAUTH_TEST_DB_DISPOSABLE=1`, which `scripts/with-test-db.sh`
-  sets for the cluster it creates and tears down, and which CI sets because its Postgres is
-  a per-job service container. It FAILS rather than skipping, so the protection cannot be
-  lost by the marker quietly going away.
+  The harness ENFORCES the first of those rather than trusting it, and enforces it where the
+  threshold is read rather than in one test: any binary whose override lowers the sweep below
+  the six-hour default refuses unless `IRONAUTH_TEST_DB_DISPOSABLE=1`. `scripts/with-test-db.sh`
+  sets it for the cluster it creates and tears down, and CI sets it because its Postgres is a
+  per-job service container. It FAILS rather than skipping, so the protection cannot be lost
+  by the marker quietly going away.
+
+  An earlier version of this guard sat on a single test, which review measured as no
+  protection at all: the other tests in the same binary drove the same cluster-wide sweep,
+  and `TestDatabase::start` drives it once per process from over a hundred test files. Note
+  the scope: the marker guards the LOWERED threshold, which is what this setting added. A
+  sweep at the six-hour default predates it and is unchanged.
 
 - **Tenant-scoped events are now expressible, and `tenant.deleted` has a producer (issue
   #108).** `environment_id` was blanket-required on every envelope, which made a tenant-wide

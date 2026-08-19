@@ -396,3 +396,98 @@ async fn the_override_is_read_from_the_environment_and_the_sweep_obeys_it() {
     );
     drop_if_present(&admin, &taken_name).await;
 }
+
+/// The disposable-cluster marker is REQUIRED whenever the override lowers the threshold, and
+/// that is enforced for every binary rather than for one test (issue #445).
+///
+/// The guard began life as an assertion at the top of one test in this file. Review measured
+/// what that left open: the other three tests here drive the same cluster-wide sweep, and
+/// `TestDatabase::start` drives it once per process from over a hundred test files. A
+/// colleague's six-minute-old database was dropped by an UNGUARDED test while the guarded one
+/// refused afterwards.
+///
+/// It now lives in `reclaim_min_age_secs`, so any binary that lowers the threshold refuses.
+/// This test drives the refusal in a CHILD process, because the guard panics and the parent
+/// has to observe that rather than die of it.
+///
+/// The three arms are the ones that matter: lowered without the marker must refuse, lowered
+/// with it must proceed, and the DEFAULT without the marker must proceed, because sweeping at
+/// six hours is behaviour that predates this crate and is not this guard's to change.
+#[tokio::test]
+async fn the_disposable_marker_is_required_only_when_the_override_lowers_the_threshold() {
+    const CHILD: &str = "IRONAUTH_TEST_DB_GUARD_CHILD";
+    const REACHED: &str = "IRONAUTH-GUARD-CHILD-REACHED-THE-SWEEP";
+
+    if std::env::var(CHILD).is_ok() {
+        // Any call that reads the threshold is enough; `TestDatabase::start` is what every
+        // other binary calls, so this exercises the path they take.
+        let db = ironauth_store::test_support::TestDatabase::start().await;
+        drop(db);
+        println!("{REACHED}");
+        return;
+    }
+
+    let child = |min_age: Option<&str>, marker: Option<&str>| {
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        command.args([
+            "--exact",
+            "the_disposable_marker_is_required_only_when_the_override_lowers_the_threshold",
+            "--nocapture",
+        ]);
+        command.env(CHILD, "1");
+        match min_age {
+            Some(secs) => command.env("IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS", secs),
+            None => command.env_remove("IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS"),
+        };
+        match marker {
+            Some(value) => command.env("IRONAUTH_TEST_DB_DISPOSABLE", value),
+            None => command.env_remove("IRONAUTH_TEST_DB_DISPOSABLE"),
+        };
+        command.output().expect("re-invoke this test binary")
+    };
+
+    for (min_age, marker, must_reach, why) in [
+        (
+            Some("300"),
+            None,
+            false,
+            "a lowered threshold without the marker must REFUSE",
+        ),
+        (
+            Some("300"),
+            Some("1"),
+            true,
+            "a lowered threshold with the marker must proceed",
+        ),
+        (
+            Some("300"),
+            Some("yes"),
+            false,
+            "the marker must be exactly 1",
+        ),
+        (
+            None,
+            None,
+            true,
+            "the six-hour default is not this guard's to change",
+        ),
+    ] {
+        let out = child(min_age, marker);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            text.contains(REACHED),
+            must_reach,
+            "{why} (min_age={min_age:?} marker={marker:?}): {text}"
+        );
+        if !must_reach {
+            assert!(
+                text.contains("lowers the leftover sweep"),
+                "{why}: the refusal must name the reason, not fail some other way: {text}"
+            );
+        }
+    }
+}

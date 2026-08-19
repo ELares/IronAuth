@@ -19,8 +19,10 @@
 # ON THAT PATH THIS SCRIPT IS A PASS-THROUGH, and one thing it deliberately does NOT do is
 # set IRONAUTH_TEST_DB_DISPOSABLE. That marker says "every database in this cluster is mine
 # to reclaim", which is true of a cluster this script created and unknowable for one you
-# handed it. `test_db_reclaim` drives a cluster-wide sweep and refuses without the marker, so
-# set it yourself when the cluster really is disposable:
+# handed it. The store harness refuses to run when IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS
+# LOWERS the leftover sweep below its six-hour default and the marker is absent, in EVERY
+# test binary rather than in one test, so set it yourself when the cluster really is
+# disposable:
 #
 #   DATABASE_URL=... IRONAUTH_TEST_DB_DISPOSABLE=1 scripts/with-test-db.sh cargo test ...
 #
