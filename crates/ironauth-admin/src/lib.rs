@@ -78,6 +78,7 @@ pub mod usage;
 pub mod log_shipper;
 pub mod log_stream_signature;
 
+pub mod ciba_ping;
 mod log_streams;
 mod mds3_health;
 mod memberships;

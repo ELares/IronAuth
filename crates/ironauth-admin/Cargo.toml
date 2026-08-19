@@ -701,3 +701,12 @@ required-features = ["testing"]
 name = "membership_reconcile"
 path = "tests/membership_reconcile.rs"
 required-features = ["testing"]
+
+# The CIBA ping worker (issue #131 criterion 2). Asserts the OUTCOME CLASSIFICATION, which is
+# the part with consequences: a failure wrongly called permanent discards a notification the
+# client was promised, and one wrongly called retryable spends the whole retry budget
+# re-deciding a question whose answer cannot change.
+[[test]]
+name = "ciba_ping"
+path = "tests/ciba_ping.rs"
+required-features = ["testing"]
