@@ -11,10 +11,15 @@ cd "$(git rev-parse --show-toplevel)"
 # FAILURES ARE ACCUMULATED, not fatal on the spot, and this is the whole point of the
 # rewrite. `set -e` plus a flat sequence meant the FIRST failing check killed the run, so
 # everything after it silently never executed. When scripts/scoped-table-registration.sh
-# started failing at line 32, this gate ran 7 of its 53 checks and exited -- and every
-# "green local gate" claimed after that was 13% of a gate. Three CI breaks (rfc9700-scan,
-# event-catalog freshness, dash-scan) sat in the 46 checks it never reached and were found
-# only by replaying the CI job by hand.
+# started failing, this gate announced 7 banners and exited -- 6 checks actually completed,
+# so every "green local gate" claimed after that was about a ninth of a gate. Three CI breaks
+# (rfc9700-scan, event-catalog freshness, dash-scan) sat in the ~44 announced checks it never
+# reached, and were found only by replaying the CI job by hand.
+#
+# The banner count is not the whole story either: the file holds 66 executable commands, and
+# 15 of them are assertions with no banner of their own -- which is exactly how the six
+# `git diff --exit-code` freshness checks came to be the LAST things still able to kill this
+# script after its first rewrite.
 #
 # A gate that stops at the first failure also makes the WRONG tradeoff for its user: you fix
 # one thing, re-run the whole expensive suite, and discover the next one. Reporting every
@@ -23,6 +28,27 @@ cd "$(git rev-parse --show-toplevel)"
 # `set -e` stays ON: the `if !` context suppresses errexit for the condition only, so a
 # failure inside a check is caught here while an unexpected error anywhere else still aborts.
 GATE_FAILURES=()
+
+# The summary prints from a TRAP, not from the tail of the script.
+#
+# A tail-printed summary is lost the moment anything aborts -- and the first version of this
+# rewrite left 16 commands unwrapped, so a failure in any of them killed the run AND discarded
+# every failure already collected. The report was least available exactly when it mattered
+# most. On EXIT the summary prints whatever was gathered, however the script ended.
+gate_summary() {
+  local rc=$?
+  if ((${#GATE_FAILURES[@]} > 0)); then
+    echo "" >&2
+    echo "gate: ${#GATE_FAILURES[@]} check(s) FAILED:" >&2
+    printf '  - %s\n' "${GATE_FAILURES[@]}" >&2
+    # A non-zero rc from an abort is preserved; a clean exit with failures recorded becomes 1.
+    ((rc == 0)) && rc=1
+  elif ((rc == 0)); then
+    echo "gate: all local checks green"
+  fi
+  exit "$rc"
+}
+trap gate_summary EXIT
 
 run() {
   local label="$1"
@@ -34,12 +60,31 @@ run() {
   fi
 }
 
+# A PREREQUISITE: if this fails, everything downstream is noise, so stop.
+#
+# Accumulating is right for independent checks and wrong for a build. Roughly two thirds of
+# the checks below invoke cargo, so one compile error would otherwise report ~18 "failed
+# checks" for a single root cause and spend the gate's full wall-clock (20 minutes to a couple
+# of hours) proving the same thing repeatedly. A reader wants "it does not compile", once.
+run_required() {
+  local label="$1"
+  shift
+  echo "==> $label"
+  if ! "$@"; then
+    GATE_FAILURES+=("$label (prerequisite -- later checks were skipped)")
+    echo "    FAILED: $label"
+    echo "    This is a PREREQUISITE: everything after it needs a compiling tree, so the"
+    echo "    gate stops here rather than reporting the same root cause many times."
+    exit 1
+  fi
+}
+
 
 run "fmt" cargo fmt --all --check
 
 run "msrv audit (no dependency declares a rust-version above the workspace MSRV)" ./scripts/msrv-audit.sh
 
-run "clippy (pedantic, -D warnings)" cargo clippy --workspace --all-targets --all-features -- -D warnings
+run_required "clippy (pedantic, -D warnings)" cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # The ironauth-store isolation tests need a real Postgres via DATABASE_URL.
 # with-test-db.sh runs against DATABASE_URL if set (a CI service), else brings up
@@ -95,7 +140,6 @@ run "terraform provider coverage (generated from the OpenAPI document)" scripts/
 # above, because a check that fails from its first commit gets disabled rather than fixed.
 run "event producer coverage (every management write announces itself)" scripts/producer-coverage.py
 
-echo "==> SDK check() middleware (issue #100, criterion 6)"
 # The uniform authorization `check()`: one call resolving via token claims, via IronAuth's
 # AuthZEN PDP, or via a customer PDP, by configuration. It is a fail-CLOSED authorization
 # primitive, so its tests are the kind worth running on every gate.
@@ -109,7 +153,8 @@ echo "==> SDK check() middleware (issue #100, criterion 6)"
 # `tsc`, so testing for a global one would skip a check the tree can actually run. The skip
 # names the command that removes it.
 if [ -x packages/ironauth-sdk/node_modules/.bin/tsc ]; then
-    run "sdk check() tests" bash -c 'cd packages/ironauth-sdk && npm test --silent' 
+    run "SDK check() middleware (issue #100, criterion 6)" \
+        bash -c 'cd packages/ironauth-sdk && npm test --silent'
 else
     echo "sdk check(): SKIPPED, packages/ironauth-sdk dependencies are not installed."
     echo "             Run: (cd packages/ironauth-sdk && npm install)  [CI runs this check]"
@@ -119,7 +164,6 @@ run "journey transcript replay" scripts/journey-replay.sh
 
 run "admin SPA embed freshness" scripts/admin-spa-embed.sh
 
-echo "==> admin SPA bindings freshness (generated from the OpenAPI document)"
 # The precondition is the LOCAL npm bin, not a global one.
 #
 # The first version of this guard tested `command -v openapi-typescript`, which is the wrong
@@ -132,7 +176,7 @@ echo "==> admin SPA bindings freshness (generated from the OpenAPI document)"
 # The skip now names the command that removes it. An announced skip nobody can act on is only
 # half the value.
 if [ -x packages/admin-spa/node_modules/.bin/openapi-typescript ]; then
-    run "admin SPA bindings freshness" scripts/admin-spa-bindings.sh
+    run "admin SPA bindings freshness (generated from the OpenAPI document)" scripts/admin-spa-bindings.sh
 else
     echo "admin-spa-bindings: SKIPPED, packages/admin-spa dependencies are not installed."
     echo "                    Run: (cd packages/admin-spa && npm install)  [CI runs this check]"
@@ -173,45 +217,44 @@ run "rfc9700 scan (every OAuth endpoint bound to a conformance test)" scripts/rf
 run "conformance harness static checks (results gate, matrix, plan config, digest pins, fail-closed wiring, downgrade confinement)" scripts/conformance-check.sh
 
 run "compatibility matrix freshness" scripts/compat-matrix.sh
-git diff --exit-code docs/COMPATIBILITY.md
+run "compat matrix is committed fresh" git diff --exit-code docs/COMPATIBILITY.md
 
 run "config schema freshness" scripts/config-schema.sh
-git diff --exit-code docs/config-schema.json docs/CONFIG.md
+run "config schema is committed fresh" git diff --exit-code docs/config-schema.json docs/CONFIG.md
 
 run "connector schema freshness (definition + capability matrix)" scripts/connector-schema.sh
-git diff --exit-code docs/connector-schema.json docs/capability-matrix.schema.json
+run "connector schema is committed fresh" git diff --exit-code docs/connector-schema.json docs/capability-matrix.schema.json
 
 run "flow schema freshness (flow object schema + message id registry)" scripts/flow-schema.sh
-git diff --exit-code docs/flow-schema.json docs/flow-messages.json
+run "flow schema is committed fresh" git diff --exit-code docs/flow-schema.json docs/flow-messages.json
 
 run "journey schema freshness (published journey artifact contract)" scripts/journey-schema.sh
-git diff --exit-code docs/journey-schema.json
+run "journey schema is committed fresh" git diff --exit-code docs/journey-schema.json
 
 run "flow golden corpus freshness (rendered flow shape, all journeys x both transports)" scripts/flow-golden.sh
-git diff --exit-code docs/flow-golden.json
+run "flow golden is committed fresh" git diff --exit-code docs/flow-golden.json
 
 run "openapi freshness (served management spec vs committed artifact)" scripts/openapi-check.sh
 # Drift says the spec is CURRENT; this says it is generator-ready (issue #122).
-scripts/openapi-lint.sh
+run "openapi lint (generator-ready)" scripts/openapi-lint.sh
 # The spec-diff changelog generator must itself be correct (issue #122).
-python3 scripts/openapi-changelog.py --self-test
+run "openapi changelog self-test" python3 scripts/openapi-changelog.py --self-test
 # The published wire-format contract must still describe the code (issue #122).
-python3 scripts/sdk-contract.py --check
+run "sdk contract freshness" python3 scripts/sdk-contract.py --check
 # The generated management SDKs must still match the published contract (issue #122).
-python3 scripts/gen-management-sdks.py --check
+run "generated management SDKs freshness" python3 scripts/gen-management-sdks.py --check
 # And they must still COMPILE, which a freshness check cannot show.
-( cd sdks/go && go build ./... )
-python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('c','sdks/python/ironauth_management/client_gen.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
+run "Go SDK builds" bash -c 'cd sdks/go && go build ./...'
+run "Python SDK imports" python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('c','sdks/python/ironauth_management/client_gen.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
 # The events-vs-webhooks guidance must still match the code it quotes (issue #107).
-python3 scripts/events-vs-webhooks.py --check
+run "events-vs-webhooks guidance" python3 scripts/events-vs-webhooks.py --check
 # Metering must stay off the login and token-issuance paths (issue #107).
-scripts/metering-off-hot-path.sh
+run "metering stays off the hot path" scripts/metering-off-hot-path.sh
 
 run "fuzz matrix freshness (every registered fuzz target has a CI matrix row)" scripts/fuzz-matrix-freshness.sh
 
 if command -v cargo-deny >/dev/null 2>&1; then
-  echo "==> cargo deny"
-  cargo deny check
+  run "cargo deny" cargo deny check
 else
   echo "==> cargo deny skipped (not installed; CI enforces it)"
 fi
@@ -226,18 +269,11 @@ fi
 # a broker its cases skip, so what is missing locally is the live-broker assertion and
 # nothing else.
 if [ -n "${IRONBUS_ADDR:-}" ]; then
-  echo "==> outbox ironbus lane (IRONBUS_ADDR=$IRONBUS_ADDR)"
-  scripts/with-test-db.sh cargo test -p ironauth-store --features testing,ironbus \
+  run "outbox ironbus lane (IRONBUS_ADDR=$IRONBUS_ADDR)" \
+    scripts/with-test-db.sh cargo test -p ironauth-store --features testing,ironbus \
     --test outbox --test outbox_ironbus
 else
   echo "==> outbox ironbus lane SKIPPED (set IRONBUS_ADDR to a broker to run it; CI always does)"
 fi
 
-if ((${#GATE_FAILURES[@]} > 0)); then
-  echo ""
-  echo "gate: ${#GATE_FAILURES[@]} check(s) FAILED:"
-  printf '  - %s\n' "${GATE_FAILURES[@]}"
-  exit 1
-fi
-
-echo "gate: all local checks green"
+# The EXIT trap prints the summary and decides the status.
