@@ -375,6 +375,19 @@ run "clippy (pedantic, -D warnings)" cargo clippy --workspace --all-targets --al
 # The ironauth-store isolation tests need a real Postgres via DATABASE_URL.
 # with-test-db.sh runs against DATABASE_URL if set (a CI service), else brings up
 # a throwaway local cluster and tears it down. All other tests are unaffected.
+#
+# IF YOU EXPORT DATABASE_URL, export IRONAUTH_TEST_DB_DISPOSABLE=1 with it when the cluster
+# is yours to reclaim. `test_db_reclaim` asserts the marker directly, because it spawns
+# children that sweep, so this lane goes red without it. Leaving it red is the intended
+# outcome for a cluster nobody has vouched for.
+#
+# This script does NOT set `IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS`, so the harness-wide guard
+# in `reclaim_min_age_secs` is inert locally; that one fires in CI, where the job sets the
+# override. Naming the right mechanism matters because the two fail at different points.
+#
+# Note the scope precisely: the marker guards the LOWERED threshold, which is what that
+# variable added. A sweep at the six-hour default is behaviour that predates it and still
+# runs, so a cluster you share with a run older than six hours is not protected by this.
 run "test" scripts/with-test-db.sh cargo test --workspace --all-features
 
 run "invariant lints" scripts/invariant-lints.sh

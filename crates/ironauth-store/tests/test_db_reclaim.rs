@@ -20,10 +20,24 @@ use sqlx::PgPool;
 /// sweeps, so they must not run at the same time.
 ///
 /// This does NOT make a fixture safe on its own, and reading it that way is the trap.
-/// `TestDatabase::start` sweeps once per PROCESS, and cargo runs test binaries
-/// concurrently, so a sweep from a binary this lock cannot reach may still land in the
-/// middle of a fixture here. The lock removes the interference WITHIN this binary; the
-/// retries below cover what is left.
+/// `TestDatabase::start` sweeps once per PROCESS, so a sweep from a binary this lock
+/// cannot reach may still land in the middle of a fixture here. The lock removes the
+/// interference WITHIN this binary; the retries below cover what is left.
+///
+/// An earlier version of this said cargo runs test binaries CONCURRENTLY. It does not:
+/// measured against a full CI run, 239 `Running` lines with every apparent overlap a
+/// stdout merge artifact under 2 ms. Binaries run strictly one after another, and that
+/// matters now rather than being a pedantic correction, because
+/// `IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS` lowers the sweep's threshold by a factor of
+/// seventy-two in CI and its safety rests on exactly this: at the moment binary N+1
+/// sweeps, every database from binaries 1..N belongs to an exited process and has no
+/// `pg_stat_activity` row.
+///
+/// SO THE ASSUMPTION IS LOAD-BEARING AND SHOULD BE WRITTEN DOWN. Moving this suite to a
+/// process-per-test runner (`cargo nextest`) would break it: parallel processes mean a
+/// live process's database can be both older than the threshold and connectionless, since
+/// sqlx closes idle connections after ten minutes with `min_connections` at zero, and
+/// another process's sweep would drop it out from under a running test.
 static CLUSTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// How many times to re-stage a fixture that a sweep elsewhere reclaimed first. Losing
@@ -221,4 +235,309 @@ async fn starting_a_test_database_is_what_triggers_the_reclaim() {
          other tests here pass, the reclaim exists but nothing calls it"
     );
     drop(db);
+}
+
+/// THE ENV READ, which is the only part the unit test cannot reach.
+///
+/// `reclaim_min_age_from` is a pure function over the raw setting and is pinned in seven
+/// cases by a unit test. Nothing covered `reclaim_min_age_secs`, the seam that reads the
+/// environment, or the fact that the sweep consults it at all. MEASURED: replacing that
+/// function's body with `reclaim_min_age_from(None)` -- the override disconnected entirely,
+/// with the constant still referenced so no dead-code lint fires -- left the whole crate
+/// green, pedantic clippy included. In CI that mutant silently restores the six-hour
+/// threshold, the sweep reclaims nothing, and the disk problem this override exists to fix
+/// comes back with no test and no lint saying so.
+///
+/// This file already carries that warning about a different layer:
+/// `starting_a_test_database_is_what_triggers_the_reclaim` exists because "this project has
+/// shipped three separate defects of exactly that shape, where a test proved a layer above
+/// the layer that decides whether anything runs at all". The override is a fourth layer.
+///
+/// # BOTH halves are children, and the first version got that wrong
+///
+/// The parent used to assert the survival half itself. That made it depend on the AMBIENT
+/// environment, and `ci.yml` sets `IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS=300` at job level
+/// for exactly this suite -- so in CI the parent's own sweep reclaimed the ten-minute-old
+/// fixture and the test failed on the assertion that it survives. It was invisible only
+/// because `cargo test` fails fast and `absent_scope` (target 1 of 88) dies before
+/// `test_db_reclaim` (target 81) runs. The day that clears, this goes red.
+///
+/// So each half runs in its own child with its own environment: one with the variable
+/// REMOVED, one with it set. Neither reads whatever the parent was launched with.
+///
+/// # Why children rather than `set_var`
+///
+/// `std::env::set_var` is `unsafe` from the 2024 edition and the workspace denies unsafe
+/// blocks. The stronger objection is that the environment is process-global: a test that
+/// wrote it would race every other test in this binary.
+///
+/// The fixture is aged TEN MINUTES: below the six-hour default, so the `env_remove` child
+/// spares it, and above the five-minute floor, so the `300` child takes it.
+///
+/// # A child that ran nothing must not read as a pass
+///
+/// `--exact <name>` is a string literal duplicating the function name, so renaming the
+/// function makes the child match zero tests and exit 0, and `status.success()` would call
+/// that a pass with the seam uncovered again. Each child prints a SENTINEL and the parent
+/// requires it, so "ran nothing" and "ran and passed" stop being the same observation.
+#[tokio::test]
+async fn the_override_is_read_from_the_environment_and_the_sweep_obeys_it() {
+    const SPARED: &str = "IRONAUTH-CHILD-SPARED";
+    const RECLAIMED: &str = "IRONAUTH-CHILD-RECLAIMED";
+
+    // FIRST STATEMENT IN THE TEST, before the child dispatch and before anything opens a
+    // connection, and the position is the whole guarantee.
+    //
+    // This test drives a CLUSTER-WIDE sweep. Placed lower down it refused AFTER the spare
+    // half had already staged a database in the cluster and spawned a child that swept it,
+    // which a review reproduced by watching it drop an unrelated database and only then
+    // print the refusal. A guard that runs after the thing it forbids is a message, not a
+    // guard.
+    //
+    // REFUSED rather than skipped: a silent skip would let the coverage disappear the day
+    // the marker stops being set. CI sets it because its Postgres is a per-job service
+    // container, and `scripts/with-test-db.sh` sets it for the cluster it creates and tears
+    // down. It does NOT set it when `DATABASE_URL` is already in the environment, because at
+    // that point the script is a pass-through and cannot know whose cluster it is; the
+    // caller says so, which is what the message asks for.
+    assert!(
+        std::env::var("IRONAUTH_TEST_DB_DISPOSABLE").is_ok_and(|value| value == "1"),
+        "this test drives a sweep across EVERY database in the cluster at a five-minute \
+         threshold, so it runs only where that is known to be safe. Set \
+         IRONAUTH_TEST_DB_DISPOSABLE=1 if the cluster is disposable (a CI service container, \
+         or one you created for this run); `scripts/with-test-db.sh` sets it for a cluster \
+         it starts itself, but not when you pass your own DATABASE_URL"
+    );
+
+    // The child re-enters this same test, so the recursion has to stop somewhere.
+    if let Ok(mode) = std::env::var("IRONAUTH_TEST_DB_RECLAIM_CHILD") {
+        let (admin, base) = admin_pool().await;
+        let name = std::env::var("IRONAUTH_TEST_DB_RECLAIM_FIXTURE").expect("fixture name");
+        // The fixture must be THERE before the sweep, or "gone afterwards" is a pass for
+        // the wrong reason. The other tests in this file guard the same thing for the same
+        // stated reason: an absent fixture reads as a pass and is worse than a flake.
+        assert!(
+            exists(&admin, &name).await,
+            "the parent staged {name} and it must still be present when the child starts"
+        );
+        reclaim_leaked_databases_now(&base).await;
+        let still_there = exists(&admin, &name).await;
+        if mode == "spare" {
+            assert!(
+                still_there,
+                "with the variable REMOVED the default is six hours, so a ten-minute-old \
+                 leftover survives: {name}"
+            );
+            println!("{SPARED}");
+        } else {
+            assert!(
+                !still_there,
+                "with the override at 300 a ten-minute-old leftover is past its threshold \
+                 and must be reclaimed: {name}"
+            );
+            println!("{RECLAIMED}");
+        }
+        return;
+    }
+
+    let _serialized = CLUSTER.lock().await;
+    let (admin, base) = admin_pool().await;
+    let _ = &base;
+
+    let child = |mode: &'static str, name: String, override_secs: Option<&'static str>| {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        command
+            .args([
+                "--exact",
+                "the_override_is_read_from_the_environment_and_the_sweep_obeys_it",
+                // Needed for the sentinel: libtest swallows a passing test's stdout
+                // otherwise. It costs nothing in the log because the parent CAPTURES this
+                // with `output()`, so the child's libtest block never reaches CI.
+                "--nocapture",
+            ])
+            .env("IRONAUTH_TEST_DB_RECLAIM_CHILD", mode)
+            .env("IRONAUTH_TEST_DB_RECLAIM_FIXTURE", name);
+        match override_secs {
+            Some(secs) => command.env("IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS", secs),
+            // REMOVED, not merely unset in this process: the parent may itself have been
+            // launched with it, which is exactly what CI does.
+            None => command.env_remove("IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS"),
+        };
+        command.output().expect("re-invoke this test binary")
+    };
+
+    // THE SPARE HALF, in a child with the variable removed.
+    let spared_name = aged_name(10 * 60, "override_spare");
+    drop_if_present(&admin, &spared_name).await;
+    create(&admin, &spared_name).await;
+    let out = child("spare", spared_name.clone(), None);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success() && text.contains(SPARED),
+        "the child with no override must SPARE a ten-minute-old leftover, and must have \
+         actually run: {text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop_if_present(&admin, &spared_name).await;
+
+    // THE RECLAIM HALF, in a child with the value CI sets.
+    let taken_name = aged_name(10 * 60, "override_take");
+    drop_if_present(&admin, &taken_name).await;
+    create(&admin, &taken_name).await;
+    let out = child("take", taken_name.clone(), Some("300"));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success() && text.contains(RECLAIMED),
+        "the child with IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS=300 must reclaim what the \
+         other child spared, and must have actually run; if it did not, the sweep is not \
+         reading the environment at all: {text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop_if_present(&admin, &taken_name).await;
+}
+
+/// The disposable-cluster marker is REQUIRED whenever the override lowers the threshold, and
+/// that is enforced for every binary rather than for one test (issue #445).
+///
+/// The guard began life as an assertion at the top of one test in this file. Review measured
+/// what that left open: the other three tests here drive the same cluster-wide sweep, and
+/// `TestDatabase::start` drives it once per process from over a hundred test files. A
+/// colleague's six-minute-old database was dropped by an UNGUARDED test while the guarded one
+/// refused afterwards.
+///
+/// It now lives in `reclaim_min_age_secs`, so any binary that lowers the threshold refuses.
+/// This test drives the refusal in a CHILD process, because the guard panics and the parent
+/// has to observe that rather than die of it.
+///
+/// FOUR arms: lowered without the marker must refuse, lowered with a marker that is not
+/// exactly `1` must refuse, lowered with a real marker must proceed, and the DEFAULT without
+/// a marker must proceed, because sweeping at six hours predates this crate and is not this
+/// guard's to change.
+#[tokio::test]
+async fn the_disposable_marker_is_required_only_when_the_override_lowers_the_threshold() {
+    const CHILD: &str = "IRONAUTH_TEST_DB_GUARD_CHILD";
+    const REACHED: &str = "IRONAUTH-GUARD-CHILD-REACHED-THE-SWEEP";
+
+    if std::env::var(CHILD).is_ok() {
+        // Any call that reads the threshold is enough; `TestDatabase::start` is what every
+        // other binary calls, so this exercises the path they take.
+        let db = ironauth_store::test_support::TestDatabase::start().await;
+        drop(db);
+        println!("{REACHED}");
+        return;
+    }
+
+    // The allowed arm's child sweeps the whole cluster at five minutes, which is BELOW the
+    // ten-minute fixture test 4 stages, so this test has to be serialized against its siblings
+    // like they are against each other. Taken after the child branch above: the child is this
+    // same test function in a new process and returns before it reaches here.
+    let _serialized = CLUSTER.lock().await;
+
+    // THE PARENT MUST HOLD A REAL MARKER BEFORE IT SPAWNS ANYTHING, and this assertion is
+    // the whole reason the test is not itself the hole.
+    //
+    // One of the arms below hands a child `IRONAUTH_TEST_DB_DISPOSABLE=1` so it can prove the
+    // guard LETS a marked run through, and that child then sweeps the cluster at five
+    // minutes. Without this line the test SYNTHESIZED that marker: review reproduced it
+    // dropping two foreign databases from a hand-set `DATABASE_URL` while reporting `ok`.
+    // A guard whose own test forges its precondition is worse than no test, because it reads
+    // as coverage.
+    //
+    // Asserting here means the marker an arm passes on is one the OPERATOR set, inherited
+    // rather than manufactured, which is what the sibling test at the top of this file does.
+    assert!(
+        std::env::var("IRONAUTH_TEST_DB_DISPOSABLE").is_ok_and(|value| value == "1"),
+        "this test spawns children that sweep EVERY database in the cluster at a five-minute \
+         threshold, so it runs only where that is known to be safe. Set \
+         IRONAUTH_TEST_DB_DISPOSABLE=1 if the cluster is disposable; \
+         `scripts/with-test-db.sh` sets it for a cluster it starts itself, but not when you \
+         pass your own DATABASE_URL"
+    );
+
+    let child = |min_age: Option<&str>, marker: Option<&str>| {
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        command.args([
+            "--exact",
+            "the_disposable_marker_is_required_only_when_the_override_lowers_the_threshold",
+            "--nocapture",
+        ]);
+        command.env(CHILD, "1");
+        match min_age {
+            Some(secs) => command.env("IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS", secs),
+            None => command.env_remove("IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS"),
+        };
+        match marker {
+            Some(value) => command.env("IRONAUTH_TEST_DB_DISPOSABLE", value),
+            None => command.env_remove("IRONAUTH_TEST_DB_DISPOSABLE"),
+        };
+        command.output().expect("re-invoke this test binary")
+    };
+
+    let (admin, _) = admin_pool().await;
+
+    for (min_age, marker, must_reach, why) in [
+        (
+            Some("300"),
+            None,
+            false,
+            "a lowered threshold without the marker must REFUSE",
+        ),
+        (
+            Some("300"),
+            Some("1"),
+            true,
+            "a lowered threshold with the marker must proceed",
+        ),
+        (
+            Some("300"),
+            Some("yes"),
+            false,
+            "the marker must be exactly 1",
+        ),
+        (
+            None,
+            None,
+            true,
+            "the six-hour default is not this guard's to change",
+        ),
+    ] {
+        // A FOREIGN DATABASE OLD ENOUGH THAT A LOWERED SWEEP WOULD TAKE IT, staged fresh for
+        // each refusing arm so the arm can assert the guard runs BEFORE the drops.
+        //
+        // Staged inside the loop, not before it: the allowed arm sweeps at five minutes and
+        // legitimately takes this database, so a single fixture staged up front is already
+        // gone by the time the third arm looks for it. Measured, not predicted.
+        let bystander = aged_name(20 * 60, "guard_bystander");
+        if !must_reach {
+            drop_if_present(&admin, &bystander).await;
+            create(&admin, &bystander).await;
+        }
+
+        let out = child(min_age, marker);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            text.contains(REACHED),
+            must_reach,
+            "{why} (min_age={min_age:?} marker={marker:?}): {text}"
+        );
+        if !must_reach {
+            assert!(
+                text.contains("lowers the leftover sweep"),
+                "{why}: the refusal must name the reason, not fail some other way: {text}"
+            );
+            // AND IT REFUSED BEFORE IT SWEPT. A guard that runs after the drop loop still
+            // prints this message, and still destroys the database it was meant to protect.
+            assert!(
+                exists(&admin, &bystander).await,
+                "{why}: a refused run must not have swept first, and this 20-minute-old \
+                 database would be taken by a five-minute threshold"
+            );
+            drop_if_present(&admin, &bystander).await;
+        }
+    }
 }

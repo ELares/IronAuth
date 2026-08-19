@@ -16,6 +16,16 @@
 # If DATABASE_URL is already set, the command runs against that database instead
 # and no cluster is started (use this to target a CI Postgres service).
 #
+# ON THAT PATH THIS SCRIPT IS A PASS-THROUGH, and one thing it deliberately does NOT do is
+# set IRONAUTH_TEST_DB_DISPOSABLE. That marker says "every database in this cluster is mine
+# to reclaim", which is true of a cluster this script created and unknowable for one you
+# handed it. The store harness refuses to run when IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS
+# LOWERS the leftover sweep below its six-hour default and the marker is absent, in EVERY
+# test binary rather than in one test, so set it yourself when the cluster really is
+# disposable:
+#
+#   DATABASE_URL=... IRONAUTH_TEST_DB_DISPOSABLE=1 scripts/with-test-db.sh cargo test ...
+#
 # Postgres binaries are found via (in order): $PG_BIN, pg_ctl on PATH,
 # /usr/lib/postgresql/*/bin (Debian/Ubuntu), and ~/.theseus/postgresql/*/bin.
 set -euo pipefail
@@ -25,7 +35,9 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-# Respect an externally provided database (for example a CI service).
+# Respect an externally provided database (for example a CI service). Note that
+# IRONAUTH_TEST_DB_DISPOSABLE is NOT set here: see the header for why the caller owns that
+# decision on this path.
 if [ -n "${DATABASE_URL:-}" ]; then
   exec "$@"
 fi
@@ -77,6 +89,15 @@ echo "with-test-db: initializing throwaway cluster in ${PGDATA} on port ${PORT}"
   "-p ${PORT} -k ${SOCKDIR} -c listen_addresses=127.0.0.1" start >/dev/null
 
 export DATABASE_URL="postgres://${SUPERUSER}@127.0.0.1:${PORT}/postgres"
+# THIS CLUSTER IS DISPOSABLE, and one test needs to know that rather than assume it.
+#
+# `test_db_reclaim` drives a sweep with IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS lowered to
+# five minutes, which is cluster-wide: it would also reclaim a CONCURRENT harness run's
+# databases in the same cluster. That is safe here, because this script just created the
+# cluster and tears it down on exit, and it is not safe against a DATABASE_URL somebody
+# set by hand. The test refuses to run that arm without this marker rather than skipping
+# it, so the protection can never be lost silently.
+export IRONAUTH_TEST_DB_DISPOSABLE=1
 echo "with-test-db: DATABASE_URL=${DATABASE_URL}"
 
 set +e
