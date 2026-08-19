@@ -53,9 +53,10 @@ GATE_FAILURES=()
 # which is the same "attribute the number to the first cause you thought of" mistake the
 # paragraph above is about.)
 #
-# This file says it of itself, at the ironbus lane and again at the freshness lane rather
-# than in this header: "a local gate that is quietly a subset of CI teaches you to trust a
-# green that does not mean what it looks like."
+# This file says it of itself, at the ironbus lane rather than in this header: "a local gate
+# that is quietly a subset of CI teaches you to trust a green that does not mean what it
+# looks like." The freshness lane makes the same point in different words ("a strict subset"),
+# which is why this quotes one site rather than claiming both say the same sentence.
 GATE_COMPLETED=0
 GATE_SKIPPED=()
 
@@ -110,9 +111,25 @@ gate_diff_hash() {
     echo "no-hasher"
     return 0
   fi
-  git diff HEAD 2>/dev/null | $GATE_HASHER 2>/dev/null || true
+  local digest
+  # NOT `|| true` into the empty string. An empty digest compares equal to an empty digest,
+  # so a hasher that exists but FAILS silently restores exactly the inert oracle the probe
+  # above was added to close: measured, a `shasum` that exits 1 took the tree warning from
+  # fired to silent on the arm the hash half exists for. A distinct sentinel per call cannot
+  # compare equal to anything, so a broken hasher reads as a CHANGED tree rather than as an
+  # unchanged one, which is the direction that fails loudly.
+  digest="$(git diff HEAD 2>/dev/null | $GATE_HASHER 2>/dev/null || true)"
+  if [[ -z "$digest" ]]; then
+    echo "hasher-failed-$RANDOM$RANDOM"
+    return 0
+  fi
+  printf '%s\n' "$digest"
 }
-GATE_TREE_BEFORE="$(git status --porcelain 2>/dev/null || true)"
+# `--untracked-files=all`, because the default collapses an untracked DIRECTORY to a single
+# `?? dir/` line: a check writing a new file inside one produced identical snapshots and the
+# oracle said nothing. Measured before this flag, with a generator writing `wip/generated.json`
+# under an untracked `wip/`: tree warning 0, verdict a bare green.
+GATE_TREE_BEFORE="$(git status --porcelain --untracked-files=all 2>/dev/null || true)"
 GATE_DIFF_BEFORE="$(gate_diff_hash)"
 
 # The summary prints from a TRAP, not from the tail of the script.
@@ -123,6 +140,12 @@ GATE_DIFF_BEFORE="$(gate_diff_hash)"
 # most. On EXIT the summary prints whatever was gathered, however the script ended.
 gate_summary() {
   local rc=$?
+  # IGNORE further signals for the duration of this trap. It does real work before the
+  # verdict (two `git status` calls, a `git diff | shasum`, a `sort`/`comm`), and a SECOND
+  # Ctrl-C inside that window killed it mid-way, printing zero verdicts: the one state this
+  # summary exists to make impossible. An impatient double Ctrl-C is how people actually stop
+  # a multi-hour gate.
+  trap '' INT TERM HUP
   if ((${#GATE_FAILURES[@]} > 0)); then
     # stdout, like every other line this script prints. Splitting the summary onto stderr
     # would drop it from `scripts/gate.sh > gate.log`, which is how a multi-hour run is
@@ -151,13 +174,27 @@ gate_summary() {
   #
   # A completed GREEN run prints nothing here, and that is an EXPECTATION rather than a
   # guarantee: every generator ends in `git diff --exit-code` or `git status --porcelain`,
-  # so one that had rewritten something would have failed. Anything else that writes,
-  # including something with no diff assertion at all, still shows up here, which is the
-  # whole point of measuring the tree instead of trusting a list of generators.
-  local tree_after diff_after
-  tree_after="$(git status --porcelain 2>/dev/null || true)"
+  # so one that had rewritten something would have failed.
+  #
+  # WHAT THIS DOES NOT SEE, enumerated rather than waved at, because an earlier version of
+  # this comment claimed it catches everything and a commit message said "every mutation
+  # except gitignored paths". Measured, three classes are invisible:
+  #
+  #   * anything under a GITIGNORED path. `git status` does not report it and `git diff HEAD`
+  #     does not cover it. This is the one that was already disclosed.
+  #   * a rewrite of a file that was ALREADY untracked before the run. Both snapshots read
+  #     `?? path` and the diff hash never covers untracked content.
+  #   * a check that COMMITS its own writes. The status goes clean again and the diff is
+  #     taken against the new HEAD. No lane does this today.
+  #
+  # A new file inside an already-untracked DIRECTORY used to be a fourth; `--untracked-files=all`
+  # on both snapshots closes it. The remaining three are not closable by a snapshot of the
+  # tree, which is the honest limit of measuring the tree rather than the generators.
+  local tree_after diff_after tree_changed=0
+  tree_after="$(git status --porcelain --untracked-files=all 2>/dev/null || true)"
   diff_after="$(gate_diff_hash)"
   if [[ "$tree_after" != "$GATE_TREE_BEFORE" || "$diff_after" != "$GATE_DIFF_BEFORE" ]]; then
+    tree_changed=1
     echo ""
     echo "gate: this run CHANGED the working tree. Anything graded after the change read"
     echo "      the rewritten file rather than the committed one. The usual cause is a"
@@ -184,8 +221,17 @@ gate_summary() {
   # which checks had no chance to speak.
   if ((${#GATE_SKIPPED[@]} > 0)); then
     echo ""
-    echo "gate: ${#GATE_SKIPPED[@]} lane(s) SKIPPED here (CI runs them):"
+    echo "gate: ${#GATE_SKIPPED[@]} lane(s) SKIPPED here:"
     printf '  - %s\n' "${GATE_SKIPPED[@]}"
+  fi
+  # SEPARATE from the lane ledger, because it is not a lane. The tree-change hash is a local
+  # TOOL this summary needs, not one of the 66 checks and not something CI runs, so counting
+  # it as a skipped lane made the header false of that row and made the green verdict's count
+  # conflate "a check did not run" with "the oracle is half blind".
+  if [[ -z "$GATE_HASHER" ]]; then
+    echo ""
+    echo "gate: no shasum or sha256sum on PATH, so the tree oracle ran on its STATUS half"
+    echo "      only. A content-only rewrite of an already-dirty file would go unreported."
   fi
 
   # THE VERDICT IS LAST, and that placement is load-bearing rather than tidy.
@@ -199,8 +245,8 @@ gate_summary() {
   # printed and nothing can change that.
   echo ""
   if ((GATE_COMPLETED == 0)); then
-    echo "gate: INCOMPLETE -- the run ended before the last check. Every check after the"
-    echo "      interruption never ran, so anything above is a PARTIAL accounting."
+    echo "gate: INCOMPLETE -- the run ended before the last check. Every check after that"
+    echo "      point never ran, so anything above is a PARTIAL accounting."
     # The LAST line carries the `gate:` prefix like the other two verdicts, so a caller
     # reading `tail -1` gets a verdict in all three outcomes rather than an indented
     # continuation in one of them.
@@ -212,8 +258,26 @@ gate_summary() {
     # made the green line bare again, which undid the very property the ledger was added
     # for. Both hold now: the ledger prints on every outcome AND the verdict says whether
     # it is a whole-gate green.
+    #
+    # A CHANGED TREE QUALIFIES IT TOO, for the same reason and it is the stronger case. A
+    # skipped lane is a check that did not speak; a changed tree is every check after the
+    # change having read a file this run rewrote, which the warning block above says in as
+    # many words. Leaving the last line a bare green while the block above it says the run
+    # cannot be trusted is a false green, and this commit is the one that tells a
+    # contributor to read `tail -1`. Reachable in the real gate: `Cargo.lock` is tracked and
+    # nothing here passes `--locked`, so any run that refreshes it finishes 66/66 green with
+    # a modified tree.
+    local qualifiers=()
     if ((${#GATE_SKIPPED[@]} > 0)); then
-      echo "gate: all local checks green (${#GATE_SKIPPED[@]} lane(s) SKIPPED above)"
+      qualifiers+=("${#GATE_SKIPPED[@]} lane(s) SKIPPED above")
+    fi
+    if ((tree_changed == 1)); then
+      qualifiers+=("this run CHANGED the working tree")
+    fi
+    if ((${#qualifiers[@]} > 0)); then
+      local joined
+      joined="$(printf '; %s' "${qualifiers[@]}")"
+      echo "gate: all local checks green (${joined:2})"
     else
       echo "gate: all local checks green"
     fi

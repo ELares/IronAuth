@@ -5,7 +5,7 @@ dist/
 .DS_Store
 __pycache__/
 
-# The gate's own capture file. `scripts/gate.sh > gate.log` is what CONTRIBUTING.md tells a
+# The gate's own capture file. `scripts/gate.sh > gate.log 2>&1` is what CONTRIBUTING.md tells a
 # contributor to run for a multi-hour gate, and the summary now reports which files THIS RUN
 # changed by comparing the tree before and after, so a tracked log would make every run
 # report its own log.
