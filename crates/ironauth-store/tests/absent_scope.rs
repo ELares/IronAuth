@@ -148,7 +148,8 @@ async fn the_recognition_rule_matches_the_scope_foreign_keys_and_nothing_else() 
         unrecognized.is_empty(),
         "every foreign key onto a scope table must be recognizable as an absent scope, \
          or a write that trips it answers a server fault instead of the uniform \
-         not-found and becomes an existence oracle on the unauthenticated data plane. \
+         not-found: a contract defect on the management plane, and an existence oracle \
+         wherever the table is reachable from the unauthenticated data plane. \
          These are not: {unrecognized:#?}"
     );
 
@@ -156,15 +157,14 @@ async fn the_recognition_rule_matches_the_scope_foreign_keys_and_nothing_else() 
     // constraint the rule MATCHES really does reference a scope table, so the conversion
     // cannot answer not-found for a referential failure against a row that is there.
     //
-    // This is not hypothetical safety. The schema carries A DOZEN constraints of the
-    // shape `FOREIGN KEY (x_id, tenant_id, environment_id)` onto a non-scope parent, and
-    // every one of them is kept out of this rule's reach only by `environment_id` coming
-    // LAST in the column list. (Eleven when that sentence was written; 0147 added the
-    // twelfth, which is the argument for the assertion below reading the live schema rather
-    // than for anyone writing the number down again.) The scope keys themselves use the
-    // opposite order, so both
-    // orders are already in the schema and a new table written the other way round would
-    // land here.
+    // This is not hypothetical safety. The schema carries a dozen constraints of the shape
+    // `FOREIGN KEY (x_id, tenant_id, environment_id)` onto a non-scope parent, and every one
+    // of them is kept out of this rule's reach only by `environment_id` coming LAST in the
+    // column list. (Eleven when that sentence was written; 0147 added the twelfth, which is
+    // the argument for the assertion below reading the live schema rather than for anyone
+    // writing the number down again.) The scope keys themselves use the opposite order, so
+    // both orders are already in the schema and a new table written the other way round
+    // would land here.
     let wrongly_matched: Vec<&ForeignKey> = keys
         .iter()
         .filter(|key| key.recognized() && !key.onto_a_scope_table())
@@ -374,8 +374,15 @@ async fn a_genuine_database_fault_is_still_a_database_fault() {
 /// scoped table, so Postgres named the constraint `..._tenant_id_environment_id_fkey`
 /// instead of `..._environment_id_tenant_id_fkey`. The conversion matches on the suffix
 /// `_tenant_id_fkey`, which the second name carries and the first does not, so a write into
-/// an absent environment answered a SERVER FAULT: a distinguisher an unauthenticated caller
-/// can enumerate scopes with.
+/// an absent environment answered a SERVER FAULT rather than the uniform not-found.
+///
+/// ON THESE TWO TABLES THAT IS ISSUE #409's MANAGEMENT-PLANE CONTRACT DEFECT AND NOT A LIVE
+/// ORACLE, and the difference is worth stating precisely because an earlier draft of this
+/// comment got it wrong in the alarming direction. Both are control plane only: 0145 and
+/// 0146 grant `ironauth_app` SELECT alone, so no unauthenticated caller can reach either
+/// write. It becomes issue #449's oracle the day either table acquires a data-plane write
+/// path, which is exactly why the fix is the naming convention rather than a note on these
+/// two tables.
 ///
 /// The module documentation above predicted exactly this ("the schema already carries both
 /// orders, so it is one keystroke from breaking"), and it went unseen for two migrations
@@ -431,11 +438,16 @@ async fn a_template_write_into_an_absent_environment_is_the_uniform_not_found() 
     assert!(
         matches!(error, StoreError::NotFound),
         "an absent environment must be the uniform not-found and never a database fault, \
-         or the data plane distinguishes a scope that exists from one that does not: \
-         {error:?}"
+         or a caller that can reach this write distinguishes a scope that exists from one \
+         that does not: {error:?}"
     );
 
-    // And a tenant that never existed either, which trips the single-column key.
+    // And a wholly invented tenant AND environment, reaching the same composite key from
+    // the other direction. NOT a single-column tenant key: `message_templates` declares
+    // exactly one foreign key (0145), so both cases above report
+    // `message_templates_environment_id_tenant_id_fkey`. An earlier version of this comment
+    // claimed the single-column key by copying the framing from the sibling test above,
+    // where it is true.
     let error = write(ghost_scope(&env))
         .await
         .expect_err("a write into an absent tenant cannot land");
@@ -443,4 +455,152 @@ async fn a_template_write_into_an_absent_environment_is_the_uniform_not_found() 
         matches!(error, StoreError::NotFound),
         "an absent tenant must be the uniform not-found too: {error:?}"
     );
+}
+
+/// EVERY forced-row-level-security table declares a scope foreign key (issues #409, #449).
+///
+/// The recognition rule above asserts that every scope foreign key is RECOGNIZABLE. It
+/// cannot see a scoped table that has no scope foreign key at all, and neither can the
+/// behavioural test: measured, dropping `message_templates`' composite key without re-adding
+/// it leaves all four tests in this file green, because the write then lands and the audit
+/// row's own recognized key produces the not-found a caller sees.
+///
+/// The module documentation above asserts this property in prose ("Every scoped table
+/// carries a foreign key to `tenants` and, for the environment-scoped ones, a composite
+/// foreign key to `environments`") and nothing enforced it. A scoped table without one is
+/// worse than an unrecognized constraint: row-level security still hides its reads, so a
+/// write into an absent scope SUCCEEDS and the row is then invisible to everybody.
+///
+/// "Scoped" is read from the schema as forced row-level security, the same definition
+/// `scripts/scoped-table-registration.sh` uses, so a new scoped table is covered the moment
+/// it is migrated rather than when somebody remembers to list it.
+#[tokio::test]
+async fn every_scoped_table_declares_a_scope_foreign_key() {
+    // `tenants` and `environments` are the scope tables THEMSELVES. `tenants` is the root,
+    // so it has no scope above it to reference, and `environments` references `tenants`
+    // through a plain single-column key that the composite rule does not describe. Both
+    // still force row-level security, which is why they are named here rather than filtered
+    // by some property that would also excuse a real table.
+    const THE_SCOPE_TABLES: [&str; 2] = ["tenants", "environments"];
+
+    // THREE TABLES THAT DO NOT SATISFY THE RULE TODAY, listed rather than filtered away.
+    //
+    // Every one predates this migration and belongs to a different subsystem, so fixing
+    // them is issue #920 rather than this change: each needs its own schema migration, and
+    // adding a foreign key VALIDATES existing rows, so on a deployment that already carries
+    // an orphan the migration fails rather than the write. That is a decision to take
+    // deliberately and not inside a naming fix.
+    //
+    // What each is missing, measured from its own migration:
+    //
+    // * `webhook_endpoints` (0111) declares NO foreign key at all, only a non-empty CHECK
+    //   on the two scope columns. A store-level write naming an environment that never
+    //   existed lands. The management handler resolves the scope first, so nothing reaches
+    //   it today; the store invariant is still false.
+    // * `webhook_delivery_attempts` (0113) keys onto `outbox_messages (id)`, and
+    //   `user_trait_login_index` (0131) onto `users (id)`. Both parents are scoped, so in
+    //   practice a ghost scope has no parent row to reference and the write fails on THAT
+    //   key instead. That is a weaker guarantee than a scope key and it is not the one the
+    //   module documentation above claims.
+    //
+    // Asserted as an EXACT set, both directions. A fourth table fails here the day it is
+    // migrated, and so does fixing one of these three without removing it from this list,
+    // which is what keeps the list from rotting into a permanent excuse.
+    const KNOWN_MISSING: [&str; 3] = [
+        "user_trait_login_index",
+        "webhook_delivery_attempts",
+        "webhook_endpoints",
+    ];
+
+    let db = TestDatabase::start().await;
+
+    let forced: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relforcerowsecurity \
+         ORDER BY c.relname",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the forced row-level-security tables");
+
+    // The same non-triviality floor the rule's inventory carries, for the same reason: an
+    // empty result would satisfy every assertion below while measuring nothing.
+    assert!(
+        forced.len() > 50,
+        "the schema must force row-level security on the scoped tables; found {} which \
+         means this query is reading the wrong thing rather than that the tables are gone",
+        forced.len()
+    );
+
+    let with_scope_key: BTreeSet<String> = candidate_foreign_keys(&db)
+        .await
+        .into_iter()
+        .filter(ForeignKey::onto_a_scope_table)
+        .map(|key| key.child)
+        .collect();
+
+    let missing: BTreeSet<&str> = forced
+        .iter()
+        .map(String::as_str)
+        .filter(|table| !THE_SCOPE_TABLES.contains(table) && !with_scope_key.contains(*table))
+        .collect();
+    let known: BTreeSet<&str> = KNOWN_MISSING.into_iter().collect();
+    let unexpected: Vec<&&str> = missing.difference(&known).collect();
+    assert!(
+        unexpected.is_empty(),
+        "every table with forced row-level security must declare a foreign key onto a \
+         scope table, or a write naming a scope that was never created SUCCEEDS and the \
+         row it wrote is then invisible to every reader. These do not, and are not on the \
+         documented list: {unexpected:#?}"
+    );
+    let fixed: Vec<&&str> = known.difference(&missing).collect();
+    assert!(
+        fixed.is_empty(),
+        "these are documented above as MISSING a scope foreign key and now have one, so \
+         the list here is stale and hides the next real gap: {fixed:#?}"
+    );
+}
+
+/// The two constraints migration 0150 rewrites keep `ON DELETE CASCADE` (issues #111, #112).
+///
+/// 0150 DROPs and re-ADDs both keys, and its header states the delete behaviour is
+/// "preserved exactly". Nothing measured that: re-adding either one without the clause left
+/// every test in this file and in `message_templates.rs` and `flow_targets.rs` green.
+///
+/// Losing it is silent and permanent. Deleting an environment would fail on a dangling
+/// template or flow target instead of cascading, and the migration that caused it is
+/// checksummed, so the claim in its header could not be corrected afterwards.
+#[tokio::test]
+async fn the_rewritten_scope_keys_still_cascade_on_delete() {
+    let db = TestDatabase::start().await;
+
+    for (constraint, table) in [
+        (
+            "message_templates_environment_id_tenant_id_fkey",
+            "message_templates",
+        ),
+        ("flow_targets_environment_id_tenant_id_fkey", "flow_targets"),
+    ] {
+        let definition: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con \
+             JOIN pg_class child ON child.oid = con.conrelid \
+             JOIN pg_namespace ns ON ns.oid = child.relnamespace \
+             WHERE ns.nspname = 'public' AND con.conname = $1",
+        )
+        .bind(constraint)
+        .fetch_optional(db.owner_pool())
+        .await
+        .expect("read the constraint definition");
+
+        // Its EXISTENCE under the new name first: without this the assertion below passes
+        // vacuously on a `None` the day the constraint is renamed again.
+        let definition = definition
+            .unwrap_or_else(|| panic!("{table} must declare {constraint} after migration 0150"));
+        assert!(
+            definition.contains("ON DELETE CASCADE"),
+            "{constraint} must keep ON DELETE CASCADE, which 0150 says it preserves \
+             exactly: {definition}"
+        );
+    }
 }

@@ -1,7 +1,8 @@
 -- SPDX-License-Identifier: MIT OR Apache-2.0
 --
--- Bring two scope foreign keys back onto the naming convention the absent-scope
--- conversion depends on (issues #111, #112).
+-- Bring two scope foreign keys onto the naming convention the absent-scope conversion
+-- depends on (issues #111, #112). They were never on it: both were declared off-convention
+-- and have been since the migration that created them.
 --
 -- WHAT WAS WRONG. `StoreError::from` recognizes "this write tripped a foreign key onto a
 -- scope table" by the constraint NAME, matching the suffix `_tenant_id_fkey`. That works
@@ -21,11 +22,13 @@
 -- one, so no route reaches these writes today on any plane. The uniform not-found exists
 -- to stop the data plane being an existence oracle, and these two are not on it.
 --
--- So this is not a live oracle. It is a table that BROKE the convention the anti-oracle
--- conversion is built on, which is a defect the moment such a table acquires a write path
--- and a contract defect on the management plane before then (issue #409: an integrator who
--- mistypes an environment id gets a 500). The completeness guard is what caught it, and
--- the guard is worth exactly as much as the convention being kept.
+-- So this is not a live oracle, and it is not a live 500 either: with no route to these
+-- writes, nobody gets either answer today. What it is, is a table that BROKE the convention
+-- the anti-oracle conversion is built on. The day such a table acquires a management write
+-- path it is issue #409's contract defect (an integrator who mistypes an environment id
+-- gets a 500); the day it acquires a data-plane one it is issue #449's oracle. The
+-- completeness guard is what caught it, and the guard is worth exactly as much as the
+-- convention being kept.
 --
 -- WHY RE-DECLARE RATHER THAN RENAME. `ALTER ... RENAME CONSTRAINT` would satisfy the rule
 -- while leaving the columns in the order the name now denies, so the schema would agree
@@ -52,7 +55,25 @@
 
 -- Bounded rather than unbounded: if `environments` is busy, fail and let the operator
 -- retry rather than queue an AccessExclusive request in front of every new reader.
-SET LOCAL lock_timeout = '3s';
+--
+-- TUNABLE, because `SET LOCAL` overrides a role or database default and this file is
+-- CHECKSUMMED, so a bare literal would be a one-way choice nobody could revisit. An
+-- operator on a busy `environments` sets `ironauth.migration_lock_timeout` (in
+-- postgresql.conf, on the role, or on the connection) and gets their value; everyone else
+-- gets three seconds. The `true` argument to `current_setting` makes an unset custom
+-- setting return NULL rather than raise, which is what makes the default reachable at all.
+--
+-- `set_config(..., true)` rather than `SET LOCAL`, because `SET` takes a literal and not an
+-- expression: the expression form is a syntax error, which is how this was found.
+DO $$
+BEGIN
+    PERFORM set_config(
+        'lock_timeout',
+        coalesce(current_setting('ironauth.migration_lock_timeout', true), '3s'),
+        true
+    );
+END
+$$;
 
 ALTER TABLE message_templates
     DROP CONSTRAINT message_templates_tenant_id_environment_id_fkey;

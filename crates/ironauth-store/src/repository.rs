@@ -29504,7 +29504,7 @@ fn locale_bundle_from_row(row: &sqlx::postgres::PgRow) -> LocaleBundleRecord {
 
 /// Authoring message template overrides (issue #111).
 ///
-/// CONTROL plane only, which migration 0144's grants enforce: the app role renders and holds
+/// CONTROL plane only, which migration 0145's grants enforce: the app role renders and holds
 /// SELECT alone. An app role that could author a template could rewrite what every recipient
 /// of that environment is sent, which is a strictly larger power than anything else the send
 /// path needs.
