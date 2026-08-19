@@ -89,6 +89,7 @@ cd "$(git rev-parse --show-toplevel)"
 # PR survived and the shell half did not. That is the shape a merge conflict resolved by
 # hand produces -- a tree that compiles and passes its own tests with one side quietly
 # dropped -- and it is why scoped-table-registration.sh exists.
+#
 # backchannel_authentication_requests (#131) is the OpenID CIBA table: the digest-
 # keyed poll lookup plus the approval linkage. Scoped exactly like device_codes,
 # which it is modelled on -- the two flows differ in who is polled and where the
