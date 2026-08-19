@@ -30,6 +30,31 @@ cd "$(git rev-parse --show-toplevel)"
 # failure inside a check is caught here while an unexpected error anywhere else still aborts.
 GATE_FAILURES=()
 
+# WHETHER THE RUN REACHED THE END, and the lanes it could not run.
+#
+# The trap alone is not enough, and the first version of this rewrite proved it. On a signal
+# death `$?` inside the trap is the status of the last COMPLETED command, not the signal, so
+# a Ctrl-C during a long check left `rc=0` and an empty failure list, and the summary printed
+# `gate: all local checks green` after 35 of 66 checks. The process still exited 130, so the
+# STATUS was right and only the text lied -- which is the worse half, because a multi-hour
+# run is read from `gate.log` afterwards and the last line is what a reader takes away.
+#
+# On main this could not happen, for an uninteresting reason: the green line was the script's
+# last statement, so an interrupted run never reached it. Moving the summary into a trap is
+# what created the hole, so this flag is part of that move rather than an extra.
+#
+# SKIPPED lanes are ledgered for the same reason one step milder: on a fresh clone with no
+# node dependencies, 62 of 66 checks run and the summary said "all local checks green" with
+# no qualification. This file's own header warns that "a local gate that is quietly a subset
+# of CI teaches you to trust a green that does not mean what it looks like."
+GATE_COMPLETED=0
+GATE_SKIPPED=()
+
+# Record a lane this machine could not run. `$1` is the lane, `$2` how to enable it.
+skipped() {
+  GATE_SKIPPED+=("$1 ($2)")
+}
+
 # The summary prints from a TRAP, not from the tail of the script.
 #
 # A tail-printed summary is lost the moment anything aborts -- and the first version of this
@@ -46,9 +71,25 @@ gate_summary() {
     echo "gate: ${#GATE_FAILURES[@]} check(s) FAILED:"
     printf '  - %s\n' "${GATE_FAILURES[@]}"
     # A non-zero rc from an abort is preserved; a clean exit with failures recorded becomes 1.
-    ((rc == 0)) && rc=1
+    if ((rc == 0)); then rc=1; fi
+  fi
+
+  # LAST, deliberately. An interrupted run's failure list is a PARTIAL accounting, so the
+  # caveat has to be the thing at the bottom of the log rather than a line above a list that
+  # reads as complete.
+  if ((GATE_COMPLETED == 0)); then
+    echo ""
+    echo "gate: INCOMPLETE -- the run ended before the last check."
+    echo "      Every check after the interruption never ran, so any list above is a"
+    echo "      PARTIAL accounting. This is not a green gate."
+    if ((rc == 0)); then rc=1; fi
   elif ((rc == 0)); then
-    echo "gate: all local checks green"
+    if ((${#GATE_SKIPPED[@]} > 0)); then
+      echo "gate: all local checks green, ${#GATE_SKIPPED[@]} lane(s) SKIPPED here (CI runs them):"
+      printf '  - %s\n' "${GATE_SKIPPED[@]}"
+    else
+      echo "gate: all local checks green"
+    fi
   fi
   exit "$rc"
 }
@@ -72,11 +113,27 @@ run() {
 # the fix-one-thing-rerun-everything loop this rewrite exists to remove, for what is by far
 # clippy's most common failure mode.
 #
-# The scope is also narrower than it looks: 18 of the 51 downstream checks invoke cargo, and
-# the other 33 are grep and python scans that never needed a compiling tree. So the honest
-# claim is "one third of the checks below would report the same root cause", not two thirds,
-# and the reason to stop is that those 18 are also the slow ones -- they would spend the
-# gate's full wall-clock re-proving a single compile error.
+# The scope is also narrower than it looks. Counted on this file: 66 checks, 63 of them below
+# this prerequisite. FIFTEEN of those 63 reach cargo -- two on gate.sh's own lines and
+# thirteen through leaf scripts that shell out to it -- or seventeen when cargo-deny and the
+# ironbus lane are both available. The remaining 46 to 48 are grep and python scans that
+# never needed a compiling tree.
+#
+# So the honest claim is "about a quarter of the checks below would report the same root
+# cause", and the reason to stop is that those fifteen are also the slow ones: they would
+# spend the gate's full wall-clock re-proving one compile error.
+#
+# RE-DERIVED rather than adjusted. An earlier version said "18 of the 51", where 51 was a
+# leftover denominator from the banner count this rewrite replaced. Correcting a fraction
+# without re-deriving what it divides by is how a wrong number survives a correction.
+#
+# IT ALSO COSTS SOMETHING, on every green run, which is the common case. `cargo check` and
+# `cargo clippy` do not share fingerprints, so clippy re-checks what this just checked. The
+# cost is bounded to the workspace crates rather than the dependency graph (measured:
+# dependencies are reused, only the workspace crate recompiles), so it is a second pass over
+# our own code and not a second build. That is the trade: a bounded fixed cost on every green
+# run, against not spending the gate's full wall-clock re-proving one compile error on a red
+# one. Worth stating rather than presenting this as free.
 run_required() {
   local label="$1"
   shift
@@ -85,7 +142,7 @@ run_required() {
     GATE_FAILURES+=("$label (prerequisite -- later checks were skipped)")
     echo "    FAILED: $label"
     echo "    This is a PREREQUISITE: the cargo-dependent checks after it need a compiling"
-    echo "    tree, so the gate stops rather than re-proving one root cause 18 times."
+    echo "    tree, so the gate stops rather than re-proving one root cause 15 times."
     exit 1
   fi
 }
@@ -170,6 +227,7 @@ if [ -x packages/ironauth-sdk/node_modules/.bin/tsc ]; then
 else
     echo "sdk check(): SKIPPED, packages/ironauth-sdk dependencies are not installed."
     echo "             Run: (cd packages/ironauth-sdk && npm install)  [CI runs this check]"
+    skipped "SDK check() middleware" "cd packages/ironauth-sdk && npm install"
 fi
 
 run "journey transcript replay" scripts/journey-replay.sh
@@ -192,6 +250,7 @@ if [ -x packages/admin-spa/node_modules/.bin/openapi-typescript ]; then
 else
     echo "admin-spa-bindings: SKIPPED, packages/admin-spa dependencies are not installed."
     echo "                    Run: (cd packages/admin-spa && npm install)  [CI runs this check]"
+    skipped "admin SPA bindings freshness" "cd packages/admin-spa && npm install"
 fi
 run "idempotent write audit (no admin handler splits two store writes behind one Idempotency-Key)" scripts/idempotent-write-audit.sh
 
@@ -269,6 +328,7 @@ if command -v cargo-deny >/dev/null 2>&1; then
   run "cargo deny" cargo deny check
 else
   echo "==> cargo deny skipped (not installed; CI enforces it)"
+  skipped "cargo deny" "cargo install cargo-deny"
 fi
 
 # The IRONBUS lane of the dual-mode async matrix (issue #104, criterion 6).
@@ -286,6 +346,14 @@ if [ -n "${IRONBUS_ADDR:-}" ]; then
     --test outbox --test outbox_ironbus
 else
   echo "==> outbox ironbus lane SKIPPED (set IRONBUS_ADDR to a broker to run it; CI always does)"
+  skipped "outbox ironbus lane" "set IRONBUS_ADDR to a broker"
 fi
+
+# THE LAST STATEMENT, and it has to stay last.
+#
+# This is what tells the trap the difference between a run that finished and one that was
+# killed. Anything placed below it would execute on a run the flag has already declared
+# complete, so new checks go ABOVE.
+GATE_COMPLETED=1
 
 # The EXIT trap prints the summary and decides the status.
