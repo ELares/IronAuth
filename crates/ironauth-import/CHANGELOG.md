@@ -8,11 +8,13 @@ range per docs/RELEASING.md.
 
 - **Dropped five dependencies this crate never used**: `aes`, `ctr`, `subtle`, `base64` and
   `password-hash`.
-  All four were declared with comments explaining what Firebase modified scrypt needs, which
-  is true and happens entirely inside `ironauth-hash-scheme`. Measured: zero references to
-  any of them anywhere in `crates/ironauth-import/src` or `tests`, and
-  `cargo check -p ironauth-import --all-features --all-targets` is clean with all four
-  removed.
+  Four of the five were declared with comments explaining what Firebase modified scrypt
+  needs, which is true and happens entirely inside `ironauth-hash-scheme`. `password-hash`
+  was not: its comment described the PHC parser and the `PasswordVerifier` trait, which is
+  part of why a grep organized around the Firebase theme walked past it.
+  Measured: `cargo check -p ironauth-import --all-features --all-targets` is clean with all
+  five removed. NOT "zero references": `password_hash::` appears five times under `tests/`,
+  which is exactly the point made below and the reason the compile oracle was needed.
 
   They were left behind when the Firebase logic moved out, and they are why dependabot kept
   opening bumps against a crate that could not have noticed either way.
@@ -22,7 +24,8 @@ range per docs/RELEASING.md.
   third replaced grep with a COMPILE ORACLE -- remove each declared dependency in turn, run
   `cargo check --all-features --all-targets`, restore -- and that found `password-hash`,
   which grep could not, because every `password_hash::` occurrence in this crate arrives
-  through `argon2`'s re-export. Exactly the mechanism that made `cipher` dead in
+  through a re-export: three through `argon2`, one through `scrypt`, one through `pbkdf2`.
+  The crate name never appears, so nothing keyed on it can see that the dependency is dead. Exactly the mechanism that made `cipher` dead in
   `ironauth-hash-scheme`, one crate over, found only when the method stopped keying on the
   name.
 
