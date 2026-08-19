@@ -1363,6 +1363,62 @@ async fn a_storm_of_session_bound_opens_never_orphans_a_family_onto_a_revoked_se
     );
 }
 
+/// Claim and complete everything the FIXTURE queued, and say how many that was.
+///
+/// Creating a session emits `user.signed_in` in the insert's own transaction (issue #107,
+/// commit 79809905), because metering counts monthly actives off it and the store is its only
+/// producer. The revocation tests below were written before that existed and claim the WHOLE
+/// outbox, so each one saw the fixture's sign-ins alongside the event it was actually
+/// asserting about and failed with `left: 2, right: 1`.
+///
+/// Returns the count rather than draining silently, so every caller ASSERTS what its fixture
+/// queued. A blind drain would swallow the next such change instead of reporting it, and the
+/// count is worth pinning in its own right: it is the only place the suite states that
+/// creating a session emits exactly one event per session.
+async fn drain_fixture_events(db: &TestDatabase, env: &Env, scope: Scope) -> usize {
+    // LOOPS, because one claim is not one drain. The outbox delivers at most one message per
+    // ORDERING KEY at a time, so a claim never yields the second sign-in until the first is
+    // completed, and every session in these fixtures shares one subject. A single claim
+    // returned 1 where the fixture had queued 3, which is exactly the false reading a drain
+    // helper must not hand back.
+    let mut drained = 0;
+    // Bounded so a stuck claim fails the test instead of hanging it. Well above any fixture
+    // here, which queue at most three.
+    for _ in 0..64 {
+        let claimed = db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim the fixture's events");
+        if claimed.is_empty() {
+            return drained;
+        }
+        for message in &claimed {
+            assert_eq!(
+                message.payload["type"], "user.signed_in",
+                "the fixture queued an event that is not a sign-in; the assertions below \
+                 drain the outbox on the assumption that a session insert is the only thing \
+                 that queued anything, and that assumption has just changed"
+            );
+            db.store()
+                .scoped(scope)
+                .outbox()
+                .complete(env, message)
+                .await
+                .expect("complete");
+            drained += 1;
+        }
+    }
+    panic!("the fixture's outbox never drained; {drained} events completed and more remain")
+}
+
 /// Revoking a session emits `session.revoked`, carrying the CAUSE and no token.
 ///
 /// The cause is the point: an operator ending a session and a session ended by a policy fence
@@ -1380,6 +1436,12 @@ async fn revoking_a_session_emits_the_cause_and_never_a_token() {
     let subject = UserId::generate(&env, &scope).to_string();
     let session = create_session(&db, &env, scope, &subject, None).await;
     let session_subject = session.to_string();
+    assert_eq!(
+        drain_fixture_events(&db, &env, scope).await,
+        1,
+        "creating one session queues one sign-in, and this test asserts on what the REVOKE \
+         queues, so the fixture's event is taken off the feed first"
+    );
 
     let envelope = ironauth_store::event_catalog::envelope(
         "evt_session_revoked",
@@ -1460,6 +1522,11 @@ async fn a_bulk_revoke_announces_only_the_sessions_that_flipped() {
     let first = create_session(&db, &env, scope, &subject, None).await;
     let already = create_session(&db, &env, scope, &subject, None).await;
     let third = create_session(&db, &env, scope, &subject, None).await;
+    assert_eq!(
+        drain_fixture_events(&db, &env, scope).await,
+        3,
+        "three sessions, three sign-ins"
+    );
 
     // Revoke the middle one up front, WITHOUT an event, so it is a no-op in the batch below.
     db.store()
@@ -1564,6 +1631,11 @@ async fn a_bulk_revoke_refuses_an_envelope_slice_of_the_wrong_length() {
     let subject = UserId::generate(&env, &scope).to_string();
     let first = create_session(&db, &env, scope, &subject, None).await;
     let second = create_session(&db, &env, scope, &subject, None).await;
+    assert_eq!(
+        drain_fixture_events(&db, &env, scope).await,
+        2,
+        "two sessions, two sign-ins"
+    );
 
     let one = first.to_string();
     let envelope = ironauth_store::event_catalog::envelope(
@@ -1628,6 +1700,11 @@ async fn revoking_every_session_of_a_user_emits_one_event_naming_the_user() {
     let subject_id = subject.to_string();
     let _first = create_session(&db, &env, scope, &subject_id, None).await;
     let _second = create_session(&db, &env, scope, &subject_id, None).await;
+    assert_eq!(
+        drain_fixture_events(&db, &env, scope).await,
+        2,
+        "two sessions, two sign-ins"
+    );
 
     let envelope = ironauth_store::event_catalog::envelope(
         "evt_user_sessions_revoked",

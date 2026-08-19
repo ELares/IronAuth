@@ -608,9 +608,16 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 148 operations declare a required permission and 4 have that permission proven. The other
+/// 166 operations declare a required permission and 22 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
+///
+/// ALL THREE NUMBERS ARE PINNED BELOW, and that is a repair rather than a flourish. This
+/// paragraph read "148 ... and 4" while the assertion underneath pinned 166, because only the
+/// first number had a test and the sentence beside it was maintained by hand. It was wrong at
+/// the merge-base too (147 and 3 against an actual 165 and 21), so it had drifted twice
+/// without anything going red. A sentence that carries a count needs the count asserted, or
+/// the next reader budgets against a figure nobody has checked since it was typed.
 ///
 /// This pin may only improve: `PERMISSION_PROVEN` may grow, and the ratio may not get worse
 /// without somebody editing this assertion and noticing what they are doing.
@@ -626,6 +633,11 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
         CLASSIFIED.len(),
         166,
         "the classified set changed size; update the unproven count below with it"
+    );
+    assert_eq!(
+        PERMISSION_PROVEN.len(),
+        22,
+        "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
     assert!(
