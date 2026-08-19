@@ -1293,6 +1293,11 @@ pub enum Action {
     /// is validated before it lands, and the upstream client secret is sealed inline
     /// under the scope DEK.
     ConnectorCreate,
+    /// A metering snapshot was published onto the event feed (issue #107): an operator
+    /// or scheduler took a usage reading and made every webhook subscriber receive it.
+    /// Usage belongs to the scope rather than to any row, so the target is the
+    /// scope-level `usage` handle.
+    UsagePublish,
     /// A Standard Webhooks delivery endpoint was registered (issue #105): a POST target
     /// and its sealed signing secret. The row targets the `whe_` endpoint.
     WebhookEndpointCreate,
@@ -1599,6 +1604,7 @@ impl Action {
             Action::RecoveryContactConfirmed => "recovery.contact.confirmed",
             Action::RecoveryIdvCallback => "recovery.idv.callback",
             Action::RiskDisavow => "risk.disavow",
+            Action::UsagePublish => "usage.publish",
             Action::WebhookEndpointCreate => "webhook.endpoint.create",
             Action::WebhookEndpointRotateSecret => "webhook.endpoint.rotate_secret",
             Action::WebhookEndpointSetActive => "webhook.endpoint.set_active",

@@ -2223,6 +2223,15 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         // refuse a soft-deleted one like everything else here.
         Case::empty("event_feed.readEventFeed", "GET", format!("{base}/events")),
         Case::empty("usage.exportUsage", "GET", format!("{base}/usage")),
+        // PUBLISHING is the write half, and it is here for the reason the read half is not
+        // enough: it appends to the feed every webhook subscriber receives, so a
+        // soft-deleted environment that could still publish would keep sending billing
+        // records after the operator believed it gone.
+        Case::empty(
+            "usage.publishUsage",
+            "POST",
+            format!("{base}/usage/publish"),
+        ),
         // ---- sessions ----
         Case::empty("sessions.listSessions", "GET", format!("{base}/sessions")),
         Case::empty(

@@ -2457,6 +2457,38 @@
       "type": "trait_schema.version_created"
     },
     {
+      "domain": "usage",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "connections": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "monthly_active_users": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_issued": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "monthly_active_users",
+          "tokens_issued",
+          "connections",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "usage.reported"
+    },
+    {
       "domain": "user",
       "payload_schema": {
         "additionalProperties": false,

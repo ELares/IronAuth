@@ -401,11 +401,24 @@ async fn validate_and_map(
     ))?;
 
     // RFC 7523 3: `sub` and `exp` are REQUIRED. A missing or empty `sub` is invalid.
+    //
+    // THE EMPTINESS CHECK TRIMS AND THE VALUE DOES NOT, and the difference is a live gate.
+    // This read `.map(str::trim)`, which normalized the subject before the mapping lookup
+    // compared it with `=`. `str::trim` strips the whole Unicode `White_Space` set, not
+    // just ASCII space, so every registered mapping was reachable by a family of about
+    // twenty-five distinct subject strings: measured, `...refs/heads/main` followed by
+    // U+00A0, U+2028, U+202F or U+3000 was each issued the mapped principal, and a git ref
+    // may legally contain all four (git forbids ASCII space and control characters, not
+    // these).
+    //
+    // The trim stays where it belongs. An all-whitespace `sub` is still empty and still
+    // rejected, which is what it was there for; what it no longer does is decide which
+    // mapping the caller matched. The lookup now compares the subject the issuer actually
+    // signed, which is what "binds the exact repository and ref" has to mean.
     let subject = verified
         .claims()
         .subject()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.trim().is_empty())
         .ok_or(JwtBearerError::Reject(
             ClientAuthDiagnosticReason::AssertionInvalid,
         ))?

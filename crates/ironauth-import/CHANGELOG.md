@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Dropped five dependencies this crate never used**: `aes`, `ctr`, `subtle`, `base64` and
+  `password-hash`.
+  Four of the five were declared with comments explaining what Firebase modified scrypt
+  needs, which is true and happens entirely inside `ironauth-hash-scheme`. `password-hash`
+  was not: its comment described the PHC parser and the `PasswordVerifier` trait, which is
+  part of why a grep organized around the Firebase theme walked past it.
+  Measured: `cargo check -p ironauth-import --all-features --all-targets` is clean with all
+  five removed. NOT "zero references": `password_hash::` appears five times under `tests/`,
+  which is exactly the point made below and the reason the compile oracle was needed.
+
+  They were left behind when the Firebase logic moved out, and they are why dependabot kept
+  opening bumps against a crate that could not have noticed either way.
+
+  IT TOOK THREE PASSES, and how the last one found the fifth is the useful part. The first
+  removed two and stopped; the second removed two more after a review pointed at them; the
+  third replaced grep with a COMPILE ORACLE -- remove each declared dependency in turn, run
+  `cargo check --all-features --all-targets`, restore -- and that found `password-hash`,
+  which grep could not, because every `password_hash::` occurrence in this crate arrives
+  through a re-export: three through `argon2`, one through `scrypt`, one through `pbkdf2`.
+
+  A NAME-KEYED GREP DOES NOT COME BACK EMPTY HERE, IT COMES BACK WRONG, and that is the
+  sharper version of the lesson. `password_hash` appears 34 times in this crate, 15 of them
+  in `src/`, and none of those 15 is the crate: they are a struct field and a JSON key
+  (`record.password_hash`, `"password_hash": "..."`). The crate is reached only as the root
+  of a re-exported path, which appears zero times. So a reader grepping the name concludes
+  the dependency is ALIVE, and a reader grepping the manifest spelling finds one hit in a
+  doc comment. Only the compile oracle answers the question.
+
+  Exactly the mechanism that made `cipher` dead in `ironauth-hash-scheme`, one crate over,
+  found only when the method stopped keying on the name.
+
 - **Four import defects that left a run PERMANENTLY unable to complete** (issue #55, review
   fold). Each was measured end to end, and each is worse than it sounds, because in every
   case the identities were fine and only the accounting was wrong, so nothing an operator

@@ -718,3 +718,129 @@ async fn a_producer_emitting_an_off_schema_payload_fails_the_test_that_exercised
         .await
         .expect("unreachable: the enqueue panics before this resolves");
 }
+
+/// The DIRECT appender is covered by the same guard (issue #108 criterion 1).
+///
+/// The sibling above drives `enqueue_domain_event`, the path a producer takes when it rides
+/// a domain write. That is where the assertion originally lived, and there it covered ten of
+/// eleven producers. `OutboxRepo::append_event` is the eleventh: the documented path for a
+/// producer with no domain write to ride (a scheduled job, an operator-triggered publish),
+/// and it went straight to the insert. A guard that covers all but one producer is a guard
+/// the remaining one will eventually find, which is what the usage publisher did.
+///
+/// So the check now sits at the INSERT rather than at one producer, and this test is what
+/// makes that true rather than intended. There are two inserts, not one -- the
+/// conflict-tolerant path has its own -- and the sibling below covers the other.
+#[tokio::test]
+#[should_panic(expected = "does not validate against the registry")]
+async fn the_direct_appender_is_covered_by_the_emit_time_schema_guard() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // Same shape as the sibling: a REGISTERED type whose payload violates its schema, built
+    // by hand because `event_catalog::envelope` would refuse it.
+    let invalid = serde_json::json!({
+        "id": "evt_direct_off_schema",
+        "type": "ban.created",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        "payload": { "subject_kind": "identifier", "auth_path": "password" },
+    });
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .append_event(
+            &env,
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: "evt_direct_off_schema",
+                ordering_key: "identifier:password",
+                payload: invalid,
+            },
+        )
+        .await
+        .expect("unreachable: the append panics before this resolves");
+}
+
+/// The guard is scoped to the EVENT feed, and that scoping is deliberate.
+///
+/// A message on `WEBHOOK_DELIVERY_CONSUMER` is a delivery instruction, not an event: it
+/// carries a different payload shape that the catalog does not describe and must not be
+/// measured against. Without this test the scoping is an untested condition, and the
+/// cheapest wrong way to write the guard -- drop the consumer check and validate every
+/// outbox row -- would break every delivery in the system while the two tests above stayed
+/// green.
+#[tokio::test]
+async fn a_delivery_message_is_not_measured_against_the_event_registry() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // Not an event envelope at all, and correctly so.
+    let delivery = serde_json::json!({ "endpoint": "whe_x", "attempt": 1 });
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .append_event(
+            &env,
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::WEBHOOK_DELIVERY_CONSUMER,
+                idempotency_key: "dlv_not_an_event",
+                ordering_key: "whe_x",
+                payload: delivery,
+            },
+        )
+        .await
+        .expect("a delivery message is not an event and must append unchallenged");
+}
+
+/// The CONFLICT-TOLERANT insert is covered by the same guard too (issue #108 criterion 1).
+///
+/// `OutboxRepo::enqueue_all` writes through `enqueue_outbox_in_tx_ignoring_conflict`, which
+/// carries its own `INSERT` and so did not reach the assertion when it moved down from
+/// `enqueue_domain_event`. Review put an unregistered type through it and watched the row
+/// land with no panic, which made "the single statement every event-feed row passes through"
+/// false by exactly one statement -- the same shape as the defect the move was fixing, one
+/// function over.
+///
+/// No live hole existed: both production callers of `enqueue_all` use
+/// `WEBHOOK_DELIVERY_CONSUMER` and `BACKCHANNEL_LOGOUT_CONSUMER`. But `enqueue_all` is the
+/// shape a fan-out producer is documented to use, so the next one would have found it, and a
+/// claim asserted in three places that outlive this change had better be true.
+#[tokio::test]
+#[should_panic(expected = "does not validate against the registry")]
+async fn the_conflict_tolerant_insert_is_covered_by_the_emit_time_schema_guard() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let invalid = serde_json::json!({
+        "id": "evt_enqueue_all_off_schema",
+        "type": "ban.created",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        "payload": { "subject_kind": "identifier", "auth_path": "password" },
+    });
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .enqueue_all(
+            &env,
+            &[ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: "evt_enqueue_all_off_schema",
+                ordering_key: "identifier:password",
+                payload: invalid,
+            }],
+        )
+        .await
+        .expect("unreachable: the enqueue panics before this resolves");
+}

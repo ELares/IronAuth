@@ -13,6 +13,10 @@ to pick an open issue in the current milestone and say so on the issue.
   compatibility checks CI enforces. Changes to the management API additionally
   run `scripts/openapi-check.sh` (the served-versus-committed OpenAPI drift
   check).
+  A full run takes hours, so capture it: `scripts/gate.sh > gate.log 2>&1`, then read
+  `tail -1 gate.log` for the verdict. The summary prints from an EXIT trap, so it
+  survives an interrupt, and it reports every failing check rather than the first.
+  `gate.log` is gitignored.
 - **New fuzz targets run in CI.** A fuzz target is registered by a `[[bin]]`
   entry in its `*/fuzz/Cargo.toml`, and it only ever EXECUTES if it also has a
   row in the `.github/workflows/fuzz.yml` matrix. `scripts/fuzz-matrix-freshness.sh`

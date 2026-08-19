@@ -1524,10 +1524,20 @@ async fn an_event_outside_the_catalog_is_refused_permanently_and_reaches_no_endp
         "environment_id": environment,
         "payload": {"user_id": "usr_1"}
     });
+    // Enqueued through the UNVALIDATED seam, and that is now load-bearing rather than
+    // incidental. The emit-time assertion (issue #108 criterion 1) sits at BOTH of the two
+    // statements that insert into `outbox_messages`, which together are every event-feed
+    // row (it was one statement until this change, and "the single statement every row
+    // passes through" was false by exactly one), so an ordinary enqueue of this envelope
+    // panics inside the producer's transaction -- which is exactly what it is there for.
+    //
+    // That assertion is compiled out of RELEASE builds by design, so in production this row
+    // lands and the fan-out is what refuses it. This seam reproduces that state, which is
+    // the state the test is about.
     store
         .scoped(scope)
         .outbox()
-        .enqueue(
+        .enqueue_unvalidated_for_test(
             &env,
             &NewOutboxMessage {
                 consumer: WEBHOOK_EVENT_CONSUMER,

@@ -81,11 +81,31 @@ BASELINE = ROOT / "scripts" / "producer-coverage-baseline.txt"
 # `post(tenants::create_tenant)` -> ("post", "tenants", "create_tenant")
 ROUTE = re.compile(r"\b(post|put|patch|delete)\(\s*([a-z0-9_]+)::([a-z0-9_]+)\s*[,)]")
 
-# The frame builds an event: a `DomainEvent` value, or a call to one of the `*_event`
-# builders. Keyed on CONSTRUCTION rather than on the store method's name, because the
-# event-accepting methods are spelled eight different ways and three carry no suffix
-# (`admin_create_emitting`, `delete`, `update_claims`).
-EMITS = re.compile(r"DomainEvent|\b[a-z0-9_]+_event\s*\(")
+# The frame builds an event: a `DomainEvent` value, a call to one of the `*_event`
+# builders, or a direct `event_catalog::envelope(...)`. Keyed on CONSTRUCTION rather than
+# on the store method's name, because the event-accepting methods are spelled eight
+# different ways and three carry no suffix (`admin_create_emitting`, `delete`,
+# `update_claims`).
+#
+# `envelope(` is the third shape and it was missing. A producer that rides a domain write
+# hands the store a `DomainEvent`; a producer with NO domain write to ride -- a scheduled
+# job, an operator-triggered publish -- builds the envelope itself and appends it. That
+# second shape is documented on `OutboxRepo::append_event` as the supported path, so it is
+# what every future producer of its kind will look like, and this scan reported the first
+# one that arrived as announcing nothing. An EXEMPT entry would have been a false
+# statement: that handler both mutates and announces.
+#
+# Deliberately not tightened to `event_catalog::envelope`, and NOT because every call site
+# is that qualified form: 76 are, and four are `crate::events::envelope(` (`users.rs` three
+# times, `organizations.rs` once). An earlier version of this comment asserted the stronger
+# thing, which was false and would have made the tightening look free. Measured, tightening
+# still passes 127/127, because those four producers are detected through the `*_event(`
+# shape instead. The reason to keep the loose pattern is the tradeoff below: the looser
+# pattern's only risk is a false PASS on some future unrelated `envelope(`. That is the
+# wrong direction to guard against
+# here -- a false FAILURE on a correct handler would push the next author toward an
+# EXEMPT entry, and a wrong EXEMPT entry is permanent while a wrong regex is not.
+EMITS = re.compile(r"DomainEvent|\b[a-z0-9_]+_event\s*\(|\benvelope\s*\(")
 
 # Mounted on a write method, but mutates NOTHING: a query whose input does not fit in a URL.
 # Each was read and confirmed to contain no write call and no audited write. An event here

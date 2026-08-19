@@ -598,6 +598,14 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/usage",
             get(usage::export_usage),
         )
+        // Publishing the same snapshot as a `usage.reported` event (issue #107 criterion 4:
+        // metering "exports via API and webhook"). A separate verb from the GET above
+        // deliberately: emitting on read would make whoever polls the dashboard decide when
+        // a customer is billed.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish",
+            post(usage::publish_usage),
+        )
         // The ordered event feed (issue #107): the cursor-paginated READ surface over the
         // log, recommended over webhooks for data synchronisation. An aged-out cursor is a
         // 410 carrying the oldest cursor that still resolves, never an empty 200.

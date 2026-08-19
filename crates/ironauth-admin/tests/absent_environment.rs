@@ -301,6 +301,16 @@ fn abuse_and_sudo_cases(base: &str) -> Vec<Case> {
             body: Some(ban),
         },
         Case {
+            // The usage PUBLISH, not the export: the export is a GET and this sweep covers
+            // writes. It appends to the event feed every webhook subscriber receives, so an
+            // absent environment reaching it would make subscribers receive a billing record
+            // for a scope that does not exist.
+            label: "usage.publishUsage",
+            method: "POST",
+            path: format!("{base}/usage/publish"),
+            body: None,
+        },
+        Case {
             label: "webhook_endpoints.createWebhookEndpoint",
             method: "POST",
             path: format!("{base}/webhook-endpoints"),

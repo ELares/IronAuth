@@ -249,6 +249,7 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     "trait_migration_job",
     "upstream_token",
     "upstream_token_grant",
+    "usage",
     "webhook",
 ];
 

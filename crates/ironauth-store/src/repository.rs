@@ -1459,6 +1459,17 @@ impl<'a> ActingStore<'a> {
         }
     }
 
+    /// The mutating per-scope usage repository for this scope and actor (issue #107):
+    /// publish a metering snapshot onto the event feed, audited.
+    #[must_use]
+    pub fn usage(&self) -> ActingUsageRepo<'a> {
+        ActingUsageRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
     /// The mutating per-scope step-up policy repository for this scope and actor
     /// (RFC 9470, issue #72): set (upsert) or remove a per-scope authentication
     /// requirement, audited.
@@ -8210,6 +8221,141 @@ impl ActingSmsOtpRepo<'_> {
         insert_audit_row(&mut tx, &alarm_spec, Some(detail)).await?;
         tx.commit().await?;
         Ok(true)
+    }
+}
+
+/// The audit target for a usage SNAPSHOT publish (issue #107). Usage is a property of the
+/// scope rather than of any row, so like the SMS configuration it targets a scope-level
+/// handle instead of an `id_`.
+struct UsageTarget;
+
+impl AuditTarget for UsageTarget {
+    fn audit_target_kind(&self) -> &'static str {
+        "usage"
+    }
+
+    fn audit_target_id(&self) -> String {
+        "usage".to_owned()
+    }
+}
+
+/// The acting per (tenant, environment) usage repository (issue #107): publishing a
+/// metering snapshot onto the event feed.
+pub struct ActingUsageRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingUsageRepo<'_> {
+    /// Append a usage snapshot to the event feed, record the caller's `Idempotency-Key`
+    /// response, and write the audit row -- all in ONE transaction.
+    ///
+    /// # Why all three together
+    ///
+    /// Split across statements, each pair can half-succeed in a way that matters:
+    ///
+    /// - append without idempotency: the retry that WILL happen appends a second event,
+    ///   which for a billing record is a duplicate invoice line;
+    /// - append without audit: a state-mutating admin request with no trail, which is the
+    ///   one thing this module's whole audited-write discipline exists to prevent;
+    /// - idempotency without append: every later retry replays a success for an event that
+    ///   was never published, and the snapshot is lost silently.
+    ///
+    /// So this rides [`write_audited`], the module's single committing write path, with the
+    /// append and the idempotency row as its mutation.
+    ///
+    /// The advisory lock is taken inside that same transaction, so the per-scope append
+    /// ORDER this method inherits from [`OutboxRepo::append_event`] is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::IdempotencyConflict`] when a concurrent request stored the same
+    /// `(credential_ref, key)` first; the caller resolves that by replaying the stored
+    /// response. [`StoreError::Database`] on any other persistence fault.
+    ///
+    /// Named exactly, because the first version of this doc said `Conflict` and the handler
+    /// matched on what the doc said. `Conflict` is the DOMAIN uniqueness error and this path
+    /// cannot raise it, so the replay arm was unreachable and a concurrent retry got a 500.
+    pub async fn publish_snapshot(
+        &self,
+        env: &Env,
+        message: &NewOutboxMessage<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<String, StoreError> {
+        self.publish_snapshot_inner(env, message, idempotency, false)
+            .await
+    }
+
+    /// Testing-only atomicity probe: run a real [`publish_snapshot`] (the append, the
+    /// idempotency row and the audit row), then force a guaranteed error inside the SAME
+    /// transaction, so a test can assert that none of the three survives.
+    ///
+    /// This path carries THREE writes rather than the usual two, which is the whole
+    /// argument for routing it through `write_audited` at all, and the argument was
+    /// untested until a review said so. It exercises the exact production path plus a
+    /// trailing poison statement; the public method never poisons.
+    ///
+    /// [`publish_snapshot`]: Self::publish_snapshot
+    ///
+    /// # Errors
+    ///
+    /// Always errors (that is the point): the injected failure rolls the whole transaction
+    /// back.
+    #[cfg(feature = "testing")]
+    pub async fn publish_snapshot_injecting_post_audit_failure(
+        &self,
+        env: &Env,
+        message: &NewOutboxMessage<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<String, StoreError> {
+        self.publish_snapshot_inner(env, message, idempotency, true)
+            .await
+    }
+
+    async fn publish_snapshot_inner(
+        &self,
+        env: &Env,
+        message: &NewOutboxMessage<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        poison_after_audit: bool,
+    ) -> Result<String, StoreError> {
+        let scope = self.scope;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::UsagePublish,
+            target: &UsageTarget,
+        };
+        write_audited(
+            spec,
+            async |tx: &mut Transaction<'_, Postgres>| {
+                // The same per-scope append lock `OutboxRepo::append_event` takes, so a
+                // publish orders against ordinary producers rather than racing them.
+                //
+                // MEASURED, by `atomicity.rs::a_publish_blocks_on_the_per_scope_append_lock`.
+                // An earlier version of this comment said a test aimed at it "would be a
+                // flake rather than a test" and declined to write one. That was wrong about
+                // which property is under test: it is not who WINS a race, it is whether
+                // this call takes the lock at all, and that is observable by holding the
+                // lock from another session and watching the publish fail to complete. The
+                // technique is the one `events_cursor_ordering.rs::
+                // serialising_appenders_on_a_scope_lock_makes_sequence_order_equal_commit_order`
+                // already uses, which races nothing either. Deleting this line now fails
+                // that test.
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(append_lock_key(scope))
+                    .execute(&mut **tx)
+                    .await?;
+                let id = enqueue_outbox_in_tx(tx, env, scope, message).await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(id.to_string())
+            },
+            poison_after_audit,
+        )
+        .await
     }
 }
 
@@ -20955,34 +21101,14 @@ pub(crate) async fn enqueue_domain_event(
     event: Option<&DomainEvent<'_>>,
 ) -> Result<(), StoreError> {
     if let Some(event) = event {
-        // ISSUE #108 CRITERION 1, enforced where a violation is CHEAPEST to diagnose.
+        // NO EMIT-TIME GUARD HERE ANY MORE, and this is where a reader looks for it.
         //
-        // `ironauth_admin::events` validates every event at the fan-out, which is the one
-        // choke point production traffic passes through and is where the check belongs at
-        // run time. But its failure is a log line and a permanent consumer error, discovered
-        // by whoever is watching deliveries -- and by then the producer that built the bad
-        // envelope is long out of scope.
-        //
-        // Under the `testing` feature this panics INSIDE the producer's own transaction
-        // instead, so an unregistered type or an off-schema payload fails the test that
-        // exercised it, with that producer on the stack. Every store and admin test runs
-        // with the feature, so this covers every event the suite emits: the criterion asks
-        // that such an event fail the build, and nothing weaker than an assertion at emit
-        // time does that.
-        //
-        // Deliberately NOT compiled into release builds. A panic here would abort a real
-        // write for a payload the fan-out is already equipped to refuse, turning a
-        // deliverability problem into an outage.
-        #[cfg(feature = "testing")]
-        if let Err(error) = crate::event_catalog::validate_event(event.envelope) {
-            panic!(
-                "a producer emitted an event that does not validate against the registry: \
-                 {error:?}\n\nenvelope: {}\n\nThe fan-out refuses this permanently, so \
-                 shipping it would announce nothing while the write succeeded. Register the \
-                 type, or fix the payload to match the schema it declares.",
-                event.envelope
-            );
-        }
+        // The issue #108 criterion 1 assertion sat at this line first, and here it covered
+        // only producers that ride a domain write: `OutboxRepo::append_event`, the path for
+        // a producer with no domain write to ride, went straight to the insert unchecked.
+        // It now sits on the TWO statements that insert into `outbox_messages`, which
+        // together are every row on the feed. Its rationale lives with it, at
+        // `enqueue_outbox_in_tx_at_inner`.
         enqueue_outbox_in_tx(
             tx,
             env,
@@ -21034,6 +21160,77 @@ pub(crate) async fn enqueue_outbox_in_tx_at(
     message: &NewOutboxMessage<'_>,
     not_before_unix_micros: Option<i64>,
 ) -> Result<OutboxMessageId, StoreError> {
+    enqueue_outbox_in_tx_at_inner(tx, env, scope, message, not_before_unix_micros, true).await
+}
+
+/// [`enqueue_outbox_in_tx_at`] with the emit-time schema assertion turned OFF.
+///
+/// Exists for ONE caller: a test that has to model a row a RELEASE build would have
+/// written, which is where an unregistered type genuinely comes from (the assertion is
+/// compiled out there, so the row lands and the fan-out is what refuses it). Without this
+/// seam such a test cannot exist at all, because the assertion it must bypass is the same
+/// one that makes every other producer safe, and narrowing that assertion to let the test
+/// through would reopen the hole for everybody.
+#[cfg(feature = "testing")]
+pub(crate) async fn enqueue_outbox_in_tx_at_unvalidated(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    message: &NewOutboxMessage<'_>,
+) -> Result<OutboxMessageId, StoreError> {
+    enqueue_outbox_in_tx_at_inner(tx, env, scope, message, None, false).await
+}
+
+async fn enqueue_outbox_in_tx_at_inner(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    message: &NewOutboxMessage<'_>,
+    not_before_unix_micros: Option<i64>,
+    #[cfg_attr(not(feature = "testing"), allow(unused_variables))] validate: bool,
+) -> Result<OutboxMessageId, StoreError> {
+    // ISSUE #108 CRITERION 1, enforced at the insert rather than at one producer, whatever
+    // producer wrote the row.
+    //
+    // `ironauth_admin::events` validates every event at the fan-out, which is the one
+    // choke point production traffic passes through and is where the check belongs at run
+    // time. But its failure is a log line and a permanent consumer error, discovered by
+    // whoever is watching deliveries -- and by then the producer that built the bad
+    // envelope is long out of scope.
+    //
+    // Under the `testing` feature this panics INSIDE the producer's own transaction
+    // instead, so an unregistered type or an off-schema payload fails the test that
+    // exercised it, with that producer on the stack. Every store and admin test runs with
+    // the feature, so this covers every event the suite emits: the criterion asks that
+    // such an event fail the build, and nothing weaker than an assertion at emit time does
+    // that.
+    //
+    // Deliberately NOT compiled into release builds. A panic here would abort a real write
+    // for a payload the fan-out is already equipped to refuse, turning a deliverability
+    // problem into an outage.
+    //
+    // Scoped to `WEBHOOK_EVENT_CONSUMER`, because that is what "event" means here. A
+    // delivery message on `WEBHOOK_DELIVERY_CONSUMER` carries a different payload shape
+    // that the catalog does not describe and must not be measured against it.
+    //
+    // TWO statements carry this, not one: `enqueue_outbox_in_tx_ignoring_conflict` has its
+    // own INSERT and its own copy. An earlier version of this comment said "the single
+    // statement every event-feed row passes through", which was false by exactly one
+    // statement and was found by putting an unregistered type through `enqueue_all`. Both
+    // are tested (`abuse.rs`), so a third insert added without the assertion would be a
+    // third place the claim is wrong rather than a place it is quietly true.
+    #[cfg(feature = "testing")]
+    if validate && message.consumer == WEBHOOK_EVENT_CONSUMER {
+        if let Err(error) = crate::event_catalog::validate_event(&message.payload) {
+            panic!(
+                "a producer emitted an event that does not validate against the registry: \
+                 {error:?}\n\nenvelope: {}\n\nThe fan-out refuses this permanently, so \
+                 shipping it would announce nothing while the write succeeded. Register the \
+                 type, or fix the payload to match the schema it declares.",
+                message.payload
+            );
+        }
+    }
     let id = OutboxMessageId::generate(env, &scope);
     let now_micros = epoch_micros(env.clock().now_utc());
     let due_micros = not_before_unix_micros.unwrap_or(now_micros);
@@ -21088,6 +21285,29 @@ async fn enqueue_outbox_in_tx_ignoring_conflict(
     scope: Scope,
     message: &NewOutboxMessage<'_>,
 ) -> Result<bool, StoreError> {
+    // THE SAME emit-time assertion the ordinary insert carries, because this one is also an
+    // insert into `outbox_messages` and `OutboxRepo::enqueue_all` reaches it with any
+    // consumer the caller names.
+    //
+    // It was missed when the assertion moved down from `enqueue_domain_event`, and that made
+    // "the single statement every event-feed row passes through" false by one statement --
+    // the same shape as the defect the move was fixing, one function over. Review found it
+    // by putting an unregistered type through `enqueue_all` and watching it land without a
+    // panic. No live hole today, because both production callers use
+    // `WEBHOOK_DELIVERY_CONSUMER` and `BACKCHANNEL_LOGOUT_CONSUMER`; but `enqueue_all` is
+    // the shape a fan-out producer is documented to use, so the next one would have found it.
+    #[cfg(feature = "testing")]
+    if message.consumer == WEBHOOK_EVENT_CONSUMER {
+        if let Err(error) = crate::event_catalog::validate_event(&message.payload) {
+            panic!(
+                "a producer emitted an event that does not validate against the registry: \
+                 {error:?}\n\nenvelope: {}\n\nThe fan-out refuses this permanently, so \
+                 shipping it would announce nothing while the write succeeded. Register the \
+                 type, or fix the payload to match the schema it declares.",
+                message.payload
+            );
+        }
+    }
     let id = OutboxMessageId::generate(env, &scope);
     let now_micros = epoch_micros(env.clock().now_utc());
     let inserted = sqlx::query(
@@ -21586,6 +21806,33 @@ impl OutboxRepo<'_> {
         Ok(id.to_string())
     }
 
+    /// [`OutboxRepo::enqueue`] WITHOUT the emit-time schema assertion, for a test that has
+    /// to put a row on the event feed that a release build would have written.
+    ///
+    /// An unregistered event type is not hypothetical in production: the assertion is
+    /// compiled out of release builds by design, so such a row lands and the FAN-OUT is
+    /// what refuses it permanently. A test of that refusal therefore needs the row to
+    /// exist, and every ordinary path now (correctly) prevents it from being created.
+    ///
+    /// Gated on the `testing` feature so it cannot be reached from a shipped binary, and
+    /// deliberately awkward to name so it is not mistaken for the ordinary enqueue.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    #[cfg(feature = "testing")]
+    pub async fn enqueue_unvalidated_for_test(
+        &self,
+        env: &Env,
+        message: &NewOutboxMessage<'_>,
+    ) -> Result<String, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let id = enqueue_outbox_in_tx_at_unvalidated(&mut tx, env, scope, message).await?;
+        tx.commit().await?;
+        Ok(id.to_string())
+    }
+
     /// Enqueue EVERY message in `messages` in ONE transaction, skipping any whose
     /// `(consumer, idempotency_key)` is already taken (issue #104). Returns how many rows
     /// were NEWLY inserted.
@@ -21790,8 +22037,41 @@ impl OutboxRepo<'_> {
         .await?;
         tx.commit().await?;
 
+        // A cursor at the BEGINNING has missed nothing, and this guard is what makes that
+        // true rather than merely intended.
+        //
+        // `sequence` is a TABLE-WIDE identity, so a scope's oldest row is almost never
+        // global sequence 1: with two tenants writing, the second one's oldest row might be
+        // 2, or 5000. `beginning()` is 0, so `oldest_retained > 1` held for every scope but
+        // whichever happened to own sequence 1, and a fold from the beginning got `Gone`.
+        // Measured before this guard: a second tenant in the same database answered 500 on
+        // `GET /usage` and on `POST /usage/publish`, and 410 on the event feed with a
+        // message saying events "have been deleted" when nothing had been. Once retention
+        // pruned the row holding sequence 1, that became every scope.
+        //
+        // The remaining heuristic is CONSERVATIVE rather than exact, and under a table-wide
+        // sequence it cannot be exact: `MIN(sequence) > after + 1` cannot tell "rows of this
+        // scope were pruned" from "the intervening sequences belonged to other scopes". It
+        // only ever fires for a consumer whose own last-read row is gone (a live cursor row
+        // forces `MIN <= after`), and that is where an earlier version of this comment
+        // stopped, adding "which is the case where a resync is the safe answer". MEASURED,
+        // that last clause is false: a consumer in a multi-scope database that has read
+        // every one of its own rows, whose read rows are then pruned, gets `Gone` while an
+        // identical single-scope fixture gets a `Page`. It has missed nothing. So this
+        // over-reports in a case that is reachable, and the caller must not tell such a
+        // consumer that events were DELETED, only that it should resync.
+        //
+        // The other direction is a behaviour change this guard makes and is worth naming: a
+        // BEGINNING cursor is now never told about a real prune. Measured, five rows seeded
+        // and three genuinely deleted returns a two-row `Page` and no `Gone`. That is right
+        // for the usage fold, which is explicitly "the retained window", and for a brand new
+        // consumer; the exposure is a subscriber that polls, gets an empty page, keeps the
+        // beginning cursor, and is later handed a silently short feed.
+        //
+        // Making either exact needs a per-scope pruned-through watermark, which is a schema
+        // change and its own issue.
         if let Some(oldest_retained) = oldest {
-            if oldest_retained > after_sequence.saturating_add(1) {
+            if after_sequence > 0 && oldest_retained > after_sequence.saturating_add(1) {
                 return Ok(EventPage::Gone { oldest_retained });
             }
         }
@@ -29504,7 +29784,7 @@ fn locale_bundle_from_row(row: &sqlx::postgres::PgRow) -> LocaleBundleRecord {
 
 /// Authoring message template overrides (issue #111).
 ///
-/// CONTROL plane only, which migration 0144's grants enforce: the app role renders and holds
+/// CONTROL plane only, which migration 0145's grants enforce: the app role renders and holds
 /// SELECT alone. An app role that could author a template could rewrite what every recipient
 /// of that environment is sent, which is a strictly larger power than anything else the send
 /// path needs.
