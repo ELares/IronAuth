@@ -6,6 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The per-test-database reclaim threshold is overridable**, through
+  `IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS`, clamped at a five-minute floor. The six-hour
+  default is correct on a developer machine, where the cluster outlives many runs, and
+  exactly wrong in CI, where the Postgres container is created fresh for every job so
+  nothing in it is ever six hours old and the sweep reclaims NOTHING. Measured on the CI
+  job this was written for: 46 GB consumed of which `target` was 24. The remaining 22 is a
+  DIFFERENCE between two runs rather than a direct reading, because `/var/lib/docker` was
+  not measured on the run that produced the 46; the per-test databases are the term that
+  grows without bound, and the later run that did measure docker put it at 4.6 to 5.4 GB.
+
+  **Set it in CI or against a throwaway cluster, and nowhere else.** It lowers the
+  concurrency protection for every database in the cluster `DATABASE_URL` names, and its
+  safety rests on two things that do not hold generally: a cluster nothing else is using,
+  and `cargo test` running test binaries one after another (a process-per-test runner such
+  as `cargo nextest` breaks it). An unparseable value falls back to the DEFAULT rather than
+  the floor, so a typo cannot silently make the sweep more aggressive.
+
+  The test that exercises the override enforces the first of those rather than trusting it:
+  it refuses to run unless `IRONAUTH_TEST_DB_DISPOSABLE=1`, which `scripts/with-test-db.sh`
+  sets for the cluster it creates and tears down, and which CI sets because its Postgres is
+  a per-job service container. It FAILS rather than skipping, so the protection cannot be
+  lost by the marker quietly going away.
+
 - **Tenant-scoped events are now expressible, and `tenant.deleted` has a producer (issue
   #108).** `environment_id` was blanket-required on every envelope, which made a tenant-wide
   fact impossible to state: deleting a tenant fences ALL of its environments, and the store

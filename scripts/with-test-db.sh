@@ -77,6 +77,15 @@ echo "with-test-db: initializing throwaway cluster in ${PGDATA} on port ${PORT}"
   "-p ${PORT} -k ${SOCKDIR} -c listen_addresses=127.0.0.1" start >/dev/null
 
 export DATABASE_URL="postgres://${SUPERUSER}@127.0.0.1:${PORT}/postgres"
+# THIS CLUSTER IS DISPOSABLE, and one test needs to know that rather than assume it.
+#
+# `test_db_reclaim` drives a sweep with IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS lowered to
+# five minutes, which is cluster-wide: it would also reclaim a CONCURRENT harness run's
+# databases in the same cluster. That is safe here, because this script just created the
+# cluster and tears it down on exit, and it is not safe against a DATABASE_URL somebody
+# set by hand. The test refuses to run that arm without this marker rather than skipping
+# it, so the protection can never be lost silently.
+export IRONAUTH_TEST_DB_DISPOSABLE=1
 echo "with-test-db: DATABASE_URL=${DATABASE_URL}"
 
 set +e

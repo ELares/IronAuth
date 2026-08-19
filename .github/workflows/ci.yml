@@ -55,11 +55,16 @@ jobs:
   test:
     name: test (ubuntu-latest)
     runs-on: ubuntu-latest
-    # The workspace suite (hundreds of DB integration tests, each on an isolated
-    # database) runs close to 30 minutes and has outgrown that ceiling, so a normal
-    # run now intermittently trips the wall-clock limit with tests still completing
-    # (not a hang). Give it headroom to match the other heavy jobs.
-    timeout-minutes: 45
+    # MEASURED, not guessed, and the previous value was neither.
+    #
+    # The first run of this job that did not die on disk exhaustion instead hit the
+    # 45-minute ceiling with the suite still running: compile finished at 4m09s and the
+    # test phase had consumed 37.5 minutes without reaching the end. So no run in the
+    # recorded history has ever COMPLETED this suite, and the true wall-clock cost is
+    # still unknown -- which is exactly why the ceiling has to be generous rather than
+    # tight. 90 leaves room for a complete run to be measured for the first time; the
+    # honest next step is to read the duration off a green run and bring this down to it.
+    timeout-minutes: 90
     # The ironauth-store isolation tests (rls, idor, repository) require a real
     # Postgres. The harness creates a fresh per-run database and provisions the
     # low-privilege application role, so it needs a superuser/owner connection;
@@ -84,14 +89,204 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The Postgres above is a per-job SERVICE CONTAINER, created fresh for this job and
+      # destroyed with it, so the cluster-wide sweep `test_db_reclaim` drives under the
+      # override below cannot reach anything but this job's own databases. `with-test-db.sh`
+      # sets the same marker for the cluster it creates. Without it that test fails rather
+      # than skipping, so a hand-set DATABASE_URL is refused instead of swept.
+      IRONAUTH_TEST_DB_DISPOSABLE: "1"
+      # Debug info is a large part of what this job writes, and this job is the one that
+      # ran the runner out of disk. `line-tables-only` keeps the `file:line` a panic
+      # backtrace needs (the entire diagnostic value of debug info in a test run) and
+      # drops the type and variable DWARF, which nothing here reads because no debugger
+      # is attached.
+      #
+      # THE LARGEST SINGLE THING, now. An earlier version of this comment said it was not,
+      # which was true of the run it was written from (24 GB of 46) and stopped being true
+      # the moment the Postgres reclaim below landed: measured after it, `target` is 24 GB
+      # of 28. So this override is the lever with the most left in it, and it is also the
+      # one with no ratchet -- `target` grows with every crate and every test target the
+      # project adds, and nothing here bounds that.
+      #
+      # ONE variable, not two. `cargo test` selects the `test` profile for every unit it
+      # builds, and `CARGO_PROFILE_TEST_DEBUG` wins when both are set, so the `DEV` one
+      # was dead weight that read as load-bearing.
+      #
+      # Set as an ENV OVERRIDE rather than a `[profile]` entry in Cargo.toml on purpose:
+      # a profile entry would also degrade every local `cargo test`, where a developer
+      # DOES attach a debugger and does want the full information. The tradeoff is
+      # environment dependent, so it lives with the environment.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # THE OTHER HALF OF THE FOOTPRINT, and the half that grows on its own.
+      #
+      # The store harness creates a database per test and reclaims leftovers only when
+      # they are older than a threshold that defaults to six hours. In CI the Postgres
+      # container is created fresh for every job, so nothing in it is ever six hours old,
+      # the sweep reclaims NOTHING, and every per-test database survives to the end of the
+      # run inside the container's writable layer. That is roughly the 22 GB of the
+      # measured 46 that `target` does not account for, and unlike the build it scales
+      # with the number of tests, which this project adds to every week.
+      #
+      # `cargo test` runs test binaries one after another and the sweep runs once per
+      # process, so a five-minute threshold reclaims the previous binaries' databases at
+      # the start of each new one. Five minutes rather than zero because the sweep's
+      # live-connection guard does not cover the window between `CREATE DATABASE` and the
+      # first connection to it.
+      #
+      # This value sits exactly AT `RECLAIM_MIN_AGE_FLOOR_SECS`, so the harness's clamp is
+      # a no-op today and the two numbers can drift apart in silence: raise the floor and
+      # this is clamped upward, the sweep reclaims less, and the disk problem returns with
+      # nothing failing. Raise them together, or lower this deliberately below the floor
+      # and let the clamp be the thing that speaks.
+      IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS: "300"
     steps:
       - uses: actions/checkout@v7
+      # RECLAIM RUNNER DISK, and the reason this step exists at all.
+      #
+      # From 2026-08-18 22:55 onward every run of this job died of `No space left on
+      # device`, in THREE shapes. Read off the API rather than remembered, over the eight
+      # `test (ubuntu-latest)` jobs in that window:
+      #
+      #   4  every step conclusion blank, log endpoint answers `BlobNotFound`. These die
+      #      in the RUNNER's own diagnostic writer, which kills the runner process before
+      #      it uploads anything.
+      #   3  every step conclusion present, full log uploaded. These surface the same
+      #      exhaustion as Postgres error 53100 (`could not extend file ...: No space
+      #      left on device`) inside the tests; two end with exit code 101.
+      #   1  every step conclusion present and NO log (`BlobNotFound` anyway).
+      #
+      # Said in all three shapes because the first version of this comment said "all of
+      # them, blank, no log", the second said two shapes four and four, and the logged
+      # group is where every number below came from. A description that erases its own
+      # evidence is how the next person concludes there is nothing to read; a description
+      # that rounds its own evidence is how they conclude the wrong thing about it.
+      #
+      # `--all-features` across 20 workspace members builds every dependency AND a
+      # test binary per target -- 309 integration test files, which is the number that
+      # actually drives the size -- and that is far larger than the `cargo check` and
+      # `cargo clippy` lanes that share the same image and still pass. The image ships
+      # toolchains this repository never invokes (Android, .NET, GHC, CodeQL, Swift),
+      # so the cheapest correct fix is to stop carrying them.
+      #
+      # `|| true` on each removal: reclaiming space must never be what fails the merge
+      # gate, and a future image that drops one of these paths would otherwise turn
+      # this into a spurious red. `df` on both sides so the run reports what it
+      # actually reclaimed instead of asking a reader to trust this comment.
+      - name: reclaim runner disk
+        run: |
+          df -h / || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h / || true
+          # A FLOOR, checked here rather than reported later, and this is the one fatal
+          # thing in the step.
+          #
+          # The post-build report below is the number everybody wants, and it is exactly
+          # the number that vanishes when the runner dies: `if: always()` is evaluated by
+          # the runner process, so when THAT is what disk exhaustion kills, no always-step
+          # runs. The four blank runs that started this prove it -- their implicit
+          # `Post Run` and `Stop containers` steps did not run either.
+          #
+          # So the guaranteed measurement has to be taken while the runner is certainly
+          # alive. A run that cannot fit should fail in three minutes with a reason rather
+          # than at the wall-clock limit with a blank log. The number itself is below.
+          #
+          # The removals above stay `|| true`: reclaiming space must never be what fails
+          # the merge gate, and a future image that drops one of those paths must not turn
+          # this red. Only the floor is fatal, and it is fatal for a stated number.
+          free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "free after reclaim: ${free_gb}G"
+          # A guard that cannot read its own input must SAY so rather than skip.
+          #
+          # The step's shell is `bash -e` with no `pipefail`. On an empty or malformed
+          # value, `[ "" -lt 60 ]` prints "integer expression expected" and returns
+          # non-zero; `set -e` does not fire inside an `if` condition, so the else
+          # branch is taken and the floor silently does not exist. Without `pipefail`
+          # a `df` that fails outright is invisible too, because `tr` still exits 0.
+          # That is the same defect as the post-build report it exists to compensate
+          # for: a measurement absent exactly when it is needed.
+          #
+          # The last hole is closed by LENGTH rather than left documented. A run of digits
+          # too large for the shell's arithmetic would reach the comparison and take the
+          # same silent-else path; it is unreachable through `df -BG --output=avail /`, but
+          # "unreachable" is what the earlier version of this comment settled for, and the
+          # bound costs one more pattern in a `case` that already runs.
+          case "$free_gb" in
+            ''|*[!0-9]*)
+              echo "::error::could not read free space from df; the floor cannot be checked"
+              exit 1
+              ;;
+          esac
+          if [ "${#free_gb}" -gt 6 ]; then
+            echo "::error::df reported ${free_gb}G, which is not a plausible free-space reading; the floor cannot be checked"
+            exit 1
+          fi
+          # 60, not 100, and derived from the STANDING components rather than from a
+          # completed run, because no run has ever completed this suite.
+          #
+          # What was measured, and its limit: 28 to 29 G consumed at 239 of the 328 test
+          # binaries (24 G `target`, 4.6 to 5.4 G docker). The 89 that never ran are almost
+          # all `ironauth-store`, which is the densest per-test-database creator in the
+          # workspace and the reason the reclaim override exists, so 28 G is a LOWER BOUND
+          # sampled before that crate's own contribution starts.
+          #
+          # The floor does not rest on it. `target` is fully built at 24 G before the first
+          # test runs and does not grow during the run, and docker held between 4.6 and
+          # 5.4 G across both measured runs. Those two are what 60 is twice over, and the
+          # per-test databases the reclaim now sweeps are the term that was unbounded. 60
+          # also tolerates a runner image growing by 50 G; a floor of 100 against 113 G
+          # free left 13 G of tolerance to an image that grows routinely, which turns a
+          # working job red with a message about a footprint it does not have.
+          if [ "$free_gb" -lt 60 ]; then
+            echo "::error::only ${free_gb}G free after reclaim; this job needs 24G of target plus a docker layer and the per-test databases above it"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: tests (workspace, all features)
         run: cargo test --workspace --all-features
       - name: doctests
         run: cargo test --workspace --all-features --doc
+      # What the run actually cost, reported by the job that pays it.
+      #
+      # BEST EFFORT, and knowing which parts are is the point: `if: always()` does not
+      # survive the runner process dying, which is the failure this job had. The
+      # guaranteed number is the floor check above; these are the diagnostic ones.
+      #
+      # BOTH consumers, not just the one that was already shrunk. `du -sh target` alone
+      # measured 24 GB of the 46 GB that run consumed and was blind to the rest, which is
+      # how the Postgres side grew unnoticed. (46 is the pre-reclaim figure; with the
+      # reclaim active the same job consumes 28.)
+      #
+      # `sudo du -sh /var/lib/docker` is the one that can SEE the Postgres data.
+      # `docker ps --size` cannot: it reports a container's writable layer only, and
+      # the official `postgres` image puts `PGDATA` in a declared volume, which
+      # `--size` excludes by construction. It reported `63B` after 39 minutes of
+      # creating a database per test, which is worse than useless -- a maintainer
+      # following this comment to find "which lever to pull" would read it and
+      # conclude Postgres is not the lever, which is the exact error this step exists
+      # to prevent. `docker system df -v` is used instead because it counts volumes.
+      #
+      # A TROUGH READING, and worth knowing which. With the sweep running, the Postgres
+      # side is a sawtooth and this single end-of-step sample lands near its low point,
+      # while an exhaustion would be caused by a peak. NOTHING SAMPLES THE PEAK: the floor
+      # fires before a byte is written and this fires after the build, so a mid-run spike
+      # is invisible to both. The floor is a pre-flight headroom check, not a peak guard.
+      - name: report disk headroom
+        if: always()
+        run: |
+          df -h /
+          du -sh target 2>/dev/null || true
+          sudo du -sh /var/lib/docker 2>/dev/null || true
+          # No `head`: the volumes section is the entire reason this replaced
+          # `docker ps --size`, and it currently lands around line 33, one extra image away
+          # from being truncated out of the log by a fixed slice.
+          docker system df -v 2>/dev/null || true
 
   # The IRONBUS lane of the dual-mode async matrix (issue #104, criterion 6).
   #
@@ -125,6 +320,12 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The Postgres above is a per-job SERVICE CONTAINER, created fresh for this job and
+      # destroyed with it, so the cluster-wide sweep `test_db_reclaim` drives under the
+      # override below cannot reach anything but this job's own databases. `with-test-db.sh`
+      # sets the same marker for the cluster it creates. Without it that test fails rather
+      # than skipping, so a hand-set DATABASE_URL is refused instead of swept.
+      IRONAUTH_TEST_DB_DISPOSABLE: "1"
       IRONBUS_ADDR: 127.0.0.1:17654
     steps:
       - uses: actions/checkout@v7

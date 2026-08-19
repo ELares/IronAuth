@@ -602,7 +602,8 @@ async fn provision_role(owner_pool: &PgPool, role: &str) {
 /// it owns and never touch a database belonging to something else.
 const TEST_DB_PREFIX: &str = "ironauth_test_";
 
-/// How old a leftover per-test database must be before the sweep reclaims it.
+/// How old a leftover per-test database must be before the sweep reclaims it, by
+/// default.
 ///
 /// This is the CONCURRENCY margin, not a tidiness preference. A run in progress owns
 /// young databases, so the threshold has to exceed the longest run by enough that a
@@ -611,6 +612,87 @@ const TEST_DB_PREFIX: &str = "ironauth_test_";
 /// skips any database with a live connection, so this bound is the second of two
 /// independent protections rather than the only one.
 const RECLAIM_MIN_AGE_SECS: u64 = 6 * 60 * 60;
+
+/// The lowest age the override below will accept, in seconds.
+///
+/// The live-connection guard does not cover the window between `CREATE DATABASE` and
+/// the first connection to it. That window is milliseconds in principle and seconds
+/// under load, so a floor of zero would let a sweep drop a database another test had
+/// created and not yet opened. Five minutes is far above any plausible value of that
+/// window and far below the length of a suite, which is what makes the override useful
+/// at all.
+///
+/// COUPLED to a fixture, though not by direct causation and the difference matters.
+/// `test_db_reclaim.rs` stages a sixty-second-old database and asserts a sweep spares it.
+/// Lowering THIS constant alone does nothing, because the clamp only ever raises a
+/// setting: CI passes 300 explicitly and would keep getting 300. The real invariant is
+/// that the EFFECTIVE threshold must stay above the youngest fixture any test stages, and
+/// this floor only bounds how low a SETTING is permitted to push it. Worth naming because
+/// the two numbers are two directories apart and neither end says so.
+const RECLAIM_MIN_AGE_FLOOR_SECS: u64 = 300;
+
+/// The environment variable that lowers [`RECLAIM_MIN_AGE_SECS`].
+const RECLAIM_MIN_AGE_ENV: &str = "IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS";
+
+/// How old a leftover per-test database must be before this process reclaims it.
+///
+/// # Why this is tunable at all
+///
+/// The six-hour default is correct for a developer machine, where the cluster outlives
+/// many runs and a concurrent gate is a real possibility. It is exactly wrong for CI,
+/// where the Postgres container is created fresh for every job: nothing in it is ever
+/// six hours old, so the sweep reclaims NOTHING and every per-test database survives to
+/// the end of the run inside the container's writable layer.
+///
+/// That is not a tidiness problem, it is the disk. MEASURED on the job this was written
+/// for: 46 GB consumed, of which `target` was 24 GB. The rest is here, and it grows with
+/// the number of tests, which is the quantity this project adds to every week.
+///
+/// The sweep runs once per PROCESS and `cargo test` runs test binaries one after
+/// another, so a low threshold in CI reclaims the previous binaries' databases at the
+/// start of each new one, bounding the total to roughly one binary's worth plus whatever
+/// the floor keeps alive.
+///
+/// Clamped at [`RECLAIM_MIN_AGE_FLOOR_SECS`] rather than trusted: an operator who sets
+/// zero would reintroduce the create-then-connect race the age check exists to close,
+/// and a harness that lets its own safety bound be configured to nothing is not bounded.
+/// An unparseable value falls back to the default rather than to the floor, because a
+/// typo must not silently make the sweep more aggressive.
+///
+/// # Setting this against a SHARED cluster is not safe, and the default is why
+///
+/// The six-hour default exists because "a concurrent gate is a real possibility". Lowering
+/// it lowers that protection for every database in the cluster `DATABASE_URL` names, not
+/// only for this run's own. It is correct in CI because the Postgres container is created
+/// fresh per job and nothing else is in it, and `cargo test` runs test binaries one after
+/// another so at the moment binary N+1 sweeps, binaries 1..N have exited.
+///
+/// Neither of those holds on a developer machine pointed at a cluster somebody else is
+/// also using, and neither holds under a process-per-test runner such as `cargo nextest`,
+/// where a live process's database can be both past the threshold and connectionless
+/// (sqlx closes idle connections after ten minutes with `min_connections` at zero). Set
+/// this in CI, or in a throwaway cluster, and nowhere else.
+fn reclaim_min_age_secs() -> u64 {
+    reclaim_min_age_from(std::env::var(RECLAIM_MIN_AGE_ENV).ok().as_deref())
+}
+
+/// The decision itself, over the raw setting rather than over the environment.
+///
+/// Split out so it is testable without mutating process-global state: `set_var` is
+/// `unsafe` from the 2024 edition and the workspace sets `unsafe_code = "deny"`, and a
+/// test that wrote the variable would race every other test in the binary regardless.
+///
+/// `deny` rather than `forbid`, which matters: an `#[allow(unsafe_code)]` would be
+/// available, so the race is the reason this is split out and the lint is only the
+/// reminder. The ENV READ itself is covered by a child-process test in
+/// `test_db_reclaim.rs`, because this pure function cannot reach it and a mutant that
+/// disconnected the read survived the whole crate until that test existed.
+fn reclaim_min_age_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(RECLAIM_MIN_AGE_SECS, |secs| {
+            secs.max(RECLAIM_MIN_AGE_FLOOR_SECS)
+        })
+}
 
 /// The count of leftovers at which the sweep says so loudly rather than quietly
 /// tidying. A developer whose cluster is filling up should learn it at the START of a
@@ -652,7 +734,7 @@ fn created_at_secs(datname: &str) -> Option<u64> {
 /// reclaim happens on the NEXT run's way in and no abnormal exit can defeat it.
 ///
 /// Two independent guards keep a concurrent run safe. A database is reclaimed only if
-/// it is older than [`RECLAIM_MIN_AGE_SECS`] AND has no live connection. Best effort
+/// it is older than [`reclaim_min_age_secs`] AND has no live connection. Best effort
 /// throughout: every failure here is ignored, because a harness that refuses to run
 /// tests because it could not tidy up would be a worse defect than the one it fixes.
 async fn reclaim_leaked_databases(owner_base: &str) {
@@ -695,11 +777,20 @@ pub async fn reclaim_leaked_databases_now(owner_base: &str) -> usize {
     let now = std::time::UNIX_EPOCH
         .elapsed()
         .map_or(0, |since| since.as_secs());
+    let min_age = reclaim_min_age_secs();
     let stale: Vec<String> = candidates
         .into_iter()
         .filter(|name| {
-            created_at_secs(name)
-                .is_some_and(|created| now.saturating_sub(created) >= RECLAIM_MIN_AGE_SECS)
+            // `>=` rather than `>`, and the boundary second is KNOWINGLY unmeasured. Both
+            // operators are reachable, but the age here is derived from a wall-clock instant
+            // encoded in the name and compared against a wall clock read later, so a fixture
+            // staged to land exactly ON the threshold lands a few milliseconds past it by
+            // the time this runs. A test aimed at the boundary would pass under either
+            // operator most of the time and flake the rest, which is worse than an
+            // unmeasured line. What IS measured is that the threshold is the configured
+            // value and not the floor or the default, which is the property that matters:
+            // an off-by-one second on a five-minute window is not a defect anyone can reach.
+            created_at_secs(name).is_some_and(|created| now.saturating_sub(created) >= min_age)
         })
         .collect();
 
@@ -763,5 +854,60 @@ fn host_port_of(url: &str) -> (String, u16) {
     match host_port.rsplit_once(':') {
         Some((host, port)) => (host.to_string(), port.parse().unwrap_or(5432)),
         None => (host_port.to_string(), 5432),
+    }
+}
+
+#[cfg(test)]
+mod reclaim_threshold_tests {
+    use super::{RECLAIM_MIN_AGE_FLOOR_SECS, RECLAIM_MIN_AGE_SECS, reclaim_min_age_from};
+
+    /// The override lowers the threshold, clamps at the floor, and ignores nonsense.
+    ///
+    /// The floor is the load-bearing case. `reclaim_leaked_databases_now` skips any
+    /// database with a live connection, but that guard does not cover the window between
+    /// `CREATE DATABASE` and the first connection to it, so a threshold of zero would let
+    /// one test's sweep drop a database another test had just created. A harness that
+    /// lets its own safety bound be configured to nothing is not bounded.
+    ///
+    /// The last case is the one that is easy to get backwards: a value that does not
+    /// parse falls back to the DEFAULT, not to the floor. A typo must never silently make
+    /// the sweep more aggressive than it was.
+    #[test]
+    fn the_reclaim_threshold_override_is_clamped_at_its_floor() {
+        assert_eq!(
+            reclaim_min_age_from(None),
+            RECLAIM_MIN_AGE_SECS,
+            "unset keeps the six-hour default a developer machine needs"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some("600")),
+            600,
+            "a value above the floor is taken as given"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some(" 600 ")),
+            600,
+            "surrounding whitespace is not a typo"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some("0")),
+            RECLAIM_MIN_AGE_FLOOR_SECS,
+            "zero clamps to the floor rather than disabling the create-then-connect guard"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some("1")),
+            RECLAIM_MIN_AGE_FLOOR_SECS,
+            "and so does anything else below it"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some("not-a-number")),
+            RECLAIM_MIN_AGE_SECS,
+            "an unparseable value falls back to the DEFAULT, never to the floor"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some("")),
+            RECLAIM_MIN_AGE_SECS,
+            "and so does an empty one"
+        );
     }
 }
