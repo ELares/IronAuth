@@ -33,6 +33,12 @@ use ironauth_jose::TrustedKey;
 struct CachedKeys {
     keys: Vec<TrustedKey>,
     fetched_at: SystemTime,
+    /// When this entry was last refetched because a `kid` was missing from it.
+    ///
+    /// Separate from `fetched_at` because it bounds a DIFFERENT thing: `fetched_at`
+    /// governs ordinary expiry, this governs how often an unknown `kid` may cause an
+    /// outbound request. [`None`] means no rotation refetch has happened for this entry.
+    last_rotation_refetch: Option<SystemTime>,
 }
 
 /// Resolves a client's `jwks_uri` to trusted keys through the hardened fetcher,
@@ -92,8 +98,51 @@ impl ClientKeyResolver {
     /// or a document naming no usable key) yields an EMPTY set, which fails the
     /// caller closed (a verification policy cannot be built without a key).
     pub async fn resolve(&self, now: SystemTime, jwks_uri: &str) -> Vec<TrustedKey> {
+        self.resolve_for_kid(now, jwks_uri, None).await
+    }
+
+    /// As [`Self::resolve`], refetching once when `kid` is absent from the cached set
+    /// (issue #126 criterion 4: tolerate key rotation without an outage window).
+    ///
+    /// # The window this closes
+    ///
+    /// Without this, a cached set is served until its TTL expires. When an issuer rotates and
+    /// starts signing with a newly published key, every assertion it signs fails verification
+    /// for up to one full TTL -- an outage whose victim is a workload that did the right thing
+    /// by rotating. The cache cannot tell "signed by a key I have never seen" from "bad
+    /// signature", because it never sees the `kid`.
+    ///
+    /// # Why the rate limit is part of the design and not a hardening pass
+    ///
+    /// `kid` comes from an UNVERIFIED token header -- it is attacker-chosen. "Refetch whenever
+    /// a kid is unknown" is therefore an outbound-request amplifier: one cheap forged header
+    /// per request, each producing a fetch to a third-party host, turns this deployment into a
+    /// traffic source aimed at someone else. So a rotation refetch is permitted at most once
+    /// per [`Self::rotation_refetch_min_interval`] per URI, independent of how many unknown
+    /// kids arrive. A genuine rotation is discovered within that interval; a flood of forged
+    /// kids costs one fetch, exactly as a single one does.
+    ///
+    /// The bound is per-URI rather than global so one issuer's rotation cannot be starved by
+    /// another issuer being hammered.
+    pub async fn resolve_for_kid(
+        &self,
+        now: SystemTime,
+        jwks_uri: &str,
+        kid: Option<&str>,
+    ) -> Vec<TrustedKey> {
         if let Some(keys) = self.cached(now, jwks_uri) {
-            return keys;
+            // The cached set answers unless a NAMED kid is absent from it. An assertion with
+            // no `kid` cannot tell us anything is stale, so it never triggers a refetch.
+            let satisfied = match kid {
+                None => true,
+                Some(wanted) => keys.iter().any(|key| key.kid() == Some(wanted)),
+            };
+            if satisfied || !self.may_rotation_refetch(now, jwks_uri) {
+                return keys;
+            }
+            // Fall through to refetch, and record the attempt BEFORE the fetch so a burst of
+            // forged kids cannot each start one while the first is still in flight.
+            self.record_rotation_refetch(now, jwks_uri);
         }
         let mut request = FetchRequest::get(FetchPurpose::JwksUri, jwks_uri);
         if self.allow_http {
@@ -112,6 +161,38 @@ impl ClientKeyResolver {
             self.store(now, jwks_uri, keys.clone());
         }
         keys
+    }
+
+    /// The shortest interval between two rotation refetches of one `jwks_uri`.
+    ///
+    /// Deliberately a constant rather than a config knob for now: it bounds an
+    /// ATTACKER-DRIVEN outbound request, so making it operator-tunable would let a
+    /// deployment lower it into an amplifier by accident. Thirty seconds discovers a genuine
+    /// rotation promptly while capping one issuer at two extra fetches a minute.
+    const fn rotation_refetch_min_interval() -> Duration {
+        Duration::from_secs(30)
+    }
+
+    /// Whether a rotation refetch of `jwks_uri` is permitted right now.
+    fn may_rotation_refetch(&self, now: SystemTime, jwks_uri: &str) -> bool {
+        let cache = self.cache.lock().expect("client key cache lock poisoned");
+        let Some(entry) = cache.get(jwks_uri) else {
+            return true;
+        };
+        match entry.last_rotation_refetch {
+            None => true,
+            Some(last) => now
+                .duration_since(last)
+                .is_ok_and(|elapsed| elapsed >= Self::rotation_refetch_min_interval()),
+        }
+    }
+
+    /// Record that a rotation refetch of `jwks_uri` is being attempted now.
+    fn record_rotation_refetch(&self, now: SystemTime, jwks_uri: &str) {
+        let mut cache = self.cache.lock().expect("client key cache lock poisoned");
+        if let Some(entry) = cache.get_mut(jwks_uri) {
+            entry.last_rotation_refetch = Some(now);
+        }
     }
 
     /// The cached keys for `jwks_uri` if a non-expired entry exists.
@@ -136,6 +217,10 @@ impl ClientKeyResolver {
                 CachedKeys {
                     keys,
                     fetched_at: now,
+                    // A fresh set starts with no rotation refetch recorded: the entry it
+                    // replaces may have been refetched, but this one has not, and carrying
+                    // the old instant forward would delay the next genuine rotation.
+                    last_rotation_refetch: None,
                 },
             );
     }
