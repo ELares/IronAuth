@@ -2648,8 +2648,8 @@ async fn each_issuers_rotation_is_answered_from_its_own_jwks_uri() {
 ///
 /// Review measured the consequence. Rekeying the marker to a constant, which makes the bound
 /// global, leaves the whole binary green at 42 passed. The guarantee was stated in three
-/// places (the `client_keys.rs` doc, the CHANGELOG, and a THREAT-MODEL DoS row) and pinned
-/// in none, which is the shape this PR exists to fix one level up.
+/// places (the `client_keys.rs` doc, the CHANGELOG, and a THREAT-MODEL denial-of-service
+/// row) and pinned in none, which is the shape this PR exists to fix one level up.
 ///
 /// So this test PRIMES both URIs first, putting each in the cache, and only then presents an
 /// unknown `kid` to each. Both must refetch. Under a global bound the first refetch consumes
