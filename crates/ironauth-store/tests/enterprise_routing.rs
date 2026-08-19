@@ -925,6 +925,21 @@ async fn creating_a_rule_and_verifying_its_domain_emit_distinct_types() {
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let ocn_id = seed_binding(&db, &env, scope).await;
+    // THE FIXTURE QUEUES AN EVENT OF ITS OWN, and this test claims the whole outbox.
+    //
+    // Opening the org connection emits `connection.opened` in the write's own transaction
+    // (issue #107, commit 79809905): metering counts connections off it and the store is its
+    // only producer. This test predates that and asserted "exactly one queued event", so it
+    // saw the fixture's event next to the one it is about and failed with `left: 2`.
+    //
+    // Taken off the feed here, by type, so the assertions below still see EVERYTHING the
+    // action under test queues. Asserted rather than swallowed: if the fixture stops emitting
+    // it, or emits something else, this line says so instead of quietly passing.
+    let fixture = claim_one_event(&db, &env, scope).await;
+    assert_eq!(
+        fixture["type"], "connection.opened",
+        "the only event the fixture should have queued is the connection it opened"
+    );
     let rule_id = RoutingRuleId::generate(&env, &scope);
     let subject = rule_id.to_string();
 
