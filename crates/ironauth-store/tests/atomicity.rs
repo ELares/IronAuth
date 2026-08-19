@@ -255,3 +255,86 @@ async fn a_mid_transaction_failure_leaves_no_publish_no_key_and_no_audit_row() {
         "the control appends, records the key and audits"
     );
 }
+
+/// A usage publish BLOCKS on the per-scope append lock (issue #107).
+///
+/// `publish_snapshot` takes the same `pg_advisory_xact_lock` on the same key as
+/// `OutboxRepo::append_event`, so a publish orders against ordinary producers rather than
+/// racing them. An earlier version of the comment at that line said a test aimed at the
+/// window "would be a flake rather than a test", and declined to write one. That reasoning
+/// was wrong about which property is under test: the property is not who WINS a race, it is
+/// whether the call takes the lock at all, and that is observable by holding the lock from
+/// another session and watching the publish fail to complete.
+///
+/// The technique is `events_cursor_ordering.rs::
+/// serialising_appenders_on_a_scope_lock_makes_sequence_order_equal_commit_order`, which
+/// races nothing either: it holds the lock, starts the contender, and asserts the contender
+/// has not finished. The margin here is a two-second timeout against an unblocked publish
+/// measured in single-digit milliseconds, and the unblocked call is the control on the same
+/// fixture, so nothing depends on scheduling.
+#[tokio::test]
+async fn a_publish_blocks_on_the_per_scope_append_lock() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // The SAME key the store derives, computed the same way, so this cannot pass by holding
+    // an unrelated lock.
+    let mut hasher = DefaultHasher::new();
+    scope.tenant().to_string().hash(&mut hasher);
+    scope.environment().to_string().hash(&mut hasher);
+    let key = i64::from_ne_bytes(hasher.finish().to_ne_bytes());
+
+    let mut holder = db.owner_pool().begin().await.expect("begin the holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the per-scope append lock");
+
+    let writer = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .usage();
+    let ordering = format!("{}/{}", scope.tenant(), scope.environment());
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        writer.publish_snapshot(
+            &env,
+            &NewOutboxMessage {
+                consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: PROBE_EVENT_ID,
+                ordering_key: &ordering,
+                payload: usage_envelope(scope),
+            },
+            Some(probe_idempotency()),
+        ),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "publish_snapshot must BLOCK while another session holds the per-scope append lock; \
+         it returned {blocked:?} instead, so it never took the lock"
+    );
+
+    // THE CONTROL. Release the lock and the same call completes, so the timeout above
+    // measured the lock and not a publish that cannot succeed at all.
+    holder.rollback().await.expect("release the lock");
+    writer
+        .publish_snapshot(
+            &env,
+            &NewOutboxMessage {
+                consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: PROBE_EVENT_ID,
+                ordering_key: &ordering,
+                payload: usage_envelope(scope),
+            },
+            Some(probe_idempotency()),
+        )
+        .await
+        .expect("the same publish succeeds once the lock is released");
+}

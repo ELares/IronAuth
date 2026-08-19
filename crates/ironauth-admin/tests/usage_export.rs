@@ -170,15 +170,20 @@ async fn a_fold_that_stops_early_says_so() {
             .expect("fold");
         counted = tally.tokens_issued();
         truncated = stopped_early;
-        if counted > 0 {
+        // ALL THREE, not "any". Exiting on `counted > 0` is the subset-exit shape: the
+        // assertion below needs the fold to have hit its limit of 2, and it passes today
+        // only because the harness's own provisioning contributes one more meterable row.
+        // With a fixture that contributed none, one visible token would satisfy the exit and
+        // fail the truncation assertion below.
+        if counted == 3 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    assert!(
-        counted > 0,
-        "the events must have landed for this to mean anything"
+    assert_eq!(
+        counted, 3,
+        "the three seeded events must have landed for this to mean anything"
     );
     assert!(
         truncated,

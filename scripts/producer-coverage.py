@@ -101,7 +101,8 @@ ROUTE = re.compile(r"\b(post|put|patch|delete)\(\s*([a-z0-9_]+)::([a-z0-9_]+)\s*
 # thing, which was false and would have made the tightening look free. Measured, tightening
 # still passes 127/127, because those four producers are detected through the `*_event(`
 # shape instead. The reason to keep the loose pattern is the tradeoff below: the looser
-# pattern's only risk is a false PASS on some future unrelated `envelope(`. That is the wrong direction to guard against
+# pattern's only risk is a false PASS on some future unrelated `envelope(`. That is the
+# wrong direction to guard against
 # here -- a false FAILURE on a correct handler would push the next author toward an
 # EXEMPT entry, and a wrong EXEMPT entry is permanent while a wrong regex is not.
 EMITS = re.compile(r"DomainEvent|\b[a-z0-9_]+_event\s*\(|\benvelope\s*\(")

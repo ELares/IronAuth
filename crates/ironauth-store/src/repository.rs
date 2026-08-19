@@ -8335,16 +8335,16 @@ impl ActingUsageRepo<'_> {
                 // The same per-scope append lock `OutboxRepo::append_event` takes, so a
                 // publish orders against ordinary producers rather than racing them.
                 //
-                // UNMEASURED, and said rather than implied. Deleting this line leaves every
-                // store and admin suite green, because nothing drives concurrent publishes:
-                // the property is that two appends to one scope cannot interleave their
-                // sequence assignment, and observing it needs two writers held at a
-                // specific interleaving. `events_cursor_ordering.rs::
+                // MEASURED, by `atomicity.rs::a_publish_blocks_on_the_per_scope_append_lock`.
+                // An earlier version of this comment said a test aimed at it "would be a
+                // flake rather than a test" and declined to write one. That was wrong about
+                // which property is under test: it is not who WINS a race, it is whether
+                // this call takes the lock at all, and that is observable by holding the
+                // lock from another session and watching the publish fail to complete. The
+                // technique is the one `events_cursor_ordering.rs::
                 // serialising_appenders_on_a_scope_lock_makes_sequence_order_equal_commit_order`
-                // measures exactly that property for `append_event`, and this path takes the
-                // same lock by the same key; what is untested is that THIS path still takes
-                // it. A test aimed at the window would be a flake rather than a test, which
-                // is the same call the client-key resolver's check-then-act comment makes.
+                // already uses, which races nothing either. Deleting this line now fails
+                // that test.
                 sqlx::query("SELECT pg_advisory_xact_lock($1)")
                     .bind(append_lock_key(scope))
                     .execute(&mut **tx)
@@ -22052,9 +22052,23 @@ impl OutboxRepo<'_> {
         // The remaining heuristic is CONSERVATIVE rather than exact, and under a table-wide
         // sequence it cannot be exact: `MIN(sequence) > after + 1` cannot tell "rows of this
         // scope were pruned" from "the intervening sequences belonged to other scopes". It
-        // only ever fires for a consumer whose own last-read row is gone, which is the case
-        // where a resync is the safe answer, so it over-reports rather than under-reports.
-        // Making it exact needs a per-scope pruned-through watermark, which is a schema
+        // only ever fires for a consumer whose own last-read row is gone (a live cursor row
+        // forces `MIN <= after`), and that is where an earlier version of this comment
+        // stopped, adding "which is the case where a resync is the safe answer". MEASURED,
+        // that last clause is false: a consumer in a multi-scope database that has read
+        // every one of its own rows, whose read rows are then pruned, gets `Gone` while an
+        // identical single-scope fixture gets a `Page`. It has missed nothing. So this
+        // over-reports in a case that is reachable, and the caller must not tell such a
+        // consumer that events were DELETED, only that it should resync.
+        //
+        // The other direction is a behaviour change this guard makes and is worth naming: a
+        // BEGINNING cursor is now never told about a real prune. Measured, five rows seeded
+        // and three genuinely deleted returns a two-row `Page` and no `Gone`. That is right
+        // for the usage fold, which is explicitly "the retained window", and for a brand new
+        // consumer; the exposure is a subscriber that polls, gets an empty page, keeps the
+        // beginning cursor, and is later handed a silently short feed.
+        //
+        // Making either exact needs a per-scope pruned-through watermark, which is a schema
         // change and its own issue.
         if let Some(oldest_retained) = oldest {
             if after_sequence > 0 && oldest_retained > after_sequence.saturating_add(1) {

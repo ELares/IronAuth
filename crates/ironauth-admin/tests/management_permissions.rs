@@ -138,6 +138,7 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // grants sight of anything a `management.read` caller could not already list.
     ("readEventFeed", ManagementPermission::Read),
     ("exportUsage", ManagementPermission::Read),
+    ("publishUsage", ManagementPermission::WriteConfig),
     ("createPermission", ManagementPermission::WriteOrganizations),
     ("updatePermission", ManagementPermission::WriteOrganizations),
     ("deletePermission", ManagementPermission::WriteOrganizations),
@@ -546,6 +547,12 @@ const PERMISSION_PROVEN: &[&str] = &[
     // so neither a blanket refusal nor a missing gate would pass it.
     "readEventFeed",
     "exportUsage",
+    // Proven in `usage_export.rs::write_config_is_required_and_sufficient_for_publishing`,
+    // in BOTH directions: a credential restricted to `management.read` is refused 403 and
+    // one restricted to `management.write_config` is allowed. Publishing appends to the feed
+    // every webhook subscriber receives, so a read-only credential reaching it would make
+    // every subscriber receive a billing record.
+    "publishUsage",
     // Proven in `a_read_only_credential_can_list_api_keys_and_cannot_mint_or_kill_one`,
     // verified by mutation: downgrading all three to `Read` fails that test and passes every
     // other pin.
@@ -601,7 +608,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 147 operations declare a required permission and 3 have that permission proven. The other
+/// 148 operations declare a required permission and 4 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -617,7 +624,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        165,
+        166,
         "the classified set changed size; update the unproven count below with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
