@@ -688,8 +688,16 @@ async fn the_rewritten_scope_keys_still_cascade_on_delete() {
 /// while mutating the copy failed it. A test that drives its own paraphrase is a test of the
 /// paraphrase.
 ///
-/// The `assert!` matters as much as the extraction: without it, DELETING the block from 0150
-/// would make this test vacuous rather than red.
+/// The `assert!` NAMES a failure rather than causing one, and an earlier version of this
+/// sentence over-credited it: deleting the block is red either way, via the `.expect` on
+/// `find`. What the assertion buys is the message. If the extraction ever picks up a
+/// DIFFERENT `DO` block (one inserted earlier in the file, say), it says so instead of
+/// letting the test fail as `left: "0" right: "3s"`.
+///
+/// What nothing here observes is the block's POSITION. Moving it after the `ALTER`s would
+/// set `lock_timeout` after the locks it exists to bound, and this test would stay green;
+/// 0150 is checksummed, so once shipped nobody can move it without a mismatch on every
+/// deployed database, and that is what the property rests on.
 fn lock_timeout_block() -> &'static str {
     const SQL: &str = include_str!("../migrations/0150_scope_fk_naming.sql");
     let start = SQL.find("DO $$").expect("0150 must open with a DO block");
