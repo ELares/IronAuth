@@ -6,6 +6,39 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The JWT bearer grant normalized the presented subject before comparing it against a mapping,
+  so a subject the operator never registered could mint that mapping's principal (issue #26, the
+  grant itself; hardened under #126).**
+  The grant read `sub` with `.map(str::trim)` and then compared the TRIMMED value against
+  `external_assertion_subject_mappings.external_subject` with SQL `=`. `str::trim` strips the whole
+  Unicode `White_Space` set, so every padded spelling of a registered subject collapsed onto it:
+  `...:ref:refs/heads/main` followed by U+00A0, U+2028 or U+3000 each exchanged successfully and
+  minted the mapped principal, verified against a live grant rather than reasoned about. A
+  federation anchor is an identity boundary, and the only string an operator can audit is the one
+  they registered.
+
+  The trim now applies to the EMPTINESS TEST only, not to the value that is compared: an
+  all-whitespace `sub` is still rejected as an invalid assertion, and a padded one is refused as
+  unmapped instead of silently matching. In practice no working deployment changes,
+  and the reason is narrower than "these providers emit clean subjects". A deployment that was
+  exchanging successfully had already registered whatever string its provider sends, so the
+  trimmed and untrimmed forms were the same string for it.
+
+  THE PROVIDERS ARE NOT THE GUARANTEE, and this entry should not claim they are, because that
+  claim is the negation of the attack above. A GitHub Actions subject embeds the git ref, and git
+  accepts these characters in a ref name: `git check-ref-format` was measured to ACCEPT
+  `refs/heads/main` followed by U+00A0, by U+3000 and by U+2028, rejecting only the ASCII space.
+  A padded subject is therefore reachable through an ordinary provider, which is why the
+  comparison has to be on the registered string rather than a normalized one.
+
+  A provider that does emit padding now fails closed at the TOKEN EXCHANGE, where `resolve` finds
+  no mapping and the grant records `assertion_subject_unmapped`, rather than minting on a string
+  the operator never saw. Nothing here touches registration.
+
+  The adjacent `jti` replay cache keeps its trim deliberately: it records and looks up the SAME
+  trimmed value, so whitespace variants collapse to one cache key and a second presentation is
+  refused as a replay. That asymmetry is now stated where it lives.
+
 - **The emulator's fake upstream IdP could never have completed a federation login, and now does
   (issue #121, criterion 4).** The provider `ironauth dev` ships was written, wired, seeded as a
   connector, and reachable, and no test ever drove a login through it. Two defects were sitting in

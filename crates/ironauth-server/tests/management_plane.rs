@@ -69,6 +69,61 @@ async fn metrics_serves_prometheus_exposition() {
     assert!(body.contains("ironauth_http_requests_total"), "{body}");
     // Metric labels must be route templates, never raw paths.
     assert!(body.contains("route=\"/healthz\""), "{body}");
+
+    // THE HISTOGRAM BUCKETS, as the EXPOSITION renders them.
+    //
+    // `DURATION_BUCKETS` was asserted only by construction: nothing read a `le=` boundary
+    // back off the wire, so a future exporter bump that changed the default buckets or the
+    // way a histogram renders would pass every gate in this repo. The bucket list is a
+    // contract with whatever scrapes this endpoint, and a dashboard or an alert threshold
+    // built on `le="0.25"` breaks silently if it moves.
+    //
+    // Every boundary, plus `+Inf`, `_sum` and `_count`, because a partial check would let a
+    // truncated or re-scaled list through.
+    for boundary in [
+        "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10",
+        "+Inf",
+    ] {
+        assert!(
+            body.contains(&format!(
+                "ironauth_http_request_duration_seconds_bucket{{method=\"GET\",\
+                 route=\"/healthz\",status=\"200\",le=\"{boundary}\"}}"
+            )),
+            "the exposition must carry the le=\"{boundary}\" bucket: {body}"
+        );
+    }
+    for suffix in ["_sum", "_count"] {
+        assert!(
+            body.contains(&format!(
+                "ironauth_http_request_duration_seconds{suffix}{{method=\"GET\",\
+                 route=\"/healthz\",status=\"200\"}}"
+            )),
+            "the exposition must carry {suffix} with its full label set: {body}"
+        );
+    }
+
+    // THE COUNT, because every assertion above is a PRESENCE check and a thirteenth boundary
+    // would pass all of them. Measured: re-scaling or dropping a boundary fails above,
+    // ADDING one did not until this line. Thirteen is the twelve configured boundaries plus
+    // `+Inf`.
+    let rendered = body
+        .lines()
+        .filter(|line| {
+            line.starts_with(
+                "ironauth_http_request_duration_seconds_bucket{method=\"GET\",route=\"/healthz\"",
+            )
+        })
+        .count();
+    assert_eq!(
+        rendered, 13,
+        "the healthz histogram must render exactly the twelve configured boundaries plus \
+         +Inf, so an ADDED bucket is caught as well as a removed one: {body}"
+    );
+
+    // The label ORDER above is asserted deliberately, not incidentally. Prometheus attaches
+    // no meaning to it, and it does not vary at runtime, so pinning it costs nothing today
+    // and would cost one test edit on some future exporter that sorts labels. That is a
+    // cheaper failure than a silently loosened assertion.
 }
 
 #[tokio::test]
