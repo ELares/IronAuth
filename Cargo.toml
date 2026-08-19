@@ -93,7 +93,7 @@ utoipa = { version = "5", features = ["axum_extras"] }
 # and the musl static lane holds (rustls-native-certs reads /etc/ssl at runtime,
 # no C dependency). Pinned to the 0.8 line: 0.9 floors above MSRV 1.85 (see the
 # crate's CHANGELOG and Cargo.lock pins).
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring-native-roots",
     "postgres",
