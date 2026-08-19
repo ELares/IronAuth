@@ -410,9 +410,10 @@ async fn the_override_is_read_from_the_environment_and_the_sweep_obeys_it() {
 /// This test drives the refusal in a CHILD process, because the guard panics and the parent
 /// has to observe that rather than die of it.
 ///
-/// The three arms are the ones that matter: lowered without the marker must refuse, lowered
-/// with it must proceed, and the DEFAULT without the marker must proceed, because sweeping at
-/// six hours is behaviour that predates this crate and is not this guard's to change.
+/// FOUR arms: lowered without the marker must refuse, lowered with a marker that is not
+/// exactly `1` must refuse, lowered with a real marker must proceed, and the DEFAULT without
+/// a marker must proceed, because sweeping at six hours predates this crate and is not this
+/// guard's to change.
 #[tokio::test]
 async fn the_disposable_marker_is_required_only_when_the_override_lowers_the_threshold() {
     const CHILD: &str = "IRONAUTH_TEST_DB_GUARD_CHILD";
@@ -426,6 +427,27 @@ async fn the_disposable_marker_is_required_only_when_the_override_lowers_the_thr
         println!("{REACHED}");
         return;
     }
+
+    // THE PARENT MUST HOLD A REAL MARKER BEFORE IT SPAWNS ANYTHING, and this assertion is
+    // the whole reason the test is not itself the hole.
+    //
+    // One of the arms below hands a child `IRONAUTH_TEST_DB_DISPOSABLE=1` so it can prove the
+    // guard LETS a marked run through, and that child then sweeps the cluster at five
+    // minutes. Without this line the test SYNTHESIZED that marker: review reproduced it
+    // dropping two foreign databases from a hand-set `DATABASE_URL` while reporting `ok`.
+    // A guard whose own test forges its precondition is worse than no test, because it reads
+    // as coverage.
+    //
+    // Asserting here means the marker an arm passes on is one the OPERATOR set, inherited
+    // rather than manufactured, which is what the sibling test at the top of this file does.
+    assert!(
+        std::env::var("IRONAUTH_TEST_DB_DISPOSABLE").is_ok_and(|value| value == "1"),
+        "this test spawns children that sweep EVERY database in the cluster at a five-minute \
+         threshold, so it runs only where that is known to be safe. Set \
+         IRONAUTH_TEST_DB_DISPOSABLE=1 if the cluster is disposable; \
+         `scripts/with-test-db.sh` sets it for a cluster it starts itself, but not when you \
+         pass your own DATABASE_URL"
+    );
 
     let child = |min_age: Option<&str>, marker: Option<&str>| {
         let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));

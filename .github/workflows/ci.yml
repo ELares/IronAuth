@@ -96,10 +96,20 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The Postgres above is a per-job SERVICE CONTAINER, created fresh for this job and
-      # destroyed with it, so the cluster-wide sweep `test_db_reclaim` drives under the
-      # override below cannot reach anything but this job's own databases. `with-test-db.sh`
-      # sets the same marker for the cluster it creates. Without it that test fails rather
-      # than skipping, so a hand-set DATABASE_URL is refused instead of swept.
+      # destroyed with it, so the cluster-wide sweep cannot reach anything but this job's own
+      # databases.
+      #
+      # EVERY store binary drives that sweep, not one test: `TestDatabase::start` runs it once
+      # per process from over a hundred test files, all of them under the override below. So
+      # the marker is read in `reclaim_min_age_secs`, and any binary whose threshold has been
+      # LOWERED refuses without it. `with-test-db.sh` sets it for a cluster it creates itself
+      # and deliberately does NOT set it when you pass your own DATABASE_URL, because on that
+      # path it cannot know whose cluster it is.
+      #
+      # Scope, stated because an earlier version of this comment overstated it: the marker
+      # guards the LOWERED threshold. A sweep at the six-hour default predates this setting
+      # and still runs unguarded, so a shared cluster holding a run older than six hours is
+      # not protected by this.
       IRONAUTH_TEST_DB_DISPOSABLE: "1"
       # Debug info is a large part of what this job writes, and this job is the one that
       # ran the runner out of disk. `line-tables-only` keeps the `file:line` a panic

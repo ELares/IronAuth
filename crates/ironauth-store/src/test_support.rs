@@ -699,7 +699,9 @@ fn reclaim_min_age_secs() -> u64 {
     let secs = reclaim_min_age_from(std::env::var(RECLAIM_MIN_AGE_ENV).ok().as_deref());
     // THE GUARD LIVES HERE, not in one test, and that placement is the whole of it.
     //
-    // It was on a single test in `test_db_reclaim.rs`. The other three tests in that binary
+    // It began as an assertion on a single test in `test_db_reclaim.rs`, which is still there
+    // as belt and braces because it fires earlier and with a more specific message. The other
+    // three tests in that binary
     // drive the same cluster-wide sweep, and `TestDatabase::start` drives it once per
     // process from 103 test files, none of which consulted the marker. Review reproduced a
     // colleague's six-minute-old database being dropped by an UNGUARDED test while the

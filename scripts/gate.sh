@@ -377,10 +377,13 @@ run "clippy (pedantic, -D warnings)" cargo clippy --workspace --all-targets --al
 # a throwaway local cluster and tears it down. All other tests are unaffected.
 #
 # IF YOU EXPORT DATABASE_URL, export IRONAUTH_TEST_DB_DISPOSABLE=1 with it when the cluster
-# is yours to reclaim. CI sets `IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS`, which LOWERS the
-# leftover sweep from six hours to five minutes across every database in the cluster, and the
-# store harness refuses that without the marker, so this lane goes red otherwise. Leaving it
-# red is the intended outcome for a cluster nobody has vouched for.
+# is yours to reclaim. `test_db_reclaim` asserts the marker directly, because it spawns
+# children that sweep, so this lane goes red without it. Leaving it red is the intended
+# outcome for a cluster nobody has vouched for.
+#
+# This script does NOT set `IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS`, so the harness-wide guard
+# in `reclaim_min_age_secs` is inert locally; that one fires in CI, where the job sets the
+# override. Naming the right mechanism matters because the two fail at different points.
 #
 # Note the scope precisely: the marker guards the LOWERED threshold, which is what that
 # variable added. A sweep at the six-hour default is behaviour that predates it and still
