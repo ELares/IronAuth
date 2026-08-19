@@ -1850,8 +1850,6 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
     // comparison written `issuer LIKE $1 || '%'` matches the stored `...com` mapping and
     // hands over its principal.
     const ISSUER_A_TRUNCATED: &str = "https://token.actions.githubusercontent.co";
-    // An issuer that ENDS WITH the mapped one. Path-bearing issuers are ordinary, so an
-    // attacker-controlled host with the real issuer as a path suffix is registrable.
     // And one differing only in CASE. DNS is case-insensitive, so an operator can register
     // this as a distinct row while it addresses the same host.
     const ISSUER_A_CASED: &str = "https://Token.Actions.GitHubUserContent.com";
@@ -1953,32 +1951,44 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
     // exactly one comparison, so the anchors have to mirror the comparisons a reader could
     // plausibly write.
     //
-    // NOT covered, deliberately: an issuer-SUFFIX comparison (`$1 LIKE '%' || issuer`). To
-    // trigger it the presented issuer must end with the ENTIRE stored string INCLUDING its
-    // scheme, so the anchor would have to be something like
-    // `https://evil.test/https://token.actions.githubusercontent.com` -- not a URL any
-    // issuer would publish or any operator would register. A first draft of this test used
-    // `https://evil.test/token.actions.githubusercontent.com`, which looks like it exercises
-    // the shape and does not: it lacks the inner `https://`, so it matches nothing and the
-    // case was pure decoration. Stating the gap is worth more than a negative that passes
-    // for the wrong reason.
-    for (issuer, jti, why) in [(
-        ISSUER_A_CASED,
-        "jti-xiss-case",
-        "an issuer differing from the mapped one only in case",
-    )] {
-        harness
-            .register_external_issuer(issuer, Some(&jwks), None, None, true)
-            .await;
-        let attempt = assertion(&key, issuer, SHARED_SUBJECT, &aud, 3600, jti);
-        let (status, _h, body) = present(&harness, &client_id, &attempt).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "{why} must not inherit its mappings: {body}"
-        );
-        assert_eq!(json(&body)["error"], "invalid_grant", "for `{issuer}`");
-    }
+    // NOT covered: an issuer-SUFFIX comparison (`$1 LIKE '%' || issuer`). Stating the gap
+    // precisely, because the obvious statement of it is wrong.
+    //
+    // GIVEN THE SCHEME-BEARING ANCHOR THIS TEST REGISTERS, the shape is unreachable: the
+    // presented issuer would have to end with the entire stored string INCLUDING the
+    // `https://`, so the anchor would be something like
+    // `https://evil.test/https://token.actions.githubusercontent.com`, which no issuer
+    // publishes and no operator registers. A first draft used
+    // `https://evil.test/token.actions.githubusercontent.com`, which LOOKS like it
+    // exercises the shape and does not: it lacks the inner `https://`, matches nothing,
+    // and was pure decoration.
+    //
+    // That is a fact about this anchor, NOT about the shape, and the difference matters.
+    // Nothing makes a stored issuer carry a scheme: `external_assertion_issuers.issuer` is
+    // plain `text NOT NULL` (`migrations/0020_jwt_bearer_assertion.sql`), `register()`
+    // parses no URL, and the grant passes the presented `iss` through as an opaque string.
+    // Against a scheme-less anchor -- `kubernetes/serviceaccount`, or a bare host -- the
+    // trigger is an ordinary URL: `https://evil.test/kubernetes/serviceaccount` ends with
+    // `kubernetes/serviceaccount`, and a suffix comparison would hand over its principal.
+    //
+    // The shipped query uses `=`, so this is a coverage gap and not a live defect. It is
+    // left uncovered rather than closed with a second anchor because a scheme-less
+    // registration is its own question (should `register()` demand a URL at all?), and
+    // answering it inside a fixture test would bury it. Recorded here so the next reader
+    // inherits the real boundary instead of a reassuring one.
+    let issuer = ISSUER_A_CASED;
+    harness
+        .register_external_issuer(issuer, Some(&jwks), None, None, true)
+        .await;
+    let attempt = assertion(&key, issuer, SHARED_SUBJECT, &aud, 3600, "jti-xiss-case");
+    let (status, _h, body) = present(&harness, &client_id, &attempt).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an issuer differing from the mapped one only in case must not inherit its \
+         mappings: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant", "for `{issuer}`");
 }
 
 /// A Kubernetes projected service-account token exchanges through the same model (issue #126
