@@ -828,6 +828,43 @@ mod tests {
         assert!(!parsed.verify(b"user1passwordX"), "wrong password rejected");
     }
 
+    /// The verify compares the WHOLE derived block, not a prefix of it.
+    ///
+    /// Review mutated `block.ct_eq(&self.expected)` to `block[..16].ct_eq(&self.expected[..16])`
+    /// and the suite stayed green at 22 passed: a 128-bit prefix match was accepted as a
+    /// verification. The published vector cannot see that, because a correct implementation
+    /// agrees with it on every byte, so agreement on the first sixteen is indistinguishable
+    /// from agreement on all sixty-four.
+    ///
+    /// The expected block is 64 bytes, so a flip in the LAST byte is outside any 16, 32 or
+    /// 48-byte prefix, and the head flip is the control: it fails under the shipped code AND
+    /// under the prefix mutant, so on its own it would prove nothing. The pair is what
+    /// distinguishes them.
+    ///
+    /// Unexploitable in practice at 2^128, which is why this is a coverage fix rather than a
+    /// defect: the point is that the next edit to this comparison has something to fail.
+    #[test]
+    fn firebase_verify_compares_every_byte_not_a_prefix() {
+        const TAIL_FLIPPED: &str = "lSrfV15cpx95/sZS2W9c9Kp6i/LVgQNDNC/qzrCnh1SAyZvqmZqAjTdn3aoItz+VHjoZilo78198JAdRuid5lA==";
+        const HEAD_FLIPPED: &str = "lCrfV15cpx95/sZS2W9c9Kp6i/LVgQNDNC/qzrCnh1SAyZvqmZqAjTdn3aoItz+VHjoZilo78198JAdRuid5lQ==";
+
+        for (expected, which) in [(TAIL_FLIPPED, "last"), (HEAD_FLIPPED, "first")] {
+            let stored = firebase_stored(
+                14,
+                8,
+                "Bw==",
+                "jxspr8Ki0RYycVU8zykbdLGjFQ3McFUH0uiiTvC8pVMXAn210wjLNmdZJzxUECKbm0QsEmYUSDzZvpjeJ9WmXA==",
+                "42xEC+ixf3L2lw==",
+                expected,
+            );
+            let parsed = ForeignHash::parse(&stored).expect("firebase parses");
+            assert!(
+                !parsed.verify(b"user1password"),
+                "a vector differing from the published one in its {which} byte must not verify"
+            );
+        }
+    }
+
     #[test]
     fn unrecognized_and_malformed_are_rejected() {
         assert_eq!(

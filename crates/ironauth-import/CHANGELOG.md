@@ -28,7 +28,7 @@ range per docs/RELEASING.md.
 
   A NAME-KEYED GREP DOES NOT COME BACK EMPTY HERE, IT COMES BACK WRONG, and that is the
   sharper version of the lesson. `password_hash` appears 34 times in this crate, 15 of them
-  in `src/`, and none of them is the crate: they are a struct field and a JSON key
+  in `src/`, and none of those 15 is the crate: they are a struct field and a JSON key
   (`record.password_hash`, `"password_hash": "..."`). The crate is reached only as the root
   of a re-exported path, which appears zero times. So a reader grepping the name concludes
   the dependency is ALIVE, and a reader grepping the manifest spelling finds one hit in a
