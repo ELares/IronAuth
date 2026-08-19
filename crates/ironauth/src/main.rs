@@ -1196,50 +1196,135 @@ async fn build_oidc_plane(
                 None
             }
         };
-    let state = OidcState::new(store, env, registry, oidc_config, issuer_base)
-        .with_org_provisioning(org_provisioning)
-        .with_global_token_revocation_enabled(surfaces.global_revocation)
-        .with_fedcm_enabled(surfaces.fedcm)
-        .with_risk_signals_enabled(surfaces.risk_signals)
-        .with_org_scoped_clients_enabled(surfaces.org_scoped_clients)
-        .with_first_party_challenge_enabled(surfaces.first_party_challenge)
-        .with_flows_enabled(surfaces.flows)
-        .with_hosted_pages_enabled(surfaces.hosted_pages)
-        .with_diagnostics(&config.diagnostics)
-        .with_quota_enforcer(quota_enforcer)
-        .with_hashing_pool(hashing_pool)
-        .with_password_policy(password_policy, screening_failure, screen_on_login)
-        // The email-OTP / magic-link factors (issue #68) deliver through the verification
-        // seam. Until a real email provider is wired (M11 messaging), ship the dev
-        // transport: it records deliveries on the observability plane and emits the code /
-        // link only at the `debug` trace level, so the OTP and magic-link logic works end
-        // to end without a mail server. A production deployment installs its own
-        // `VerificationSender` here.
-        // In dev mode the capture sink replaces the logging transport, so a CI script can
-        // read the code back rather than scraping a debug log. Everywhere else this is
-        // `None` and the logging transport is installed exactly as before.
-        .with_verification_sender(DEV_CAPTURE.get().map_or_else(
-            || {
-                std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender)
-                    as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
-            },
-            |sink| {
-                std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
-            },
-        ))
-        // The guarded SMS-OTP factor (issue #70) delivers through a SEPARATE provider
-        // seam. Until a real SMS provider (Twilio Verify, Vonage, SNS) is wired (M11
-        // messaging), ship the dev stub: it records deliveries and emits the code only at
-        // the `debug` trace level, so the guarded SMS logic works end to end without an
-        // SMS gateway. A production deployment installs its own `SmsSender` here. SMS OTP
-        // is off by default, so this stub is inert until a tenant explicitly enables SMS.
-        .with_sms_sender(DEV_CAPTURE.get().map_or_else(
-            || {
-                std::sync::Arc::new(ironauth_oidc::LoggingSmsSender)
-                    as std::sync::Arc<dyn ironauth_oidc::SmsSender>
-            },
-            |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::SmsSender>,
-        ));
+    // THE CLIENT-KEY RESOLVER (issues #25, #126 criterion 4), and it was missing.
+    //
+    // `OidcState::new` passes `None`, so THREE surfaces read `client_key_resolver()` and
+    // found nothing. The resolver was correct, tested, reachable from the tests that
+    // construct it directly, and reachable from nothing else: the only `Some(resolver)` call
+    // site in the whole repository was a test harness.
+    //
+    // The three do NOT all fail the same way, and an earlier version of this comment said
+    // "both surfaces", which was wrong on the count and hid the one that matters most:
+    //
+    //   1. `private_key_jwt` client authentication (#25) -- resolved to an empty key set,
+    //      so every such client was refused. Inert.
+    //   2. The `jwt-bearer` assertion grant (#126) -- same, inert.
+    //   3. `jwks_uri` DYNAMIC CLIENT REGISTRATION (RFC 7591) -- NOT inert. It hard-refused
+    //      with "jwks_uri registration is not available on this deployment", an explicit
+    //      operator-visible message.
+    //
+    // So wiring the resolver CHANGES BEHAVIOUR for the third one: a registration that was
+    // always refused is now accepted, and accepting means an outbound fetch to a URL the
+    // CLIENT supplies.
+    //
+    // AN EARLIER VERSION OF THIS COMMENT GOT THE SHAPE OF THAT WRONG TWICE, in the
+    // reassuring direction both times, so both are named rather than quietly corrected.
+    //
+    //   * It said the other two surfaces always fetch a URL "an operator chose". True of the
+    //     jwt-bearer grant (#126), which requires a registered, enabled ISSUER record. NOT
+    //     true of `private_key_jwt` (#25): `client_auth::resolve_client_keys` reads
+    //     `jwks_uri` off the CLIENT record, and with RFC 7591 registration on, that string
+    //     is the one the client supplied.
+    //   * It said the registration route "carries the issue #31 abuse controls". True of
+    //     `POST` register, which calls `enforce_rate_limits` before any store write. NOT
+    //     true of the RFC 7592 `PUT` update, which reaches the same
+    //     `validate_metadata` -> `validate_client_keys` -> fetch with no rate limit and no
+    //     quota, so a registration-access-token holder can loop updates naming a different
+    //     `jwks_uri` each time.
+    //
+    // AND THE WIDER HALF IS NOT REGISTRATION AT ALL. `resolve_client_keys` is the FIRST
+    // statement of `verify_private_key_assertion`, before the presented assertion is parsed
+    // or verified. So once a `private_key_jwt` client with a `jwks_uri` exists, anyone who
+    // knows its `client_id` drives a fetch per `POST /token` by presenting garbage; `token.rs`
+    // has no rate limit and no quota. It is bounded by the cache in the ordinary case, but
+    // that path resolves with NO kid hint, so the 30s rotation bound never applies to it, and
+    // a failed fetch is never cached -- a URL that served a valid JWK Set once at
+    // registration and fails thereafter costs one outbound request per token request, with
+    // no ceiling. `docs/THREAT-MODEL.md` carries the row.
+    //
+    // What genuinely bounds the REGISTRATION half: `oidc.registration_enabled` defaults to
+    // false and the route is mounted only when it is on; `POST` register carries the #31
+    // controls (peer-keyed rate limit, exposure switch, initial access token); and every
+    // fetch goes through the SSRF-hardened fetcher, which is what makes a client-supplied URL
+    // acceptable at all. Said here because a behaviour change nobody wrote down is a
+    // behaviour change nobody reviewed.
+    //
+    // Built like the claims-enrichment hook above and failing the same way: a fetcher that
+    // will not build is a TLS trust-store fault, and taking the whole OIDC plane down for it
+    // would be worse than the surfaces it disables. The warning names all three.
+    //
+    // The `Err` arm is UNVERIFIED prose, not covered code: under `cfg(test)`
+    // `shared_config::outbound_fetcher` returns `Ok` unconditionally, so no test in this repo
+    // reaches the branch. Its text is reviewed, not exercised.
+    let client_key_resolver =
+        match crate::shared_config::outbound_fetcher(ironauth_fetch::FetchLimits::default()) {
+            Ok(fetcher) => Some(std::sync::Arc::new(ironauth_oidc::ClientKeyResolver::new(
+                std::sync::Arc::new(fetcher),
+                std::time::Duration::from_secs(oidc_config.client_jwks_ttl_secs),
+            ))),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the client-key resolver's outbound fetcher could not be built; \
+                     private_key_jwt clients authenticating through a jwks_uri, jwt-bearer \
+                     assertions from an issuer with a jwks_uri, and dynamic client \
+                     registration of a jwks_uri will all be refused"
+                );
+                None
+            }
+        };
+    let state = match client_key_resolver {
+        Some(resolver) => OidcState::with_client_key_resolver(
+            store,
+            env,
+            registry,
+            oidc_config,
+            issuer_base,
+            resolver,
+        ),
+        None => OidcState::new(store, env, registry, oidc_config, issuer_base),
+    }
+    .with_org_provisioning(org_provisioning)
+    .with_global_token_revocation_enabled(surfaces.global_revocation)
+    .with_fedcm_enabled(surfaces.fedcm)
+    .with_risk_signals_enabled(surfaces.risk_signals)
+    .with_org_scoped_clients_enabled(surfaces.org_scoped_clients)
+    .with_first_party_challenge_enabled(surfaces.first_party_challenge)
+    .with_flows_enabled(surfaces.flows)
+    .with_hosted_pages_enabled(surfaces.hosted_pages)
+    .with_diagnostics(&config.diagnostics)
+    .with_quota_enforcer(quota_enforcer)
+    .with_hashing_pool(hashing_pool)
+    .with_password_policy(password_policy, screening_failure, screen_on_login)
+    // The email-OTP / magic-link factors (issue #68) deliver through the verification
+    // seam. Until a real email provider is wired (M11 messaging), ship the dev
+    // transport: it records deliveries on the observability plane and emits the code /
+    // link only at the `debug` trace level, so the OTP and magic-link logic works end
+    // to end without a mail server. A production deployment installs its own
+    // `VerificationSender` here.
+    // In dev mode the capture sink replaces the logging transport, so a CI script can
+    // read the code back rather than scraping a debug log. Everywhere else this is
+    // `None` and the logging transport is installed exactly as before.
+    .with_verification_sender(DEV_CAPTURE.get().map_or_else(
+        || {
+            std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender)
+                as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
+        },
+        |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>,
+    ))
+    // The guarded SMS-OTP factor (issue #70) delivers through a SEPARATE provider
+    // seam. Until a real SMS provider (Twilio Verify, Vonage, SNS) is wired (M11
+    // messaging), ship the dev stub: it records deliveries and emits the code only at
+    // the `debug` trace level, so the guarded SMS logic works end to end without an
+    // SMS gateway. A production deployment installs its own `SmsSender` here. SMS OTP
+    // is off by default, so this stub is inert until a tenant explicitly enables SMS.
+    .with_sms_sender(DEV_CAPTURE.get().map_or_else(
+        || {
+            std::sync::Arc::new(ironauth_oidc::LoggingSmsSender)
+                as std::sync::Arc<dyn ironauth_oidc::SmsSender>
+        },
+        |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::SmsSender>,
+    ));
     // Installed after the chain because it is CONDITIONAL: a disabled hook, or one whose
     // allowlist is empty, resolves to `None` and issuance is byte-for-byte unchanged.
     let state = match &claims_enrichment_hook {

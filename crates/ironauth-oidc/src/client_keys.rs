@@ -21,6 +21,32 @@
 //! outage does not stick a client into a fail-closed state for the whole TTL. The
 //! cache is keyed on the exact URL and reads the application clock seam for expiry,
 //! so it is deterministic under a manual clock in tests.
+//!
+//! # What the cache is NOT bounded by
+//!
+//! It is bounded in TIME and not in SIZE: there is one entry per distinct `jwks_uri` ever
+//! resolved, and no eviction path. Two of the three surfaces that reach it take the URI
+//! from an operator-registered issuer record, but `private_key_jwt` takes it from a CLIENT
+//! record, and once RFC 7591 dynamic registration is enabled that string is the client's
+//! own. An entry also outlives the client that caused it, since deleting a client does not
+//! touch this map.
+//!
+//! WHAT BOUNDS IT, stated carefully, because the obvious mitigation is wrong and an earlier
+//! version of this paragraph gave it. It is NOT "one client per distinct URL, and
+//! registration is rate limited". One client suffices: RFC 7592 `PUT` update rewrites
+//! `jwks_uri` on an existing client, mints a fresh registration access token each time, and
+//! reaches the fetch through `validate_client_keys` with NO rate limit and no quota, because
+//! `enforce_rate_limits` is called only from `register`. So N updates naming N URLs cost N
+//! permanent entries and one client.
+//!
+//! What actually bounds it is narrower: `oidc.registration_enabled` defaults to false and the
+//! route is mounted only when it is on, so a deployment that has not enabled dynamic
+//! registration cannot reach this at all, and one that has requires a registration access
+//! token to start. That is a real bound and it is not the one the earlier sentence claimed.
+//!
+//! Written down because it is the kind of bound whose absence is invisible: nothing here
+//! fails, it only grows. `begin_rotation_refetch`'s marker-only insert depends on there being
+//! no eviction, so adding one is not a local change.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,6 +59,12 @@ use ironauth_jose::TrustedKey;
 struct CachedKeys {
     keys: Vec<TrustedKey>,
     fetched_at: SystemTime,
+    /// When this entry was last refetched because a `kid` was missing from it.
+    ///
+    /// Separate from `fetched_at` because it bounds a DIFFERENT thing: `fetched_at`
+    /// governs ordinary expiry, this governs how often an unknown `kid` may cause an
+    /// outbound request. [`None`] means no rotation refetch has happened for this entry.
+    last_rotation_refetch: Option<SystemTime>,
 }
 
 /// Resolves a client's `jwks_uri` to trusted keys through the hardened fetcher,
@@ -83,6 +115,17 @@ impl ClientKeyResolver {
         }
     }
 
+    /// How long a successful resolution is cached.
+    ///
+    /// Exposed so the BOOT path can be asserted to have passed the configured
+    /// `oidc.client_jwks_ttl_secs` through rather than a default: a resolver installed with
+    /// the wrong TTL is indistinguishable from a correct one at every other seam, and the
+    /// value governs how long a key the client has rotated OUT stays trusted.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// Resolve `jwks_uri` to the trusted keys it publishes, using `now` (from the
     /// application clock seam) for cache expiry.
     ///
@@ -92,26 +135,148 @@ impl ClientKeyResolver {
     /// or a document naming no usable key) yields an EMPTY set, which fails the
     /// caller closed (a verification policy cannot be built without a key).
     pub async fn resolve(&self, now: SystemTime, jwks_uri: &str) -> Vec<TrustedKey> {
-        if let Some(keys) = self.cached(now, jwks_uri) {
-            return keys;
+        self.resolve_for_kid(now, jwks_uri, None).await
+    }
+
+    /// As [`Self::resolve`], refetching once when `kid` is absent from the cached set
+    /// (issue #126 criterion 4: tolerate key rotation without an outage window).
+    ///
+    /// # The window this closes
+    ///
+    /// Without this, a cached set is served until its TTL expires. When an issuer rotates and
+    /// starts signing with a newly published key, every assertion it signs fails verification
+    /// for up to one full TTL -- an outage whose victim is a workload that did the right thing
+    /// by rotating. The cache cannot tell "signed by a key I have never seen" from "bad
+    /// signature", because it never sees the `kid`.
+    ///
+    /// # Why the rate limit is part of the design and not a hardening pass
+    ///
+    /// `kid` comes from an UNVERIFIED token header -- it is attacker-chosen. "Refetch whenever
+    /// a kid is unknown" is therefore an outbound-request amplifier: one cheap forged header
+    /// per request, each producing a fetch to a third-party host, turns this deployment into a
+    /// traffic source aimed at someone else. So a rotation refetch is permitted at most once
+    /// per [`Self::rotation_refetch_min_interval`] per URI, independent of how many unknown
+    /// kids arrive. A genuine rotation is discovered within that interval; a flood of forged
+    /// kids costs one fetch, exactly as a single one does.
+    ///
+    /// The bound is per-URI rather than global so one issuer's rotation cannot be starved by
+    /// another issuer being hammered.
+    pub async fn resolve_for_kid(
+        &self,
+        now: SystemTime,
+        jwks_uri: &str,
+        kid: Option<&str>,
+    ) -> Vec<TrustedKey> {
+        let cached = self.cached(now, jwks_uri);
+        if let Some(keys) = &cached {
+            // The cached set answers unless a NAMED kid is absent from it. An assertion with
+            // no `kid` cannot tell us anything is stale, so it never triggers a refetch.
+            //
+            // A kid-LESS cached set is deliberately NOT special-cased, and an earlier version
+            // of this code got that wrong. It carried an arm treating such a set as satisfied
+            // for any kid, justified by "otherwise a kid-less issuer refetches on EVERY
+            // request". That number was measured against the code BEFORE the rate limit
+            // worked; once the limit holds, the same traffic costs one refetch per 30s per
+            // URI, which is exactly the budget this module already accepts.
+            //
+            // What the arm actually cost was the feature: an issuer whose cached set is
+            // kid-less and who then rotates to a kid-bearing set would never be refetched at
+            // all, so the new key stays undiscovered for a FULL TTL. That is criterion 4's
+            // outage, reintroduced by the guard meant to protect availability.
+            let satisfied = match kid {
+                None => true,
+                Some(wanted) => keys.iter().any(|key| key.kid() == Some(wanted)),
+            };
+            // ONE lock acquisition decides and records together. A check under one lock and
+            // a record under another is a check-then-act race: N concurrent requests with
+            // forged kids can all pass the check before any of them records, and each starts
+            // its own fetch.
+            //
+            // GUARANTEED BY CONSTRUCTION, not by a test, and the distinction is real. Review
+            // measured the split version exceeding the bound only in a MINORITY of 16-way
+            // bursts (worst trial 3 fetches), and a later 256-way burst on 16 threads did
+            // not reproduce it at all. The window is a handful of instructions with no await
+            // in it, so an assertion aimed at it would fail rarely enough to be a flake
+            // rather than a test. `a_concurrent_burst_of_unknown_kids_still_costs_one_refetch`
+            // covers the gross regression (per-caller instead of per-URI); this line is what
+            // covers the subtle one, so it must not be split.
+            if satisfied || !self.begin_rotation_refetch(now, jwks_uri) {
+                return keys.clone();
+            }
         }
         let mut request = FetchRequest::get(FetchPurpose::JwksUri, jwks_uri);
         if self.allow_http {
             request = request.allow_plaintext_http();
         }
+        // A refetch that fails falls back to the STILL VALID cached set rather than to
+        // nothing. `federation_jwks.rs` already does this for the same kid-miss refetch, and
+        // dropping it here would mean a transient upstream outage turns a working issuer into
+        // a failing one -- the refetch is an optimisation for rotation, and an optimisation
+        // must not be able to make availability worse than not having it.
+        let fallback = || cached.clone().unwrap_or_default();
         let Ok(response) = self.fetcher.fetch(request).await else {
-            return Vec::new();
+            return fallback();
         };
         if !response.status().is_success() {
-            return Vec::new();
+            return fallback();
         }
         let keys = ironauth_jose::trusted_keys_from_jwks(response.body());
-        // Cache only a usable resolution, so a transient failure or an empty
-        // document never sticks a client into a fail-closed state for the TTL.
-        if !keys.is_empty() {
-            self.store(now, jwks_uri, keys.clone());
+        if keys.is_empty() {
+            // A document that parses to NO usable key is a failure like any other, and the
+            // module doc promises it is never cached. Deleting this branch caches the empty
+            // set, which fails every client on that URI closed for a whole TTL and answers
+            // every subsequent kid as "satisfied" so no refetch is even attempted.
+            // `an_empty_upstream_document_is_never_cached_and_falls_back` is what holds it.
+            return fallback();
         }
+        self.store(now, jwks_uri, keys.clone());
         keys
+    }
+
+    /// The shortest interval between two rotation refetches of one `jwks_uri`.
+    ///
+    /// Deliberately a constant rather than a config knob: it bounds an ATTACKER-DRIVEN
+    /// outbound request, so making it operator-tunable would let a deployment lower it into
+    /// an amplifier by accident. Thirty seconds discovers a genuine rotation promptly while
+    /// capping one issuer at two extra fetches a minute.
+    const fn rotation_refetch_min_interval() -> Duration {
+        Duration::from_secs(30)
+    }
+
+    /// Claim the right to make one rotation refetch of `jwks_uri`, or refuse.
+    ///
+    /// Check AND record under a single lock acquisition, which is what makes the bound hold
+    /// under concurrency. Returns `true` at most once per
+    /// [`Self::rotation_refetch_min_interval`] per URI, however many callers ask.
+    ///
+    /// A missing entry claims the right and inserts a marker-only record rather than silently
+    /// no-opping. There is no eviction path today so the entry is always present, but a
+    /// no-op here would become a total bypass the day anyone adds an LRU, and it would be
+    /// invisible: the code would look correct and the bound would simply not exist.
+    fn begin_rotation_refetch(&self, now: SystemTime, jwks_uri: &str) -> bool {
+        let mut cache = self.cache.lock().expect("client key cache lock poisoned");
+        let entry = cache.entry(jwks_uri.to_owned()).or_insert(CachedKeys {
+            keys: Vec::new(),
+            // Stamped so this synthetic entry is expired RELATIVE TO `now`, not relative to
+            // the wall clock. `UNIX_EPOCH` would also read as expired today, but only because
+            // real time is far from the epoch -- and this repo injects manual clocks in
+            // tests, where `now` can sit near it. Under such a clock an epoch-stamped entry
+            // reads as FRESH and empty, and an empty set answers every kid, so the resolver
+            // would return no keys and make no fetch: a silent fail-closed for a whole TTL.
+            // Deriving it from `now` makes the guarantee a property of the code.
+            fetched_at: now.checked_sub(self.ttl).unwrap_or(SystemTime::UNIX_EPOCH),
+            last_rotation_refetch: None,
+        });
+        let permitted = match entry.last_rotation_refetch {
+            None => true,
+            Some(last) => now
+                .duration_since(last)
+                .is_ok_and(|elapsed| elapsed >= Self::rotation_refetch_min_interval()),
+        };
+        if permitted {
+            entry.last_rotation_refetch = Some(now);
+        }
+        permitted
     }
 
     /// The cached keys for `jwks_uri` if a non-expired entry exists.
@@ -128,15 +293,24 @@ impl ClientKeyResolver {
 
     /// Store a resolution for `jwks_uri` at `now`.
     fn store(&self, now: SystemTime, jwks_uri: &str, keys: Vec<TrustedKey>) {
-        self.cache
-            .lock()
-            .expect("client key cache lock poisoned")
-            .insert(
-                jwks_uri.to_owned(),
-                CachedKeys {
-                    keys,
-                    fetched_at: now,
-                },
-            );
+        let mut cache = self.cache.lock().expect("client key cache lock poisoned");
+        let previous_refetch = cache.get(jwks_uri).and_then(|e| e.last_rotation_refetch);
+        cache.insert(
+            jwks_uri.to_owned(),
+            CachedKeys {
+                keys,
+                fetched_at: now,
+                // PRESERVED, not reset. Resetting here erased the very marker the
+                // refetch had just set: a successful refetch would clear the bound and
+                // the next forged kid would fetch again. Review measured 11 outbound
+                // requests from a prime plus TEN forged kids, against a bound that
+                // allows 2 (the prime, and one refetch inside the window).
+                //
+                // Preserving is also right on the merits. If the refetch succeeded and
+                // the kid was genuine, the new set contains it and no further refetch is
+                // wanted; if it was forged, the marker is exactly what must survive.
+                last_rotation_refetch: previous_refetch,
+            },
+        );
     }
 }

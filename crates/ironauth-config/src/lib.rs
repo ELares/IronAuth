@@ -2079,6 +2079,13 @@ pub const OIDC_JWKS_CACHE_MAX_SECS: u64 = 900;
 /// ceiling. The default is one minute.
 pub const OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS: u64 = 300;
 
+/// The longest a fetched CLIENT `jwks_uri` key set may be cached, in seconds (issues #25,
+/// #126). It bounds how long a key the client has ROTATED OUT stays trusted here, which is
+/// the direction that matters: a rotated-IN key naming a new `kid` is picked up immediately
+/// by the kid-miss refetch, so the ceiling does not have to be short to keep rotation
+/// working. One hour.
+pub const OIDC_MAX_CLIENT_JWKS_TTL_SECS: u64 = 3600;
+
 /// The largest a refresh-token IDLE timeout may be configured to, in seconds
 /// (issue #21). A refresh token that goes unused for longer than its idle timeout
 /// expires; the cap (ninety days) bounds how long an unused, session-bound or
@@ -2366,6 +2373,29 @@ pub struct OidcConfig {
     /// jti until its assertion's `exp` PLUS this skew, so pruning never opens a
     /// replay window.
     pub client_assertion_max_skew_secs: u64,
+
+    /// How long a CLIENT's fetched `jwks_uri` key set is cached, in seconds (issues #25,
+    /// #126). Must be at least 1 and at most 3600; the default is 300. Applies to
+    /// `private_key_jwt` client authentication, the
+    /// `urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant, and `jwks_uri`
+    /// dynamic client registration, all of which resolve a `jwks_uri` through the
+    /// SSRF-hardened fetcher. It bounds how long a key the client has ROTATED OUT stays
+    /// trusted. On the ASSERTION GRANT a rotated-IN key is picked up without waiting, since
+    /// an assertion naming an unknown `kid` triggers a refetch; `private_key_jwt` client
+    /// authentication resolves with NO kid hint, so on that surface this value is the whole
+    /// rotation window and a client that rotates is verified against its old key until it
+    /// expires.
+    ///
+    /// Everything above is in ONE paragraph deliberately: `scripts/config-schema.sh` renders
+    /// only the first paragraph of a doc comment into `docs/CONFIG.md`, so anything below
+    /// this point is documented nowhere the operator who tunes the setting will look. The
+    /// ceiling constant is [`OIDC_MAX_CLIENT_JWKS_TTL_SECS`].
+    ///
+    /// The assertion-grant refetch is rate limited to once per 30 seconds per URI, because
+    /// the `kid` that triggers it comes from an unverified header and an unlimited refetch
+    /// would be an outbound-request amplifier. Giving `private_key_jwt` the same kid hint is
+    /// out of scope for #126 criterion 4.
+    pub client_jwks_ttl_secs: u64,
 
     /// The web origins (scheme + host + optional port, no path) of registered
     /// single-page-app clients allowed to call the `UserInfo` endpoint cross-origin
@@ -3210,6 +3240,7 @@ impl Default for OidcConfig {
             conform_id_token_claims: false,
             client_assertion_audience: ClientAssertionAudience::TokenEndpointOrIssuer,
             client_assertion_max_skew_secs: 60,
+            client_jwks_ttl_secs: 300,
             userinfo_cors_origins: Vec::new(),
             enable_response_type_id_token: false,
             enable_response_type_code_id_token: false,
@@ -5224,17 +5255,7 @@ impl Config {
                 ),
             });
         }
-        // The client-assertion skew has only an upper bound: 0 is valid (no
-        // tolerance), but a wide skew keeps an expired assertion replayable.
-        if self.oidc.client_assertion_max_skew_secs > OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "oidc.client_assertion_max_skew_secs ({}) must not exceed \
-                     {OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS} seconds",
-                    self.oidc.client_assertion_max_skew_secs
-                ),
-            });
-        }
+        validate_client_credential_bounds(&self.oidc)?;
         validate_refresh_and_consent(&self.oidc)?;
         // The PAR request_uri lifetime is bounded like the other credential
         // lifetimes: a zero-second request_uri is born expired, and a lifetime beyond
@@ -7269,6 +7290,44 @@ fn validate_session_lifetimes(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 "oidc.session_idle_ttl_secs ({}) must not exceed oidc.session_ttl_secs ({}): an \
                  idle timeout beyond the absolute cap can never fire",
                 oidc.session_idle_ttl_secs, oidc.session_ttl_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The two bounds on how this provider handles a CLIENT's own credentials: the skew it
+/// tolerates on a client assertion, and how long it caches a client's fetched key set.
+///
+/// Split out of [`Config::validate`] because that function had grown past its line bound,
+/// and split at THIS seam because these two are the same question asked twice: how long a
+/// client credential this provider did not mint stays acceptable.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] naming the setting and its bound.
+fn validate_client_credential_bounds(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    // The client-assertion skew has only an upper bound: 0 is valid (no tolerance), but a
+    // wide skew keeps an expired assertion replayable.
+    if oidc.client_assertion_max_skew_secs > OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.client_assertion_max_skew_secs ({}) must not exceed \
+                 {OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS} seconds",
+                oidc.client_assertion_max_skew_secs
+            ),
+        });
+    }
+    // BOTH bounds on the JWKS TTL, each for its own reason. Zero would make every request
+    // refetch, which is the amplifier the per-URI rate limit exists to prevent, reached
+    // through configuration instead of through an attacker. Above the ceiling, a key the
+    // client has rotated OUT stays trusted for longer than the rotation was meant to take.
+    if oidc.client_jwks_ttl_secs < 1 || oidc.client_jwks_ttl_secs > OIDC_MAX_CLIENT_JWKS_TTL_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.client_jwks_ttl_secs ({}) must be between 1 and \
+                 {OIDC_MAX_CLIENT_JWKS_TTL_SECS} seconds",
+                oidc.client_jwks_ttl_secs
             ),
         });
     }
@@ -9676,6 +9735,77 @@ mod tests {
         assert!(
             err.to_string().contains("client_assertion_max_skew_secs"),
             "{err}"
+        );
+    }
+
+    /// The client JWKS TTL is bounded on BOTH sides, and each side has its own reason.
+    ///
+    /// Zero would make every request refetch, which is the amplifier the resolver's per-URI
+    /// rate limit exists to prevent, reached through configuration instead of through an
+    /// attacker. Above the ceiling, a key the client has ROTATED OUT stays trusted for
+    /// longer than the rotation was meant to take.
+    ///
+    /// Both are asserted because a guard with no test is a guard that can be deleted, and
+    /// this one is load-bearing beyond its own setting: the resolver's fail-closed argument
+    /// for a marker-only cache entry rests on the TTL never being able to reach
+    /// `Duration::MAX`, and the only thing that makes that true is the ceiling here.
+    #[test]
+    fn the_client_jwks_ttl_is_bounded_on_both_sides() {
+        let accepted = Config::from_toml_str(
+            &format!("[oidc]\nclient_jwks_ttl_secs = {OIDC_MAX_CLIENT_JWKS_TTL_SECS}\n"),
+            "ironauth.toml",
+        )
+        .expect("exactly the ceiling is accepted")
+        .config;
+        assert_eq!(
+            accepted.oidc.client_jwks_ttl_secs,
+            OIDC_MAX_CLIENT_JWKS_TTL_SECS
+        );
+        assert_eq!(
+            Config::from_toml_str("[oidc]\nclient_jwks_ttl_secs = 1\n", "ironauth.toml")
+                .expect("exactly the floor is accepted")
+                .config
+                .oidc
+                .client_jwks_ttl_secs,
+            1,
+            "the boundary values themselves must be usable, or the bound is off by one"
+        );
+
+        let err = Config::from_toml_str("[oidc]\nclient_jwks_ttl_secs = 0\n", "ironauth.toml")
+            .expect_err("zero is refused");
+        assert!(err.to_string().contains("client_jwks_ttl_secs"), "{err}");
+
+        let err = Config::from_toml_str(
+            &format!(
+                "[oidc]\nclient_jwks_ttl_secs = {}\n",
+                OIDC_MAX_CLIENT_JWKS_TTL_SECS + 1
+            ),
+            "ironauth.toml",
+        )
+        .expect_err("one over the ceiling is refused");
+        assert!(err.to_string().contains("client_jwks_ttl_secs"), "{err}");
+
+        // The ceiling's VALUE, not just the bounds relative to it. Every assertion above
+        // builds its input FROM the constant, so all of them survive the constant moving --
+        // and two things outside this file are written against one hour specifically: the
+        // doc comment and `docs/CONFIG.md` say "at most 3600" in hand-written prose, and the
+        // resolver's fail-closed argument for a marker-only cache entry rests on the TTL
+        // being unable to reach anything near `Duration::MAX`. Raising this is a decision,
+        // so it should cost a test edit.
+        assert_eq!(
+            OIDC_MAX_CLIENT_JWKS_TTL_SECS, 3600,
+            "one hour, and the prose that says so is hand written"
+        );
+        // And the DEFAULT, for exactly the same reason and in the same sentence. The doc
+        // comment says "the default is 300" in hand-written prose while `docs/CONFIG.md`
+        // GENERATES its default column from this value, so moving it leaves the rendered row
+        // stating two different numbers, and every assertion above survives because they all
+        // build their input from the ceiling. Measured: 300 to 600 left `ironauth-config`
+        // green and `config-schema.sh` regenerating cleanly.
+        assert_eq!(
+            OidcConfig::default().client_jwks_ttl_secs,
+            300,
+            "five minutes, and the prose beside the generated default column says so"
         );
     }
 

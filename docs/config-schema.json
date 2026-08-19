@@ -916,6 +916,13 @@
           "default": "client_id",
           "description": "The default audience a client-credentials access token (RFC 6749 4.4, issue\n#23) carries when the request targets NO resource server. The default\n(`client_id`) makes the token's `aud` the OAuth client id, preserving the\nenvironment's existing no-resource behavior; `issuer` makes it the\nper-environment issuer. When a request DOES target a registered resource\nserver (the RFC 8707 `resource` parameter, issue #28), that resource server's\naudience wins and this default does not apply. This is a promotable\nper-environment setting in spirit; the process value is the deployment default\nuntil per-environment overrides ride the M5 promotion pipeline."
         },
+        "client_jwks_ttl_secs": {
+          "default": 300,
+          "description": "How long a CLIENT's fetched `jwks_uri` key set is cached, in seconds (issues #25,\n#126). Must be at least 1 and at most 3600; the default is 300. Applies to\n`private_key_jwt` client authentication, the\n`urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant, and `jwks_uri`\ndynamic client registration, all of which resolve a `jwks_uri` through the\nSSRF-hardened fetcher. It bounds how long a key the client has ROTATED OUT stays\ntrusted. On the ASSERTION GRANT a rotated-IN key is picked up without waiting, since\nan assertion naming an unknown `kid` triggers a refetch; `private_key_jwt` client\nauthentication resolves with NO kid hint, so on that surface this value is the whole\nrotation window and a client that rotates is verified against its old key until it\nexpires.\n\nEverything above is in ONE paragraph deliberately: `scripts/config-schema.sh` renders\nonly the first paragraph of a doc comment into `docs/CONFIG.md`, so anything below\nthis point is documented nowhere the operator who tunes the setting will look. The\nceiling constant is [`OIDC_MAX_CLIENT_JWKS_TTL_SECS`].\n\nThe assertion-grant refetch is rate limited to once per 30 seconds per URI, because\nthe `kid` that triggers it comes from an unverified header and an unlimited refetch\nwould be an outbound-request amplifier. Giving `private_key_jwt` the same kid hint is\nout of scope for #126 criterion 4.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "conform_id_token_claims": {
           "default": false,
           "description": "Copy the scope-derived standard claims into the ID token (issue #15). The\nspec-conform default (`false`) places scope-derived claims (`profile`,\n`email`, `address`, `phone`) at the `UserInfo` endpoint and keeps the ID\ntoken lean, per OIDC Core 5.4. Setting this `true` additionally copies those\nclaims into the ID token for legacy relying parties that never call\n`UserInfo`; that placement is explicitly NON-conform (it is the\nnode-oidc-provider `conformIdTokenClaims = false` behavior) and is documented\nas such. This is a promotable per-environment setting: it appears in config\nsnapshots and rides the M5 promotion pipeline; the process value is the\ndeployment default until per-environment overrides land.",
@@ -2825,6 +2832,7 @@
         "client_assertion_audience": "token_endpoint_or_issuer",
         "client_assertion_max_skew_secs": 60,
         "client_credentials_default_audience": "client_id",
+        "client_jwks_ttl_secs": 300,
         "conform_id_token_claims": false,
         "consent_lockdown": {
           "gate_unverified_sensitive_scopes": true,

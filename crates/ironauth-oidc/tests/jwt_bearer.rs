@@ -18,7 +18,7 @@ mod common;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::http::{StatusCode, header};
 use base64::Engine;
@@ -1291,6 +1291,187 @@ async fn start_jwks_server(body: String) -> SocketAddr {
     addr
 }
 
+/// A JWKS server that answers the FIRST request and then stops listening entirely.
+///
+/// Its sibling `start_jwks_server_failing_after_first` fails at the HTTP layer, with a 500.
+/// This one fails at the TRANSPORT layer: the listener is dropped after one request, so a later connect is refused. That is
+/// a different arm of `resolve_for_kid` (`Err` from the fetcher rather than a non-success
+/// status) and it is the more common upstream failure, covering a connection refused, a
+/// timeout, and every `FetchError::Blocked` the SSRF fetcher raises.
+async fn start_jwks_server_closing_after_first(body: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0_u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        }
+        // The listener drops here, so every later connect is REFUSED rather than answered.
+        drop(listener);
+    });
+    addr
+}
+
+/// A JWKS server that answers the first request `before`, then answers `after` with a NON-2xx
+/// status and a fully parseable body.
+///
+/// The distinction this exists for is invisible to every other fixture here. A 500 whose body
+/// is empty is refused twice over: once by the status check and once by the empty-document
+/// check, so deleting the status check changes nothing and the guard is unmeasured. A 500
+/// carrying a VALID key set is refused only by the status check, and if it were not it would
+/// be cached as authoritative.
+async fn start_jwks_server_non_2xx_with_keys(before: String, after: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let before = before.clone();
+            let after = after.clone();
+            let served = Arc::clone(&served);
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = if n == 0 {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{before}",
+                        before.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{after}",
+                        after.len()
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    addr
+}
+
+/// A JWKS server that answers 200 ONCE and then 500 to every later request.
+///
+/// Lets a test prime the cache from a healthy upstream and then make the rotation refetch
+/// fail, which is the only way to observe the fallback: the recording dialer cannot be
+/// retargeted mid-test.
+///
+/// This doc was detached from its function for a while, and the way it happened is worth a
+/// line. A later commit inserted a new helper BETWEEN the comment and the fn it described,
+/// so the comment silently became the first of two stacked blocks above the wrong function
+/// and this one was left with none. Nothing warns about it: both still compile, and the
+/// summary line simply describes a function 60 lines away.
+async fn start_jwks_server_failing_after_first(body: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let body = body.clone();
+            let served = Arc::clone(&served);
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = if n == 0 {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    addr
+}
+
+/// A JWKS server that answers by PATH: `/a.json` gets `a`, anything else gets `b`.
+///
+/// The point is to make the URI observable. `RecordingDialer` forwards every connection to
+/// one fixed address and records a `SocketAddr`, so two `jwks_uri` values pointing at the
+/// same loopback server are indistinguishable to it and a resolver that fetched the WRONG
+/// registered URI would look identical. Routing on the path puts the difference in the
+/// RESPONSE instead, where an assertion can see it.
+async fn start_path_routed_jwks_server(a: String, b: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let a = a.clone();
+            let b = b.clone();
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+                let body = if request.contains("/a.json") { a } else { b };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    addr
+}
+
+/// A JWKS server that serves `before` to the FIRST request and `after` to every later one.
+///
+/// This is an upstream ROTATION: the key set genuinely changes between two fetches, which is
+/// the situation the kid-aware refetch exists for and the only way to observe it end to end.
+/// The recording dialer cannot be retargeted mid-test, so the change has to happen behind one
+/// address.
+async fn start_rotating_jwks_server(before: String, after: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let before = before.clone();
+            let after = after.clone();
+            let served = Arc::clone(&served);
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = if n == 0 { before } else { after };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    addr
+}
+
 /// The external `sub` a mapping to a LIFECYCLE-BEARING user principal is keyed on, kept
 /// distinct from [`EXTERNAL_SUBJECT`] so a single harness can carry a user mapping and a
 /// workload mapping from the SAME trusted issuer at once.
@@ -1762,6 +1943,871 @@ async fn a_successful_issuance_names_the_external_issuer_and_subject_in_the_audi
         !detail.contains(&assertion),
         "the assertion is a live credential and must never land in an audit row"
     );
+}
+
+/// Build a resolver over a recording dialer serving `jwks`, returning both so a test can
+/// count outbound fetches. DB-free: this exercises `ClientKeyResolver` directly.
+async fn counting_resolver(
+    jwks: String,
+    ttl: Duration,
+) -> (
+    Arc<ironauth_oidc::ClientKeyResolver>,
+    Arc<RecordingDialer>,
+    String,
+) {
+    let server = start_jwks_server(jwks).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = Arc::new(ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        ttl,
+    ));
+    (resolver, dialer, "http://jwks.test/keys".to_owned())
+}
+
+/// An unknown `kid` triggers exactly ONE refetch however many times it is presented, and a
+/// known `kid` triggers none (issue #126 criterion 4).
+///
+/// Both halves matter and neither alone is sufficient. Without the second, an implementation
+/// that refetched on EVERY request would pass the first. Without the first, an implementation
+/// where the whole feature is inert would pass the second -- which is exactly the state the
+/// review found: two mutants, "delete the rate limit" and "make the feature inert", both
+/// survived the entire suite because nothing counted fetches.
+///
+/// All requests are made at the SAME instant, deep inside the 30s window, so this measures
+/// the bound and not the clock.
+#[tokio::test]
+async fn an_unknown_kid_refetches_once_and_a_known_kid_never_does() {
+    let key = issuer_key();
+    let (resolver, dialer, uri) =
+        counting_resolver(jwks_json(&key), Duration::from_secs(300)).await;
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    // Prime the cache.
+    let keys = resolver.resolve(now, &uri).await;
+    assert!(!keys.is_empty(), "the fixture must serve a usable key set");
+    assert_eq!(dialer.requested().len(), 1, "priming is one fetch");
+
+    // A KNOWN kid is answered from cache: no outbound request at all.
+    let known = keys[0]
+        .kid()
+        .expect("the fixture key carries a kid")
+        .to_owned();
+    for _ in 0..5 {
+        resolver.resolve_for_kid(now, &uri, Some(&known)).await;
+    }
+    assert_eq!(
+        dialer.requested().len(),
+        1,
+        "a kid already in the cached set must never cause a fetch"
+    );
+
+    // TEN forged kids at the same instant cost ONE fetch between them. Before the rework
+    // this measured 11 -- `store()` reset the rate-limit marker the refetch had just set, so
+    // every forged kid fetched again.
+    for i in 0..10 {
+        resolver
+            .resolve_for_kid(now, &uri, Some(&format!("forged-{i}")))
+            .await;
+    }
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "a burst of unknown kids must cost exactly one refetch, not one each"
+    );
+}
+
+/// A refetch whose upstream fails falls back to the still-valid cached set (issue #126
+/// criterion 4: no outage window).
+///
+/// The refetch exists to make rotation seamless. If a failing upstream turned a working
+/// issuer into a failing one, the optimisation would have made availability WORSE than not
+/// having it -- and `federation_jwks.rs` already gets this right for the same kid-miss
+/// refetch, so the house pattern was there to follow.
+#[tokio::test]
+async fn a_failed_rotation_refetch_falls_back_to_the_cached_keys() {
+    let key = issuer_key();
+    let server = start_jwks_server_failing_after_first(jwks_json(&key)).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(300),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    let primed = resolver.resolve(now, "http://jwks.test/keys").await;
+    assert_eq!(primed.len(), 1, "the first fetch must succeed and prime");
+
+    // The refetch now hits a 500.
+    let after = resolver
+        .resolve_for_kid(now, "http://jwks.test/keys", Some("unknown-kid"))
+        .await;
+    assert_eq!(
+        after.len(),
+        1,
+        "a failed refetch must return the CACHED keys, not nothing -- otherwise a transient \
+         upstream outage turns a working issuer into a failing one"
+    );
+    assert_eq!(dialer.requested().len(), 2, "it did attempt the refetch");
+}
+
+/// A refetch whose upstream is UNREACHABLE falls back too, not only one that answers 500.
+///
+/// The sibling above drives an HTTP 500, which is the `!is_success()` arm. Measured: making
+/// the `Err` arm return an empty set instead of the cached one left the entire
+/// `ironauth-oidc` suite green, so the more common upstream failure -- a connection refused,
+/// a timeout, or any `FetchError::Blocked` from the SSRF fetcher -- was the unmeasured half
+/// of a guarantee this PR advertises in three places.
+#[tokio::test]
+async fn a_refetch_whose_upstream_is_unreachable_falls_back_to_the_cached_keys() {
+    let key = issuer_key();
+    let server = start_jwks_server_closing_after_first(jwks_json(&key)).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(300),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let uri = "http://gone.test/keys";
+
+    let primed = resolver.resolve(now, uri).await;
+    assert_eq!(
+        primed.len(),
+        1,
+        "the first fetch must succeed and prime, or the rest of this test proves nothing"
+    );
+
+    // The listener is gone, so this refetch cannot connect at all.
+    let after = resolver
+        .resolve_for_kid(now, uri, Some("unknown-kid"))
+        .await;
+    assert_eq!(
+        after.len(),
+        1,
+        "a refetch that cannot REACH the upstream must return the cached keys, not nothing: \
+         a transport failure is the common case and it must not be worse than a 500"
+    );
+}
+
+/// A NON-2xx carrying a valid key set is refused on its STATUS, and never cached.
+///
+/// Every other non-success fixture in this file answers with an empty body, so it is refused
+/// twice over: once by the status check and once by the empty-document check. Measured:
+/// deleting the status check entirely left all three suites green, because nothing
+/// distinguished the two reasons. An error page that happens to parse as a JWK Set would
+/// then be stored as authoritative for a whole TTL.
+#[tokio::test]
+async fn a_non_2xx_answer_is_refused_on_its_status_even_when_its_body_parses() {
+    let good = SigningKey::ed25519_from_seed(Some("k-good".to_owned()), &[0x11; 32]).expect("key");
+    let usurper =
+        SigningKey::ed25519_from_seed(Some("k-usurper".to_owned()), &[0x22; 32]).expect("key");
+    let server = start_jwks_server_non_2xx_with_keys(jwks_json(&good), jwks_json(&usurper)).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(300),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let uri = "http://five-hundred.test/keys";
+
+    let primed = resolver.resolve(now, uri).await;
+    assert_eq!(
+        primed
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-good"],
+        "the first fetch must prime with the good key set"
+    );
+
+    // The refetch receives a 500 whose body is a perfectly valid JWK Set naming a DIFFERENT
+    // key. Only the status check stands between it and the cache.
+    let after = resolver
+        .resolve_for_kid(now, uri, Some("unknown-kid"))
+        .await;
+    assert_eq!(
+        after
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-good"],
+        "a non-2xx must be refused on its STATUS, whatever its body parses to"
+    );
+
+    // And it must not have been stored: an ordinary resolve, which cannot trigger a refetch,
+    // still answers with the primed set rather than the usurper's.
+    assert_eq!(
+        resolver
+            .resolve(now, uri)
+            .await
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-good"],
+        "the error page's key set must never have been cached"
+    );
+}
+
+/// A kid-less key set is bounded by the rate limit, NOT exempted from refetching.
+///
+/// `ironauth-jose` deliberately supports keys with no `kid` (the RFC 8037 A.4 vector). For
+/// such a set every named kid is "absent" forever, so an earlier version of this code treated
+/// it as satisfied by definition, to avoid refetching on every request.
+///
+/// That exemption was wrong twice over. The traffic it feared is already bounded -- five
+/// requests naming an unknown kid cost ONE refetch, not five, because the rate limit holds.
+/// And exempting the set meant an issuer that rotates FROM a kid-less set TO a kid-bearing
+/// one would never be refetched, leaving the new key undiscovered for a full TTL: criterion
+/// 4's outage, reintroduced by the guard meant to protect availability.
+///
+/// So this asserts the bound rather than an exemption.
+#[tokio::test]
+async fn a_kidless_key_set_is_bounded_by_the_rate_limit_not_exempted() {
+    // Built by HAND, because `jwks_json` always emits a `kid` -- an earlier version of this
+    // test used it and the guard below caught the fixture proving nothing.
+    let key = SigningKey::ed25519_from_seed(Some("k-drop".to_owned()), &[0x33; 32]).expect("key");
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&jwks_json(&key)).expect("jwks json parses");
+    for jwk in doc["keys"].as_array_mut().expect("keys array") {
+        jwk.as_object_mut().expect("jwk object").remove("kid");
+    }
+    let (resolver, dialer, uri) =
+        counting_resolver(doc.to_string(), Duration::from_secs(300)).await;
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    let keys = resolver.resolve(now, &uri).await;
+    assert!(!keys.is_empty());
+    assert!(
+        keys.iter().all(|k| k.kid().is_none()),
+        "this fixture must serve a kid-less set for the test to mean anything"
+    );
+    for attempt in 0..5 {
+        let answered = resolver.resolve_for_kid(now, &uri, Some("any-kid")).await;
+        // Bounded, not BROKEN. The four calls the rate limit refuses must still be answered
+        // from the cache: a refusal that returned an empty set would fail-close every
+        // request naming an unfamiliar kid, and would change the #91 diagnostic from
+        // `AssertionKidUnknown` to `AssertionInvalid` for all of them.
+        assert!(
+            !answered.is_empty(),
+            "attempt {attempt}: a rate-limited refetch must answer from the cache, not with \
+             nothing"
+        );
+    }
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "five requests naming an unknown kid must cost ONE refetch between them -- bounded, \
+         not exempted"
+    );
+}
+
+/// An upstream document that names NO usable key is never cached, and the caller falls back
+/// to the still-valid set.
+///
+/// The module doc promises exactly this ("A failed or empty fetch is NEVER cached"), and it
+/// was promised without a test: deleting the `keys.is_empty()` branch left all sixty-three
+/// tests in these three files green. What the deletion costs is not subtle. The empty set
+/// would be stored under the URI, so every client on it fails closed for a full TTL, and
+/// because an empty set contains no kid the "is this kid present" check answers `false`
+/// forever -- so the ONE refetch per 30s the rate limit allows is the only path out, and
+/// every request in between is refused.
+///
+/// An empty document is the realistic shape of a partial upstream failure: a CDN serving a
+/// stale-but-valid JSON skeleton, or a key server mid-rotation with nothing published.
+#[tokio::test]
+async fn an_empty_upstream_document_is_never_cached_and_falls_back() {
+    let key = SigningKey::ed25519_from_seed(Some("k-empty".to_owned()), &[0x5a; 32]).expect("key");
+    // Valid first, then a well-formed JWK Set naming nothing. `start_rotating_jwks_server`
+    // serves `before` to the first request and `after` to every later one.
+    let server = start_rotating_jwks_server(jwks_json(&key), "{\"keys\":[]}".to_owned()).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(300),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let uri = "http://empty.test/keys";
+
+    let primed = resolver.resolve(now, uri).await;
+    assert_eq!(
+        primed
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-empty"],
+        "the first fetch must succeed and prime, or the rest of this test proves nothing"
+    );
+
+    // The refetch now receives `{"keys":[]}`.
+    let after = resolver
+        .resolve_for_kid(now, uri, Some("unknown-kid"))
+        .await;
+    assert_eq!(
+        after
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-empty"],
+        "an empty document must fall back to the cached set, not replace it"
+    );
+    assert_eq!(dialer.requested().len(), 2, "it did attempt the refetch");
+
+    // And the cache itself must be UNPOISONED: an ordinary resolve, which cannot trigger a
+    // refetch at all, still answers with the primed set.
+    assert_eq!(
+        resolver
+            .resolve(now, uri)
+            .await
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-empty"],
+        "the empty document must not have been stored"
+    );
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "and that answer came from the cache, not from a third fetch"
+    );
+}
+
+/// A ROTATED upstream key is accepted at `/token`, inside the cache TTL (issue #126
+/// criterion 4).
+///
+/// # Why this test exists, and why the three that preceded it were not enough
+///
+/// The other rotation tests call `ClientKeyResolver::resolve_for_kid` directly. They prove
+/// the resolver, and they proved it well: the bound holds, the fallback works, the kid-less
+/// exemption is gone. What none of them touched is the WIRING -- whether the grant actually
+/// hands the presented `kid` to the resolver.
+///
+/// Measured: replacing `let kid = ironauth_jose::compact_jws_kid(assertion);` in
+/// `jwt_bearer.rs` with `let kid: Option<String> = None;` -- the feature disconnected from
+/// the grant entirely -- left the whole suite green. A feature can be correct, tested, and
+/// reachable by nothing, and this file had all three of those and called it done.
+///
+/// So this drives the real `/token` endpoint. The TTL is 300 seconds and nothing advances a
+/// clock, so the cache CANNOT expire during the test: the only thing that can make the
+/// second exchange succeed is the kid-miss refetch firing through the grant.
+#[tokio::test]
+// One rotation, followed in a single walk: prime, rotate, refetch, forge, and the
+// known-kid arm that separates "the presented kid travels" from "a kid travels".
+// Each arm depends on the dial count the previous one left behind, so splitting them
+// would mean re-priming a fresh server per arm and asserting on counts that no longer
+// compose.
+#[allow(clippy::too_many_lines)]
+async fn a_rotated_upstream_key_is_accepted_at_the_token_endpoint_inside_the_ttl() {
+    // Two keys with DISTINCT kids. The kid is the whole hint: with one kid the presented
+    // assertion would name a key the cache already claims to hold, and no refetch is due.
+    // MIXED CASE deliberately. `kid` is an opaque JSON string and JWK matching is exact, so
+    // a hint that lowercased it on the way through would silently miss every key a real
+    // issuer publishes with capitals. All-lowercase fixtures cannot see that.
+    let before = SigningKey::ed25519_from_seed(Some("Rot-Before".to_owned()), &[11_u8; 32])
+        .expect("before key");
+    let after = SigningKey::ed25519_from_seed(Some("Rot-After".to_owned()), &[22_u8; 32])
+        .expect("after key");
+
+    // The upstream rotates between the two fetches, which is the event under test.
+    let server = start_rotating_jwks_server(jwks_json(&before), jwks_json(&after)).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = Arc::new(ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        // LONG, deliberately. If this were short the second exchange could succeed by
+        // ordinary cache expiry and the test would measure nothing about the kid path.
+        Duration::from_secs(300),
+    ));
+    let h = Harness::start_with_resolver(
+        OidcConfig {
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        },
+        resolver,
+    )
+    .await;
+    h.register_external_issuer(
+        EXTERNAL_ISSUER,
+        None,
+        Some("http://issuer.test/jwks.json"),
+        None,
+        true,
+    )
+    .await;
+    h.create_subject_mapping(
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        None,
+        None,
+        MAPPED_PRINCIPAL,
+    )
+    .await;
+    let client_id = h.client_id().to_string();
+
+    // PRIME. One fetch, and the cache now holds `rot-before` only.
+    let first = assertion(
+        &before,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-rot-1",
+    );
+    let (status, _h, body) = present(&h, &client_id, &first).await;
+    assert_eq!(status, StatusCode::OK, "the pre-rotation exchange: {body}");
+    assert_eq!(dialer.requested().len(), 1, "primed with one fetch");
+
+    // THE ROTATION. The workload now signs with the new key, whose `kid` the cached set
+    // does not contain. Inside the TTL, so nothing but the kid-miss refetch can save it.
+    let second = assertion(
+        &after,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-rot-2",
+    );
+    let (status, _h, body) = present(&h, &client_id, &second).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a rotated upstream key must be accepted inside the TTL, which is the whole point \
+         of the kid-aware refetch: {body}"
+    );
+    assert_eq!(
+        jwt_payload(json(&body)["access_token"].as_str().expect("access_token"))["sub"],
+        MAPPED_PRINCIPAL,
+        "and it must still issue under the MAPPED principal"
+    );
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "exactly one refetch: the rotation, not a fetch per request"
+    );
+
+    // AND THE BOUND STILL HOLDS through the grant. A third exchange naming a kid nothing
+    // publishes must not buy another fetch, or the wiring would have turned the endpoint
+    // into an amplifier for anyone who can post a forged header.
+    let forged = SigningKey::ed25519_from_seed(Some("Rot-Forged".to_owned()), &[33_u8; 32])
+        .expect("forged key");
+    let third = assertion(
+        &forged,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-rot-3",
+    );
+    let (status, _h, _body) = present(&h, &client_id, &third).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a forged kid is refused");
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "the rate limit holds at the endpoint too: a forged kid buys no third fetch"
+    );
+
+    // FINALLY: the kid that travels is the PRESENTED one, not merely some kid.
+    //
+    // Without this arm the test is satisfied by a grant that hands the resolver a constant
+    // string, because a constant unknown kid also refetches once and also lands on the
+    // rotated set. Measured: that mutant survived every assertion above.
+    //
+    // The clock is advanced past the refetch rate limit first, which is what makes the two
+    // hypotheses separable. With the window open, an assertion naming a kid the cache now
+    // HOLDS must buy no fetch; a constant unknown kid would buy one.
+    h.clock().advance(Duration::from_secs(120));
+    let known_again = assertion(
+        &after,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-rot-4",
+    );
+    let (status, _h, body) = present(&h, &client_id, &known_again).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the rotated key still works: {body}"
+    );
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "a kid the cache already holds must never refetch, even with the rate-limit window \
+         open -- which is only true if the PRESENTED kid is what reaches the resolver"
+    );
+}
+
+/// The refetch interval is THIRTY seconds, at its boundary (issue #126 criterion 4).
+///
+/// # Why this test had to exist
+///
+/// Every other count assertion in this file is made at one frozen instant, which any
+/// positive interval satisfies. So both of these mutants passed the whole suite:
+///
+/// * `Duration::from_secs(30)` to `from_secs(1)` -- a thirty-fold amplifier at a
+///   third-party host, driven by an unverified header, which is the exact thing the bound
+///   exists to prevent;
+/// * `Duration::from_secs(30)` to `from_secs(3600)` -- a rotated key undiscovered for an
+///   hour, which is criterion 4's outage back again wearing a different number.
+///
+/// A constant nothing can move is a constant nobody is measuring. Both sides are asserted
+/// here, so either direction fails.
+#[tokio::test]
+async fn the_refetch_interval_is_thirty_seconds_at_its_boundary() {
+    let key = issuer_key();
+    let (resolver, dialer, uri) =
+        counting_resolver(jwks_json(&key), Duration::from_secs(86_400)).await;
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    // The TTL is a day, so ordinary cache expiry cannot explain any fetch below. Only the
+    // interval can.
+    resolver.resolve(t0, &uri).await;
+    assert_eq!(dialer.requested().len(), 1, "priming is one fetch");
+
+    resolver.resolve_for_kid(t0, &uri, Some("unknown-a")).await;
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "the first unknown kid claims the one refetch the window allows"
+    );
+
+    resolver
+        .resolve_for_kid(t0 + Duration::from_secs(29), &uri, Some("unknown-b"))
+        .await;
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "one second INSIDE the window buys nothing: an interval shorter than 30s fails here"
+    );
+
+    resolver
+        .resolve_for_kid(t0 + Duration::from_secs(30), &uri, Some("unknown-c"))
+        .await;
+    assert_eq!(
+        dialer.requested().len(),
+        3,
+        "exactly AT the window the next refetch is allowed: an interval longer than 30s \
+         fails here"
+    );
+
+    // And the window restarts from the refetch, not from the prime. Without this a
+    // reading of "at most one per 30s counted from the first request ever" would pass.
+    resolver
+        .resolve_for_kid(t0 + Duration::from_secs(59), &uri, Some("unknown-d"))
+        .await;
+    assert_eq!(
+        dialer.requested().len(),
+        3,
+        "the window is measured from the last refetch, so 29s after it buys nothing"
+    );
+}
+
+/// The bound holds under CONCURRENCY (issue #126 criterion 4).
+///
+/// A `Barrier` rather than a plain spawn: without it the tasks would almost certainly run
+/// one after another and this would measure the sequential case a second time.
+///
+/// # What this test does and does NOT catch, stated because the difference matters
+///
+/// It catches a gross regression: anything that makes the refetch per-caller rather than
+/// per-URI fails here immediately, and that is the shape a rewrite is most likely to
+/// introduce.
+///
+/// It does NOT reliably catch the SUBTLE one. Splitting `begin_rotation_refetch` into
+/// check-then-act with the lock released between the two halves survives this test in most
+/// trials, MEASURED: a 256-way burst on 16 worker threads with that mutation applied still
+/// reported 2 fetches. The window between the two lock acquisitions is a handful of
+/// instructions with no await in it, so the interleaving that would expose it is rare, and
+/// an assertion that fails in a minority of trials is a flake generator rather than a test.
+///
+/// So the single lock acquisition in `begin_rotation_refetch` is guaranteed by CONSTRUCTION
+/// and not by this test, and that is worth writing down rather than leaving a reader to
+/// infer a coverage this file does not have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_concurrent_burst_of_unknown_kids_still_costs_one_refetch() {
+    const BURST: usize = 64;
+
+    let key = issuer_key();
+    let (resolver, dialer, uri) =
+        counting_resolver(jwks_json(&key), Duration::from_secs(86_400)).await;
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    resolver.resolve(now, &uri).await;
+    assert_eq!(dialer.requested().len(), 1, "priming is one fetch");
+
+    let gate = Arc::new(tokio::sync::Barrier::new(BURST));
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..BURST {
+        let resolver = Arc::clone(&resolver);
+        let gate = Arc::clone(&gate);
+        let uri = uri.clone();
+        tasks.spawn(async move {
+            // Every task waits here, so they are released into the resolver together.
+            gate.wait().await;
+            resolver
+                .resolve_for_kid(now, &uri, Some(&format!("forged-{i}")))
+                .await;
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "{BURST} concurrent unknown kids must cost ONE refetch between them, not one each"
+    );
+}
+
+/// Two URIs are two cache entries, each fetched from its own path (issue #126 criterion 4).
+///
+/// # What this proves, and what it does NOT
+///
+/// It proves the RESOLVER keeps two `jwks_uri` values apart: the `FetchRequest` carries the
+/// URI it was given, and the cache is keyed per URI rather than on something coarser (two
+/// issuers cost two fetches, not one). Both calls run against a cold cache, so `cached()`
+/// returns `None` and the kid guard is never entered -- the `kid` arguments below are there
+/// to show they do not change the answer, not to exercise the rotation path. An earlier
+/// version of this doc claimed they did; a probe panic placed inside the guard block proved
+/// otherwise while the test still passed.
+///
+/// It does NOT prove that `jwt_bearer.rs` passes the REGISTERED URI, because it never calls
+/// `jwt_bearer.rs`. That is the whole point of the finding this test was written for, and
+/// pinning the `uri` argument to a constant survives it. The test below,
+/// `an_assertion_is_verified_against_its_own_issuers_registered_jwks_uri`, is what closes
+/// that, by driving `/token` with two registered issuers whose URIs differ only in path.
+#[tokio::test]
+async fn each_issuers_rotation_is_answered_from_its_own_jwks_uri() {
+    let key_a =
+        SigningKey::ed25519_from_seed(Some("uri-a".to_owned()), &[44_u8; 32]).expect("key a");
+    let key_b =
+        SigningKey::ed25519_from_seed(Some("uri-b".to_owned()), &[55_u8; 32]).expect("key b");
+    let server = start_path_routed_jwks_server(jwks_json(&key_a), jwks_json(&key_b)).await;
+
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(86_400),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let uri_a = "http://issuer-a.test/a.json";
+    let uri_b = "http://issuer-b.test/b.json";
+
+    // Each URI is asked for a kid only the OTHER one publishes, so a resolver that fetched
+    // the wrong URI would satisfy the request instead of refusing it.
+    let from_first = resolver.resolve_for_kid(now, uri_a, Some("uri-b")).await;
+    assert_eq!(
+        from_first
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["uri-a"],
+        "issuer A's uri must answer with A's key set, whatever kid was asked for"
+    );
+
+    let from_second = resolver.resolve_for_kid(now, uri_b, Some("uri-a")).await;
+    assert_eq!(
+        from_second
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["uri-b"],
+        "and issuer B's uri with B's, so one issuer's key can never mint under the other's \
+         mappings"
+    );
+
+    // Two URIs, two entries, two fetches. One fetch would mean the cache is keyed on
+    // something coarser than the URI, which is the same confusion arriving by another route.
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "the cache is keyed per URI: two distinct issuers cost two fetches, not one"
+    );
+}
+
+/// The rotation-refetch bound is PER URI, so one issuer's rotation cannot starve another's
+/// (issue #126 criterion 4).
+///
+/// # Why the test above cannot cover this, and why that mattered
+///
+/// `each_issuers_rotation_is_answered_from_its_own_jwks_uri` runs both calls against a COLD
+/// cache, which its own doc says: `cached()` returns `None` and the kid guard is never
+/// entered. The per-URI property lives INSIDE that guard, in `begin_rotation_refetch`, so no
+/// cold-cache test can reach it however many URIs it uses.
+///
+/// Review measured the consequence. Rekeying the marker to a constant, which makes the bound
+/// global, leaves the whole binary green at 42 passed. The guarantee was stated in three
+/// places (the `client_keys.rs` doc, the CHANGELOG, and a THREAT-MODEL DoS row) and pinned
+/// in none, which is the shape this PR exists to fix one level up.
+///
+/// So this test PRIMES both URIs first, putting each in the cache, and only then presents an
+/// unknown `kid` to each. Both must refetch. Under a global bound the first refetch consumes
+/// the only permit inside the 30s interval and the second issuer is refused: measured
+/// 3 requests then 3, against 3 then 4 on the shipped code.
+#[tokio::test]
+async fn a_rotation_refetch_bound_is_per_uri_so_one_issuer_cannot_starve_another() {
+    let key_a =
+        SigningKey::ed25519_from_seed(Some("uri-a".to_owned()), &[44_u8; 32]).expect("key a");
+    let key_b =
+        SigningKey::ed25519_from_seed(Some("uri-b".to_owned()), &[55_u8; 32]).expect("key b");
+    let server = start_path_routed_jwks_server(jwks_json(&key_a), jwks_json(&key_b)).await;
+
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(86_400),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let uri_a = "http://issuer-a.test/a.json";
+    let uri_b = "http://issuer-b.test/b.json";
+
+    // PRIME. Each URI is asked for the kid it publishes, so the answer is served and cached
+    // without entering the rotation guard. Two fetches.
+    let _ = resolver.resolve_for_kid(now, uri_a, Some("uri-a")).await;
+    let _ = resolver.resolve_for_kid(now, uri_b, Some("uri-b")).await;
+    let after_priming = dialer.requested().len();
+    assert_eq!(
+        after_priming, 2,
+        "priming must cost one fetch per URI, or the rest of this test is measuring something \
+         else"
+    );
+
+    // Issuer A rotates: a kid it does not have yet. This consumes A's permit.
+    let _ = resolver
+        .resolve_for_kid(now, uri_a, Some("rotated-a"))
+        .await;
+    let after_a = dialer.requested().len();
+    assert_eq!(
+        after_a, 3,
+        "an unknown kid on a PRIMED uri must refetch, or this test never enters the guard it \
+         is about"
+    );
+
+    // Issuer B rotates in the same interval. Its permit is its own.
+    let _ = resolver
+        .resolve_for_kid(now, uri_b, Some("rotated-b"))
+        .await;
+    assert_eq!(
+        dialer.requested().len(),
+        4,
+        "the refetch bound is PER URI: issuer A having just spent its permit must not starve \
+         issuer B's rotation, which is the DoS mitigation the threat model claims"
+    );
+}
+
+/// An assertion is verified against ITS OWN issuer's registered `jwks_uri`, driven through
+/// the live `/token` endpoint (issue #126 criterion 4).
+///
+/// # Why this is the test that had to exist
+///
+/// The one above proves the resolver keeps two URIs apart. It calls the resolver directly,
+/// so no assertion in it can observe the argument `jwt_bearer.rs` actually passes -- and
+/// measurement bore that out: pinning that argument to a constant
+/// (`resolve_for_kid(state.now(), "http://wrong.test/keys", kid)`) left the whole
+/// `ironauth-oidc` suite green. Proving the layer while leaving the call into it unproven is
+/// the same defect this PR was opened to fix one level up, so answering it with another
+/// direct-call test would have been answering it with the defect.
+///
+/// # What a mixup costs
+///
+/// A trust confusion, not a slow path. With two registered assertion issuers, verifying A's
+/// assertion against B's key set means whoever holds B's signing key mints tokens under A's
+/// subject mappings. Both issuers here are legitimately registered and enabled; the only
+/// thing separating them is which URI is fetched for which.
+///
+/// The two URIs differ ONLY in path, and the server answers a different key set per path, so
+/// the difference lands in the response where an assertion can see it. `RecordingDialer`
+/// forwards every connection to one address, so nothing coarser than the response body can
+/// tell the two apart.
+#[tokio::test]
+async fn an_assertion_is_verified_against_its_own_issuers_registered_jwks_uri() {
+    const ISSUER_A: &str = "https://a.workload.test";
+    const ISSUER_B: &str = "https://b.workload.test";
+    let key_a =
+        SigningKey::ed25519_from_seed(Some("e2e-uri-a".to_owned()), &[0x66; 32]).expect("key a");
+    let key_b =
+        SigningKey::ed25519_from_seed(Some("e2e-uri-b".to_owned()), &[0x77; 32]).expect("key b");
+    let server = start_path_routed_jwks_server(jwks_json(&key_a), jwks_json(&key_b)).await;
+
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = Arc::new(ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(300),
+    ));
+    let h = Harness::start_with_resolver(
+        OidcConfig {
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        },
+        resolver,
+    )
+    .await;
+    // `/a.json` serves A's key set; every other path serves B's. So a resolver fetching any
+    // URI other than the one registered for A gets B's keys.
+    h.register_external_issuer(ISSUER_A, None, Some("http://jwks.test/a.json"), None, true)
+        .await;
+    h.register_external_issuer(ISSUER_B, None, Some("http://jwks.test/b.json"), None, true)
+        .await;
+    h.create_subject_mapping(ISSUER_A, EXTERNAL_SUBJECT, None, None, MAPPED_PRINCIPAL)
+        .await;
+    let client_id = h.client_id().to_string();
+
+    // A's assertion, signed with A's key. This is the direction the constant-URI mutant
+    // breaks: under it the grant fetches some other path, gets B's key set, and A's genuine
+    // signature no longer verifies.
+    let own = assertion(
+        &key_a,
+        ISSUER_A,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-own-uri",
+    );
+    let (status, _hdrs, body) = present(&h, &client_id, &own).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "issuer A's assertion must verify against the key set at A's REGISTERED jwks_uri: \
+         {body}"
+    );
+    assert_eq!(
+        jwt_payload(json(&body)["access_token"].as_str().expect("access token"))["sub"],
+        MAPPED_PRINCIPAL
+    );
+
+    // And B's key must not verify an assertion CLAIMING to be A. Without this the test
+    // above would still pass if every issuer resolved to A's URI, which is the same mixup
+    // in the opposite direction.
+    let forged = assertion(
+        &key_b,
+        ISSUER_A,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-cross-uri",
+    );
+    let (status, _hdrs, body) = present(&h, &client_id, &forged).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the OTHER issuer's key must not verify an assertion claiming issuer A: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
 }
 
 /// A GitHub Actions-shaped workload token exchanges under the MAPPED identity, and the

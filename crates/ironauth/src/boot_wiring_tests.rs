@@ -658,3 +658,59 @@ async fn both_planes_receive_the_same_shared_values() {
     // read through a seam that had already been dropped.
     drop(clock);
 }
+
+/// The boot path INSTALLS the client-key resolver (issues #25, #126 criterion 4).
+///
+/// This test exists because of a measurement. `OidcState::new` passes `None` for the
+/// resolver, and until this change the shipped binary called exactly that: the only
+/// `Some(resolver)` call site in the repository was a test harness. THREE surfaces read
+/// `client_key_resolver()` and found nothing -- `private_key_jwt` client authentication,
+/// the `jwt-bearer` assertion grant, and `jwks_uri` dynamic client registration -- while
+/// their own suites stayed green, because those suites construct the resolver themselves.
+///
+/// The first two were inert. The third hard-refused with an explicit message, so wiring the
+/// resolver CHANGES its behaviour rather than restoring it; see the comment at the wiring
+/// site in `main.rs`.
+///
+/// The unwired plane is the control, and it is what makes this non-vacuous: it is built
+/// through `OidcState::new` deliberately, so a version of this assertion that could not
+/// tell an installed resolver from an absent one fails here rather than passing quietly.
+#[tokio::test]
+async fn the_boot_path_installs_the_client_key_resolver() {
+    // A TTL that is neither the shipped default (300) nor any other duration this harness
+    // sets, so an assertion on it cannot pass by coincidence.
+    const CONFIGURED_TTL_SECS: u64 = 1234;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let fixture = fixture(
+        &db,
+        &env,
+        LadderIntent {
+            signup_quarantine: true,
+            advanced_recovery: true,
+        },
+    );
+    let mut fixture = fixture;
+    fixture.config.oidc.client_jwks_ttl_secs = CONFIGURED_TTL_SECS;
+    let wired = boot_both_planes(&fixture).await;
+    let unwired = unwired_planes(&db, &env).await;
+
+    let resolver = wired.oidc.client_key_resolver().cloned().expect(
+        "a booted OIDC plane must hold a client-key resolver, or every jwks_uri client and \
+         every jwks_uri assertion issuer resolves to no keys at all",
+    );
+    // INSTALLED IS NOT ENOUGH. A resolver built with a default TTL instead of the configured
+    // one is indistinguishable from a correct one at every other seam, and the value it
+    // ignores governs how long a key the client has ROTATED OUT stays trusted -- a silent
+    // security misconfiguration, in the same shape as the wiring defect this test exists for.
+    assert_eq!(
+        resolver.ttl(),
+        std::time::Duration::from_secs(CONFIGURED_TTL_SECS),
+        "the resolver must be built from oidc.client_jwks_ttl_secs, not from a default"
+    );
+    assert!(
+        unwired.oidc.client_key_resolver().is_none(),
+        "the unwired control must NOT hold one, or the assertion above proves nothing"
+    );
+}

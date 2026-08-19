@@ -367,7 +367,13 @@ async fn validate_and_map(
     // keys, the SHARED audience policy, and the SHARED skew bound. The policy
     // enforces `iss == record.issuer` and the algorithm allowlist, so the token's
     // own `alg` header is never trusted.
-    let keys = resolve_issuer_keys(state, &record).await;
+    // The header `kid`, UNVERIFIED and used only as a staleness hint. Via the purpose-built
+    // `ironauth_jose::compact_jws_kid`, which is documented for exactly this ("a JWKS-refetch
+    // HINT on upstream key rotation") and enforces an 8 KB header bound. A local copy without
+    // that bound would run an unbounded base64 and JSON decode on an unauthenticated request,
+    // BEFORE `verify()`'s own size caps apply.
+    let kid = ironauth_jose::compact_jws_kid(assertion);
+    let keys = resolve_issuer_keys(state, &record, kid.as_deref()).await;
     let algorithms = allowed_algs(&record);
     // NARROWED by the issuer's own allowlist (issue #126 criterion 3). The shared policy
     // is the deployment floor and this can only restrict it, never widen it: an issuer that
@@ -750,13 +756,19 @@ fn allowed_algs(record: &ExternalAssertionIssuerRecord) -> Vec<JwsAlgorithm> {
 async fn resolve_issuer_keys(
     state: &OidcState,
     record: &ExternalAssertionIssuerRecord,
+    kid: Option<&str>,
 ) -> Vec<TrustedKey> {
     if let Some(inline) = &record.jwks {
         return ironauth_jose::trusted_keys_from_jwks(inline.as_bytes());
     }
     if let Some(uri) = &record.jwks_uri {
         if let Some(resolver) = state.client_key_resolver() {
-            return resolver.resolve(state.now(), uri).await;
+            // The assertion's UNVERIFIED `kid` is passed so a rotation is discovered without
+            // waiting out the cache TTL (issue #126 criterion 4). Passing it introduces no
+            // trust: it selects nothing and authorises nothing, it only tells the resolver
+            // that the cached set may be stale, and the refetch it can trigger is rate
+            // limited per URI precisely because the value is attacker-chosen.
+            return resolver.resolve_for_kid(state.now(), uri, kid).await;
         }
     }
     Vec::new()

@@ -6,6 +6,67 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`jwks_uri` key resolution now works in a deployed server at all, which it did not
+  before.** `OidcState::new` passes `None` for the client-key resolver and the shipped
+  binary called exactly that, so the only `Some(resolver)` call site in the repository was a
+  test harness. THREE surfaces read it and found nothing, and they did not all fail the same
+  way:
+
+  - `private_key_jwt` client authentication (issue #25) resolved to an EMPTY key set, so
+    every such client was refused. Inert.
+  - The `urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant (issue #126): same.
+  - `jwks_uri` DYNAMIC CLIENT REGISTRATION (RFC 7591) was not inert. It hard-refused with
+    "jwks_uri registration is not available on this deployment".
+
+  So this is a BEHAVIOUR CHANGE for the third one: a registration that was always refused is
+  now accepted, and accepting means an outbound fetch to a URL the CLIENT supplies.
+
+  Two clauses an earlier draft of this entry got wrong, in the reassuring direction both
+  times. It is NOT the case that "the other two always fetch a URL an operator chose": that
+  holds for the jwt-bearer grant, which needs a registered issuer record, but
+  `private_key_jwt` reads `jwks_uri` off the CLIENT record, which is client-supplied once
+  RFC 7591 registration is on. And it is NOT the case that the registration route always
+  "carries the issue #31 abuse controls": `POST` register does, the RFC 7592 `PUT` update
+  reaches the same fetch with no rate limit and no quota.
+
+  The wider half is not registration. `resolve_client_keys` is the first statement of
+  `verify_private_key_assertion`, before the assertion is parsed, so anyone who knows the
+  `client_id` of a `private_key_jwt` client with a `jwks_uri` drives a fetch per
+  `POST /token`; that path resolves with no `kid`, so the 30s refetch bound does not apply,
+  and a failed fetch is never cached, so an always-failing URL costs one outbound request per
+  token request. `docs/THREAT-MODEL.md` carries the row. What bounds the registration half:
+  `oidc.registration_enabled` defaults to false, the route is mounted only when it is on,
+  `POST` register carries the #31 controls, and every fetch goes through the SSRF-hardened
+  fetcher. Recorded here because a behaviour change nobody writes down is a behaviour change
+  nobody reviews.
+
+  The suites for all three were green throughout, because each constructs the resolver
+  itself. `crates/ironauth/src/boot_wiring_tests.rs` now pins the installation against an
+  unwired control built through `OidcState::new`.
+
+- **New setting `oidc.client_jwks_ttl_secs`** (default 300, bounded 1 to 3600): how long a
+  client's fetched `jwks_uri` key set is cached. Both bounds are tested. Zero would make
+  every request refetch, which is the amplifier the resolver's per-URI rate limit exists to
+  prevent, reached through configuration rather than through an attacker; above the ceiling
+  a key the client has rotated OUT stays trusted longer than the rotation was meant to take.
+
+- **A rotating external issuer no longer fails every assertion until the JWKS cache expires
+  (issue #126, criterion 4).** A cached key set was served until its TTL ran out, so when an
+  issuer published a new key and started signing with it, every assertion it signed failed for
+  up to a full TTL. The cache could not tell "signed by a key I have never seen" from "bad
+  signature", because it never saw the `kid`.
+
+  `ClientKeyResolver::resolve_for_kid` now refetches when the presented `kid` is absent from
+  the cached set. The `kid` is a STALENESS HINT only: it selects no key and authorises
+  nothing, and the verification policy still binds `iss` and the algorithm allowlist
+  independently.
+
+  The refetch is RATE LIMITED, and that is part of the design rather than hardening. `kid`
+  comes from an unverified header, so an unbounded refetch is an outbound-request amplifier
+  aimed at a third party. It is claimed under a single lock and permitted at most once per 30s
+  per `jwks_uri`, however many unknown kids arrive. A refetch whose upstream fails falls back
+  to the still-valid cached set, so the optimisation cannot make availability worse than not
+  having it.
 - **The JWT bearer grant normalized the presented subject before comparing it against a mapping,
   so a subject the operator never registered could mint that mapping's principal (issue #26, the
   grant itself; hardened under #126).**
