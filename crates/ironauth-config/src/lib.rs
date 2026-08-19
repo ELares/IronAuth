@@ -9796,6 +9796,17 @@ mod tests {
             OIDC_MAX_CLIENT_JWKS_TTL_SECS, 3600,
             "one hour, and the prose that says so is hand written"
         );
+        // And the DEFAULT, for exactly the same reason and in the same sentence. The doc
+        // comment says "the default is 300" in hand-written prose while `docs/CONFIG.md`
+        // GENERATES its default column from this value, so moving it leaves the rendered row
+        // stating two different numbers, and every assertion above survives because they all
+        // build their input from the ceiling. Measured: 300 to 600 left `ironauth-config`
+        // green and `config-schema.sh` regenerating cleanly.
+        assert_eq!(
+            OidcConfig::default().client_jwks_ttl_secs,
+            300,
+            "five minutes, and the prose beside the generated default column says so"
+        );
     }
 
     #[test]

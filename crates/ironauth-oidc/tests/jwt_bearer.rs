@@ -1260,6 +1260,76 @@ async fn start_jwks_server(body: String) -> SocketAddr {
 /// Lets a test prime the cache from a healthy upstream and then make the rotation refetch
 /// fail, which is the only way to observe the fallback: the recording dialer cannot be
 /// retargeted mid-test.
+/// A JWKS server that answers the FIRST request and then stops listening entirely.
+///
+/// The sibling above fails at the HTTP layer, with a 500. This one fails at the TRANSPORT
+/// layer: the listener is dropped after one request, so a later connect is refused. That is
+/// a different arm of `resolve_for_kid` (`Err` from the fetcher rather than a non-success
+/// status) and it is the more common upstream failure, covering a connection refused, a
+/// timeout, and every `FetchError::Blocked` the SSRF fetcher raises.
+async fn start_jwks_server_closing_after_first(body: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0_u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        }
+        // The listener drops here, so every later connect is REFUSED rather than answered.
+        drop(listener);
+    });
+    addr
+}
+
+/// A JWKS server that answers the first request `before`, then answers `after` with a NON-2xx
+/// status and a fully parseable body.
+///
+/// The distinction this exists for is invisible to every other fixture here. A 500 whose body
+/// is empty is refused twice over: once by the status check and once by the empty-document
+/// check, so deleting the status check changes nothing and the guard is unmeasured. A 500
+/// carrying a VALID key set is refused only by the status check, and if it were not it would
+/// be cached as authoritative.
+async fn start_jwks_server_non_2xx_with_keys(before: String, after: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let before = before.clone();
+            let after = after.clone();
+            let served = Arc::clone(&served);
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = if n == 0 {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{before}",
+                        before.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{after}",
+                        after.len()
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    addr
+}
+
 async fn start_jwks_server_failing_after_first(body: String) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -1940,6 +2010,107 @@ async fn a_failed_rotation_refetch_falls_back_to_the_cached_keys() {
          upstream outage turns a working issuer into a failing one"
     );
     assert_eq!(dialer.requested().len(), 2, "it did attempt the refetch");
+}
+
+/// A refetch whose upstream is UNREACHABLE falls back too, not only one that answers 500.
+///
+/// The sibling above drives an HTTP 500, which is the `!is_success()` arm. Measured: making
+/// the `Err` arm return an empty set instead of the cached one left the entire
+/// `ironauth-oidc` suite green, so the more common upstream failure -- a connection refused,
+/// a timeout, or any `FetchError::Blocked` from the SSRF fetcher -- was the unmeasured half
+/// of a guarantee this PR advertises in three places.
+#[tokio::test]
+async fn a_refetch_whose_upstream_is_unreachable_falls_back_to_the_cached_keys() {
+    let key = issuer_key();
+    let server = start_jwks_server_closing_after_first(jwks_json(&key)).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(300),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let uri = "http://gone.test/keys";
+
+    let primed = resolver.resolve(now, uri).await;
+    assert_eq!(
+        primed.len(),
+        1,
+        "the first fetch must succeed and prime, or the rest of this test proves nothing"
+    );
+
+    // The listener is gone, so this refetch cannot connect at all.
+    let after = resolver
+        .resolve_for_kid(now, uri, Some("unknown-kid"))
+        .await;
+    assert_eq!(
+        after.len(),
+        1,
+        "a refetch that cannot REACH the upstream must return the cached keys, not nothing: \
+         a transport failure is the common case and it must not be worse than a 500"
+    );
+}
+
+/// A NON-2xx carrying a valid key set is refused on its STATUS, and never cached.
+///
+/// Every other non-success fixture in this file answers with an empty body, so it is refused
+/// twice over: once by the status check and once by the empty-document check. Measured:
+/// deleting the status check entirely left all three suites green, because nothing
+/// distinguished the two reasons. An error page that happens to parse as a JWK Set would
+/// then be stored as authoritative for a whole TTL.
+#[tokio::test]
+async fn a_non_2xx_answer_is_refused_on_its_status_even_when_its_body_parses() {
+    let good = SigningKey::ed25519_from_seed(Some("k-good".to_owned()), &[0x11; 32]).expect("key");
+    let usurper =
+        SigningKey::ed25519_from_seed(Some("k-usurper".to_owned()), &[0x22; 32]).expect("key");
+    let server = start_jwks_server_non_2xx_with_keys(jwks_json(&good), jwks_json(&usurper)).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(300),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let uri = "http://five-hundred.test/keys";
+
+    let primed = resolver.resolve(now, uri).await;
+    assert_eq!(
+        primed
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-good"],
+        "the first fetch must prime with the good key set"
+    );
+
+    // The refetch receives a 500 whose body is a perfectly valid JWK Set naming a DIFFERENT
+    // key. Only the status check stands between it and the cache.
+    let after = resolver
+        .resolve_for_kid(now, uri, Some("unknown-kid"))
+        .await;
+    assert_eq!(
+        after
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-good"],
+        "a non-2xx must be refused on its STATUS, whatever its body parses to"
+    );
+
+    // And it must not have been stored: an ordinary resolve, which cannot trigger a refetch,
+    // still answers with the primed set rather than the usurper's.
+    assert_eq!(
+        resolver
+            .resolve(now, uri)
+            .await
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-good"],
+        "the error page's key set must never have been cached"
+    );
 }
 
 /// A kid-less key set is bounded by the rate limit, NOT exempted from refetching.

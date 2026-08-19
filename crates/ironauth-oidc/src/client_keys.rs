@@ -31,11 +31,22 @@
 //! own. An entry also outlives the client that caused it, since deleting a client does not
 //! touch this map.
 //!
-//! It is not treated as a live problem, because reaching it means registering a client per
-//! distinct URL and dynamic registration is off by default and rate limited when on. It is
-//! written down because it is the kind of bound whose absence is invisible: nothing here
-//! fails, it only grows. [`Self::begin_rotation_refetch`]'s marker-only insert depends on
-//! there being no eviction, so adding one is not a local change.
+//! WHAT BOUNDS IT, stated carefully, because the obvious mitigation is wrong and an earlier
+//! version of this paragraph gave it. It is NOT "one client per distinct URL, and
+//! registration is rate limited". One client suffices: RFC 7592 `PUT` update rewrites
+//! `jwks_uri` on an existing client, mints a fresh registration access token each time, and
+//! reaches the fetch through `validate_client_keys` with NO rate limit and no quota, because
+//! `enforce_rate_limits` is called only from `register`. So N updates naming N URLs cost N
+//! permanent entries and one client.
+//!
+//! What actually bounds it is narrower: `oidc.registration_enabled` defaults to false and the
+//! route is mounted only when it is on, so a deployment that has not enabled dynamic
+//! registration cannot reach this at all, and one that has requires a registration access
+//! token to start. That is a real bound and it is not the one the earlier sentence claimed.
+//!
+//! Written down because it is the kind of bound whose absence is invisible: nothing here
+//! fails, it only grows. `begin_rotation_refetch`'s marker-only insert depends on there being
+//! no eviction, so adding one is not a local change.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
