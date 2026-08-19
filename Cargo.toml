@@ -182,7 +182,7 @@ rsa = { version = "0.9", default-features = false, features = ["std"] }
 # a 32-byte draw off the entropy seam, so the p256/rsa keygen above expands seam
 # entropy deterministically. Already in the tree transitively; this adds a direct
 # edge, not a new crate. Pure Rust, permissive (MIT OR Apache-2.0), musl clean.
-rand_chacha = "0.3"
+rand_chacha = "0.9"
 # SHA-256 for migration checksums (drift and tamper detection). Pure Rust
 # (no asm/C feature), permissive (MIT OR Apache-2.0); MSRV 1.85 and musl clean.
 # NOTE: this is no longer only a direct edge onto a crate sqlx already pulls.
