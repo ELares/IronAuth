@@ -1741,8 +1741,8 @@ async fn a_successful_issuance_names_the_external_issuer_and_subject_in_the_audi
 /// something the others did not. That was false: deleting `refs/heads/feature` and
 /// `repo:acme/service-staging` changed no mutant outcome at all. They are gone.
 ///
-/// What remains was verified against a 17-mutant family by deleting each case and re-running
-/// every mutant. Each entry below names the ONE mutant only it kills -- naming it is what
+/// What remains was verified by deleting each case and re-running a family of wrong-comparison
+/// mutants over the mapping lookup. Each entry below names the ONE mutant only it kills -- naming it is what
 /// makes the claim checkable rather than asserted, which is the failure the first version
 /// shipped:
 ///
@@ -1757,7 +1757,6 @@ async fn a_successful_issuance_names_the_external_issuer_and_subject_in_the_audi
 ///   column is `text` under a deterministic collation, which nothing else pins.
 /// * `repo:acme/other` -- a comparison that IGNORES the repository name.
 /// * `repo:evil/service` -- a comparison that IGNORES the owner.
-///
 #[tokio::test]
 async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_ref() {
     const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
@@ -1846,6 +1845,16 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
     // An issuer that EXTENDS ISSUER_A. A domain an attacker can genuinely register, and it
     // extends the real issuer exactly the way a prefix comparison accepts.
     const ISSUER_A_EXTENDED: &str = "https://token.actions.githubusercontent.com.evil.test";
+    // And one that is a strict PREFIX of ISSUER_A. `...githubusercontent.co` is a registrable
+    // `.co` domain, so this is the same typosquat class in the opposite direction: an issuer
+    // comparison written `issuer LIKE $1 || '%'` matches the stored `...com` mapping and
+    // hands over its principal.
+    const ISSUER_A_TRUNCATED: &str = "https://token.actions.githubusercontent.co";
+    // An issuer that ENDS WITH the mapped one. Path-bearing issuers are ordinary, so an
+    // attacker-controlled host with the real issuer as a path suffix is registrable.
+    // And one differing only in CASE. DNS is case-insensitive, so an operator can register
+    // this as a distinct row while it addresses the same host.
+    const ISSUER_A_CASED: &str = "https://Token.Actions.GitHubUserContent.com";
     const SHARED_SUBJECT: &str = "repo:acme/service:ref:refs/heads/main";
 
     let harness = Harness::start().await;
@@ -1872,6 +1881,12 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
         status,
         StatusCode::OK,
         "the mapped issuer exchanges: {body}"
+    );
+    assert_eq!(
+        jwt_payload(json(&body)["access_token"].as_str().expect("access_token"))["sub"],
+        MAPPED_PRINCIPAL,
+        "the control must pin the IDENTITY too: without this it is the one positive that \
+         would still pass under a resolver that ignores the mapping entirely"
     );
 
     // The same subject, signed by the same key, presented under the OTHER registered issuer.
@@ -1909,6 +1924,61 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
         "an issuer that merely EXTENDS the mapped one must not inherit its mappings: {body}"
     );
     assert_eq!(json(&body)["error"], "invalid_grant");
+
+    // The opposite direction. Registering the EXTENDED anchor closes `$1 LIKE issuer || '%'`
+    // and nothing else; a comparison written the other way round, `issuer LIKE $1 || '%'`,
+    // survives it. Both are the same typosquat class and both need an anchor of the matching
+    // shape to be detectable at all.
+    harness
+        .register_external_issuer(ISSUER_A_TRUNCATED, Some(&jwks), None, None, true)
+        .await;
+    let truncated = assertion(
+        &key,
+        ISSUER_A_TRUNCATED,
+        SHARED_SUBJECT,
+        &aud,
+        3600,
+        "jti-xiss-trunc",
+    );
+    let (status, _h, body) = present(&harness, &client_id, &truncated).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an issuer that is a PREFIX of the mapped one must not inherit its mappings: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+
+    // An issuer differing only in CASE. Each comparison shape needs an anchor of its own
+    // shape to be detectable at all, which is the general lesson: one adjacent anchor closes
+    // exactly one comparison, so the anchors have to mirror the comparisons a reader could
+    // plausibly write.
+    //
+    // NOT covered, deliberately: an issuer-SUFFIX comparison (`$1 LIKE '%' || issuer`). To
+    // trigger it the presented issuer must end with the ENTIRE stored string INCLUDING its
+    // scheme, so the anchor would have to be something like
+    // `https://evil.test/https://token.actions.githubusercontent.com` -- not a URL any
+    // issuer would publish or any operator would register. A first draft of this test used
+    // `https://evil.test/token.actions.githubusercontent.com`, which looks like it exercises
+    // the shape and does not: it lacks the inner `https://`, so it matches nothing and the
+    // case was pure decoration. Stating the gap is worth more than a negative that passes
+    // for the wrong reason.
+    for (issuer, jti, why) in [(
+        ISSUER_A_CASED,
+        "jti-xiss-case",
+        "an issuer differing from the mapped one only in case",
+    )] {
+        harness
+            .register_external_issuer(issuer, Some(&jwks), None, None, true)
+            .await;
+        let attempt = assertion(&key, issuer, SHARED_SUBJECT, &aud, 3600, jti);
+        let (status, _h, body) = present(&harness, &client_id, &attempt).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{why} must not inherit its mappings: {body}"
+        );
+        assert_eq!(json(&body)["error"], "invalid_grant", "for `{issuer}`");
+    }
 }
 
 /// A Kubernetes projected service-account token exchanges through the same model (issue #126
@@ -1964,4 +2034,5 @@ async fn a_kubernetes_projected_token_exchanges_under_the_mapped_identity() {
         StatusCode::BAD_REQUEST,
         "another service account in the same namespace must be refused: {body}"
     );
+    assert_eq!(json(&body)["error"], "invalid_grant");
 }
