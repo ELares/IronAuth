@@ -1547,11 +1547,17 @@ async fn the_log_stream_status_read_demands_read_and_never_answers_unauthenticat
 /// redaction, and `credentials` in the plural evades an equality check on `credential` just
 /// as easily. `token` or `api_key` is what a future author would actually reach for.
 ///
-/// So this asserts the key set EQUALS the documented one. Any new field on a
-/// credential-bearing view fails here and has to be looked at, which is the property worth
-/// having: the guarantee lives in the SHAPE of this view rather than in a check, and a shape
-/// is what a later field quietly changes. `last_error` already leaves the system through this
-/// view, which is the precedent for a value arriving here by accident.
+/// So this asserts the key set EQUALS the documented one, for a stream of EVERY sink type.
+/// The per-type loop is what makes that a universal rather than a claim about one fixture:
+/// review demonstrated a field declared `#[serde(skip_serializing_if = "Option::is_none")]`
+/// and resolved only for vendor sinks, which renders no key for an HTTP stream and ships the
+/// secret on every Datadog one. A single-fixture assertion passes that; this does not.
+///
+/// The guarantee lives in the SHAPE of this view rather than in a check, and a shape is what
+/// a later field quietly changes. `last_error` already leaves the system through this view,
+/// which is the precedent for a value arriving here by accident, and it is why the fixture
+/// also asserts that field is null: a secret riding inside the VALUE of a key that is already
+/// in the set changes no key at all.
 ///
 /// The first assertion stops the second passing vacuously: a listing that silently lost the
 /// stream would otherwise report a clean redaction over an empty array.
@@ -1567,68 +1573,103 @@ async fn a_log_stream_read_names_the_credential_secret_and_renders_no_value() {
         EnvironmentId::parse(&environment).expect("environment id"),
     );
     let env = ironauth_env::Env::system();
-    h.control_store()
-        .scoped(scope)
-        .log_streams()
-        .create(
-            &env,
-            &NewLogStream {
-                id: None,
-                description: "redaction fixture",
-                source: StreamSource::Both,
-                sink_type: SinkType::Http,
-                sink_config: serde_json::json!({ "endpoint": "https://sink.example/in" }),
-                credential_secret_name: Some("collector_token"),
-                event_type_filter: None,
-                organization_id: None,
-            },
-            None,
-        )
-        .await
-        .expect("configure a stream that names a credential");
+    // ONE STREAM PER SINK TYPE. A view field resolved only for some sink types renders no key
+    // for the others, so a single-fixture key set is a claim about that fixture and not about
+    // the view.
+    for (sink_type, sink_config) in [
+        (
+            SinkType::Http,
+            serde_json::json!({ "endpoint": "https://sink.example/in" }),
+        ),
+        (
+            SinkType::Datadog,
+            serde_json::json!({ "endpoint": "https://http-intake.example/api/v2/logs" }),
+        ),
+        (
+            SinkType::SplunkHec,
+            serde_json::json!({ "endpoint": "https://splunk.example/services/collector" }),
+        ),
+        (
+            SinkType::S3,
+            serde_json::json!({ "endpoint": "https://s3.example", "bucket": "audit", "region": "us-east-1" }),
+        ),
+    ] {
+        h.control_store()
+            .scoped(scope)
+            .log_streams()
+            .create(
+                &env,
+                &NewLogStream {
+                    id: None,
+                    description: "redaction fixture",
+                    source: StreamSource::Both,
+                    sink_type,
+                    sink_config,
+                    credential_secret_name: Some("collector_token"),
+                    event_type_filter: None,
+                    organization_id: None,
+                },
+                None,
+            )
+            .await
+            .expect("configure a stream that names a credential");
+    }
 
     let streams = format!("/v1/tenants/{tenant}/environments/{environment}/log-streams");
     let (status, _, body) = h.get_as(&streams, &secret).await;
     assert_eq!(status, StatusCode::OK, "log streams under read: {body}");
     let document: Value = serde_json::from_str(&body).expect("json");
     let items = document["items"].as_array().expect("items array");
-    assert_eq!(items.len(), 1, "the fixture stream must be listed: {body}");
-
     assert_eq!(
-        items[0]["credential_secret_name"], "collector_token",
-        "the view must carry the NAME, and this assertion is also what keeps the one below \
-         from passing on a listing that lost the stream: {body}"
+        items.len(),
+        4,
+        "one stream per sink type must be listed, or the loop below checks fewer shapes than \
+         it claims: {body}"
     );
 
-    let mut keys: Vec<&str> = items[0]
-        .as_object()
-        .expect("the item is an object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(
-        keys,
-        [
-            "active",
-            "consecutive_failures",
-            "credential_secret_name",
-            "cursor_audit_id",
-            "description",
-            "event_type_filter",
-            "id",
-            "last_error",
-            "last_error_at_unix_micros",
-            "last_success_at_unix_micros",
-            "organization_id",
-            "sink_type",
-            "source",
-            "status",
-        ],
-        "the rendered stream's field set changed. A new field on a view that names a \
-         credential has to be looked at before it ships, which is why this pins the SET \
-         rather than a list of forbidden names: {body}"
-    );
+    for item in items {
+        assert_eq!(
+            item["credential_secret_name"], "collector_token",
+            "the view must carry the NAME, and this assertion is also what keeps the one \
+             below from passing on a listing that lost a stream: {body}"
+        );
+        assert!(
+            item["last_error"].is_null(),
+            "a freshly configured stream has no error, and `last_error` is the one field \
+             whose VALUE leaves the system here: a secret riding inside it would change no \
+             key at all: {body}"
+        );
+
+        let mut keys: Vec<&str> = item
+            .as_object()
+            .expect("the item is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "active",
+                "consecutive_failures",
+                "credential_secret_name",
+                "cursor_audit_id",
+                "description",
+                "event_type_filter",
+                "id",
+                "last_error",
+                "last_error_at_unix_micros",
+                "last_success_at_unix_micros",
+                "organization_id",
+                "sink_type",
+                "source",
+                "status",
+            ],
+            "the rendered stream's field set changed. A new field on a view that names a \
+             credential has to be looked at before it ships, which is why this pins the SET \
+             rather than a list of forbidden names, for every sink type: {body}"
+        );
+    }
 }
 
 /// Every `AuthZEN` endpoint demands `management.read`, and unauthenticated evaluation is never
