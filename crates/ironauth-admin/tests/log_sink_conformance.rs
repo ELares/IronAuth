@@ -415,3 +415,81 @@ fn the_published_sample_consumer_verifies_a_batch_this_code_signed() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The published consumer verifies a DATADOG batch, including a non-ASCII event
+/// (issue #110 criterion 5).
+///
+/// # The bug this exists to stop coming back
+///
+/// The vendor sinks reshape the payload, so the consumer has to unwrap it back to the array
+/// that was hashed. Python's `json.dumps` escapes every non-ASCII character to `\uXXXX` by
+/// default and `serde_json` emits UTF-8 directly, so the unwrapped bytes differed from the
+/// signed bytes the moment any event carried an accented character. A single accented
+/// username was enough to fail an honest batch, and the failure reads exactly like tampering.
+///
+/// So the fixture event carries a non-ASCII string AND a nested object: the accent catches the
+/// escaping, and the nested object catches key ordering, since `serde_json` sorts map keys and a
+/// consumer that rebuilt the JSON from scratch rather than preserving the wire order would
+/// reorder them.
+#[test]
+fn the_published_consumer_verifies_a_datadog_batch_with_a_non_ascii_event() {
+    use std::io::Write as _;
+
+    let events = serde_json::json!([
+        {"class_uid": 3002, "nested": {"a": 2, "b": 1}, "user": "josé"}
+    ]);
+    let events_json = serde_json::to_string(&events).expect("serializes");
+    let key = b"a-shared-signing-secret";
+    let canonical = ironauth_admin::log_stream_signature::canonical_string(
+        "lgs_stream",
+        7,
+        "aud_ACCENT",
+        1,
+        &events_json,
+    );
+    let signature = ironauth_admin::log_stream_signature::sign(key, &canonical);
+
+    // What the Datadog sink actually puts on the wire for those events.
+    let wire =
+        ironauth_admin::log_shipper::datadog_body(events.as_array().expect("an array").as_slice());
+
+    let dir = std::env::temp_dir().join(format!("ironauth-consumer-dd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let secret_path = dir.join("key.bin");
+    let body_path = dir.join("batch.json");
+    std::fs::File::create(&secret_path)
+        .and_then(|mut f| f.write_all(key))
+        .expect("write the secret");
+    std::fs::File::create(&body_path)
+        .and_then(|mut f| f.write_all(wire.as_bytes()))
+        .expect("write the body");
+
+    let consumer = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/verify-log-stream.py"
+    );
+    let output = std::process::Command::new("python3")
+        .arg(consumer)
+        .arg("--secret-file")
+        .arg(&secret_path)
+        .arg("--body")
+        .arg(&body_path)
+        .arg("--position")
+        .arg("lgs_stream 7 aud_ACCENT")
+        .arg("--signature")
+        .arg(&signature)
+        .arg("--sink")
+        .arg("datadog")
+        .output()
+        .expect("run the published consumer");
+
+    assert!(
+        output.status.success(),
+        "the consumer must unwrap the datadog envelope back to the signed bytes, accents and \
+         all: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

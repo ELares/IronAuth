@@ -67,6 +67,14 @@ Both wrappings are deterministic, so a consumer unwraps them back to the array t
 signed. Verification is possible on every sink; the sample consumer does this for you with
 `--sink datadog` or `--sink splunk`.
 
+**If you write your own unwrapper, two details decide whether it works.** serde_json emits
+UTF-8 directly and puts no space after `,` or `:`, so a re-serializer that escapes non-ASCII
+to `\uXXXX` (Python's `json.dumps` default) or pretty-prints produces different bytes, a
+different digest, and a verification failure that looks exactly like tampering. One accented
+character in a username is enough. Key ORDER needs no special handling: serde_json sorts map
+keys, so the wire bytes are already in that order and any parser that preserves order through
+the round trip is fine.
+
 ## The sample consumer
 
 [`examples/verify-log-stream.py`](../examples/verify-log-stream.py) is dependency free and

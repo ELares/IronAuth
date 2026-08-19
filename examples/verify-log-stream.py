@@ -56,11 +56,23 @@ def events_from(body: str, sink: str) -> str:
         # HTTP and S3 transmit the signed bytes verbatim. Re-serializing would risk
         # changing separators or key order, so the body is used exactly as received.
         return body
+    # `ensure_ascii=False` and the compact separators are NOT cosmetic: they are what makes
+    # these bytes match what Rust hashed. serde_json emits UTF-8 directly and puts no spaces
+    # after `,` or `:`; Python's defaults escape every non-ASCII character to \uXXXX and add
+    # spaces. A single accented character in a username is enough to make an honest batch fail
+    # verification, and the failure would look like tampering.
+    #
+    # Key ORDER needs no handling: serde_json serializes map keys sorted, so the bytes on the
+    # wire are already in that order and `json.loads` preserves it through the round trip.
     if sink == "datadog":
-        return json.dumps([entry["message"] for entry in json.loads(body)], separators=(",", ":"))
+        return json.dumps(
+            [entry["message"] for entry in json.loads(body)],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
     if sink == "splunk":
         events = [json.loads(line)["event"] for line in body.splitlines() if line.strip()]
-        return json.dumps(events, separators=(",", ":"))
+        return json.dumps(events, separators=(",", ":"), ensure_ascii=False)
     raise SystemExit(f"unknown sink {sink!r}")
 
 
