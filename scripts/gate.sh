@@ -103,8 +103,6 @@ if command -v shasum >/dev/null 2>&1; then
   GATE_HASHER="shasum -a 256"
 elif command -v sha256sum >/dev/null 2>&1; then
   GATE_HASHER="sha256sum"
-else
-  skipped "the tree-change hash" "install shasum or sha256sum"
 fi
 gate_diff_hash() {
   if [[ -z "$GATE_HASHER" ]]; then
@@ -141,15 +139,22 @@ GATE_DIFF_BEFORE="$(gate_diff_hash)"
 gate_summary() {
   local rc=$?
   # IGNORE further signals for the duration of this trap. It does real work before the
-  # verdict (two `git status` calls, a `git diff | shasum`, a `sort`/`comm`), and a SECOND
-  # Ctrl-C inside that window killed it mid-way, printing zero verdicts: the one state this
-  # summary exists to make impossible. An impatient double Ctrl-C is how people actually stop
-  # a multi-hour gate.
+  # verdict (a `git status`, a `git diff | shasum`, a `sort`/`comm`/`sed`), and A SIGNAL
+  # ARRIVING INSIDE THAT WINDOW killed it mid-way, printing zero verdicts: the one state this
+  # summary exists to make impossible.
+  #
+  # Measured on bash 3.2 with this line removed: an INT during a run followed by a TERM or a
+  # HUP printed no verdict at all, and so did a first signal of any kind landing while the
+  # summary ran after a COMPLETED gate. A second INT after an INT did NOT reproduce there,
+  # because bash defers INT while running the EXIT trap after a SIGINT, so the earlier
+  # "double Ctrl-C" framing named the one arm that does not reproduce on this shell.
   trap '' INT TERM HUP
   if ((${#GATE_FAILURES[@]} > 0)); then
-    # stdout, like every other line this script prints. Splitting the summary onto stderr
-    # would drop it from `scripts/gate.sh > gate.log`, which is how a multi-hour run is
-    # actually captured -- the failure list is the one part of the log that must survive.
+    # stdout, like every other line this script prints. CONTRIBUTING documents
+    # `scripts/gate.sh > gate.log 2>&1`, which would capture stderr too, so the argument is
+    # no longer that stderr gets dropped: it is that a reader running the plain command, or
+    # reading a terminal, gets the failure list in the same stream as everything else. The
+    # failure list is the one part of the log that must survive.
     echo ""
     echo "gate: ${#GATE_FAILURES[@]} check(s) FAILED:"
     printf '  - %s\n' "${GATE_FAILURES[@]}"
@@ -221,13 +226,14 @@ gate_summary() {
   # which checks had no chance to speak.
   if ((${#GATE_SKIPPED[@]} > 0)); then
     echo ""
-    echo "gate: ${#GATE_SKIPPED[@]} lane(s) SKIPPED here:"
+    echo "gate: ${#GATE_SKIPPED[@]} lane(s) SKIPPED here (CI runs them):"
     printf '  - %s\n' "${GATE_SKIPPED[@]}"
   fi
   # SEPARATE from the lane ledger, because it is not a lane. The tree-change hash is a local
-  # TOOL this summary needs, not one of the 66 checks and not something CI runs, so counting
-  # it as a skipped lane made the header false of that row and made the green verdict's count
-  # conflate "a check did not run" with "the oracle is half blind".
+  # TOOL this summary needs, not one of the 66 checks and not something CI runs. It WAS
+  # ledgered as a lane, which made the header's "(CI runs them)" false of that row and made
+  # the green verdict's count conflate "a check did not run" with "the oracle is half blind".
+  # Removing the row is what let the header's annotation come back, true of all four lanes.
   if [[ -z "$GATE_HASHER" ]]; then
     echo ""
     echo "gate: no shasum or sha256sum on PATH, so the tree oracle ran on its STATUS half"
