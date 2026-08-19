@@ -18,7 +18,7 @@ mod common;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::http::{StatusCode, header};
 use base64::Engine;
@@ -1255,6 +1255,42 @@ async fn start_jwks_server(body: String) -> SocketAddr {
     addr
 }
 
+/// A JWKS server that answers 200 ONCE and then 500 to every later request.
+///
+/// Lets a test prime the cache from a healthy upstream and then make the rotation refetch
+/// fail, which is the only way to observe the fallback: the recording dialer cannot be
+/// retargeted mid-test.
+async fn start_jwks_server_failing_after_first(body: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let body = body.clone();
+            let served = Arc::clone(&served);
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = if n == 0 {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    addr
+}
+
 /// The external `sub` a mapping to a LIFECYCLE-BEARING user principal is keyed on, kept
 /// distinct from [`EXTERNAL_SUBJECT`] so a single harness can carry a user mapping and a
 /// workload mapping from the SAME trusted issuer at once.
@@ -1725,5 +1761,151 @@ async fn a_successful_issuance_names_the_external_issuer_and_subject_in_the_audi
     assert!(
         !detail.contains(&assertion),
         "the assertion is a live credential and must never land in an audit row"
+    );
+}
+
+/// Build a resolver over a recording dialer serving `jwks`, returning both so a test can
+/// count outbound fetches. DB-free: this exercises `ClientKeyResolver` directly.
+async fn counting_resolver(
+    jwks: String,
+    ttl: Duration,
+) -> (
+    Arc<ironauth_oidc::ClientKeyResolver>,
+    Arc<RecordingDialer>,
+    String,
+) {
+    let server = start_jwks_server(jwks).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = Arc::new(ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        ttl,
+    ));
+    (resolver, dialer, "http://jwks.test/keys".to_owned())
+}
+
+/// An unknown `kid` triggers exactly ONE refetch however many times it is presented, and a
+/// known `kid` triggers none (issue #126 criterion 4).
+///
+/// Both halves matter and neither alone is sufficient. Without the second, an implementation
+/// that refetched on EVERY request would pass the first. Without the first, an implementation
+/// where the whole feature is inert would pass the second -- which is exactly the state the
+/// review found: two mutants, "delete the rate limit" and "make the feature inert", both
+/// survived the entire suite because nothing counted fetches.
+///
+/// All requests are made at the SAME instant, deep inside the 30s window, so this measures
+/// the bound and not the clock.
+#[tokio::test]
+async fn an_unknown_kid_refetches_once_and_a_known_kid_never_does() {
+    let key = issuer_key();
+    let (resolver, dialer, uri) =
+        counting_resolver(jwks_json(&key), Duration::from_secs(300)).await;
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    // Prime the cache.
+    let keys = resolver.resolve(now, &uri).await;
+    assert!(!keys.is_empty(), "the fixture must serve a usable key set");
+    assert_eq!(dialer.requested().len(), 1, "priming is one fetch");
+
+    // A KNOWN kid is answered from cache: no outbound request at all.
+    let known = keys[0]
+        .kid()
+        .expect("the fixture key carries a kid")
+        .to_owned();
+    for _ in 0..5 {
+        resolver.resolve_for_kid(now, &uri, Some(&known)).await;
+    }
+    assert_eq!(
+        dialer.requested().len(),
+        1,
+        "a kid already in the cached set must never cause a fetch"
+    );
+
+    // TEN forged kids at the same instant cost ONE fetch between them. Before the rework
+    // this measured 11 -- `store()` reset the rate-limit marker the refetch had just set, so
+    // every forged kid fetched again.
+    for i in 0..10 {
+        resolver
+            .resolve_for_kid(now, &uri, Some(&format!("forged-{i}")))
+            .await;
+    }
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "a burst of unknown kids must cost exactly one refetch, not one each"
+    );
+}
+
+/// A refetch whose upstream fails falls back to the still-valid cached set (issue #126
+/// criterion 4: no outage window).
+///
+/// The refetch exists to make rotation seamless. If a failing upstream turned a working
+/// issuer into a failing one, the optimisation would have made availability WORSE than not
+/// having it -- and `federation_jwks.rs` already gets this right for the same kid-miss
+/// refetch, so the house pattern was there to follow.
+#[tokio::test]
+async fn a_failed_rotation_refetch_falls_back_to_the_cached_keys() {
+    let key = issuer_key();
+    let server = start_jwks_server_failing_after_first(jwks_json(&key)).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(300),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    let primed = resolver.resolve(now, "http://jwks.test/keys").await;
+    assert_eq!(primed.len(), 1, "the first fetch must succeed and prime");
+
+    // The refetch now hits a 500.
+    let after = resolver
+        .resolve_for_kid(now, "http://jwks.test/keys", Some("unknown-kid"))
+        .await;
+    assert_eq!(
+        after.len(),
+        1,
+        "a failed refetch must return the CACHED keys, not nothing -- otherwise a transient \
+         upstream outage turns a working issuer into a failing one"
+    );
+    assert_eq!(dialer.requested().len(), 2, "it did attempt the refetch");
+}
+
+/// A JWKS whose keys carry no `kid` does not refetch on every request.
+///
+/// `ironauth-jose` deliberately supports kid-less keys (the RFC 8037 A.4 vector). For such a
+/// set, ANY named kid is "absent" forever, so treating that as staleness puts a legitimate
+/// issuer into a permanent refetch with no attacker involved -- self-inflicted amplification
+/// from ordinary traffic.
+#[tokio::test]
+async fn a_kidless_key_set_does_not_refetch_on_every_request() {
+    // Built by HAND, because `jwks_json` always emits a `kid` -- the first version of this
+    // test used it and the guard below caught the fixture proving nothing. Strip the member
+    // so the served set genuinely carries no key id, which is the case under test.
+    let key = SigningKey::ed25519_from_seed(Some("k-drop".to_owned()), &[0x33; 32]).expect("key");
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&jwks_json(&key)).expect("jwks json parses");
+    for jwk in doc["keys"].as_array_mut().expect("keys array") {
+        jwk.as_object_mut().expect("jwk object").remove("kid");
+    }
+    let (resolver, dialer, uri) =
+        counting_resolver(doc.to_string(), Duration::from_secs(300)).await;
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    let keys = resolver.resolve(now, &uri).await;
+    assert!(!keys.is_empty());
+    assert!(
+        keys.iter().all(|k| k.kid().is_none()),
+        "this fixture must serve a kid-less set for the test to mean anything"
+    );
+    for _ in 0..5 {
+        resolver.resolve_for_kid(now, &uri, Some("any-kid")).await;
+    }
+    assert_eq!(
+        dialer.requested().len(),
+        1,
+        "a kid-less set cannot answer the kid question, so it must not be treated as stale"
     );
 }

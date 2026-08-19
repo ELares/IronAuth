@@ -130,69 +130,93 @@ impl ClientKeyResolver {
         jwks_uri: &str,
         kid: Option<&str>,
     ) -> Vec<TrustedKey> {
-        if let Some(keys) = self.cached(now, jwks_uri) {
-            // The cached set answers unless a NAMED kid is absent from it. An assertion with
-            // no `kid` cannot tell us anything is stale, so it never triggers a refetch.
+        let cached = self.cached(now, jwks_uri);
+        if let Some(keys) = &cached {
+            // The cached set answers unless a NAMED kid is absent from it.
+            //
+            // A set whose keys carry NO kid at all cannot answer the question: `kid()` is
+            // `None` for every key, so a named kid is "absent" from it forever. Treating that
+            // as staleness would put a legitimate issuer whose JWKS omits `kid` -- which
+            // ironauth-jose deliberately supports -- into a refetch on EVERY request, with no
+            // attacker involved. So a kid-less set is satisfied by definition.
+            let discriminating = keys.iter().any(|key| key.kid().is_some());
             let satisfied = match kid {
                 None => true,
+                Some(_) if !discriminating => true,
                 Some(wanted) => keys.iter().any(|key| key.kid() == Some(wanted)),
             };
-            if satisfied || !self.may_rotation_refetch(now, jwks_uri) {
-                return keys;
+            // ONE lock acquisition decides and records together. A check under one lock and
+            // a record under another is a check-then-act race: N concurrent requests with
+            // forged kids can all pass the check before any of them records, and each starts
+            // its own fetch. Measured at 3 fetches in a 16-way burst before this was folded
+            // into a single critical section.
+            if satisfied || !self.begin_rotation_refetch(now, jwks_uri) {
+                return keys.clone();
             }
-            // Fall through to refetch, and record the attempt BEFORE the fetch so a burst of
-            // forged kids cannot each start one while the first is still in flight.
-            self.record_rotation_refetch(now, jwks_uri);
         }
         let mut request = FetchRequest::get(FetchPurpose::JwksUri, jwks_uri);
         if self.allow_http {
             request = request.allow_plaintext_http();
         }
+        // A refetch that fails falls back to the STILL VALID cached set rather than to
+        // nothing. `federation_jwks.rs` already does this for the same kid-miss refetch, and
+        // dropping it here would mean a transient upstream outage turns a working issuer into
+        // a failing one -- the refetch is an optimisation for rotation, and an optimisation
+        // must not be able to make availability worse than not having it.
+        let fallback = || cached.clone().unwrap_or_default();
         let Ok(response) = self.fetcher.fetch(request).await else {
-            return Vec::new();
+            return fallback();
         };
         if !response.status().is_success() {
-            return Vec::new();
+            return fallback();
         }
         let keys = ironauth_jose::trusted_keys_from_jwks(response.body());
-        // Cache only a usable resolution, so a transient failure or an empty
-        // document never sticks a client into a fail-closed state for the TTL.
-        if !keys.is_empty() {
-            self.store(now, jwks_uri, keys.clone());
+        if keys.is_empty() {
+            return fallback();
         }
+        self.store(now, jwks_uri, keys.clone());
         keys
     }
 
     /// The shortest interval between two rotation refetches of one `jwks_uri`.
     ///
-    /// Deliberately a constant rather than a config knob for now: it bounds an
-    /// ATTACKER-DRIVEN outbound request, so making it operator-tunable would let a
-    /// deployment lower it into an amplifier by accident. Thirty seconds discovers a genuine
-    /// rotation promptly while capping one issuer at two extra fetches a minute.
+    /// Deliberately a constant rather than a config knob: it bounds an ATTACKER-DRIVEN
+    /// outbound request, so making it operator-tunable would let a deployment lower it into
+    /// an amplifier by accident. Thirty seconds discovers a genuine rotation promptly while
+    /// capping one issuer at two extra fetches a minute.
     const fn rotation_refetch_min_interval() -> Duration {
         Duration::from_secs(30)
     }
 
-    /// Whether a rotation refetch of `jwks_uri` is permitted right now.
-    fn may_rotation_refetch(&self, now: SystemTime, jwks_uri: &str) -> bool {
-        let cache = self.cache.lock().expect("client key cache lock poisoned");
-        let Some(entry) = cache.get(jwks_uri) else {
-            return true;
-        };
-        match entry.last_rotation_refetch {
+    /// Claim the right to make one rotation refetch of `jwks_uri`, or refuse.
+    ///
+    /// Check AND record under a single lock acquisition, which is what makes the bound hold
+    /// under concurrency. Returns `true` at most once per
+    /// [`Self::rotation_refetch_min_interval`] per URI, however many callers ask.
+    ///
+    /// A missing entry claims the right and inserts a marker-only record rather than silently
+    /// no-opping. There is no eviction path today so the entry is always present, but a
+    /// no-op here would become a total bypass the day anyone adds an LRU, and it would be
+    /// invisible: the code would look correct and the bound would simply not exist.
+    fn begin_rotation_refetch(&self, now: SystemTime, jwks_uri: &str) -> bool {
+        let mut cache = self.cache.lock().expect("client key cache lock poisoned");
+        let entry = cache.entry(jwks_uri.to_owned()).or_insert(CachedKeys {
+            keys: Vec::new(),
+            // The epoch, so this synthetic entry is already expired and can never be served
+            // as if it were a real resolution.
+            fetched_at: SystemTime::UNIX_EPOCH,
+            last_rotation_refetch: None,
+        });
+        let permitted = match entry.last_rotation_refetch {
             None => true,
             Some(last) => now
                 .duration_since(last)
                 .is_ok_and(|elapsed| elapsed >= Self::rotation_refetch_min_interval()),
-        }
-    }
-
-    /// Record that a rotation refetch of `jwks_uri` is being attempted now.
-    fn record_rotation_refetch(&self, now: SystemTime, jwks_uri: &str) {
-        let mut cache = self.cache.lock().expect("client key cache lock poisoned");
-        if let Some(entry) = cache.get_mut(jwks_uri) {
+        };
+        if permitted {
             entry.last_rotation_refetch = Some(now);
         }
+        permitted
     }
 
     /// The cached keys for `jwks_uri` if a non-expired entry exists.
@@ -209,19 +233,23 @@ impl ClientKeyResolver {
 
     /// Store a resolution for `jwks_uri` at `now`.
     fn store(&self, now: SystemTime, jwks_uri: &str, keys: Vec<TrustedKey>) {
-        self.cache
-            .lock()
-            .expect("client key cache lock poisoned")
-            .insert(
-                jwks_uri.to_owned(),
-                CachedKeys {
-                    keys,
-                    fetched_at: now,
-                    // A fresh set starts with no rotation refetch recorded: the entry it
-                    // replaces may have been refetched, but this one has not, and carrying
-                    // the old instant forward would delay the next genuine rotation.
-                    last_rotation_refetch: None,
-                },
-            );
+        let mut cache = self.cache.lock().expect("client key cache lock poisoned");
+        let previous_refetch = cache.get(jwks_uri).and_then(|e| e.last_rotation_refetch);
+        cache.insert(
+            jwks_uri.to_owned(),
+            CachedKeys {
+                keys,
+                fetched_at: now,
+                // PRESERVED, not reset. Resetting here erased the very marker the
+                // refetch had just set: a successful refetch would clear the bound and
+                // the next forged kid would fetch again, measured at 11 outbound
+                // requests for 11 forged kids where the bound promises 1.
+                //
+                // Preserving is also right on the merits. If the refetch succeeded and
+                // the kid was genuine, the new set contains it and no further refetch is
+                // wanted; if it was forged, the marker is exactly what must survive.
+                last_rotation_refetch: previous_refetch,
+            },
+        );
     }
 }

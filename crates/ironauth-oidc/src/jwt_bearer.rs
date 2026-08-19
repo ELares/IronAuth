@@ -367,9 +367,12 @@ async fn validate_and_map(
     // keys, the SHARED audience policy, and the SHARED skew bound. The policy
     // enforces `iss == record.issuer` and the algorithm allowlist, so the token's
     // own `alg` header is never trusted.
-    // The header `kid`, UNVERIFIED and used only as a staleness hint. See
-    // `resolve_issuer_keys`.
-    let kid = peek_unverified_kid(assertion);
+    // The header `kid`, UNVERIFIED and used only as a staleness hint. Via the purpose-built
+    // `ironauth_jose::compact_jws_kid`, which is documented for exactly this ("a JWKS-refetch
+    // HINT on upstream key rotation") and enforces an 8 KB header bound. A local copy without
+    // that bound would run an unbounded base64 and JSON decode on an unauthenticated request,
+    // BEFORE `verify()`'s own size caps apply.
+    let kid = ironauth_jose::compact_jws_kid(assertion);
     let keys = resolve_issuer_keys(state, &record, kid.as_deref()).await;
     let algorithms = allowed_algs(&record);
     // NARROWED by the issuer's own allowlist (issue #126 criterion 3). The shared policy
@@ -927,19 +930,6 @@ fn jwt_bearer_response(
         body["scope"] = serde_json::json!(scope);
     }
     token_ok(&body.to_string())
-}
-
-/// Peek the `kid` from an assertion's UNVERIFIED header.
-///
-/// Used only as a cache-staleness hint (issue #126 criterion 4), never to select a key: the
-/// verification policy picks the key and enforces `iss` and the algorithm allowlist. Reading
-/// it here introduces no trust for the same reason peeking `iss` does not -- it decides
-/// nothing, it only says the cached set might not be current.
-fn peek_unverified_kid(assertion: &str) -> Option<String> {
-    let header = assertion.split('.').next()?;
-    let bytes = URL_SAFE_NO_PAD.decode(header).ok()?;
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
-    value.get("kid")?.as_str().map(ToOwned::to_owned)
 }
 
 /// Read a top-level string claim from a compact JWS's (UNVERIFIED) payload, for
