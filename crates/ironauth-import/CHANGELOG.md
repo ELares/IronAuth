@@ -25,9 +25,17 @@ range per docs/RELEASING.md.
   `cargo check --all-features --all-targets`, restore -- and that found `password-hash`,
   which grep could not, because every `password_hash::` occurrence in this crate arrives
   through a re-export: three through `argon2`, one through `scrypt`, one through `pbkdf2`.
-  The crate name never appears, so nothing keyed on it can see that the dependency is dead. Exactly the mechanism that made `cipher` dead in
-  `ironauth-hash-scheme`, one crate over, found only when the method stopped keying on the
-  name.
+
+  A NAME-KEYED GREP DOES NOT COME BACK EMPTY HERE, IT COMES BACK WRONG, and that is the
+  sharper version of the lesson. `password_hash` appears 34 times in this crate, 15 of them
+  in `src/`, and none of them is the crate: they are a struct field and a JSON key
+  (`record.password_hash`, `"password_hash": "..."`). The crate is reached only as the root
+  of a re-exported path, which appears zero times. So a reader grepping the name concludes
+  the dependency is ALIVE, and a reader grepping the manifest spelling finds one hit in a
+  doc comment. Only the compile oracle answers the question.
+
+  Exactly the mechanism that made `cipher` dead in `ironauth-hash-scheme`, one crate over,
+  found only when the method stopped keying on the name.
 
 - **Four import defects that left a run PERMANENTLY unable to complete** (issue #55, review
   fold). Each was measured end to end, and each is worse than it sounds, because in every
