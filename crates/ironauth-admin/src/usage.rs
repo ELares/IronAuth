@@ -43,6 +43,9 @@ pub(crate) const USAGE_REPORTED: &str = "usage.reported";
 /// A bound rather than a preference: an unbounded fold over a long-retained feed is a
 /// request that gets slower every day until it times out, and it would do so first for the
 /// busiest tenant, which is the one most likely to be asking.
+///
+/// [`AdminState::usage_fold_limit`] can lower it, and only a `testing` build can set that,
+/// so this is the bound in every shipped binary.
 const EXPORT_FOLD_LIMIT: i64 = 10_000;
 
 /// A tenant's usage for the retained window.
@@ -67,6 +70,21 @@ pub struct UsageExport {
 /// [`fold_usage`]) would turn "stop after 10,000" into "keep reading until 10,000
 /// meterable ones turn up", which on a feed dominated by non-meterable events is not a
 /// bound at all.
+///
+/// # Why ten times the fold bound and not some other multiple
+///
+/// It is a RATIO, chosen against what actually dilutes the feed: the webhook fan-out writes
+/// one delivery row per subscribed endpoint per event, and those rows are read here (the
+/// page query filters on tenant, environment and sequence only) while metering nothing. Ten
+/// is one order of magnitude of dilution, which covers a tenant with several endpoints
+/// subscribed and still keeps a single request's worst case finite. A tenant with ten
+/// endpoints reaches this bound at roughly nine thousand meterable events rather than the
+/// nominal ten thousand, and `truncated` says so.
+///
+/// The worst case is real and worth stating plainly: 100,000 rows at a page size of 1000,
+/// and `events_page_after` opens two transactions per page, so 200 transactions on a
+/// `management.read` endpoint a dashboard can poll. That is the price of the second bound
+/// existing at all; the alternative is the unbounded read it replaced.
 const EXPORT_SCAN_LIMIT: i64 = 100_000;
 
 /// What a publish returns: the snapshot, and the id of the event it caused.
@@ -173,7 +191,20 @@ pub async fn fold_usage_bounded(
             .count();
         scanned += i64::try_from(events.len()).unwrap_or(i64::MAX);
         metered += i64::try_from(meterable).unwrap_or(i64::MAX);
+        // ONE ASYMMETRY, deliberate and worth naming: the budget above counts event-feed
+        // rows only, while `absorb` keys on a top-level `type` across every row the page
+        // returned. No producer inflates the tally today (a delivery row is
+        // `{endpoint_id, body}`, a back-channel row is a logout token, a session-ended row
+        // has no top-level `type`), so the two universes agree in practice. A future
+        // consumer whose payload happens to carry a top-level `type` would count toward the
+        // invoice while consuming no budget, and this is where a reader would look.
         tally.absorb(&events);
+        // `>=`, and the boundary case it decides is deliberate. A fold whose last page takes
+        // `metered` to EXACTLY `limit` and whose feed then ends reports `truncated: true`,
+        // which is a lower bound claimed for an exact number. Being sure would cost one more
+        // read per bounded export, and the error is in the direction where a billing
+        // pipeline distrusts a number that happens to be right, rather than trusting one
+        // that is short.
         if metered >= limit || scanned >= scan_limit {
             return Ok((tally, true));
         }
@@ -213,8 +244,11 @@ pub async fn export_usage(
     // folds the same feed, so it is the same authority over the same facts.
     principal.require_permission(ManagementPermission::Read)?;
 
-    let (tally, truncated) =
-        fold_usage(&state.store().scoped(scope).outbox(), EXPORT_FOLD_LIMIT).await?;
+    let (tally, truncated) = fold_usage(
+        &state.store().scoped(scope).outbox(),
+        state.usage_fold_limit().unwrap_or(EXPORT_FOLD_LIMIT),
+    )
+    .await?;
 
     let body = serde_json::to_string(&UsageExport {
         monthly_active_users: tally.monthly_active_users(),
@@ -262,15 +296,9 @@ async fn resolve_scope(
 /// Folds the retained feed and publishes the result as a `usage.reported` event, so metering
 /// reaches a billing pipeline by webhook and not only by polling this API.
 ///
-/// The first line is a SENTENCE rather than the route, because utoipa lifts it into the
-/// OpenAPI `summary` and from there into the generated Go, Python and TypeScript clients.
-/// This was the only one of 227 operations whose summary was a backticked copy of its own
-/// path, which is the least useful thing a summary can say next to a field already holding
-/// the path.
-///
 /// # Why publishing is an explicit action
 ///
-/// It could have been emitted as a side effect of [`export_usage`], and that would be wrong:
+/// It could have been emitted as a side effect of the usage export, and that would be wrong:
 /// reporting would then be driven by whoever happens to poll, so a dashboard refresh would
 /// bill a customer and a quiet week would bill nobody. A snapshot is something an operator or
 /// a scheduler decides to take, so it gets its own verb.
@@ -284,8 +312,19 @@ async fn resolve_scope(
 ///
 /// # Errors
 ///
-/// [`ApiError`] for an unknown scope, a soft-deleted environment, a caller without
-/// `management.write_config`, a missing or reused `Idempotency-Key`, or a store fault.
+/// An error for an unknown scope, a soft-deleted environment, a caller without
+/// `management.write_config`, a missing or reused `Idempotency-Key`, or a store fault. The
+/// status each produces is in the responses table.
+// Everything above this line REACHES THE PUBLIC ARTIFACT: utoipa lifts the first line into
+// the OpenAPI `summary` and the rest into `description`, and both are copied verbatim into
+// `docs/openapi/management.json` and the generated TypeScript client. So it is written for
+// an integrator, and notes about this repository's own review history stay down here.
+//
+// Two of those notes, kept because they explain the shape above rather than the endpoint.
+// The first line is a SENTENCE rather than a backticked copy of the route: it was the
+// latter, uniquely among the spec's operations, which is the least useful thing a summary
+// can say next to a field already holding the path. And rustdoc intra-doc links render as
+// literal `[`text`]` in the published description, so this doc comment uses none.
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish",
@@ -293,7 +332,9 @@ async fn resolve_scope(
     tag = "usage",
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
-        ("environment_id" = String, Path, description = "The environment identifier")
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
     ),
     security(("bearer" = [])),
     responses(
@@ -335,8 +376,11 @@ pub async fn publish_usage(
         return Ok(replay);
     }
 
-    let (tally, truncated) =
-        fold_usage(&state.store().scoped(scope).outbox(), EXPORT_FOLD_LIMIT).await?;
+    let (tally, truncated) = fold_usage(
+        &state.store().scoped(scope).outbox(),
+        state.usage_fold_limit().unwrap_or(EXPORT_FOLD_LIMIT),
+    )
+    .await?;
     let occurred_at_unix_ms = state.now_unix_micros() / 1000;
     let id = format!("evt_{}", CorrelationId::generate(state.env()));
     let published = UsagePublished {

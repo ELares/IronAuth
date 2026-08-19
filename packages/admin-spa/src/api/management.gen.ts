@@ -2476,15 +2476,9 @@ export interface paths {
          * @description Folds the retained feed and publishes the result as a `usage.reported` event, so metering
          *     reaches a billing pipeline by webhook and not only by polling this API.
          *
-         *     The first line is a SENTENCE rather than the route, because utoipa lifts it into the
-         *     OpenAPI `summary` and from there into the generated Go, Python and TypeScript clients.
-         *     This was the only one of 227 operations whose summary was a backticked copy of its own
-         *     path, which is the least useful thing a summary can say next to a field already holding
-         *     the path.
-         *
          *     # Why publishing is an explicit action
          *
-         *     It could have been emitted as a side effect of [`export_usage`], and that would be wrong:
+         *     It could have been emitted as a side effect of the usage export, and that would be wrong:
          *     reporting would then be driven by whoever happens to poll, so a dashboard refresh would
          *     bill a customer and a quiet week would bill nobody. A snapshot is something an operator or
          *     a scheduler decides to take, so it gets its own verb.
@@ -2498,8 +2492,9 @@ export interface paths {
          *
          *     # Errors
          *
-         *     [`ApiError`] for an unknown scope, a soft-deleted environment, a caller without
-         *     `management.write_config`, a missing or reused `Idempotency-Key`, or a store fault.
+         *     An error for an unknown scope, a soft-deleted environment, a caller without
+         *     `management.write_config`, a missing or reused `Idempotency-Key`, or a store fault. The
+         *     status each produces is in the responses table.
          */
         post: operations["publishUsage"];
         delete?: never;
@@ -19593,7 +19588,10 @@ export interface operations {
     publishUsage: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description The tenant identifier */
                 tenant_id: string;

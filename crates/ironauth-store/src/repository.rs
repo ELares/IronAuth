@@ -8283,6 +8283,43 @@ impl ActingUsageRepo<'_> {
         message: &NewOutboxMessage<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<String, StoreError> {
+        self.publish_snapshot_inner(env, message, idempotency, false)
+            .await
+    }
+
+    /// Testing-only atomicity probe: run a real [`publish_snapshot`] (the append, the
+    /// idempotency row and the audit row), then force a guaranteed error inside the SAME
+    /// transaction, so a test can assert that none of the three survives.
+    ///
+    /// This path carries THREE writes rather than the usual two, which is the whole
+    /// argument for routing it through `write_audited` at all, and the argument was
+    /// untested until a review said so. It exercises the exact production path plus a
+    /// trailing poison statement; the public method never poisons.
+    ///
+    /// [`publish_snapshot`]: Self::publish_snapshot
+    ///
+    /// # Errors
+    ///
+    /// Always errors (that is the point): the injected failure rolls the whole transaction
+    /// back.
+    #[cfg(feature = "testing")]
+    pub async fn publish_snapshot_injecting_post_audit_failure(
+        &self,
+        env: &Env,
+        message: &NewOutboxMessage<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<String, StoreError> {
+        self.publish_snapshot_inner(env, message, idempotency, true)
+            .await
+    }
+
+    async fn publish_snapshot_inner(
+        &self,
+        env: &Env,
+        message: &NewOutboxMessage<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        poison_after_audit: bool,
+    ) -> Result<String, StoreError> {
         let scope = self.scope;
         let spec = AuditedWrite {
             store: self.store,
@@ -8303,7 +8340,7 @@ impl ActingUsageRepo<'_> {
                 insert_idempotency(tx, idempotency).await?;
                 Ok(id.to_string())
             },
-            false,
+            poison_after_audit,
         )
         .await
     }
@@ -21051,30 +21088,14 @@ pub(crate) async fn enqueue_domain_event(
     event: Option<&DomainEvent<'_>>,
 ) -> Result<(), StoreError> {
     if let Some(event) = event {
-        // ISSUE #108 CRITERION 1, enforced where a violation is CHEAPEST to diagnose.
+        // NO EMIT-TIME GUARD HERE ANY MORE, and this is where a reader looks for it.
         //
-        // `ironauth_admin::events` validates every event at the fan-out, which is the one
-        // choke point production traffic passes through and is where the check belongs at
-        // run time. But its failure is a log line and a permanent consumer error, discovered
-        // by whoever is watching deliveries -- and by then the producer that built the bad
-        // envelope is long out of scope.
-        //
-        // Under the `testing` feature this panics INSIDE the producer's own transaction
-        // instead, so an unregistered type or an off-schema payload fails the test that
-        // exercised it, with that producer on the stack. Every store and admin test runs
-        // with the feature, so this covers every event the suite emits: the criterion asks
-        // that such an event fail the build, and nothing weaker than an assertion at emit
-        // time does that.
-        //
-        // Deliberately NOT compiled into release builds. A panic here would abort a real
-        // write for a payload the fan-out is already equipped to refuse, turning a
-        // deliverability problem into an outage.
-        // The emit-time assertion itself now lives in `enqueue_outbox_in_tx_at`, the ONE
-        // statement every event-feed row passes through. It sat here first, and here it
-        // only covered producers that ride a domain write: `OutboxRepo::append_event`
-        // (the documented path for a producer with no domain write to ride, such as an
-        // operator-triggered publish) went straight to the insert and was never checked.
-        // A guard that covers ten of eleven producers is a guard the eleventh will find.
+        // The issue #108 criterion 1 assertion sat at this line first, and here it covered
+        // only producers that ride a domain write: `OutboxRepo::append_event`, the path for
+        // a producer with no domain write to ride, went straight to the insert unchecked.
+        // It now sits on the TWO statements that insert into `outbox_messages`, which
+        // together are every row on the feed. Its rationale lives with it, at
+        // `enqueue_outbox_in_tx_at_inner`.
         enqueue_outbox_in_tx(
             tx,
             env,

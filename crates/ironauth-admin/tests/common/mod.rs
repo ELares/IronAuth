@@ -78,6 +78,34 @@ impl Harness {
         }
     }
 
+    /// Start with the usage fold's meterable-event bound LOWERED (issue #107).
+    ///
+    /// The shipped bound is ten thousand events, so the truncation path on the publish
+    /// endpoint is unreachable from a test that seeds a realistic fixture, and it went
+    /// untested: a `truncated` hardcoded to `false` on the published event survived every
+    /// suite. Lowering the bound for one state reaches the same code the shipped bound
+    /// reaches, without seeding ten thousand rows.
+    pub async fn start_with_usage_fold_limit(default_page_size: u32, limit: i64) -> Self {
+        let mut db = TestDatabase::start().await;
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_usage_fold_limit(limit);
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+            txt: None,
+        }
+    }
+
     /// Start with an injected DNS TXT lookup (issue #96).
     ///
     /// `records` is what every domain "publishes"; `Err` is a resolver that could not

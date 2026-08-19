@@ -18386,7 +18386,7 @@
           "usage"
         ],
         "summary": "Publish a usage snapshot onto the event feed (issue #107).",
-        "description": "Folds the retained feed and publishes the result as a `usage.reported` event, so metering\nreaches a billing pipeline by webhook and not only by polling this API.\n\nThe first line is a SENTENCE rather than the route, because utoipa lifts it into the\nOpenAPI `summary` and from there into the generated Go, Python and TypeScript clients.\nThis was the only one of 227 operations whose summary was a backticked copy of its own\npath, which is the least useful thing a summary can say next to a field already holding\nthe path.\n\n# Why publishing is an explicit action\n\nIt could have been emitted as a side effect of [`export_usage`], and that would be wrong:\nreporting would then be driven by whoever happens to poll, so a dashboard refresh would\nbill a customer and a quiet week would bill nobody. A snapshot is something an operator or\na scheduler decides to take, so it gets its own verb.\n\n# Authority\n\n`management.write_config`, NOT the `management.read` the export needs. Publishing appends\nto the event feed every webhook subscriber receives, which is a write to shared state even\nthough the numbers it carries are read-only. A caller who may only READ usage must not be\nable to make every subscriber receive a billing record.\n\n# Errors\n\n[`ApiError`] for an unknown scope, a soft-deleted environment, a caller without\n`management.write_config`, a missing or reused `Idempotency-Key`, or a store fault.",
+        "description": "Folds the retained feed and publishes the result as a `usage.reported` event, so metering\nreaches a billing pipeline by webhook and not only by polling this API.\n\n# Why publishing is an explicit action\n\nIt could have been emitted as a side effect of the usage export, and that would be wrong:\nreporting would then be driven by whoever happens to poll, so a dashboard refresh would\nbill a customer and a quiet week would bill nobody. A snapshot is something an operator or\na scheduler decides to take, so it gets its own verb.\n\n# Authority\n\n`management.write_config`, NOT the `management.read` the export needs. Publishing appends\nto the event feed every webhook subscriber receives, which is a write to shared state even\nthough the numbers it carries are read-only. A caller who may only READ usage must not be\nable to make every subscriber receive a billing record.\n\n# Errors\n\nAn error for an unknown scope, a soft-deleted environment, a caller without\n`management.write_config`, a missing or reused `Idempotency-Key`, or a store fault. The\nstatus each produces is in the responses table.",
         "operationId": "publishUsage",
         "parameters": [
           {
@@ -18402,6 +18402,15 @@
             "name": "environment_id",
             "in": "path",
             "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
             "required": true,
             "schema": {
               "type": "string"

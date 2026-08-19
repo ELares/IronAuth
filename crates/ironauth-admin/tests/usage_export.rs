@@ -234,7 +234,12 @@ async fn publishing_usage_emits_the_same_numbers_the_api_returns() {
         )
         .await;
     }
-    for i in 0..2 {
+    // FIVE, not two, and the difference is the whole power of this fixture. With two token
+    // events `tokens_issued` equalled `monthly_active_users`, so SWAPPING the two fields in
+    // the handler left every assertion below green -- measured, on both the response and the
+    // envelope. A billing pipeline invoiced on seats would have been invoiced on issuance.
+    // The rule was already written down three lines further on and broken here.
+    for i in 0..5 {
         append(&h, &env, scope, &format!("p_tok_{i}"), "token.issued", "-").await;
     }
     // Connections seeded too, and seeded at a count that is neither zero nor equal to any
@@ -271,7 +276,7 @@ async fn publishing_usage_emits_the_same_numbers_the_api_returns() {
             .await;
         assert_eq!(status, StatusCode::OK, "publish: {response}");
         body = serde_json::from_str(&response).expect("json");
-        if body["tokens_issued"] == 2 {
+        if body["tokens_issued"] == 5 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -280,7 +285,11 @@ async fn publishing_usage_emits_the_same_numbers_the_api_returns() {
         body["monthly_active_users"], 2,
         "alice twice and bob once: {body}"
     );
-    assert_eq!(body["tokens_issued"], 2, "{body}");
+    assert_eq!(
+        body["tokens_issued"], 5,
+        "five token events were seeded, and five is distinct from the other three \
+         expectations: {body}"
+    );
     // Pinned against the SEEDED count, not against the event that echoes it. Comparing the
     // event's `connections` to the response's `connections` alone is a guard computing its
     // own expectation: a mutant returning 999 makes both sides 999 and passes. Three is
@@ -346,6 +355,42 @@ async fn publishing_usage_emits_the_same_numbers_the_api_returns() {
     assert_eq!(reported["payload"]["connections"], body["connections"]);
     assert_eq!(reported["payload"]["truncated"], body["truncated"]);
     assert_eq!(reported["payload"]["truncated"], false);
+
+    // The ENVELOPE's scope, which is the routing key a per-scope billing feed reads and is
+    // not covered by anything above: the emit-time catalog guard validates the payload
+    // against its schema and says nothing about whether the envelope names the scope the
+    // row was written into. Writing a constant there survived the whole suite.
+    assert_eq!(
+        reported["tenant_id"], tenant,
+        "the envelope must name the tenant it was published for: {reported}"
+    );
+    assert_eq!(
+        reported["environment_id"], environment,
+        "and the environment, or a consumer bills the wrong one: {reported}"
+    );
+    assert_eq!(
+        reported["id"], body["event_id"],
+        "the id the caller was handed must be the id on the feed, or the two halves of one \
+         publish cannot be correlated at all"
+    );
+
+    // THE AUDIT ROW. `publish_snapshot` rides `write_audited` precisely so the append and
+    // its audit row commit together, and until this assertion existed the action could be
+    // any variant in the enum and every suite stayed green. `usage.publish` is the string
+    // an operator greps for after a disputed invoice.
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE tenant_id = $1 AND environment_id = $2 \
+         AND action = 'usage.publish'",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_all(h.db().owner_pool())
+    .await
+    .expect("read the audit rows");
+    assert!(
+        !actions.is_empty(),
+        "a successful publish must write a usage.publish audit row"
+    );
 
     // The envelope timestamp is MILLISECONDS. Feeding it microseconds is a thousandfold
     // error that every equality assertion above would still pass, and it would land in a
@@ -423,6 +468,181 @@ async fn publishing_usage_emits_the_same_numbers_the_api_returns() {
         ordering.as_deref(),
         Some(format!("{tenant}/{environment}").as_str()),
         "the ordering key must be the scope, so two snapshots stay in the order taken"
+    );
+}
+
+/// One credential's Idempotency-Key does not replay for ANOTHER credential (issue #107).
+///
+/// The stored key is scoped by `credential_ref`, and replacing that with a per-scope
+/// constant survived the suite: the fingerprint still binds the method and path, so
+/// cross-TENANT replay stayed blocked and nothing noticed that two credentials inside one
+/// environment had been merged into one replay namespace.
+///
+/// What that costs is a publish that silently does not happen. A scheduler and an operator
+/// both publishing under a fixed key such as `daily` would have the second call replay the
+/// first's response: a 200 carrying the FIRST snapshot's numbers, with no second event on
+/// the feed and nothing to indicate the snapshot was never taken.
+#[tokio::test]
+async fn one_credentials_idempotency_key_does_not_replay_for_another() {
+    // Same key, same path, same (empty) body for both credentials, so the request
+    // fingerprint is identical and the credential is the only thing separating them.
+    const SHARED_KEY: &str = "daily";
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-usage-cred").await;
+    let publish = format!("/v1/tenants/{tenant}/environments/{environment}/usage/publish");
+
+    // Two credentials in ONE environment.
+    let (_, first_secret) = mint_key(&h, &tenant, &environment, "k-cred-a").await;
+    let (_, second_secret) = mint_key(&h, &tenant, &environment, "k-cred-b").await;
+
+    let (status, _, first) = h.post_as(&publish, &first_secret, SHARED_KEY, "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the first credential publishes: {first}"
+    );
+    let first: Value = serde_json::from_str(&first).expect("json");
+
+    // The same credential replaying is the CONTROL: without it, a second distinct response
+    // below could mean the endpoint simply never replays anything.
+    let (status, _, replay) = h.post_as(&publish, &first_secret, SHARED_KEY, "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the same credential replays: {replay}"
+    );
+    let replay: Value = serde_json::from_str(&replay).expect("json");
+    assert_eq!(
+        replay["event_id"], first["event_id"],
+        "the same credential under the same key must replay the SAME event"
+    );
+
+    let (status, _, second) = h.post_as(&publish, &second_secret, SHARED_KEY, "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the other credential must publish rather than replay: {second}"
+    );
+    let second: Value = serde_json::from_str(&second).expect("json");
+    assert_ne!(
+        second["event_id"], first["event_id"],
+        "a second credential's publish under the same key must be its OWN snapshot, or one \
+         caller's key silently suppresses another's publish"
+    );
+
+    // And BOTH events are on the feed, which is the fact a billing pipeline depends on.
+    let published: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND payload->>'type' = 'usage.reported'",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_one(h.db().owner_pool())
+    .await
+    .expect("count");
+    assert_eq!(
+        published, 2,
+        "two credentials, two publishes, two events; the replay in between adds none"
+    );
+}
+
+/// A TRUNCATED publish says so, in the 200 body AND in the event on the feed (issue #107).
+///
+/// # Why this test had to be built rather than asserted
+///
+/// `truncated` is the field this endpoint's own doc calls "the one number a customer would
+/// never think to question", and on the publish path it was unmeasured in the strictest
+/// sense: hardcoding it to `false` in the published event left every suite green. The two
+/// assertions that existed were `event.truncated == body.truncated` and `== false`, which is
+/// a guard comparing two copies of one value plus a pin to what the mutant already produces.
+///
+/// The reason was structural, not an oversight anyone could see: reaching the shipped bound
+/// means ten thousand meterable events, so the truncation path was not reachable from a
+/// fixture at all. `AdminState::with_usage_fold_limit` lowers the bound instead, which
+/// reaches the same branch on the same code the shipped bound reaches.
+///
+/// The control is a SECOND harness on the shipped bound, not a second assertion on this one:
+/// with both states publishing the same fixture, the flag is the only thing that differs, so
+/// a constant on either side fails here whichever constant it is.
+#[tokio::test]
+async fn a_truncated_publish_says_so_in_the_response_and_in_the_event() {
+    let env = Env::system();
+
+    // The bounded state: any feed carrying a single meterable event crosses the bound.
+    let truncating = Harness::start_with_usage_fold_limit(50, 1).await;
+    // And the control, on the shipped bound, seeded identically.
+    let exact = Harness::start(50).await;
+
+    let mut outcomes = Vec::new();
+    for (h, label) in [(&truncating, "bounded at 1"), (&exact, "the shipped bound")] {
+        let (tenant, environment) = h.create_tenant("acme", &format!("k-trunc-{label}")).await;
+        let scope = Scope::new(
+            TenantId::parse(&tenant).expect("tenant id"),
+            EnvironmentId::parse(&environment).expect("environment id"),
+        );
+        for i in 0..3 {
+            append(h, &env, scope, &format!("t_tok_{i}"), "token.issued", "-").await;
+        }
+
+        let publish = format!("/v1/tenants/{tenant}/environments/{environment}/usage/publish");
+        let (status, _, response) = h.post(&publish, "k-trunc-publish", "").await;
+        assert_eq!(status, StatusCode::OK, "{label}: {response}");
+        let body: Value = serde_json::from_str(&response).expect("json");
+
+        // The flag as the FEED carries it, which is the copy a billing pipeline reads. The
+        // response is what the caller sees; only one of the two reaches the subscriber.
+        let mut published = None;
+        for _ in 0..100 {
+            let claimed = h
+                .store()
+                .scoped(scope)
+                .outbox()
+                .claim(
+                    &env,
+                    ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                    std::time::Duration::from_secs(30),
+                    100,
+                )
+                .await
+                .expect("claim");
+            for m in &claimed {
+                if m.payload["type"] == "usage.reported" {
+                    published = Some(m.payload.clone());
+                }
+            }
+            for m in claimed {
+                h.store()
+                    .scoped(scope)
+                    .outbox()
+                    .complete(&env, &m)
+                    .await
+                    .expect("complete");
+            }
+            if published.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let published = published.expect("a usage.reported event reaches the feed");
+        assert_eq!(
+            published["payload"]["truncated"], body["truncated"],
+            "{label}: the event and the response must agree: {published}"
+        );
+        outcomes.push((label, body["truncated"].clone()));
+    }
+
+    assert_eq!(
+        outcomes[0].1,
+        Value::Bool(true),
+        "a fold that stopped at its bound must publish truncated: true, or a billing \
+         pipeline books a lower bound as an exact figure: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes[1].1,
+        Value::Bool(false),
+        "and the same fixture under the shipped bound must publish truncated: false, or \
+         the assertion above is satisfied by a constant: {outcomes:?}"
     );
 }
 
@@ -551,6 +771,22 @@ async fn publishing_into_a_soft_deleted_environment_is_refused() {
     .fetch_one(h.db().owner_pool())
     .await
     .expect("count");
+    // Nor an audit row. `publish_snapshot` writes the append and the audit row in ONE
+    // transaction, so a refusal that reached the store at all would leave both; a refusal
+    // that never reaches it leaves neither. One row, from the control publish above.
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'usage.publish'",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_one(h.db().owner_pool())
+    .await
+    .expect("count audit rows");
+    assert_eq!(
+        audited, 1,
+        "the refused publish must write no audit row: only the control's remains"
+    );
     assert_eq!(
         count, 1,
         "only the pre-deletion publish may have appended an event"
@@ -739,16 +975,27 @@ async fn a_published_snapshot_does_not_consume_the_export_budget() {
     // from the other tests in this binary the two disagree for a moment, and a limit derived
     // from the direct count is then above what the fold can reach. That is how this test
     // came to pass alone and fail in the suite, which is the worst way to learn about a race.
+    let mut caught_up = false;
     for _ in 0..100 {
         let (tally, _) =
             ironauth_admin::usage::fold_usage(&h.store().scoped(scope).outbox(), 1_000)
                 .await
                 .expect("fold");
         if tally.tokens_issued() == 4 {
+            caught_up = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    // The loop's OWN exit condition, asserted where it is decided. Its two siblings in this
+    // file assert theirs; this one did not, so when the watermark stayed behind for the full
+    // five seconds the failure surfaced twenty lines below as "the numbers are unaffected:
+    // left 0, right 4", which names the wrong thing and sends a reader to the wrong code.
+    assert!(
+        caught_up,
+        "the fold's view never caught up with the seeded events; everything derived below \
+         would be derived from a feed the fold cannot see yet"
+    );
 
     let (total, meterable) = feed_counts(&h, &tenant, &environment).await;
     assert!(
