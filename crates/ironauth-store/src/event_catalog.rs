@@ -1162,6 +1162,35 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The METERING SNAPSHOT, so usage exports by webhook and not only by polling the API
+        // (issue #107 criterion 4: "exports via API and webhook").
+        //
+        // A billing pipeline wants the aggregate PUSHED. Deriving it from the raw feed means
+        // every consumer re-implements the fold -- including its truncation rule -- and two
+        // implementations of a billing number is how a customer gets two different invoices.
+        //
+        // NO PER-USER DATA. `monthly_active_users` is a COUNT, never a list: metering needs
+        // to distinguish people, not identify them, and a billing pipeline is exactly the
+        // downstream system that should never be handed a directory of its customer's users.
+        //
+        // `truncated` travels because the numbers are meaningless without it. When the fold
+        // stops at its limit these are a LOWER BOUND, and a silently truncated usage figure
+        // is the one number a customer would never think to question.
+        "usage.reported",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "monthly_active_users": {"type": "integer", "minimum": 0},
+                "tokens_issued": {"type": "integer", "minimum": 0},
+                "connections": {"type": "integer", "minimum": 0},
+                "truncated": {"type": "boolean"}
+            },
+            "required": ["monthly_active_users", "tokens_issued", "connections", "truncated"]
+        }"#,
+    ),
+    (
         "recovery_approval.decided",
         1,
         r#"{

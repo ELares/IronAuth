@@ -1652,3 +1652,55 @@ async fn queued_events(harness: &Harness, scope: Scope) -> Vec<serde_json::Value
     }
     claimed.into_iter().map(|message| message.payload).collect()
 }
+
+/// Publishing a usage snapshot is sudo gated (issues #73, #107).
+///
+/// The guard was added in the same round that added the endpoint, and nothing measured it:
+/// `Harness::start` uses `AdminConfig::default()`, where sudo mode is off, so deleting
+/// `require_fresh_privilege` from `publish_usage` left the whole `usage_export` suite green.
+/// This file is where that measurement lives, and the route was not in it.
+///
+/// Both halves, as every test in this file has: without a fresh elevation the publish is
+/// challenged and NOTHING is appended, and after elevation the same call succeeds. Asserting
+/// only the challenge would also pass against an endpoint that refused everyone.
+#[tokio::test]
+async fn a_usage_publish_is_sudo_gated() {
+    let (harness, _clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k-usage-sudo").await;
+    let path = format!("/v1/tenants/{tenant}/environments/{env}/usage/publish");
+
+    let (status, _, challenge) = harness.post(&path, "k-sudo-stale", "").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale publish is challenged: {challenge}"
+    );
+    assert!(
+        challenge.contains("insufficient_user_authentication"),
+        "the challenge body carries the RFC 9470 error: {challenge}"
+    );
+
+    // Nothing was appended by the challenged call. A challenge that still published would
+    // be the worst of both, and this endpoint's output is a billing record.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND payload->>'type' = 'usage.reported'",
+    )
+    .bind(&tenant)
+    .bind(&env)
+    .fetch_one(harness.db().owner_pool())
+    .await
+    .expect("count");
+    assert_eq!(count, 0, "a challenged publish must announce nothing");
+
+    let (status, _, elevated) = harness
+        .post(&elevate_path(&tenant, &env), "e-usage", "{}")
+        .await;
+    assert_eq!(status, StatusCode::OK, "elevate: {elevated}");
+    let (status, _, published) = harness.post(&path, "k-sudo-fresh", "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated publish succeeds: {published}"
+    );
+}

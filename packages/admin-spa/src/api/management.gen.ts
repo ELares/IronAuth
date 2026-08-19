@@ -2462,6 +2462,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Publish a usage snapshot onto the event feed (issue #107).
+         * @description Folds the retained feed and publishes the result as a `usage.reported` event, so metering
+         *     reaches a billing pipeline by webhook and not only by polling this API.
+         *
+         *     # Why publishing is an explicit action
+         *
+         *     It could have been emitted as a side effect of the usage export, and that would be wrong:
+         *     reporting would then be driven by whoever happens to poll, so a dashboard refresh would
+         *     bill a customer and a quiet week would bill nobody. A snapshot is something an operator or
+         *     a scheduler decides to take, so it gets its own verb.
+         *
+         *     # Authority
+         *
+         *     `management.write_config`, NOT the `management.read` the export needs. Publishing appends
+         *     to the event feed every webhook subscriber receives, which is a write to shared state even
+         *     though the numbers it carries are read-only. A caller who may only READ usage must not be
+         *     able to make every subscriber receive a billing record.
+         *
+         *     # Errors
+         *
+         *     An error for an unknown scope, a soft-deleted environment, a caller without
+         *     `management.write_config`, a missing or reused `Idempotency-Key`, or a store fault. The
+         *     status each produces is in the responses table.
+         */
+        post: operations["publishUsage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users": {
         parameters: {
             query?: never;
@@ -7139,6 +7180,18 @@ export interface components {
              *     truncated usage figure is the one number a customer would never think to question.
              */
             truncated: boolean;
+        };
+        /**
+         * @description What a publish returns: the snapshot, and the id of the event it caused.
+         *
+         *     The id is not decoration. A caller that publishes and then watches its webhook endpoint
+         *     has two halves of one transaction and, without it, no way to match them except by
+         *     timestamp -- which is exactly the correlation that breaks when two publishes land in the
+         *     same second, and the case where getting it wrong means reconciling the wrong invoice.
+         */
+        UsagePublished: components["schemas"]["UsageExport"] & {
+            /** @description The id of the `usage.reported` event this request appended. */
+            event_id: string;
         };
         /**
          * @description A user's connected apps (issue #88): the remembered consents they hold, oldest
@@ -19523,6 +19576,79 @@ export interface operations {
             };
             /** @description Unknown tenant or environment */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    publishUsage: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The published snapshot */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsagePublished"];
+                };
+            };
+            /** @description Missing Idempotency-Key */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown tenant or environment */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused for a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

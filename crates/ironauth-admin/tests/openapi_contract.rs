@@ -252,6 +252,7 @@ fn operation_ids_are_the_stable_set() {
             "planConfigPromotion",
             "postFlowDryRun",
             "probePasswordHashing",
+            "publishUsage",
             "purgeTenant",
             "readEventFeed",
             "rejectRecoveryApproval",
@@ -670,6 +671,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/{version}/activate",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers",
@@ -798,7 +800,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        226,
+        227,
         "the documented route count is pinned"
     );
 

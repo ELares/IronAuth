@@ -842,3 +842,95 @@ async fn metering_matches_seeded_activity_exactly() {
     assert_eq!(tally.tokens_issued(), 5);
     assert_eq!(tally.connections(), 1);
 }
+
+/// A SECOND scope's feed is readable from the beginning (issue #107).
+///
+/// `sequence` is a TABLE-WIDE identity, so the second tenant to write in a database does not
+/// own sequence 1: its oldest row might be 2, or five thousand. `EventCursor::beginning()` is
+/// 0, and the aged-out test compares the scope's `MIN(sequence)` against it, so every scope
+/// but whichever happened to own sequence 1 answered `Gone` to a reader starting from the
+/// beginning. Measured before the fix: `GET /usage` and `POST /usage/publish` both returned
+/// 500 for the second tenant in a database, and the event feed returned 410 telling the
+/// caller its events "have been deleted" when nothing had been.
+///
+/// Every fixture in the suites that cover this reads the FIRST tenant created in a fresh
+/// database, which is why it survived a criterion whose whole subject is this feed. Two
+/// scopes in one database is the arrangement that makes the question askable at all, which
+/// is the same shape as the cross-issuer gap in the federation fixtures.
+#[tokio::test]
+async fn a_second_scopes_feed_is_readable_from_the_beginning() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let first = db.seed_scope(&env).await;
+    let second = db.seed_scope(&env).await;
+    let store = db.store().clone();
+
+    // Interleave, so neither scope owns a contiguous run and the second cannot own the
+    // lowest sequence in the table.
+    for i in 0..3 {
+        append_envelope(
+            &store,
+            &env,
+            first,
+            &format!("evt_first_{i}"),
+            "user.signed_in",
+            serde_json::json!({"user_id": "usr_first", "method": "password"}),
+        )
+        .await;
+        append_envelope(
+            &store,
+            &env,
+            second,
+            &format!("evt_second_{i}"),
+            "user.signed_in",
+            serde_json::json!({"user_id": "usr_second", "method": "password"}),
+        )
+        .await;
+    }
+
+    let oldest_of_second: i64 = sqlx::query_scalar(
+        "SELECT MIN(sequence) FROM outbox_messages WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(second.tenant().to_string())
+    .bind(second.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the second scope's oldest sequence");
+    // The premise. Without this the test could pass in a database where the second scope
+    // happened to start at 1, which is exactly the fixture blindness it exists to close.
+    assert!(
+        oldest_of_second > 1,
+        "the second scope must NOT own sequence 1, or this test proves nothing: {oldest_of_second}"
+    );
+
+    // The feed is watermarked on `pg_snapshot_xmin`, so a row is readable a moment after it
+    // commits. Poll for the count the way this file's other tests do, and assert the exit
+    // condition, so a timeout fails HERE rather than as a confusing count below.
+    let mut seen = 0;
+    for _ in 0..100 {
+        match store
+            .scoped(second)
+            .outbox()
+            .events_page_after(EventCursor::beginning(), 100)
+            .await
+            .expect("read the second scope's feed")
+        {
+            EventPage::Page(events) => {
+                seen = events.len();
+                if seen == 3 {
+                    break;
+                }
+            }
+            EventPage::Gone { oldest_retained } => panic!(
+                "a beginning cursor has missed nothing by definition, but the feed reported \
+                 Gone at {oldest_retained}: every scope but the one owning sequence 1 would \
+                 be unreadable"
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        seen, 3,
+        "a beginning cursor must be handed this scope's OWN events, and only those"
+    );
+}

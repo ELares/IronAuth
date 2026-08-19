@@ -217,6 +217,7 @@ use crate::views::{
     paths(
         crate::event_feed::read_event_feed,
         crate::usage::export_usage,
+        crate::usage::publish_usage,
         crate::operators::list_operators,
         crate::operators::get_operator,
         crate::resource_types::list_resource_types,

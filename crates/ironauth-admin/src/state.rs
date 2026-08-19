@@ -178,6 +178,16 @@ struct Inner {
     // The AuthZEN batch bound (issue #100), installed on the boot path from
     // `organizations.max_authzen_batch` and read by the batch evaluation handler.
     max_authzen_batch: u32,
+    // A TESTING-ONLY override of the usage fold's meterable-event bound (issue #107).
+    // `None` in every production build, because the only setter is gated on `testing`, so
+    // the shipped bound is always `usage::EXPORT_FOLD_LIMIT`.
+    //
+    // It exists because `truncated` was UNMEASURABLE on the publish path without it. The
+    // flag's whole job is to admit the numbers beside it are a lower bound, and a billing
+    // pipeline that ignores it invoices a truncated snapshot as exact -- so it is the last
+    // field that should be untested. Reaching the real bound needs ten thousand seeded
+    // events, which is not a test; lowering the bound for one request is.
+    usage_fold_limit: Option<i64>,
     outbox_visibility_timeout_secs: u64,
     // The deployment-wide login-identifier uniqueness policy (issue #54), installed by
     // the boot path from the top-level `[identifiers]` section and passed to every
@@ -328,6 +338,7 @@ impl AdminState {
                 federation: None,
                 max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
                 max_authzen_batch,
+                usage_fold_limit: None,
                 outbox_visibility_timeout_secs: ironauth_config::OutboxConfig::default()
                     .visibility_timeout_secs,
                 identifier_uniqueness: UniquenessMode::EnvironmentWide,
@@ -816,6 +827,25 @@ impl AdminState {
             inner.federation = Some(runtime);
         }
         self
+    }
+
+    /// Lower the usage fold's meterable-event bound for this state (issue #107).
+    ///
+    /// Gated on `testing`, so a production build has no way to set it and the shipped bound
+    /// is always `usage::EXPORT_FOLD_LIMIT`. See the field's comment for why the alternative
+    /// (seeding ten thousand events) is not one.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_usage_fold_limit(mut self, limit: i64) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.usage_fold_limit = Some(limit);
+        }
+        self
+    }
+
+    /// The overridden usage fold bound, or `None` for the shipped one.
+    pub(crate) fn usage_fold_limit(&self) -> Option<i64> {
+        self.inner.usage_fold_limit
     }
 
     /// The installed federation runtime, if any (issue #76).

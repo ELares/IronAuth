@@ -10,7 +10,9 @@
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{CorrelationId, EnvironmentId, Scope, StoreError, TenantId};
+use ironauth_store::{
+    CorrelationId, EnvironmentId, IdempotencyWrite, NewOutboxMessage, Scope, StoreError, TenantId,
+};
 use sqlx::Row;
 
 /// Count every row in `table` via the owner pool (bypasses row-level security).
@@ -139,4 +141,200 @@ async fn a_data_insert_failure_writes_no_audit_row() {
         1,
         "and its audit row, which is what proves the path under test really writes both"
     );
+}
+
+/// The envelope a usage publish carries, built through the SAME catalog helper the endpoint
+/// uses. A hand-rolled one is refused by the emit-time schema guard under the `testing`
+/// feature, and the failure would then be that guard rather than the rollback under test.
+fn usage_envelope(scope: Scope) -> serde_json::Value {
+    ironauth_store::event_catalog::envelope(
+        PROBE_EVENT_ID,
+        "usage.reported",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1_700_000_000_000,
+        &serde_json::json!({
+            "monthly_active_users": 1,
+            "tokens_issued": 2,
+            "connections": 3,
+            "truncated": false,
+        }),
+    )
+    .expect("the catalog builds a usage.reported envelope")
+}
+
+/// The idempotency record a usage publish writes alongside its append.
+fn probe_idempotency() -> IdempotencyWrite<'static> {
+    IdempotencyWrite {
+        credential_ref: "cred_atomicity_probe",
+        key: "k-atomicity",
+        request_fingerprint: "fingerprint",
+        response_status: 200,
+        response_body: "{}",
+    }
+}
+
+/// The three row counts a publish touches: feed, idempotency, audit.
+async fn publish_counts(db: &TestDatabase) -> (i64, i64, i64) {
+    (
+        count_all(db, "outbox_messages").await,
+        count_all(db, "idempotency_keys").await,
+        count_all(db, "audit_log").await,
+    )
+}
+
+const PROBE_EVENT_ID: &str = "evt_atomicity_probe";
+
+/// The usage publish's THREE writes commit together or not at all (issue #107).
+///
+/// Every other audited write in this store carries two rows, the data change and its audit
+/// row. This one carries three: the outbox append, the `Idempotency-Key` record, and the
+/// audit row. Three is the whole reason it was routed through `write_audited` rather than
+/// given a transaction of its own, and that argument had no test for three review rounds.
+///
+/// The partial failures it rules out are not equivalent, and one of them is silent. An
+/// append with no idempotency row means a retried `POST` publishes a SECOND snapshot and the
+/// customer is billed twice. An idempotency row with no append means the retry replays a 200
+/// describing an event that is not on the feed, so the billing pipeline is never told. An
+/// audit row with no append is a record of a publish that did not happen.
+#[tokio::test]
+async fn a_mid_transaction_failure_leaves_no_publish_no_key_and_no_audit_row() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    // The CONTROL store, because that is the one the management plane hands this repo:
+    // `idempotency_keys` is a control-plane table and only `ironauth_control` may write it.
+    let writer = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .usage();
+    let ordering = format!("{}/{}", scope.tenant(), scope.environment());
+    let message = |scope| NewOutboxMessage {
+        consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+        idempotency_key: PROBE_EVENT_ID,
+        ordering_key: &ordering,
+        payload: usage_envelope(scope),
+    };
+
+    let before = publish_counts(&db).await;
+    assert_eq!(
+        (before.0, before.1),
+        (0, 0),
+        "baseline: no feed row and no idempotency row"
+    );
+
+    let result = writer
+        .publish_snapshot_injecting_post_audit_failure(
+            &env,
+            &message(scope),
+            Some(probe_idempotency()),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::Database(_))),
+        "the poisoned publish must fail: {result:?}"
+    );
+    assert_eq!(
+        publish_counts(&db).await,
+        before,
+        "a mid-transaction failure leaves NO event on the feed, no idempotency row (which \
+         would make a retry replay a 200 for an event that was never published) and no \
+         audit row for a publish that did not happen"
+    );
+
+    // THE CONTROL. The same call without the injected failure has to write all three, or
+    // the assertion above is satisfied by a method that does nothing at all.
+    writer
+        .publish_snapshot(&env, &message(scope), Some(probe_idempotency()))
+        .await
+        .expect("the unpoisoned publish succeeds");
+    assert_eq!(
+        publish_counts(&db).await,
+        (before.0 + 1, before.1 + 1, before.2 + 1),
+        "the control appends, records the key and audits"
+    );
+}
+
+/// A usage publish BLOCKS on the per-scope append lock (issue #107).
+///
+/// `publish_snapshot` takes the same `pg_advisory_xact_lock` on the same key as
+/// `OutboxRepo::append_event`, so a publish orders against ordinary producers rather than
+/// racing them. An earlier version of the comment at that line said a test aimed at the
+/// window "would be a flake rather than a test", and declined to write one. That reasoning
+/// was wrong about which property is under test: the property is not who WINS a race, it is
+/// whether the call takes the lock at all, and that is observable by holding the lock from
+/// another session and watching the publish fail to complete.
+///
+/// The technique is `events_cursor_ordering.rs::
+/// serialising_appenders_on_a_scope_lock_makes_sequence_order_equal_commit_order`, which
+/// races nothing either: it holds the lock, starts the contender, and asserts the contender
+/// has not finished. The margin here is a two-second timeout against an unblocked publish
+/// measured in single-digit milliseconds, and the unblocked call is the control on the same
+/// fixture, so nothing depends on scheduling.
+#[tokio::test]
+async fn a_publish_blocks_on_the_per_scope_append_lock() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // The SAME key the store derives, computed the same way, so this cannot pass by holding
+    // an unrelated lock.
+    let mut hasher = DefaultHasher::new();
+    scope.tenant().to_string().hash(&mut hasher);
+    scope.environment().to_string().hash(&mut hasher);
+    let key = i64::from_ne_bytes(hasher.finish().to_ne_bytes());
+
+    let mut holder = db.owner_pool().begin().await.expect("begin the holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the per-scope append lock");
+
+    let writer = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .usage();
+    let ordering = format!("{}/{}", scope.tenant(), scope.environment());
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        writer.publish_snapshot(
+            &env,
+            &NewOutboxMessage {
+                consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: PROBE_EVENT_ID,
+                ordering_key: &ordering,
+                payload: usage_envelope(scope),
+            },
+            Some(probe_idempotency()),
+        ),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "publish_snapshot must BLOCK while another session holds the per-scope append lock; \
+         it returned {blocked:?} instead, so it never took the lock"
+    );
+
+    // THE CONTROL. Release the lock and the same call completes, so the timeout above
+    // measured the lock and not a publish that cannot succeed at all.
+    holder.rollback().await.expect("release the lock");
+    writer
+        .publish_snapshot(
+            &env,
+            &NewOutboxMessage {
+                consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: PROBE_EVENT_ID,
+                ordering_key: &ordering,
+                payload: usage_envelope(scope),
+            },
+            Some(probe_idempotency()),
+        )
+        .await
+        .expect("the same publish succeeds once the lock is released");
 }

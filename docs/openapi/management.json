@@ -18380,6 +18380,112 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish": {
+      "post": {
+        "tags": [
+          "usage"
+        ],
+        "summary": "Publish a usage snapshot onto the event feed (issue #107).",
+        "description": "Folds the retained feed and publishes the result as a `usage.reported` event, so metering\nreaches a billing pipeline by webhook and not only by polling this API.\n\n# Why publishing is an explicit action\n\nIt could have been emitted as a side effect of the usage export, and that would be wrong:\nreporting would then be driven by whoever happens to poll, so a dashboard refresh would\nbill a customer and a quiet week would bill nobody. A snapshot is something an operator or\na scheduler decides to take, so it gets its own verb.\n\n# Authority\n\n`management.write_config`, NOT the `management.read` the export needs. Publishing appends\nto the event feed every webhook subscriber receives, which is a write to shared state even\nthough the numbers it carries are read-only. A caller who may only READ usage must not be\nable to make every subscriber receive a billing record.\n\n# Errors\n\nAn error for an unknown scope, a soft-deleted environment, a caller without\n`management.write_config`, a missing or reused `Idempotency-Key`, or a store fault. The\nstatus each produces is in the responses table.",
+        "operationId": "publishUsage",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The published snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsagePublished"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing Idempotency-Key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown tenant or environment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused for a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users": {
       "get": {
         "tags": [
@@ -28974,6 +29080,27 @@
             "description": "Whether the fold stopped at its limit rather than reaching the end of the feed.\nWhen true these numbers are a LOWER BOUND, and saying so is the point: a silently\ntruncated usage figure is the one number a customer would never think to question."
           }
         }
+      },
+      "UsagePublished": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/UsageExport",
+            "description": "The snapshot that was published, byte for byte what the event carries."
+          },
+          {
+            "type": "object",
+            "required": [
+              "event_id"
+            ],
+            "properties": {
+              "event_id": {
+                "type": "string",
+                "description": "The id of the `usage.reported` event this request appended."
+              }
+            }
+          }
+        ],
+        "description": "What a publish returns: the snapshot, and the id of the event it caused.\n\nThe id is not decoration. A caller that publishes and then watches its webhook endpoint\nhas two halves of one transaction and, without it, no way to match them except by\ntimestamp -- which is exactly the correlation that breaks when two publishes land in the\nsame second, and the case where getting it wrong means reconciling the wrong invoice."
       },
       "UserConsentList": {
         "type": "object",

@@ -198,8 +198,18 @@ pub async fn read_event_feed(
         EventPage::Gone { oldest_retained } => {
             let body = serde_json::to_string(&FeedGone {
                 code: "cursor_expired".to_owned(),
-                message: "the cursor is older than the retention window; events you had \
-                          not read have been deleted"
+                // ASSERTS A RESYNC, NOT A DELETION, and the difference is measurable. The
+                // store answers `Gone` when the scope's oldest retained row is beyond the
+                // cursor, and under a table-wide sequence that cannot distinguish "rows of
+                // this scope were pruned" from "the intervening sequences belonged to other
+                // scopes". Measured: a consumer in a multi-scope database that had read
+                // every one of its own rows, whose read rows were then pruned, reached this
+                // arm having missed nothing. Telling it its events "have been deleted" is a
+                // claim this endpoint cannot support; telling it to resume from
+                // `oldest_cursor` is one it can.
+                message: "the cursor is older than the retention window; resume from \
+                          oldest_cursor. Events between your cursor and that point may \
+                          have been pruned"
                     .to_owned(),
                 // The cursor that resumes JUST BEFORE the oldest surviving event, so a
                 // reconciling consumer receives that event rather than skipping it.
