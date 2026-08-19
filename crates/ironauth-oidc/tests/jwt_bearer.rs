@@ -1728,26 +1728,35 @@ async fn a_successful_issuance_names_the_external_issuer_and_subject_in_the_audi
     );
 }
 
-/// A GitHub Actions-shaped workload token exchanges, and the subject gate binds the exact
-/// repository and ref (issue #126 criterion 1).
+/// A GitHub Actions-shaped workload token exchanges under the MAPPED identity, and the
+/// subject gate binds the exact repository and ref (issue #126 criterion 1).
 ///
-/// The mechanism is issuer-agnostic and already proven; what this pins is that it handles the
-/// SHAPE a real CI provider emits. GitHub's `sub` is structured --
-/// `repo:{owner}/{repo}:ref:refs/heads/{branch}` -- and the whole security value of federating
-/// to it is that a workflow on `main` of one repository is a different principal from a
-/// workflow on a branch, or from another repository entirely.
+/// GitHub's `sub` is structured -- `repo:{owner}/{repo}:ref:refs/heads/{branch}` -- and the
+/// security value of federating to it is that a workflow on main is a different principal
+/// from one on a branch, from a tag of the same name, or from another repository.
 ///
-/// So the negative half is the point. A mapping registered for main must NOT admit:
+/// # Every negative here is load-bearing, and that was MEASURED
 ///
-/// * the same repo on a different ref -- otherwise anyone who can push a branch to the
-///   repository can mint the identity that main's workflow uses, which is the exact
-///   escalation GitHub's structured subject exists to prevent;
-/// * a different repository under the same owner;
-/// * the mapped subject EXTENDED by a suffix (`main-old`), which is what a prefix
-///   comparison would wrongly admit. This is the case I got wrong first time: I used
-///   `service-staging`, which is NOT an extension of the mapped subject, so it exercised
-///   nothing and a prefix-match mutant passed against it;
-/// * a repository whose name merely contains the mapped one.
+/// An earlier version of this test carried five near-misses and asserted in its own doc that
+/// each caught something the others did not. That was false: deleting `refs/heads/feature`
+/// and `repo:acme/service-staging` changed no mutant outcome at all -- the first is strictly
+/// subsumed by `main-old` (both are "same repo, different ref", and `main-old` additionally
+/// kills a prefix comparison), and the second was already a case I had "fixed" once and which
+/// still proved nothing. They are gone. What remains is the set where each entry kills a
+/// mutant no other entry kills:
+///
+/// * `refs/heads/main-old` -- the mapped subject EXTENDED. Kills a prefix and a substring
+///   comparison. The realistic escalation: a branch whose name extends main's.
+/// * `refs/tags/main` -- a TAG named `main`. Kills a comparison that matches on the trailing
+///   component, and it is the genuine attack: tag creation is usually far less protected
+///   than branch protection.
+/// * `Xrepo:acme/service:ref:refs/heads/main` -- the mapped subject as a SUFFIX. Kills a
+///   suffix comparison.
+/// * `refs/heads/Main` -- case variation. Kills a case-insensitive comparison. Currently safe
+///   only because the column is `text` under a deterministic collation, which nothing else
+///   pins.
+/// * `repo:acme/other` -- a different repository under the same owner.
+/// * `repo:evil/service` -- the same repository name under a different OWNER.
 #[tokio::test]
 async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_ref() {
     const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
@@ -1765,7 +1774,9 @@ async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_r
     let client_id = harness.client_id().to_string();
     let aud = harness.state().token_endpoint_url();
 
-    // The mapped workflow exchanges: zero stored secrets, only the ambient token.
+    // The mapped workflow exchanges its ambient token for a token issued under the MAPPED
+    // principal. Asserting the `sub` is the point: a 200 alone would still pass if the
+    // exchange issued under the EXTERNAL subject, which would mean the mapping did nothing.
     let ok = assertion(
         &key,
         GITHUB_ISSUER,
@@ -1778,28 +1789,32 @@ async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_r
     assert_eq!(
         status,
         StatusCode::OK,
-        "the mapped workflow must exchange its ambient token: {body}"
+        "the mapped workflow must exchange: {body}"
+    );
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+    assert_eq!(
+        jwt_payload(&access)["sub"],
+        MAPPED_PRINCIPAL,
+        "the token must be issued under the MAPPED principal, not the external subject"
     );
 
-    // Every near-miss is refused. Each is a DIFFERENT way to be adjacent to the mapped
-    // subject, and a comparison that got any of them wrong would look correct on the others.
-    let near_misses = [
-        ("repo:acme/service:ref:refs/heads/feature", "jti-gha-branch"),
-        ("repo:acme/other:ref:refs/heads/main", "jti-gha-other-repo"),
-        // The mapped subject EXTENDED by a suffix. This is the one a prefix comparison
-        // would wrongly admit, and it is the realistic escalation: a branch named
-        // `main-old` minting the identity `main`'s workflow uses.
+    for (subject, jti) in [
         (
             "repo:acme/service:ref:refs/heads/main-old",
             "jti-gha-extends",
         ),
+        ("repo:acme/service:ref:refs/tags/main", "jti-gha-tag"),
+        ("Xrepo:acme/service:ref:refs/heads/main", "jti-gha-suffix"),
+        ("repo:acme/service:ref:refs/heads/Main", "jti-gha-case"),
+        ("repo:acme/other:ref:refs/heads/main", "jti-gha-other-repo"),
         (
-            "repo:acme/service-staging:ref:refs/heads/main",
-            "jti-gha-similar",
+            "repo:evil/service:ref:refs/heads/main",
+            "jti-gha-other-owner",
         ),
-        ("repo:evil/service:ref:refs/heads/main", "jti-gha-owner"),
-    ];
-    for (subject, jti) in near_misses {
+    ] {
         let attempt = assertion(&key, GITHUB_ISSUER, subject, &aud, 3600, jti);
         let (status, _h, body) = present(&harness, &client_id, &attempt).await;
         assert_eq!(
@@ -1811,16 +1826,72 @@ async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_r
     }
 }
 
-/// A Kubernetes projected service-account token exchanges through the SAME model (issue #126
+/// A mapping registered for ONE issuer does not fire for another (issue #126 criterion 3:
+/// per-issuer trust policies).
+///
+/// This is the gap the first version of these fixtures walked straight past. It registered
+/// two providers and put them in SEPARATE harnesses, so nothing ever presented one issuer's
+/// subject under the other's identity -- and dropping the issuer predicate from the mapping
+/// lookup entirely left the whole suite green.
+///
+/// The attack it covers is concrete: a deployment federating to both GitHub Actions and a
+/// Kubernetes cluster has two trust anchors. If the mapping matched on subject alone, anyone
+/// who can mint a token from the WEAKER anchor with the stronger one's subject string gets
+/// the stronger one's identity. Federating to a second issuer would silently widen the first.
+#[tokio::test]
+async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
+    const ISSUER_A: &str = "https://token.actions.githubusercontent.com";
+    const ISSUER_B: &str = "https://kubernetes.default.svc.cluster.local";
+    const SHARED_SUBJECT: &str = "repo:acme/service:ref:refs/heads/main";
+
+    let harness = Harness::start().await;
+    let key = issuer_key();
+    let jwks = jwks_json(&key);
+    // BOTH anchors registered in ONE environment, which is the arrangement that makes the
+    // cross-issuer question askable at all.
+    for issuer in [ISSUER_A, ISSUER_B] {
+        harness
+            .register_external_issuer(issuer, Some(&jwks), None, None, true)
+            .await;
+    }
+    // The mapping exists for A only.
+    harness
+        .create_subject_mapping(ISSUER_A, SHARED_SUBJECT, None, None, MAPPED_PRINCIPAL)
+        .await;
+    let client_id = harness.client_id().to_string();
+    let aud = harness.state().token_endpoint_url();
+
+    // Control: under A it exchanges, so the refusal below cannot be a broken fixture.
+    let under_a = assertion(&key, ISSUER_A, SHARED_SUBJECT, &aud, 3600, "jti-xiss-a");
+    let (status, _h, body) = present(&harness, &client_id, &under_a).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mapped issuer exchanges: {body}"
+    );
+
+    // The same subject, signed by the same key, presented under the OTHER registered issuer.
+    // Only the mapping's issuer binding can refuse this.
+    let under_b = assertion(&key, ISSUER_B, SHARED_SUBJECT, &aud, 3600, "jti-xiss-b");
+    let (status, _h, body) = present(&harness, &client_id, &under_b).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a mapping registered for one issuer must not fire for another: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+}
+
+/// A Kubernetes projected service-account token exchanges through the same model (issue #126
 /// criterion 2).
 ///
-/// Kept alongside the GitHub fixture rather than folded into it, because the point of
-/// criterion 2 is that a SECOND provider with a completely different subject shape --
-/// `system:serviceaccount:{namespace}:{name}` rather than GitHub's `repo:...:ref:...` --
-/// needs no provider-specific code. If this ever requires a special case, the trust-anchor
-/// model has stopped being issuer-agnostic and that is worth failing over.
+/// Deliberately modest about what this proves. There is no code path that branches on subject
+/// SHAPE -- the subject travels as an opaque string into a SQL equality -- and this file
+/// already exercises a third shape (`spiffe://...`) across many tests. So this is not
+/// evidence that "a second shape needs no special case"; it is a provider-shaped fixture for
+/// criterion 2, which asks for one by name.
 #[tokio::test]
-async fn a_kubernetes_projected_token_exchanges_through_the_same_model() {
+async fn a_kubernetes_projected_token_exchanges_under_the_mapped_identity() {
     const K8S_ISSUER: &str = "https://kubernetes.default.svc.cluster.local";
     const K8S_SUBJECT: &str = "system:serviceaccount:payments:checkout";
 
@@ -1841,9 +1912,13 @@ async fn a_kubernetes_projected_token_exchanges_through_the_same_model() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "a projected service-account token must exchange with no provider-specific code: \
-         {body}"
+        "a projected token must exchange: {body}"
     );
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+    assert_eq!(jwt_payload(&access)["sub"], MAPPED_PRINCIPAL);
 
     // A different service account in the same namespace is a different principal.
     let other = assertion(
