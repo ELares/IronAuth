@@ -63,13 +63,23 @@
 -- gets three seconds.
 --
 -- `nullif` IS LOAD-BEARING, and leaving it out fails the migration. `current_setting(name,
--- true)` returns NULL only for a setting that was NEVER defined; for one an operator set and
--- then cleared it returns the EMPTY STRING, on all three tuning paths and for every new
--- backend until the postmaster restarts. Without `nullif` the `coalesce` never reaches the
--- default, `set_config('lock_timeout', '', true)` raises `invalid value for parameter
--- "lock_timeout": ""`, and the migration aborts. The error names `lock_timeout` rather than
--- the knob the operator touched, and 0150 re-runs on every new database on that cluster, so
--- tidying up a setting this header recommends would break fresh deployments.
+-- true)` returns NULL when the placeholder is not defined in THIS backend, and the EMPTY
+-- STRING when it was defined and then cleared. Which of the three paths above leaves an
+-- empty string is not uniform, and an earlier version of this paragraph said it was:
+--
+--   * postgresql.conf and `ALTER SYSTEM`: remove the setting and reload, and EVERY backend
+--     including every new one reads `''` until the postmaster restarts. This is the one that
+--     matters, because 0150 re-runs on every new database on that cluster.
+--   * a `SET` then `RESET` on one CONNECTION: `''` in that session only; a new backend
+--     reads NULL.
+--   * `ALTER ROLE ... RESET`: a new backend reads NULL, never `''`.
+--
+-- Without `nullif` the `coalesce` never reaches the default in the empty-string states,
+-- `set_config('lock_timeout', '', true)` raises `invalid value for parameter
+-- "lock_timeout": ""`, and the migration aborts. So does a MALFORMED value, and whitespace
+-- alone (`'   '`) is malformed rather than empty, which is a plausible way to "clear" a
+-- knob. In every case the error names `lock_timeout` rather than the setting the operator
+-- touched, which is what makes it hard to diagnose.
 --
 -- `set_config(..., true)` rather than `SET LOCAL`, because `SET` takes a literal and not an
 -- expression: the expression form is a syntax error, which is how this was found.

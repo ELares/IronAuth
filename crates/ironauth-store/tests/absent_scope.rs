@@ -607,7 +607,8 @@ async fn every_scoped_table_declares_a_scope_foreign_key() {
     // bound it, and it hardcodes a COLUMN NAME (`environment_id`). That is the rot mode this
     // module's doc is written against: a migration renaming the scope column would reduce
     // this assertion to nothing while the first assertion and its floor stayed green.
-    // Measured: mutating this query to return zero rows left the whole suite passing.
+    // Measured on the file as it stood BEFORE this floor existed: mutating this query to
+    // return zero rows left the whole suite passing. With the floor it fails here.
     assert!(
         environment_scoped.len() > 100,
         "the schema must carry an environment_id column on the scoped tables; found {} \
@@ -679,6 +680,32 @@ async fn the_rewritten_scope_keys_still_cascade_on_delete() {
     }
 }
 
+/// The `DO` block migration 0150 opens with, read out of the migration file itself.
+///
+/// `include_str!` rather than a copy, because a copy is what the previous version of the
+/// test used and it measured nothing: three separate mutations of the shipped migration
+/// (removing `nullif`, deleting the block, changing the default) all left the test green,
+/// while mutating the copy failed it. A test that drives its own paraphrase is a test of the
+/// paraphrase.
+///
+/// The `assert!` matters as much as the extraction: without it, DELETING the block from 0150
+/// would make this test vacuous rather than red.
+fn lock_timeout_block() -> &'static str {
+    const SQL: &str = include_str!("../migrations/0150_scope_fk_naming.sql");
+    let start = SQL.find("DO $$").expect("0150 must open with a DO block");
+    let end = SQL[start..]
+        .find("$$;")
+        .expect("the DO block must terminate")
+        + start
+        + 3;
+    let block = &SQL[start..end];
+    assert!(
+        block.contains("set_config") && block.contains("lock_timeout"),
+        "0150's DO block must still be the lock_timeout block: {block}"
+    );
+    block
+}
+
 /// Migration 0150's `lock_timeout` expression resolves in every state an operator can leave
 /// the knob in (issues #111, #112).
 ///
@@ -713,19 +740,17 @@ async fn the_migration_lock_timeout_resolves_in_every_operator_state() {
                 .await
                 .expect("apply the operator's setting");
         }
-        // The expression EXACTLY as 0150 ships it, so this cannot drift from the migration
-        // by being paraphrased here.
-        sqlx::raw_sql(
-            "BEGIN; \
-             DO $$ BEGIN PERFORM set_config('lock_timeout', \
-             coalesce(nullif(current_setting('ironauth.migration_lock_timeout', true), ''), \
-             '3s'), true); END $$;",
-        )
-        .execute(&mut *conn)
-        .await
-        .unwrap_or_else(|error| {
-            panic!("the 0150 lock_timeout expression must not raise after `{setup}`: {error}")
-        });
+        // The block READ OUT OF 0150, not a copy of it. An earlier version of this test
+        // pasted the expression here and claimed it "cannot drift from the migration by
+        // being paraphrased", which was exactly backwards: nothing linked the two, so
+        // mutating the shipped migration left this green while mutating the copy failed it.
+        let sql = format!("BEGIN; {}", lock_timeout_block());
+        sqlx::raw_sql(&sql)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the 0150 lock_timeout expression must not raise after `{setup}`: {error}")
+            });
         let effective: String = sqlx::query_scalar("SHOW lock_timeout")
             .fetch_one(&mut *conn)
             .await
