@@ -916,6 +916,13 @@
           "default": "client_id",
           "description": "The default audience a client-credentials access token (RFC 6749 4.4, issue\n#23) carries when the request targets NO resource server. The default\n(`client_id`) makes the token's `aud` the OAuth client id, preserving the\nenvironment's existing no-resource behavior; `issuer` makes it the\nper-environment issuer. When a request DOES target a registered resource\nserver (the RFC 8707 `resource` parameter, issue #28), that resource server's\naudience wins and this default does not apply. This is a promotable\nper-environment setting in spirit; the process value is the deployment default\nuntil per-environment overrides ride the M5 promotion pipeline."
         },
+        "client_jwks_ttl_secs": {
+          "default": 300,
+          "description": "How long a CLIENT's fetched `jwks_uri` key set is cached, in seconds (issues #25,\n#126). Applies to `private_key_jwt` client authentication and to the\n`urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant, both of which resolve\na registered `jwks_uri` through the SSRF-hardened fetcher.\n\nThe default (300) trades one fetch per client per five minutes against how long a\nrotated-OUT key stays trusted. It does NOT govern how fast a rotated-IN key is\npicked up: an assertion naming a `kid` the cached set does not hold triggers an\nimmediate refetch, rate limited to once per 30 seconds per URI so an unverified\nheader cannot turn this into an amplifier. Must be at least 1 and at most\n`OIDC_MAX_CLIENT_JWKS_TTL_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "conform_id_token_claims": {
           "default": false,
           "description": "Copy the scope-derived standard claims into the ID token (issue #15). The\nspec-conform default (`false`) places scope-derived claims (`profile`,\n`email`, `address`, `phone`) at the `UserInfo` endpoint and keeps the ID\ntoken lean, per OIDC Core 5.4. Setting this `true` additionally copies those\nclaims into the ID token for legacy relying parties that never call\n`UserInfo`; that placement is explicitly NON-conform (it is the\nnode-oidc-provider `conformIdTokenClaims = false` behavior) and is documented\nas such. This is a promotable per-environment setting: it appears in config\nsnapshots and rides the M5 promotion pipeline; the process value is the\ndeployment default until per-environment overrides land.",
@@ -2825,6 +2832,7 @@
         "client_assertion_audience": "token_endpoint_or_issuer",
         "client_assertion_max_skew_secs": 60,
         "client_credentials_default_audience": "client_id",
+        "client_jwks_ttl_secs": 300,
         "conform_id_token_claims": false,
         "consent_lockdown": {
           "gate_unverified_sensitive_scopes": true,

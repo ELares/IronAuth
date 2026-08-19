@@ -252,8 +252,9 @@ impl ClientKeyResolver {
                 fetched_at: now,
                 // PRESERVED, not reset. Resetting here erased the very marker the
                 // refetch had just set: a successful refetch would clear the bound and
-                // the next forged kid would fetch again, measured at 11 outbound
-                // requests for 11 forged kids where the bound promises 1.
+                // the next forged kid would fetch again. Review measured 11 outbound
+                // requests from a prime plus TEN forged kids, against a bound that
+                // allows 2 (the prime, and one refetch inside the window).
                 //
                 // Preserving is also right on the merits. If the refetch succeeded and
                 // the kid was genuine, the new set contains it and no further refetch is

@@ -1196,50 +1196,85 @@ async fn build_oidc_plane(
                 None
             }
         };
-    let state = OidcState::new(store, env, registry, oidc_config, issuer_base)
-        .with_org_provisioning(org_provisioning)
-        .with_global_token_revocation_enabled(surfaces.global_revocation)
-        .with_fedcm_enabled(surfaces.fedcm)
-        .with_risk_signals_enabled(surfaces.risk_signals)
-        .with_org_scoped_clients_enabled(surfaces.org_scoped_clients)
-        .with_first_party_challenge_enabled(surfaces.first_party_challenge)
-        .with_flows_enabled(surfaces.flows)
-        .with_hosted_pages_enabled(surfaces.hosted_pages)
-        .with_diagnostics(&config.diagnostics)
-        .with_quota_enforcer(quota_enforcer)
-        .with_hashing_pool(hashing_pool)
-        .with_password_policy(password_policy, screening_failure, screen_on_login)
-        // The email-OTP / magic-link factors (issue #68) deliver through the verification
-        // seam. Until a real email provider is wired (M11 messaging), ship the dev
-        // transport: it records deliveries on the observability plane and emits the code /
-        // link only at the `debug` trace level, so the OTP and magic-link logic works end
-        // to end without a mail server. A production deployment installs its own
-        // `VerificationSender` here.
-        // In dev mode the capture sink replaces the logging transport, so a CI script can
-        // read the code back rather than scraping a debug log. Everywhere else this is
-        // `None` and the logging transport is installed exactly as before.
-        .with_verification_sender(DEV_CAPTURE.get().map_or_else(
-            || {
-                std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender)
-                    as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
-            },
-            |sink| {
-                std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
-            },
-        ))
-        // The guarded SMS-OTP factor (issue #70) delivers through a SEPARATE provider
-        // seam. Until a real SMS provider (Twilio Verify, Vonage, SNS) is wired (M11
-        // messaging), ship the dev stub: it records deliveries and emits the code only at
-        // the `debug` trace level, so the guarded SMS logic works end to end without an
-        // SMS gateway. A production deployment installs its own `SmsSender` here. SMS OTP
-        // is off by default, so this stub is inert until a tenant explicitly enables SMS.
-        .with_sms_sender(DEV_CAPTURE.get().map_or_else(
-            || {
-                std::sync::Arc::new(ironauth_oidc::LoggingSmsSender)
-                    as std::sync::Arc<dyn ironauth_oidc::SmsSender>
-            },
-            |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::SmsSender>,
-        ));
+    // THE CLIENT-KEY RESOLVER (issues #25, #126 criterion 4), and it was missing.
+    //
+    // `OidcState::new` passes `None`, so `resolve_issuer_keys` returned an EMPTY key set for
+    // every `jwks_uri` issuer and both surfaces that depend on it -- `private_key_jwt` client
+    // authentication and the jwt-bearer assertion grant -- were inert in a deployed server.
+    // The resolver was correct, tested, reachable from the tests that construct it directly,
+    // and reachable from nothing else. A review measured it: the only `Some(resolver)` call
+    // site in the whole repository was a test harness.
+    //
+    // Built like the claims-enrichment hook above and failing the same way: a fetcher that
+    // will not build is a TLS trust-store fault, and taking the whole OIDC plane down for it
+    // would be worse than the surfaces it disables. A warning says which ones.
+    let client_key_resolver = match crate::shared_config::outbound_fetcher(
+        ironauth_fetch::FetchLimits::default(),
+    ) {
+        Ok(fetcher) => Some(std::sync::Arc::new(ironauth_oidc::ClientKeyResolver::new(
+            std::sync::Arc::new(fetcher),
+            std::time::Duration::from_secs(oidc_config.client_jwks_ttl_secs),
+        ))),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "the client-key resolver's outbound fetcher could not be built; clients                  authenticating with private_key_jwt through a jwks_uri, and jwt-bearer                  assertions from an issuer with a jwks_uri, will be refused"
+            );
+            None
+        }
+    };
+    let state = match client_key_resolver {
+        Some(resolver) => OidcState::with_client_key_resolver(
+            store,
+            env,
+            registry,
+            oidc_config,
+            issuer_base,
+            resolver,
+        ),
+        None => OidcState::new(store, env, registry, oidc_config, issuer_base),
+    }
+    .with_org_provisioning(org_provisioning)
+    .with_global_token_revocation_enabled(surfaces.global_revocation)
+    .with_fedcm_enabled(surfaces.fedcm)
+    .with_risk_signals_enabled(surfaces.risk_signals)
+    .with_org_scoped_clients_enabled(surfaces.org_scoped_clients)
+    .with_first_party_challenge_enabled(surfaces.first_party_challenge)
+    .with_flows_enabled(surfaces.flows)
+    .with_hosted_pages_enabled(surfaces.hosted_pages)
+    .with_diagnostics(&config.diagnostics)
+    .with_quota_enforcer(quota_enforcer)
+    .with_hashing_pool(hashing_pool)
+    .with_password_policy(password_policy, screening_failure, screen_on_login)
+    // The email-OTP / magic-link factors (issue #68) deliver through the verification
+    // seam. Until a real email provider is wired (M11 messaging), ship the dev
+    // transport: it records deliveries on the observability plane and emits the code /
+    // link only at the `debug` trace level, so the OTP and magic-link logic works end
+    // to end without a mail server. A production deployment installs its own
+    // `VerificationSender` here.
+    // In dev mode the capture sink replaces the logging transport, so a CI script can
+    // read the code back rather than scraping a debug log. Everywhere else this is
+    // `None` and the logging transport is installed exactly as before.
+    .with_verification_sender(DEV_CAPTURE.get().map_or_else(
+        || {
+            std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender)
+                as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
+        },
+        |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>,
+    ))
+    // The guarded SMS-OTP factor (issue #70) delivers through a SEPARATE provider
+    // seam. Until a real SMS provider (Twilio Verify, Vonage, SNS) is wired (M11
+    // messaging), ship the dev stub: it records deliveries and emits the code only at
+    // the `debug` trace level, so the guarded SMS logic works end to end without an
+    // SMS gateway. A production deployment installs its own `SmsSender` here. SMS OTP
+    // is off by default, so this stub is inert until a tenant explicitly enables SMS.
+    .with_sms_sender(DEV_CAPTURE.get().map_or_else(
+        || {
+            std::sync::Arc::new(ironauth_oidc::LoggingSmsSender)
+                as std::sync::Arc<dyn ironauth_oidc::SmsSender>
+        },
+        |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::SmsSender>,
+    ));
     // Installed after the chain because it is CONDITIONAL: a disabled hook, or one whose
     // allowlist is empty, resolves to `None` and issuance is byte-for-byte unchanged.
     let state = match &claims_enrichment_hook {

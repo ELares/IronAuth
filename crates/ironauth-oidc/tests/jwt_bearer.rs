@@ -1291,6 +1291,41 @@ async fn start_jwks_server_failing_after_first(body: String) -> SocketAddr {
     addr
 }
 
+/// A JWKS server that serves `before` to the FIRST request and `after` to every later one.
+///
+/// This is an upstream ROTATION: the key set genuinely changes between two fetches, which is
+/// the situation the kid-aware refetch exists for and the only way to observe it end to end.
+/// The recording dialer cannot be retargeted mid-test, so the change has to happen behind one
+/// address.
+async fn start_rotating_jwks_server(before: String, after: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let before = before.clone();
+            let after = after.clone();
+            let served = Arc::clone(&served);
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = if n == 0 { before } else { after };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    addr
+}
+
 /// The external `sub` a mapping to a LIFECYCLE-BEARING user principal is keyed on, kept
 /// distinct from [`EXTERNAL_SUBJECT`] so a single harness can carry a user mapping and a
 /// workload mapping from the SAME trusted issuer at once.
@@ -1914,5 +1949,169 @@ async fn a_kidless_key_set_is_bounded_by_the_rate_limit_not_exempted() {
         2,
         "five requests naming an unknown kid must cost ONE refetch between them -- bounded, \
          not exempted"
+    );
+}
+
+/// A ROTATED upstream key is accepted at `/token`, inside the cache TTL (issue #126
+/// criterion 4).
+///
+/// # Why this test exists, and why the three that preceded it were not enough
+///
+/// The other rotation tests call `ClientKeyResolver::resolve_for_kid` directly. They prove
+/// the resolver, and they proved it well: the bound holds, the fallback works, the kid-less
+/// exemption is gone. What none of them touched is the WIRING -- whether the grant actually
+/// hands the presented `kid` to the resolver.
+///
+/// Measured: replacing `let kid = ironauth_jose::compact_jws_kid(assertion);` in
+/// `jwt_bearer.rs` with `let kid: Option<String> = None;` -- the feature disconnected from
+/// the grant entirely -- left the whole suite green. A feature can be correct, tested, and
+/// reachable by nothing, and this file had all three of those and called it done.
+///
+/// So this drives the real `/token` endpoint. The TTL is 300 seconds and nothing advances a
+/// clock, so the cache CANNOT expire during the test: the only thing that can make the
+/// second exchange succeed is the kid-miss refetch firing through the grant.
+#[tokio::test]
+// One rotation, followed in a single walk: prime, rotate, refetch, forge, and the
+// known-kid arm that separates "the presented kid travels" from "a kid travels".
+// Each arm depends on the dial count the previous one left behind, so splitting them
+// would mean re-priming a fresh server per arm and asserting on counts that no longer
+// compose.
+#[allow(clippy::too_many_lines)]
+async fn a_rotated_upstream_key_is_accepted_at_the_token_endpoint_inside_the_ttl() {
+    // Two keys with DISTINCT kids. The kid is the whole hint: with one kid the presented
+    // assertion would name a key the cache already claims to hold, and no refetch is due.
+    let before = SigningKey::ed25519_from_seed(Some("rot-before".to_owned()), &[11_u8; 32])
+        .expect("before key");
+    let after = SigningKey::ed25519_from_seed(Some("rot-after".to_owned()), &[22_u8; 32])
+        .expect("after key");
+
+    // The upstream rotates between the two fetches, which is the event under test.
+    let server = start_rotating_jwks_server(jwks_json(&before), jwks_json(&after)).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = Arc::new(ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        // LONG, deliberately. If this were short the second exchange could succeed by
+        // ordinary cache expiry and the test would measure nothing about the kid path.
+        Duration::from_secs(300),
+    ));
+    let h = Harness::start_with_resolver(
+        OidcConfig {
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        },
+        resolver,
+    )
+    .await;
+    h.register_external_issuer(
+        EXTERNAL_ISSUER,
+        None,
+        Some("http://issuer.test/jwks.json"),
+        None,
+        true,
+    )
+    .await;
+    h.create_subject_mapping(
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        None,
+        None,
+        MAPPED_PRINCIPAL,
+    )
+    .await;
+    let client_id = h.client_id().to_string();
+
+    // PRIME. One fetch, and the cache now holds `rot-before` only.
+    let first = assertion(
+        &before,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-rot-1",
+    );
+    let (status, _h, body) = present(&h, &client_id, &first).await;
+    assert_eq!(status, StatusCode::OK, "the pre-rotation exchange: {body}");
+    assert_eq!(dialer.requested().len(), 1, "primed with one fetch");
+
+    // THE ROTATION. The workload now signs with the new key, whose `kid` the cached set
+    // does not contain. Inside the TTL, so nothing but the kid-miss refetch can save it.
+    let second = assertion(
+        &after,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-rot-2",
+    );
+    let (status, _h, body) = present(&h, &client_id, &second).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a rotated upstream key must be accepted inside the TTL, which is the whole point \
+         of the kid-aware refetch: {body}"
+    );
+    assert_eq!(
+        jwt_payload(json(&body)["access_token"].as_str().expect("access_token"))["sub"],
+        MAPPED_PRINCIPAL,
+        "and it must still issue under the MAPPED principal"
+    );
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "exactly one refetch: the rotation, not a fetch per request"
+    );
+
+    // AND THE BOUND STILL HOLDS through the grant. A third exchange naming a kid nothing
+    // publishes must not buy another fetch, or the wiring would have turned the endpoint
+    // into an amplifier for anyone who can post a forged header.
+    let forged = SigningKey::ed25519_from_seed(Some("rot-forged".to_owned()), &[33_u8; 32])
+        .expect("forged key");
+    let third = assertion(
+        &forged,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-rot-3",
+    );
+    let (status, _h, _body) = present(&h, &client_id, &third).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a forged kid is refused");
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "the rate limit holds at the endpoint too: a forged kid buys no third fetch"
+    );
+
+    // FINALLY: the kid that travels is the PRESENTED one, not merely some kid.
+    //
+    // Without this arm the test is satisfied by a grant that hands the resolver a constant
+    // string, because a constant unknown kid also refetches once and also lands on the
+    // rotated set. Measured: that mutant survived every assertion above.
+    //
+    // The clock is advanced past the refetch rate limit first, which is what makes the two
+    // hypotheses separable. With the window open, an assertion naming a kid the cache now
+    // HOLDS must buy no fetch; a constant unknown kid would buy one.
+    h.clock().advance(Duration::from_secs(120));
+    let known_again = assertion(
+        &after,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-rot-4",
+    );
+    let (status, _h, body) = present(&h, &client_id, &known_again).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the rotated key still works: {body}"
+    );
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "a kid the cache already holds must never refetch, even with the rate-limit window \
+         open -- which is only true if the PRESENTED kid is what reaches the resolver"
     );
 }

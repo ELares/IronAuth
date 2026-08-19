@@ -2079,6 +2079,13 @@ pub const OIDC_JWKS_CACHE_MAX_SECS: u64 = 900;
 /// ceiling. The default is one minute.
 pub const OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS: u64 = 300;
 
+/// The longest a fetched CLIENT `jwks_uri` key set may be cached, in seconds (issues #25,
+/// #126). It bounds how long a key the client has ROTATED OUT stays trusted here, which is
+/// the direction that matters: a rotated-IN key naming a new `kid` is picked up immediately
+/// by the kid-miss refetch, so the ceiling does not have to be short to keep rotation
+/// working. One hour.
+pub const OIDC_MAX_CLIENT_JWKS_TTL_SECS: u64 = 3600;
+
 /// The largest a refresh-token IDLE timeout may be configured to, in seconds
 /// (issue #21). A refresh token that goes unused for longer than its idle timeout
 /// expires; the cap (ninety days) bounds how long an unused, session-bound or
@@ -2366,6 +2373,19 @@ pub struct OidcConfig {
     /// jti until its assertion's `exp` PLUS this skew, so pruning never opens a
     /// replay window.
     pub client_assertion_max_skew_secs: u64,
+
+    /// How long a CLIENT's fetched `jwks_uri` key set is cached, in seconds (issues #25,
+    /// #126). Applies to `private_key_jwt` client authentication and to the
+    /// `urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant, both of which resolve
+    /// a registered `jwks_uri` through the SSRF-hardened fetcher.
+    ///
+    /// The default (300) trades one fetch per client per five minutes against how long a
+    /// rotated-OUT key stays trusted. It does NOT govern how fast a rotated-IN key is
+    /// picked up: an assertion naming a `kid` the cached set does not hold triggers an
+    /// immediate refetch, rate limited to once per 30 seconds per URI so an unverified
+    /// header cannot turn this into an amplifier. Must be at least 1 and at most
+    /// `OIDC_MAX_CLIENT_JWKS_TTL_SECS`.
+    pub client_jwks_ttl_secs: u64,
 
     /// The web origins (scheme + host + optional port, no path) of registered
     /// single-page-app clients allowed to call the `UserInfo` endpoint cross-origin
@@ -3210,6 +3230,7 @@ impl Default for OidcConfig {
             conform_id_token_claims: false,
             client_assertion_audience: ClientAssertionAudience::TokenEndpointOrIssuer,
             client_assertion_max_skew_secs: 60,
+            client_jwks_ttl_secs: 300,
             userinfo_cors_origins: Vec::new(),
             enable_response_type_id_token: false,
             enable_response_type_code_id_token: false,
@@ -5224,17 +5245,7 @@ impl Config {
                 ),
             });
         }
-        // The client-assertion skew has only an upper bound: 0 is valid (no
-        // tolerance), but a wide skew keeps an expired assertion replayable.
-        if self.oidc.client_assertion_max_skew_secs > OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "oidc.client_assertion_max_skew_secs ({}) must not exceed \
-                     {OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS} seconds",
-                    self.oidc.client_assertion_max_skew_secs
-                ),
-            });
-        }
+        validate_client_credential_bounds(&self.oidc)?;
         validate_refresh_and_consent(&self.oidc)?;
         // The PAR request_uri lifetime is bounded like the other credential
         // lifetimes: a zero-second request_uri is born expired, and a lifetime beyond
@@ -7269,6 +7280,44 @@ fn validate_session_lifetimes(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 "oidc.session_idle_ttl_secs ({}) must not exceed oidc.session_ttl_secs ({}): an \
                  idle timeout beyond the absolute cap can never fire",
                 oidc.session_idle_ttl_secs, oidc.session_ttl_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The two bounds on how this provider handles a CLIENT's own credentials: the skew it
+/// tolerates on a client assertion, and how long it caches a client's fetched key set.
+///
+/// Split out of [`Config::validate`] because that function had grown past its line bound,
+/// and split at THIS seam because these two are the same question asked twice: how long a
+/// client credential this provider did not mint stays acceptable.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] naming the setting and its bound.
+fn validate_client_credential_bounds(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    // The client-assertion skew has only an upper bound: 0 is valid (no tolerance), but a
+    // wide skew keeps an expired assertion replayable.
+    if oidc.client_assertion_max_skew_secs > OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.client_assertion_max_skew_secs ({}) must not exceed \
+                 {OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS} seconds",
+                oidc.client_assertion_max_skew_secs
+            ),
+        });
+    }
+    // BOTH bounds on the JWKS TTL, each for its own reason. Zero would make every request
+    // refetch, which is the amplifier the per-URI rate limit exists to prevent, reached
+    // through configuration instead of through an attacker. Above the ceiling, a key the
+    // client has rotated OUT stays trusted for longer than the rotation was meant to take.
+    if oidc.client_jwks_ttl_secs < 1 || oidc.client_jwks_ttl_secs > OIDC_MAX_CLIENT_JWKS_TTL_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.client_jwks_ttl_secs ({}) must be between 1 and \
+                 {OIDC_MAX_CLIENT_JWKS_TTL_SECS} seconds",
+                oidc.client_jwks_ttl_secs
             ),
         });
     }
