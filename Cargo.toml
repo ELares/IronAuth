@@ -218,7 +218,29 @@ sha1 = "0.11"
 # alternative, webauthn-rs, is rejected: webauthn-rs-core is MPL-2.0, which is NOT
 # on the cargo-deny license allowlist and would fail `cargo deny check`.
 ciborium = "0.2"
-trybuild = "1.0"
+# CEILINGED at the MSRV, not merely versioned. trybuild 1.0.120 declares
+# `rust-version = "1.88"`, above this workspace's 1.85 promise, so an unbounded
+# requirement lets `cargo update` walk into a resolver refusal on the `msrv (1.85)`
+# lane, which is exactly what happened to the dependabot PR proposing 1.0.120.
+#
+# THE BOUND IS 1.0.120, NOT 1.0.119, and the difference is the whole point. 1.0.119
+# declares `rust-version = "1.85"` and is fine; the first version of this ceiling
+# excluded it, which would have forbidden the newest release inside our own MSRV. On
+# the last occurrence of this wall (dependabot #671) the stated condition for taking a
+# new release was "if trybuild publishes a version inside 1.85" -- and 1.0.119 is
+# exactly that, published a day before 1.0.120. Its one change, fixing feature
+# detection under the new Cargo build-dir layout, is directly relevant on a repo
+# pinned to 1.97.0.
+#
+# `scripts/msrv-audit.sh` catches a regression in the local gate; this stops `cargo update`
+# walking into it. It is PAIRED with a dependabot `ignore` entry, because a manifest
+# requirement is something dependabot edits rather than a policy it reads -- it edited this
+# file in #864 -- and 1.0.119 to 1.0.120 is a PATCH bump, so a re-proposal would ride inside
+# the grouped cargo PR and take every safe bump with it.
+#
+# Both come off when the MSRV moves, which is a deliberate decision rather than a build
+# detail: it is a published promise.
+trybuild = ">=1.0, <1.0.120"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
 schemars = { version = "1.0", features = ["derive"] }
@@ -260,7 +282,7 @@ bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false }
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # OpenTelemetry OTLP trace export, compiled only behind the non-default `otlp`
 # feature so the default build and the musl static lane stay lean and
