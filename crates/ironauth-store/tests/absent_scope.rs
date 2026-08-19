@@ -461,9 +461,11 @@ async fn a_template_write_into_an_absent_environment_is_the_uniform_not_found() 
 ///
 /// The recognition rule above asserts that every scope foreign key is RECOGNIZABLE. It
 /// cannot see a scoped table that has no scope foreign key at all, and neither can the
-/// behavioural test: measured, dropping `message_templates`' composite key without re-adding
-/// it leaves all four tests in this file green, because the write then lands and the audit
-/// row's own recognized key produces the not-found a caller sees.
+/// behavioural test. Measured on the file as it stood BEFORE this test existed: dropping
+/// `message_templates`' composite key without re-adding it left all four tests of that
+/// version green, because the write then lands and the audit row's own recognized key
+/// produces the not-found a caller sees. (On the current file that mutation fails two tests,
+/// this one and the cascade check, which is the point.)
 ///
 /// The module documentation above asserts this property in prose ("Every scoped table
 /// carries a foreign key to `tenants` and, for the environment-scoped ones, a composite
@@ -479,9 +481,15 @@ async fn a_template_write_into_an_absent_environment_is_the_uniform_not_found() 
 /// has an `environment_id` column at all. It costs nothing today: it passes against the
 /// same three documented exceptions.
 ///
-/// "Scoped" is read from the schema as forced row-level security, the same definition
-/// `scripts/scoped-table-registration.sh` uses, so a new scoped table is covered the moment
-/// it is migrated rather than when somebody remembers to list it.
+/// "Scoped" is read from the schema as forced row-level security, the same DEFINITION
+/// `scripts/scoped-table-registration.sh` uses, though not the same SOURCE: that script
+/// derives from migration TEXT and this reads the live catalogue. They can diverge, and in
+/// one direction nothing catches it. A new scoped table is covered the moment it is
+/// migrated, but a table LEAVING the subject set is invisible: `ALTER TABLE x NO FORCE ROW
+/// LEVEL SECURITY` drops it out of this query while the script's regex still matches the
+/// original `FORCE` statement, so its floor stays satisfied. Measured, `NO FORCE` plus
+/// dropping that table's scope key passes both suites. Worth knowing rather than worth new
+/// machinery: `NO FORCE` only affects the table owner, so the data plane is unaffected.
 #[tokio::test]
 async fn every_scoped_table_declares_a_scope_foreign_key() {
     // The scope tables THEMSELVES, held out as belt and braces rather than because they
@@ -551,11 +559,12 @@ async fn every_scoped_table_declares_a_scope_foreign_key() {
         forced.len()
     );
 
-    let with_scope_key: BTreeSet<String> = candidate_foreign_keys(&db)
-        .await
-        .into_iter()
-        .filter(ForeignKey::onto_a_scope_table)
-        .map(|key| key.child)
+    // ONE read of the catalogue, used by both assertions. It was read twice.
+    let keys = candidate_foreign_keys(&db).await;
+    let with_scope_key: BTreeSet<&str> = keys
+        .iter()
+        .filter(|key| key.onto_a_scope_table())
+        .map(|key| key.child.as_str())
         .collect();
 
     let missing: BTreeSet<&str> = forced
@@ -568,9 +577,10 @@ async fn every_scoped_table_declares_a_scope_foreign_key() {
     assert!(
         unexpected.is_empty(),
         "every table with forced row-level security must declare a foreign key onto a \
-         scope table, or a write naming a scope that was never created SUCCEEDS and the \
-         row it wrote is then invisible to every reader. These do not, and are not on the \
-         documented list: {unexpected:#?}"
+         scope table, or a write naming a scope that was never created SUCCEEDS and the row \
+         it wrote is then reachable only by repeating that same absent scope, invisible to \
+         every scope that exists. These do not, and are not on the documented list: \
+         {unexpected:#?}"
     );
     let fixed: Vec<&&str> = known.difference(&missing).collect();
     assert!(
@@ -593,12 +603,25 @@ async fn every_scoped_table_declares_a_scope_foreign_key() {
     .fetch_all(db.owner_pool())
     .await
     .expect("read the environment-scoped tables");
-    let onto_environments: BTreeSet<String> = candidate_foreign_keys(&db)
-        .await
-        .into_iter()
+    // ITS OWN FLOOR. This is a SECOND query with an extra join, so the floor above does not
+    // bound it, and it hardcodes a COLUMN NAME (`environment_id`). That is the rot mode this
+    // module's doc is written against: a migration renaming the scope column would reduce
+    // this assertion to nothing while the first assertion and its floor stayed green.
+    // Measured: mutating this query to return zero rows left the whole suite passing.
+    assert!(
+        environment_scoped.len() > 100,
+        "the schema must carry an environment_id column on the scoped tables; found {} \
+         which means this query is reading the wrong thing",
+        environment_scoped.len()
+    );
+    let onto_environments: BTreeSet<&str> = keys
+        .iter()
         .filter(|key| key.parent == "environments")
-        .map(|key| key.child)
+        .map(|key| key.child.as_str())
         .collect();
+    // `THE_SCOPE_TABLES` is inert HERE for a different reason than above: neither scope
+    // table has an `environment_id` column, so neither can reach this subject set at all.
+    // Kept for symmetry with the first assertion rather than because it filters anything.
     let missing_environment_key: Vec<&str> = environment_scoped
         .iter()
         .map(String::as_str)
@@ -652,6 +675,68 @@ async fn the_rewritten_scope_keys_still_cascade_on_delete() {
             definition.contains("ON DELETE CASCADE"),
             "{constraint} must keep ON DELETE CASCADE, which 0150 says it preserves \
              exactly: {definition}"
+        );
+    }
+}
+
+/// Migration 0150's `lock_timeout` expression resolves in every state an operator can leave
+/// the knob in (issues #111, #112).
+///
+/// This needs NO lock contention and no timing, which is the part an earlier round got
+/// wrong: I declined to test the expression on the grounds that measuring a `lock_timeout`
+/// means holding a lock, and the property that actually matters is not the WAIT, it is what
+/// the expression evaluates to. There are three input states and they are all cheap.
+///
+/// The state that matters is the middle one. `current_setting(name, true)` returns NULL only
+/// for a setting that was NEVER defined; for one an operator set and then cleared it returns
+/// the EMPTY STRING, and `set_config('lock_timeout', '', true)` raises. Without `nullif` the
+/// migration aborts for an operator who did nothing but tidy up a knob the header recommends,
+/// with an error naming `lock_timeout` rather than the setting they touched. 0150 re-runs on
+/// every new database on the cluster, so it is not a one-shot risk.
+#[tokio::test]
+async fn the_migration_lock_timeout_resolves_in_every_operator_state() {
+    let db = TestDatabase::start().await;
+
+    // (what the operator did, what `lock_timeout` must end up as)
+    for (setup, expected) in [
+        ("", "3s"),
+        (
+            "SET ironauth.migration_lock_timeout = '11s'; RESET ironauth.migration_lock_timeout;",
+            "3s",
+        ),
+        ("SET ironauth.migration_lock_timeout = '21s';", "21s"),
+    ] {
+        let mut conn = db.owner_pool().acquire().await.expect("connection");
+        if !setup.is_empty() {
+            sqlx::raw_sql(setup)
+                .execute(&mut *conn)
+                .await
+                .expect("apply the operator's setting");
+        }
+        // The expression EXACTLY as 0150 ships it, so this cannot drift from the migration
+        // by being paraphrased here.
+        sqlx::raw_sql(
+            "BEGIN; \
+             DO $$ BEGIN PERFORM set_config('lock_timeout', \
+             coalesce(nullif(current_setting('ironauth.migration_lock_timeout', true), ''), \
+             '3s'), true); END $$;",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("the 0150 lock_timeout expression must not raise after `{setup}`: {error}")
+        });
+        let effective: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("read lock_timeout");
+        sqlx::raw_sql("COMMIT;")
+            .execute(&mut *conn)
+            .await
+            .expect("commit");
+        assert_eq!(
+            effective, expected,
+            "after `{setup}` the migration must run with lock_timeout {expected}"
         );
     }
 }

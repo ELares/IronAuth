@@ -60,8 +60,16 @@
 -- CHECKSUMMED, so a bare literal would be a one-way choice nobody could revisit. An
 -- operator on a busy `environments` sets `ironauth.migration_lock_timeout` (in
 -- postgresql.conf, on the role, or on the connection) and gets their value; everyone else
--- gets three seconds. The `true` argument to `current_setting` makes an unset custom
--- setting return NULL rather than raise, which is what makes the default reachable at all.
+-- gets three seconds.
+--
+-- `nullif` IS LOAD-BEARING, and leaving it out fails the migration. `current_setting(name,
+-- true)` returns NULL only for a setting that was NEVER defined; for one an operator set and
+-- then cleared it returns the EMPTY STRING, on all three tuning paths and for every new
+-- backend until the postmaster restarts. Without `nullif` the `coalesce` never reaches the
+-- default, `set_config('lock_timeout', '', true)` raises `invalid value for parameter
+-- "lock_timeout": ""`, and the migration aborts. The error names `lock_timeout` rather than
+-- the knob the operator touched, and 0150 re-runs on every new database on that cluster, so
+-- tidying up a setting this header recommends would break fresh deployments.
 --
 -- `set_config(..., true)` rather than `SET LOCAL`, because `SET` takes a literal and not an
 -- expression: the expression form is a syntax error, which is how this was found.
@@ -69,7 +77,7 @@ DO $$
 BEGIN
     PERFORM set_config(
         'lock_timeout',
-        coalesce(current_setting('ironauth.migration_lock_timeout', true), '3s'),
+        coalesce(nullif(current_setting('ironauth.migration_lock_timeout', true), ''), '3s'),
         true
     );
 END
