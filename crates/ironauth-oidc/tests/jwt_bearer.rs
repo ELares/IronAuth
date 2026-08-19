@@ -1757,6 +1757,20 @@ async fn a_successful_issuance_names_the_external_issuer_and_subject_in_the_audi
 ///   column is `text` under a deterministic collation, which nothing else pins.
 /// * `repo:acme/other` -- a comparison that IGNORES the repository name.
 /// * `repo:evil/service` -- a comparison that IGNORES the owner.
+/// * `...refs/heads/mai` (a strict PREFIX of the mapped subject) -- a REVERSE-PREFIX
+///   comparison, `external_subject LIKE $2 || '%'`. Strictly more reachable than any
+///   attacker-anchor case on the issuer axis: it needs no registration at all, only a
+///   branch name the workflow can mint, and its degenerate form (`repo:`, or the empty
+///   string) matches every mapping in the environment.
+/// * `refs/heads/main` (the mapped subject's TAIL alone) -- a REVERSE-SUFFIX comparison,
+///   `external_subject LIKE '%' || $2`. Like `Xrepo:...` this is not a subject GitHub
+///   mints; both are pure shape-killers, and the file already carries that precedent.
+///
+/// The last two exist because the issuer axis reasons explicitly about "the opposite
+/// direction" and the subject axis did not. Both survived the whole binary green until a
+/// review measured them, which is what the general rule above is FOR: one adjacent anchor
+/// closes exactly one comparison, so the anchors have to mirror the comparisons a reader
+/// could plausibly write -- in both directions, on every axis.
 #[tokio::test]
 async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_ref() {
     const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
@@ -1814,6 +1828,11 @@ async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_r
             "repo:evil/service:ref:refs/heads/main",
             "jti-gha-other-owner",
         ),
+        (
+            "repo:acme/service:ref:refs/heads/mai",
+            "jti-gha-sub-revprefix",
+        ),
+        ("refs/heads/main", "jti-gha-sub-revsuffix"),
     ] {
         let attempt = assertion(&key, GITHUB_ISSUER, subject, &aud, 3600, jti);
         let (status, _h, body) = present(&harness, &client_id, &attempt).await;
@@ -1958,18 +1977,21 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
     // presented issuer would have to end with the entire stored string INCLUDING the
     // `https://`, so the anchor would be something like
     // `https://evil.test/https://token.actions.githubusercontent.com`, which no issuer
-    // publishes and no operator registers. A first draft used
+    // publishes. (What an OPERATOR might register is a separate and unmeasured question,
+    // and the paragraph below is the answer to it.) A first draft used
     // `https://evil.test/token.actions.githubusercontent.com`, which LOOKS like it
     // exercises the shape and does not: it lacks the inner `https://`, matches nothing,
     // and was pure decoration.
     //
     // That is a fact about this anchor, NOT about the shape, and the difference matters.
     // Nothing makes a stored issuer carry a scheme: `external_assertion_issuers.issuer` is
-    // plain `text NOT NULL` (`migrations/0020_jwt_bearer_assertion.sql`), `register()`
-    // parses no URL, and the grant passes the presented `iss` through as an opaque string.
-    // Against a scheme-less anchor -- `kubernetes/serviceaccount`, or a bare host -- the
-    // trigger is an ordinary URL: `https://evil.test/kubernetes/serviceaccount` ends with
-    // `kubernetes/serviceaccount`, and a suffix comparison would hand over its principal.
+    // plain `text NOT NULL` (`crates/ironauth-store/migrations/0020_jwt_bearer_assertion.sql`),
+    // `register()` parses no URL, and the grant passes the presented `iss` through as an
+    // opaque string. Against a scheme-less anchor -- a bare host, or the LEGACY Kubernetes
+    // service-account issuer `kubernetes/serviceaccount`, which predates the projected
+    // token this file's own fixture uses -- the trigger is an ordinary URL:
+    // `https://evil.test/kubernetes/serviceaccount` ends with `kubernetes/serviceaccount`,
+    // and a suffix comparison would hand over its principal.
     //
     // The shipped query uses `=`, so this is a coverage gap and not a live defect. It is
     // left uncovered rather than closed with a second anchor because a scheme-less
