@@ -100,6 +100,8 @@ crates/ironauth-admin/src/trait_schemas.rs:activate_trait_schema_version:1
 crates/ironauth-admin/src/trait_schemas.rs:create_trait_migration_job:1
 crates/ironauth-admin/src/trait_schemas.rs:create_trait_schema_version:1
 crates/ironauth-admin/src/trait_schemas.rs:resolve_scope:0
+crates/ironauth-admin/src/usage.rs:fold_usage:0
+crates/ironauth-admin/src/usage.rs:publish_usage:1
 crates/ironauth-admin/src/usage.rs:resolve_scope:0
 crates/ironauth-admin/src/users.rs:create_user:1
 crates/ironauth-admin/src/users.rs:resolve_scope:0

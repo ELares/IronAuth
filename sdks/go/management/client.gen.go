@@ -1240,6 +1240,13 @@ func (c *Client) ProbePasswordHashing(tenant_id string, environment_id string, q
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/password-hashing/probe", query, body)
 }
 
+// PublishUsage performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish.
+//
+// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish`.
+func (c *Client) PublishUsage(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/usage/publish", query, nil)
+}
+
 // PurgeTenant performs POST /v1/tenants/{tenant_id}/purge.
 //
 // Terminally PURGE a grace tenant: crypto-shred it and erase what the grace period kept.

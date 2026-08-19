@@ -719,6 +719,10 @@ class Client:
         """Run the Argon2id tuning probe on this host and return a recommendation. POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/password-hashing/probe", query, body)
 
+    def publish_usage(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """`POST /v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish`. POST /v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/usage/publish", query, None)
+
     def purge_tenant(self, tenant_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Terminally PURGE a grace tenant: crypto-shred it and erase what the grace period kept. POST /v1/tenants/{tenant_id}/purge."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/purge", query, None)
