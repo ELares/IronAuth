@@ -32,6 +32,22 @@
  * alone -- which is why `verifyBatch` refuses to be used without a position and returns the
  * position it verified rather than a bare boolean.
  *
+ * ## Where the position comes from
+ *
+ * The `x-ironauth-log-position` header, as `<stream id> <cursor sequence> <cursor id>`, space
+ * separated. The S3 sink carries the same value as the `x-amz-meta-ironauth-log-position`
+ * object metadata key, since an object has no headers once written.
+ *
+ *     const [streamId, cursorSequence, cursorId] = positionHeader.split(' ');
+ *
+ * Split positionally: all three are opaque identifiers, which is why the separator is a space
+ * rather than a character that could occur inside one.
+ *
+ * This is worth stating here because it was missing for a while. The header was defined and
+ * documented in the shipper and sent by nothing, so this file required three values the wire
+ * never carried: a published verifier that could not be fed. See
+ * `docs/log-stream-verification.md` for the full wire description.
+ *
  * ## Conformance
  *
  * This file and the Rust signer are kept honest by the same corpus

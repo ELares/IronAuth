@@ -2,12 +2,10 @@
 
 //! The signed security-event stream (issue #110 criterion 5).
 //!
-//! Consumer-facing documentation is `docs/log-stream-verification.md`, and the published
-//! verifier is `examples/verify-log-stream.py`, which
-//! `log_sink_conformance::the_published_sample_consumer_verifies_a_batch_this_code_signed`
-//! runs against a batch this module signed. Change the canonical string below and that test
-//! fails, which is the point: a published verifier that drifts from the signer is worse than
-//! none, because an operator will trust it.
+//! The published verifier is `packages/ironauth-sdk/snippets/verify-log-stream.mjs`, kept in
+//! step with this module by the corpus at `packages/ironauth-sdk/vectors/log-stream-vectors.json`,
+//! which `scripts/log-stream-vectors.sh` regenerates from the shipped signer and fails on any
+//! diff. Consumer-facing documentation is `docs/log-stream-verification.md`.
 //!
 //! A SIEM receiving shipped batches has to answer three questions that TLS cannot answer for
 //! it, because TLS protects the hop and says nothing about the payload once it has landed in

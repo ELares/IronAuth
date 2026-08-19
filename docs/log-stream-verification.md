@@ -1,26 +1,29 @@
 # Verifying a signed log stream
 
-IronAuth can sign every batch it ships to a SIEM. This is how a consumer checks one.
+IronAuth can sign every batch it ships to a SIEM. This is how a consumer checks one, and
+where it gets the values it needs to do that.
 
 Signing is per stream and opt in: a stream signs when it names a signing secret
-(`signing_secret_name`), and ships unsigned when it does not. An unsigned batch carries
+(`signing_secret_name`) and ships unsigned when it does not. An unsigned batch carries
 neither header below.
 
 ## Why a signature at all
 
 TLS protects the hop. It says nothing about a payload once that payload has landed in an
-object store, a forwarder, or a log index, which is where a SIEM actually reads it. Three
-questions survive TLS and a signature answers all three:
+object store, a forwarder or a log index, which is where a SIEM actually reads it. The AWS
+SigV4 signing on the S3 sink is transport authentication to S3: discarded the moment the
+object is written, and absent entirely for the HTTP, Datadog and Splunk sinks.
 
-- **Authenticity.** Did this batch come from this deployment, or from anyone who could write
-  into the bucket the S3 sink writes to?
-- **Ordering.** Is this the batch that follows the one I last verified, or has something been
-  dropped in between?
-- **Replay.** Have I already applied this batch, under a different name?
+Three questions survive TLS, and the batch signature answers all three:
 
-## What arrives
+- **Authenticity.** Did this come from the deployment, or from anyone who can write to the
+  bucket?
+- **Ordering.** Is this the batch after the one I last verified?
+- **Replay.** Have I applied this already, under another name?
 
-Two headers travel with every signed batch, and you need both:
+## What arrives on the wire
+
+Two headers travel with every signed batch, and a consumer needs **both**:
 
 | header | value |
 |---|---|
@@ -28,14 +31,16 @@ Two headers travel with every signed batch, and you need both:
 | `x-ironauth-log-position` | `<stream id> <cursor sequence> <cursor id>`, space separated |
 
 The S3 sink carries the same two as object metadata, `x-amz-meta-ironauth-log-signature` and
-`x-amz-meta-ironauth-log-position`, because an object has no headers once written. Both are
-inside the SigV4 canonical headers, so neither can be stripped or rewritten in flight.
+`x-amz-meta-ironauth-log-position`, because an object has no headers once it is written. Both
+are inside the SigV4 canonical headers, so neither can be stripped or rewritten in flight: a
+position an attacker can rewrite is a gap and replay check the attacker controls.
 
 **The position is not a convenience.** The signature covers the stream id and the cursor
 position, and neither is derivable from the payload, so a consumer that has only the body and
-the signature cannot rebuild what was signed and cannot verify anything. That is also what
-makes ordering and replay checkable without any server-side state: record the last sequence
-you verified, and refuse anything that is not after it.
+the signature cannot rebuild what was signed and cannot verify anything at all. It is also
+what makes ordering and replay checkable with no server-side state: keep the last position you
+verified, and a position at or below it is a replay while a position beyond the next expected
+one is a gap.
 
 ## What is signed
 
@@ -48,53 +53,53 @@ ironauth-log-stream-v1
 <SHA-256 of the serialized events, lowercase hex>
 ```
 
-joined with newlines, then HMAC-SHA256 under the stream's signing secret.
+joined with newlines, then HMAC-SHA256 under the stream's signing secret. The count is
+redundant for integrity and deliberately present for DIAGNOSIS: a consumer that fails
+verification can say whether it received a different number of events or the same number with
+different content.
 
-The digest is over the events array exactly as IronAuth serialized it. The count is redundant
-for integrity, and deliberately present for DIAGNOSIS: a consumer that fails verification can
-say whether it received a different number of events or the same number with different
-content.
+## The verifier
+
+**Use [`packages/ironauth-sdk/snippets/verify-log-stream.mjs`](../packages/ironauth-sdk/snippets/verify-log-stream.mjs).**
+It imports nothing and uses only WebCrypto, so it drops into a SIEM forwarder, a Lambda
+reading the S3 sink's objects, or a Node handler behind the HTTP sink, unchanged.
+
+Split the position header on spaces to get the three values `verifyBatch` needs:
+
+```js
+const [streamId, cursorSequence, cursorId] = positionHeader.split(' ');
+const { ok, reason, position } = await verifyBatch({
+  key, signature, streamId,
+  cursorSequence: Number(cursorSequence),
+  cursorId,
+  eventCount: events.length,
+  eventsJson: bodyAsReceived,
+  lastVerifiedSequence,          // pass this every time after the first batch
+});
+```
+
+Pass `lastVerifiedSequence` on every call after the first. Without it the verifier checks
+authenticity and integrity but cannot check ordering or replay, and a replayed batch sails
+straight through.
+
+**It is kept in step with the signer by a corpus, not by review.**
+`packages/ironauth-sdk/vectors/log-stream-vectors.json` is generated from the shipped signer,
+and `scripts/log-stream-vectors.sh` regenerates it in the gate and fails on any diff. Any
+change to the canonical form, the algorithm or the hex encoding is a breaking change for every
+SIEM already verifying in the field, so it has to be seen rather than merged quietly.
 
 ## Vendor sinks reshape the payload
 
-The HTTP and S3 sinks transmit the signed bytes verbatim. The Datadog and Splunk HEC sinks do
-not, because those APIs require their own envelopes:
+The HTTP and S3 sinks transmit the signed bytes verbatim, so `eventsJson` is the body exactly
+as received. The Datadog and Splunk HEC sinks wrap each event, because those APIs require it:
 
-- Datadog wraps each event as `{"ddsource","service","message":<event>}`
-- Splunk HEC wraps each as `{"sourcetype","event":<event>}`, newline delimited
+- Datadog: `{"ddsource","service","message":<event>}` per event, in an array
+- Splunk HEC: `{"sourcetype","event":<event>}` per event, newline delimited
 
-Both wrappings are deterministic, so a consumer unwraps them back to the array that was
-signed. Verification is possible on every sink; the sample consumer does this for you with
-`--sink datadog` or `--sink splunk`.
-
-**If you write your own unwrapper, two details decide whether it works.** serde_json emits
-UTF-8 directly and puts no space after `,` or `:`, so a re-serializer that escapes non-ASCII
-to `\uXXXX` (Python's `json.dumps` default) or pretty-prints produces different bytes, a
-different digest, and a verification failure that looks exactly like tampering. One accented
-character in a username is enough. Key ORDER needs no special handling: serde_json sorts map
-keys, so the wire bytes are already in that order and any parser that preserves order through
-the round trip is fine.
-
-## The sample consumer
-
-[`examples/verify-log-stream.py`](../examples/verify-log-stream.py) is dependency free and
-short enough to read before you trust it with your audit trail.
-
-```console
-$ ./examples/verify-log-stream.py \
-    --secret-file key.bin \
-    --body batch.json \
-    --position "$X_IRONAUTH_LOG_POSITION" \
-    --signature "$X_IRONAUTH_LOG_SIGNATURE" \
-    --last-sequence 4241
-verified: stream lgs_01J8 at sequence 4242, cursor aud_01J8ZQ
-```
-
-It exits 0 when the batch verifies and 1 when it does not, printing the reason either way.
-Pass `--last-sequence` to make it check ordering and replay as well as authenticity.
-
-**It is kept honest by a test, not by review.**
-`log_sink_conformance::the_published_sample_consumer_verifies_a_batch_this_code_signed` runs
-this file as a subprocess over a batch the Rust signer produced, and asserts both that it
-accepts a good signature and that it refuses a tampered one. A published verifier that drifts
-from the signing code is worse than none, because an operator will trust it.
+Both wrappings are deterministic, so unwrap back to the array that was signed before
+verifying. **Two details decide whether your unwrapper works.** `serde_json` emits UTF-8
+directly and puts no space after `,` or `:`, so a re-serializer that escapes non-ASCII to
+`\uXXXX` or pretty-prints produces different bytes, a different digest, and a verification
+failure that looks exactly like tampering; one accented character in a username is enough. Key
+ORDER needs no handling, because `serde_json` serializes map keys sorted, so the wire bytes are
+already in that order and any parser that preserves order through the round trip is fine.
