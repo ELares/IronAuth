@@ -53451,6 +53451,12 @@ fn org_auth_policy_from_row(row: &PgRow, scope: &Scope) -> Result<OrgAuthPolicyR
             .map(|values| values.into_iter().collect()),
         jit_provisioning: row.get("jit_provisioning"),
         invitations_enabled: row.get("invitations_enabled"),
+        // Not yet sourced from a column: the per-level template selection is resolved
+        // through the policy engine (issue #619) and the org_auth_policies row does not
+        // carry it. A None here means this level states no template, which is the
+        // identity for `fold_template` -- so the resolver behaves exactly as it did before
+        // the field existed until a column feeds it.
+        template_override: None,
         session_ttl_secs: row
             .get::<Option<i32>, _>("session_ttl_secs")
             .map(secs_from_i32),

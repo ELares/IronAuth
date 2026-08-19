@@ -321,6 +321,7 @@ fn random_corpus_document(rng: &mut Rng) -> AuthPolicy {
         duration(rng)
     };
     AuthPolicy {
+        template_override: None,
         mfa_required: if rng.flip() { Some(rng.flip()) } else { None },
         allowed_factors,
         allowed_email_domains,
@@ -342,6 +343,7 @@ fn random_corpus_document(rng: &mut Rng) -> AuthPolicy {
 /// migration 0121's schema test exists to catch.
 fn full_document() -> AuthPolicy {
     AuthPolicy {
+        template_override: None,
         mfa_required: Some(true),
         allowed_factors: Some(tokens(&["pwd", "totp", "passkey_uv"])),
         allowed_email_domains: Some(tokens(&["acme.example", "contractor.example"])),
