@@ -1735,46 +1735,75 @@ async fn a_successful_issuance_names_the_external_issuer_and_subject_in_the_audi
 /// security value of federating to it is that a workflow on main is a different principal
 /// from one on a branch, from a tag of the same name, or from another repository.
 ///
-/// # Every negative here is load-bearing, and that was MEASURED
+/// # Which negative closes which comparison, and which are redundant
 ///
 /// An earlier version carried five near-misses and asserted in its own doc that each caught
 /// something the others did not. That was false: deleting `refs/heads/feature` and
 /// `repo:acme/service-staging` changed no mutant outcome at all. They are gone.
 ///
-/// What remains was verified by deleting each case and re-running a family of wrong-comparison
-/// mutants over the mapping lookup. Each entry below names the ONE mutant only it kills -- naming it is what
-/// makes the claim checkable rather than asserted, which is the failure the first version
-/// shipped:
+/// The version after that made a WEAKER version of the same mistake. It said "each entry
+/// below names the ONE mutant only it kills", which was true when it was written and stopped
+/// being true as anchors were added, because a later anchor can cover an earlier one's shape
+/// by accident. So this section states the attribution as measured rather than as a rule.
 ///
-/// * `refs/heads/main-old` (mapped subject EXTENDED) -- a PREFIX comparison. The realistic
-///   escalation: a branch whose name extends main's.
-/// * `refs/tags/main` -- a comparison that CONFLATES a tag ref with a branch ref. Tag
-///   creation is usually far less protected than branch protection. (It does not uniquely
-///   kill a trailing-component comparison, which an earlier draft of this comment claimed --
-///   three other entries kill that one too.)
-/// * `Xrepo:acme/service:...` (mapped subject as a SUFFIX) -- a SUFFIX comparison.
-/// * `refs/heads/Main` -- a CASE-INSENSITIVE comparison. Currently safe only because the
-///   column is `text` under a deterministic collation, which nothing else pins.
-/// * `repo:acme/other` -- a comparison that IGNORES the repository name.
-/// * `repo:evil/service` -- a comparison that IGNORES the owner.
-/// * `...refs/heads/mai` (a strict PREFIX of the mapped subject) -- a REVERSE-PREFIX
-///   comparison, `external_subject LIKE $2 || '%'`. Strictly more reachable than any
-///   attacker-anchor case on the issuer axis: it needs no registration at all, only a
-///   branch name the workflow can mint, and its degenerate form (`repo:`, or the empty
-///   string) matches every mapping in the environment.
-/// * `refs/heads/main` (the mapped subject's TAIL alone) -- a REVERSE-SUFFIX comparison,
-///   `external_subject LIKE '%' || $2`. Like `Xrepo:...` this is not a subject GitHub
-///   mints; both are pure shape-killers, and the file already carries that precedent.
+/// The measurement: thirteen wrong-comparison shapes over the subject predicate of the
+/// mapping lookup (`crates/ironauth-store/src/repository.rs`, `AssertionSubjectMappingRepo::
+/// resolve`), each applied on its own, verified present in the source before running and
+/// restored byte-identically after. ALL THIRTEEN ARE CAUGHT. Then each negative was deleted
+/// in turn, against each shape, to find which deletions let a shape survive:
 ///
-/// The last two exist because the issuer axis reasons explicitly about "the opposite
-/// direction" and the subject axis did not. Both survived the whole binary green until a
-/// review measured them, which is what the general rule above is FOR: one adjacent anchor
-/// closes exactly one comparison, so the anchors have to mirror the comparisons a reader
-/// could plausibly write -- in both directions, on every axis.
+/// | negative | the shape that survives without it |
+/// |---|---|
+/// | `...refs/heads/main-old` (mapped subject EXTENDED) | PREFIX, `$2 LIKE external_subject \|\| '%'` |
+/// | `Xrepo:acme/service:...` (mapped subject as a SUFFIX) | SUFFIX, `$2 LIKE '%' \|\| external_subject` |
+/// | `refs/heads/Main` | CASE-INSENSITIVE, `lower(...) = lower(...)` |
+/// | `refs/tags/main` | TAG/BRANCH CONFLATION, `replace($2, 'refs/tags/', 'refs/heads/') = external_subject` |
+/// | `refs/heads/main` (the mapped subject's TAIL alone) | REVERSE-SUFFIX, `external_subject LIKE '%' \|\| $2` |
+/// | `...refs/heads/ma`U+FF49`n` (a FULLWIDTH `i`) | NFKC-NORMALIZING, `normalize(...) = normalize(...)` |
+/// | a mapping STORED as `repo:acme/padded:...main ` | WHITESPACE-NORMALIZING, `btrim(...) = btrim(...)` |
+///
+/// And the three that are REDUNDANTLY covered, which is worth saying because the earlier
+/// wording implied otherwise:
+///
+/// * `repo:acme/other` (the repository name) and `repo:evil/service` (the owner). Both were
+///   added for comparisons that ignore one component, and both such shapes are caught with
+///   either one deleted, because the other entries reach them too.
+/// * `...refs/heads/mai` (a strict PREFIX of the mapped subject), for the REVERSE-PREFIX
+///   shape `external_subject LIKE $2 \|\| '%'`. It was uniquely load-bearing when it was
+///   added and is not any more: the stored-padded mapping below also kills that shape, since
+///   a stored `...main ` starts with a presented `...main`.
+///
+/// All three stay. Redundant coverage is not a defect; claiming uniqueness that measurement
+/// does not support is, and that is what this file did twice.
+///
+/// Three of the shapes deserve their reasoning rather than a table row.
+///
+/// REVERSE-PREFIX is strictly more reachable than any attacker-anchor case on the issuer
+/// axis: it needs no registration at all, only a branch name the workflow can mint, and its
+/// degenerate form (`repo:`, or the empty string) matches every mapping in the environment.
+///
+/// The two NORMALIZING shapes are a different family from the rest, and they were the last
+/// to be measured for a structural reason. Every other shape compares the strings AS GIVEN,
+/// so a near-miss built by adding or removing characters reaches it; these compare after a
+/// transform, so the difference has to SURVIVE the transform. That is why they sat green
+/// under five rounds of anchors built by editing the visible string. Both are one function
+/// call away in Postgres (`btrim`, `normalize`), and both directions of the class exist on
+/// the issuer axis too, closed there by the same means.
+///
+/// CASE-INSENSITIVE is currently safe only because the column is `text` under a
+/// deterministic collation, which nothing else in this tree pins.
 #[tokio::test]
+// One linear walk over one fixture: the positive, then every negative that closes a
+// comparison shape, then the stored-whitespace anchor that needs its own mapping. Splitting
+// it would re-seed the same issuer and mapping several times to assert on one string each,
+// and the attribution table above is only checkable because all of them share one fixture.
+#[allow(clippy::too_many_lines)]
 async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_ref() {
     const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
     const MAIN_SUBJECT: &str = "repo:acme/service:ref:refs/heads/main";
+    // A mapping stored WITH trailing whitespace, for the whitespace-normalizing shape. See
+    // the comment at its assertions below for why the anchor has to be on the stored side.
+    const PADDED_MAPPING_SUBJECT: &str = "repo:acme/padded:ref:refs/heads/main ";
 
     let harness = Harness::start().await;
     let key = issuer_key();
@@ -1833,6 +1862,10 @@ async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_r
             "jti-gha-sub-revprefix",
         ),
         ("refs/heads/main", "jti-gha-sub-revsuffix"),
+        (
+            "repo:acme/service:ref:refs/heads/ma\u{ff49}n",
+            "jti-gha-sub-nfkc",
+        ),
     ] {
         let attempt = assertion(&key, GITHUB_ISSUER, subject, &aud, 3600, jti);
         let (status, _h, body) = present(&harness, &client_id, &attempt).await;
@@ -1840,6 +1873,50 @@ async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_r
             status,
             StatusCode::BAD_REQUEST,
             "`{subject}` is not the mapped subject and must be refused: {body}"
+        );
+        assert_eq!(json(&body)["error"], "invalid_grant", "for `{subject}`");
+    }
+
+    // THE WHITESPACE-NORMALIZING SHAPE, which needs an anchor of a different KIND, and
+    // finding that out corrected a claim this file was about to make.
+    //
+    // The obvious anchor is a presented subject with a trailing space. It does not work,
+    // and not because the comparison is exact: `validate_and_map` trims the verified `sub`
+    // before the lookup, so `...main ` arrives at the query as `...main` and EXCHANGES.
+    // (Measured: it returned 200 under `usr_workload_alpha`.) That is deliberate on the
+    // grant's side, since the same trim is what makes an all-whitespace `sub` count as
+    // empty and be rejected.
+    //
+    // So the presented side is already normalized and the STORED side is not:
+    // `ActingAssertionSubjectMappingRepo::create` binds `external_subject` verbatim. Two
+    // consequences worth pinning rather than leaving for a reader to discover.
+    //
+    // 1. A mapping an operator registers with stray whitespace -- pasted from a console,
+    //    which is exactly how it happens -- can NEVER fire, in either form. It fails
+    //    CLOSED, which is the right direction, and SILENTLY, which is not.
+    // 2. It is the only way to reach `btrim(external_subject) = btrim($2)`. Under that
+    //    mutant the padded mapping below starts firing for the unpadded subject, so a
+    //    comparison that quietly forgives whitespace on both sides would be issuing a
+    //    principal from a row an operator cannot see is live.
+    harness
+        .create_subject_mapping(
+            GITHUB_ISSUER,
+            PADDED_MAPPING_SUBJECT,
+            None,
+            None,
+            MAPPED_PRINCIPAL,
+        )
+        .await;
+    for (subject, jti) in [
+        (PADDED_MAPPING_SUBJECT, "jti-gha-stored-pad-exact"),
+        (PADDED_MAPPING_SUBJECT.trim(), "jti-gha-stored-pad-trimmed"),
+    ] {
+        let attempt = assertion(&key, GITHUB_ISSUER, subject, &aud, 3600, jti);
+        let (status, _h, body) = present(&harness, &client_id, &attempt).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a mapping stored WITH whitespace must not fire for `{subject}`: {body}"
         );
         assert_eq!(json(&body)["error"], "invalid_grant", "for `{subject}`");
     }
@@ -1857,6 +1934,40 @@ async fn a_github_actions_shaped_workload_token_binds_the_exact_repository_and_r
 /// Kubernetes cluster has two trust anchors. If the mapping matched on subject alone, anyone
 /// who can mint a token from the WEAKER anchor with the stronger one's subject string gets
 /// the stronger one's identity. Federating to a second issuer would silently widen the first.
+///
+/// # The one shape left OPEN, stated precisely
+///
+/// An issuer-SUFFIX comparison, `$1 LIKE '%' || issuer`, is not closed. Applying that mutant
+/// leaves this binary green. Stating the gap precisely matters, because the obvious statement
+/// of it is wrong in the reassuring direction.
+///
+/// GIVEN THE SCHEME-BEARING ANCHORS THIS TEST REGISTERS, the shape is unreachable: a
+/// triggering issuer would have to end with the entire stored string INCLUDING the
+/// `https://`, so the anchor would be something like
+/// `https://evil.test/https://token.actions.githubusercontent.com`, which nothing publishes.
+/// An early draft used `https://evil.test/token.actions.githubusercontent.com`, which LOOKS
+/// like it exercises the shape and does not: it lacks the inner scheme, matches nothing, and
+/// was decoration.
+///
+/// That is a fact about THIS ANCHOR, not about the shape, and the difference is the whole
+/// point. Nothing makes a stored issuer carry a scheme: `external_assertion_issuers.issuer`
+/// is plain `text NOT NULL`
+/// (`crates/ironauth-store/migrations/0020_jwt_bearer_assertion.sql`), `register()` parses no
+/// URL, and the grant passes the presented `iss` through as an opaque string. Against a
+/// scheme-less anchor -- a bare host, or the LEGACY Kubernetes service-account issuer
+/// `kubernetes/serviceaccount`, which predates the projected token this file's own fixture
+/// uses -- the trigger is an ordinary URL: `https://evil.test/kubernetes/serviceaccount` ends
+/// with `kubernetes/serviceaccount`, and a suffix comparison would hand over its principal.
+///
+/// The shipped query uses `=`, so this is a COVERAGE GAP and not a live defect. It stays open
+/// rather than being closed with a second anchor because "should `register()` demand a URL at
+/// all" is its own question, and answering it inside a fixture test would bury it.
+///
+/// Its MIRROR is closed. `issuer LIKE '%' || $1` survived every earlier round and is killed
+/// by `ISSUER_A_BARE_HOST` below, which is cheaper to reach than the shape above: it needs
+/// only a scheme-less registration, which the paragraph above establishes is possible. Its
+/// degenerate form is worse still, since an anchor registered as the empty string makes
+/// `issuer LIKE '%'` match every mapping in the environment.
 #[tokio::test]
 async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
     const ISSUER_A: &str = "https://token.actions.githubusercontent.com";
@@ -1872,6 +1983,20 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
     // And one differing only in CASE. DNS is case-insensitive, so an operator can register
     // this as a distinct row while it addresses the same host.
     const ISSUER_A_CASED: &str = "https://Token.Actions.GitHubUserContent.com";
+    // A SUFFIX of the mapped issuer: the bare host, with no scheme. Closes the mirror of the
+    // gap in this test's doc comment; see there for why a scheme-less anchor is registrable.
+    const ISSUER_A_BARE_HOST: &str = "token.actions.githubusercontent.com";
+    // And two that differ from ISSUER_A only under a TRANSFORM, not in their visible
+    // characters. Every anchor above is built by editing the string, so none of them can
+    // reach a comparison that normalizes before comparing -- the difference has to survive
+    // the transform. `btrim` and `normalize(..., NFKC)` are both one function call away in
+    // Postgres, and an operator pasting an issuer URL out of a console is exactly how a
+    // trailing space gets into a registration in the first place.
+    const ISSUER_A_PADDED: &str = "https://token.actions.githubusercontent.com ";
+    // U+FF43 is the FULLWIDTH LATIN SMALL LETTER C; NFKC maps it onto plain `c`, so this
+    // normalizes to ISSUER_A while being a different string of bytes. A homoglyph domain is
+    // registrable, which makes this the same typosquat class as the two above it.
+    const ISSUER_A_FULLWIDTH: &str = "https://token.actions.githubusercontent.\u{ff43}om";
     const SHARED_SUBJECT: &str = "repo:acme/service:ref:refs/heads/main";
 
     let harness = Harness::start().await;
@@ -1917,100 +2042,63 @@ async fn a_mapping_for_one_issuer_does_not_fire_for_another() {
     );
     assert_eq!(json(&body)["error"], "invalid_grant");
 
-    // An issuer that EXTENDS the mapped one. ISSUER_A and ISSUER_B are unrelated strings, so
-    // neither can detect an issuer comparison that matches on a PREFIX. The domain shape is
-    // the point: `token.actions.githubusercontent.com.evil.test` is a domain an attacker can
-    // genuinely register, and it extends the real issuer exactly the way a prefix comparison
-    // accepts. Reaching it requires an operator to have registered that anchor as enabled --
+    // SIX ADJACENT ANCHORS, each registered as its own enabled issuer with no mapping of its
+    // own, so only the mapping lookup's exact `=` on the issuer can refuse it. One anchor
+    // closes exactly one comparison shape, which is the general rule this file learned the
+    // expensive way: the anchors have to mirror the comparisons a reader could plausibly
+    // write, in both directions, on every axis.
+    //
+    // Reaching any of them requires an operator to have registered that anchor as enabled,
     // which is the multi-anchor deployment criterion 3 contemplates.
-    harness
-        .register_external_issuer(ISSUER_A_EXTENDED, Some(&jwks), None, None, true)
-        .await;
-    let extended = assertion(
-        &key,
-        ISSUER_A_EXTENDED,
-        SHARED_SUBJECT,
-        &aud,
-        3600,
-        "jti-xiss-ext",
-    );
-    let (status, _h, body) = present(&harness, &client_id, &extended).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "an issuer that merely EXTENDS the mapped one must not inherit its mappings: {body}"
-    );
-    assert_eq!(json(&body)["error"], "invalid_grant");
-
-    // The opposite direction. Registering the EXTENDED anchor closes `$1 LIKE issuer || '%'`
-    // and nothing else; a comparison written the other way round, `issuer LIKE $1 || '%'`,
-    // survives it. Both are the same typosquat class and both need an anchor of the matching
-    // shape to be detectable at all.
-    harness
-        .register_external_issuer(ISSUER_A_TRUNCATED, Some(&jwks), None, None, true)
-        .await;
-    let truncated = assertion(
-        &key,
-        ISSUER_A_TRUNCATED,
-        SHARED_SUBJECT,
-        &aud,
-        3600,
-        "jti-xiss-trunc",
-    );
-    let (status, _h, body) = present(&harness, &client_id, &truncated).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "an issuer that is a PREFIX of the mapped one must not inherit its mappings: {body}"
-    );
-    assert_eq!(json(&body)["error"], "invalid_grant");
-
-    // An issuer differing only in CASE. Each comparison shape needs an anchor of its own
-    // shape to be detectable at all, which is the general lesson: one adjacent anchor closes
-    // exactly one comparison, so the anchors have to mirror the comparisons a reader could
-    // plausibly write.
-    //
-    // NOT covered: an issuer-SUFFIX comparison (`$1 LIKE '%' || issuer`). Stating the gap
-    // precisely, because the obvious statement of it is wrong.
-    //
-    // GIVEN THE SCHEME-BEARING ANCHOR THIS TEST REGISTERS, the shape is unreachable: the
-    // presented issuer would have to end with the entire stored string INCLUDING the
-    // `https://`, so the anchor would be something like
-    // `https://evil.test/https://token.actions.githubusercontent.com`, which no issuer
-    // publishes. (What an OPERATOR might register is a separate and unmeasured question,
-    // and the paragraph below is the answer to it.) A first draft used
-    // `https://evil.test/token.actions.githubusercontent.com`, which LOOKS like it
-    // exercises the shape and does not: it lacks the inner `https://`, matches nothing,
-    // and was pure decoration.
-    //
-    // That is a fact about this anchor, NOT about the shape, and the difference matters.
-    // Nothing makes a stored issuer carry a scheme: `external_assertion_issuers.issuer` is
-    // plain `text NOT NULL` (`crates/ironauth-store/migrations/0020_jwt_bearer_assertion.sql`),
-    // `register()` parses no URL, and the grant passes the presented `iss` through as an
-    // opaque string. Against a scheme-less anchor -- a bare host, or the LEGACY Kubernetes
-    // service-account issuer `kubernetes/serviceaccount`, which predates the projected
-    // token this file's own fixture uses -- the trigger is an ordinary URL:
-    // `https://evil.test/kubernetes/serviceaccount` ends with `kubernetes/serviceaccount`,
-    // and a suffix comparison would hand over its principal.
-    //
-    // The shipped query uses `=`, so this is a coverage gap and not a live defect. It is
-    // left uncovered rather than closed with a second anchor because a scheme-less
-    // registration is its own question (should `register()` demand a URL at all?), and
-    // answering it inside a fixture test would bury it. Recorded here so the next reader
-    // inherits the real boundary instead of a reassuring one.
-    let issuer = ISSUER_A_CASED;
-    harness
-        .register_external_issuer(issuer, Some(&jwks), None, None, true)
-        .await;
-    let attempt = assertion(&key, issuer, SHARED_SUBJECT, &aud, 3600, "jti-xiss-case");
-    let (status, _h, body) = present(&harness, &client_id, &attempt).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "an issuer differing from the mapped one only in case must not inherit its \
-         mappings: {body}"
-    );
-    assert_eq!(json(&body)["error"], "invalid_grant", "for `{issuer}`");
+    for (issuer, jti, shape) in [
+        // `token.actions.githubusercontent.com.evil.test` is a domain an attacker can
+        // genuinely register, and it extends the real issuer exactly the way a prefix
+        // comparison accepts.
+        (
+            ISSUER_A_EXTENDED,
+            "jti-xiss-ext",
+            "EXTENDS the mapped issuer (a prefix comparison)",
+        ),
+        // The opposite direction. The extended anchor closes `$1 LIKE issuer || '%'` and
+        // nothing else; a comparison written the other way round survives it.
+        (
+            ISSUER_A_TRUNCATED,
+            "jti-xiss-trunc",
+            "is a PREFIX of the mapped issuer (a reverse-prefix comparison)",
+        ),
+        (
+            ISSUER_A_CASED,
+            "jti-xiss-case",
+            "differs from the mapped issuer only in CASE",
+        ),
+        (
+            ISSUER_A_BARE_HOST,
+            "jti-xiss-bare-host",
+            "is a SUFFIX of the mapped issuer (the mirror of the gap noted below)",
+        ),
+        (
+            ISSUER_A_PADDED,
+            "jti-xiss-padded",
+            "equals the mapped issuer after btrim",
+        ),
+        (
+            ISSUER_A_FULLWIDTH,
+            "jti-xiss-nfkc",
+            "equals the mapped issuer after NFKC normalization",
+        ),
+    ] {
+        harness
+            .register_external_issuer(issuer, Some(&jwks), None, None, true)
+            .await;
+        let attempt = assertion(&key, issuer, SHARED_SUBJECT, &aud, 3600, jti);
+        let (status, _h, body) = present(&harness, &client_id, &attempt).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an issuer that {shape} must not inherit its mappings: {body}"
+        );
+        assert_eq!(json(&body)["error"], "invalid_grant", "for `{issuer}`");
+    }
 }
 
 /// A Kubernetes projected service-account token exchanges through the same model (issue #126
