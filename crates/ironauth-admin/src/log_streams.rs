@@ -10,8 +10,20 @@
 //!
 //! The sink credential, in any form. `log_streams` never holds one (it holds the NAME of
 //! an environment secret), and this view carries the name rather than resolving it, so
-//! there is no path from this endpoint to a secret value. A test asserts the rendered view
-//! contains no resolved credential even when the stream names one.
+//! there is no path from this endpoint to a secret value.
+//!
+//! Two tests hold that, at the two levels it can break at.
+//! `tests::a_status_view_never_carries_a_credential_value` below pins the rendering itself,
+//! and `delegated_admin::a_log_stream_read_names_the_credential_secret_and_renders_no_value`
+//! drives the real HTTP route under a `management.read` grant, which the unit test cannot
+//! see: it calls `into_view` directly, so it would still pass if a handler resolved the
+//! secret and merged it into the response, or if this route stopped calling `into_view`.
+//!
+//! They differ in strength and the difference is deliberate. The unit test enumerates the
+//! field names a credential might arrive under; the HTTP test asserts the rendered key set
+//! EQUALS the documented one, because enumeration only catches names someone thought of. A
+//! secret rendered under `resolved_token`, or under `credentials` in the plural, passes an
+//! enumerated guard and fails an exact one.
 //!
 //! `last_error` DOES leave the system here, which is why the shipper builds it from error
 //! variants rather than from a sink's response body: a status read is exactly the place a
