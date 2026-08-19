@@ -27,6 +27,10 @@ to pick an open issue in the current milestone and say so on the issue.
   reason on the same line.
 - **Changelogs.** User-visible changes update the owning artifact's
   `CHANGELOG.md` (Unreleased section) in the same PR.
+  A full run takes hours, so capture it: `scripts/gate.sh > gate.log 2>&1`, then read
+  `tail -1 gate.log` for the verdict. The summary prints from an EXIT trap, so it
+  survives an interrupt, and it reports every failing check rather than the first.
+  `gate.log` is gitignored.
 
 ## The management-api-first rule (mandatory)
 

@@ -53,12 +53,17 @@ GATE_FAILURES=()
 # which is the same "attribute the number to the first cause you thought of" mistake the
 # paragraph above is about.)
 #
-# This file says it of itself, at the ironbus lane rather than in the header: "a local gate
-# that is quietly a subset of CI teaches you to trust a green that does not mean what it
-# looks like." This file's own header warns that "a local gate that is quietly a subset
-# of CI teaches you to trust a green that does not mean what it looks like."
+# This file says it of itself, at the ironbus lane and again at the freshness lane rather
+# than in this header: "a local gate that is quietly a subset of CI teaches you to trust a
+# green that does not mean what it looks like."
 GATE_COMPLETED=0
 GATE_SKIPPED=()
+
+# Record a lane this machine could not run. `$1` is the lane, `$2` how to enable it.
+skipped() {
+  GATE_SKIPPED+=("$1 ($2)")
+}
+
 # WHAT THE TREE LOOKED LIKE BEFORE ANY CHECK RAN.
 #
 # The summary compares this against the tree at exit to answer "did this run rewrite
@@ -72,7 +77,11 @@ GATE_SKIPPED=()
 # back produced byte-identical output.
 #
 # A snapshot cannot go stale. A check added tomorrow is covered without anybody
-# remembering, and `git status --porcelain` costs 31 to 76 ms measured on this repo.
+# remembering, and both snapshots together cost well under a second warm, against a gate
+# run measured in hours. No millisecond figure here: an earlier version quoted a range a
+# REVIEWER measured on their machine, in the very commit that deleted a different borrowed
+# figure for that reason, and the range does not reproduce anyway (the first
+# `git status` in a cold worktree is seconds, later ones tens of milliseconds).
 #
 # Compared against the START rather than tested for emptiness, because a developer may
 # begin a gate run with work in progress and the question is what THIS RUN changed.
@@ -82,13 +91,29 @@ GATE_SKIPPED=()
 # before and after and would slip past. Hashing the diff catches content changes to a
 # file that was already dirty; the porcelain list catches new and untracked ones. Together
 # they answer the question; either alone has a hole.
-GATE_TREE_BEFORE="$(git status --porcelain 2>/dev/null || true)"
-GATE_DIFF_BEFORE="$(git diff HEAD 2>/dev/null | shasum -a 256 2>/dev/null || true)"
-
-# Record a lane this machine could not run. `$1` is the lane, `$2` how to enable it.
-skipped() {
-  GATE_SKIPPED+=("$1 ($2)")
+#
+# `shasum` is perl-provided and not on every minimal Linux image. Without this probe both
+# snapshots fall back to the empty string, they compare equal, and the hash half of the
+# oracle is silently inert: a content-only rewrite of an already-dirty file goes unreported
+# with nothing saying so. Probed once, recorded as a SKIPPED lane, so a missing tool is
+# visible in the summary like every other one.
+GATE_HASHER=""
+if command -v shasum >/dev/null 2>&1; then
+  GATE_HASHER="shasum -a 256"
+elif command -v sha256sum >/dev/null 2>&1; then
+  GATE_HASHER="sha256sum"
+else
+  skipped "the tree-change hash" "install shasum or sha256sum"
+fi
+gate_diff_hash() {
+  if [[ -z "$GATE_HASHER" ]]; then
+    echo "no-hasher"
+    return 0
+  fi
+  git diff HEAD 2>/dev/null | $GATE_HASHER 2>/dev/null || true
 }
+GATE_TREE_BEFORE="$(git status --porcelain 2>/dev/null || true)"
+GATE_DIFF_BEFORE="$(gate_diff_hash)"
 
 # The summary prints from a TRAP, not from the tail of the script.
 #
@@ -107,16 +132,8 @@ gate_summary() {
     printf '  - %s\n' "${GATE_FAILURES[@]}"
     # A non-zero rc from an abort is preserved; a clean exit with failures recorded becomes 1.
     if ((rc == 0)); then rc=1; fi
-
   fi
 
-  # WHAT THE RUN LEFT BEHIND, keyed on whether a generator actually RAN.
-  #
-  # The freshness generators (`openapi-check`, the schema and golden scripts) rewrite
-  # their artifact in place and then `git diff --exit-code` it. On main a stale artifact
-  # aborted the gate there and nothing downstream ran; now the run continues, so the
-  # checks after it read the REGENERATED document rather than the committed one.
-  #
   # WHAT THIS RUN CHANGED, measured rather than predicted.
   #
   # The freshness checks regenerate their artifact in place and then diff it, so a run that
@@ -124,23 +141,38 @@ gate_summary() {
   # differ from the tree the run started with, so the operator sees the files rather than a
   # sentence about files.
   #
-  # A completed GREEN run prints nothing here for a real reason rather than by suppression:
-  # every generator ends in `git diff --exit-code` or `git status --porcelain`, so if any
-  # had rewritten something the run would not be green. If it somehow did, this says so,
-  # which a flag keyed on failure could never have done.
+  # It reports THAT the tree moved and does not claim to know WHY. An earlier version of
+  # this block said a check had regenerated an artifact and that everything after it read
+  # the regenerated file, which is a cause the comparison never measures. It was also
+  # wrong on its first real outcome: the Python SDK lane byte-compiled a tracked `.pyc`,
+  # so a clean-tree green run fired this every time, naming a cause that had not happened.
+  # The lane runs `python3 -B` now and the cache file is untracked, but the wording stays
+  # about what moved rather than about why.
+  #
+  # A completed GREEN run prints nothing here, and that is an EXPECTATION rather than a
+  # guarantee: every generator ends in `git diff --exit-code` or `git status --porcelain`,
+  # so one that had rewritten something would have failed. Anything else that writes,
+  # including something with no diff assertion at all, still shows up here, which is the
+  # whole point of measuring the tree instead of trusting a list of generators.
   local tree_after diff_after
   tree_after="$(git status --porcelain 2>/dev/null || true)"
-  diff_after="$(git diff HEAD 2>/dev/null | shasum -a 256 2>/dev/null || true)"
+  diff_after="$(gate_diff_hash)"
   if [[ "$tree_after" != "$GATE_TREE_BEFORE" || "$diff_after" != "$GATE_DIFF_BEFORE" ]]; then
     echo ""
-    echo "gate: this run CHANGED the working tree. A check that regenerates its artifact"
-    echo "      rewrites it in place, and anything graded after that read the regenerated"
-    echo "      file rather than the committed one. Run \`git diff\` before committing."
+    echo "gate: this run CHANGED the working tree. Anything graded after the change read"
+    echo "      the rewritten file rather than the committed one. The usual cause is a"
+    echo "      freshness check regenerating its artifact in place, but this is measured"
+    echo "      and not diagnosed. Run \`git diff\` before committing."
     # The files whose STATUS changed, when that is what moved. A content-only change to an
     # already-dirty file moves the hash and not this list, so the sentence above is the
     # instruction and this is the shortcut.
-    comm -13 <(printf '%s\n' "$GATE_TREE_BEFORE" | sort) \
-             <(printf '%s\n' "$tree_after" | sort) | sed 's/^/  /'
+    # `|| true`, because this runs inside a trap under `set -e` and it is CONVENIENCE.
+    # A non-zero status here aborts `gate_summary` before the verdict, and a run that
+    # prints no verdict at all is the one state this summary is written to make
+    # impossible: `gate.log` is read from the end. GNU `comm` exits 1 on unsorted input,
+    # which is reachable on a Linux developer box where BSD `comm` here is not.
+    { comm -13 <(printf '%s\n' "$GATE_TREE_BEFORE" | sort) \
+               <(printf '%s\n' "$tree_after" | sort) | sed 's/^/  /'; } || true
   fi
 
   # The skip ledger prints on EVERY outcome, not only the green one.
@@ -431,7 +463,10 @@ run "sdk contract freshness" python3 scripts/sdk-contract.py --check
 run "generated management SDKs freshness" python3 scripts/gen-management-sdks.py --check
 # And they must still COMPILE, which a freshness check cannot show.
 run "Go SDK builds" bash -c 'cd sdks/go && go build ./...'
-run "Python SDK imports" python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('c','sdks/python/ironauth_management/client_gen.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
+# `-B`, so importing does not write a `.pyc` and dirty the tree. Without it this lane was
+# the gate's own first tripwire: it rewrote a tracked cache file on every clean-tree run,
+# so a green gate reported "this run CHANGED the working tree" every time.
+run "Python SDK imports" python3 -B -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('c','sdks/python/ironauth_management/client_gen.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
 # The events-vs-webhooks guidance must still match the code it quotes (issue #107).
 run "events-vs-webhooks guidance" python3 scripts/events-vs-webhooks.py --check
 # Metering must stay off the login and token-issuance paths (issue #107).
