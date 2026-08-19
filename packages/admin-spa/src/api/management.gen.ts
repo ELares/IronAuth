@@ -2472,10 +2472,15 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * `POST /v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish`
-         * @description Fold the retained feed and PUBLISH the result as a `usage.reported` event, so metering
-         *     reaches a billing pipeline by webhook and not only by polling this API (issue #107
-         *     criterion 4).
+         * Publish a usage snapshot onto the event feed (issue #107).
+         * @description Folds the retained feed and publishes the result as a `usage.reported` event, so metering
+         *     reaches a billing pipeline by webhook and not only by polling this API.
+         *
+         *     The first line is a SENTENCE rather than the route, because utoipa lifts it into the
+         *     OpenAPI `summary` and from there into the generated Go, Python and TypeScript clients.
+         *     This was the only one of 227 operations whose summary was a backticked copy of its own
+         *     path, which is the least useful thing a summary can say next to a field already holding
+         *     the path.
          *
          *     # Why publishing is an explicit action
          *

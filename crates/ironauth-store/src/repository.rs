@@ -8270,9 +8270,13 @@ impl ActingUsageRepo<'_> {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Conflict`] when a concurrent request stored the same
+    /// [`StoreError::IdempotencyConflict`] when a concurrent request stored the same
     /// `(credential_ref, key)` first; the caller resolves that by replaying the stored
     /// response. [`StoreError::Database`] on any other persistence fault.
+    ///
+    /// Named exactly, because the first version of this doc said `Conflict` and the handler
+    /// matched on what the doc said. `Conflict` is the DOMAIN uniqueness error and this path
+    /// cannot raise it, so the replay arm was unreachable and a concurrent retry got a 500.
     pub async fn publish_snapshot(
         &self,
         env: &Env,
@@ -21151,8 +21155,8 @@ async fn enqueue_outbox_in_tx_at_inner(
     not_before_unix_micros: Option<i64>,
     #[cfg_attr(not(feature = "testing"), allow(unused_variables))] validate: bool,
 ) -> Result<OutboxMessageId, StoreError> {
-    // ISSUE #108 CRITERION 1, enforced at the ONE statement every event-feed row passes
-    // through, whatever producer wrote it.
+    // ISSUE #108 CRITERION 1, enforced at the insert rather than at one producer, whatever
+    // producer wrote the row.
     //
     // `ironauth_admin::events` validates every event at the fan-out, which is the one
     // choke point production traffic passes through and is where the check belongs at run
@@ -21174,6 +21178,13 @@ async fn enqueue_outbox_in_tx_at_inner(
     // Scoped to `WEBHOOK_EVENT_CONSUMER`, because that is what "event" means here. A
     // delivery message on `WEBHOOK_DELIVERY_CONSUMER` carries a different payload shape
     // that the catalog does not describe and must not be measured against it.
+    //
+    // TWO statements carry this, not one: `enqueue_outbox_in_tx_ignoring_conflict` has its
+    // own INSERT and its own copy. An earlier version of this comment said "the single
+    // statement every event-feed row passes through", which was false by exactly one
+    // statement and was found by putting an unregistered type through `enqueue_all`. Both
+    // are tested (`abuse.rs`), so a third insert added without the assertion would be a
+    // third place the claim is wrong rather than a place it is quietly true.
     #[cfg(feature = "testing")]
     if validate && message.consumer == WEBHOOK_EVENT_CONSUMER {
         if let Err(error) = crate::event_catalog::validate_event(&message.payload) {
@@ -21240,6 +21251,29 @@ async fn enqueue_outbox_in_tx_ignoring_conflict(
     scope: Scope,
     message: &NewOutboxMessage<'_>,
 ) -> Result<bool, StoreError> {
+    // THE SAME emit-time assertion the ordinary insert carries, because this one is also an
+    // insert into `outbox_messages` and `OutboxRepo::enqueue_all` reaches it with any
+    // consumer the caller names.
+    //
+    // It was missed when the assertion moved down from `enqueue_domain_event`, and that made
+    // "the single statement every event-feed row passes through" false by one statement --
+    // the same shape as the defect the move was fixing, one function over. Review found it
+    // by putting an unregistered type through `enqueue_all` and watching it land without a
+    // panic. No live hole today, because both production callers use
+    // `WEBHOOK_DELIVERY_CONSUMER` and `BACKCHANNEL_LOGOUT_CONSUMER`; but `enqueue_all` is
+    // the shape a fan-out producer is documented to use, so the next one would have found it.
+    #[cfg(feature = "testing")]
+    if message.consumer == WEBHOOK_EVENT_CONSUMER {
+        if let Err(error) = crate::event_catalog::validate_event(&message.payload) {
+            panic!(
+                "a producer emitted an event that does not validate against the registry: \
+                 {error:?}\n\nenvelope: {}\n\nThe fan-out refuses this permanently, so \
+                 shipping it would announce nothing while the write succeeded. Register the \
+                 type, or fix the payload to match the schema it declares.",
+                message.payload
+            );
+        }
+    }
     let id = OutboxMessageId::generate(env, &scope);
     let now_micros = epoch_micros(env.clock().now_utc());
     let inserted = sqlx::query(

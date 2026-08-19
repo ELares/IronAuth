@@ -15,15 +15,30 @@ use ironauth_env::Env;
 use ironauth_store::{EnvironmentId, NewOutboxMessage, Scope, TenantId};
 use serde_json::Value;
 
-/// Append one event envelope through the commit-ordered appender.
+/// Append one metering event envelope through the commit-ordered appender.
+///
+/// On `WEBHOOK_EVENT_CONSUMER`, which is what the real producers use and therefore what the
+/// fold's budget counts. An earlier version used a made-up consumer string, which made no
+/// difference while the budget counted every row and made this whole fixture unrepresentative
+/// the moment it stopped.
+///
+/// Each type carries the payload its registered schema requires, so these envelopes pass the
+/// emit-time validation every event-feed row now goes through. `user.signed_in` needs
+/// `subject`, `token.issued` needs `grant_id` and `token_kind`, `connection.opened` needs
+/// `connection_id`.
 async fn append(h: &Harness, env: &Env, scope: Scope, key: &str, event_type: &str, subject: &str) {
+    let payload = match event_type {
+        "token.issued" => serde_json::json!({ "grant_id": key, "token_kind": "access" }),
+        "connection.opened" => serde_json::json!({ "connection_id": key }),
+        _ => serde_json::json!({ "subject": subject }),
+    };
     h.store()
         .scoped(scope)
         .outbox()
         .append_event(
             env,
             &NewOutboxMessage {
-                consumer: "usage-export-test",
+                consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
                 idempotency_key: key,
                 ordering_key: "k",
                 payload: serde_json::json!({
@@ -33,7 +48,7 @@ async fn append(h: &Harness, env: &Env, scope: Scope, key: &str, event_type: &st
                     "occurred_at_unix_ms": 0,
                     "tenant_id": scope.tenant().to_string(),
                     "environment_id": scope.environment().to_string(),
-                    "payload": { "subject": subject },
+                    "payload": payload,
                 }),
             },
         )
@@ -241,10 +256,19 @@ async fn publishing_usage_emits_the_same_numbers_the_api_returns() {
     let path = format!("/v1/tenants/{tenant}/environments/{environment}/usage");
     let publish = format!("{path}/publish");
 
-    // Poll until the watermarked feed has the seeded events, same reason as the test above.
+    // A DISTINCT KEY PER ITERATION, and that is the whole correctness of this loop.
+    //
+    // With a constant key every iteration after the first was an idempotent REPLAY of the
+    // first response, so the exit condition was decided entirely by the first call: on a
+    // lagging watermark the loop slept five seconds and then failed on a frozen number. It
+    // was measured doing exactly that (first fold 1, replay 1, while the GET saw 4). The
+    // sibling test asserts that replay behaviour deliberately, so the two tests were in
+    // direct contradiction about what a second POST does.
     let mut body = Value::Null;
-    for _ in 0..100 {
-        let (status, _, response) = h.post(&publish, "k-usage-publish", "").await;
+    for attempt in 0..100 {
+        let (status, _, response) = h
+            .post(&publish, &format!("k-usage-publish-{attempt}"), "")
+            .await;
         assert_eq!(status, StatusCode::OK, "publish: {response}");
         body = serde_json::from_str(&response).expect("json");
         if body["tokens_issued"] == 2 {
@@ -639,6 +663,23 @@ async fn a_published_snapshot_does_not_consume_the_export_budget() {
         EnvironmentId::parse(&environment).expect("environment id"),
     );
 
+    // A REGISTERED SUBSCRIBER, which is the whole point of the fixture and was missing.
+    //
+    // Without one, a publish appends a single `usage.reported` event and nothing else, so a
+    // type-keyed exclusion looked sufficient and this test passed while the loop it is named
+    // for was still open. With a subscriber, each published event ALSO produces a delivery
+    // row per endpoint once the fan-out runs, and a delivery row is not an envelope: it has
+    // no top-level `type` for an exclusion to match. Registering an endpoint is registering
+    // the only configuration in which the feature does anything.
+    let (status, _, body) = h
+        .post(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/webhook-endpoints"),
+            "k-budget-endpoint",
+            &serde_json::json!({ "url": "https://example.test/hook" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "register a subscriber: {body}");
+
     for i in 0..4 {
         append(&h, &env, scope, &format!("b_tok_{i}"), "token.issued", "-").await;
     }
@@ -649,22 +690,80 @@ async fn a_published_snapshot_does_not_consume_the_export_budget() {
         assert_eq!(status, StatusCode::OK, "publish {i}: {body}");
     }
 
+    // Run the REAL fan-out over every queued event, so the delivery rows this test exists to
+    // account for actually exist. Claiming and completing rather than peeking: a claimed but
+    // open message blocks its ordering key, and the fold has to see a settled feed.
+    {
+        use ironauth_admin::events::WebhookFanoutConsumer;
+        use ironauth_store::outbox::OutboxConsumer;
+        let store = h.store().clone();
+        let fanout = WebhookFanoutConsumer::new(store.clone());
+        loop {
+            let claimed = store
+                .scoped(scope)
+                .outbox()
+                .claim(
+                    &env,
+                    ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                    std::time::Duration::from_secs(30),
+                    100,
+                )
+                .await
+                .expect("claim the queued events");
+            if claimed.is_empty() {
+                break;
+            }
+            for message in claimed {
+                fanout
+                    .handle(&env, scope, &message)
+                    .await
+                    .expect("the fan-out runs");
+                store
+                    .scoped(scope)
+                    .outbox()
+                    .complete(&env, &message)
+                    .await
+                    .expect("complete");
+            }
+        }
+    }
+
     // The limit is DERIVED, not written down. The fixture's own provisioning puts events
     // on this feed too, so a hardcoded number would silently stop discriminating the day
     // that count changed. Read both totals and pick the one limit that separates the two
     // counting rules.
-    let (total, published) = feed_counts(&h, &tenant, &environment).await;
-    assert!(
-        published >= 3,
-        "the three publishes are on the feed: {published}"
-    );
-    let limit = total - published + 1;
+    // WAIT FOR THE FOLD'S VIEW TO CATCH UP before deriving anything from a direct count.
+    //
+    // `feed_counts` reads `outbox_messages` straight, while `fold_usage` reads through
+    // `events_page_after`, which applies the cluster-wide watermark. Under concurrent load
+    // from the other tests in this binary the two disagree for a moment, and a limit derived
+    // from the direct count is then above what the fold can reach. That is how this test
+    // came to pass alone and fail in the suite, which is the worst way to learn about a race.
+    for _ in 0..100 {
+        let (tally, _) =
+            ironauth_admin::usage::fold_usage(&h.store().scoped(scope).outbox(), 1_000)
+                .await
+                .expect("fold");
+        if tally.tokens_issued() == 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
-    // At this limit the two rules disagree BY CONSTRUCTION: counting every row reaches
-    // `total`, which is >= limit, and truncates; counting only meterable rows reaches
-    // `total - published`, which is < limit, and does not. Any limit outside this seam
-    // would pass whichever rule were in force, which is what made the first version of
-    // this test measure nothing.
+    let (total, meterable) = feed_counts(&h, &tenant, &environment).await;
+    assert!(
+        total > meterable + 3,
+        "the publishes and their deliveries must be on the feed and OUTSIDE the meterable \
+         set: total {total}, meterable {meterable}"
+    );
+    let limit = meterable + 1;
+
+    // At this limit the two rules disagree BY CONSTRUCTION: counting every row the fold
+    // READS reaches `total`, which is >= limit, and truncates; counting only the meterable
+    // ones reaches `meterable`, which is < limit, and does not. Any limit outside this seam
+    // would pass whichever rule were in force, which is what made the first version of this
+    // test measure nothing -- and the second version's seam was still wrong, because it
+    // subtracted only the `usage.reported` rows and left the delivery rows inside.
     let (tally, truncated) =
         ironauth_admin::usage::fold_usage(&h.store().scoped(scope).outbox(), limit)
             .await
@@ -672,16 +771,16 @@ async fn a_published_snapshot_does_not_consume_the_export_budget() {
     assert_eq!(tally.tokens_issued(), 4, "the numbers are unaffected");
     assert!(
         !truncated,
-        "{published} published snapshots must not push a {}-event feed into truncation at \
-         limit {limit}",
-        total - published
+        "publishing must not push a {meterable}-event feed into truncation at limit \
+         {limit} (the feed holds {total} rows in total, the rest being the publishes and \
+         their deliveries)"
     );
 
     // The positive control: a limit BELOW the meterable count truncates as it always did.
     // Without it, a `truncated` hardwired to false would pass the assertion above and this
     // whole test would measure nothing.
     let (_, truncated) =
-        ironauth_admin::usage::fold_usage(&h.store().scoped(scope).outbox(), total - published - 1)
+        ironauth_admin::usage::fold_usage(&h.store().scoped(scope).outbox(), meterable - 1)
             .await
             .expect("fold");
     assert!(
@@ -690,17 +789,125 @@ async fn a_published_snapshot_does_not_consume_the_export_budget() {
     );
 }
 
-/// `(every row on the scope's feed, the `usage.reported` ones among them)`.
+/// `(every row the fold READS, the meterable ones among them)`.
+///
+/// The first number is every `outbox_messages` row in the scope, because `events_after`
+/// filters on tenant, environment and sequence only and so reads all of them. The second is
+/// the subset the BUDGET counts: event-feed rows that are not this endpoint's own output.
+/// The gap between the two is exactly what a publish adds -- one event AND one delivery row
+/// per subscriber -- and the test's derived limit sits inside that gap.
 async fn feed_counts(h: &Harness, tenant: &str, environment: &str) -> (i64, i64) {
     let row: (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), \
-                COUNT(*) FILTER (WHERE payload->>'type' = 'usage.reported') \
+                COUNT(*) FILTER ( \
+                    WHERE consumer = $3 \
+                      AND payload->>'type' IS DISTINCT FROM 'usage.reported') \
          FROM outbox_messages WHERE tenant_id = $1 AND environment_id = $2",
     )
     .bind(tenant)
     .bind(environment)
+    .bind(ironauth_store::WEBHOOK_EVENT_CONSUMER)
     .fetch_one(h.db().owner_pool())
     .await
     .expect("count the feed");
     row
+}
+
+/// A CONCURRENT retry replays rather than failing (issue #105's discipline applied to #107).
+///
+/// The sequential retry is covered above. This is the case the conflict arm exists for, and
+/// that arm was dead code: it matched `StoreError::Conflict`, the DOMAIN uniqueness error,
+/// while `insert_idempotency` raises `StoreError::IdempotencyConflict`. So the replay could
+/// never happen and the loser of the race fell through to a 500 -- measured five times out
+/// of five -- for a request whose twin had succeeded, with no way to tell whether the
+/// snapshot was published. A scheduler retrying on 500 would then publish again under a new
+/// key and bill twice, which is the exact outcome the header exists to prevent.
+///
+/// Both halves are asserted. Two 200s with IDENTICAL bodies, because a race that returned
+/// two different snapshots would be two readings presented as one; and exactly ONE event,
+/// because that is what "replayed rather than repeated" means.
+#[tokio::test]
+async fn two_publishes_racing_under_one_key_both_replay_the_same_response() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-usage-race").await;
+    let publish = format!("/v1/tenants/{tenant}/environments/{environment}/usage/publish");
+
+    let (first, second) = tokio::join!(
+        h.post(&publish, "k-race", ""),
+        h.post(&publish, "k-race", "")
+    );
+
+    assert_eq!(
+        (first.0, second.0),
+        (StatusCode::OK, StatusCode::OK),
+        "neither racer may see a 500: {} / {}",
+        first.2,
+        second.2
+    );
+    assert_eq!(
+        first.2, second.2,
+        "the loser must replay the winner's response, byte for byte"
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND payload->>'type' = 'usage.reported'",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_one(h.db().owner_pool())
+    .await
+    .expect("count");
+    assert_eq!(count, 1, "one key, one event, however many racers");
+}
+
+/// The SCAN bound stops a fold whose feed is mostly unmeterable (issue #107).
+///
+/// `EXPORT_FOLD_LIMIT` bounds meterable events; without a second bound, excluding rows from
+/// that count would turn "stop after 10,000" into "keep reading until 10,000 meterable ones
+/// turn up", which on a feed dominated by delivery rows is not a bound at all.
+///
+/// Driven through the parameterised entry point for the same reason `limit` is: reaching the
+/// shipped 100,000 from a test would mean seeding a hundred thousand rows, so the bound went
+/// untested and deleting it entirely survived the suite.
+#[tokio::test]
+async fn a_fold_whose_feed_is_mostly_unmeterable_stops_at_the_scan_bound() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-usage-scan").await;
+    let env = Env::system();
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+
+    for i in 0..4 {
+        append(&h, &env, scope, &format!("s_tok_{i}"), "token.issued", "-").await;
+    }
+
+    let outbox = h.store().scoped(scope);
+    let outbox = outbox.outbox();
+
+    // A meterable limit far above what the feed holds, so ONLY the scan bound can fire.
+    let (tally, truncated) = ironauth_admin::usage::fold_usage_bounded(&outbox, 1_000, 2)
+        .await
+        .expect("fold");
+    assert!(
+        truncated,
+        "a scan bound below the row count must report a lower bound"
+    );
+    // ...and the numbers are still whatever it managed to read, never zero: a bound that
+    // discarded the partial tally would turn a large tenant's invoice into nothing.
+    assert!(
+        tally.tokens_issued() > 0,
+        "the partial tally survives the bound"
+    );
+
+    // The control: with both bounds above the feed, nothing truncates.
+    let (_, truncated) = ironauth_admin::usage::fold_usage_bounded(&outbox, 1_000, 1_000)
+        .await
+        .expect("fold");
+    assert!(
+        !truncated,
+        "with both bounds above the feed, the fold reaches the end"
+    );
 }

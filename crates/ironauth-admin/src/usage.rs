@@ -120,6 +120,25 @@ pub async fn fold_usage(
     outbox: &ironauth_store::OutboxRepo<'_>,
     limit: i64,
 ) -> Result<(UsageTally, bool), ApiError> {
+    fold_usage_bounded(outbox, limit, EXPORT_SCAN_LIMIT).await
+}
+
+/// [`fold_usage`] with the SCAN bound as a parameter too.
+///
+/// Split out for the reason `limit` was split out one round earlier: with the scan bound
+/// baked in as a constant, reaching it from a test meant seeding a hundred thousand rows, so
+/// it went untested and a mutation that deleted the bound entirely survived the suite. A
+/// bound whose whole job is to keep work finite is not one to leave unmeasured, and it is
+/// the newer of the two.
+///
+/// # Errors
+///
+/// As [`fold_usage`].
+pub async fn fold_usage_bounded(
+    outbox: &ironauth_store::OutboxRepo<'_>,
+    limit: i64,
+    scan_limit: i64,
+) -> Result<(UsageTally, bool), ApiError> {
     let mut tally = UsageTally::new();
     let mut cursor = EventCursor::beginning();
     let mut metered = 0_i64;
@@ -139,16 +158,23 @@ pub async fn fold_usage(
         cursor = events
             .last()
             .map_or(cursor, |m| EventCursor::after_sequence(m.sequence));
-        let self_published = events
+        let meterable = events
             .iter()
             .filter(|m| {
-                m.payload.get("type").and_then(serde_json::Value::as_str) == Some(USAGE_REPORTED)
+                // The event feed only: a delivery instruction or a back-channel logout
+                // message is transport, not an announcement, and carries no envelope for a
+                // type check to look at.
+                m.consumer == ironauth_store::WEBHOOK_EVENT_CONSUMER
+                    // ...and not this endpoint's own output, which would otherwise make
+                    // reporting usage shrink the usage reported.
+                    && m.payload.get("type").and_then(serde_json::Value::as_str)
+                        != Some(USAGE_REPORTED)
             })
             .count();
         scanned += i64::try_from(events.len()).unwrap_or(i64::MAX);
-        metered += i64::try_from(events.len().saturating_sub(self_published)).unwrap_or(i64::MAX);
+        metered += i64::try_from(meterable).unwrap_or(i64::MAX);
         tally.absorb(&events);
-        if metered >= limit || scanned >= EXPORT_SCAN_LIMIT {
+        if metered >= limit || scanned >= scan_limit {
             return Ok((tally, true));
         }
     }
@@ -231,11 +257,16 @@ async fn resolve_scope(
     Ok((Scope::new(tenant, environment), actor))
 }
 
-/// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish`
+/// Publish a usage snapshot onto the event feed (issue #107).
 ///
-/// Fold the retained feed and PUBLISH the result as a `usage.reported` event, so metering
-/// reaches a billing pipeline by webhook and not only by polling this API (issue #107
-/// criterion 4).
+/// Folds the retained feed and publishes the result as a `usage.reported` event, so metering
+/// reaches a billing pipeline by webhook and not only by polling this API.
+///
+/// The first line is a SENTENCE rather than the route, because utoipa lifts it into the
+/// OpenAPI `summary` and from there into the generated Go, Python and TypeScript clients.
+/// This was the only one of 227 operations whose summary was a backticked copy of its own
+/// path, which is the least useful thing a summary can say next to a field already holding
+/// the path.
 ///
 /// # Why publishing is an explicit action
 ///
@@ -373,9 +404,25 @@ pub async fn publish_usage(
         Ok(_) => Ok(json(axum::http::StatusCode::OK, body)),
         // Another request stored the same key first. Re-read and replay ITS response
         // rather than reporting a failure for a request that has effectively succeeded.
-        Err(ironauth_store::StoreError::Conflict) => {
+        //
+        // `IdempotencyConflict`, NOT `Conflict`, and the difference is the whole arm.
+        // `insert_idempotency` raises the former on a unique violation of
+        // `(credential_ref, idempotency_key)`; `Conflict` is the DOMAIN uniqueness error,
+        // which 25 other handlers map to a 409 and which this path cannot produce. Written
+        // as `Conflict` first, this arm was unreachable and a concurrent retry fell through
+        // to a 500 -- measured 5 times out of 5 -- for a request whose twin had succeeded,
+        // with no way for the caller to tell whether the snapshot was published. The
+        // comment above it described the opposite of what the code did.
+        Err(ironauth_store::StoreError::IdempotencyConflict) => {
             idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
         }
-        Err(_) => Err(ApiError::Internal),
+        // Anything else is a genuine fault, and it is LOGGED rather than swallowed. A bare
+        // `Err(_) => Internal` collapses a misconfigured audit classification and a dead
+        // database into the same opaque 500 with nothing written down, and the first of
+        // those is a deployment mistake an operator can fix the moment they can see it.
+        Err(error) => {
+            tracing::error!(?error, "publishing a usage snapshot failed");
+            Err(ApiError::Internal)
+        }
     }
 }

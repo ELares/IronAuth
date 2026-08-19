@@ -728,8 +728,9 @@ async fn a_producer_emitting_an_off_schema_payload_fails_the_test_that_exercised
 /// and it went straight to the insert. A guard that covers all but one producer is a guard
 /// the remaining one will eventually find, which is what the usage publisher did.
 ///
-/// So the check now sits at `enqueue_outbox_in_tx_at`, the single statement every event-feed
-/// row passes through, and this test is what makes that true rather than intended.
+/// So the check now sits at the INSERT rather than at one producer, and this test is what
+/// makes that true rather than intended. There are two inserts, not one -- the
+/// conflict-tolerant path has its own -- and the sibling below covers the other.
 #[tokio::test]
 #[should_panic(expected = "does not validate against the registry")]
 async fn the_direct_appender_is_covered_by_the_emit_time_schema_guard() {
@@ -796,4 +797,50 @@ async fn a_delivery_message_is_not_measured_against_the_event_registry() {
         )
         .await
         .expect("a delivery message is not an event and must append unchallenged");
+}
+
+/// The CONFLICT-TOLERANT insert is covered by the same guard too (issue #108 criterion 1).
+///
+/// `OutboxRepo::enqueue_all` writes through `enqueue_outbox_in_tx_ignoring_conflict`, which
+/// carries its own `INSERT` and so did not reach the assertion when it moved down from
+/// `enqueue_domain_event`. Review put an unregistered type through it and watched the row
+/// land with no panic, which made "the single statement every event-feed row passes through"
+/// false by exactly one statement -- the same shape as the defect the move was fixing, one
+/// function over.
+///
+/// No live hole existed: both production callers of `enqueue_all` use
+/// `WEBHOOK_DELIVERY_CONSUMER` and `BACKCHANNEL_LOGOUT_CONSUMER`. But `enqueue_all` is the
+/// shape a fan-out producer is documented to use, so the next one would have found it, and a
+/// claim asserted in three places that outlive this change had better be true.
+#[tokio::test]
+#[should_panic(expected = "does not validate against the registry")]
+async fn the_conflict_tolerant_insert_is_covered_by_the_emit_time_schema_guard() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let invalid = serde_json::json!({
+        "id": "evt_enqueue_all_off_schema",
+        "type": "ban.created",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        "payload": { "subject_kind": "identifier", "auth_path": "password" },
+    });
+
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .enqueue_all(
+            &env,
+            &[ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: "evt_enqueue_all_off_schema",
+                ordering_key: "identifier:password",
+                payload: invalid,
+            }],
+        )
+        .await
+        .expect("unreachable: the enqueue panics before this resolves");
 }
