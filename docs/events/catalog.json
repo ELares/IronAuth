@@ -737,6 +737,67 @@
       "type": "environment_variable.set"
     },
     {
+      "domain": "flow_target",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "flow_target_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "flow_target_id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "flow_target.deleted"
+    },
+    {
+      "domain": "flow_target",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "flow_target_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "invocation": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "target_class": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "timing": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "flow_target_id",
+          "name",
+          "target_class",
+          "invocation",
+          "timing"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "flow_target.set"
+    },
+    {
       "domain": "flow_version",
       "payload_schema": {
         "additionalProperties": false,
@@ -1038,6 +1099,76 @@
       },
       "payload_schema_version": 1,
       "type": "management_key.revoked"
+    },
+    {
+      "domain": "message_template",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "level": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "locale": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "message_template_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "message_template_id",
+          "level",
+          "kind",
+          "locale"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "message_template.deleted"
+    },
+    {
+      "domain": "message_template",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "level": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "locale": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "message_template_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "message_template_id",
+          "level",
+          "kind",
+          "locale"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "message_template.set"
     },
     {
       "domain": "org_group",

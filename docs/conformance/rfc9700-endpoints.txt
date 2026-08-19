@@ -13,6 +13,7 @@
 /.well-known/web-identity
 /.well-known/webauthn
 /authorize
+/backchannel_authenticate
 /connect/check_session
 /consent
 /device_authorization
