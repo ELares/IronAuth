@@ -63678,6 +63678,24 @@ pub struct ClientBackchannelProfile {
     pub notification_endpoint: Option<String>,
 }
 
+/// What a queued CIBA ping needs in order to be sent (issue #131 criterion 2).
+///
+/// Read from the request row at DELIVERY time rather than carried in the queue payload,
+/// because the notification token is a live bearer credential and an outbox row is readable
+/// by anything that can read the queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PingDelivery {
+    /// Where to POST.
+    pub notification_url: String,
+    /// The client-supplied bearer token the notification must carry back, so the client can
+    /// authenticate it as genuinely ours.
+    pub notification_token: Vec<u8>,
+    /// Whether the request is still approved and unredeemed. A ping for a request that has
+    /// since been redeemed or expired is pointless, and sending it would tell a client to
+    /// come and fetch tokens it can no longer obtain.
+    pub still_deliverable: bool,
+}
+
 /// A pending request as the approval surface needs to render it (#131 criterion 1).
 ///
 /// Carries `binding_message` because that is the whole point of the surface: the user must
@@ -64068,6 +64086,56 @@ impl BackchannelAuthRepo<'_> {
         }
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// What a queued ping needs in order to be sent (#131 criterion 2).
+    ///
+    /// Returns [`None`] when the request is gone or out of scope. `still_deliverable` is
+    /// reported rather than folded into [`None`] so the consumer can distinguish "this
+    /// message is garbage" from "this ping is no longer worth sending" -- the first is a
+    /// permanent failure worth dead-lettering, the second is a success with nothing to do,
+    /// and retrying either would be wrong.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn ping_delivery(
+        &self,
+        id: &BackchannelAuthRequestId,
+        now_micros: i64,
+    ) -> Result<Option<PingDelivery>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT client_notification_url, client_notification_token, status, \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
+             FROM backchannel_authentication_requests \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let (Some(url), Some(token)) = (
+            row.get::<Option<String>, _>("client_notification_url"),
+            row.get::<Option<Vec<u8>>, _>("client_notification_token"),
+        ) else {
+            // A ping was queued for a request with no notification target. The schema's
+            // mode/target CHECK makes this unreachable, so treat it as garbage rather than
+            // as something to retry.
+            return Ok(None);
+        };
+        let status: String = row.get("status");
+        let expires_us: i64 = row.get("expires_us");
+        Ok(Some(PingDelivery {
+            notification_url: url,
+            notification_token: token,
+            still_deliverable: status == "approved" && expires_us > now_micros,
+        }))
     }
 
     /// Redeem an approved request exactly once, for the client it belongs to (#131
