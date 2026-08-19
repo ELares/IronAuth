@@ -285,6 +285,30 @@ async fn the_override_is_read_from_the_environment_and_the_sweep_obeys_it() {
     const SPARED: &str = "IRONAUTH-CHILD-SPARED";
     const RECLAIMED: &str = "IRONAUTH-CHILD-RECLAIMED";
 
+    // FIRST STATEMENT IN THE TEST, before the child dispatch and before anything opens a
+    // connection, and the position is the whole guarantee.
+    //
+    // This test drives a CLUSTER-WIDE sweep. Placed lower down it refused AFTER the spare
+    // half had already staged a database in the cluster and spawned a child that swept it,
+    // which a review reproduced by watching it drop an unrelated database and only then
+    // print the refusal. A guard that runs after the thing it forbids is a message, not a
+    // guard.
+    //
+    // REFUSED rather than skipped: a silent skip would let the coverage disappear the day
+    // the marker stops being set. CI sets it because its Postgres is a per-job service
+    // container, and `scripts/with-test-db.sh` sets it for the cluster it creates and tears
+    // down. It does NOT set it when `DATABASE_URL` is already in the environment, because at
+    // that point the script is a pass-through and cannot know whose cluster it is; the
+    // caller says so, which is what the message asks for.
+    assert!(
+        std::env::var("IRONAUTH_TEST_DB_DISPOSABLE").is_ok_and(|value| value == "1"),
+        "this test drives a sweep across EVERY database in the cluster at a five-minute \
+         threshold, so it runs only where that is known to be safe. Set \
+         IRONAUTH_TEST_DB_DISPOSABLE=1 if the cluster is disposable (a CI service container, \
+         or one you created for this run); `scripts/with-test-db.sh` sets it for a cluster \
+         it starts itself, but not when you pass your own DATABASE_URL"
+    );
+
     // The child re-enters this same test, so the recursion has to stop somewhere.
     if let Ok(mode) = std::env::var("IRONAUTH_TEST_DB_RECLAIM_CHILD") {
         let (admin, base) = admin_pool().await;
@@ -358,22 +382,6 @@ async fn the_override_is_read_from_the_environment_and_the_sweep_obeys_it() {
     drop_if_present(&admin, &spared_name).await;
 
     // THE RECLAIM HALF, in a child with the value CI sets.
-    //
-    // REFUSED, not skipped, on a cluster nobody has said is disposable. The override the
-    // child sets lowers the sweep's threshold from six hours to five minutes, and the sweep
-    // is CLUSTER-WIDE: against a `DATABASE_URL` somebody set by hand it would reclaim a
-    // concurrent harness run's databases too, which is exactly what this PR's own CHANGELOG
-    // tells operators not to do. `scripts/with-test-db.sh` sets the marker for the cluster
-    // it creates and tears down, and CI sets it because its Postgres is a per-job service
-    // container. A silent skip would let the coverage disappear the day the marker stops
-    // being set, so this fails loudly instead.
-    assert!(
-        std::env::var("IRONAUTH_TEST_DB_DISPOSABLE").is_ok_and(|value| value == "1"),
-        "this test sweeps the WHOLE cluster at a five-minute threshold, so it runs only \
-         against a cluster that was created for it. Run it through \
-         `scripts/with-test-db.sh`, which sets IRONAUTH_TEST_DB_DISPOSABLE=1, rather than \
-         against a DATABASE_URL you set by hand"
-    );
     let taken_name = aged_name(10 * 60, "override_take");
     drop_if_present(&admin, &taken_name).await;
     create(&admin, &taken_name).await;

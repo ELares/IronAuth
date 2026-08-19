@@ -630,6 +630,11 @@ const RECLAIM_MIN_AGE_SECS: u64 = 6 * 60 * 60;
 /// this floor only bounds how low a SETTING is permitted to push it. Worth naming because
 /// the two numbers are two directories apart and neither end says so.
 const RECLAIM_MIN_AGE_FLOOR_SECS: u64 = 300;
+// WHAT WOULD CATCH A CHANGE TO IT, stated because the coupling is not obvious. The
+// integration fixture is staged at TEN MINUTES, so this floor can drift to 600 with the
+// whole suite green and only starts failing at 900. That is the bound; a change inside it
+// is caught by the unit tests on `reclaim_min_age_from` alone, which assert the clamped
+// value directly rather than through a fixture.
 
 /// The environment variable that lowers [`RECLAIM_MIN_AGE_SECS`].
 const RECLAIM_MIN_AGE_ENV: &str = "IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS";
@@ -642,7 +647,12 @@ const RECLAIM_MIN_AGE_ENV: &str = "IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS";
 /// many runs and a concurrent gate is a real possibility. It is exactly wrong for CI,
 /// where the Postgres container is created fresh for every job: nothing in it is ever
 /// six hours old, so the sweep reclaims NOTHING and every per-test database survives to
-/// the end of the run inside the container's writable layer.
+/// the end of the run in the container's DATA VOLUME. Not its writable layer, which an
+/// earlier version of this sentence said: the official `postgres` image declares `PGDATA` a
+/// volume, so the layer stays at 63 bytes after a run that created a database per test
+/// while the volume holds gigabytes. It matters because it decides which command can see
+/// the growth (`du -sh /var/lib/docker`, which counts volumes) and which cannot
+/// (`docker ps --size`, which does not).
 ///
 /// That is not a tidiness problem, it is the disk. MEASURED on the job this was written
 /// for: 46 GB consumed, of which `target` was 24 GB. The rest is here, and it grows with

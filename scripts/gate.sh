@@ -375,6 +375,12 @@ run "clippy (pedantic, -D warnings)" cargo clippy --workspace --all-targets --al
 # The ironauth-store isolation tests need a real Postgres via DATABASE_URL.
 # with-test-db.sh runs against DATABASE_URL if set (a CI service), else brings up
 # a throwaway local cluster and tears it down. All other tests are unaffected.
+#
+# IF YOU EXPORT DATABASE_URL, export IRONAUTH_TEST_DB_DISPOSABLE=1 with it when the cluster
+# is yours to reclaim. `test_db_reclaim` sweeps every database in the cluster and refuses
+# without that marker, so this lane goes red otherwise. Leaving the gate red is the intended
+# outcome for a cluster nobody has vouched for: the alternative is a test that quietly drops
+# somebody else's databases.
 run "test" scripts/with-test-db.sh cargo test --workspace --all-features
 
 run "invariant lints" scripts/invariant-lints.sh

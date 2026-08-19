@@ -11,10 +11,12 @@ range per docs/RELEASING.md.
   default is correct on a developer machine, where the cluster outlives many runs, and
   exactly wrong in CI, where the Postgres container is created fresh for every job so
   nothing in it is ever six hours old and the sweep reclaims NOTHING. Measured on the CI
-  job this was written for: 46 GB consumed of which `target` was 24. The remaining 22 is a
-  DIFFERENCE between two runs rather than a direct reading, because `/var/lib/docker` was
-  not measured on the run that produced the 46; the per-test databases are the term that
-  grows without bound, and the later run that did measure docker put it at 4.6 to 5.4 GB.
+  job this was written for: 46 GB consumed of which `target` was 24, both read off that one
+  run. The ATTRIBUTION of the remaining 22 comes from a later run, because `/var/lib/docker`
+  was not measured on the first; that run put docker at 4.6 to 5.4 GB, and the per-test
+  databases live in the container's data VOLUME (the official `postgres` image declares
+  `PGDATA` a volume), which is why `du -sh /var/lib/docker` sees them and
+  `docker ps --size` reports 63 bytes.
 
   **Set it in CI or against a throwaway cluster, and nowhere else.** It lowers the
   concurrency protection for every database in the cluster `DATABASE_URL` names, and its

@@ -16,6 +16,14 @@
 # If DATABASE_URL is already set, the command runs against that database instead
 # and no cluster is started (use this to target a CI Postgres service).
 #
+# ON THAT PATH THIS SCRIPT IS A PASS-THROUGH, and one thing it deliberately does NOT do is
+# set IRONAUTH_TEST_DB_DISPOSABLE. That marker says "every database in this cluster is mine
+# to reclaim", which is true of a cluster this script created and unknowable for one you
+# handed it. `test_db_reclaim` drives a cluster-wide sweep and refuses without the marker, so
+# set it yourself when the cluster really is disposable:
+#
+#   DATABASE_URL=... IRONAUTH_TEST_DB_DISPOSABLE=1 scripts/with-test-db.sh cargo test ...
+#
 # Postgres binaries are found via (in order): $PG_BIN, pg_ctl on PATH,
 # /usr/lib/postgresql/*/bin (Debian/Ubuntu), and ~/.theseus/postgresql/*/bin.
 set -euo pipefail
@@ -25,7 +33,9 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-# Respect an externally provided database (for example a CI service).
+# Respect an externally provided database (for example a CI service). Note that
+# IRONAUTH_TEST_DB_DISPOSABLE is NOT set here: see the header for why the caller owns that
+# decision on this path.
 if [ -n "${DATABASE_URL:-}" ]; then
   exec "$@"
 fi

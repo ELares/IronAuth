@@ -123,7 +123,10 @@ jobs:
       # they are older than a threshold that defaults to six hours. In CI the Postgres
       # container is created fresh for every job, so nothing in it is ever six hours old,
       # the sweep reclaims NOTHING, and every per-test database survives to the end of the
-      # run inside the container's writable layer. That is roughly the 22 GB of the
+      # run in the container's DATA VOLUME (the official `postgres` image declares `PGDATA`
+      # a volume, so the writable layer measures 63 BYTES after a full run while the volume
+      # holds gigabytes; see the report step below, which is where that was measured).
+      # That is roughly the 22 GB of the
       # measured 46 that `target` does not account for, and unlike the build it scales
       # with the number of tests, which this project adds to every week.
       #
@@ -143,23 +146,32 @@ jobs:
       - uses: actions/checkout@v7
       # RECLAIM RUNNER DISK, and the reason this step exists at all.
       #
-      # From 2026-08-18 22:55 onward every run of this job died of `No space left on
-      # device`, in THREE shapes. Read off the API rather than remembered, over the eight
-      # `test (ubuntu-latest)` jobs in that window:
+      # From 2026-08-18 22:55 to 2026-08-19, every run of this job died of `No space left
+      # on device`. READ off the API, over the eight `test (ubuntu-latest)` jobs in that
+      # window, by step conclusion and log availability:
       #
-      #   4  every step conclusion blank, log endpoint answers `BlobNotFound`. These die
-      #      in the RUNNER's own diagnostic writer, which kills the runner process before
-      #      it uploads anything.
-      #   3  every step conclusion present, full log uploaded. These surface the same
-      #      exhaustion as Postgres error 53100 (`could not extend file ...: No space
-      #      left on device`) inside the tests; two end with exit code 101.
-      #   1  every step conclusion present and NO log (`BlobNotFound` anyway).
+      #   4  steps 1 to 5 succeed and everything from `tests` onward has NO conclusion;
+      #      the log endpoint answers `BlobNotFound`.
+      #   3  every step has a conclusion and a full log is uploaded.
+      #   1  every step has a conclusion and the log endpoint answers `BlobNotFound`.
       #
-      # Said in all three shapes because the first version of this comment said "all of
-      # them, blank, no log", the second said two shapes four and four, and the logged
-      # group is where every number below came from. A description that erases its own
-      # evidence is how the next person concludes there is nothing to read; a description
-      # that rounds its own evidence is how they conclude the wrong thing about it.
+      # INFERRED, and marked as such because the two are not the same kind of statement:
+      # the group of 4 is read as dying in the RUNNER's own diagnostic writer, which would
+      # kill the runner process before it uploads. The evidence is the blankness itself
+      # plus one logged job (95968133506) whose ONLY ENOSPC is the runner's writer path
+      # (`.../actions-runner/cached/.../_diag/...`) with zero Postgres 53100 lines.
+      #
+      # So the middle group is not homogeneous either. TWO of its three carry Postgres
+      # 53100 (`could not extend file ...`) inside the tests and end with exit code 101;
+      # the third is the runner-writer shape that happened to upload anyway. An earlier
+      # version of this comment said "these surface the same exhaustion ... inside the
+      # tests", which is true of two of three.
+      #
+      # Written out this carefully because the first version said "all of them, blank, no
+      # log", the second said two shapes four and four, and the third rounded a 2-of-3 to
+      # a 3-of-3. A description that erases its own evidence is how the next person
+      # concludes there is nothing to read; one that rounds it is how they conclude the
+      # wrong thing about it.
       #
       # `--all-features` across 20 workspace members builds every dependency AND a
       # test binary per target -- 309 integration test files, which is the number that
@@ -229,7 +241,7 @@ jobs:
           # 60, not 100, and derived from the STANDING components rather than from a
           # completed run, because no run has ever completed this suite.
           #
-          # What was measured, and its limit: 28 to 29 G consumed at 239 of the 328 test
+          # What was measured, and its limit: 28 to 29 G consumed at 239 of the 329 test
           # binaries (24 G `target`, 4.6 to 5.4 G docker). The 89 that never ran are almost
           # all `ironauth-store`, which is the densest per-test-database creator in the
           # workspace and the reason the reclaim override exists, so 28 G is a LOWER BOUND
@@ -280,11 +292,11 @@ jobs:
       - name: report disk headroom
         if: always()
         run: |
-          df -h /
+          df -h / || true
           du -sh target 2>/dev/null || true
           sudo du -sh /var/lib/docker 2>/dev/null || true
           # No `head`: the volumes section is the entire reason this replaced
-          # `docker ps --size`, and it currently lands around line 33, one extra image away
+          # `docker ps --size`, and it lands after the images section, whose length depends on what the prune left, one extra image away
           # from being truncated out of the log by a fixed slice.
           docker system df -v 2>/dev/null || true
 
@@ -321,10 +333,14 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The Postgres above is a per-job SERVICE CONTAINER, created fresh for this job and
-      # destroyed with it, so the cluster-wide sweep `test_db_reclaim` drives under the
-      # override below cannot reach anything but this job's own databases. `with-test-db.sh`
-      # sets the same marker for the cluster it creates. Without it that test fails rather
-      # than skipping, so a hand-set DATABASE_URL is refused instead of swept.
+      # destroyed with it, so a cluster-wide sweep here can reach nothing but this job's own
+      # databases.
+      #
+      # INERT TODAY, and set anyway. This job runs only `--test outbox --test outbox_ironbus`,
+      # so `test_db_reclaim` never executes here and nothing reads the marker; there is also
+      # no reclaim override in this job's environment, which a copied version of this comment
+      # claimed there was. It is set because the property it asserts is true of this job and
+      # the day this job's test list grows is not the day to rediscover that.
       IRONAUTH_TEST_DB_DISPOSABLE: "1"
       IRONBUS_ADDR: 127.0.0.1:17654
     steps:
