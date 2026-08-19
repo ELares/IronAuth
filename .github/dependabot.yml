@@ -28,6 +28,20 @@ updates:
           - minor
           - patch
     ignore:
+      # WHAT AN `ignore` RULE COSTS, stated once for all three entries below, because
+      # this file's own header promises the opposite and a reader will believe it.
+      #
+      # `ignore` applies to SECURITY updates as well as version updates (GitHub's
+      # options reference marks it with both icons), and `applies-to` is NOT available
+      # on `ignore` the way it is on `groups`, so the rule cannot be narrowed to
+      # version updates. The header above says security updates "stay ungrouped and
+      # keep arriving as their own immediate PRs": that remains true of grouping, and
+      # is NOT true of the three dependencies named here.
+      #
+      # Concretely: an advisory against sqlx 0.8 whose remediation is 0.9 produces no
+      # PR at all. That is the price of every entry below, and it is why each one
+      # carries a written retirement condition rather than being left to lapse. When
+      # revisiting, check the advisory databases for these three by hand.
       # trybuild 1.0.120 declares `rust-version = "1.88"`, above this workspace's
       # 1.85 promise. Measured against the crates.io index 2026-08-19:
       #   1.0.117, 1.0.118, 1.0.119  ->  rust-version 1.85
@@ -58,6 +72,69 @@ updates:
       # the wall has moved. Check `rust-version` on the index when revisiting.
       - dependency-name: trybuild
         versions: [">=1.0.120"]
+      # sqlx 0.9.0 declares `rust-version = "1.94.0"`, nine minors above this
+      # workspace's 1.85 promise. `scripts/msrv-audit.sh` names all seven siblings
+      # (sqlx, sqlx-core, sqlx-macros, sqlx-macros-core, sqlx-mysql, sqlx-postgres,
+      # sqlx-sqlite) and the `msrv (1.85)` CI lane fails on them, so #924 could not
+      # merge whatever else was done to it.
+      #
+      # THE PORT ITSELF WAS DONE AND IT WORKS, which is why this is an MSRV wall and
+      # not a "we did not try". Measured on a throwaway branch: the whole workspace
+      # plus every test compiles on 0.9 after three kinds of change, and the suite got
+      # 60 test binaries deep with zero failures before it was stopped as moot. The
+      # changes are (1) the `json` feature, which 0.9 stops supplying implicitly and
+      # without which the build fails outright, (2) 114 dynamic-SQL sites across 27
+      # files wrapped in `AssertSqlSafe` after auditing every one, and (3) 11 call
+      # sites passing a borrowed string that now need an owned one.
+      #
+      # THE 114 IS THE SECOND NUMBER THIS COMMENT CARRIED, and the first one is worth
+      # recording because the mistake is reusable. It said 79, which is how many E0277
+      # errors `cargo check` PRINTS: the compile aborts at `ironauth-store`, so the 35
+      # sites in the test files of `ironauth-store`, `ironauth-admin` and
+      # `ironauth-oidc` are never reached and never reported. An error count is not a
+      # site count, and here it undercounted by 31%. Count from the patch, not the
+      # compiler.
+      #
+      # The audit is the part worth keeping: all 114 interpolate compile-time
+      # constants, `&'static str` parameters, or enum-derived SQL fragments, and NONE
+      # carries caller or user data.
+      #
+      # ONE SITE IS NOT IN THOSE THREE CATEGORIES and is called out rather than
+      # rounded off: `test_support::execute_owner_sql(sql: &str)` takes a genuine
+      # runtime string, by design, because a test supplies the statement. It is safe
+      # for a different reason: it sits behind `feature = "testing"`, which is not in
+      # `default`, so it is absent from production builds, and every caller is a test
+      # passing a literal it wrote.
+      #
+      # The manifest requirement `"0.8"` already excludes 0.9 by caret semantics, so
+      # nothing can walk into it. This rule stops dependabot proposing the manifest
+      # EDIT that replaces it, which is what #924 was.
+      #
+      # WHAT RETIRES THIS: the workspace MSRV moving to 1.94 or above, which is an
+      # owner decision about a published promise, not a build detail. There is no
+      # "sqlx publishes a lower rust-version" path to wait for here, unlike trybuild.
+      - dependency-name: sqlx
+        versions: [">=0.9"]
+      # rand_chacha 0.9 implements the rand_core 0.9 traits, and this workspace's
+      # signing path needs rand_core 0.6. Measured by compiling #923: `elliptic-curve
+      # 0.13.8` and `rsa 0.9.10` both require `CryptoRngCore` from rand_core 0.6, so
+      # `ChaCha20Rng` from 0.9 does not satisfy the bound and
+      # `crates/ironauth-jose/src/signing_key.rs` fails to build at TWO call sites,
+      # 384 and 408. (An earlier draft said three, from counting the three `-->` lines
+      # rustc prints for a single error: the call site, the trait definition, and the
+      # bound. Three notes, one error.)
+      #
+      # This is not a wall we can climb alone: it retires when the RustCrypto stack
+      # moves off rand_core 0.6, and then rand_chacha, elliptic-curve and rsa have to
+      # move together as a SET, which is exactly the sibling case `msrv-audit.sh`
+      # warns about. Do not pin the target version in advance: rand_chacha 0.10 is
+      # already out on rand_core 0.10, so "moves to rand_core 0.9" was stale within
+      # the hour. Check what elliptic-curve and rsa actually require when revisiting.
+      #
+      # The manifest requirement `"0.3"` already excludes it; this stops the proposed
+      # manifest edit.
+      - dependency-name: rand_chacha
+        versions: [">=0.4"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
