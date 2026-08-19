@@ -21,6 +21,21 @@
 //! outage does not stick a client into a fail-closed state for the whole TTL. The
 //! cache is keyed on the exact URL and reads the application clock seam for expiry,
 //! so it is deterministic under a manual clock in tests.
+//!
+//! # What the cache is NOT bounded by
+//!
+//! It is bounded in TIME and not in SIZE: there is one entry per distinct `jwks_uri` ever
+//! resolved, and no eviction path. Two of the three surfaces that reach it take the URI
+//! from an operator-registered issuer record, but `private_key_jwt` takes it from a CLIENT
+//! record, and once RFC 7591 dynamic registration is enabled that string is the client's
+//! own. An entry also outlives the client that caused it, since deleting a client does not
+//! touch this map.
+//!
+//! It is not treated as a live problem, because reaching it means registering a client per
+//! distinct URL and dynamic registration is off by default and rate limited when on. It is
+//! written down because it is the kind of bound whose absence is invisible: nothing here
+//! fails, it only grows. [`Self::begin_rotation_refetch`]'s marker-only insert depends on
+//! there being no eviction, so adding one is not a local change.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -87,6 +102,17 @@ impl ClientKeyResolver {
             ttl,
             allow_http: true,
         }
+    }
+
+    /// How long a successful resolution is cached.
+    ///
+    /// Exposed so the BOOT path can be asserted to have passed the configured
+    /// `oidc.client_jwks_ttl_secs` through rather than a default: a resolver installed with
+    /// the wrong TTL is indistinguishable from a correct one at every other seam, and the
+    /// value governs how long a key the client has rotated OUT stays trusted.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        self.ttl
     }
 
     /// Resolve `jwks_uri` to the trusted keys it publishes, using `now` (from the
@@ -185,6 +211,11 @@ impl ClientKeyResolver {
         }
         let keys = ironauth_jose::trusted_keys_from_jwks(response.body());
         if keys.is_empty() {
+            // A document that parses to NO usable key is a failure like any other, and the
+            // module doc promises it is never cached. Deleting this branch caches the empty
+            // set, which fails every client on that URI closed for a whole TTL and answers
+            // every subsequent kid as "satisfied" so no refetch is even attempted.
+            // `an_empty_upstream_document_is_never_cached_and_falls_back` is what holds it.
             return fallback();
         }
         self.store(now, jwks_uri, keys.clone());

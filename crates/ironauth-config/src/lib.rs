@@ -2375,23 +2375,26 @@ pub struct OidcConfig {
     pub client_assertion_max_skew_secs: u64,
 
     /// How long a CLIENT's fetched `jwks_uri` key set is cached, in seconds (issues #25,
-    /// #126). Must be at least 1 and at most 3600. Applies to `private_key_jwt` client
-    /// authentication, the `urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant,
-    /// and `jwks_uri` dynamic client registration, all of which resolve a `jwks_uri`
-    /// through the SSRF-hardened fetcher. The default (300) trades one fetch per client per
-    /// five minutes against how long a rotated-OUT key stays trusted.
+    /// #126). Must be at least 1 and at most 3600; the default is 300. Applies to
+    /// `private_key_jwt` client authentication, the
+    /// `urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant, and `jwks_uri`
+    /// dynamic client registration, all of which resolve a `jwks_uri` through the
+    /// SSRF-hardened fetcher. It bounds how long a key the client has ROTATED OUT stays
+    /// trusted. On the ASSERTION GRANT a rotated-IN key is picked up without waiting, since
+    /// an assertion naming an unknown `kid` triggers a refetch; `private_key_jwt` client
+    /// authentication resolves with NO kid hint, so on that surface this value is the whole
+    /// rotation window and a client that rotates is verified against its old key until it
+    /// expires.
     ///
-    /// The bound is in the paragraph ABOVE rather than in one of its own because
-    /// `scripts/config-schema.sh` renders only the FIRST paragraph of a doc comment into
-    /// `docs/CONFIG.md`, so a limit written below it is documented nowhere an operator
-    /// looks. The ceiling constant is [`OIDC_MAX_CLIENT_JWKS_TTL_SECS`].
+    /// Everything above is in ONE paragraph deliberately: `scripts/config-schema.sh` renders
+    /// only the first paragraph of a doc comment into `docs/CONFIG.md`, so anything below
+    /// this point is documented nowhere the operator who tunes the setting will look. The
+    /// ceiling constant is [`OIDC_MAX_CLIENT_JWKS_TTL_SECS`].
     ///
-    /// It does NOT govern how fast a rotated-IN key is picked up ON THE ASSERTION GRANT:
-    /// an assertion naming a `kid` the cached set does not hold triggers an immediate
-    /// refetch, rate limited to once per 30 seconds per URI so an unverified header cannot
-    /// turn this into an amplifier. `private_key_jwt` client authentication (#25) resolves
-    /// WITHOUT a kid hint, so for that surface this TTL is the whole rotation window and
-    /// closing it is out of scope for #126 criterion 4.
+    /// The assertion-grant refetch is rate limited to once per 30 seconds per URI, because
+    /// the `kid` that triggers it comes from an unverified header and an unlimited refetch
+    /// would be an outbound-request amplifier. Giving `private_key_jwt` the same kid hint is
+    /// out of scope for #126 criterion 4.
     pub client_jwks_ttl_secs: u64,
 
     /// The web origins (scheme + host + optional port, no path) of registered
@@ -9781,6 +9784,18 @@ mod tests {
         )
         .expect_err("one over the ceiling is refused");
         assert!(err.to_string().contains("client_jwks_ttl_secs"), "{err}");
+
+        // The ceiling's VALUE, not just the bounds relative to it. Every assertion above
+        // builds its input FROM the constant, so all of them survive the constant moving --
+        // and two things outside this file are written against one hour specifically: the
+        // doc comment and `docs/CONFIG.md` say "at most 3600" in hand-written prose, and the
+        // resolver's fail-closed argument for a marker-only cache entry rests on the TTL
+        // being unable to reach anything near `Duration::MAX`. Raising this is a decision,
+        // so it should cost a test edit.
+        assert_eq!(
+            OIDC_MAX_CLIENT_JWKS_TTL_SECS, 3600,
+            "one hour, and the prose that says so is hand written"
+        );
     }
 
     #[test]

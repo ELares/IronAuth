@@ -19,13 +19,26 @@ range per docs/RELEASING.md.
     "jwks_uri registration is not available on this deployment".
 
   So this is a BEHAVIOUR CHANGE for the third one: a registration that was always refused is
-  now accepted, and accepting means an outbound fetch to a URL the CLIENT supplies. That is
-  a wider attacker-URL surface than the other two, where a registered and enabled issuer
-  record is required before any fetch, so the URL is always one an operator chose. It is
-  bounded rather than open: `oidc.registration_enabled` defaults to false, the route is
-  mounted only when it is on, it carries the issue #31 abuse controls when it is, and the
-  fetch itself goes through the SSRF-hardened fetcher. Recorded here because a behaviour
-  change nobody writes down is a behaviour change nobody reviews.
+  now accepted, and accepting means an outbound fetch to a URL the CLIENT supplies.
+
+  Two clauses an earlier draft of this entry got wrong, in the reassuring direction both
+  times. It is NOT the case that "the other two always fetch a URL an operator chose": that
+  holds for the jwt-bearer grant, which needs a registered issuer record, but
+  `private_key_jwt` reads `jwks_uri` off the CLIENT record, which is client-supplied once
+  RFC 7591 registration is on. And it is NOT the case that the registration route always
+  "carries the issue #31 abuse controls": `POST` register does, the RFC 7592 `PUT` update
+  reaches the same fetch with no rate limit and no quota.
+
+  The wider half is not registration. `resolve_client_keys` is the first statement of
+  `verify_private_key_assertion`, before the assertion is parsed, so anyone who knows the
+  `client_id` of a `private_key_jwt` client with a `jwks_uri` drives a fetch per
+  `POST /token`; that path resolves with no `kid`, so the 30s refetch bound does not apply,
+  and a failed fetch is never cached, so an always-failing URL costs one outbound request per
+  token request. `docs/THREAT-MODEL.md` carries the row. What bounds the registration half:
+  `oidc.registration_enabled` defaults to false, the route is mounted only when it is on,
+  `POST` register carries the #31 controls, and every fetch goes through the SSRF-hardened
+  fetcher. Recorded here because a behaviour change nobody writes down is a behaviour change
+  nobody reviews.
 
   The suites for all three were green throughout, because each constructs the resolver
   itself. `crates/ironauth/src/boot_wiring_tests.rs` now pins the installation against an

@@ -6,6 +6,34 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **New setting `oidc.client_jwks_ttl_secs`** (default `300`, bounded 1 to
+  `OIDC_MAX_CLIENT_JWKS_TTL_SECS` = 3600, a new public const; a new
+  `ConfigError::Invalid` naming the setting). How long a CLIENT's fetched `jwks_uri` key set
+  is cached, on all three surfaces that resolve one: `private_key_jwt` client
+  authentication, the `urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant, and
+  `jwks_uri` dynamic client registration.
+
+  BOTH bounds exist for their own reason, and both are tested. Zero would make every request
+  refetch, which is the outbound-request amplifier the resolver's per-URI rate limit exists
+  to prevent, reached through configuration instead of through an attacker. Above the
+  ceiling, a key the client has ROTATED OUT stays trusted for longer than the rotation was
+  meant to take. The ceiling's VALUE is asserted too, not only the bounds relative to it: the
+  doc comment and `docs/CONFIG.md` hand-write "at most 3600", and the resolver's fail-closed
+  argument for a marker-only cache entry rests on the TTL being unable to grow without limit.
+
+  WHAT IT DOES NOT GOVERN: on the assertion grant a rotated-IN key is picked up without
+  waiting, because an assertion naming an unknown `kid` triggers a refetch. `private_key_jwt`
+  resolves with no kid hint, so on THAT surface this value is the whole rotation window.
+  That sentence is in the setting's FIRST doc paragraph deliberately, because
+  `scripts/config-schema.sh` renders only the first paragraph into `docs/CONFIG.md` and an
+  operator tuning the setting reads the rendered row, not the source.
+
+  `Config::validate` also lost its client-credential bounds to a new
+  `validate_client_credential_bounds`, which is a refactor with no behaviour change: the
+  function had grown past its line bound, and the skew bound and this one are the same
+  question asked twice (how long a client credential this provider did not mint stays
+  acceptable).
+
 - **Five `[outbox]` retention knobs, two of which read the OPPOSITE way to
   `diagnostics.retention_secs` (issue #104, PR 3).** `outbox_messages` had no retention at
   all, so these are the settings of the reaper that gives it one.

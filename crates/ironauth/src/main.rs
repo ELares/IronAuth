@@ -1215,20 +1215,47 @@ async fn build_oidc_plane(
     //
     // So wiring the resolver CHANGES BEHAVIOUR for the third one: a registration that was
     // always refused is now accepted, and accepting means an outbound fetch to a URL the
-    // CLIENT supplies. That is a wider attacker-URL surface than the other two, where the
-    // grant requires a registered, enabled issuer record before any fetch, so the URL is
-    // always one an operator chose.
+    // CLIENT supplies.
     //
-    // Bounded rather than unbounded: `oidc.registration_enabled` defaults to false and the
-    // route is mounted only when it is on, and when on it carries the issue #31 abuse
-    // controls (peer-keyed rate limit, exposure switch, initial access token). The fetch
-    // itself goes through the SSRF-hardened fetcher, which is what makes a client-supplied
-    // URL acceptable at all. Said here because a behaviour change nobody wrote down is a
+    // AN EARLIER VERSION OF THIS COMMENT GOT THE SHAPE OF THAT WRONG TWICE, in the
+    // reassuring direction both times, so both are named rather than quietly corrected.
+    //
+    //   * It said the other two surfaces always fetch a URL "an operator chose". True of the
+    //     jwt-bearer grant (#126), which requires a registered, enabled ISSUER record. NOT
+    //     true of `private_key_jwt` (#25): `client_auth::resolve_client_keys` reads
+    //     `jwks_uri` off the CLIENT record, and with RFC 7591 registration on, that string
+    //     is the one the client supplied.
+    //   * It said the registration route "carries the issue #31 abuse controls". True of
+    //     `POST` register, which calls `enforce_rate_limits` before any store write. NOT
+    //     true of the RFC 7592 `PUT` update, which reaches the same
+    //     `validate_metadata` -> `validate_client_keys` -> fetch with no rate limit and no
+    //     quota, so a registration-access-token holder can loop updates naming a different
+    //     `jwks_uri` each time.
+    //
+    // AND THE WIDER HALF IS NOT REGISTRATION AT ALL. `resolve_client_keys` is the FIRST
+    // statement of `verify_private_key_assertion`, before the presented assertion is parsed
+    // or verified. So once a `private_key_jwt` client with a `jwks_uri` exists, anyone who
+    // knows its `client_id` drives a fetch per `POST /token` by presenting garbage; `token.rs`
+    // has no rate limit and no quota. It is bounded by the cache in the ordinary case, but
+    // that path resolves with NO kid hint, so the 30s rotation bound never applies to it, and
+    // a failed fetch is never cached -- a URL that served a valid JWK Set once at
+    // registration and fails thereafter costs one outbound request per token request, with
+    // no ceiling. `docs/THREAT-MODEL.md` carries the row.
+    //
+    // What genuinely bounds the REGISTRATION half: `oidc.registration_enabled` defaults to
+    // false and the route is mounted only when it is on; `POST` register carries the #31
+    // controls (peer-keyed rate limit, exposure switch, initial access token); and every
+    // fetch goes through the SSRF-hardened fetcher, which is what makes a client-supplied URL
+    // acceptable at all. Said here because a behaviour change nobody wrote down is a
     // behaviour change nobody reviewed.
     //
     // Built like the claims-enrichment hook above and failing the same way: a fetcher that
     // will not build is a TLS trust-store fault, and taking the whole OIDC plane down for it
     // would be worse than the surfaces it disables. The warning names all three.
+    //
+    // The `Err` arm is UNVERIFIED prose, not covered code: under `cfg(test)`
+    // `shared_config::outbound_fetcher` returns `Ok` unconditionally, so no test in this repo
+    // reaches the branch. Its text is reviewed, not exercised.
     let client_key_resolver =
         match crate::shared_config::outbound_fetcher(ironauth_fetch::FetchLimits::default()) {
             Ok(fetcher) => Some(std::sync::Arc::new(ironauth_oidc::ClientKeyResolver::new(

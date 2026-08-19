@@ -677,6 +677,10 @@ async fn both_planes_receive_the_same_shared_values() {
 /// tell an installed resolver from an absent one fails here rather than passing quietly.
 #[tokio::test]
 async fn the_boot_path_installs_the_client_key_resolver() {
+    // A TTL that is neither the shipped default (300) nor any other duration this harness
+    // sets, so an assertion on it cannot pass by coincidence.
+    const CONFIGURED_TTL_SECS: u64 = 1234;
+
     let db = TestDatabase::start().await;
     let env = Env::system();
     let fixture = fixture(
@@ -687,13 +691,23 @@ async fn the_boot_path_installs_the_client_key_resolver() {
             advanced_recovery: true,
         },
     );
+    let mut fixture = fixture;
+    fixture.config.oidc.client_jwks_ttl_secs = CONFIGURED_TTL_SECS;
     let wired = boot_both_planes(&fixture).await;
     let unwired = unwired_planes(&db, &env).await;
 
-    assert!(
-        wired.oidc.client_key_resolver().is_some(),
+    let resolver = wired.oidc.client_key_resolver().cloned().expect(
         "a booted OIDC plane must hold a client-key resolver, or every jwks_uri client and \
-         every jwks_uri assertion issuer resolves to no keys at all"
+         every jwks_uri assertion issuer resolves to no keys at all",
+    );
+    // INSTALLED IS NOT ENOUGH. A resolver built with a default TTL instead of the configured
+    // one is indistinguishable from a correct one at every other seam, and the value it
+    // ignores governs how long a key the client has ROTATED OUT stays trusted -- a silent
+    // security misconfiguration, in the same shape as the wiring defect this test exists for.
+    assert_eq!(
+        resolver.ttl(),
+        std::time::Duration::from_secs(CONFIGURED_TTL_SECS),
+        "the resolver must be built from oidc.client_jwks_ttl_secs, not from a default"
     );
     assert!(
         unwired.oidc.client_key_resolver().is_none(),

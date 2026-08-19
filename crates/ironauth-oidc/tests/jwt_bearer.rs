@@ -1975,14 +1975,95 @@ async fn a_kidless_key_set_is_bounded_by_the_rate_limit_not_exempted() {
         keys.iter().all(|k| k.kid().is_none()),
         "this fixture must serve a kid-less set for the test to mean anything"
     );
-    for _ in 0..5 {
-        resolver.resolve_for_kid(now, &uri, Some("any-kid")).await;
+    for attempt in 0..5 {
+        let answered = resolver.resolve_for_kid(now, &uri, Some("any-kid")).await;
+        // Bounded, not BROKEN. The four calls the rate limit refuses must still be answered
+        // from the cache: a refusal that returned an empty set would fail-close every
+        // request naming an unfamiliar kid, and would change the #91 diagnostic from
+        // `AssertionKidUnknown` to `AssertionInvalid` for all of them.
+        assert!(
+            !answered.is_empty(),
+            "attempt {attempt}: a rate-limited refetch must answer from the cache, not with \
+             nothing"
+        );
     }
     assert_eq!(
         dialer.requested().len(),
         2,
         "five requests naming an unknown kid must cost ONE refetch between them -- bounded, \
          not exempted"
+    );
+}
+
+/// An upstream document that names NO usable key is never cached, and the caller falls back
+/// to the still-valid set.
+///
+/// The module doc promises exactly this ("A failed or empty fetch is NEVER cached"), and it
+/// was promised without a test: deleting the `keys.is_empty()` branch left all sixty-three
+/// tests in these three files green. What the deletion costs is not subtle. The empty set
+/// would be stored under the URI, so every client on it fails closed for a full TTL, and
+/// because an empty set contains no kid the "is this kid present" check answers `false`
+/// forever -- so the ONE refetch per 30s the rate limit allows is the only path out, and
+/// every request in between is refused.
+///
+/// An empty document is the realistic shape of a partial upstream failure: a CDN serving a
+/// stale-but-valid JSON skeleton, or a key server mid-rotation with nothing published.
+#[tokio::test]
+async fn an_empty_upstream_document_is_never_cached_and_falls_back() {
+    let key = SigningKey::ed25519_from_seed(Some("k-empty".to_owned()), &[0x5a; 32]).expect("key");
+    // Valid first, then a well-formed JWK Set naming nothing. `start_rotating_jwks_server`
+    // serves `before` to the first request and `after` to every later one.
+    let server = start_rotating_jwks_server(jwks_json(&key), "{\"keys\":[]}".to_owned()).await;
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(300),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let uri = "http://empty.test/keys";
+
+    let primed = resolver.resolve(now, uri).await;
+    assert_eq!(
+        primed
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-empty"],
+        "the first fetch must succeed and prime, or the rest of this test proves nothing"
+    );
+
+    // The refetch now receives `{"keys":[]}`.
+    let after = resolver
+        .resolve_for_kid(now, uri, Some("unknown-kid"))
+        .await;
+    assert_eq!(
+        after
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-empty"],
+        "an empty document must fall back to the cached set, not replace it"
+    );
+    assert_eq!(dialer.requested().len(), 2, "it did attempt the refetch");
+
+    // And the cache itself must be UNPOISONED: an ordinary resolve, which cannot trigger a
+    // refetch at all, still answers with the primed set.
+    assert_eq!(
+        resolver
+            .resolve(now, uri)
+            .await
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["k-empty"],
+        "the empty document must not have been stored"
+    );
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "and that answer came from the cache, not from a third fetch"
     );
 }
 
@@ -2274,22 +2355,23 @@ async fn a_concurrent_burst_of_unknown_kids_still_costs_one_refetch() {
     );
 }
 
-/// Each issuer's rotation is answered from ITS OWN `jwks_uri` (issue #126 criterion 4).
+/// Two URIs are two cache entries, each fetched from its own path (issue #126 criterion 4).
 ///
-/// # The half of the seam the end-to-end test cannot see
+/// # What this proves, and what it does NOT
 ///
-/// `a_rotated_upstream_key_is_accepted_at_the_token_endpoint_inside_the_ttl` proves the
-/// presented `kid` reaches the resolver. It cannot prove the registered URI does: replacing
-/// the `uri` argument with a constant string survives it, because `RecordingDialer`
-/// forwards every connection to one fixed address and records a `SocketAddr`, so no
-/// assertion in that test can observe WHICH url was fetched.
+/// It proves the RESOLVER keeps two `jwks_uri` values apart: the `FetchRequest` carries the
+/// URI it was given, and the cache is keyed per URI rather than on something coarser (two
+/// issuers cost two fetches, not one). Both calls run against a cold cache, so `cached()`
+/// returns `None` and the kid guard is never entered -- the `kid` arguments below are there
+/// to show they do not change the answer, not to exercise the rotation path. An earlier
+/// version of this doc claimed they did; a probe panic placed inside the guard block proved
+/// otherwise while the test still passed.
 ///
-/// That is not a performance bug. With two registered assertion issuers, a URI mixup means
-/// issuer A's assertion is verified against issuer B's key set, which is a trust confusion:
-/// whoever holds B's key can mint under A's mappings.
-///
-/// So the two URIs here differ only in path, the server answers a DIFFERENT key set per
-/// path, and each issuer's cached set is asserted to hold its own kid and not the other's.
+/// It does NOT prove that `jwt_bearer.rs` passes the REGISTERED URI, because it never calls
+/// `jwt_bearer.rs`. That is the whole point of the finding this test was written for, and
+/// pinning the `uri` argument to a constant survives it. The test below,
+/// `an_assertion_is_verified_against_its_own_issuers_registered_jwks_uri`, is what closes
+/// that, by driving `/token` with two registered issuers whose URIs differ only in path.
 #[tokio::test]
 async fn each_issuers_rotation_is_answered_from_its_own_jwks_uri() {
     let key_a =
@@ -2339,4 +2421,106 @@ async fn each_issuers_rotation_is_answered_from_its_own_jwks_uri() {
         2,
         "the cache is keyed per URI: two distinct issuers cost two fetches, not one"
     );
+}
+
+/// An assertion is verified against ITS OWN issuer's registered `jwks_uri`, driven through
+/// the live `/token` endpoint (issue #126 criterion 4).
+///
+/// # Why this is the test that had to exist
+///
+/// The one above proves the resolver keeps two URIs apart. It calls the resolver directly,
+/// so no assertion in it can observe the argument `jwt_bearer.rs` actually passes -- and
+/// measurement bore that out: pinning that argument to a constant
+/// (`resolve_for_kid(state.now(), "http://wrong.test/keys", kid)`) left the whole
+/// `ironauth-oidc` suite green. Proving the layer while leaving the call into it unproven is
+/// the same defect this PR was opened to fix one level up, so answering it with another
+/// direct-call test would have been answering it with the defect.
+///
+/// # What a mixup costs
+///
+/// A trust confusion, not a slow path. With two registered assertion issuers, verifying A's
+/// assertion against B's key set means whoever holds B's signing key mints tokens under A's
+/// subject mappings. Both issuers here are legitimately registered and enabled; the only
+/// thing separating them is which URI is fetched for which.
+///
+/// The two URIs differ ONLY in path, and the server answers a different key set per path, so
+/// the difference lands in the response where an assertion can see it. `RecordingDialer`
+/// forwards every connection to one address, so nothing coarser than the response body can
+/// tell the two apart.
+#[tokio::test]
+async fn an_assertion_is_verified_against_its_own_issuers_registered_jwks_uri() {
+    const ISSUER_A: &str = "https://a.workload.test";
+    const ISSUER_B: &str = "https://b.workload.test";
+    let key_a =
+        SigningKey::ed25519_from_seed(Some("e2e-uri-a".to_owned()), &[0x66; 32]).expect("key a");
+    let key_b =
+        SigningKey::ed25519_from_seed(Some("e2e-uri-b".to_owned()), &[0x77; 32]).expect("key b");
+    let server = start_path_routed_jwks_server(jwks_json(&key_a), jwks_json(&key_b)).await;
+
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = Arc::new(ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(300),
+    ));
+    let h = Harness::start_with_resolver(
+        OidcConfig {
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        },
+        resolver,
+    )
+    .await;
+    // `/a.json` serves A's key set; every other path serves B's. So a resolver fetching any
+    // URI other than the one registered for A gets B's keys.
+    h.register_external_issuer(ISSUER_A, None, Some("http://jwks.test/a.json"), None, true)
+        .await;
+    h.register_external_issuer(ISSUER_B, None, Some("http://jwks.test/b.json"), None, true)
+        .await;
+    h.create_subject_mapping(ISSUER_A, EXTERNAL_SUBJECT, None, None, MAPPED_PRINCIPAL)
+        .await;
+    let client_id = h.client_id().to_string();
+
+    // A's assertion, signed with A's key. This is the direction the constant-URI mutant
+    // breaks: under it the grant fetches some other path, gets B's key set, and A's genuine
+    // signature no longer verifies.
+    let own = assertion(
+        &key_a,
+        ISSUER_A,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-own-uri",
+    );
+    let (status, _hdrs, body) = present(&h, &client_id, &own).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "issuer A's assertion must verify against the key set at A's REGISTERED jwks_uri: \
+         {body}"
+    );
+    assert_eq!(
+        jwt_payload(json(&body)["access_token"].as_str().expect("access token"))["sub"],
+        MAPPED_PRINCIPAL
+    );
+
+    // And B's key must not verify an assertion CLAIMING to be A. Without this the test
+    // above would still pass if every issuer resolved to A's URI, which is the same mixup
+    // in the opposite direction.
+    let forged = assertion(
+        &key_b,
+        ISSUER_A,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-cross-uri",
+    );
+    let (status, _hdrs, body) = present(&h, &client_id, &forged).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the OTHER issuer's key must not verify an assertion claiming issuer A: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
 }
