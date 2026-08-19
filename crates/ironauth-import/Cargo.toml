@@ -46,18 +46,6 @@ bcrypt = "0.19"
 scrypt = "0.11"
 # PBKDF2 (RFC 8018 / PKCS#5 v2.1) PHC-string verify over HMAC-SHA256/512.
 pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
-# The PHC string parser and the PasswordVerifier trait shared by argon2, scrypt,
-# and pbkdf2. Already in the tree via argon2, so no new crate.
-password-hash = "0.5"
-# Firebase modified scrypt finishes by AES-256-CTR encrypting the account signer
-# key under the scrypt-derived key; aes + ctr supply exactly that primitive.
-aes = "0.8"
-ctr = "0.9"
-# Constant-time comparison for the Firebase hash equality check (no timing oracle).
-subtle = "2"
-# base64 for the Firebase salt / salt-separator / signer-key / hash operands and
-# the canonical foreign-hash storage serialization. Already in the tree.
-base64.workspace = true
 # The ledger subject an UNPARSEABLE or UNDECODABLE line is accounted under is a
 # truncated SHA-256 of the line's own bytes (issue #55): stable across attempts, so a
 # repeated bad line dedups; distinct per bad line, so two bad lines are two accounted
