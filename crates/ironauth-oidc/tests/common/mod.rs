@@ -2734,6 +2734,28 @@ impl Harness {
         signing_alg_allow: Option<&str>,
         enabled: bool,
     ) -> ExternalIssuerId {
+        self.register_external_issuer_with_audiences(
+            issuer,
+            jwks,
+            jwks_uri,
+            signing_alg_allow,
+            None,
+            enabled,
+        )
+        .await
+    }
+
+    /// As [`Harness::register_external_issuer`], with the per-issuer audience allowlist
+    /// (issue #126 criterion 3). A delegating wrapper so no existing call site changes.
+    pub async fn register_external_issuer_with_audiences(
+        &self,
+        issuer: &str,
+        jwks: Option<&str>,
+        jwks_uri: Option<&str>,
+        signing_alg_allow: Option<&str>,
+        audience_allow: Option<&str>,
+        enabled: bool,
+    ) -> ExternalIssuerId {
         let id = ExternalIssuerId::generate(&self.env, &self.scope);
         let (actor, corr) = self.seeding_actor();
         self.store()
@@ -2748,6 +2770,7 @@ impl Harness {
                     jwks,
                     jwks_uri,
                     signing_alg_allow,
+                    audience_allow,
                     enabled,
                 },
             )
@@ -2788,6 +2811,7 @@ impl Harness {
             .register(
                 &self.env,
                 NewExternalAssertionIssuer {
+                    audience_allow: None,
                     id: &id,
                     issuer,
                     jwks,

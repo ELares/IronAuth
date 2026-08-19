@@ -354,7 +354,17 @@ async fn validate_and_map(
     // own `alg` header is never trusted.
     let keys = resolve_issuer_keys(state, &record).await;
     let algorithms = allowed_algs(&record);
-    let audiences = state.client_assertion_audiences(&scope);
+    // NARROWED by the issuer's own allowlist (issue #126 criterion 3). The shared policy
+    // is the deployment floor and this can only restrict it, never widen it: an issuer that
+    // could widen would be a way to escape the floor, which is the opposite of a trust
+    // policy. `None` leaves the shared set untouched, so every issuer registered before this
+    // column existed behaves exactly as it did.
+    //
+    // Without this, an assertion addressed to the shared audience is acceptable from ANY
+    // registered issuer -- a GitHub Actions token and a Kubernetes projected token land at
+    // the same audience, so a trust anchor that should only speak to one can present
+    // assertions addressed to another's.
+    let audiences = narrowed_audiences(&state.client_assertion_audiences(&scope), &record);
     let skew = state.client_assertion_skew();
     let verified = verify_external_assertion(
         assertion,
@@ -658,6 +668,27 @@ fn verify_external_assertion(
     None
 }
 
+/// Intersect the deployment's shared audience policy with this issuer's allowlist.
+///
+/// `None` on the issuer means the shared policy applies unchanged, matching how
+/// `signing_alg_allow` already behaves so an operator learns one rule rather than two.
+///
+/// The intersection is what makes an unusable allowlist FAIL CLOSED rather than dangerous:
+/// an issuer whose allowlist shares nothing with the shared policy ends up able to address
+/// nothing, so its assertions are refused. The alternative -- treating an empty intersection
+/// as "no constraint" -- would turn a typo into a silently wider trust boundary.
+fn narrowed_audiences(shared: &[String], record: &ExternalAssertionIssuerRecord) -> Vec<String> {
+    let Some(allow) = record.audience_allow.as_deref() else {
+        return shared.to_vec();
+    };
+    let permitted: Vec<&str> = allow.split_whitespace().collect();
+    shared
+        .iter()
+        .filter(|audience| permitted.contains(&audience.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// The JWS algorithms a registered issuer's assertions may be signed with: its
 /// pinned `signing_alg_allow` (a space-separated per-issuer allowlist) intersected
 /// with the supported asymmetric set, otherwise the full asymmetric set. A pinned
@@ -889,6 +920,7 @@ mod tests {
         // assertion is rejected; a multi-alg pin parses to exactly its supported
         // members and drops an unknown token.
         let mut record = ExternalAssertionIssuerRecord {
+            audience_allow: None,
             id: sample_issuer_id(),
             issuer: "https://issuer.test".to_owned(),
             jwks: Some("{}".to_owned()),

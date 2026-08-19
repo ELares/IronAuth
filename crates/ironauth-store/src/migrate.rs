@@ -1184,6 +1184,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0148_client_backchannel_delivery.sql"),
         },
+        Migration {
+            version: 149,
+            name: "external_issuer_audience_allow",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0149_external_issuer_audience_allow.sql"),
+        },
     ]
 }
 

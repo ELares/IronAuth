@@ -12950,6 +12950,14 @@ pub struct ExternalAssertionIssuerRecord {
     /// An OPTIONAL space-separated JOSE algorithm allowlist for this issuer's
     /// assertions; [`None`] means the supported asymmetric set applies.
     pub signing_alg_allow: Option<String>,
+    /// An OPTIONAL space-separated audience allowlist for this issuer's assertions
+    /// (issue #126 criterion 3); [`None`] means the deployment-wide policy applies.
+    ///
+    /// NARROWING only: enforcement INTERSECTS this with the shared policy, so an issuer
+    /// can restrict what the deployment permits and can never widen it. A per-issuer
+    /// setting that could widen would be a way to escape the deployment floor, which is
+    /// the opposite of a trust policy.
+    pub audience_allow: Option<String>,
     /// The enable switch. A disabled issuer's assertions are rejected exactly as an
     /// unregistered issuer's are.
     pub enabled: bool,
@@ -12970,6 +12978,8 @@ pub struct NewExternalAssertionIssuer<'a> {
     pub jwks_uri: Option<&'a str>,
     /// The OPTIONAL space-separated JOSE algorithm allowlist, or [`None`].
     pub signing_alg_allow: Option<&'a str>,
+    /// The optional space-separated audience allowlist. [`None`] keeps the shared policy.
+    pub audience_allow: Option<&'a str>,
     /// The enable switch to register the issuer with.
     pub enabled: bool,
 }
@@ -12996,7 +13006,7 @@ impl ExternalAssertionIssuerRepo<'_> {
     ) -> Result<Option<ExternalAssertionIssuerRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, issuer, jwks, jwks_uri, signing_alg_allow, enabled \
+            "SELECT id, issuer, jwks, jwks_uri, signing_alg_allow, audience_allow, enabled \
              FROM external_assertion_issuers \
              WHERE issuer = $1 AND tenant_id = $2 AND environment_id = $3",
         )
@@ -13017,6 +13027,7 @@ impl ExternalAssertionIssuerRepo<'_> {
                     jwks: row.get("jwks"),
                     jwks_uri: row.get("jwks_uri"),
                     signing_alg_allow: row.get("signing_alg_allow"),
+                    audience_allow: row.get("audience_allow"),
                     enabled: row.get("enabled"),
                 }))
             }
@@ -13065,8 +13076,8 @@ impl ActingExternalAssertionIssuerRepo<'_> {
                 let result = sqlx::query(
                     "INSERT INTO external_assertion_issuers \
                      (id, tenant_id, environment_id, issuer, jwks, jwks_uri, \
-                      signing_alg_allow, enabled) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                      signing_alg_allow, audience_allow, enabled) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 )
                 .bind(issuer.id.to_string())
                 .bind(scope.tenant().to_string())
@@ -13075,6 +13086,7 @@ impl ActingExternalAssertionIssuerRepo<'_> {
                 .bind(issuer.jwks)
                 .bind(issuer.jwks_uri)
                 .bind(issuer.signing_alg_allow)
+                .bind(issuer.audience_allow)
                 .bind(issuer.enabled)
                 .execute(&mut **tx)
                 .await;

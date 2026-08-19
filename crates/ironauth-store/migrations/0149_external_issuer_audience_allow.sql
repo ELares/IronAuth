@@ -1,0 +1,56 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Per-issuer audience narrowing for external assertion issuers (issue #126
+-- criterion 3, which asks for per-issuer trust policies enforcing "audience,
+-- algorithm, and subject-claim constraints").
+--
+-- Algorithm was already per-issuer (`signing_alg_allow`) and the subject claim was
+-- already per-issuer (the subject-mapping table). AUDIENCE was not: `jwt_bearer.rs`
+-- takes it from the ONE deployment-wide `client_assertion_audiences` policy, so an
+-- assertion addressed to that audience is acceptable from ANY registered issuer.
+--
+-- That is the gap this closes. A GitHub Actions token and a Kubernetes projected
+-- token are otherwise accepted at the same audience, so a trust anchor that should
+-- only ever speak to one audience can present assertions addressed to another's.
+-- Per-issuer narrowing is defence in depth against a misconfigured or compromised
+-- issuer.
+--
+-- NARROWING, never widening, and this is the whole design:
+--
+--   NULL          -> the shared deployment policy applies unchanged. The default, so
+--                    every existing issuer behaves exactly as it did before this
+--                    column existed.
+--   a value       -> the space-separated set this issuer may address, INTERSECTED
+--                    with the shared policy at enforcement time.
+--
+-- An issuer can therefore only ever restrict what the deployment already permits. If
+-- it could widen, a per-issuer setting would become a way to escape the deployment
+-- floor, which is the opposite of a trust policy. `signing_alg_allow` already works
+-- this way and this column deliberately mirrors it, including the NULL-means-shared
+-- default, so an operator learns one rule rather than two.
+--
+-- No CHECK on the contents: the values are audience STRINGS whose validity is a
+-- property of the deployment's own policy, not something SQL can decide. The
+-- intersection at enforcement is what makes an unusable value inert rather than
+-- dangerous -- an issuer whose allowlist shares nothing with the shared policy can
+-- address nothing, which fails closed.
+
+ALTER TABLE external_assertion_issuers
+    ADD COLUMN audience_allow text;
+
+-- NO UPDATE GRANT, deliberately, and this is the correction that matters.
+--
+-- A first draft granted the data plane a column-scoped UPDATE here by analogy with
+-- other additive columns. That is wrong for THIS table: `rls.rs` asserts
+-- `app_role_can_only_update_the_enabled_switch_on_external_assertion_trust`, and
+-- `signing_alg_allow` -- the column this one deliberately mirrors -- carries no UPDATE
+-- grant either. An issuer's trust configuration is WRITE-ONCE at registration; only
+-- the enable switch toggles.
+--
+-- That is the stronger design and worth keeping: a compromised or buggy data-plane
+-- path can disable an issuer (fail-safe) but cannot WIDEN what it may address. A
+-- grant here would have made the audience constraint editable by exactly the plane it
+-- exists to constrain.
+--
+-- The column is therefore app-unwritable after INSERT, which migration 0018's
+-- narrowing already guarantees by default.

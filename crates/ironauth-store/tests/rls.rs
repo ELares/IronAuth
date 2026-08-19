@@ -624,8 +624,7 @@ async fn app_role_can_only_update_the_enabled_switch_on_external_assertion_trust
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let tenant = scope.tenant().to_string();
-    let environment = scope.environment().to_string();
+    let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
 
     // Register an issuer and a mapping through the data-plane acting store.
     let issuer_id = ExternalIssuerId::generate(&env, &scope);
@@ -636,6 +635,7 @@ async fn app_role_can_only_update_the_enabled_switch_on_external_assertion_trust
         .register(
             &env,
             NewExternalAssertionIssuer {
+                audience_allow: None,
                 id: &issuer_id,
                 issuer: "https://issuer.test",
                 jwks: Some("{}"),
