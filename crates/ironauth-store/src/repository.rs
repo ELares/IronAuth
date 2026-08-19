@@ -8332,6 +8332,19 @@ impl ActingUsageRepo<'_> {
         write_audited(
             spec,
             async |tx: &mut Transaction<'_, Postgres>| {
+                // The same per-scope append lock `OutboxRepo::append_event` takes, so a
+                // publish orders against ordinary producers rather than racing them.
+                //
+                // UNMEASURED, and said rather than implied. Deleting this line leaves every
+                // store and admin suite green, because nothing drives concurrent publishes:
+                // the property is that two appends to one scope cannot interleave their
+                // sequence assignment, and observing it needs two writers held at a
+                // specific interleaving. `events_cursor_ordering.rs::
+                // serialising_appenders_on_a_scope_lock_makes_sequence_order_equal_commit_order`
+                // measures exactly that property for `append_event`, and this path takes the
+                // same lock by the same key; what is untested is that THIS path still takes
+                // it. A test aimed at the window would be a flake rather than a test, which
+                // is the same call the client-key resolver's check-then-act comment makes.
                 sqlx::query("SELECT pg_advisory_xact_lock($1)")
                     .bind(append_lock_key(scope))
                     .execute(&mut **tx)
@@ -22024,8 +22037,27 @@ impl OutboxRepo<'_> {
         .await?;
         tx.commit().await?;
 
+        // A cursor at the BEGINNING has missed nothing, and this guard is what makes that
+        // true rather than merely intended.
+        //
+        // `sequence` is a TABLE-WIDE identity, so a scope's oldest row is almost never
+        // global sequence 1: with two tenants writing, the second one's oldest row might be
+        // 2, or 5000. `beginning()` is 0, so `oldest_retained > 1` held for every scope but
+        // whichever happened to own sequence 1, and a fold from the beginning got `Gone`.
+        // Measured before this guard: a second tenant in the same database answered 500 on
+        // `GET /usage` and on `POST /usage/publish`, and 410 on the event feed with a
+        // message saying events "have been deleted" when nothing had been. Once retention
+        // pruned the row holding sequence 1, that became every scope.
+        //
+        // The remaining heuristic is CONSERVATIVE rather than exact, and under a table-wide
+        // sequence it cannot be exact: `MIN(sequence) > after + 1` cannot tell "rows of this
+        // scope were pruned" from "the intervening sequences belonged to other scopes". It
+        // only ever fires for a consumer whose own last-read row is gone, which is the case
+        // where a resync is the safe answer, so it over-reports rather than under-reports.
+        // Making it exact needs a per-scope pruned-through watermark, which is a schema
+        // change and its own issue.
         if let Some(oldest_retained) = oldest {
-            if oldest_retained > after_sequence.saturating_add(1) {
+            if after_sequence > 0 && oldest_retained > after_sequence.saturating_add(1) {
                 return Ok(EventPage::Gone { oldest_retained });
             }
         }

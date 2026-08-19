@@ -95,9 +95,13 @@ ROUTE = re.compile(r"\b(post|put|patch|delete)\(\s*([a-z0-9_]+)::([a-z0-9_]+)\s*
 # one that arrived as announcing nothing. An EXEMPT entry would have been a false
 # statement: that handler both mutates and announces.
 #
-# Deliberately not tightened to `event_catalog::envelope`: every call site in the admin
-# crate is that qualified form today, and the looser pattern's only risk is a false PASS
-# on some future unrelated `envelope(`. That is the wrong direction to guard against
+# Deliberately not tightened to `event_catalog::envelope`, and NOT because every call site
+# is that qualified form: 76 are, and four are `crate::events::envelope(` (`users.rs` three
+# times, `organizations.rs` once). An earlier version of this comment asserted the stronger
+# thing, which was false and would have made the tightening look free. Measured, tightening
+# still passes 127/127, because those four producers are detected through the `*_event(`
+# shape instead. The reason to keep the loose pattern is the tradeoff below: the looser
+# pattern's only risk is a false PASS on some future unrelated `envelope(`. That is the wrong direction to guard against
 # here -- a false FAILURE on a correct handler would push the next author toward an
 # EXEMPT entry, and a wrong EXEMPT entry is permanent while a wrong regex is not.
 EMITS = re.compile(r"DomainEvent|\b[a-z0-9_]+_event\s*\(|\benvelope\s*\(")

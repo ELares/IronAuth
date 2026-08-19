@@ -276,7 +276,17 @@ async fn publishing_usage_emits_the_same_numbers_the_api_returns() {
             .await;
         assert_eq!(status, StatusCode::OK, "publish: {response}");
         body = serde_json::from_str(&response).expect("json");
-        if body["tokens_issued"] == 5 {
+        // EVERY seeded count, not the first interesting one. The fixture seeds sign-ins,
+        // then tokens, then connections, and the feed is watermarked, so they become visible
+        // in that order. Keying the exit on `tokens_issued` alone let the loop stop while
+        // `connections` was still 0, and the assertion twenty lines below then failed on
+        // connections instead: 3 failures in 10 runs at `--test-threads=4`, reporting
+        // `left: 0, right: 3`. A poll loop's exit condition has to be the whole state it is
+        // waiting for.
+        if body["monthly_active_users"] == 2
+            && body["tokens_issued"] == 5
+            && body["connections"] == 3
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -334,14 +344,33 @@ async fn publishing_usage_emits_the_same_numbers_the_api_returns() {
                 .await
                 .expect("complete");
         }
-        if !seen.is_empty() {
+        // Wait for the event the LAST response named, not merely for any event: with a
+        // distinct key per attempt there may be several on the feed, and the earliest is
+        // not the one whose numbers `body` carries.
+        if seen.iter().any(|event| event["id"] == body["event_id"]) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    // SELECTED BY ID, not by position, and that is not a detail.
+    //
+    // The loop above uses a distinct key per attempt (a constant key made every attempt
+    // after the first an idempotent REPLAY, which is the defect the distinct key fixed), so
+    // every attempt that runs appends ANOTHER `usage.reported` event. `seen.first()` is the
+    // EARLIEST of them and `body` is the LAST response, so on any run that took more than
+    // one attempt the two came from different publishes and the field comparisons below
+    // compared different snapshots. Measured: 3 failures in 10 runs at `--test-threads=4`,
+    // reporting `left: 1, right: 2` on `tokens_issued`.
+    //
+    // The fix that introduced this fixed a real bug and created a smaller one, which is
+    // exactly why the selector has to be the id the response already carries.
+    let event_id = body["event_id"].as_str().expect("event_id");
     let reported = seen
-        .first()
-        .expect("a usage.reported event reaches the feed");
+        .iter()
+        .find(|event| event["id"] == event_id)
+        .unwrap_or_else(|| {
+            panic!("the event named by the response must be on the feed: {seen:#?}")
+        });
 
     // ALL FOUR fields, not the two that happened to be interesting. An earlier version of
     // this test pinned `tokens_issued` alone, and mutants that returned 999 connections or
@@ -390,6 +419,25 @@ async fn publishing_usage_emits_the_same_numbers_the_api_returns() {
     assert!(
         !actions.is_empty(),
         "a successful publish must write a usage.publish audit row"
+    );
+
+    // The TARGET too, not only the action. Round 3 asserted the action and stopped there,
+    // and pointing the row at another target survived every suite: an audit row that names
+    // the right verb against the wrong object is not evidence of anything.
+    let targets: Vec<(String, String)> = sqlx::query_as(
+        "SELECT target_kind, target_id FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'usage.publish'",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_all(h.db().owner_pool())
+    .await
+    .expect("read the audit targets");
+    assert!(
+        targets
+            .iter()
+            .all(|(kind, id)| kind == "usage" && id == "usage"),
+        "a usage.publish row must target the scope-level usage handle: {targets:?}"
     );
 
     // The envelope timestamp is MILLISECONDS. Feeding it microseconds is a thousandfold
@@ -585,6 +633,33 @@ async fn a_truncated_publish_says_so_in_the_response_and_in_the_event() {
             append(h, &env, scope, &format!("t_tok_{i}"), "token.issued", "-").await;
         }
 
+        // WAIT FOR THE FEED before publishing, or the bound has nothing to stop at.
+        //
+        // The feed is watermarked, so a publish taken immediately after seeding folds an
+        // EMPTY first page and returns `truncated: false` however low the bound is. That is
+        // not a flaky assertion, it is the assertion measuring a feed that is not there yet,
+        // and it failed 3 times in 10 at `--test-threads=4`. Polled directly with generous
+        // bounds, so the wait is independent of the bound under test.
+        let outbox = h.store().scoped(scope);
+        let outbox = outbox.outbox();
+        let mut caught_up = false;
+        for _ in 0..100 {
+            let (tally, _) =
+                ironauth_admin::usage::fold_usage_bounded(&outbox, 1_000_000, 1_000_000)
+                    .await
+                    .expect("fold");
+            if tally.tokens_issued() == 3 {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            caught_up,
+            "{label}: the fold's view never caught up with the three seeded events, so the \
+             bound below would be measured against a feed the fold cannot see"
+        );
+
         let publish = format!("/v1/tenants/{tenant}/environments/{environment}/usage/publish");
         let (status, _, response) = h.post(&publish, "k-trunc-publish", "").await;
         assert_eq!(status, StatusCode::OK, "{label}: {response}");
@@ -629,6 +704,25 @@ async fn a_truncated_publish_says_so_in_the_response_and_in_the_event() {
             published["payload"]["truncated"], body["truncated"],
             "{label}: the event and the response must agree: {published}"
         );
+
+        // AND THE GET, which had the seam and none of the measurement. `export_usage` reads
+        // the same `usage_fold_limit()` override, and hardcoding `truncated: false` in the
+        // response it returns survived every suite: the only assertion on it pinned `false`,
+        // which is what that mutant already produces. The publish path was measured last
+        // round and the export path one function above it was not.
+        let (status, _, exported) = h
+            .get(&format!(
+                "/v1/tenants/{tenant}/environments/{environment}/usage"
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{label}: {exported}");
+        let exported: Value = serde_json::from_str(&exported).expect("json");
+        assert_eq!(
+            exported["truncated"], body["truncated"],
+            "{label}: the GET and the POST fold the same feed under the same bound, so they \
+             must report the same truncation: {exported}"
+        );
+
         outcomes.push((label, body["truncated"].clone()));
     }
 
@@ -1133,6 +1227,31 @@ async fn a_fold_whose_feed_is_mostly_unmeterable_stops_at_the_scan_bound() {
 
     let outbox = h.store().scoped(scope);
     let outbox = outbox.outbox();
+
+    // WAIT FOR THE FOLD'S VIEW, and assert that it caught up.
+    //
+    // The feed is gated on `pg_snapshot_xmin`, so a concurrent test's open transaction holds
+    // rows back and the first page comes back EMPTY. `fold_usage_bounded` then returns at
+    // the `events.is_empty()` arm with `truncated: false`, and this test failed 4 times in
+    // 10 under `--test-threads=4` for exactly that reason. Its sibling
+    // `a_published_snapshot_does_not_consume_the_export_budget` has this loop; this one had
+    // no loop at all.
+    let mut caught_up = false;
+    for _ in 0..100 {
+        let (tally, _) = ironauth_admin::usage::fold_usage_bounded(&outbox, 1_000, 1_000)
+            .await
+            .expect("fold");
+        if tally.tokens_issued() == 4 {
+            caught_up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        caught_up,
+        "the fold's view never caught up with the four seeded events, so the scan bound \
+         below would be measured against a feed the fold cannot see"
+    );
 
     // A meterable limit far above what the feed holds, so ONLY the scan bound can fire.
     let (tally, truncated) = ironauth_admin::usage::fold_usage_bounded(&outbox, 1_000, 2)

@@ -1525,8 +1525,10 @@ async fn an_event_outside_the_catalog_is_refused_permanently_and_reaches_no_endp
         "payload": {"user_id": "usr_1"}
     });
     // Enqueued through the UNVALIDATED seam, and that is now load-bearing rather than
-    // incidental. The emit-time assertion (issue #108 criterion 1) sits at the single
-    // insert every event-feed row passes through, so an ordinary enqueue of this envelope
+    // incidental. The emit-time assertion (issue #108 criterion 1) sits at BOTH of the two
+    // statements that insert into `outbox_messages`, which together are every event-feed
+    // row (it was one statement until this change, and "the single statement every row
+    // passes through" was false by exactly one), so an ordinary enqueue of this envelope
     // panics inside the producer's transaction -- which is exactly what it is there for.
     //
     // That assertion is compiled out of RELEASE builds by design, so in production this row

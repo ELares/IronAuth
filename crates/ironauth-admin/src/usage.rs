@@ -44,8 +44,8 @@ pub(crate) const USAGE_REPORTED: &str = "usage.reported";
 /// request that gets slower every day until it times out, and it would do so first for the
 /// busiest tenant, which is the one most likely to be asking.
 ///
-/// [`AdminState::usage_fold_limit`] can lower it, and only a `testing` build can set that,
-/// so this is the bound in every shipped binary.
+/// [`AdminState::with_usage_fold_limit`] can lower it, and it exists only in a `testing`
+/// build, so this is the bound in every shipped binary.
 const EXPORT_FOLD_LIMIT: i64 = 10_000;
 
 /// A tenant's usage for the retained window.
