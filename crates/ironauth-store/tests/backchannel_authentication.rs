@@ -702,6 +702,7 @@ async fn only_the_named_subject_can_decide_and_only_from_pending() {
     let stolen = repo
         .backchannel_auth()
         .decide(
+            &env,
             &id,
             "usr_grace",
             true,
@@ -716,6 +717,7 @@ async fn only_the_named_subject_can_decide_and_only_from_pending() {
     let denied = repo
         .backchannel_auth()
         .decide(
+            &env,
             &id,
             "usr_ada",
             false,
@@ -731,6 +733,7 @@ async fn only_the_named_subject_can_decide_and_only_from_pending() {
     let flipped = repo
         .backchannel_auth()
         .decide(
+            &env,
             &id,
             "usr_ada",
             true,
@@ -755,6 +758,7 @@ async fn approval_makes_a_request_redeemable_and_denial_does_not() {
     assert!(
         repo.backchannel_auth()
             .decide(
+                &env,
                 &approved_id,
                 "usr_ada",
                 true,
@@ -859,4 +863,194 @@ async fn a_client_cannot_register_push_or_a_mismatched_notification_endpoint() {
         .await
         .expect_err("a poll client must not carry a notification endpoint");
     assert!(error.to_string().contains("ping_has_endpoint"), "{error}");
+}
+
+/// Seed a request in the given delivery mode, wired consistently with the schema's
+/// mode/endpoint/token pairing.
+async fn seed(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    mode: DeliveryMode,
+) -> BackchannelAuthRequestId {
+    let id = BackchannelAuthRequestId::generate(env, &scope);
+    let digest = format!(
+        "{:064x}",
+        id.to_string().len() + usize::from(mode == DeliveryMode::Ping) + 41
+    );
+    db.store()
+        .scoped(scope)
+        .backchannel_auth()
+        .create(&NewBackchannelRequest {
+            auth_req_id_digest: &digest,
+            id: &id,
+            client_id: "cli_owner",
+            delivery_mode: mode,
+            client_notification_url: match mode {
+                DeliveryMode::Ping => Some("https://client.test/ciba"),
+                DeliveryMode::Poll => None,
+            },
+            client_notification_token: match mode {
+                DeliveryMode::Ping => Some(b"nt-secret"),
+                DeliveryMode::Poll => None,
+            },
+            requested_scope: None,
+            authorization_details: None,
+            binding_message: None,
+            subject: "usr_ada",
+            interval_secs: 5,
+            expires_at_micros: FAR_FUTURE_MICROS,
+        })
+        .await
+        .expect("create");
+    id
+}
+
+/// Claim and complete every pending CIBA ping, returning their payloads.
+async fn drain_pings(db: &TestDatabase, env: &Env, scope: Scope) -> Vec<serde_json::Value> {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::CIBA_PING_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim pings");
+    let payloads = claimed.iter().map(|m| m.payload.clone()).collect();
+    for m in claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, &m)
+            .await
+            .expect("complete");
+    }
+    payloads
+}
+
+/// Approving a PING request enqueues exactly one ping; approving a POLL request enqueues
+/// none (#131 criterion 2).
+///
+/// Both halves, because only together do they say the enqueue is conditional. A test that
+/// checked the ping alone would pass an implementation that notified every approval, which
+/// would call a poll client's endpoint -- and a poll client has no endpoint, so the message
+/// would carry a null URL and fail forever in the retry loop.
+#[tokio::test]
+async fn approving_a_ping_request_enqueues_one_notification_and_poll_enqueues_none() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let repo = db.store().scoped(scope);
+
+    // POLL: approving must enqueue nothing.
+    let poll_id = seed(&db, &env, scope, DeliveryMode::Poll).await;
+    assert!(
+        repo.backchannel_auth()
+            .decide(
+                &env,
+                &poll_id,
+                "usr_ada",
+                true,
+                BackchannelApprovalLinkage::default(),
+                NOW_MICROS
+            )
+            .await
+            .expect("decide")
+    );
+    assert!(
+        drain_pings(&db, &env, scope).await.is_empty(),
+        "a poll client has no endpoint; notifying one would queue a null URL that fails forever"
+    );
+
+    // PING: approving must enqueue exactly one, carrying the endpoint and NOT the token.
+    let ping_id = seed(&db, &env, scope, DeliveryMode::Ping).await;
+    assert!(
+        repo.backchannel_auth()
+            .decide(
+                &env,
+                &ping_id,
+                "usr_ada",
+                true,
+                BackchannelApprovalLinkage::default(),
+                NOW_MICROS
+            )
+            .await
+            .expect("decide")
+    );
+    let pings = drain_pings(&db, &env, scope).await;
+    assert_eq!(pings.len(), 1, "exactly one ping per approval: {pings:?}");
+    assert_eq!(pings[0]["auth_req_id"], ping_id.to_string());
+    assert_eq!(pings[0]["notification_url"], "https://client.test/ciba");
+    assert!(
+        pings[0].get("client_notification_token").is_none(),
+        "the notification token is a live bearer credential and must never ride in the \
+         queue payload: {:?}",
+        pings[0]
+    );
+}
+
+/// A DENIAL enqueues no ping.
+///
+/// The client learns nothing by notification when the user said no -- it discovers the
+/// denial by polling, exactly as CIBA Core describes. Notifying on denial would also mean an
+/// endpoint that is down burns retry budget for a request that will never issue tokens.
+#[tokio::test]
+async fn denying_a_ping_request_enqueues_no_notification() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = BackchannelAuthRequestId::generate(&env, &scope);
+    let digest = format!("{:064x}", id.to_string().len() + 61);
+    db.store()
+        .scoped(scope)
+        .backchannel_auth()
+        .create(&NewBackchannelRequest {
+            auth_req_id_digest: &digest,
+            id: &id,
+            client_id: "cli_owner",
+            delivery_mode: DeliveryMode::Ping,
+            client_notification_url: Some("https://client.test/ciba"),
+            client_notification_token: Some(b"nt-secret"),
+            requested_scope: None,
+            authorization_details: None,
+            binding_message: None,
+            subject: "usr_ada",
+            interval_secs: 5,
+            expires_at_micros: FAR_FUTURE_MICROS,
+        })
+        .await
+        .expect("create");
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .decide(
+                &env,
+                &id,
+                "usr_ada",
+                false,
+                BackchannelApprovalLinkage::default(),
+                NOW_MICROS
+            )
+            .await
+            .expect("decide")
+    );
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::CIBA_PING_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    assert!(claimed.is_empty(), "a denial notifies nobody");
 }

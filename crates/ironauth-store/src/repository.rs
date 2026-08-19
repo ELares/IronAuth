@@ -20564,6 +20564,23 @@ pub const WEBHOOK_REPLAY_CONSUMER: &str = "webhook.replay";
 /// matches no rows, the pool reports healthy, and the only symptom is targets that never fire.
 pub const FLOW_TARGET_DELIVERY_CONSUMER: &str = "flow_target.delivery";
 
+/// The registered consumer name a CIBA PING notification drains under (issue #131
+/// criterion 2).
+///
+/// Routed through the outbox for the same reason async flow targets are: the bounded backoff,
+/// the dead-lettering at the attempts bound, and the replay already exist there, so a ping
+/// inherits all three instead of growing a second delivery mechanism beside them.
+///
+/// A SEPARATE consumer again, and here the reason is sharper than for the others. A ping
+/// carries a per-request bearer credential to a per-client endpoint; a client whose endpoint
+/// is down must not consume the retry budget of an unrelated client's webhook, and a stuck
+/// ping at the head of an ordering group must not delay deliveries it has nothing to do with.
+///
+/// Exported so producer and consumer read the SAME bytes. A consumer whose name does not
+/// equal the discriminator its producers write drains NOTHING, silently: the claim matches no
+/// rows, the pool reports healthy, and the only symptom is pings that never arrive.
+pub const CIBA_PING_CONSUMER: &str = "ciba.ping";
+
 /// The consumer name ONE batch of a trait MIGRATION JOB drains under (issue #53).
 ///
 /// #104 named "migration jobs" as one of the async paths the outbox exists to carry, and
@@ -63963,6 +63980,7 @@ impl BackchannelAuthRepo<'_> {
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn decide(
         &self,
+        env: &Env,
         id: &BackchannelAuthRequestId,
         subject: &str,
         approved: bool,
@@ -63970,7 +63988,7 @@ impl BackchannelAuthRepo<'_> {
         now_micros: i64,
     ) -> Result<bool, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        let result = sqlx::query(
+        let decided = sqlx::query(
             "UPDATE backchannel_authentication_requests \
              SET status = CASE WHEN $3 THEN 'approved' ELSE 'denied' END, \
                  grant_id = $4, consent_ref = $5, auth_methods = $6, \
@@ -63979,7 +63997,8 @@ impl BackchannelAuthRepo<'_> {
              WHERE id = $1 AND subject = $2 \
                AND tenant_id = $8 AND environment_id = $9 \
                AND status = 'pending' \
-               AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $10",
+               AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $10 \
+             RETURNING delivery_mode, notified, client_notification_url",
         )
         .bind(id.to_string())
         .bind(subject)
@@ -63991,10 +64010,64 @@ impl BackchannelAuthRepo<'_> {
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(now_micros)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+
+        // The enqueue sits INSIDE this transaction and AFTER the write's own guard, so a
+        // refused decision (wrong subject, already decided, expired) and a rolled-back one
+        // announce nothing. A ping enqueued beside the approval rather than after it is the
+        // difference between "the client is told once the approval is durable" and "the
+        // client is told about an approval that did not happen".
+        let Some(row) = decided else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        if approved {
+            let mode_text: String = row.get("delivery_mode");
+            let already_notified: bool = row.get("notified");
+            // Only ping mode notifies, and only once. `notified` is flipped in the SAME
+            // statement below, so a concurrent second approval cannot enqueue a duplicate --
+            // though `status = 'pending'` already makes a second approval impossible, which
+            // makes this the second of two fences rather than the only one.
+            if mode_text == crate::ciba::DeliveryMode::Ping.as_str() && !already_notified {
+                enqueue_outbox_in_tx(
+                    &mut tx,
+                    env,
+                    self.scope,
+                    &NewOutboxMessage {
+                        consumer: CIBA_PING_CONSUMER,
+                        // Derived from the DOMAIN FACT (this request's id), never from
+                        // entropy, so one approval can enqueue exactly one ping: a second
+                        // attempt is a unique violation rather than a duplicate notification.
+                        idempotency_key: &id.to_string(),
+                        // Ordered per REQUEST, so two messages about one request serialize
+                        // while unrelated clients' pings proceed independently.
+                        ordering_key: &id.to_string(),
+                        payload: serde_json::json!({
+                            "auth_req_id": id.to_string(),
+                            // What the ping needs, and nothing more. The notification TOKEN is
+                            // deliberately ABSENT: it is a live bearer credential, an outbox
+                            // row is readable by anything that can read the queue, and the
+                            // consumer reads it from the request row it already has to fetch.
+                            "notification_url": row
+                                .get::<Option<String>, _>("client_notification_url"),
+                        }),
+                    },
+                )
+                .await?;
+                sqlx::query(
+                    "UPDATE backchannel_authentication_requests SET notified = true \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+                )
+                .bind(id.to_string())
+                .bind(self.scope.tenant().to_string())
+                .bind(self.scope.environment().to_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         tx.commit().await?;
-        Ok(result.rows_affected() == 1)
+        Ok(true)
     }
 
     /// Redeem an approved request exactly once, for the client it belongs to (#131
