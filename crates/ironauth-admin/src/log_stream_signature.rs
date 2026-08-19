@@ -50,9 +50,8 @@
 //! not a counter, so there is no "expected next one" to compare against. A consumer can prove
 //! it has not seen a position before; it cannot prove it has missed nothing in between.
 //! Closing that would mean signing the batch's START position too, so positions chain, and
-//! that is a wire change rather than a documentation one. That is the whole reason the
-//! position is signed rather than merely
-//! sent.
+//! that is a wire change rather than a documentation one. Detecting a replay is the whole
+//! reason the position is signed rather than merely sent.
 //!
 //! **The count and the digest of the events** are separate on purpose. The digest alone would
 //! detect any change to the payload, so the count is redundant for integrity -- but it is not

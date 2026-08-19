@@ -1061,6 +1061,41 @@ pub fn position_header_value(stream_id: &str, sequence: i64, cursor_id: &str) ->
     format!("{stream_id} {sequence} {cursor_id}")
 }
 
+/// The headers an S3 PUT of a batch is SIGNED over: host, the two `x-amz-*` request headers,
+/// and the batch metadata.
+///
+/// ONE source for both lists that follow. The canonical request is signed from this, and the
+/// outgoing request is derived from the same vector by dropping `host` (which travels as the
+/// URL's authority rather than a header) and adding `authorization`. Building the two
+/// independently made it a one-line edit to move the batch metadata OUTSIDE the signature
+/// while still sending it, which is exactly the "a metadata header `SigV4` did not sign can be
+/// stripped in flight" failure the comment below warns about, and it survived the suite.
+#[must_use]
+pub fn s3_signed_put_headers(
+    host: &str,
+    payload_hash: &str,
+    timestamp: &str,
+    stream_id: &str,
+    signature: Option<&str>,
+    position: (i64, &str),
+) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("host".to_string(), host.to_owned()),
+        ("x-amz-content-sha256".to_string(), payload_hash.to_owned()),
+        ("x-amz-date".to_string(), timestamp.to_owned()),
+    ];
+    // Object METADATA, because an S3 object has no headers once written and a consumer
+    // reading the bucket later has nowhere else to find it. INSIDE the signed set, so it
+    // cannot be stripped or rewritten in flight: the batch signature is exactly the thing an
+    // attacker would remove.
+    headers.extend(
+        s3_batch_metadata(stream_id, signature, position)
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value)),
+    );
+    headers
+}
+
 /// The headers a batch carries when the stream is signed: the signature, and the position it
 /// covers. Empty when the batch ships unsigned.
 ///
@@ -1237,32 +1272,18 @@ impl LogSink for S3LogSink {
                 .to_owned();
             let path = format!("/{bucket}/{prefix}/{stream_id}/{last}.json");
             let payload_hash = crate::sigv4::sha256_hex(body.as_bytes());
+            let signed_headers = s3_signed_put_headers(
+                &host,
+                &payload_hash,
+                &timestamp,
+                &stream_id,
+                batch_signature.as_deref(),
+                (position_sequence, &position_cursor),
+            );
             let canonical = crate::sigv4::CanonicalRequest {
                 method: "PUT",
                 path: &path,
-                headers: {
-                    let mut headers = vec![
-                        ("host".to_string(), host.clone()),
-                        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-                        ("x-amz-date".to_string(), timestamp.clone()),
-                    ];
-                    // Object METADATA, because an S3 object has no headers once written and
-                    // a consumer reading the bucket later has nowhere else to find it.
-                    //
-                    // Inside the CANONICAL headers, not merely on the request: a metadata
-                    // header SigV4 did not sign can be stripped or rewritten in flight, and
-                    // the batch signature is exactly the thing an attacker would remove.
-                    headers.extend(
-                        s3_batch_metadata(
-                            &stream_id,
-                            batch_signature.as_deref(),
-                            (position_sequence, &position_cursor),
-                        )
-                        .into_iter()
-                        .map(|(name, value)| (name.to_string(), value)),
-                    );
-                    headers
-                },
+                headers: signed_headers.clone(),
                 payload_hash: &payload_hash,
             };
             let scope = crate::sigv4::credential_scope(&date, &region, "s3");
@@ -1279,16 +1300,17 @@ impl LogSink for S3LogSink {
                 &fetcher,
                 format!("{}{path}", endpoint.trim_end_matches('/')),
                 {
-                    let mut headers = vec![
-                        ("x-amz-content-sha256", payload_hash),
-                        ("x-amz-date", timestamp),
-                        ("authorization", authorization),
-                    ];
-                    headers.extend(s3_batch_metadata(
-                        &stream_id,
-                        batch_signature.as_deref(),
-                        (position_sequence, &position_cursor),
-                    ));
+                    // DERIVED from the signed set, not rebuilt beside it. `host` travels as
+                    // the URL's authority rather than a header, and `authorization` is the
+                    // product of signing, so those two differ; everything else, including the
+                    // batch metadata, is by construction the same list that was signed.
+                    // Rebuilding it made it a one-line edit to send metadata that was not
+                    // signed, or sign metadata that was not sent.
+                    let mut headers: Vec<(String, String)> = signed_headers
+                        .into_iter()
+                        .filter(|(name, _)| name != "host")
+                        .collect();
+                    headers.push(("authorization".to_string(), authorization));
                     headers
                 },
                 body,
@@ -1344,7 +1366,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 async fn post_object(
     fetcher: &ironauth_fetch::Fetcher,
     url: String,
-    headers: Vec<(&'static str, String)>,
+    headers: Vec<(String, String)>,
     body: String,
 ) -> SinkOutcome {
     let mut request = ironauth_fetch::FetchRequest::new(

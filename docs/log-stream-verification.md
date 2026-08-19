@@ -14,14 +14,14 @@ object store, a forwarder or a log index, which is where a SIEM actually reads i
 SigV4 signing on the S3 sink is transport authentication to S3: discarded the moment the
 object is written, and absent entirely for the HTTP, Datadog and Splunk sinks.
 
-Three questions survive TLS, and the batch signature answers all three:
+Three questions survive TLS. The batch signature answers two of them outright:
 
 - **Authenticity.** Did this come from the deployment, or from anyone who can write to the
   bucket?
 - **Replay.** Have I applied this already, under another name?
 
-Ordering is only partly answerable, and it is worth being exact about which part. See
-"What replay detection can and cannot tell you" below.
+**Ordering** is the third, and it is only partly answerable: see "What replay detection can
+and cannot tell you" below before you build on it.
 
 ## What arrives on the wire
 

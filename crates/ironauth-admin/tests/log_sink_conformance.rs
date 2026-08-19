@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use ironauth_admin::log_shipper::{
     DatadogSink, HttpLogSink, LogSink, S3LogSink, SinkOutcome, SplunkHecSink, datadog_body,
-    s3_batch_metadata, signed_batch_headers, splunk_body,
+    s3_batch_metadata, s3_signed_put_headers, signed_batch_headers, splunk_body,
 };
 use ironauth_store::log_stream::{LogStreamRecord, SinkType, StreamHealth, StreamSource};
 use serde_json::{Value, json};
@@ -299,8 +299,9 @@ fn an_empty_batch_produces_a_well_formed_body() {
 /// That made the signed stream INERT. The signature covers
 /// `(stream id, sequence, cursor id, count, digest)` and only the last two are derivable from
 /// the payload, so a consumer holding the body and the signature could not rebuild the
-/// canonical string, and therefore could not verify it, detect a gap, or detect a replay. The
-/// shipper spent an HMAC per batch that nothing could check.
+/// canonical string, and therefore could not verify it or detect a replay. (Not a gap: the
+/// position is a timestamp rather than a counter, so gaps are not detectable with what a
+/// batch carries.) The shipper spent an HMAC per batch that nothing could check.
 ///
 /// The signature header had no test either, which is how both went unnoticed for so long.
 ///
@@ -373,4 +374,55 @@ fn an_s3_batch_carries_the_signature_and_position_as_object_metadata() {
 #[test]
 fn an_unsigned_s3_batch_carries_no_metadata() {
     assert!(s3_batch_metadata("lgs_stream", None, (4242, "aud_01J8ZQ")).is_empty());
+}
+
+/// The batch metadata is inside the set the `SigV4` signature is computed over (issue #110).
+///
+/// # Why this is the assertion that matters
+///
+/// The security claim is not that the metadata is SENT, it is that it is SIGNED: a metadata
+/// header the request signature did not cover can be stripped or rewritten in flight, and a
+/// position an attacker can rewrite is a replay check the attacker controls.
+///
+/// Review measured that deleting the metadata from the canonical block alone, or from the
+/// outgoing block alone, each survived the whole suite. Both lists now derive from this one
+/// function, so they cannot disagree, and this pins that the signed set is the one carrying
+/// the metadata rather than merely that some list somewhere does.
+#[test]
+fn the_s3_batch_metadata_is_inside_the_signed_header_set() {
+    let signed = s3_signed_put_headers(
+        "audit.s3.amazonaws.com",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "20260819T000000Z",
+        "lgs_stream",
+        Some("deadbeefcafe"),
+        (4242, "aud_01J8ZQ"),
+    );
+    let names: Vec<&str> = signed.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "host",
+            "x-amz-content-sha256",
+            "x-amz-date",
+            "x-amz-meta-ironauth-log-signature",
+            "x-amz-meta-ironauth-log-position",
+        ],
+        "both metadata keys must be in the SIGNED set, or they can be stripped in flight"
+    );
+    assert!(
+        signed.contains(&(
+            "x-amz-meta-ironauth-log-position".to_string(),
+            "lgs_stream 4242 aud_01J8ZQ".to_string()
+        )),
+        "and the signed position must be the one the batch was signed against: {signed:?}"
+    );
+}
+
+/// An UNSIGNED S3 batch signs only the three request headers, and carries no metadata.
+#[test]
+fn an_unsigned_s3_batch_signs_only_the_request_headers() {
+    let signed = s3_signed_put_headers("h", "p", "t", "lgs_stream", None, (4242, "aud_01J8ZQ"));
+    let names: Vec<&str> = signed.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["host", "x-amz-content-sha256", "x-amz-date"]);
 }
