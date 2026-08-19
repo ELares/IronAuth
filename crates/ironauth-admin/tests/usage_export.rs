@@ -181,3 +181,113 @@ async fn a_fold_that_stops_early_says_so() {
         "a fold that reached the end of the feed must not report truncation"
     );
 }
+
+/// Publishing emits a `usage.reported` event carrying the same numbers the API returns
+/// (issue #107 criterion 4: metering "exports via API and webhook").
+///
+/// Both halves asserted together, because the value of the webhook export is that a billing
+/// pipeline gets the SAME aggregate the API would have given it. If the two could disagree,
+/// a customer could be invoiced from one and audited against the other.
+///
+/// The payload carries counts and never a list of users: metering distinguishes people, it
+/// does not identify them, and a billing pipeline is the last system that should hold a
+/// directory of its customer's users.
+#[tokio::test]
+async fn publishing_usage_emits_the_same_numbers_the_api_returns() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-usage-pub").await;
+    let env = Env::system();
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+
+    for (i, subject) in ["alice", "bob", "alice"].iter().enumerate() {
+        append(
+            &h,
+            &env,
+            scope,
+            &format!("p_act_{i}"),
+            "user.signed_in",
+            subject,
+        )
+        .await;
+    }
+    for i in 0..2 {
+        append(&h, &env, scope, &format!("p_tok_{i}"), "token.issued", "-").await;
+    }
+
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/usage");
+    let publish = format!("{path}/publish");
+
+    // Poll until the watermarked feed has the seeded events, same reason as the test above.
+    let mut body = Value::Null;
+    for _ in 0..100 {
+        let (status, _, response) = h.post(&publish, "k-usage-publish", "").await;
+        assert_eq!(status, StatusCode::OK, "publish: {response}");
+        body = serde_json::from_str(&response).expect("json");
+        if body["tokens_issued"] == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        body["monthly_active_users"], 2,
+        "alice twice and bob once: {body}"
+    );
+    assert_eq!(body["tokens_issued"], 2, "{body}");
+
+    // The API returns the same aggregate.
+    let (status, _, api) = h.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "export: {api}");
+    let api: Value = serde_json::from_str(&api).expect("json");
+    assert_eq!(api["monthly_active_users"], body["monthly_active_users"]);
+    assert_eq!(api["tokens_issued"], body["tokens_issued"]);
+
+    // And a `usage.reported` event is on the feed for a webhook subscriber to receive.
+    let mut seen: Vec<Value> = Vec::new();
+    for _ in 0..100 {
+        let claimed = h
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        for m in &claimed {
+            if m.payload["type"] == "usage.reported" {
+                seen.push(m.payload.clone());
+            }
+        }
+        for m in claimed {
+            h.store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, &m)
+                .await
+                .expect("complete");
+        }
+        if !seen.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let reported = seen
+        .first()
+        .expect("a usage.reported event reaches the feed");
+    assert_eq!(
+        reported["payload"]["monthly_active_users"],
+        body["monthly_active_users"]
+    );
+    assert_eq!(reported["payload"]["tokens_issued"], body["tokens_issued"]);
+    assert_eq!(reported["payload"]["truncated"], false);
+    assert!(
+        reported["payload"].get("users").is_none() && reported["payload"].get("subjects").is_none(),
+        "the snapshot must carry counts, never a directory of users: {reported}"
+    );
+}

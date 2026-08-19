@@ -17,7 +17,7 @@
 
 use axum::extract::{Path, State};
 use axum::response::Response;
-use ironauth_store::{ActorRef, EventCursor, EventPage, Scope, UsageTally};
+use ironauth_store::{ActorRef, CorrelationId, EventCursor, EventPage, Scope, UsageTally};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -167,4 +167,101 @@ async fn resolve_scope(
     }
     let actor = principal.require_environment(tenant, environment)?;
     Ok((Scope::new(tenant, environment), actor))
+}
+
+/// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish`
+///
+/// Fold the retained feed and PUBLISH the result as a `usage.reported` event, so metering
+/// reaches a billing pipeline by webhook and not only by polling this API (issue #107
+/// criterion 4).
+///
+/// # Why publishing is an explicit action
+///
+/// It could have been emitted as a side effect of [`export_usage`], and that would be wrong:
+/// reporting would then be driven by whoever happens to poll, so a dashboard refresh would
+/// bill a customer and a quiet week would bill nobody. A snapshot is something an operator or
+/// a scheduler decides to take, so it gets its own verb.
+///
+/// # Authority
+///
+/// `management.write_config`, NOT the `management.read` the export needs. Publishing appends
+/// to the event feed every webhook subscriber receives, which is a write to shared state even
+/// though the numbers it carries are read-only. A caller who may only READ usage must not be
+/// able to make every subscriber receive a billing record.
+///
+/// # Errors
+///
+/// [`ApiError`] for an unknown scope, a caller without `management.write`, or a store fault.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/usage/publish",
+    operation_id = "publishUsage",
+    tag = "usage",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The published snapshot", body = UsageExport),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Unknown tenant or environment", body = ErrorBody)
+    )
+)]
+pub async fn publish_usage(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+
+    let (tally, truncated) =
+        fold_usage(&state.store().scoped(scope).outbox(), EXPORT_FOLD_LIMIT).await?;
+    let export = UsageExport {
+        monthly_active_users: tally.monthly_active_users(),
+        tokens_issued: tally.tokens_issued(),
+        connections: tally.connections(),
+        truncated,
+    };
+
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "usage.reported",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "monthly_active_users": export.monthly_active_users,
+            "tokens_issued": export.tokens_issued,
+            "connections": export.connections,
+            "truncated": export.truncated,
+        }),
+    )
+    .ok_or(ApiError::Internal)?;
+
+    state
+        .store()
+        .scoped(scope)
+        .outbox()
+        .append_event(
+            state.env(),
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                // The EVENT id, so two publishes are two events while a retried enqueue of
+                // the same one is a conflict rather than a duplicate invoice line.
+                idempotency_key: &id,
+                // Ordered per SCOPE: two snapshots of one environment must reach a billing
+                // consumer in the order they were taken, or it books the older numbers last.
+                ordering_key: &format!("{}/{}", scope.tenant(), scope.environment()),
+                payload: envelope,
+            },
+        )
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    let body = serde_json::to_string(&export).map_err(|_| ApiError::Internal)?;
+    Ok(json(axum::http::StatusCode::OK, body))
 }
