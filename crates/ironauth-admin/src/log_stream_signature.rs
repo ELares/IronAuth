@@ -2,6 +2,13 @@
 
 //! The signed security-event stream (issue #110 criterion 5).
 //!
+//! Consumer-facing documentation is `docs/log-stream-verification.md`, and the published
+//! verifier is `examples/verify-log-stream.py`, which
+//! `log_sink_conformance::the_published_sample_consumer_verifies_a_batch_this_code_signed`
+//! runs against a batch this module signed. Change the canonical string below and that test
+//! fails, which is the point: a published verifier that drifts from the signer is worse than
+//! none, because an operator will trust it.
+//!
 //! A SIEM receiving shipped batches has to answer three questions that TLS cannot answer for
 //! it, because TLS protects the hop and says nothing about the payload once it has landed in
 //! an object store, a forwarder, or a log index:

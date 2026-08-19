@@ -72,12 +72,20 @@ pub trait LogSink: Send + Sync {
     /// [`None`] when it ships unsigned. Computed by the shipper, never by the sink: it must be
     /// identical whatever carried it, and a per-sink signature would be four chances to get
     /// the canonical form subtly different.
+    ///
+    /// `position` is the cursor position that signature covers, and a sink MUST transmit it
+    /// alongside the signature. Without it a consumer cannot rebuild the canonical string, so
+    /// it cannot verify anything at all: the signature is over `(stream id, sequence, cursor
+    /// id, count, digest)` and only the last two are derivable from the payload. This
+    /// parameter exists because the trait previously did not carry it, which is why
+    /// `POSITION_HEADER` was defined, documented as sent, and sent by nothing.
     fn deliver<'a>(
         &'a self,
         stream: &'a LogStreamRecord,
         credential: Option<&'a str>,
         events: &'a [Value],
         signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>>;
 }
 
@@ -252,7 +260,8 @@ pub async fn replay_dead_letters(
                 &stream,
                 credential.as_deref(),
                 &events,
-                replay_signature.as_deref()
+                replay_signature.as_deref(),
+                (dead.from.0, dead.from.1.as_str())
             )
             .await,
             SinkOutcome::Accepted
@@ -418,7 +427,13 @@ async fn ship_stream(
     };
 
     match sink
-        .deliver(stream, credential.as_deref(), &events, signature.as_deref())
+        .deliver(
+            stream,
+            credential.as_deref(),
+            &events,
+            signature.as_deref(),
+            (position.0, position.1.as_str()),
+        )
         .await
     {
         SinkOutcome::Accepted => {
@@ -576,6 +591,7 @@ impl LogSink for HttpLogSink {
         _credential: Option<&'a str>,
         events: &'a [Value],
         signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = Self::endpoint(stream).map(str::to_owned);
@@ -608,6 +624,13 @@ impl LogSink for HttpLogSink {
                     );
                 };
                 request = request.header(http::HeaderName::from_static(SIGNATURE_HEADER), value);
+                // The position travels WITH the signature or the signature is unverifiable.
+                // Built from the same values the shipper signed, one line above the send, so
+                // the two cannot drift apart.
+                let position_value = position_header_value(&stream.id, position.0, position.1);
+                if let Ok(value) = http::HeaderValue::from_str(&position_value) {
+                    request = request.header(http::HeaderName::from_static(POSITION_HEADER), value);
+                }
             }
             // Matched by VARIANT rather than rendered with `Display`, so the reason
             // stored on the stream row is operator-safe by construction. This string is
@@ -772,6 +795,7 @@ impl LogSink for DatadogSink {
         credential: Option<&'a str>,
         events: &'a [Value],
         signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = configured_endpoint(stream).map(str::to_owned);
@@ -791,9 +815,7 @@ impl LogSink for DatadogSink {
                 );
             };
             let mut headers = vec![("dd-api-key", credential)];
-            if let Some(signature) = signature {
-                headers.push((SIGNATURE_HEADER, signature.to_owned()));
-            }
+            headers.extend(signed_batch_headers(&stream.id, signature, position));
             post_json(&fetcher, endpoint, headers, body).await
         })
     }
@@ -827,6 +849,7 @@ impl LogSink for SplunkHecSink {
         credential: Option<&'a str>,
         events: &'a [Value],
         signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = configured_endpoint(stream).map(str::to_owned);
@@ -850,9 +873,7 @@ impl LogSink for SplunkHecSink {
                 );
             };
             let mut headers = vec![("authorization", format!("Splunk {credential}"))];
-            if let Some(signature) = signature {
-                headers.push((SIGNATURE_HEADER, signature.to_owned()));
-            }
+            headers.extend(signed_batch_headers(&stream.id, signature, position));
             post_json(&fetcher, endpoint, headers, body).await
         })
     }
@@ -1016,12 +1037,61 @@ pub const SIGNATURE_HEADER: &str = "x-ironauth-log-signature";
 /// gap or a replay.
 pub const POSITION_HEADER: &str = "x-ironauth-log-position";
 
+/// Render the position header's value.
+///
+/// `<stream id> <sequence> <cursor id>`, space separated, in the order the canonical string
+/// uses them. Space separated because all three are opaque identifiers a consumer splits
+/// positionally, and because a `:` or `.` would be a separator that could plausibly occur
+/// inside an id and turn a parse bug into a verification failure with no visible cause.
+///
+/// The STREAM ID is in here as well as the position, despite the constant's name, because a
+/// consumer needs all three to rebuild the canonical string and a second header would be a
+/// second thing to forget to send.
+#[must_use]
+pub fn position_header_value(stream_id: &str, sequence: i64, cursor_id: &str) -> String {
+    format!("{stream_id} {sequence} {cursor_id}")
+}
+
+/// The headers a batch carries when the stream is signed: the signature, and the position it
+/// covers. Empty when the batch ships unsigned.
+///
+/// ONE function for all three HTTP-shaped sinks, because the two headers are only useful
+/// together. A sink that sent the signature and forgot the position would ship something that
+/// looks verifiable and is not, which is precisely the state this repaired: `POSITION_HEADER`
+/// was defined and documented as sent, and the only reference to it in the workspace was its
+/// own declaration.
+#[must_use]
+pub fn signed_batch_headers(
+    stream_id: &str,
+    signature: Option<&str>,
+    position: (i64, &str),
+) -> Vec<(&'static str, String)> {
+    signature.map_or_else(Vec::new, |signature| {
+        vec![
+            (SIGNATURE_HEADER, signature.to_owned()),
+            (
+                POSITION_HEADER,
+                position_header_value(stream_id, position.0, position.1),
+            ),
+        ]
+    })
+}
+
 /// The S3 object metadata key the batch signature travels in.
 ///
 /// An S3 object carries no headers once written, so the signature has to become metadata or a
 /// consumer reading the bucket has nowhere to find it. `x-amz-meta-` is the only prefix S3
 /// preserves.
 pub const S3_SIGNATURE_METADATA: &str = "x-amz-meta-ironauth-log-signature";
+
+/// The S3 object metadata key the batch POSITION travels in.
+///
+/// Same reasoning as the signature: an object carries no headers once written, so a consumer
+/// reading the bucket needs the position as metadata or it cannot rebuild the canonical
+/// string. Both go inside the `SigV4` canonical headers for the same reason, that a metadata
+/// header `SigV4` did not sign can be stripped or rewritten in flight, and a position an
+/// attacker can rewrite is a gap and replay check an attacker controls.
+pub const S3_POSITION_METADATA: &str = "x-amz-meta-ironauth-log-position";
 
 /// One PUT per batch, keyed by stream and cursor position, signed with AWS `SigV4`.
 ///
@@ -1061,12 +1131,18 @@ impl LogSink for S3LogSink {
         credential: Option<&'a str>,
         events: &'a [Value],
         signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         // Captured under its own name because this method shadows `signature` with the
         // SigV4 request signature further down, and the two are entirely different things:
         // one authenticates this PUT to S3, the other proves the BATCH to whoever reads the
         // object afterwards. Conflating them is the mistake this rename exists to prevent.
         let batch_signature = signature.map(str::to_owned);
+        // Owned before the async block, like the signature above and for the same reason: the
+        // future outlives the borrow of `position`. `stream_id` is already owned inside the
+        // block for the object key.
+        let position_sequence = position.0;
+        let position_cursor = position.1.to_owned();
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = configured_endpoint(stream).map(str::to_owned);
         let region = stream
@@ -1144,6 +1220,10 @@ impl LogSink for S3LogSink {
                     // the batch signature is exactly the thing an attacker would remove.
                     if let Some(signature) = batch_signature.as_deref() {
                         headers.push((S3_SIGNATURE_METADATA.to_string(), signature.to_owned()));
+                        headers.push((
+                            S3_POSITION_METADATA.to_string(),
+                            position_header_value(&stream_id, position_sequence, &position_cursor),
+                        ));
                     }
                     headers
                 },
@@ -1170,6 +1250,10 @@ impl LogSink for S3LogSink {
                     ];
                     if let Some(signature) = batch_signature {
                         headers.push((S3_SIGNATURE_METADATA, signature));
+                        headers.push((
+                            S3_POSITION_METADATA,
+                            position_header_value(&stream_id, position_sequence, &position_cursor),
+                        ));
                     }
                     headers
                 },

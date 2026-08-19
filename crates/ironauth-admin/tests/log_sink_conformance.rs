@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use ironauth_admin::log_shipper::{
     DatadogSink, HttpLogSink, LogSink, S3LogSink, SinkOutcome, SplunkHecSink, datadog_body,
-    splunk_body,
+    signed_batch_headers, splunk_body,
 };
 use ironauth_store::log_stream::{LogStreamRecord, SinkType, StreamHealth, StreamSource};
 use serde_json::{Value, json};
@@ -102,7 +102,13 @@ async fn every_sink_refuses_a_stream_with_no_endpoint() {
     for (sink_type, sink) in sinks() {
         let configured = stream(sink_type, json!({}));
         let outcome = sink
-            .deliver(&configured, Some(CANARY), &events(), None)
+            .deliver(
+                &configured,
+                Some(CANARY),
+                &events(),
+                None,
+                (1, "aud_fixture"),
+            )
             .await;
         assert!(
             matches!(outcome, SinkOutcome::Rejected(_)),
@@ -127,7 +133,9 @@ async fn a_vendor_sink_refuses_without_a_credential() {
             continue;
         }
         let configured = stream(sink_type, complete_config(sink_type));
-        let outcome = sink.deliver(&configured, None, &events(), None).await;
+        let outcome = sink
+            .deliver(&configured, None, &events(), None, (1, "aud_fixture"))
+            .await;
         match outcome {
             SinkOutcome::Rejected(reason) => assert!(
                 reason.contains("credential_secret_name"),
@@ -165,7 +173,13 @@ async fn no_sink_leaks_the_credential_into_its_reason() {
             for config in [json!({}), complete_config(sink_type)] {
                 let configured = stream(sink_type, config);
                 let outcome = sink
-                    .deliver(&configured, Some(credential.as_str()), &events(), None)
+                    .deliver(
+                        &configured,
+                        Some(credential.as_str()),
+                        &events(),
+                        None,
+                        (1, "aud_fixture"),
+                    )
                     .await;
                 if let SinkOutcome::Rejected(reason) = outcome {
                     assert!(
@@ -192,7 +206,13 @@ async fn an_unsendable_credential_is_refused_at_the_header() {
         json!({"endpoint": "https://sink.invalid/in"}),
     );
     let outcome = sink
-        .deliver(&configured, Some(&format!("{CANARY}\nx")), &events(), None)
+        .deliver(
+            &configured,
+            Some(&format!("{CANARY}\nx")),
+            &events(),
+            None,
+            (1, "aud_fixture"),
+        )
         .await;
     match outcome {
         SinkOutcome::Rejected(reason) => assert!(
@@ -265,4 +285,133 @@ fn a_configured_splunk_index_is_carried_on_every_event() {
 fn an_empty_batch_produces_a_well_formed_body() {
     assert_eq!(datadog_body(&[]), "[]");
     assert_eq!(splunk_body(&[], None), "");
+}
+
+/// A signed batch carries its POSITION beside its signature, or nothing can verify it
+/// (issue #110 criterion 5).
+///
+/// # Why this test exists
+///
+/// `POSITION_HEADER` was defined, documented as "sent BESIDE the signature", and sent by
+/// nothing: the entire workspace held one reference to it, its own `pub const`. The `LogSink`
+/// trait did not carry the position at all, so no sink could have sent it.
+///
+/// That made the signed stream INERT. The signature covers
+/// `(stream id, sequence, cursor id, count, digest)` and only the last two are derivable from
+/// the payload, so a consumer holding the body and the signature could not rebuild the
+/// canonical string, and therefore could not verify it, detect a gap, or detect a replay. The
+/// shipper spent an HMAC per batch that nothing could check.
+///
+/// The signature header had no test either, which is how both went unnoticed for so long.
+///
+/// This pins the VALUES, not the presence. A header carrying the wrong position verifies
+/// nothing while looking correct, and the position is the half a consumer cannot cross-check
+/// against the payload.
+#[test]
+fn a_signed_batch_carries_the_position_its_signature_covers() {
+    let headers = signed_batch_headers("lgs_stream", Some("deadbeefcafe"), (4242, "aud_01J8ZQ"));
+    assert_eq!(
+        headers,
+        vec![
+            ("x-ironauth-log-signature", "deadbeefcafe".to_string()),
+            (
+                "x-ironauth-log-position",
+                "lgs_stream 4242 aud_01J8ZQ".to_string()
+            ),
+        ],
+        "a signed batch ships the signature AND the position it covers"
+    );
+}
+
+/// An UNSIGNED batch carries neither header.
+///
+/// The pair is meaningless without a signing secret, and a position header on an unsigned
+/// batch would tell a consumer there is something to verify when there is not.
+#[test]
+fn an_unsigned_batch_carries_no_signature_and_no_position() {
+    assert!(
+        signed_batch_headers("lgs_stream", None, (4242, "aud_01J8ZQ")).is_empty(),
+        "an unsigned batch must not advertise a position to verify against"
+    );
+}
+
+/// The PUBLISHED sample consumer verifies a batch this code signed (issue #110 criterion 5).
+///
+/// # Why this is a subprocess and not a Rust assertion
+///
+/// A Rust test that re-implemented the canonical string would agree with `log_stream_signature`
+/// by construction and prove nothing about anyone else's verifier. The criterion asks that the
+/// stream be "verifiable by the published sample consumer", so the test runs THAT FILE, in
+/// another language, over bytes this crate produced. The same reasoning as the Firebase
+/// known-answer vector in `ironauth-hash-scheme`, which is checked from outside the `RustCrypto`
+/// stack rather than against itself.
+///
+/// It also keeps `examples/verify-log-stream.py` honest: a published consumer that drifts from
+/// the signing code is worse than none, because an operator will trust it.
+#[test]
+fn the_published_sample_consumer_verifies_a_batch_this_code_signed() {
+    use std::io::Write as _;
+
+    let events = serde_json::json!([{"class_uid": 3002, "activity_id": 1}]);
+    let events_json = serde_json::to_string(&events).expect("serializes");
+    let key = b"a-shared-signing-secret";
+    let canonical = ironauth_admin::log_stream_signature::canonical_string(
+        "lgs_stream",
+        4242,
+        "aud_01J8ZQ",
+        1,
+        &events_json,
+    );
+    let signature = ironauth_admin::log_stream_signature::sign(key, &canonical);
+
+    let dir = std::env::temp_dir().join(format!("ironauth-consumer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let secret_path = dir.join("key.bin");
+    let body_path = dir.join("batch.json");
+    std::fs::File::create(&secret_path)
+        .and_then(|mut f| f.write_all(key))
+        .expect("write the secret");
+    std::fs::File::create(&body_path)
+        .and_then(|mut f| f.write_all(events_json.as_bytes()))
+        .expect("write the body");
+
+    let consumer = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/verify-log-stream.py"
+    );
+    let run = |signature: &str| {
+        std::process::Command::new("python3")
+            .arg(consumer)
+            .arg("--secret-file")
+            .arg(&secret_path)
+            .arg("--body")
+            .arg(&body_path)
+            .arg("--position")
+            .arg("lgs_stream 4242 aud_01J8ZQ")
+            .arg("--signature")
+            .arg(signature)
+            .output()
+            .expect("run the published consumer")
+    };
+
+    let accepted = run(&signature);
+    assert!(
+        accepted.status.success(),
+        "the published consumer must verify a batch this code signed: {}{}",
+        String::from_utf8_lossy(&accepted.stdout),
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    // AND IT MUST REFUSE A BAD ONE, or the check above passes for a consumer that accepts
+    // everything, which is the failure mode a sample verifier is most likely to ship with.
+    let mut tampered = signature.clone();
+    tampered.replace_range(0..1, if signature.starts_with('a') { "b" } else { "a" });
+    let refused = run(&tampered);
+    assert!(
+        !refused.status.success(),
+        "the published consumer must refuse a signature that is not the batch's: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -108,6 +108,7 @@ async fn a_plaintext_endpoint_is_refused_with_a_reason_that_names_the_scheme() {
                 Some("token"),
                 &events(),
                 None,
+                (1, "aud_fixture"),
             )
             .await;
         match outcome {
@@ -144,7 +145,13 @@ async fn an_https_endpoint_gets_past_the_policy_and_fails_at_the_transport() {
     let sink = HttpLogSink::new(fetcher_to(addr));
     let endpoint = format!("https://collector.example.test:{}/ingest", addr.port());
     let outcome = sink
-        .deliver(&stream(SinkType::Http, &endpoint), None, &events(), None)
+        .deliver(
+            &stream(SinkType::Http, &endpoint),
+            None,
+            &events(),
+            None,
+            (1, "aud_fixture"),
+        )
         .await;
     match outcome {
         SinkOutcome::Rejected(reason) => {
