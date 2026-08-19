@@ -58,6 +58,47 @@ updates:
       # the wall has moved. Check `rust-version` on the index when revisiting.
       - dependency-name: trybuild
         versions: [">=1.0.120"]
+      # sqlx 0.9.0 declares `rust-version = "1.94.0"`, nine minors above this
+      # workspace's 1.85 promise. `scripts/msrv-audit.sh` names all seven siblings
+      # (sqlx, sqlx-core, sqlx-macros, sqlx-macros-core, sqlx-mysql, sqlx-postgres,
+      # sqlx-sqlite) and the `msrv (1.85)` CI lane fails on them, so #924 could not
+      # merge whatever else was done to it.
+      #
+      # THE PORT ITSELF WAS DONE AND IT WORKS, which is why this is an MSRV wall and
+      # not a "we did not try". Measured on a throwaway branch: the whole workspace
+      # plus every test compiles on 0.9 after three mechanical changes, and the suite
+      # got 60 test binaries deep with zero failures before it was stopped as moot.
+      # The changes are (1) the `json` feature, which 0.9 stops supplying implicitly
+      # and whose absence alone breaks 18 call sites, (2) 79 dynamic-SQL sites wrapped
+      # in `AssertSqlSafe` after auditing every one, and (3) ten test helpers taking
+      # `&str` that now need an owned string. The audit is the part worth keeping: all
+      # 79 interpolate compile-time constants, `&'static str` parameters, or
+      # enum-derived SQL fragments, and NONE carries caller or user data.
+      #
+      # The manifest requirement `"0.8"` already excludes 0.9 by caret semantics, so
+      # nothing can walk into it. This rule stops dependabot proposing the manifest
+      # EDIT that replaces it, which is what #924 was.
+      #
+      # WHAT RETIRES THIS: the workspace MSRV moving to 1.94 or above, which is an
+      # owner decision about a published promise, not a build detail. There is no
+      # "sqlx publishes a lower rust-version" path to wait for here, unlike trybuild.
+      - dependency-name: sqlx
+        versions: [">=0.9"]
+      # rand_chacha 0.9 implements the rand_core 0.9 traits, and this workspace's
+      # signing path needs rand_core 0.6. Measured by compiling #923: `elliptic-curve
+      # 0.13.8` and `rsa 0.9.10` both require `CryptoRngCore` from rand_core 0.6, so
+      # `ChaCha20Rng` from 0.9 does not satisfy the bound and
+      # `crates/ironauth-jose/src/signing_key.rs` fails to build at three call sites.
+      #
+      # This is not a wall we can climb alone: it retires when the RustCrypto stack
+      # moves to rand_core 0.9 (elliptic-curve 0.14 and rsa 0.10 or later), and then
+      # rand_chacha, elliptic-curve and rsa have to move together as a SET, which is
+      # exactly the sibling case `msrv-audit.sh` warns about.
+      #
+      # The manifest requirement `"0.3"` already excludes it; this stops the proposed
+      # manifest edit.
+      - dependency-name: rand_chacha
+        versions: [">=0.4"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
