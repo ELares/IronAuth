@@ -471,16 +471,32 @@ async fn a_template_write_into_an_absent_environment_is_the_uniform_not_found() 
 /// worse than an unrecognized constraint: row-level security still hides its reads, so a
 /// write into an absent scope SUCCEEDS and the row is then invisible to everybody.
 ///
+/// BOTH HALVES OF THAT SENTENCE, because the first version of this test enforced only the
+/// first. "A foreign key onto a scope table" is a DISJUNCTION: an environment-scoped table
+/// carrying the single-column `tenants` key and no `environments` key satisfies it, and
+/// that is precisely the write-into-an-absent-environment gap migration 0150 exists to
+/// close. So the second assertion below requires an `environments` key of every table that
+/// has an `environment_id` column at all. It costs nothing today: it passes against the
+/// same three documented exceptions.
+///
 /// "Scoped" is read from the schema as forced row-level security, the same definition
 /// `scripts/scoped-table-registration.sh` uses, so a new scoped table is covered the moment
 /// it is migrated rather than when somebody remembers to list it.
 #[tokio::test]
 async fn every_scoped_table_declares_a_scope_foreign_key() {
-    // `tenants` and `environments` are the scope tables THEMSELVES. `tenants` is the root,
-    // so it has no scope above it to reference, and `environments` references `tenants`
-    // through a plain single-column key that the composite rule does not describe. Both
-    // still force row-level security, which is why they are named here rather than filtered
-    // by some property that would also excuse a real table.
+    // The scope tables THEMSELVES, held out as belt and braces rather than because they
+    // reach this filter today. An earlier version of this comment said "both still force
+    // row-level security", which is false: no migration enables it on either, so neither
+    // can appear in `forced` and this exclusion is inert. Dropping it changes no outcome,
+    // measured.
+    //
+    // It stays because the day either one is brought under forced row-level security is
+    // exactly the day this test would start reporting the root of the scope tree as a gap.
+    // Only `tenants` would need it even then: `environments` declares
+    // `tenant_id text NOT NULL REFERENCES tenants (id)` (0001), a plain single-column key
+    // onto a scope table, which `ForeignKey::onto_a_scope_table` accepts, so it lands in
+    // `with_scope_key` on its own. `tenants` is the root and has nothing above it to
+    // reference.
     const THE_SCOPE_TABLES: [&str; 2] = ["tenants", "environments"];
 
     // THREE TABLES THAT DO NOT SATISFY THE RULE TODAY, listed rather than filtered away.
@@ -524,10 +540,12 @@ async fn every_scoped_table_declares_a_scope_foreign_key() {
     .await
     .expect("read the forced row-level-security tables");
 
-    // The same non-triviality floor the rule's inventory carries, for the same reason: an
-    // empty result would satisfy every assertion below while measuring nothing.
+    // A non-triviality floor, so an empty or truncated result cannot satisfy every assertion
+    // below while measuring nothing. 100 rather than 50: the live schema has 117 and
+    // `scripts/scoped-table-registration.sh` pins its own floor at 117, so a query that
+    // silently returned 51 rows would have cleared the old bound by a factor of two.
     assert!(
-        forced.len() > 50,
+        forced.len() > 100,
         "the schema must force row-level security on the scoped tables; found {} which \
          means this query is reading the wrong thing rather than that the tables are gone",
         forced.len()
@@ -560,6 +578,39 @@ async fn every_scoped_table_declares_a_scope_foreign_key() {
         "these are documented above as MISSING a scope foreign key and now have one, so \
          the list here is stale and hides the next real gap: {fixed:#?}"
     );
+
+    // THE SECOND HALF: an ENVIRONMENT-scoped table needs an `environments` key specifically.
+    // The assertion above accepts a `tenants` key alone, which is the shape 113 tables have
+    // and which says nothing about whether a write into an absent ENVIRONMENT can land.
+    let environment_scoped: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_attribute a ON a.attrelid = c.oid \
+         WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relforcerowsecurity \
+         AND a.attname = 'environment_id' AND a.attnum > 0 AND NOT a.attisdropped \
+         ORDER BY c.relname",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the environment-scoped tables");
+    let onto_environments: BTreeSet<String> = candidate_foreign_keys(&db)
+        .await
+        .into_iter()
+        .filter(|key| key.parent == "environments")
+        .map(|key| key.child)
+        .collect();
+    let missing_environment_key: Vec<&str> = environment_scoped
+        .iter()
+        .map(String::as_str)
+        .filter(|table| !THE_SCOPE_TABLES.contains(table) && !onto_environments.contains(*table))
+        .filter(|table| !known.contains(table))
+        .collect();
+    assert!(
+        missing_environment_key.is_empty(),
+        "every forced-row-level-security table with an environment_id column must declare \
+         a foreign key onto environments, or a write naming an environment that never \
+         existed lands: {missing_environment_key:#?}"
+    );
 }
 
 /// The two constraints migration 0150 rewrites keep `ON DELETE CASCADE` (issues #111, #112).
@@ -586,7 +637,7 @@ async fn the_rewritten_scope_keys_still_cascade_on_delete() {
             "SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con \
              JOIN pg_class child ON child.oid = con.conrelid \
              JOIN pg_namespace ns ON ns.oid = child.relnamespace \
-             WHERE ns.nspname = 'public' AND con.conname = $1",
+             WHERE ns.nspname = 'public' AND con.contype = 'f' AND con.conname = $1",
         )
         .bind(constraint)
         .fetch_optional(db.owner_pool())
