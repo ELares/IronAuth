@@ -1291,15 +1291,10 @@ async fn start_jwks_server(body: String) -> SocketAddr {
     addr
 }
 
-/// A JWKS server that answers 200 ONCE and then 500 to every later request.
-///
-/// Lets a test prime the cache from a healthy upstream and then make the rotation refetch
-/// fail, which is the only way to observe the fallback: the recording dialer cannot be
-/// retargeted mid-test.
 /// A JWKS server that answers the FIRST request and then stops listening entirely.
 ///
-/// The sibling above fails at the HTTP layer, with a 500. This one fails at the TRANSPORT
-/// layer: the listener is dropped after one request, so a later connect is refused. That is
+/// Its sibling `start_jwks_server_failing_after_first` fails at the HTTP layer, with a 500.
+/// This one fails at the TRANSPORT layer: the listener is dropped after one request, so a later connect is refused. That is
 /// a different arm of `resolve_for_kid` (`Err` from the fetcher rather than a non-success
 /// status) and it is the more common upstream failure, covering a connection refused, a
 /// timeout, and every `FetchError::Blocked` the SSRF fetcher raises.
@@ -1366,6 +1361,17 @@ async fn start_jwks_server_non_2xx_with_keys(before: String, after: String) -> S
     addr
 }
 
+/// A JWKS server that answers 200 ONCE and then 500 to every later request.
+///
+/// Lets a test prime the cache from a healthy upstream and then make the rotation refetch
+/// fail, which is the only way to observe the fallback: the recording dialer cannot be
+/// retargeted mid-test.
+///
+/// This doc was detached from its function for a while, and the way it happened is worth a
+/// line. A later commit inserted a new helper BETWEEN the comment and the fn it described,
+/// so the comment silently became the first of two stacked blocks above the wrong function
+/// and this one was left with none. Nothing warns about it: both still compile, and the
+/// summary line simply describes a function 60 lines away.
 async fn start_jwks_server_failing_after_first(body: String) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2627,6 +2633,78 @@ async fn each_issuers_rotation_is_answered_from_its_own_jwks_uri() {
         dialer.requested().len(),
         2,
         "the cache is keyed per URI: two distinct issuers cost two fetches, not one"
+    );
+}
+
+/// The rotation-refetch bound is PER URI, so one issuer's rotation cannot starve another's
+/// (issue #126 criterion 4).
+///
+/// # Why the test above cannot cover this, and why that mattered
+///
+/// `each_issuers_rotation_is_answered_from_its_own_jwks_uri` runs both calls against a COLD
+/// cache, which its own doc says: `cached()` returns `None` and the kid guard is never
+/// entered. The per-URI property lives INSIDE that guard, in `begin_rotation_refetch`, so no
+/// cold-cache test can reach it however many URIs it uses.
+///
+/// Review measured the consequence. Rekeying the marker to a constant, which makes the bound
+/// global, leaves the whole binary green at 42 passed. The guarantee was stated in three
+/// places (the `client_keys.rs` doc, the CHANGELOG, and a THREAT-MODEL DoS row) and pinned
+/// in none, which is the shape this PR exists to fix one level up.
+///
+/// So this test PRIMES both URIs first, putting each in the cache, and only then presents an
+/// unknown `kid` to each. Both must refetch. Under a global bound the first refetch consumes
+/// the only permit inside the 30s interval and the second issuer is refused: measured
+/// 3 requests then 3, against 3 then 4 on the shipped code.
+#[tokio::test]
+async fn a_rotation_refetch_bound_is_per_uri_so_one_issuer_cannot_starve_another() {
+    let key_a =
+        SigningKey::ed25519_from_seed(Some("uri-a".to_owned()), &[44_u8; 32]).expect("key a");
+    let key_b =
+        SigningKey::ed25519_from_seed(Some("uri-b".to_owned()), &[55_u8; 32]).expect("key b");
+    let server = start_path_routed_jwks_server(jwks_json(&key_a), jwks_json(&key_b)).await;
+
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(86_400),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let uri_a = "http://issuer-a.test/a.json";
+    let uri_b = "http://issuer-b.test/b.json";
+
+    // PRIME. Each URI is asked for the kid it publishes, so the answer is served and cached
+    // without entering the rotation guard. Two fetches.
+    let _ = resolver.resolve_for_kid(now, uri_a, Some("uri-a")).await;
+    let _ = resolver.resolve_for_kid(now, uri_b, Some("uri-b")).await;
+    let after_priming = dialer.requested().len();
+    assert_eq!(
+        after_priming, 2,
+        "priming must cost one fetch per URI, or the rest of this test is measuring something \
+         else"
+    );
+
+    // Issuer A rotates: a kid it does not have yet. This consumes A's permit.
+    let _ = resolver
+        .resolve_for_kid(now, uri_a, Some("rotated-a"))
+        .await;
+    let after_a = dialer.requested().len();
+    assert_eq!(
+        after_a, 3,
+        "an unknown kid on a PRIMED uri must refetch, or this test never enters the guard it \
+         is about"
+    );
+
+    // Issuer B rotates in the same interval. Its permit is its own.
+    let _ = resolver
+        .resolve_for_kid(now, uri_b, Some("rotated-b"))
+        .await;
+    assert_eq!(
+        dialer.requested().len(),
+        4,
+        "the refetch bound is PER URI: issuer A having just spent its permit must not starve \
+         issuer B's rotation, which is the DoS mitigation the threat model claims"
     );
 }
 
