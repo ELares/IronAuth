@@ -16,11 +16,14 @@ cd "$(git rev-parse --show-toplevel)"
 # (rfc9700-scan, event-catalog freshness, dash-scan) sat in the ~44 announced checks it never
 # reached, and were found only by replaying the CI job by hand.
 #
-# The banner count is not the whole story either: the file holds 66 executable commands, 14
-# of which were assertions with no banner of their own (a 15th, `git rev-parse`, is setup) --
-# which is exactly how the six
-# `git diff --exit-code` freshness checks came to be the LAST things still able to kill this
-# script after its first rewrite.
+# The banner count is not the whole story either. MAIN held 65 executable commands, 14 of
+# which were assertions with no banner of their own (a 15th, `git rev-parse`, is setup), and
+# that is exactly how the six `git diff --exit-code` freshness checks came to be the LAST
+# things still able to kill this script after its first rewrite. This file holds 66 (the
+# addition is the prerequisite below) and none of them are unbannered.
+#
+# Both numbers name the file they came from, because an earlier version of this sentence
+# took the numerator from main and the denominator from here.
 #
 # A gate that stops at the first failure also makes the WRONG tradeoff for its user: you fix
 # one thing, re-run the whole expensive suite, and discover the next one. Reporting every
@@ -44,11 +47,43 @@ GATE_FAILURES=()
 # what created the hole, so this flag is part of that move rather than an extra.
 #
 # SKIPPED lanes are ledgered for the same reason one step milder: on a fresh clone with no
-# node dependencies, 62 of 66 checks run and the summary said "all local checks green" with
-# no qualification. This file's own header warns that "a local gate that is quietly a subset
+# node dependencies, no cargo-deny and no broker, 62 of 66 checks run and the summary said
+# "all local checks green" with no qualification. (Measured: the two node lanes alone give
+# 64. An earlier version of this sentence blamed 62 on the node dependencies by themselves,
+# which is the same "attribute the number to the first cause you thought of" mistake the
+# paragraph above is about.)
+#
+# This file says it of itself, at the ironbus lane rather than in the header: "a local gate
+# that is quietly a subset of CI teaches you to trust a green that does not mean what it
+# looks like." This file's own header warns that "a local gate that is quietly a subset
 # of CI teaches you to trust a green that does not mean what it looks like."
 GATE_COMPLETED=0
 GATE_SKIPPED=()
+# WHAT THE TREE LOOKED LIKE BEFORE ANY CHECK RAN.
+#
+# The summary compares this against the tree at exit to answer "did this run rewrite
+# anything", which is the actual question. It replaces a per-call-site flag, and the reason
+# is the third instance in this file of the same lesson: a mechanism keyed on WHICH CHECKS
+# are generators is a text scan, and it was already stale the day it was written. Review
+# measured the selection covering ten of sixteen real generators, missing
+# `admin-spa-embed.sh` (an `rm -rf` plus `cp -R` of a committed directory, the most
+# destructive rewrite the gate performs) and wrongly including `journey-replay.sh`, which
+# writes nothing without `--regenerate`. No test could catch that: converting a call site
+# back produced byte-identical output.
+#
+# A snapshot cannot go stale. A check added tomorrow is covered without anybody
+# remembering, and `git status --porcelain` costs 31 to 76 ms measured on this repo.
+#
+# Compared against the START rather than tested for emptiness, because a developer may
+# begin a gate run with work in progress and the question is what THIS RUN changed.
+#
+# TWO snapshots, not one. `git status --porcelain` reports a file's STATUS, so a generator
+# rewriting a file the developer had already modified produces the same ` M path` line
+# before and after and would slip past. Hashing the diff catches content changes to a
+# file that was already dirty; the porcelain list catches new and untracked ones. Together
+# they answer the question; either alone has a hole.
+GATE_TREE_BEFORE="$(git status --porcelain 2>/dev/null || true)"
+GATE_DIFF_BEFORE="$(git diff HEAD 2>/dev/null | shasum -a 256 2>/dev/null || true)"
 
 # Record a lane this machine could not run. `$1` is the lane, `$2` how to enable it.
 skipped() {
@@ -72,24 +107,86 @@ gate_summary() {
     printf '  - %s\n' "${GATE_FAILURES[@]}"
     # A non-zero rc from an abort is preserved; a clean exit with failures recorded becomes 1.
     if ((rc == 0)); then rc=1; fi
+
   fi
 
-  # LAST, deliberately. An interrupted run's failure list is a PARTIAL accounting, so the
-  # caveat has to be the thing at the bottom of the log rather than a line above a list that
-  # reads as complete.
-  if ((GATE_COMPLETED == 0)); then
+  # WHAT THE RUN LEFT BEHIND, keyed on whether a generator actually RAN.
+  #
+  # The freshness generators (`openapi-check`, the schema and golden scripts) rewrite
+  # their artifact in place and then `git diff --exit-code` it. On main a stale artifact
+  # aborted the gate there and nothing downstream ran; now the run continues, so the
+  # checks after it read the REGENERATED document rather than the committed one.
+  #
+  # WHAT THIS RUN CHANGED, measured rather than predicted.
+  #
+  # The freshness checks regenerate their artifact in place and then diff it, so a run that
+  # ends early or red can leave rewritten files behind. This lists the ones that actually
+  # differ from the tree the run started with, so the operator sees the files rather than a
+  # sentence about files.
+  #
+  # A completed GREEN run prints nothing here for a real reason rather than by suppression:
+  # every generator ends in `git diff --exit-code` or `git status --porcelain`, so if any
+  # had rewritten something the run would not be green. If it somehow did, this says so,
+  # which a flag keyed on failure could never have done.
+  local tree_after diff_after
+  tree_after="$(git status --porcelain 2>/dev/null || true)"
+  diff_after="$(git diff HEAD 2>/dev/null | shasum -a 256 2>/dev/null || true)"
+  if [[ "$tree_after" != "$GATE_TREE_BEFORE" || "$diff_after" != "$GATE_DIFF_BEFORE" ]]; then
     echo ""
-    echo "gate: INCOMPLETE -- the run ended before the last check."
-    echo "      Every check after the interruption never ran, so any list above is a"
-    echo "      PARTIAL accounting. This is not a green gate."
+    echo "gate: this run CHANGED the working tree. A check that regenerates its artifact"
+    echo "      rewrites it in place, and anything graded after that read the regenerated"
+    echo "      file rather than the committed one. Run \`git diff\` before committing."
+    # The files whose STATUS changed, when that is what moved. A content-only change to an
+    # already-dirty file moves the hash and not this list, so the sentence above is the
+    # instruction and this is the shortcut.
+    comm -13 <(printf '%s\n' "$GATE_TREE_BEFORE" | sort) \
+             <(printf '%s\n' "$tree_after" | sort) | sed 's/^/  /'
+  fi
+
+  # The skip ledger prints on EVERY outcome, not only the green one.
+  #
+  # It lived inside the green branch first, which meant an operator working a RED gate never
+  # learned that three lanes had not run at all. The ledger's whole argument is that a silent
+  # subset teaches you to trust the wrong thing, and that argument does not stop applying
+  # because the run went red. If anything a red run is when the reader most needs to know
+  # which checks had no chance to speak.
+  if ((${#GATE_SKIPPED[@]} > 0)); then
+    echo ""
+    echo "gate: ${#GATE_SKIPPED[@]} lane(s) SKIPPED here (CI runs them):"
+    printf '  - %s\n' "${GATE_SKIPPED[@]}"
+  fi
+
+  # THE VERDICT IS LAST, and that placement is load-bearing rather than tidy.
+  #
+  # An interrupted run's failure list is a PARTIAL accounting, so the caveat has to be the
+  # thing at the bottom of the log rather than a line above a list that reads as complete.
+  # `gate.log` is read from the end.
+  #
+  # In every outcome where the shell survives long enough to run this trap, which is every
+  # signal a terminal sends but NOT `SIGKILL`: there the last line is whatever banner was
+  # printed and nothing can change that.
+  echo ""
+  if ((GATE_COMPLETED == 0)); then
+    echo "gate: INCOMPLETE -- the run ended before the last check. Every check after the"
+    echo "      interruption never ran, so anything above is a PARTIAL accounting."
+    # The LAST line carries the `gate:` prefix like the other two verdicts, so a caller
+    # reading `tail -1` gets a verdict in all three outcomes rather than an indented
+    # continuation in one of them.
+    echo "gate: NOT GREEN (incomplete run)"
     if ((rc == 0)); then rc=1; fi
   elif ((rc == 0)); then
+    # QUALIFIED when lanes were skipped, because the last line is what a reader takes
+    # away. Hoisting the ledger out of this branch (so a red run sees it too) silently
+    # made the green line bare again, which undid the very property the ledger was added
+    # for. Both hold now: the ledger prints on every outcome AND the verdict says whether
+    # it is a whole-gate green.
     if ((${#GATE_SKIPPED[@]} > 0)); then
-      echo "gate: all local checks green, ${#GATE_SKIPPED[@]} lane(s) SKIPPED here (CI runs them):"
-      printf '  - %s\n' "${GATE_SKIPPED[@]}"
+      echo "gate: all local checks green (${#GATE_SKIPPED[@]} lane(s) SKIPPED above)"
     else
       echo "gate: all local checks green"
     fi
+  else
+    echo "gate: FAILED (${#GATE_FAILURES[@]} check(s) above)"
   fi
   exit "$rc"
 }
@@ -114,18 +211,36 @@ run() {
 # clippy's most common failure mode.
 #
 # The scope is also narrower than it looks. Counted on this file: 66 checks, 63 of them below
-# this prerequisite. FIFTEEN of those 63 reach cargo -- two on gate.sh's own lines and
-# thirteen through leaf scripts that shell out to it -- or seventeen when cargo-deny and the
-# ironbus lane are both available. The remaining 46 to 48 are grep and python scans that
-# never needed a compiling tree.
+# this prerequisite. FOURTEEN of those 63 reach cargo -- two on gate.sh's own lines and
+# twelve through leaf scripts that shell out to it -- or sixteen when cargo-deny and the
+# ironbus lane are both available. The remaining 47 to 49 do not need a compiling tree at
+# all: mostly grep and python scans, plus six `git diff --exit-code` freshness assertions,
+# a `go build` and FOUR node-toolchain lanes (two guarded by a `node_modules` probe and
+# two not). An earlier version said "two npm lanes", which is the count of the OPTIONAL
+# ones -- the adjacent quantity again, not the one the sentence claims.
 #
-# So the honest claim is "about a quarter of the checks below would report the same root
-# cause", and the reason to stop is that those fifteen are also the slow ones: they would
-# spend the gate's full wall-clock re-proving one compile error.
+# THIRTEEN of the fourteen, not all fourteen, would report the same root cause and are the
+# slow ones. `compat-matrix.sh` runs `cargo metadata`, which reads MANIFESTS: on a crate
+# whose `src/lib.rs` does not parse, `cargo check` exits 101 while `cargo metadata` exits 0
+# in well under a second. (The exit codes are the load-bearing part and reproduce anywhere;
+# an earlier version quoted a specific millisecond figure taken from a review on one
+# machine, which is not ours to state.) So the honest claim is "about a fifth of the checks
+# below would re-prove one compile error, and they are the slow ones".
 #
-# RE-DERIVED rather than adjusted. An earlier version said "18 of the 51", where 51 was a
-# leftover denominator from the banner count this rewrite replaced. Correcting a fraction
-# without re-deriving what it divides by is how a wrong number survives a correction.
+# The distinction is the same defect one layer in: fourteen is true of the set the method
+# selected (reaches cargo), and the sentence beside it claimed a property the method never
+# tested (needs a compiling tree).
+#
+# COUNTED THREE TIMES, AND WRONG THE FIRST TWO. The original said "18 of the 51", where 51
+# was a leftover banner count from before this rewrite. The correction re-derived the
+# denominator and got 63, then miscounted the numerator as fifteen by grepping leaf scripts
+# for the WORD `cargo`: `scripts/rfc9700-scan.sh` holds a shell VARIABLE named `cargo`
+# (`cargo="crates/ironauth-oidc/Cargo.toml"`) and invokes nothing. Counting only `cargo` in
+# COMMAND position gives twelve leaf scripts, not thirteen.
+#
+# The lesson is narrower than "check your arithmetic": a count keyed on a TOKEN counts
+# every appearance of the token, and the second correction reproduced the first one's
+# method while fixing only its inputs.
 #
 # IT ALSO COSTS SOMETHING, on every green run, which is the common case. `cargo check` and
 # `cargo clippy` do not share fingerprints, so clippy re-checks what this just checked. The
@@ -142,7 +257,7 @@ run_required() {
     GATE_FAILURES+=("$label (prerequisite -- later checks were skipped)")
     echo "    FAILED: $label"
     echo "    This is a PREREQUISITE: the cargo-dependent checks after it need a compiling"
-    echo "    tree, so the gate stops rather than re-proving one root cause 15 times."
+    echo "    tree, so the gate stops rather than re-proving one root cause 13 times."
     exit 1
   fi
 }

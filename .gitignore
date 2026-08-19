@@ -4,3 +4,8 @@ node_modules/
 dist/
 .DS_Store
 __pycache__/
+
+# The gate's own capture file. `scripts/gate.sh > gate.log` is the documented way to run a
+# multi-hour gate, and the summary now reports which files THIS RUN changed by comparing
+# the tree before and after -- so a tracked log would make every run report its own log.
+gate.log
