@@ -189,6 +189,12 @@ pub struct AuthPolicy {
     /// access token is issued TO a client. An override that follows a CLIENT'S owner is
     /// therefore expressible here and not on the session.
     pub access_token_ttl_secs: Option<u32>,
+    /// This level's message-template selection, if it states one (issue #619).
+    ///
+    /// Resolved by [`fold_template`], whose rule is INNERMOST WINS UNLESS AN OUTER LEVEL
+    /// LOCKED. See that function for why, and for why it is the one combinator here that is
+    /// not order-independent.
+    pub template_override: Option<TemplateOverride>,
 }
 
 impl AuthPolicy {
@@ -197,6 +203,24 @@ impl AuthPolicy {
     pub fn is_empty(&self) -> bool {
         *self == AuthPolicy::default()
     }
+}
+
+/// A per-level message-template SELECTION, with the lock that decides whether a narrower
+/// level may replace it (issue #619).
+///
+/// A template is not a quantity, so none of this module's other combinators apply to it.
+/// `fold_min` narrows a lifetime because "shorter is safer" is true of every lifetime; there
+/// is no corresponding ordering on templates, and inventing one by analogy would be the kind
+/// of borrowed reasoning issue #619 exists to stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateOverride {
+    /// The template this level selects.
+    pub template_id: String,
+    /// Whether this level PINS its choice: a narrower level may not replace it.
+    ///
+    /// The column behind this shipped with the template store in issue #111, which is what
+    /// makes the opt-in variant buildable rather than hypothetical.
+    pub locked: bool,
 }
 
 /// The four levels of issue #95's resolution order, weakest precedence first.
@@ -323,6 +347,7 @@ pub struct ResolvedAuthPolicy {
     jit_provisioning: Option<bool>,
     invitations_enabled: Option<bool>,
     session_ttl_secs: Option<u32>,
+    template_override: Option<TemplateOverride>,
     session_idle_ttl_secs: Option<u32>,
     access_token_ttl_secs: Option<u32>,
 }
@@ -377,6 +402,17 @@ impl ResolvedAuthPolicy {
     #[must_use]
     pub fn jit_provisioning(&self) -> bool {
         self.jit_provisioning.unwrap_or(false)
+    }
+
+    /// The message template this resolution selects, if any level stated one (issue #619).
+    ///
+    /// [`None`] means NOBODY stated a template, which is not the same as a template that
+    /// resolved to nothing: the caller falls back to the built-in default. Returned by
+    /// reference so the caller can read both the id and whether it was locked -- the lock is
+    /// part of the answer, since an operator asking "why can I not change this" needs it.
+    #[must_use]
+    pub fn template_override(&self) -> Option<&TemplateOverride> {
+        self.template_override.as_ref()
     }
 
     /// Whether invitations may be issued.
@@ -514,6 +550,7 @@ pub fn resolve(levels: &PolicyLevels) -> ResolvedAuthPolicy {
     let mut access_token_ttl_secs: Option<u32> = None;
     let mut factors: Option<BTreeSet<String>> = None;
     let mut domains: Option<BTreeSet<String>> = None;
+    let mut template: Option<TemplateOverride> = None;
 
     for slot in levels.slots() {
         let Some(level) = slot.as_ref() else {
@@ -529,10 +566,12 @@ pub fn resolve(levels: &PolicyLevels) -> ResolvedAuthPolicy {
         fold_min(&mut access_token_ttl_secs, level.access_token_ttl_secs);
         fold_intersect(&mut factors, level.allowed_factors.as_ref());
         fold_intersect(&mut domains, level.allowed_email_domains.as_ref());
+        fold_template(&mut template, level.template_override.as_ref());
     }
 
     ResolvedAuthPolicy {
         mfa_required,
+        template_override: template,
         allowed_factors: match factors {
             None => AllowedFactors::Unconstrained,
             Some(set) if set.is_empty() => AllowedFactors::Empty,
@@ -588,6 +627,54 @@ fn fold_intersect(slot: &mut Option<BTreeSet<String>>, candidate: Option<&BTreeS
         Some(current) => {
             *slot = Some(current.intersection(values).cloned().collect());
         }
+    }
+}
+
+/// Fold one level's template selection into the accumulator: INNERMOST WINS, UNLESS AN OUTER
+/// LEVEL LOCKED IT (issue #619).
+///
+/// # The rule, stated rather than inferred
+///
+/// Walking weakest precedence first (tenant, environment, organization, client):
+///
+/// * A level that states nothing changes nothing.
+/// * A level that states a template REPLACES what it inherited -- innermost wins.
+/// * ...unless what it inherited was LOCKED, in which case the outer choice stands and the
+///   inner statement is ignored.
+///
+/// # Why this shape and not the other two
+///
+/// Issue #619 names three candidates. **Innermost wins** alone is what every other product
+/// does and is what branding actually needs, but it breaks the invariant every other field
+/// here holds: a narrower level cannot escape a wider one. **Outermost pins** alone preserves
+/// that invariant and is useless for the actual use case -- a tenant that sets any template at
+/// all would freeze branding for every organization under it.
+///
+/// The lock is the third: outermost pins ONLY when it opts in. A tenant that does not care
+/// says nothing about `locked` and its organizations brand freely; a tenant with a compliance
+/// obligation locks the one template that carries the legal notice and keeps the rest open.
+/// Both cases coexist, and neither is the default that surprises the other.
+///
+/// # This is the one combinator here that is NOT order-independent
+///
+/// [`PolicyLevels::slots`] documents that every combinator in this module is commutative,
+/// associative and idempotent, so the result does not depend on the walk order -- and says
+/// that a future field which is NOT order-independent "cannot be added without confronting
+/// the ordering explicitly". This is that field, and this is that confrontation.
+///
+/// It is not commutative: tenant-locks-A then org-states-B yields A, while org-states-B then
+/// tenant-locks-A yields A as well -- but tenant-states-A (unlocked) then org-states-B yields
+/// B, and the reverse yields A. The walk order is therefore LOAD-BEARING here in a way it is
+/// not for any other field, which is why `slots()` writes it down once and why the ordering
+/// is asserted directly by test rather than left to follow from algebra.
+fn fold_template(acc: &mut Option<TemplateOverride>, next: Option<&TemplateOverride>) {
+    // A locked inherited choice wins over anything narrower. Checked BEFORE `next` is
+    // examined, so a locked outer level is not merely preferred but never even compared.
+    if acc.as_ref().is_some_and(|current| current.locked) {
+        return;
+    }
+    if let Some(next) = next {
+        *acc = Some(next.clone());
     }
 }
 
@@ -922,6 +1009,7 @@ pub fn audit_detail(policy: &AuthPolicy) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::{
         AllowedDomains, AllowedFactors, AuthPolicy, AuthPolicyError, KNOWN_FACTOR_TOKENS,
         ORG_POLICY_MAX_SESSION_TTL_SECS, PolicyLevels, ResolvedAuthPolicy, SECOND_FACTOR_TOKENS,
@@ -1004,10 +1092,27 @@ mod tests {
         } else {
             None
         };
+        // A template selection, with the id and the lock drawn INDEPENDENTLY.
+        //
+        // The first version tied them together (locked => "tpl_a", unlocked => "tpl_b") and
+        // that made the shuffle oracle pass VACUOUSLY for this field: two levels could never
+        // both state different UNLOCKED templates, which is the one arrangement where order
+        // decides the answer. A generator that cannot produce the interesting case is a
+        // generator that proves nothing about it.
+        let template_override = rng.tri_bool().map(|locked| TemplateOverride {
+            template_id: if rng.tri_bool().unwrap_or(false) {
+                "tpl_a"
+            } else {
+                "tpl_b"
+            }
+            .to_owned(),
+            locked,
+        });
         AuthPolicy {
             mfa_required: rng.tri_bool(),
             allowed_factors,
             allowed_email_domains,
+            template_override,
             jit_provisioning: rng.tri_bool(),
             invitations_enabled: rng.tri_bool(),
             session_ttl_secs: if rng.flip() {
@@ -1267,13 +1372,163 @@ mod tests {
             for permutation in &permutations {
                 let shuffled: Vec<Option<AuthPolicy>> =
                     permutation.iter().map(|&i| slots[i].clone()).collect();
+                // CARVE-OUT (issue #619), the second in this module after
+                // `jit_provisioning`'s, and documented here for the same reason: a reader
+                // who finds a field excluded from a property needs to know it was excluded
+                // DELIBERATELY.
+                //
+                // `template_override` is the one field whose combinator is NOT
+                // order-independent. `fold_template` is innermost-wins-unless-locked, so
+                // two levels stating different unlocked templates resolve to whichever the
+                // walk reached last -- by design, because a template is a SELECTION and has
+                // no ordering to narrow along. Including it here would assert a property it
+                // was deliberately built not to have.
+                //
+                // Everything else must still be order-independent, so the comparison masks
+                // exactly this one field rather than skipping the assertion.
+                let mut actual = resolve(&levels_from(&shuffled));
+                let mut expected_masked = expected.clone();
+                actual.template_override = None;
+                expected_masked.template_override = None;
                 assert_eq!(
-                    resolve(&levels_from(&shuffled)),
-                    expected,
+                    actual, expected_masked,
                     "resolution must not depend on which slot a document occupies"
                 );
             }
         }
+    }
+
+    /// The template combinator IS order-dependent, and that is the design (issue #619).
+    ///
+    /// Carved out of the shuffle oracle above, so the property it DOES have is asserted here
+    /// directly rather than left unstated. Three arrangements, because each pins a different
+    /// half of the rule:
+    ///
+    /// * two unlocked levels: the INNER one wins, which is what branding needs;
+    /// * an outer LOCK: the inner statement is ignored, which is what compliance needs;
+    /// * an inner lock under an outer statement: the inner still wins, because a lock binds
+    ///   levels BELOW it and never the one above.
+    #[test]
+    fn template_selection_is_innermost_wins_unless_an_outer_level_locked() {
+        fn policy(id: &str, locked: bool) -> AuthPolicy {
+            AuthPolicy {
+                template_override: Some(TemplateOverride {
+                    template_id: id.to_owned(),
+                    locked,
+                }),
+                ..AuthPolicy::default()
+            }
+        }
+        fn selected(levels: &PolicyLevels) -> Option<String> {
+            resolve(levels)
+                .template_override()
+                .map(|t| t.template_id.clone())
+        }
+
+        // Innermost wins when nothing is locked.
+        assert_eq!(
+            selected(&PolicyLevels {
+                environment: Some(policy("tpl_env", false)),
+                organization: Some(policy("tpl_org", false)),
+                ..PolicyLevels::default()
+            }),
+            Some("tpl_org".to_owned()),
+            "an organization must be able to brand its own mail"
+        );
+
+        // An outer LOCK pins it: the inner statement is ignored.
+        assert_eq!(
+            selected(&PolicyLevels {
+                environment: Some(policy("tpl_env", true)),
+                organization: Some(policy("tpl_org", false)),
+                ..PolicyLevels::default()
+            }),
+            Some("tpl_env".to_owned()),
+            "a locked outer level must not be overridable from below"
+        );
+
+        // A lock binds LEVELS BELOW, never the level above it.
+        assert_eq!(
+            selected(&PolicyLevels {
+                environment: Some(policy("tpl_env", false)),
+                organization: Some(policy("tpl_org", true)),
+                ..PolicyLevels::default()
+            }),
+            Some("tpl_org".to_owned()),
+            "an inner lock binds what is below it, not what is above"
+        );
+
+        // A level stating nothing changes nothing, at every position.
+        assert_eq!(
+            selected(&PolicyLevels {
+                environment: Some(policy("tpl_env", false)),
+                organization: Some(AuthPolicy::default()),
+                client: Some(AuthPolicy::default()),
+                ..PolicyLevels::default()
+            }),
+            Some("tpl_env".to_owned()),
+        );
+
+        // Nobody speaking selects nothing, which is NOT the same as selecting a default:
+        // the caller falls back to the built-in template.
+        assert_eq!(selected(&PolicyLevels::default()), None);
+    }
+
+    /// Resolution reaches all FOUR levels for a template (issue #619 acceptance).
+    #[test]
+    fn a_template_resolves_at_each_of_the_four_levels() {
+        fn only(slot: impl Fn(AuthPolicy) -> PolicyLevels, id: &str) -> Option<String> {
+            let policy = AuthPolicy {
+                template_override: Some(TemplateOverride {
+                    template_id: id.to_owned(),
+                    locked: false,
+                }),
+                ..AuthPolicy::default()
+            };
+            resolve(&slot(policy))
+                .template_override()
+                .map(|t| t.template_id.clone())
+        }
+        assert_eq!(
+            only(
+                |p| PolicyLevels {
+                    tenant: Some(p),
+                    ..PolicyLevels::default()
+                },
+                "tpl_tenant"
+            ),
+            Some("tpl_tenant".to_owned())
+        );
+        assert_eq!(
+            only(
+                |p| PolicyLevels {
+                    environment: Some(p),
+                    ..PolicyLevels::default()
+                },
+                "tpl_env"
+            ),
+            Some("tpl_env".to_owned())
+        );
+        assert_eq!(
+            only(
+                |p| PolicyLevels {
+                    organization: Some(p),
+                    ..PolicyLevels::default()
+                },
+                "tpl_org"
+            ),
+            Some("tpl_org".to_owned())
+        );
+        assert_eq!(
+            only(
+                |p| PolicyLevels {
+                    client: Some(p),
+                    ..PolicyLevels::default()
+                },
+                "tpl_client"
+            ),
+            Some("tpl_client".to_owned())
+        );
     }
 
     #[test]
@@ -1713,6 +1968,7 @@ mod tests {
             Ok(())
         );
         let good = AuthPolicy {
+            template_override: None,
             mfa_required: Some(true),
             allowed_factors: Some(set(&["pwd", "totp"])),
             allowed_email_domains: Some(set(&["acme.example"])),
@@ -2288,6 +2544,7 @@ mod tests {
         );
         // Nothing but the domain list moves.
         let untouched = AuthPolicy {
+            template_override: None,
             mfa_required: Some(true),
             allowed_factors: Some(set(&["totp"])),
             jit_provisioning: Some(false),
@@ -2303,6 +2560,7 @@ mod tests {
     #[test]
     fn the_audit_detail_is_a_closed_vocabulary_and_never_echoes_a_value() {
         let stated = AuthPolicy {
+            template_override: None,
             mfa_required: Some(true),
             allowed_factors: Some(set(&["totp", "passkey_uv"])),
             allowed_email_domains: Some(set(&["acme.example"])),
