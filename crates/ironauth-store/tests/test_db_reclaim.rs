@@ -428,6 +428,12 @@ async fn the_disposable_marker_is_required_only_when_the_override_lowers_the_thr
         return;
     }
 
+    // The allowed arm's child sweeps the whole cluster at five minutes, which is BELOW the
+    // ten-minute fixture test 4 stages, so this test has to be serialized against its siblings
+    // like they are against each other. Taken after the child branch above: the child is this
+    // same test function in a new process and returns before it reaches here.
+    let _serialized = CLUSTER.lock().await;
+
     // THE PARENT MUST HOLD A REAL MARKER BEFORE IT SPAWNS ANYTHING, and this assertion is
     // the whole reason the test is not itself the hole.
     //
@@ -468,6 +474,8 @@ async fn the_disposable_marker_is_required_only_when_the_override_lowers_the_thr
         command.output().expect("re-invoke this test binary")
     };
 
+    let (admin, _) = admin_pool().await;
+
     for (min_age, marker, must_reach, why) in [
         (
             Some("300"),
@@ -494,6 +502,18 @@ async fn the_disposable_marker_is_required_only_when_the_override_lowers_the_thr
             "the six-hour default is not this guard's to change",
         ),
     ] {
+        // A FOREIGN DATABASE OLD ENOUGH THAT A LOWERED SWEEP WOULD TAKE IT, staged fresh for
+        // each refusing arm so the arm can assert the guard runs BEFORE the drops.
+        //
+        // Staged inside the loop, not before it: the allowed arm sweeps at five minutes and
+        // legitimately takes this database, so a single fixture staged up front is already
+        // gone by the time the third arm looks for it. Measured, not predicted.
+        let bystander = aged_name(20 * 60, "guard_bystander");
+        if !must_reach {
+            drop_if_present(&admin, &bystander).await;
+            create(&admin, &bystander).await;
+        }
+
         let out = child(min_age, marker);
         let text = format!(
             "{}{}",
@@ -510,6 +530,14 @@ async fn the_disposable_marker_is_required_only_when_the_override_lowers_the_thr
                 text.contains("lowers the leftover sweep"),
                 "{why}: the refusal must name the reason, not fail some other way: {text}"
             );
+            // AND IT REFUSED BEFORE IT SWEPT. A guard that runs after the drop loop still
+            // prints this message, and still destroys the database it was meant to protect.
+            assert!(
+                exists(&admin, &bystander).await,
+                "{why}: a refused run must not have swept first, and this 20-minute-old \
+                 database would be taken by a five-minute threshold"
+            );
+            drop_if_present(&admin, &bystander).await;
         }
     }
 }
