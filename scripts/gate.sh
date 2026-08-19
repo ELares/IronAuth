@@ -8,35 +8,52 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-echo "==> fmt"
-cargo fmt --all --check
+# FAILURES ARE ACCUMULATED, not fatal on the spot, and this is the whole point of the
+# rewrite. `set -e` plus a flat sequence meant the FIRST failing check killed the run, so
+# everything after it silently never executed. When scripts/scoped-table-registration.sh
+# started failing at line 32, this gate ran 7 of its 53 checks and exited -- and every
+# "green local gate" claimed after that was 13% of a gate. Three CI breaks (rfc9700-scan,
+# event-catalog freshness, dash-scan) sat in the 46 checks it never reached and were found
+# only by replaying the CI job by hand.
+#
+# A gate that stops at the first failure also makes the WRONG tradeoff for its user: you fix
+# one thing, re-run the whole expensive suite, and discover the next one. Reporting every
+# failure at the end costs one run instead of N.
+#
+# `set -e` stays ON: the `if !` context suppresses errexit for the condition only, so a
+# failure inside a check is caught here while an unexpected error anywhere else still aborts.
+GATE_FAILURES=()
 
-echo "==> msrv audit (no dependency declares a rust-version above the workspace MSRV)"
-./scripts/msrv-audit.sh
+run() {
+  local label="$1"
+  shift
+  echo "==> $label"
+  if ! "$@"; then
+    GATE_FAILURES+=("$label")
+    echo "    FAILED: $label  (continuing -- every failure is reported at the end)"
+  fi
+}
 
-echo "==> clippy (pedantic, -D warnings)"
-cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-echo "==> test"
+run "fmt" cargo fmt --all --check
+
+run "msrv audit (no dependency declares a rust-version above the workspace MSRV)" ./scripts/msrv-audit.sh
+
+run "clippy (pedantic, -D warnings)" cargo clippy --workspace --all-targets --all-features -- -D warnings
+
 # The ironauth-store isolation tests need a real Postgres via DATABASE_URL.
 # with-test-db.sh runs against DATABASE_URL if set (a CI service), else brings up
 # a throwaway local cluster and tears it down. All other tests are unaffected.
-scripts/with-test-db.sh cargo test --workspace --all-features
+run "test" scripts/with-test-db.sh cargo test --workspace --all-features
 
-echo "==> invariant lints"
-scripts/invariant-lints.sh
+run "invariant lints" scripts/invariant-lints.sh
 
-echo "==> query audit (no scoped-table SQL outside the repository module)"
-scripts/query-audit.sh
-echo "==> scoped table registration (every forced-RLS table in the migrations is in the query audit list)"
-scripts/scoped-table-registration.sh
-echo "==> audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)"
-scripts/audit-fk-claim-scan.sh
-echo "==> test registration (every tests/*.rs file has a [[test]] entry; autotests are off)"
-scripts/test-registration.sh
+run "query audit (no scoped-table SQL outside the repository module)" scripts/query-audit.sh
+run "scoped table registration (every forced-RLS table in the migrations is in the query audit list)" scripts/scoped-table-registration.sh
+run "audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)" scripts/audit-fk-claim-scan.sh
+run "test registration (every tests/*.rs file has a [[test]] entry; autotests are off)" scripts/test-registration.sh
 
-echo "==> independently publishable crates"
-scripts/publishable-crates.sh
+run "independently publishable crates" scripts/publishable-crates.sh
 
 # The freshness and audit lanes CI runs that this gate did not.
 #
@@ -47,44 +64,36 @@ scripts/publishable-crates.sh
 #
 # `comm -23` over the script names in .github/workflows/ci.yml and this file is how the six
 # missing ones were found; keep them in step.
-echo "==> route audit (server routes against the published contract)"
-scripts/route-audit.sh
+run "route audit (server routes against the published contract)" scripts/route-audit.sh
 
-echo "==> admin SPA route audit"
-scripts/admin-spa-route-audit.sh
+run "admin SPA route audit" scripts/admin-spa-route-audit.sh
 
-echo "==> reference app bindings freshness (generated from the published contract)"
-scripts/reference-app-bindings.sh
+run "reference app bindings freshness (generated from the published contract)" scripts/reference-app-bindings.sh
 
-echo "==> event catalog freshness (generated from the audit action registry)"
 # Issue #108. The catalog is DERIVED from the action list, so a new event type cannot land
 # without appearing in it, and a payload schema edited under an unchanged version shows up
 # as a diff a reviewer reads: that diff IS the compatibility check.
-scripts/event-catalog.sh
+run "event catalog freshness (generated from the audit action registry)" scripts/event-catalog.sh
 
-echo "==> JWT verification conformance corpus freshness (issue #118)"
 # The ONE corpus every verifier in issue #118 is judged against (the TS core today; the
 # Workers, Fastly, Lambda@Edge, Java and .NET verifiers as they land). Deterministic, so a
 # diff here is always a real change, and a REMOVED refusal vector is what this catches:
 # dropping the alg_none case would make every verifier go green on an unsigned token.
-scripts/verify-vectors.sh
+run "JWT verification conformance corpus freshness (issue #118)" scripts/verify-vectors.sh
 
-echo "==> log-stream signature corpus freshness (issue #110)"
 # Generated from the shipped signer, so a change to what a batch signature covers surfaces as
 # a diff rather than as a SIEM that stops verifying in the field.
-scripts/log-stream-vectors.sh
+run "log-stream signature corpus freshness (issue #110)" scripts/log-stream-vectors.sh
 
-echo "==> terraform provider coverage (generated from the OpenAPI document)"
 # Issue #51 criterion 6. A pure python lane over the committed spec, so it needs neither Go
 # nor tofu and runs everywhere.
-scripts/provider-coverage.sh
+run "terraform provider coverage (generated from the OpenAPI document)" scripts/provider-coverage.sh
 
-echo "==> event producer coverage (every management write announces itself)"
 # Issue #108 criterion 6, which the owner replaced "the registry counts at least 100 event
 # types" with: a COUNT is satisfied by registering types nothing emits, which is the fiction
 # the registry's own rule forbids. A RATCHET on the uncovered set, like the provider coverage
 # above, because a check that fails from its first commit gets disabled rather than fixed.
-scripts/producer-coverage.py
+run "event producer coverage (every management write announces itself)" scripts/producer-coverage.py
 
 echo "==> SDK check() middleware (issue #100, criterion 6)"
 # The uniform authorization `check()`: one call resolving via token claims, via IronAuth's
@@ -100,17 +109,15 @@ echo "==> SDK check() middleware (issue #100, criterion 6)"
 # `tsc`, so testing for a global one would skip a check the tree can actually run. The skip
 # names the command that removes it.
 if [ -x packages/ironauth-sdk/node_modules/.bin/tsc ]; then
-    (cd packages/ironauth-sdk && npm test --silent)
+    run "sdk check() tests" bash -c 'cd packages/ironauth-sdk && npm test --silent' 
 else
     echo "sdk check(): SKIPPED, packages/ironauth-sdk dependencies are not installed."
     echo "             Run: (cd packages/ironauth-sdk && npm install)  [CI runs this check]"
 fi
 
-echo "==> journey transcript replay"
-scripts/journey-replay.sh
+run "journey transcript replay" scripts/journey-replay.sh
 
-echo "==> admin SPA embed freshness"
-scripts/admin-spa-embed.sh
+run "admin SPA embed freshness" scripts/admin-spa-embed.sh
 
 echo "==> admin SPA bindings freshness (generated from the OpenAPI document)"
 # The precondition is the LOCAL npm bin, not a global one.
@@ -125,91 +132,65 @@ echo "==> admin SPA bindings freshness (generated from the OpenAPI document)"
 # The skip now names the command that removes it. An announced skip nobody can act on is only
 # half the value.
 if [ -x packages/admin-spa/node_modules/.bin/openapi-typescript ]; then
-    scripts/admin-spa-bindings.sh
+    run "admin SPA bindings freshness" scripts/admin-spa-bindings.sh
 else
     echo "admin-spa-bindings: SKIPPED, packages/admin-spa dependencies are not installed."
     echo "                    Run: (cd packages/admin-spa && npm install)  [CI runs this check]"
 fi
-echo "==> idempotent write audit (no admin handler splits two store writes behind one Idempotency-Key)"
-scripts/idempotent-write-audit.sh
+run "idempotent write audit (no admin handler splits two store writes behind one Idempotency-Key)" scripts/idempotent-write-audit.sh
 
-echo "==> classification lint (every resource type is classified; all three classes used)"
-scripts/classification-lint.sh
-echo "==> pii encryption (every classified PII/secret column is envelope-encrypted)"
-scripts/pii-encryption-scan.sh
-echo "==> diagnostics redaction corpus (a sentinel in any free-form diagnostic field would be seen)"
-scripts/diagnostics-redaction-scan.sh
+run "classification lint (every resource type is classified; all three classes used)" scripts/classification-lint.sh
+run "pii encryption (every classified PII/secret column is envelope-encrypted)" scripts/pii-encryption-scan.sh
+run "diagnostics redaction corpus (a sentinel in any free-form diagnostic field would be seen)" scripts/diagnostics-redaction-scan.sh
 
-echo "==> canonicalization seam (every identifier comparison routes through the one seam)"
-scripts/canonicalization-seam.sh
+run "canonicalization seam (every identifier comparison routes through the one seam)" scripts/canonicalization-seam.sh
 
-echo "==> hashing pool boundary (every request-path hash routes through the admission-controlled pool)"
-scripts/hashing-pool-boundary.sh
+run "hashing pool boundary (every request-path hash routes through the admission-controlled pool)" scripts/hashing-pool-boundary.sh
 
-echo "==> http audit (ironauth-fetch is the only outbound HTTP path)"
-scripts/http-audit.sh
+run "http audit (ironauth-fetch is the only outbound HTTP path)" scripts/http-audit.sh
 
-echo "==> jose audit (ironauth-jose is the only JOSE verification path)"
-scripts/jose-audit.sh
+run "jose audit (ironauth-jose is the only JOSE verification path)" scripts/jose-audit.sh
 
-echo "==> no M2M metering (no metering/billing/quota hook on the client-credentials path)"
-scripts/no-m2m-metering.sh
+run "no M2M metering (no metering/billing/quota hook on the client-credentials path)" scripts/no-m2m-metering.sh
 
-echo "==> dormant module scan (a public surface nothing calls)"
-scripts/dormant-module-scan.sh
+run "dormant module scan (a public surface nothing calls)" scripts/dormant-module-scan.sh
 
-echo "==> SDK portability scan (no Node-only imports in runtime-portable sources)"
-scripts/sdk-portability-scan.sh
+run "SDK portability scan (no Node-only imports in runtime-portable sources)" scripts/sdk-portability-scan.sh
 
-echo "==> dash scan"
-scripts/dash-scan.sh
+run "dash scan" scripts/dash-scan.sh
 
-echo "==> emulator doc freshness (the documented CI recipe's OTP code matches CI's pin)"
-scripts/emulator-doc-freshness.sh
+run "emulator doc freshness (the documented CI recipe's OTP code matches CI's pin)" scripts/emulator-doc-freshness.sh
 
-echo "==> no plaintext credentials (no login path writes a token to a file)"
-scripts/no-plaintext-credentials.sh
+run "no plaintext credentials (no login path writes a token to a file)" scripts/no-plaintext-credentials.sh
 
-echo "==> event registry compatibility (a breaking payload change bumps its version)"
-scripts/event-registry-compat.py
+run "event registry compatibility (a breaking payload change bumps its version)" scripts/event-registry-compat.py
 
-echo "==> SDK policy (the published policy still matches the SDKs that exist)"
-scripts/sdk-policy-check.py
+run "SDK policy (the published policy still matches the SDKs that exist)" scripts/sdk-policy-check.py
 
-echo "==> discovery scan (no static discovery JSON; generated at serve time)"
-scripts/discovery-scan.sh
+run "discovery scan (no static discovery JSON; generated at serve time)" scripts/discovery-scan.sh
 
-echo "==> rfc9700 scan (every OAuth endpoint bound to a conformance test)"
-scripts/rfc9700-scan.sh
-echo "==> conformance harness static checks (results gate, matrix, plan config, digest pins, fail-closed wiring, downgrade confinement)"
-scripts/conformance-check.sh
+run "rfc9700 scan (every OAuth endpoint bound to a conformance test)" scripts/rfc9700-scan.sh
+run "conformance harness static checks (results gate, matrix, plan config, digest pins, fail-closed wiring, downgrade confinement)" scripts/conformance-check.sh
 
-echo "==> compatibility matrix freshness"
-scripts/compat-matrix.sh
+run "compatibility matrix freshness" scripts/compat-matrix.sh
 git diff --exit-code docs/COMPATIBILITY.md
 
-echo "==> config schema freshness"
-scripts/config-schema.sh
+run "config schema freshness" scripts/config-schema.sh
 git diff --exit-code docs/config-schema.json docs/CONFIG.md
 
-echo "==> connector schema freshness (definition + capability matrix)"
-scripts/connector-schema.sh
+run "connector schema freshness (definition + capability matrix)" scripts/connector-schema.sh
 git diff --exit-code docs/connector-schema.json docs/capability-matrix.schema.json
 
-echo "==> flow schema freshness (flow object schema + message id registry)"
-scripts/flow-schema.sh
+run "flow schema freshness (flow object schema + message id registry)" scripts/flow-schema.sh
 git diff --exit-code docs/flow-schema.json docs/flow-messages.json
 
-echo "==> journey schema freshness (published journey artifact contract)"
-scripts/journey-schema.sh
+run "journey schema freshness (published journey artifact contract)" scripts/journey-schema.sh
 git diff --exit-code docs/journey-schema.json
 
-echo "==> flow golden corpus freshness (rendered flow shape, all journeys x both transports)"
-scripts/flow-golden.sh
+run "flow golden corpus freshness (rendered flow shape, all journeys x both transports)" scripts/flow-golden.sh
 git diff --exit-code docs/flow-golden.json
 
-echo "==> openapi freshness (served management spec vs committed artifact)"
-scripts/openapi-check.sh
+run "openapi freshness (served management spec vs committed artifact)" scripts/openapi-check.sh
 # Drift says the spec is CURRENT; this says it is generator-ready (issue #122).
 scripts/openapi-lint.sh
 # The spec-diff changelog generator must itself be correct (issue #122).
@@ -226,8 +207,7 @@ python3 scripts/events-vs-webhooks.py --check
 # Metering must stay off the login and token-issuance paths (issue #107).
 scripts/metering-off-hot-path.sh
 
-echo "==> fuzz matrix freshness (every registered fuzz target has a CI matrix row)"
-scripts/fuzz-matrix-freshness.sh
+run "fuzz matrix freshness (every registered fuzz target has a CI matrix row)" scripts/fuzz-matrix-freshness.sh
 
 if command -v cargo-deny >/dev/null 2>&1; then
   echo "==> cargo deny"
@@ -251,6 +231,13 @@ if [ -n "${IRONBUS_ADDR:-}" ]; then
     --test outbox --test outbox_ironbus
 else
   echo "==> outbox ironbus lane SKIPPED (set IRONBUS_ADDR to a broker to run it; CI always does)"
+fi
+
+if ((${#GATE_FAILURES[@]} > 0)); then
+  echo ""
+  echo "gate: ${#GATE_FAILURES[@]} check(s) FAILED:"
+  printf '  - %s\n' "${GATE_FAILURES[@]}"
+  exit 1
 fi
 
 echo "gate: all local checks green"
