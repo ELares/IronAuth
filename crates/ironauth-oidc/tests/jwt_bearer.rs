@@ -1547,3 +1547,127 @@ async fn a_mapped_user_principal_from_another_scope_is_refused_rather_than_treat
         "a cross-scope user principal is diagnosed as not authenticatable"
     );
 }
+
+/// A per-issuer audience allowlist NARROWS the shared policy (issue #126 criterion 3).
+///
+/// Criterion 3 asks for per-issuer trust policies over "audience, algorithm, and
+/// subject-claim constraints". Algorithm and subject-claim were already per-issuer; audience
+/// came from the ONE deployment-wide policy, so an assertion addressed to that audience was
+/// acceptable from ANY registered issuer. A GitHub Actions token and a Kubernetes projected
+/// token land at the same audience, and a trust anchor that should only ever speak to one
+/// could present assertions addressed to another's.
+///
+/// Three cases, because the rule is a narrowing and one case cannot state it:
+///
+/// * an issuer whose allowlist CONTAINS the audience still exchanges -- the narrowing must
+///   not break the issuer it was configured for;
+/// * an issuer whose allowlist EXCLUDES it is refused, which is the constraint itself;
+/// * an issuer with NO allowlist is unaffected, which is what keeps every issuer registered
+///   before this column existed behaving exactly as it did.
+#[tokio::test]
+async fn a_per_issuer_audience_allowlist_narrows_the_shared_policy() {
+    let key = issuer_key();
+    let jwks = jwks_json(&key);
+
+    // The audience the shared policy permits, which this deployment's assertions use.
+    let harness = Harness::start().await;
+    let permitted = harness.state().token_endpoint_url();
+
+    // CASE 1: the allowlist contains the audience -> still exchanges.
+    let allowed_issuer = "https://allowed.issuer.test";
+    harness
+        .register_external_issuer_with_audiences(
+            allowed_issuer,
+            Some(&jwks),
+            None,
+            None,
+            Some(&permitted),
+            true,
+        )
+        .await;
+    harness
+        .create_subject_mapping(
+            allowed_issuer,
+            EXTERNAL_SUBJECT,
+            None,
+            None,
+            MAPPED_PRINCIPAL,
+        )
+        .await;
+    let client_id = harness.client_id().to_string();
+    let ok = assertion(
+        &key,
+        allowed_issuer,
+        EXTERNAL_SUBJECT,
+        &permitted,
+        3600,
+        "jti-aud-allowed",
+    );
+    let (status, _h, body) = present(&harness, &client_id, &ok).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an issuer whose allowlist contains the audience must still exchange: {body}"
+    );
+
+    // CASE 2: the allowlist EXCLUDES the audience -> refused, even though the shared policy
+    // permits it and the assertion is otherwise valid.
+    let fenced_issuer = "https://fenced.issuer.test";
+    harness
+        .register_external_issuer_with_audiences(
+            fenced_issuer,
+            Some(&jwks),
+            None,
+            None,
+            Some("https://someone.elses.audience.test"),
+            true,
+        )
+        .await;
+    harness
+        .create_subject_mapping(
+            fenced_issuer,
+            EXTERNAL_SUBJECT,
+            None,
+            None,
+            MAPPED_PRINCIPAL,
+        )
+        .await;
+    let fenced = assertion(
+        &key,
+        fenced_issuer,
+        EXTERNAL_SUBJECT,
+        &permitted,
+        3600,
+        "jti-aud-fenced",
+    );
+    let (status, _h, body) = present(&harness, &client_id, &fenced).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an issuer may not address an audience outside its own allowlist: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+
+    // CASE 3: no allowlist -> the shared policy applies unchanged.
+    let open_issuer = "https://open.issuer.test";
+    harness
+        .register_external_issuer(open_issuer, Some(&jwks), None, None, true)
+        .await;
+    harness
+        .create_subject_mapping(open_issuer, EXTERNAL_SUBJECT, None, None, MAPPED_PRINCIPAL)
+        .await;
+    let open = assertion(
+        &key,
+        open_issuer,
+        EXTERNAL_SUBJECT,
+        &permitted,
+        3600,
+        "jti-aud-open",
+    );
+    let (status, _h, body) = present(&harness, &client_id, &open).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an issuer with no allowlist keeps the shared policy: {body}"
+    );
+}
