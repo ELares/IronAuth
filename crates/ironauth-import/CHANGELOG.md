@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Dropped five dependencies this crate never used**: `aes`, `ctr`, `subtle`, `base64` and
+  `password-hash`.
+  All four were declared with comments explaining what Firebase modified scrypt needs, which
+  is true and happens entirely inside `ironauth-hash-scheme`. Measured: zero references to
+  any of them anywhere in `crates/ironauth-import/src` or `tests`, and
+  `cargo check -p ironauth-import --all-features --all-targets` is clean with all four
+  removed.
+
+  They were left behind when the Firebase logic moved out, and they are why dependabot kept
+  opening bumps against a crate that could not have noticed either way.
+
+  IT TOOK THREE PASSES, and how the last one found the fifth is the useful part. The first
+  removed two and stopped; the second removed two more after a review pointed at them; the
+  third replaced grep with a COMPILE ORACLE -- remove each declared dependency in turn, run
+  `cargo check --all-features --all-targets`, restore -- and that found `password-hash`,
+  which grep could not, because every `password_hash::` occurrence in this crate arrives
+  through `argon2`'s re-export. Exactly the mechanism that made `cipher` dead in
+  `ironauth-hash-scheme`, one crate over, found only when the method stopped keying on the
+  name.
+
 - **Four import defects that left a run PERMANENTLY unable to complete** (issue #55, review
   fold). Each was measured end to end, and each is worse than it sounds, because in every
   case the identities were fine and only the accounting was wrong, so nothing an operator

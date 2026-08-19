@@ -769,6 +769,43 @@ mod tests {
         assert_kat(&hash, "passw0rd", Scheme::Argon2);
     }
 
+    /// The COUNTER WIDTH is `Ctr128BE`, pinned on an IV the published vector cannot reach.
+    ///
+    /// The known-answer vector below is the whole crypto argument for a `ctr` major bump,
+    /// and there is exactly one thing it cannot see. Firebase's signer key is 64 bytes, so
+    /// four AES blocks, under an all-zero IV: the counter only ever takes the values 0 to 3
+    /// and never crosses the 64-bit boundary that separates `Ctr128BE` from `Ctr64BE`.
+    /// MEASURED: swapping the alias to `Ctr64BE` reproduces that vector byte for byte and
+    /// the KAT stays green, while the two flavours disagree on an IV whose low half is
+    /// saturated.
+    ///
+    /// The counter flavour is also the single most plausible thing to shift under a major
+    /// bump of `ctr`, which is what makes the blind spot worth one more test rather than a
+    /// note. The expected block was produced once and written down, so this is a fixed
+    /// expectation and not one the code computes for itself.
+    #[test]
+    fn the_counter_width_is_the_one_the_firebase_vector_cannot_observe() {
+        // Low half saturated, so the very first increment carries into the high half.
+        let key = [7_u8; 32];
+        let mut iv = [0_u8; 16];
+        for byte in iv.iter_mut().skip(8) {
+            *byte = 0xff;
+        }
+        let mut keystream = [0_u8; 32];
+        Aes256Ctr::new_from_slices(&key, &iv)
+            .expect("a 32-byte key and a 16-byte iv are the right lengths")
+            .apply_keystream(&mut keystream);
+
+        assert_eq!(
+            keystream[16..],
+            [
+                225, 235, 107, 216, 188, 65, 115, 66, 188, 131, 102, 13, 177, 151, 197, 198
+            ],
+            "the second block must be the one a 128-bit big-endian counter produces after \
+             carrying into the high half; Ctr64BE wraps instead and yields a different block"
+        );
+    }
+
     #[test]
     fn firebase_published_known_answer_vector() {
         // The canonical Firebase modified-scrypt test vector published by Firebase

@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The RustCrypto block ciphers moved to their 2024 line** in `ironauth-hash-scheme`:
+  `aes` 0.8 -> 0.9 and `ctr` 0.9 -> 0.10. See that crate's own changelog for the detail;
+  the server-visible part is the dependency graph, which gains `cpubits` 0.1.1 (RustCrypto,
+  MIT OR Apache-2.0, MSRV 1.85) and a second `aes` major, since `aes` 0.8.4 stays in the
+  tree through `keyring -> dbus-secret-service`. `cargo deny` reports advisories, bans,
+  licenses and sources all ok; note that `deny.toml` sets `multiple-versions = "warn"`, so
+  `bans` records the duplicate rather than failing on it.
+
 - **The emulator now serves the MANAGEMENT plane, and a from-scratch reference client proves it
   (issue #122, criterion 2).** Three defects had to be fixed before a client could talk to it at
   all, and each was only visible by trying:
