@@ -9872,8 +9872,48 @@ impl ActingAuthorizationRepo<'_> {
         env: &Env,
         request: IssueClientCredentials<'_>,
     ) -> Result<(), StoreError> {
-        self.issue_machine_grant(env, request, Action::JwtBearerAssertionIssue)
+        self.issue_jwt_bearer_assertion_from(env, request, None)
             .await
+    }
+
+    /// As [`Self::issue_jwt_bearer_assertion`], recording WHICH external issuer and subject
+    /// the assertion came from on the audit row (issue #126 criterion 5).
+    ///
+    /// The criterion asks that every federated issuance appear in the audit stream "with
+    /// external issuer and subject attached to the mapped identity". The grant already
+    /// records the MAPPED principal; what the trail could not answer before is which trust
+    /// anchor vouched for it. Without that, an operator responding to a compromised issuer
+    /// cannot tell which issuances came from it -- the audit says a machine principal got a
+    /// token and not who said it should.
+    ///
+    /// The detail carries the issuer and the external subject and nothing else. The
+    /// assertion itself never travels: it is a live credential, and an audit row is a wider
+    /// audience than the exchange that produced it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn issue_jwt_bearer_assertion_from(
+        &self,
+        env: &Env,
+        request: IssueClientCredentials<'_>,
+        federation: Option<FederatedSource<'_>>,
+    ) -> Result<(), StoreError> {
+        let detail = federation.map(|source| {
+            serde_json::json!({
+                "external_issuer": source.issuer,
+                "external_subject": source.subject,
+            })
+            .to_string()
+        });
+        self.issue_machine_grant_detailed(
+            env,
+            request,
+            Action::JwtBearerAssertionIssue,
+            detail.as_deref(),
+        )
+        .await
     }
 
     /// Persist an RFC 8693 token-exchange issuance against a fresh grant (issue #125),
@@ -9914,6 +9954,21 @@ impl ActingAuthorizationRepo<'_> {
         request: IssueClientCredentials<'_>,
         action: Action,
     ) -> Result<(), StoreError> {
+        self.issue_machine_grant_detailed(env, request, action, None)
+            .await
+    }
+
+    /// As [`Self::issue_machine_grant`], with an optional audit detail.
+    ///
+    /// Delegating wrapper so the existing callers -- client credentials and token exchange --
+    /// are untouched and keep writing exactly the audit row they wrote before.
+    async fn issue_machine_grant_detailed(
+        &self,
+        env: &Env,
+        request: IssueClientCredentials<'_>,
+        action: Action,
+        detail: Option<&str>,
+    ) -> Result<(), StoreError> {
         let in_scope = request.grant_id.scope() == self.scope
             && request.client_id.scope() == self.scope
             && match &request.access {
@@ -9924,7 +9979,7 @@ impl ActingAuthorizationRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
-        write_audited(
+        write_audited_detailed(
             AuditedWrite {
                 store: self.store,
                 scope,
@@ -9996,6 +10051,7 @@ impl ActingAuthorizationRepo<'_> {
                 Ok(())
             },
             false,
+            detail,
         )
         .await
     }
@@ -63712,6 +63768,20 @@ pub struct PingDelivery {
     /// since been redeemed or expired is pointless, and sending it would tell a client to
     /// come and fetch tokens it can no longer obtain.
     pub still_deliverable: bool,
+}
+
+/// Which external trust anchor vouched for a federated issuance (issue #126 criterion 5).
+///
+/// A struct rather than two `&str` parameters, because both are strings and a call site that
+/// transposed them would compile and would write a backwards audit row -- one naming a
+/// subject as the issuer, which reads plausibly and is wrong exactly when someone is
+/// responding to an incident.
+#[derive(Debug, Clone, Copy)]
+pub struct FederatedSource<'a> {
+    /// The external issuer's `iss` value.
+    pub issuer: &'a str,
+    /// The external subject the assertion asserted, before mapping.
+    pub subject: &'a str,
 }
 
 /// A pending request as the approval surface needs to render it (#131 criterion 1).

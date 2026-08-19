@@ -93,6 +93,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_jose::{
     ExpectedTyp, JwsAlgorithm, RejectReason, TrustedKey, VerificationPolicy, VerifiedToken, verify,
 };
+use ironauth_store::FederatedSource;
 use ironauth_store::{
     ClientAuthDiagnosticReason, ClientCredentialsAccess, ClientId, CorrelationId,
     ExternalAssertionIssuerRecord, GrantId, IssueClientCredentials, JtiOutcome,
@@ -213,8 +214,8 @@ pub async fn jwt_bearer_grant(
     //       subject to an IronAuth principal. A validation/mapping failure is the
     //       uniform invalid_grant with the specific reason recorded out of band; a
     //       store/persistence fault fails closed as a server_error (no diagnostic).
-    let principal = match validate_and_map(state, scope, assertion).await {
-        Ok(principal) => principal,
+    let mapped = match validate_and_map(state, scope, assertion).await {
+        Ok(mapped) => mapped,
         Err(JwtBearerError::Reject(reason)) => {
             record_diagnostic(state, scope, &client_id_str, assertion, reason).await;
             return Err(TokenError::InvalidGrant);
@@ -228,8 +229,12 @@ pub async fn jwt_bearer_grant(
         state,
         scope,
         &client_id_str,
-        &principal,
+        &mapped.principal,
         requested_scope.as_deref(),
+        FederatedSource {
+            issuer: &mapped.issuer,
+            subject: &mapped.subject,
+        },
     )
     .await
 }
@@ -318,11 +323,21 @@ enum JwtBearerError {
 /// Returns the mapped principal on success. A verification, trust, or mapping
 /// failure is a [`JwtBearerError::Reject`] carrying the specific out-of-band reason;
 /// a store fault during a lookup is a [`JwtBearerError::Server`].
+/// A mapped federated identity, with the trust anchor that vouched for it.
+struct MappedFederation {
+    /// The IronAuth principal the external subject maps to.
+    principal: String,
+    /// The external issuer's `iss` value.
+    issuer: String,
+    /// The external subject, before mapping.
+    subject: String,
+}
+
 async fn validate_and_map(
     state: &OidcState,
     scope: Scope,
     assertion: &str,
-) -> Result<String, JwtBearerError> {
+) -> Result<MappedFederation, JwtBearerError> {
     // Peek the UNVERIFIED `iss` to find WHICH registered issuer to verify against.
     // Reading it before verification introduces no trust: the policy below enforces
     // `iss` cryptographically against the value we looked the issuer up by (exactly
@@ -402,7 +417,17 @@ async fn validate_and_map(
     spend_optional_jti(state, scope, &record.issuer, &verified, exp, skew).await?;
 
     // Resolve the REGISTERED subject to an IronAuth principal (reject by default).
-    resolve_mapped_principal(state, scope, &record.issuer, &subject, &verified).await
+    let principal =
+        resolve_mapped_principal(state, scope, &record.issuer, &subject, &verified).await?;
+    // The external issuer and subject travel OUT with the principal, so the audit row can
+    // say which trust anchor vouched for the issuance (issue #126 criterion 5). Returned
+    // together rather than re-derived at the call site: re-peeking the assertion there
+    // would be a second parse of a credential this function has already verified.
+    Ok(MappedFederation {
+        principal,
+        issuer: record.issuer,
+        subject,
+    })
 }
 
 /// Spend the OPTIONAL single-use `jti` (RFC 7523 makes it optional on the
@@ -736,6 +761,7 @@ async fn mint_and_persist(
     client_id_str: &str,
     principal: &str,
     requested_scope: Option<&str>,
+    federation: FederatedSource<'_>,
 ) -> Result<Response, TokenError> {
     // The token audience: the presenting client with no resource (an empty resource
     // set), exactly as the client-credentials default resolves. The empty-resource
@@ -812,7 +838,7 @@ async fn mint_and_persist(
             CorrelationId::generate(state.env()),
         )
         .authorization()
-        .issue_jwt_bearer_assertion(
+        .issue_jwt_bearer_assertion_from(
             state.env(),
             IssueClientCredentials {
                 grant_id: &grant_id,
@@ -821,6 +847,11 @@ async fn mint_and_persist(
                 created_at_unix_micros: epoch_micros(state.now()),
                 access,
             },
+            // WHICH trust anchor vouched for this issuance (issue #126 criterion 5). The
+            // grant records the mapped principal; without this the trail cannot say who
+            // said it should exist, so an operator responding to a compromised issuer
+            // cannot tell which issuances came from it.
+            Some(federation),
         )
         .await
         .map_err(map_store_error)?;

@@ -1671,3 +1671,59 @@ async fn a_per_issuer_audience_allowlist_narrows_the_shared_policy() {
         "an issuer with no allowlist keeps the shared policy: {body}"
     );
 }
+
+/// A successful federated issuance names the external issuer and subject in the audit
+/// stream (issue #126 criterion 5).
+///
+/// The grant already recorded the MAPPED principal. What the trail could not answer is
+/// WHICH trust anchor vouched for it -- so an operator responding to a compromised issuer
+/// could not tell which issuances came from it. The audit said a machine principal received
+/// a token and not who said it should.
+///
+/// The assertion itself is deliberately absent from the detail: it is a live credential, and
+/// an audit row is a wider audience than the exchange that produced it.
+#[tokio::test]
+async fn a_successful_issuance_names_the_external_issuer_and_subject_in_the_audit() {
+    let harness = Harness::start().await;
+    let client_id = seed_trust(&harness).await;
+    let key = issuer_key();
+    let assertion = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        &harness.state().token_endpoint_url(),
+        3600,
+        "jti-audit-detail",
+    );
+    let (status, _h, body) = present(&harness, &client_id, &assertion).await;
+    assert_eq!(status, StatusCode::OK, "the exchange succeeds: {body}");
+
+    let rows = harness
+        .store()
+        .scoped(harness.scope())
+        .audit()
+        .list()
+        .await
+        .expect("read the audit trail");
+    let issuance = rows
+        .iter()
+        .find(|row| row.action == "jwt_bearer_assertion.issue")
+        .expect("a successful federated issuance is audited");
+    let detail = issuance
+        .detail
+        .as_deref()
+        .expect("the issuance audit row carries a detail");
+    let parsed: serde_json::Value = serde_json::from_str(detail).expect("detail is json");
+    assert_eq!(
+        parsed["external_issuer"], EXTERNAL_ISSUER,
+        "the trail must name the trust anchor that vouched: {detail}"
+    );
+    assert_eq!(
+        parsed["external_subject"], EXTERNAL_SUBJECT,
+        "and the external subject it asserted: {detail}"
+    );
+    assert!(
+        !detail.contains(&assertion),
+        "the assertion is a live credential and must never land in an audit row"
+    );
+}
