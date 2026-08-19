@@ -25,12 +25,17 @@
  * rather than beside it. The shipper advances the cursor only on success and only to what was
  * accepted, so positions are monotonic per stream. Keep the last position you verified and:
  *
- *   - a position at or below it is a REPLAY;
- *   - a position beyond the next expected one is a GAP.
+ *   - a position at or below it is a REPLAY.
  *
- * Neither needs any server-side state, and neither is answerable if you verify the signature
- * alone -- which is why `verifyBatch` refuses to be used without a position and returns the
- * position it verified rather than a bare boolean.
+ * Replay is answerable with what a batch carries. `verifyBatch` refuses without a position
+ * (`missing-position`) and returns the position it verified rather than a bare boolean, so a
+ * caller can record it.
+ *
+ * GAP DETECTION IS NOT AVAILABLE, and this file used to imply it was. The position is a
+ * wall-clock microsecond timestamp of the last row in the batch, not a counter, so there is
+ * no "next expected" value to compare against: a consumer can prove it has not seen a
+ * position before, and cannot prove it has missed nothing in between. Detecting gaps would
+ * need the batch to carry its START position as well, so positions chain.
  *
  * ## Where the position comes from
  *
@@ -108,6 +113,19 @@ export async function verifyBatch({
   eventsJson,
   lastVerifiedSequence = null,
 }) {
+  // A MISSING POSITION IS ITS OWN REFUSAL, and it has to be, because the alternative is
+  // silent. Without this, an omitted `cursorSequence` builds the canonical string with the
+  // literal `undefined` in it, the HMAC does not match, and the caller is told
+  // `bad-signature`: an integration bug reported as an attack. This file previously said it
+  // "refuses to be used without a position" while doing exactly that, which was measured.
+  if (
+    typeof streamId !== 'string' || streamId.length === 0 ||
+    !Number.isInteger(cursorSequence) ||
+    typeof cursorId !== 'string' || cursorId.length === 0
+  ) {
+    return { ok: false, reason: 'missing-position', position: null };
+  }
+
   const canonical = await canonicalString({
     streamId,
     cursorSequence,

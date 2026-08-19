@@ -91,3 +91,36 @@ test('a malformed signature is refused rather than thrown on', async () => {
     assert.equal(result.ok, false, `${JSON.stringify(signature)} must be refused, not thrown on`);
   }
 });
+
+test('a batch verified without a position is refused as such, not as a bad signature', async () => {
+  // The failure mode this stops is an integration bug reported as an attack. Without the
+  // guard, an omitted position builds the canonical string with the literal `undefined` in
+  // it, the HMAC does not match, and the caller is told `bad-signature` -- so an operator
+  // wiring up the headers for the first time is told their deployment is forging batches.
+  const vector = corpus.vectors.find((v) => v.expect === 'verify');
+
+  const missing = await verifyBatch({
+    key: corpus.key_utf8,
+    signature: vector.signature,
+    streamId: vector.stream_id,
+    // cursorSequence omitted
+    cursorId: vector.cursor_id,
+    eventCount: vector.event_count,
+    eventsJson: vector.events_json,
+  });
+  assert.equal(missing.reason, 'missing-position');
+  assert.equal(missing.ok, false);
+
+  // And the same call WITH the position verifies, so the assertion above is about the
+  // position rather than about the vector being unverifiable.
+  const present = await verifyBatch({
+    key: corpus.key_utf8,
+    signature: vector.signature,
+    streamId: vector.stream_id,
+    cursorSequence: vector.cursor_sequence,
+    cursorId: vector.cursor_id,
+    eventCount: vector.event_count,
+    eventsJson: vector.events_json,
+  });
+  assert.equal(present.ok, true);
+});

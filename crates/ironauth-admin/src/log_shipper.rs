@@ -628,9 +628,17 @@ impl LogSink for HttpLogSink {
                 // Built from the same values the shipper signed, one line above the send, so
                 // the two cannot drift apart.
                 let position_value = position_header_value(&stream.id, position.0, position.1);
-                if let Ok(value) = http::HeaderValue::from_str(&position_value) {
-                    request = request.header(http::HeaderName::from_static(POSITION_HEADER), value);
-                }
+                // REFUSED on an encode failure, exactly as the signature above is. Sending
+                // the signature without the position ships a batch that LOOKS verifiable and
+                // is not: a consumer cannot rebuild the canonical string without the
+                // position, so it would reject an honest batch as tampered. Dropping it
+                // quietly was the same shape as the defect this wiring repairs.
+                let Ok(value) = http::HeaderValue::from_str(&position_value) else {
+                    return SinkOutcome::Rejected(
+                        "the batch position could not be encoded as a header".to_string(),
+                    );
+                };
+                request = request.header(http::HeaderName::from_static(POSITION_HEADER), value);
             }
             // Matched by VARIANT rather than rendered with `Display`, so the reason
             // stored on the stream row is operator-safe by construction. This string is
