@@ -13,7 +13,7 @@
 //! 3. **Replay.** Have I already applied this batch under a different name?
 //!
 //! The AWS `SigV4` signing already in [`crate::log_shipper`] answers none of these. It
-//! authenticates the *request to S3* — it is transport authentication to one sink, discarded
+//! authenticates the *request to S3* -- it is transport authentication to one sink, discarded
 //! the moment the object is written, and absent entirely for the HTTP, Datadog and Splunk
 //! sinks.
 //!
@@ -43,7 +43,7 @@
 //! sent.
 //!
 //! **The count and the digest of the events** are separate on purpose. The digest alone would
-//! detect any change to the payload, so the count is redundant for integrity — but it is not
+//! detect any change to the payload, so the count is redundant for integrity -- but it is not
 //! redundant for DIAGNOSIS: a consumer that fails verification can say whether it received a
 //! different number of events or the same number with different content, and those point at
 //! very different faults.
@@ -54,7 +54,7 @@
 //! credential the operator provisioned for the sink. Asymmetric signing would mean publishing
 //! and rotating a key pair for a consumer that is, by construction, one party the operator
 //! configured. HMAC-SHA256 keeps the verification a consumer must implement to something
-//! every runtime has natively — which is exactly what makes the sample consumer in
+//! every runtime has natively -- which is exactly what makes the sample consumer in
 //! `packages/ironauth-sdk/snippets` short enough to be read rather than trusted.
 
 use hmac::digest::KeyInit;
