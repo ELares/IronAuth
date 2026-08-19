@@ -2375,16 +2375,23 @@ pub struct OidcConfig {
     pub client_assertion_max_skew_secs: u64,
 
     /// How long a CLIENT's fetched `jwks_uri` key set is cached, in seconds (issues #25,
-    /// #126). Applies to `private_key_jwt` client authentication and to the
-    /// `urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant, both of which resolve
-    /// a registered `jwks_uri` through the SSRF-hardened fetcher.
+    /// #126). Must be at least 1 and at most 3600. Applies to `private_key_jwt` client
+    /// authentication, the `urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant,
+    /// and `jwks_uri` dynamic client registration, all of which resolve a `jwks_uri`
+    /// through the SSRF-hardened fetcher. The default (300) trades one fetch per client per
+    /// five minutes against how long a rotated-OUT key stays trusted.
     ///
-    /// The default (300) trades one fetch per client per five minutes against how long a
-    /// rotated-OUT key stays trusted. It does NOT govern how fast a rotated-IN key is
-    /// picked up: an assertion naming a `kid` the cached set does not hold triggers an
-    /// immediate refetch, rate limited to once per 30 seconds per URI so an unverified
-    /// header cannot turn this into an amplifier. Must be at least 1 and at most
-    /// `OIDC_MAX_CLIENT_JWKS_TTL_SECS`.
+    /// The bound is in the paragraph ABOVE rather than in one of its own because
+    /// `scripts/config-schema.sh` renders only the FIRST paragraph of a doc comment into
+    /// `docs/CONFIG.md`, so a limit written below it is documented nowhere an operator
+    /// looks. The ceiling constant is [`OIDC_MAX_CLIENT_JWKS_TTL_SECS`].
+    ///
+    /// It does NOT govern how fast a rotated-IN key is picked up ON THE ASSERTION GRANT:
+    /// an assertion naming a `kid` the cached set does not hold triggers an immediate
+    /// refetch, rate limited to once per 30 seconds per URI so an unverified header cannot
+    /// turn this into an amplifier. `private_key_jwt` client authentication (#25) resolves
+    /// WITHOUT a kid hint, so for that surface this TTL is the whole rotation window and
+    /// closing it is out of scope for #126 criterion 4.
     pub client_jwks_ttl_secs: u64,
 
     /// The web origins (scheme + host + optional port, no path) of registered
@@ -9726,6 +9733,54 @@ mod tests {
             err.to_string().contains("client_assertion_max_skew_secs"),
             "{err}"
         );
+    }
+
+    /// The client JWKS TTL is bounded on BOTH sides, and each side has its own reason.
+    ///
+    /// Zero would make every request refetch, which is the amplifier the resolver's per-URI
+    /// rate limit exists to prevent, reached through configuration instead of through an
+    /// attacker. Above the ceiling, a key the client has ROTATED OUT stays trusted for
+    /// longer than the rotation was meant to take.
+    ///
+    /// Both are asserted because a guard with no test is a guard that can be deleted, and
+    /// this one is load-bearing beyond its own setting: the resolver's fail-closed argument
+    /// for a marker-only cache entry rests on the TTL never being able to reach
+    /// `Duration::MAX`, and the only thing that makes that true is the ceiling here.
+    #[test]
+    fn the_client_jwks_ttl_is_bounded_on_both_sides() {
+        let accepted = Config::from_toml_str(
+            &format!("[oidc]\nclient_jwks_ttl_secs = {OIDC_MAX_CLIENT_JWKS_TTL_SECS}\n"),
+            "ironauth.toml",
+        )
+        .expect("exactly the ceiling is accepted")
+        .config;
+        assert_eq!(
+            accepted.oidc.client_jwks_ttl_secs,
+            OIDC_MAX_CLIENT_JWKS_TTL_SECS
+        );
+        assert_eq!(
+            Config::from_toml_str("[oidc]\nclient_jwks_ttl_secs = 1\n", "ironauth.toml")
+                .expect("exactly the floor is accepted")
+                .config
+                .oidc
+                .client_jwks_ttl_secs,
+            1,
+            "the boundary values themselves must be usable, or the bound is off by one"
+        );
+
+        let err = Config::from_toml_str("[oidc]\nclient_jwks_ttl_secs = 0\n", "ironauth.toml")
+            .expect_err("zero is refused");
+        assert!(err.to_string().contains("client_jwks_ttl_secs"), "{err}");
+
+        let err = Config::from_toml_str(
+            &format!(
+                "[oidc]\nclient_jwks_ttl_secs = {}\n",
+                OIDC_MAX_CLIENT_JWKS_TTL_SECS + 1
+            ),
+            "ironauth.toml",
+        )
+        .expect_err("one over the ceiling is refused");
+        assert!(err.to_string().contains("client_jwks_ttl_secs"), "{err}");
     }
 
     #[test]

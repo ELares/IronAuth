@@ -1291,6 +1291,40 @@ async fn start_jwks_server_failing_after_first(body: String) -> SocketAddr {
     addr
 }
 
+/// A JWKS server that answers by PATH: `/a.json` gets `a`, anything else gets `b`.
+///
+/// The point is to make the URI observable. `RecordingDialer` forwards every connection to
+/// one fixed address and records a `SocketAddr`, so two `jwks_uri` values pointing at the
+/// same loopback server are indistinguishable to it and a resolver that fetched the WRONG
+/// registered URI would look identical. Routing on the path puts the difference in the
+/// RESPONSE instead, where an assertion can see it.
+async fn start_path_routed_jwks_server(a: String, b: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let a = a.clone();
+            let b = b.clone();
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+                let body = if request.contains("/a.json") { a } else { b };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    addr
+}
+
 /// A JWKS server that serves `before` to the FIRST request and `after` to every later one.
 ///
 /// This is an upstream ROTATION: the key set genuinely changes between two fetches, which is
@@ -1980,9 +2014,12 @@ async fn a_kidless_key_set_is_bounded_by_the_rate_limit_not_exempted() {
 async fn a_rotated_upstream_key_is_accepted_at_the_token_endpoint_inside_the_ttl() {
     // Two keys with DISTINCT kids. The kid is the whole hint: with one kid the presented
     // assertion would name a key the cache already claims to hold, and no refetch is due.
-    let before = SigningKey::ed25519_from_seed(Some("rot-before".to_owned()), &[11_u8; 32])
+    // MIXED CASE deliberately. `kid` is an opaque JSON string and JWK matching is exact, so
+    // a hint that lowercased it on the way through would silently miss every key a real
+    // issuer publishes with capitals. All-lowercase fixtures cannot see that.
+    let before = SigningKey::ed25519_from_seed(Some("Rot-Before".to_owned()), &[11_u8; 32])
         .expect("before key");
-    let after = SigningKey::ed25519_from_seed(Some("rot-after".to_owned()), &[22_u8; 32])
+    let after = SigningKey::ed25519_from_seed(Some("Rot-After".to_owned()), &[22_u8; 32])
         .expect("after key");
 
     // The upstream rotates between the two fetches, which is the event under test.
@@ -2066,7 +2103,7 @@ async fn a_rotated_upstream_key_is_accepted_at_the_token_endpoint_inside_the_ttl
     // AND THE BOUND STILL HOLDS through the grant. A third exchange naming a kid nothing
     // publishes must not buy another fetch, or the wiring would have turned the endpoint
     // into an amplifier for anyone who can post a forged header.
-    let forged = SigningKey::ed25519_from_seed(Some("rot-forged".to_owned()), &[33_u8; 32])
+    let forged = SigningKey::ed25519_from_seed(Some("Rot-Forged".to_owned()), &[33_u8; 32])
         .expect("forged key");
     let third = assertion(
         &forged,
@@ -2113,5 +2150,193 @@ async fn a_rotated_upstream_key_is_accepted_at_the_token_endpoint_inside_the_ttl
         2,
         "a kid the cache already holds must never refetch, even with the rate-limit window \
          open -- which is only true if the PRESENTED kid is what reaches the resolver"
+    );
+}
+
+/// The refetch interval is THIRTY seconds, at its boundary (issue #126 criterion 4).
+///
+/// # Why this test had to exist
+///
+/// Every other count assertion in this file is made at one frozen instant, which any
+/// positive interval satisfies. So both of these mutants passed the whole suite:
+///
+/// * `Duration::from_secs(30)` to `from_secs(1)` -- a thirty-fold amplifier at a
+///   third-party host, driven by an unverified header, which is the exact thing the bound
+///   exists to prevent;
+/// * `Duration::from_secs(30)` to `from_secs(3600)` -- a rotated key undiscovered for an
+///   hour, which is criterion 4's outage back again wearing a different number.
+///
+/// A constant nothing can move is a constant nobody is measuring. Both sides are asserted
+/// here, so either direction fails.
+#[tokio::test]
+async fn the_refetch_interval_is_thirty_seconds_at_its_boundary() {
+    let key = issuer_key();
+    let (resolver, dialer, uri) =
+        counting_resolver(jwks_json(&key), Duration::from_secs(86_400)).await;
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    // The TTL is a day, so ordinary cache expiry cannot explain any fetch below. Only the
+    // interval can.
+    resolver.resolve(t0, &uri).await;
+    assert_eq!(dialer.requested().len(), 1, "priming is one fetch");
+
+    resolver.resolve_for_kid(t0, &uri, Some("unknown-a")).await;
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "the first unknown kid claims the one refetch the window allows"
+    );
+
+    resolver
+        .resolve_for_kid(t0 + Duration::from_secs(29), &uri, Some("unknown-b"))
+        .await;
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "one second INSIDE the window buys nothing: an interval shorter than 30s fails here"
+    );
+
+    resolver
+        .resolve_for_kid(t0 + Duration::from_secs(30), &uri, Some("unknown-c"))
+        .await;
+    assert_eq!(
+        dialer.requested().len(),
+        3,
+        "exactly AT the window the next refetch is allowed: an interval longer than 30s \
+         fails here"
+    );
+
+    // And the window restarts from the refetch, not from the prime. Without this a
+    // reading of "at most one per 30s counted from the first request ever" would pass.
+    resolver
+        .resolve_for_kid(t0 + Duration::from_secs(59), &uri, Some("unknown-d"))
+        .await;
+    assert_eq!(
+        dialer.requested().len(),
+        3,
+        "the window is measured from the last refetch, so 29s after it buys nothing"
+    );
+}
+
+/// The bound holds under CONCURRENCY (issue #126 criterion 4).
+///
+/// A `Barrier` rather than a plain spawn: without it the tasks would almost certainly run
+/// one after another and this would measure the sequential case a second time.
+///
+/// # What this test does and does NOT catch, stated because the difference matters
+///
+/// It catches a gross regression: anything that makes the refetch per-caller rather than
+/// per-URI fails here immediately, and that is the shape a rewrite is most likely to
+/// introduce.
+///
+/// It does NOT reliably catch the SUBTLE one. Splitting `begin_rotation_refetch` into
+/// check-then-act with the lock released between the two halves survives this test in most
+/// trials, MEASURED: a 256-way burst on 16 worker threads with that mutation applied still
+/// reported 2 fetches. The window between the two lock acquisitions is a handful of
+/// instructions with no await in it, so the interleaving that would expose it is rare, and
+/// an assertion that fails in a minority of trials is a flake generator rather than a test.
+///
+/// So the single lock acquisition in `begin_rotation_refetch` is guaranteed by CONSTRUCTION
+/// and not by this test, and that is worth writing down rather than leaving a reader to
+/// infer a coverage this file does not have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_concurrent_burst_of_unknown_kids_still_costs_one_refetch() {
+    const BURST: usize = 64;
+
+    let key = issuer_key();
+    let (resolver, dialer, uri) =
+        counting_resolver(jwks_json(&key), Duration::from_secs(86_400)).await;
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    resolver.resolve(now, &uri).await;
+    assert_eq!(dialer.requested().len(), 1, "priming is one fetch");
+
+    let gate = Arc::new(tokio::sync::Barrier::new(BURST));
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..BURST {
+        let resolver = Arc::clone(&resolver);
+        let gate = Arc::clone(&gate);
+        let uri = uri.clone();
+        tasks.spawn(async move {
+            // Every task waits here, so they are released into the resolver together.
+            gate.wait().await;
+            resolver
+                .resolve_for_kid(now, &uri, Some(&format!("forged-{i}")))
+                .await;
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "{BURST} concurrent unknown kids must cost ONE refetch between them, not one each"
+    );
+}
+
+/// Each issuer's rotation is answered from ITS OWN `jwks_uri` (issue #126 criterion 4).
+///
+/// # The half of the seam the end-to-end test cannot see
+///
+/// `a_rotated_upstream_key_is_accepted_at_the_token_endpoint_inside_the_ttl` proves the
+/// presented `kid` reaches the resolver. It cannot prove the registered URI does: replacing
+/// the `uri` argument with a constant string survives it, because `RecordingDialer`
+/// forwards every connection to one fixed address and records a `SocketAddr`, so no
+/// assertion in that test can observe WHICH url was fetched.
+///
+/// That is not a performance bug. With two registered assertion issuers, a URI mixup means
+/// issuer A's assertion is verified against issuer B's key set, which is a trust confusion:
+/// whoever holds B's key can mint under A's mappings.
+///
+/// So the two URIs here differ only in path, the server answers a DIFFERENT key set per
+/// path, and each issuer's cached set is asserted to hold its own kid and not the other's.
+#[tokio::test]
+async fn each_issuers_rotation_is_answered_from_its_own_jwks_uri() {
+    let key_a =
+        SigningKey::ed25519_from_seed(Some("uri-a".to_owned()), &[44_u8; 32]).expect("key a");
+    let key_b =
+        SigningKey::ed25519_from_seed(Some("uri-b".to_owned()), &[55_u8; 32]).expect("key b");
+    let server = start_path_routed_jwks_server(jwks_json(&key_a), jwks_json(&key_b)).await;
+
+    let dialer = Arc::new(RecordingDialer::new(server));
+    let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([8, 8, 8, 8])]));
+    let fetcher = Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+    let resolver = ironauth_oidc::ClientKeyResolver::new_allow_http(
+        Arc::new(fetcher),
+        Duration::from_secs(86_400),
+    );
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let uri_a = "http://issuer-a.test/a.json";
+    let uri_b = "http://issuer-b.test/b.json";
+
+    // Each URI is asked for a kid only the OTHER one publishes, so a resolver that fetched
+    // the wrong URI would satisfy the request instead of refusing it.
+    let from_first = resolver.resolve_for_kid(now, uri_a, Some("uri-b")).await;
+    assert_eq!(
+        from_first
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["uri-a"],
+        "issuer A's uri must answer with A's key set, whatever kid was asked for"
+    );
+
+    let from_second = resolver.resolve_for_kid(now, uri_b, Some("uri-a")).await;
+    assert_eq!(
+        from_second
+            .iter()
+            .filter_map(ironauth_jose::TrustedKey::kid)
+            .collect::<Vec<_>>(),
+        vec!["uri-b"],
+        "and issuer B's uri with B's, so one issuer's key can never mint under the other's \
+         mappings"
+    );
+
+    // Two URIs, two entries, two fetches. One fetch would mean the cache is keyed on
+    // something coarser than the URI, which is the same confusion arriving by another route.
+    assert_eq!(
+        dialer.requested().len(),
+        2,
+        "the cache is keyed per URI: two distinct issuers cost two fetches, not one"
     );
 }

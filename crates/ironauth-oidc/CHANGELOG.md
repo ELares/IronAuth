@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`jwks_uri` key resolution now works in a deployed server at all, which it did not
+  before.** `OidcState::new` passes `None` for the client-key resolver and the shipped
+  binary called exactly that, so the only `Some(resolver)` call site in the repository was a
+  test harness. THREE surfaces read it and found nothing, and they did not all fail the same
+  way:
+
+  - `private_key_jwt` client authentication (issue #25) resolved to an EMPTY key set, so
+    every such client was refused. Inert.
+  - The `urn:ietf:params:oauth:grant-type:jwt-bearer` assertion grant (issue #126): same.
+  - `jwks_uri` DYNAMIC CLIENT REGISTRATION (RFC 7591) was not inert. It hard-refused with
+    "jwks_uri registration is not available on this deployment".
+
+  So this is a BEHAVIOUR CHANGE for the third one: a registration that was always refused is
+  now accepted, and accepting means an outbound fetch to a URL the CLIENT supplies. That is
+  a wider attacker-URL surface than the other two, where a registered and enabled issuer
+  record is required before any fetch, so the URL is always one an operator chose. It is
+  bounded rather than open: `oidc.registration_enabled` defaults to false, the route is
+  mounted only when it is on, it carries the issue #31 abuse controls when it is, and the
+  fetch itself goes through the SSRF-hardened fetcher. Recorded here because a behaviour
+  change nobody writes down is a behaviour change nobody reviews.
+
+  The suites for all three were green throughout, because each constructs the resolver
+  itself. `crates/ironauth/src/boot_wiring_tests.rs` now pins the installation against an
+  unwired control built through `OidcState::new`.
+
+- **New setting `oidc.client_jwks_ttl_secs`** (default 300, bounded 1 to 3600): how long a
+  client's fetched `jwks_uri` key set is cached. Both bounds are tested. Zero would make
+  every request refetch, which is the amplifier the resolver's per-URI rate limit exists to
+  prevent, reached through configuration rather than through an attacker; above the ceiling
+  a key the client has rotated OUT stays trusted longer than the rotation was meant to take.
+
 - **A rotating external issuer no longer fails every assertion until the JWKS cache expires
   (issue #126, criterion 4).** A cached key set was served until its TTL ran out, so when an
   issuer published a new key and started signing with it, every assertion it signed failed for

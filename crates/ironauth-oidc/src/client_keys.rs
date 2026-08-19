@@ -153,8 +153,16 @@ impl ClientKeyResolver {
             // ONE lock acquisition decides and records together. A check under one lock and
             // a record under another is a check-then-act race: N concurrent requests with
             // forged kids can all pass the check before any of them records, and each starts
-            // its own fetch. Review measured the split version exceeding the bound in a
-            // minority of 16-way bursts (worst trial 3 fetches); it is bounded at 2 now.
+            // its own fetch.
+            //
+            // GUARANTEED BY CONSTRUCTION, not by a test, and the distinction is real. Review
+            // measured the split version exceeding the bound only in a MINORITY of 16-way
+            // bursts (worst trial 3 fetches), and a later 256-way burst on 16 threads did
+            // not reproduce it at all. The window is a handful of instructions with no await
+            // in it, so an assertion aimed at it would fail rarely enough to be a flake
+            // rather than a test. `a_concurrent_burst_of_unknown_kids_still_costs_one_refetch`
+            // covers the gross regression (per-caller instead of per-URI); this line is what
+            // covers the subtle one, so it must not be split.
             if satisfied || !self.begin_rotation_refetch(now, jwks_uri) {
                 return keys.clone();
             }

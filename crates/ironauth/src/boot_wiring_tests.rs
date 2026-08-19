@@ -663,11 +663,14 @@ async fn both_planes_receive_the_same_shared_values() {
 ///
 /// This test exists because of a measurement. `OidcState::new` passes `None` for the
 /// resolver, and until this change the shipped binary called exactly that: the only
-/// `Some(resolver)` call site in the repository was a test harness. So
-/// `resolve_issuer_keys` returned an empty key set for every `jwks_uri` issuer, and BOTH
-/// surfaces that depend on it -- `private_key_jwt` client authentication and the
-/// `jwt-bearer` assertion grant -- were inert in a deployed server while their own suites
-/// were green, because those suites construct the resolver themselves.
+/// `Some(resolver)` call site in the repository was a test harness. THREE surfaces read
+/// `client_key_resolver()` and found nothing -- `private_key_jwt` client authentication,
+/// the `jwt-bearer` assertion grant, and `jwks_uri` dynamic client registration -- while
+/// their own suites stayed green, because those suites construct the resolver themselves.
+///
+/// The first two were inert. The third hard-refused with an explicit message, so wiring the
+/// resolver CHANGES its behaviour rather than restoring it; see the comment at the wiring
+/// site in `main.rs`.
 ///
 /// The unwired plane is the control, and it is what makes this non-vacuous: it is built
 /// through `OidcState::new` deliberately, so a version of this assertion that could not

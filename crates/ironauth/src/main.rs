@@ -1198,31 +1198,54 @@ async fn build_oidc_plane(
         };
     // THE CLIENT-KEY RESOLVER (issues #25, #126 criterion 4), and it was missing.
     //
-    // `OidcState::new` passes `None`, so `resolve_issuer_keys` returned an EMPTY key set for
-    // every `jwks_uri` issuer and both surfaces that depend on it -- `private_key_jwt` client
-    // authentication and the jwt-bearer assertion grant -- were inert in a deployed server.
-    // The resolver was correct, tested, reachable from the tests that construct it directly,
-    // and reachable from nothing else. A review measured it: the only `Some(resolver)` call
+    // `OidcState::new` passes `None`, so THREE surfaces read `client_key_resolver()` and
+    // found nothing. The resolver was correct, tested, reachable from the tests that
+    // construct it directly, and reachable from nothing else: the only `Some(resolver)` call
     // site in the whole repository was a test harness.
+    //
+    // The three do NOT all fail the same way, and an earlier version of this comment said
+    // "both surfaces", which was wrong on the count and hid the one that matters most:
+    //
+    //   1. `private_key_jwt` client authentication (#25) -- resolved to an empty key set,
+    //      so every such client was refused. Inert.
+    //   2. The `jwt-bearer` assertion grant (#126) -- same, inert.
+    //   3. `jwks_uri` DYNAMIC CLIENT REGISTRATION (RFC 7591) -- NOT inert. It hard-refused
+    //      with "jwks_uri registration is not available on this deployment", an explicit
+    //      operator-visible message.
+    //
+    // So wiring the resolver CHANGES BEHAVIOUR for the third one: a registration that was
+    // always refused is now accepted, and accepting means an outbound fetch to a URL the
+    // CLIENT supplies. That is a wider attacker-URL surface than the other two, where the
+    // grant requires a registered, enabled issuer record before any fetch, so the URL is
+    // always one an operator chose.
+    //
+    // Bounded rather than unbounded: `oidc.registration_enabled` defaults to false and the
+    // route is mounted only when it is on, and when on it carries the issue #31 abuse
+    // controls (peer-keyed rate limit, exposure switch, initial access token). The fetch
+    // itself goes through the SSRF-hardened fetcher, which is what makes a client-supplied
+    // URL acceptable at all. Said here because a behaviour change nobody wrote down is a
+    // behaviour change nobody reviewed.
     //
     // Built like the claims-enrichment hook above and failing the same way: a fetcher that
     // will not build is a TLS trust-store fault, and taking the whole OIDC plane down for it
-    // would be worse than the surfaces it disables. A warning says which ones.
-    let client_key_resolver = match crate::shared_config::outbound_fetcher(
-        ironauth_fetch::FetchLimits::default(),
-    ) {
-        Ok(fetcher) => Some(std::sync::Arc::new(ironauth_oidc::ClientKeyResolver::new(
-            std::sync::Arc::new(fetcher),
-            std::time::Duration::from_secs(oidc_config.client_jwks_ttl_secs),
-        ))),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "the client-key resolver's outbound fetcher could not be built; clients                  authenticating with private_key_jwt through a jwks_uri, and jwt-bearer                  assertions from an issuer with a jwks_uri, will be refused"
-            );
-            None
-        }
-    };
+    // would be worse than the surfaces it disables. The warning names all three.
+    let client_key_resolver =
+        match crate::shared_config::outbound_fetcher(ironauth_fetch::FetchLimits::default()) {
+            Ok(fetcher) => Some(std::sync::Arc::new(ironauth_oidc::ClientKeyResolver::new(
+                std::sync::Arc::new(fetcher),
+                std::time::Duration::from_secs(oidc_config.client_jwks_ttl_secs),
+            ))),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the client-key resolver's outbound fetcher could not be built; \
+                     private_key_jwt clients authenticating through a jwks_uri, jwt-bearer \
+                     assertions from an issuer with a jwks_uri, and dynamic client \
+                     registration of a jwks_uri will all be refused"
+                );
+                None
+            }
+        };
     let state = match client_key_resolver {
         Some(resolver) => OidcState::with_client_key_resolver(
             store,
