@@ -6,6 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A rotating external issuer no longer fails every assertion until the JWKS cache expires
+  (issue #126, criterion 4).** A cached key set was served until its TTL ran out, so when an
+  issuer published a new key and started signing with it, every assertion it signed failed for
+  up to a full TTL. The cache could not tell "signed by a key I have never seen" from "bad
+  signature", because it never saw the `kid`.
+
+  `ClientKeyResolver::resolve_for_kid` now refetches when the presented `kid` is absent from
+  the cached set. The `kid` is a STALENESS HINT only: it selects no key and authorises
+  nothing, and the verification policy still binds `iss` and the algorithm allowlist
+  independently.
+
+  The refetch is RATE LIMITED, and that is part of the design rather than hardening. `kid`
+  comes from an unverified header, so an unbounded refetch is an outbound-request amplifier
+  aimed at a third party. It is claimed under a single lock and permitted at most once per 30s
+  per `jwks_uri`, however many unknown kids arrive. A refetch whose upstream fails falls back
+  to the still-valid cached set, so the optimisation cannot make availability worse than not
+  having it.
+
 - **The emulator's fake upstream IdP could never have completed a federation login, and now does
   (issue #121, criterion 4).** The provider `ironauth dev` ships was written, wired, seeded as a
   connector, and reachable, and no test ever drove a login through it. Two defects were sitting in

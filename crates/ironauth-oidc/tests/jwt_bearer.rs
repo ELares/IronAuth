@@ -1873,17 +1873,23 @@ async fn a_failed_rotation_refetch_falls_back_to_the_cached_keys() {
     assert_eq!(dialer.requested().len(), 2, "it did attempt the refetch");
 }
 
-/// A JWKS whose keys carry no `kid` does not refetch on every request.
+/// A kid-less key set is bounded by the rate limit, NOT exempted from refetching.
 ///
-/// `ironauth-jose` deliberately supports kid-less keys (the RFC 8037 A.4 vector). For such a
-/// set, ANY named kid is "absent" forever, so treating that as staleness puts a legitimate
-/// issuer into a permanent refetch with no attacker involved -- self-inflicted amplification
-/// from ordinary traffic.
+/// `ironauth-jose` deliberately supports keys with no `kid` (the RFC 8037 A.4 vector). For
+/// such a set every named kid is "absent" forever, so an earlier version of this code treated
+/// it as satisfied by definition, to avoid refetching on every request.
+///
+/// That exemption was wrong twice over. The traffic it feared is already bounded -- five
+/// requests naming an unknown kid cost ONE refetch, not five, because the rate limit holds.
+/// And exempting the set meant an issuer that rotates FROM a kid-less set TO a kid-bearing
+/// one would never be refetched, leaving the new key undiscovered for a full TTL: criterion
+/// 4's outage, reintroduced by the guard meant to protect availability.
+///
+/// So this asserts the bound rather than an exemption.
 #[tokio::test]
-async fn a_kidless_key_set_does_not_refetch_on_every_request() {
-    // Built by HAND, because `jwks_json` always emits a `kid` -- the first version of this
-    // test used it and the guard below caught the fixture proving nothing. Strip the member
-    // so the served set genuinely carries no key id, which is the case under test.
+async fn a_kidless_key_set_is_bounded_by_the_rate_limit_not_exempted() {
+    // Built by HAND, because `jwks_json` always emits a `kid` -- an earlier version of this
+    // test used it and the guard below caught the fixture proving nothing.
     let key = SigningKey::ed25519_from_seed(Some("k-drop".to_owned()), &[0x33; 32]).expect("key");
     let mut doc: serde_json::Value =
         serde_json::from_str(&jwks_json(&key)).expect("jwks json parses");
@@ -1905,7 +1911,8 @@ async fn a_kidless_key_set_does_not_refetch_on_every_request() {
     }
     assert_eq!(
         dialer.requested().len(),
-        1,
-        "a kid-less set cannot answer the kid question, so it must not be treated as stale"
+        2,
+        "five requests naming an unknown kid must cost ONE refetch between them -- bounded, \
+         not exempted"
     );
 }

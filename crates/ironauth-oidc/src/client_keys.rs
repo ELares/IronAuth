@@ -132,24 +132,29 @@ impl ClientKeyResolver {
     ) -> Vec<TrustedKey> {
         let cached = self.cached(now, jwks_uri);
         if let Some(keys) = &cached {
-            // The cached set answers unless a NAMED kid is absent from it.
+            // The cached set answers unless a NAMED kid is absent from it. An assertion with
+            // no `kid` cannot tell us anything is stale, so it never triggers a refetch.
             //
-            // A set whose keys carry NO kid at all cannot answer the question: `kid()` is
-            // `None` for every key, so a named kid is "absent" from it forever. Treating that
-            // as staleness would put a legitimate issuer whose JWKS omits `kid` -- which
-            // ironauth-jose deliberately supports -- into a refetch on EVERY request, with no
-            // attacker involved. So a kid-less set is satisfied by definition.
-            let discriminating = keys.iter().any(|key| key.kid().is_some());
+            // A kid-LESS cached set is deliberately NOT special-cased, and an earlier version
+            // of this code got that wrong. It carried an arm treating such a set as satisfied
+            // for any kid, justified by "otherwise a kid-less issuer refetches on EVERY
+            // request". That number was measured against the code BEFORE the rate limit
+            // worked; once the limit holds, the same traffic costs one refetch per 30s per
+            // URI, which is exactly the budget this module already accepts.
+            //
+            // What the arm actually cost was the feature: an issuer whose cached set is
+            // kid-less and who then rotates to a kid-bearing set would never be refetched at
+            // all, so the new key stays undiscovered for a FULL TTL. That is criterion 4's
+            // outage, reintroduced by the guard meant to protect availability.
             let satisfied = match kid {
                 None => true,
-                Some(_) if !discriminating => true,
                 Some(wanted) => keys.iter().any(|key| key.kid() == Some(wanted)),
             };
             // ONE lock acquisition decides and records together. A check under one lock and
             // a record under another is a check-then-act race: N concurrent requests with
             // forged kids can all pass the check before any of them records, and each starts
-            // its own fetch. Measured at 3 fetches in a 16-way burst before this was folded
-            // into a single critical section.
+            // its own fetch. Review measured the split version exceeding the bound in a
+            // minority of 16-way bursts (worst trial 3 fetches); it is bounded at 2 now.
             if satisfied || !self.begin_rotation_refetch(now, jwks_uri) {
                 return keys.clone();
             }
@@ -202,9 +207,14 @@ impl ClientKeyResolver {
         let mut cache = self.cache.lock().expect("client key cache lock poisoned");
         let entry = cache.entry(jwks_uri.to_owned()).or_insert(CachedKeys {
             keys: Vec::new(),
-            // The epoch, so this synthetic entry is already expired and can never be served
-            // as if it were a real resolution.
-            fetched_at: SystemTime::UNIX_EPOCH,
+            // Stamped so this synthetic entry is expired RELATIVE TO `now`, not relative to
+            // the wall clock. `UNIX_EPOCH` would also read as expired today, but only because
+            // real time is far from the epoch -- and this repo injects manual clocks in
+            // tests, where `now` can sit near it. Under such a clock an epoch-stamped entry
+            // reads as FRESH and empty, and an empty set answers every kid, so the resolver
+            // would return no keys and make no fetch: a silent fail-closed for a whole TTL.
+            // Deriving it from `now` makes the guarantee a property of the code.
+            fetched_at: now.checked_sub(self.ttl).unwrap_or(SystemTime::UNIX_EPOCH),
             last_rotation_refetch: None,
         });
         let permitted = match entry.last_rotation_refetch {
