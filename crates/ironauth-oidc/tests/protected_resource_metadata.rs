@@ -25,9 +25,16 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::{Harness, json, send_through};
+use ironauth_jose::{KeySet, SigningKey, SigningPolicy};
+use ironauth_oidc::{
+    DiscoveryCapabilities, DiscoveryState, IssuerEntry, IssuerRegistry, JwksCacheWindow,
+    PairwiseSalt, discovery_router,
+};
 use ironauth_store::{
     ActorRef, CorrelationId, NewResourceServer, ResourceServerId, ServiceId, TokenFormat,
 };
+use std::sync::Arc;
+use std::time::SystemTime;
 
 /// Register a resource server with `audience` in the harness scope.
 async fn register_rs(harness: &Harness, audience: &str) {
@@ -291,4 +298,141 @@ async fn the_document_is_cacheable_and_revalidates() {
         StatusCode::NOT_MODIFIED,
         "a matching ETag revalidates"
     );
+}
+
+/// The router with discovery merged in over a PROVISIONED registry.
+///
+/// The harness's own registry is store-backed and does not resolve its scope, so every
+/// discovery form 404s on `harness.router()` alone. `discovery_probe.rs` documents exactly
+/// this ("an unprovisioned scope would 404") and solves it the same way, so this follows the
+/// established pattern rather than inventing one.
+fn router_with_discovery(harness: &Harness) -> axum::Router {
+    let scope = harness.scope();
+    let registry = IssuerRegistry::new(common::ISSUER_BASE, JwksCacheWindow::clamped(600));
+    let key =
+        SigningKey::ed25519_from_seed(Some("prm-chain".to_owned()), &[0x22; 32]).expect("key");
+    registry.insert(
+        scope,
+        IssuerEntry::new(
+            KeySet::bootstrap(key, SystemTime::UNIX_EPOCH),
+            SigningPolicy::eddsa_default(),
+            PairwiseSalt::new(Vec::new()),
+            ironauth_store::GuardrailSet::for_kind(ironauth_store::EnvironmentType::Dev),
+        ),
+    );
+    harness.router().merge(discovery_router(DiscoveryState::new(
+        common::ISSUER_BASE,
+        JwksCacheWindow::clamped(600),
+        DiscoveryCapabilities::default(),
+        Arc::new(registry),
+        harness.env().clone(),
+    )))
+}
+
+/// A bare GET through a router, as a client would make it.
+async fn fetch(router: &axum::Router, path: &str) -> (StatusCode, String) {
+    let (status, _, body) = send_through(
+        router.clone(),
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .expect("request builds"),
+    )
+    .await;
+    (status, body)
+}
+
+/// The discovery chain completes: PRM document -> the authorization server it names -> that
+/// server's metadata, with the issuer agreeing at every hop (issue #127 criterion 2).
+///
+/// This is the half of the chain IronAuth OWNS. The criterion describes a client starting at
+/// a customer resource server's 401 and following `resource_metadata` to the PRM document;
+/// that first hop is emitted by the SDK middleware (criterion 3), which does not exist -- and
+/// `prm::challenge`, which builds exactly that header, has no caller anywhere in the
+/// workspace. Recorded on the issue; not papered over here.
+///
+/// What this asserts is that once a client HAS the PRM document, every subsequent hop
+/// resolves and agrees. The failure mode it exists for is a PRM naming an authorization
+/// server whose metadata is served under a DIFFERENT issuer string: the client fetches keys
+/// for one issuer and validates tokens minted by another, and both documents read correctly
+/// on their own.
+///
+/// What it does NOT prove: the two issuer strings are each derived from the same
+/// `ISSUER_BASE`, so their agreement is partly structural. The check that carries real weight
+/// is the PATH COMPOSITION -- RFC 8414 inserts the well-known segment between host and path
+/// rather than appending it, which is the hop a client gets wrong and which this walks for
+/// real.
+#[tokio::test]
+async fn the_discovery_chain_resolves_from_the_prm_document_to_the_authorization_server() {
+    let harness = Harness::start().await;
+    let resource = hosted_resource(&harness, "mcp");
+    register_rs(&harness, &resource).await;
+    let router = router_with_discovery(&harness);
+
+    // HOP 1: the PRM document for the resource.
+    let (status, body) = fetch(&router, &well_known_path(&harness, "mcp")).await;
+    assert_eq!(status, StatusCode::OK, "PRM: {body}");
+    let prm = json(&body);
+    assert_eq!(prm["resource"], resource);
+
+    // HOP 2: the authorization server it names.
+    let servers = prm["authorization_servers"]
+        .as_array()
+        .expect("authorization_servers is required by RFC 9728");
+    assert_eq!(servers.len(), 1, "exactly one AS for a hosted resource");
+    let issuer = servers[0].as_str().expect("issuer is a string").to_owned();
+
+    // HOP 3: that server's metadata, at the path composed from the ISSUER the PRM gave us --
+    // not from harness state, which would make the test agree with itself. RFC 8414 INSERTS
+    // the well-known segment between host and path; appending it is the common mistake and
+    // would 404 here.
+    let as_path = issuer
+        .strip_prefix(common::ISSUER_BASE)
+        .map(|tail| format!("/.well-known/oauth-authorization-server{tail}"))
+        .expect("the AS the PRM names must live under this deployment");
+    let (status, body) = fetch(&router, &as_path).await;
+    assert_eq!(status, StatusCode::OK, "AS metadata at {as_path}: {body}");
+    let metadata = json(&body);
+
+    // The hop that matters: the metadata's OWN issuer must be the string the PRM sent the
+    // client to.
+    assert_eq!(
+        metadata["issuer"], issuer,
+        "the AS metadata's issuer must be the identifier the PRM pointed at: {body}"
+    );
+
+    // The chain has to end somewhere usable.
+    for required in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+        assert!(
+            metadata[required].as_str().is_some_and(|v| !v.is_empty()),
+            "a client that completed the chain must find {required}: {body}"
+        );
+    }
+
+    // Every scope the PRM advertises must be one the AS actually supports, or a client
+    // requests a scope that is refused at the authorization endpoint.
+    let advertised: Vec<&str> = prm["scopes_supported"]
+        .as_array()
+        .expect("scopes_supported")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let supported: Vec<&str> = metadata["scopes_supported"]
+        .as_array()
+        .expect("AS scopes_supported")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        !advertised.is_empty(),
+        "an empty advertised set would make the check below vacuous"
+    );
+    for scope in &advertised {
+        assert!(
+            supported.contains(scope),
+            "the PRM advertises `{scope}`, which the authorization server does not support: \
+             {supported:?}"
+        );
+    }
 }
