@@ -1522,7 +1522,10 @@ async fn authorizing_an_impersonation_announces_it_without_the_operator_prose() 
 /// old fixture seeded envelopes.
 ///
 /// So this drives a real session through the real path and folds what the feed actually
-/// contains. It is the only test that can fail if the producer is removed.
+/// contains. It was the only test that could fail if the producer were removed; it is now one
+/// of several, because the drain assertions in `sessions.rs` count the same producer's output
+/// and go to zero with it. It remains the only one that folds the METERING result rather than
+/// the raw feed, which is the half that matters here.
 #[tokio::test]
 async fn a_real_sign_in_is_metered_as_an_active_user() {
     let db = TestDatabase::start().await;

@@ -1369,12 +1369,21 @@ async fn a_storm_of_session_bound_opens_never_orphans_a_family_onto_a_revoked_se
 /// commit 79809905), because metering counts monthly actives off it and the store is its only
 /// producer. The revocation tests below were written before that existed and claim the WHOLE
 /// outbox, so each one saw the fixture's sign-ins alongside the event it was actually
-/// asserting about and failed with `left: 2, right: 1`.
+/// asserting about.
+///
+/// THEY DID NOT ALL FAIL THE SAME WAY, and saying they did would be the same kind of
+/// unmeasured sentence this helper exists to stop. Measured on `main`: one was
+/// `left: 2, right: 1`, one `left: 3, right: 2`, one a bare `assert!` with no left or right
+/// ("a refused bulk revoke must announce nothing at all"), and one compared the wrong event
+/// entirely, `left: "user.signed_in", right: "user.sessions_revoked"`.
 ///
 /// Returns the count rather than draining silently, so every caller ASSERTS what its fixture
-/// queued. A blind drain would swallow the next such change instead of reporting it, and the
-/// count is worth pinning in its own right: it is the only place the suite states that
-/// creating a session emits exactly one event per session.
+/// queued. A blind drain would swallow the next such change instead of reporting it.
+///
+/// What the counts add is the N > 1 case. That one session emits exactly one sign-in is
+/// ALREADY pinned, by `impersonation_sessions::a_real_sign_in_is_metered_as_an_active_user`;
+/// what nothing stated before is that two sessions emit two and three emit three, which is
+/// the property a batched or deduplicated producer would break.
 async fn drain_fixture_events(db: &TestDatabase, env: &Env, scope: Scope) -> usize {
     // LOOPS, because one claim is not one drain. The outbox delivers at most one message per
     // ORDERING KEY at a time, so a claim never yields the second sign-in until the first is
