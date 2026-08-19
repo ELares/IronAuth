@@ -16,8 +16,9 @@ cd "$(git rev-parse --show-toplevel)"
 # (rfc9700-scan, event-catalog freshness, dash-scan) sat in the ~44 announced checks it never
 # reached, and were found only by replaying the CI job by hand.
 #
-# The banner count is not the whole story either: the file holds 66 executable commands, and
-# 15 of them are assertions with no banner of their own -- which is exactly how the six
+# The banner count is not the whole story either: the file holds 66 executable commands, 14
+# of which were assertions with no banner of their own (a 15th, `git rev-parse`, is setup) --
+# which is exactly how the six
 # `git diff --exit-code` freshness checks came to be the LAST things still able to kill this
 # script after its first rewrite.
 #
@@ -38,9 +39,12 @@ GATE_FAILURES=()
 gate_summary() {
   local rc=$?
   if ((${#GATE_FAILURES[@]} > 0)); then
-    echo "" >&2
-    echo "gate: ${#GATE_FAILURES[@]} check(s) FAILED:" >&2
-    printf '  - %s\n' "${GATE_FAILURES[@]}" >&2
+    # stdout, like every other line this script prints. Splitting the summary onto stderr
+    # would drop it from `scripts/gate.sh > gate.log`, which is how a multi-hour run is
+    # actually captured -- the failure list is the one part of the log that must survive.
+    echo ""
+    echo "gate: ${#GATE_FAILURES[@]} check(s) FAILED:"
+    printf '  - %s\n' "${GATE_FAILURES[@]}"
     # A non-zero rc from an abort is preserved; a clean exit with failures recorded becomes 1.
     ((rc == 0)) && rc=1
   elif ((rc == 0)); then
@@ -60,12 +64,19 @@ run() {
   fi
 }
 
-# A PREREQUISITE: if this fails, everything downstream is noise, so stop.
+# A PREREQUISITE: if this fails, the cargo-dependent checks below are noise, so stop.
 #
-# Accumulating is right for independent checks and wrong for a build. Roughly two thirds of
-# the checks below invoke cargo, so one compile error would otherwise report ~18 "failed
-# checks" for a single root cause and spend the gate's full wall-clock (20 minutes to a couple
-# of hours) proving the same thing repeatedly. A reader wants "it does not compile", once.
+# Scoped to a real COMPILE, deliberately. An earlier version gated on clippy, which exits
+# non-zero identically for `error[E0308]` and for one pedantic style lint on a tree that
+# compiles perfectly -- so a missing `#[must_use]` skipped every later check and reinstated
+# the fix-one-thing-rerun-everything loop this rewrite exists to remove, for what is by far
+# clippy's most common failure mode.
+#
+# The scope is also narrower than it looks: 18 of the 51 downstream checks invoke cargo, and
+# the other 33 are grep and python scans that never needed a compiling tree. So the honest
+# claim is "one third of the checks below would report the same root cause", not two thirds,
+# and the reason to stop is that those 18 are also the slow ones -- they would spend the
+# gate's full wall-clock re-proving a single compile error.
 run_required() {
   local label="$1"
   shift
@@ -73,8 +84,8 @@ run_required() {
   if ! "$@"; then
     GATE_FAILURES+=("$label (prerequisite -- later checks were skipped)")
     echo "    FAILED: $label"
-    echo "    This is a PREREQUISITE: everything after it needs a compiling tree, so the"
-    echo "    gate stops here rather than reporting the same root cause many times."
+    echo "    This is a PREREQUISITE: the cargo-dependent checks after it need a compiling"
+    echo "    tree, so the gate stops rather than re-proving one root cause 18 times."
     exit 1
   fi
 }
@@ -84,7 +95,8 @@ run "fmt" cargo fmt --all --check
 
 run "msrv audit (no dependency declares a rust-version above the workspace MSRV)" ./scripts/msrv-audit.sh
 
-run_required "clippy (pedantic, -D warnings)" cargo clippy --workspace --all-targets --all-features -- -D warnings
+run_required "workspace compiles" cargo check --workspace --all-targets --all-features
+run "clippy (pedantic, -D warnings)" cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # The ironauth-store isolation tests need a real Postgres via DATABASE_URL.
 # with-test-db.sh runs against DATABASE_URL if set (a CI service), else brings up
