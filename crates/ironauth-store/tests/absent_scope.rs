@@ -156,10 +156,13 @@ async fn the_recognition_rule_matches_the_scope_foreign_keys_and_nothing_else() 
     // constraint the rule MATCHES really does reference a scope table, so the conversion
     // cannot answer not-found for a referential failure against a row that is there.
     //
-    // This is not hypothetical safety. The schema carries eleven constraints of the
+    // This is not hypothetical safety. The schema carries A DOZEN constraints of the
     // shape `FOREIGN KEY (x_id, tenant_id, environment_id)` onto a non-scope parent, and
     // every one of them is kept out of this rule's reach only by `environment_id` coming
-    // LAST in the column list. The scope keys themselves use the opposite order, so both
+    // LAST in the column list. (Eleven when that sentence was written; 0147 added the
+    // twelfth, which is the argument for the assertion below reading the live schema rather
+    // than for anyone writing the number down again.) The scope keys themselves use the
+    // opposite order, so both
     // orders are already in the schema and a new table written the other way round would
     // land here.
     let wrongly_matched: Vec<&ForeignKey> = keys
@@ -355,5 +358,89 @@ async fn a_genuine_database_fault_is_still_a_database_fault() {
         "a foreign-key violation on a key that does not bind a row to its scope must \
          stay a fault; converting it would answer not-found for a row the caller can \
          address: {converted:?}"
+    );
+}
+
+/// The two tables that BROKE the convention answer the uniform not-found too (issues #111,
+/// #112).
+///
+/// The schema-wide rule above is a proxy: it asserts every scope foreign key is
+/// RECOGNIZABLE by name. This asserts the thing the proxy stands for, on the two tables
+/// that were unrecognizable until migration 0150, so the fix is measured by behaviour and
+/// not only by a naming scan.
+///
+/// It matters that these two are the ones. `message_templates` (0145) and `flow_targets`
+/// (0146) declared the composite key with the columns in the opposite order to every other
+/// scoped table, so Postgres named the constraint `..._tenant_id_environment_id_fkey`
+/// instead of `..._environment_id_tenant_id_fkey`. The conversion matches on the suffix
+/// `_tenant_id_fkey`, which the second name carries and the first does not, so a write into
+/// an absent environment answered a SERVER FAULT: a distinguisher an unauthenticated caller
+/// can enumerate scopes with.
+///
+/// The module documentation above predicted exactly this ("the schema already carries both
+/// orders, so it is one keystroke from breaking"), and it went unseen for two migrations
+/// because the CI job that runs this suite was dying on disk exhaustion before it got here.
+#[tokio::test]
+async fn a_template_write_into_an_absent_environment_is_the_uniform_not_found() {
+    use ironauth_store::message_template::TemplateLevel;
+    use ironauth_store::{MessageTemplateId, NewMessageTemplate};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let live = db.seed_scope(&env).await;
+
+    let write = async |scope: Scope| {
+        let id = MessageTemplateId::generate(&env, &scope);
+        // The CONTROL-plane store: `message_templates` is a control-plane table and the
+        // data-plane role has no grant on it, so `db.store()` would fail with a permission
+        // error and this test would be measuring the wrong refusal.
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .message_templates()
+            .set(
+                &env,
+                &id,
+                0,
+                NewMessageTemplate {
+                    level: TemplateLevel::Environment,
+                    organization_id: None,
+                    kind: "invitation",
+                    locale: "en",
+                    subject: "s",
+                    body_text: "b",
+                    body_html: None,
+                    locked: false,
+                },
+            )
+            .await
+    };
+
+    // THE CONTROL. Without it a not-found below would be measuring breakage rather than
+    // the rule, which is the failure mode this whole file is written against.
+    write(live)
+        .await
+        .expect("the write into a LIVE scope lands");
+
+    // A real tenant, an environment that never existed: this trips the COMPOSITE key, which
+    // is the one whose name broke.
+    let ghost_environment = Scope::new(live.tenant(), EnvironmentId::generate(&env));
+    let error = write(ghost_environment)
+        .await
+        .expect_err("a write into an absent environment cannot land");
+    assert!(
+        matches!(error, StoreError::NotFound),
+        "an absent environment must be the uniform not-found and never a database fault, \
+         or the data plane distinguishes a scope that exists from one that does not: \
+         {error:?}"
+    );
+
+    // And a tenant that never existed either, which trips the single-column key.
+    let error = write(ghost_scope(&env))
+        .await
+        .expect_err("a write into an absent tenant cannot land");
+    assert!(
+        matches!(error, StoreError::NotFound),
+        "an absent tenant must be the uniform not-found too: {error:?}"
     );
 }

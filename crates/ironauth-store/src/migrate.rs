@@ -1190,6 +1190,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0149_external_issuer_audience_allow.sql"),
         },
+        Migration {
+            version: 150,
+            name: "scope_fk_naming",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0150_scope_fk_naming.sql"),
+        },
     ]
 }
 
