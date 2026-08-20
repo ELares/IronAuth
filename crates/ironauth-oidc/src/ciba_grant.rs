@@ -63,7 +63,12 @@ fn auth_req_id_scope(auth_req_id: &str) -> Option<Scope> {
 /// distinguishable from unknown. That does not weaken the oracle argument on the `NotFound`
 /// arm below, which is about not distinguishing an unknown request from ANOTHER CLIENT'S
 /// request within one scope, but the two had been written as though they were the same
-/// claim. A malformed or absent `auth_req_id` is `invalid_request`, not `invalid_grant`.
+/// claim. An ABSENT or blank `auth_req_id` is `invalid_request`, because the request itself
+/// is malformed. A PRESENT but unusable one, from which no scope can be recovered, is
+/// `invalid_grant`: the request is well formed and the grant is not. That is the split this
+/// grant's own test drives, and the third consecutive version of this paragraph to state it
+/// wrongly. The previous one said "malformed or absent" was `invalid_request` while a test
+/// two files away asserted `invalid_grant` for the malformed half.
 ///
 /// An ALREADY REDEEMED `auth_req_id` is deliberately not in that list, because it does not
 /// answer `invalid_grant`. `poll` evaluates the interval before the status, so a spent
@@ -154,10 +159,17 @@ async fn issue_ciba_tokens(
     // refresh token, so it has no family, so even `delete_user` leaves the approval live.
     //
     // Without this call a blocked, disabled, or soft-deleted user's outstanding approval
-    // still mints a full ID and access token for the whole request TTL, and since the
-    // access token is a self-contained `at+jwt` and the ID token carries no `sid`, nothing
-    // downstream can take it back. Measured, before it was added: 200 with live tokens for
-    // both a Blocked and a soft-deleted user.
+    // still mints a full ID and access token for the whole request TTL. Measured, before it
+    // was added: 200 with live tokens for both a Blocked and a soft-deleted user.
+    //
+    // How recoverable that is depends on a deployment setting, and an earlier version of
+    // this comment asserted the worse half as though it were the only one. Under
+    // `oidc.default_access_token_format = at_jwt` (the default), the access token is
+    // self-contained and nothing takes it back before its own expiry. Under `opaque` this
+    // grant mints an `ira_at_` reference token, recorded against the authoritative grant id,
+    // and `resolve_opaque_access_token` filters on `g.revoked_at IS NULL`, so revoking the
+    // grant does revoke it. The ID token carries no `sid` in either configuration, so
+    // back-channel logout has nothing to target either way.
     //
     // Unconditional rather than gated on the subject's SHAPE, for the reason
     // `resolve_device_sid` gives for its own session-less branch: a CIBA `subject` is a
@@ -303,6 +315,13 @@ async fn mint_ciba_tokens(
     // whose input crosses a trust boundary this layer does not own, so the check belongs
     // here rather than inside `parse_methods`, whose under-claiming fallback is correct for
     // the callers it was written for.
+    //
+    // What it does NOT close, said plainly because the trust-boundary argument above applies
+    // to it just as well: a wrong spelling naming a RECOGNIZED but stronger method still
+    // asserts more than happened. `Some("attested_passkey")` mints the top-ranked `acr`, and
+    // `Some("trusted_device")` mints the remembered-MFA `acr` with an empty `amr`. This
+    // guard only stops an unrecognized string from becoming `pwd`; bounding what an approval
+    // may claim belongs with the surface that writes it.
     let auth_methods = approved
         .auth_methods
         .as_deref()

@@ -334,10 +334,16 @@ async fn an_expired_request_is_expired_token() {
 /// mid-incident does not stop that user's outstanding approval from minting.
 ///
 /// Measured before the fix, on both arms below: `200 OK` with a live ID token and access
-/// token. The access token is a self-contained `at+jwt` and the ID token carries no
-/// `sid`, so nothing downstream could take either back.
+/// token. The ID token carries no `sid`, so back-channel logout cannot target it. Whether
+/// the ACCESS token can be taken back depends on `oidc.default_access_token_format`: an
+/// `at+jwt` (the default) cannot, an `opaque` one is revocable through its grant.
 #[tokio::test]
 async fn a_fenced_user_cannot_redeem_an_approved_backchannel_request() {
+    // Counted, because a loop whose body never runs passes every assertion inside it. Both
+    // arms below are driven off `UserState::ALL` through predicates, so a predicate change
+    // could empty either one silently.
+    let mut transitioned = 0;
+    let mut seeded = 0;
     // EVERY state, not the two that were listed. `can_authenticate` is the predicate this
     // fence delegates to, so driving its whole domain is what makes "a fenced user" mean the
     // same thing here as it does there. Active and ScheduledOffboarding are authenticatable
@@ -381,7 +387,75 @@ async fn a_fenced_user_cannot_redeem_an_approved_backchannel_request() {
             body["access_token"].is_null() && body["id_token"].is_null(),
             "no token may escape for a {state:?} user: {body:?}"
         );
+        transitioned += 1;
     }
+
+    // The two states nothing can transition INTO, reached by SEEDING in them instead.
+    // `PendingVerification` and `Waitlisted` are both named in the changelog as fenced, and
+    // the transition-derived loop above skips both, so without this they were claimed and
+    // not measured. `seed_user_in_state` already existed for exactly this.
+    for state in UserState::ALL {
+        if state.can_authenticate() || UserState::Active.can_transition_to(state) {
+            continue;
+        }
+        let (harness, client_id) = ciba_harness().await;
+        let identifier = format!(
+            "ciba-seeded-{}@example.test",
+            ironauth_store::CorrelationId::generate(harness.env())
+        );
+        let subject = harness
+            .seed_user_in_state(&identifier, common::SEED_PASSWORD, state)
+            .await;
+        let (status, _headers, body) = harness
+            .post_form(
+                "/backchannel_authenticate",
+                &form(&[
+                    ("client_id", &client_id),
+                    ("login_hint", &identifier),
+                    ("scope", "openid"),
+                ]),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{state:?} backchannel start: {body}"
+        );
+        let auth_req_id = json(&body)["auth_req_id"]
+            .as_str()
+            .expect("auth_req_id")
+            .to_owned();
+        approve(&harness, &auth_req_id, &subject).await;
+        pace(&harness);
+
+        let (status, body) = redeem(&harness, &auth_req_id, &client_id).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a {state:?} user's approval must not mint: {body:?}"
+        );
+        assert_eq!(body["error"], "invalid_grant", "{state:?}: {body:?}");
+        assert!(
+            body["id_token"].is_null(),
+            "no token may escape for a {state:?} user: {body:?}"
+        );
+        seeded += 1;
+    }
+
+    // Every non-authenticatable state is covered by exactly one of the two arms, and both
+    // arms are non-empty. Stated as a partition rather than as two magic numbers, so adding
+    // a fenced state raises the total instead of failing an equality nobody updates.
+    let fenced = UserState::ALL
+        .iter()
+        .filter(|state| !state.can_authenticate())
+        .count();
+    assert_eq!(
+        transitioned + seeded,
+        fenced,
+        "every fenced state must be driven by one arm or the other"
+    );
+    assert!(transitioned > 0 && seeded > 0, "neither arm may be empty");
 
     // The SOFT DELETE, which the doc above claims and no assertion made. It is a distinct
     // path: a deleted row is absent rather than in a refusing state, and `delete_user` is

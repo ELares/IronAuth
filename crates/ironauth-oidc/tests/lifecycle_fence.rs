@@ -1119,8 +1119,10 @@ async fn every_token_endpoint_grant_answers_a_fenced_scope_the_same_way() {
     // without spending them. Deliberately not a count: `GrantCredentials` carries six and
     // this re-drives four of them (the assertion and the exchange's access token are not
     // re-driven), and the census comment further up this file was just de-counted for
-    // exactly this reason. A hard number here would have gone stale the same way. This is the sweep's version of "the code is not
-    // burned", and it is what makes the refusal safe to retry after the suspension.
+    // exactly this reason. A hard number here would have gone stale the same way.
+    //
+    // This is the sweep's version of "the code is not burned", and it is what makes the
+    // refusal safe to retry after the suspension.
     set_serving(&harness, &scope, "active").await;
     let (status, body) = exchange(&harness, &suspended_credentials.code).await;
     assert_eq!(
@@ -1168,11 +1170,16 @@ async fn every_token_endpoint_grant_answers_a_fenced_scope_the_same_way() {
     // So state precisely what this proves and what it does not. It proves the APPROVAL
     // survived: the fence did not consume it, and it still mints once the scope resumes.
     // It does NOT prove the refusal was free. Measured by re-driving with no clock advance
-    // at all, the answer is `400 slow_down`: the refused 503s advanced `last_poll_at` and
-    // escalated the interval, because the poll runs before `grant_issuer_entry` (which is
-    // reached inside `mint_ciba_tokens`). An earlier version of this comment claimed the
-    // stronger property and then paced 6 seconds past the interval, which hid the very cost
-    // it had just named.
+    // at all, the answer is `400 slow_down`, because the poll runs before
+    // `grant_issuer_entry` (which is reached inside `mint_ciba_tokens`) and so advanced
+    // `last_poll_at`. An earlier version of this comment claimed the stronger property and
+    // then paced 6 seconds past the interval, which hid the very cost it had just named.
+    //
+    // Precisely: what moves here is `last_poll_at`, not `interval_secs`. `grant_answers`
+    // runs once per bundle, so there is exactly one fenced CIBA call, `too_soon` is false
+    // for it, and the interval stays at its configured 5s. An earlier correction of this
+    // paragraph said "and escalated the interval", which is what a SECOND fenced poll would
+    // do and not what this arm drives.
     //
     // That is a real asymmetry with `a_refused_call_does_not_advance_the_poll_interval` in
     // `ciba_grant.rs`, which pins that a refused call must not advance the flow: the
