@@ -1153,9 +1153,13 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     // Hence: comments stripped, uppercased, and the NOT VALID check anchored to the
     // ADD CONSTRAINT statement rather than to the file.
     let statements_of = |sql: &str| -> String {
+        // Line comments cut at `--`, not just whole lines that begin with it. A TRAILING
+        // `-- ... NOT VALID ...` beside a validating ALTER was a bypass, and a trailing
+        // `-- ... VALIDATE CONSTRAINT ...` was a false alarm on correct SQL. Both are the
+        // same omission: the previous version only dropped lines that STARTED with `--`.
         let without_line_comments = sql
             .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
+            .map(|line| line.split_once("--").map_or(line, |(code, _)| code))
             .collect::<Vec<_>>()
             .join("\n");
         // Block comments out, then whitespace collapsed. Both are about not raising a FALSE
@@ -1183,8 +1187,22 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     };
     let add_statements = statements_of(&add_sql);
     let validate_statements = statements_of(&validate_sql);
-    // EVERY `ADD CONSTRAINT`, each truncated at its own terminating semicolon, with the
-    // constraint's NAME required in the same segment as `NOT VALID`.
+    // EVERY `ADD CONSTRAINT`, each cut at the next semicolon, with the constraint's NAME
+    // required in the same span as `NOT VALID`.
+    //
+    // WHAT THIS IS AND IS NOT. It is a text scan, so it catches the regression it exists for,
+    // which is somebody collapsing the two files back into one and writing a plain validating
+    // `ADD CONSTRAINT`. It is not a SQL parser and cannot be made into one by tightening:
+    // review has now defeated successive versions with a string literal, a `COMMENT ON`, a
+    // block comment, a decoy constraint of the same name on another table, and a nested block
+    // comment, and each tightening produced a new way in. Saying "cut at the next semicolon"
+    // rather than "at its own terminating semicolon" is part of that honesty: a `;` inside a
+    // string literal in the CHECK expression ends the span early.
+    //
+    // The enforcement that does not depend on spelling is elsewhere and is measured: the code
+    // guards in `decide`, `approved_details`, `redeem` and `redeem_approved`, and the
+    // `convalidated` assertion below. This one protects the LOCK property, which nothing in
+    // the schema can see.
     //
     // The previous version took everything from the FIRST `ADD CONSTRAINT` to end of file and
     // called it a statement. Four ways past it, all measured, all leaving 0151 taking

@@ -63999,7 +63999,11 @@ pub enum BackchannelPoll {
     /// Past its TTL: `expired_token`.
     Expired,
     /// No such request for this client. Also the answer for a request belonging to ANOTHER
-    /// client, so polling is not an existence oracle either.
+    /// client, and for one in another SCOPE, so polling is not an existence oracle either.
+    ///
+    /// Three causes, one answer, and deliberately no error code on the variant: naming which
+    /// applied is the oracle. A caller answers all three `invalid_grant`, which CIBA Core
+    /// section 11 makes a MUST.
     NotFound,
 }
 

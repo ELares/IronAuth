@@ -312,6 +312,29 @@ fn approving_linkage(grant: &ironauth_store::GrantId) -> BackchannelApprovalLink
     }
 }
 
+/// Point an existing request's spine at a grant, without going through `decide`.
+///
+/// `create_pending_nonce` leaves `grant_id` NULL, and a NULL spine makes
+/// `verify_redemption_grant` refuse before any status widening can be observed. A test that
+/// wants the STATUS filter to be the thing under test links the spine first, so a mutant dies
+/// at its own assertion rather than at the ownership guard one step later.
+async fn link_spine(db: &TestDatabase, scope: Scope, digest: &str, grant_id: &str) {
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    sqlx::query(
+        "UPDATE backchannel_authentication_requests SET grant_id = $4 \
+         WHERE auth_req_id_digest = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(digest)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(grant_id)
+    .execute(&mut *tx)
+    .await
+    .expect("link the spine");
+    tx.commit().await.expect("commit");
+}
+
 /// A distinct 64-hex digest per input, so fixtures cannot collide on the primary key.
 fn digest_of(seed: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -4075,18 +4098,24 @@ async fn redeem_approved_refuses_a_pending_and_a_denied_request() {
     // DENIED: the user said no.
     let (denied, denied_id) =
         create_pending_nonce(&db, &env, scope, "cli_app", "usr_ada", 95).await;
-    repo()
-        .backchannel_auth()
-        .decide(
-            &env,
-            &denied_id,
-            "usr_ada",
-            false,
-            BackchannelApprovalLinkage::default(),
-            NOW_MICROS,
-        )
-        .await
-        .expect("deny");
+    assert!(
+        repo()
+            .backchannel_auth()
+            .decide(
+                &env,
+                &denied_id,
+                "usr_ada",
+                false,
+                BackchannelApprovalLinkage::default(),
+                NOW_MICROS,
+            )
+            .await
+            .expect("deny"),
+        "the denial must actually land. Discarding this bool leaves the arm unable to tell \
+         `denied` from `pending`: measured, pointing `decide` at another subject made the \
+         denial a no-op and this test still passed"
+    );
+    link_spine(&db, scope, &denied, &grant.to_string()).await;
     assert!(
         !repo()
             .backchannel_auth()
