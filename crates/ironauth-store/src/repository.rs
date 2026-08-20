@@ -64765,7 +64765,7 @@ impl BackchannelAuthRepo<'_> {
                AND environment_id = $4 \
                AND status = 'approved' \
                AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $5 \
-             RETURNING id",
+             RETURNING id, grant_id",
         )
         .bind(auth_req_id_digest)
         .bind(presenting_client_id)
@@ -64774,9 +64774,28 @@ impl BackchannelAuthRepo<'_> {
         .bind(now_micros)
         .fetch_optional(&mut *tx)
         .await?;
-        if flipped.is_none() {
+        let Some(row) = flipped else {
             tx.commit().await?;
             return Ok(false);
+        };
+        // THE GRANT THE APPROVAL OPENED IS THE ONE THE TOKENS HANG OFF, and it is in this
+        // row, so it is checked rather than trusted. A caller-supplied grant that disagrees
+        // with the request's own is refused: review demonstrated redeeming with an unrelated
+        // grant owned by a DIFFERENT client, which recorded the tokens and the audit row
+        // against that grant, so revoking the CIBA grant revoked nothing and the issuance was
+        // mis-attributed. Naming the fields in a struct does not prevent that; comparing them
+        // does.
+        //
+        // A NULL row grant is the pre-linkage case (`decide` may open none), and the caller's
+        // grant stands alone there.
+        let spine: Option<String> = row.get("grant_id");
+        if spine.is_some_and(|opened| opened != grant_id.to_string()) {
+            return Err(StoreError::NotFound);
+        }
+        // Foreign-scope token identifiers are refused, exactly as the device grant refuses
+        // them: a token id minted under another scope must not be written into this one.
+        if tokens.iter().any(|token| token.id.scope() != scope) {
+            return Err(StoreError::NotFound);
         }
         for token in tokens {
             sqlx::query(
@@ -64794,11 +64813,17 @@ impl BackchannelAuthRepo<'_> {
         }
         if let Some(op) = opaque {
             sqlx::query(
+                // `audiences` and `dpop_jkt` are WRITTEN here, unlike the device grant's
+                // copy of this insert, which omits both. That omission is not cosmetic: a
+                // NULL `audiences` makes `resolve_opaque_access_token` fall back to the
+                // single `audience`, so a multi-audience token introspects NARROWER than it
+                // was issued, and a NULL `dpop_jkt` reads back as "not key bound", silently
+                // downgrading a sender-constrained token to a bearer token.
                 "INSERT INTO opaque_access_tokens \
                  (token_digest, tenant_id, environment_id, grant_id, subject, client_id, \
-                  audience, scope, jti, expires_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                         TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+                  audience, audiences, scope, jti, expires_at, dpop_jkt) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                         TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, $12)",
             )
             .bind(op.token_digest)
             .bind(&tenant)
@@ -64807,9 +64832,11 @@ impl BackchannelAuthRepo<'_> {
             .bind(op.subject)
             .bind(op.client_id)
             .bind(op.audience)
+            .bind(resource_array_to_json(op.audiences))
             .bind(op.scope)
             .bind(op.jti.to_string())
             .bind(op.expires_at_unix_micros)
+            .bind(op.dpop_jkt)
             .execute(&mut *tx)
             .await?;
         }

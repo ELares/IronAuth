@@ -1202,6 +1202,39 @@ async fn the_opened_grant_is_the_one_redemption_reports() {
     assert_eq!(redeemed.subject, "usr_ada");
 }
 
+/// How many issued-token rows and `token.issue` audit rows exist for `grant_id`.
+///
+/// Read back out of the database rather than inferred, because "recorded in the same
+/// transaction as the flip" is the property this file exists to prove and an earlier version
+/// of it asserted neither: review deleted the token-insert loop and the audit row in turn and
+/// the suite stayed green.
+async fn recorded_for(db: &TestDatabase, scope: Scope, grant_id: &str) -> (i64, i64) {
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let tokens: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM issued_tokens WHERE grant_id = $1 AND tenant_id = $2 \
+         AND environment_id = $3",
+    )
+    .bind(grant_id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("count issued tokens");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'token.issue' AND target_id = $1 \
+         AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(grant_id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("count audit rows");
+    tx.commit().await.expect("commit");
+    (tokens, audited)
+}
+
 /// Redeeming records the minted tokens in the SAME transaction as the flip, and does it at
 /// most once (issue #131 criteria 2 and 3).
 ///
@@ -1215,8 +1248,12 @@ async fn the_opened_grant_is_the_one_redemption_reports() {
 /// either unrecorded tokens or a second transaction that can fail independently, and both
 /// look like a working deployment.
 ///
-/// So the pair is `approved_details` (a non-consuming read, to mint from) and this. The test
-/// asserts the token row exists AFTER the flip, and that a second attempt flips nothing.
+/// So the pair is `approved_details` (a non-consuming read, to mint from) and this.
+///
+/// Every claim below is asserted rather than described. An earlier version of this comment
+/// said it asserted the token row and did not: review deleted the whole token-insert loop,
+/// and separately the audit row, and the suite stayed green at 26 passed. Both are the
+/// properties this method exists for, so both are now read back out of the database.
 #[tokio::test]
 async fn redeeming_records_its_tokens_atomically_and_only_once() {
     let db = TestDatabase::start().await;
@@ -1305,5 +1342,263 @@ async fn redeeming_records_its_tokens_atomically_and_only_once() {
     assert!(
         !second,
         "a second redemption flips nothing: the auth_req_id is single-use"
+    );
+
+    let (tokens, audited) = recorded_for(&db, scope, &grant_id.to_string()).await;
+    assert_eq!(
+        tokens, 1,
+        "the redemption must record the token it was handed, in the same transaction as the \
+         flip: a token that is issued and not recorded cannot be revoked"
+    );
+    assert_eq!(audited, 1, "the issuance must be audited exactly once");
+}
+
+/// A redemption whose token rows fail leaves the approval intact (issue #131).
+///
+/// This is what "atomic" has to mean here, and it is why the recording lives in the redeeming
+/// transaction rather than beside it. The user approved on a separate device; a failure after
+/// the flip that consumed the request anyway would make them approve again for a fault that
+/// was ours.
+///
+/// The failure is real rather than simulated: `issued_tokens.grant_id` has a foreign key to
+/// `grants`, so naming a grant that was never seeded fails the INSERT after the flip has
+/// already happened inside the same transaction.
+#[tokio::test]
+async fn a_failed_token_insert_rolls_the_flip_back_and_leaves_the_request_redeemable() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let absent_grant = ironauth_store::GrantId::generate(&env, &scope);
+
+    let failed = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &absent_grant,
+                tokens: &[ironauth_store::IssuedTokenRecord {
+                    id: ironauth_store::IssuedTokenId::generate(&env, &scope),
+                    kind: ironauth_store::TokenKind::Access,
+                }],
+                opaque: None,
+            },
+        )
+        .await;
+    assert!(
+        failed.is_err(),
+        "a token row that cannot land must fail the redemption"
+    );
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .approved_details(&digest, "cli_owner", NOW_MICROS)
+            .await
+            .expect("read")
+            .is_some(),
+        "the flip must roll back with the failed insert, or the user approves again on their \
+         other device for a failure that was ours"
+    );
+}
+
+/// Neither new method answers for another client, or after expiry (issue #131 criterion 3).
+///
+/// The pre-existing cases cover `redeem`. These two methods are their own surface and were
+/// untested, which review demonstrated by deleting each filter in turn with the suite green.
+/// A wrong client gets the SAME answer as an absent request, so neither is an existence
+/// oracle.
+#[tokio::test]
+async fn the_new_readers_refuse_another_client_and_an_expired_request() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .approved_details(&digest, "cli_other", NOW_MICROS)
+            .await
+            .expect("read")
+            .is_none(),
+        "another client's request must read as absent"
+    );
+    assert!(
+        !db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .redeem_approved(
+                &env,
+                &acting,
+                ironauth_store::BackchannelRedemption {
+                    auth_req_id_digest: &digest,
+                    presenting_client_id: "cli_other",
+                    now_micros: NOW_MICROS,
+                    grant_id: &grant_id,
+                    tokens: &[],
+                    opaque: None,
+                },
+            )
+            .await
+            .expect("redeem"),
+        "another client must not redeem it"
+    );
+
+    // Positive control: the owner still can, so the two above are about the CLIENT rather
+    // than about a fixture that was never redeemable.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .approved_details(&digest, "cli_owner", NOW_MICROS)
+            .await
+            .expect("read")
+            .is_some(),
+        "the owning client still reads it"
+    );
+
+    let past_expiry = FAR_FUTURE_MICROS + 1;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .approved_details(&digest, "cli_owner", past_expiry)
+            .await
+            .expect("read")
+            .is_none(),
+        "an expired request is not readable"
+    );
+    assert!(
+        !db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .redeem_approved(
+                &env,
+                &acting,
+                ironauth_store::BackchannelRedemption {
+                    auth_req_id_digest: &digest,
+                    presenting_client_id: "cli_owner",
+                    now_micros: past_expiry,
+                    grant_id: &grant_id,
+                    tokens: &[],
+                    opaque: None,
+                },
+            )
+            .await
+            .expect("redeem"),
+        "an expired request is not redeemable"
+    );
+}
+
+/// The tokens hang off the grant the APPROVAL opened, not one the caller names (issue #131).
+///
+/// # The failure this refuses
+///
+/// `backchannel_authentication_requests.grant_id` is the revocation spine: `decide` opens it
+/// in the approving transaction, and the issued tokens are supposed to hang off it so that
+/// revoking the grant revokes them. `redeem_approved` takes a grant from its caller, and
+/// review demonstrated redeeming with an unrelated grant owned by a DIFFERENT client: the
+/// tokens landed under that grant, none under the spine, and the audit row named the wrong
+/// one. Revoking the CIBA grant then revoked nothing, and the issuance was mis-attributed.
+///
+/// Naming the fields in a struct does not prevent that. Comparing them does, and the row
+/// being flipped already carries the answer, so it is checked rather than trusted.
+#[tokio::test]
+async fn redeeming_against_a_grant_the_approval_did_not_open_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (digest, id) = create_pending_with_id(&db, &env, scope, "cli_owner", "usr_ada").await;
+    let opened = ironauth_store::GrantId::generate(&env, &scope);
+    let unrelated = ironauth_store::GrantId::generate(&env, &scope);
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+
+    db.store()
+        .scoped(scope)
+        .backchannel_auth()
+        .decide(
+            &env,
+            &id,
+            "usr_ada",
+            true,
+            BackchannelApprovalLinkage {
+                grant_id: Some(&opened.to_string()),
+                consent_ref: None,
+                auth_methods: Some("pwd"),
+                auth_time_micros: Some(NOW_MICROS),
+            },
+            NOW_MICROS,
+        )
+        .await
+        .expect("approve with a grant");
+
+    let wrong = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &unrelated,
+                tokens: &[],
+                opaque: None,
+            },
+        )
+        .await;
+    assert!(
+        wrong.is_err(),
+        "a grant the approval did not open must be refused, or the tokens hang off something \
+         revoking the CIBA grant will never reach"
+    );
+
+    // AND THE REQUEST SURVIVES THE REFUSAL, so a caller passing the wrong grant has not
+    // burned an approval the user gave on another device.
+    let right = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &opened,
+                tokens: &[],
+                opaque: None,
+            },
+        )
+        .await
+        .expect("redeem with the opened grant");
+    assert!(
+        right,
+        "the grant the approval opened still redeems: the check is about WHICH grant, not a \
+         fixture that was never redeemable"
     );
 }
