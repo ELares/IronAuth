@@ -443,16 +443,26 @@ export function defineProtectedResource(
   // `ProtectedResource<'a>` holds `&'a str` and a Rust reference cannot change under the
   // check. The divergence exists only because this side re-reads, so the fix is to stop
   // re-reading rather than to add another check.
+  // Each field read into a local BEFORE the object literal. The two optional arrays used a
+  // `config.x ? [...config.x] : undefined` ternary, which reads twice and keeps the SECOND
+  // read, so they were the only fields still carrying the defect this snapshot exists to
+  // remove. Neither is validated, so no checked invariant was reachable through them, but
+  // "every field once" was the claim and it was true of three fields out of five. A second
+  // read returning a non-iterable also escaped as a bare `TypeError` rather than a
+  // `PrmConfigError`.
+  const resource = config.resource;
+  const authorizationServers = config.authorizationServers;
+  const scopesSupported = config.scopesSupported;
+  const bearerMethodsSupported = config.bearerMethodsSupported;
+  const maxAgeSeconds = config.maxAgeSeconds;
   const snapshot: ProtectedResourceConfig = {
-    resource: config.resource,
-    authorizationServers: [...config.authorizationServers],
-    scopesSupported: config.scopesSupported
-      ? [...config.scopesSupported]
+    resource,
+    authorizationServers: [...authorizationServers],
+    scopesSupported: scopesSupported ? [...scopesSupported] : undefined,
+    bearerMethodsSupported: bearerMethodsSupported
+      ? [...bearerMethodsSupported]
       : undefined,
-    bearerMethodsSupported: config.bearerMethodsSupported
-      ? [...config.bearerMethodsSupported]
-      : undefined,
-    maxAgeSeconds: config.maxAgeSeconds,
+    maxAgeSeconds,
   };
   const verified: VerifiedTokenConfig = {
     issuer: verifies.issuer,
@@ -460,6 +470,12 @@ export function defineProtectedResource(
   };
 
   splitResource(snapshot.resource);
+  // The composed challenge value is checked HERE, at startup, and not only where the
+  // challenge is built. `resource` is configuration, so an unrepresentable one is a
+  // deployment fault that should surface when the server starts rather than on the first
+  // 401 a real client receives, which is the same reasoning `forbidden` uses in the other
+  // direction for its per-request `scope`.
+  challengeValue(protectedResourceMetadataUrl(snapshot.resource));
   if (snapshot.authorizationServers.length === 0) {
     throw new PrmConfigError('no_authorization_servers');
   }
@@ -571,9 +587,26 @@ export function protectedResourceChallenge(
   options: ChallengeOptions = {},
 ): string {
   assertValidated(resource);
-  const parameters = [
-    `resource_metadata="${protectedResourceMetadataUrl(resource.resource)}"`,
-  ];
+  // CHECKED like the other three parameters. This was the only one always emitted and the
+  // only one exempt, and the path table deliberately accepts `"` and `\` to match the
+  // crate's `PATH_MAP`, so both reached the RFC 6750 quoted string raw: a resource ending
+  // `...\"`,error="insufficient_scope` produced a challenge a conforming `#auth-param`
+  // parser reads as TWO parameters. Non-ASCII would make Node's http layer reject the
+  // response outright, turning an intended 401 into a 500.
+  //
+  // CR and LF were already refused by the path table, so this was never header splitting,
+  // and `resource` is startup configuration that must equal the verified audience, so it
+  // takes operator misconfiguration rather than an attacker. It is still the module's own
+  // rule applied to three parameters and not the fourth.
+  //
+  // This call is UNREACHABLE for a validated instance, and that is stated rather than left
+  // to look like coverage: `assertValidated` above admits only values `defineProtectedResource`
+  // built, that function runs the same check at startup, and instances are frozen, so no
+  // validated `resource` can reach here unrepresentable. Removing this line therefore fails
+  // no test (measured: it survives), while removing the startup check fails one. Kept as the
+  // parameter-level statement of the rule, next to the three that need it per request.
+  const metadataUrl = protectedResourceMetadataUrl(resource.resource);
+  const parameters = [`resource_metadata="${challengeValue(metadataUrl)}"`];
   if (options.error) {
     parameters.push(`error="${challengeValue(options.error)}"`);
     if (options.errorDescription) {

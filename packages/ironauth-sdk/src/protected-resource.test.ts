@@ -8,6 +8,7 @@ import {
   PrmConfigError,
   ProtectedResource,
   type ProtectedResourceConfig,
+  type VerifiedTokenConfig,
   defineProtectedResource,
   forbidden,
   protectedResourceChallenge,
@@ -651,6 +652,25 @@ test('there is no public construction path', () => {
     'resource_not_validated',
     'a same-named symbol is a different symbol',
   );
+  // THE REGISTRY, which the row above cannot see. `Symbol('x') !== Symbol('x')` is a
+  // property of JavaScript rather than of this module, so it held no matter what the module
+  // did; changing `Symbol(...)` to `Symbol.for(...)` at the declaration passed the whole
+  // suite and reopened the construction hole in full. That edit is not far-fetched: a
+  // dual-loaded copy of this module has a different token, so a "token mismatch across
+  // bundles" report leads straight to it, and `Symbol.for` puts the token in a
+  // process-global registry any caller can read.
+  assert.equal(
+    refusalCode(() =>
+      Reflect.construct(ProtectedResource, [
+        hostile,
+        verifies,
+        Number.NaN,
+        Symbol.for('ironauth.prm.construct'),
+      ]),
+    ),
+    'resource_not_validated',
+    'the token must not be registry-reachable: Symbol.for must not obtain it',
+  );
 });
 
 test('a config whose reads are not stable is validated and stored as one value', () => {
@@ -680,7 +700,7 @@ test('a config whose reads are not stable is validated and stored as one value',
   assert.equal(
     reads,
     1,
-    'the config must be read exactly once, or a later read can differ from the checked one',
+    'config.resource must be read exactly once, or a later read can differ from the checked one',
   );
   assert.equal(
     defined.resource,
@@ -696,6 +716,36 @@ test('a config whose reads are not stable is validated and stored as one value',
     !JSON.stringify(protectedResourceMetadata(defined)).includes('evil'),
     'and the published document cannot carry the later read',
   );
+
+  // The `verifies` side, which was read twice per field before the snapshot and which six
+  // separate reverting mutations all survived, because nothing counted its reads.
+  let issuerReads = 0;
+  let audienceReads = 0;
+  const shiftyVerifies: VerifiedTokenConfig = {
+    get issuer() {
+      issuerReads += 1;
+      return issuerReads <= 1
+        ? 'https://auth.example'
+        : 'https://evil-iss.example';
+    },
+    get audience() {
+      audienceReads += 1;
+      return audienceReads <= 1
+        ? 'https://api.example/v1'
+        : 'https://evil.example/x';
+    },
+  };
+  const fromVerifies = defineProtectedResource(
+    {
+      resource: 'https://api.example/v1',
+      authorizationServers: ['https://auth.example'],
+    },
+    shiftyVerifies,
+  );
+  assert.equal(issuerReads, 1, 'verifies.issuer must be read exactly once');
+  assert.equal(audienceReads, 1, 'verifies.audience must be read exactly once');
+  assert.equal(fromVerifies.issuer, 'https://auth.example');
+  assert.equal(fromVerifies.audience, 'https://api.example/v1');
 
   // The same through `authorizationServers`, which was read four times.
   let listReads = 0;
@@ -716,6 +766,76 @@ test('a config whose reads are not stable is validated and stored as one value',
     [...second.authorizationServers],
     ['https://auth.example'],
     'the stored issuers must be the ones that were validated',
+  );
+});
+
+test('the optional arrays are also read exactly once', () => {
+  // These two used a `config.x ? [...config.x] : undefined` ternary, which reads twice and
+  // stores the SECOND read, so they were the last fields still carrying the defect the
+  // snapshot exists to remove. Neither is validated, so nothing checked was reachable
+  // through them, but "every field once" was the claim.
+  let scopeReads = 0;
+  let bearerReads = 0;
+  const shifty: ProtectedResourceConfig = {
+    resource: 'https://api.example/v1',
+    authorizationServers: ['https://auth.example'],
+    get scopesSupported() {
+      scopeReads += 1;
+      return scopeReads <= 1 ? ['read'] : ['evil:scope'];
+    },
+    get bearerMethodsSupported() {
+      bearerReads += 1;
+      return bearerReads <= 1 ? ['header'] : ['evil-method'];
+    },
+  };
+
+  const defined = defineProtectedResource(shifty, {
+    issuer: 'https://auth.example',
+    audience: 'https://api.example/v1',
+  });
+
+  assert.equal(scopeReads, 1, 'scopesSupported must be read exactly once');
+  assert.equal(
+    bearerReads,
+    1,
+    'bearerMethodsSupported must be read exactly once',
+  );
+  assert.deepEqual([...(defined.scopesSupported ?? [])], ['read']);
+  assert.deepEqual([...(defined.bearerMethodsSupported ?? [])], ['header']);
+});
+
+test('a resource that cannot be put in a challenge is refused at startup', () => {
+  // `resource_metadata` was the one challenge parameter never passed through
+  // `challengeValue`, and the path table deliberately accepts `"` and `\\` to match the
+  // crate's PATH_MAP, so both reached the RFC 6750 quoted string raw and a conforming
+  // parser read two parameters where one was intended.
+  //
+  // Refused at DEFINE time rather than at challenge time: `resource` is configuration, so
+  // this is a deployment fault that should surface at startup and not on the first 401.
+  const injecting = 'https://api.example/v1",error="insufficient_scope';
+  assert.equal(
+    refusalCode(() =>
+      defineProtectedResource(
+        {
+          resource: injecting,
+          authorizationServers: ['https://auth.example'],
+        },
+        { issuer: 'https://auth.example', audience: injecting },
+      ),
+    ),
+    'challenge_value_not_representable',
+  );
+
+  // An ordinary resource is unaffected, so the check is not refusing everything.
+  const ok = defineProtectedResource(
+    {
+      resource: 'https://api.example/v1',
+      authorizationServers: ['https://auth.example'],
+    },
+    { issuer: 'https://auth.example', audience: 'https://api.example/v1' },
+  );
+  assert.ok(
+    protectedResourceChallenge(ok).startsWith('Bearer resource_metadata="'),
   );
 });
 
