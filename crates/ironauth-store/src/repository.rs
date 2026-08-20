@@ -64131,7 +64131,17 @@ pub struct BackchannelApprovalLinkage<'a> {
     /// `decide` refuses an approval that leaves it `None`: redemption cannot proceed without
     /// a spine, and discovering that at redemption time strands an approval the user has
     /// already given on another device.
-    pub grant_id: Option<&'a str>,
+    ///
+    /// TYPED, and not a `&str`, because a null check is not the invariant. Review passed a
+    /// `GrantId` minted for ANOTHER SCOPE and an EMPTY STRING through the `is_none()` guard:
+    /// both produced `Ok(true)`, both left a row that `approved_details` reported as
+    /// redeemable, and both were then refused by `redeem_approved` forever. That is the exact
+    /// harm the guard exists to prevent, reachable with a one-character argument. The empty
+    /// string also inserted a `grants` row with `id = ''`.
+    ///
+    /// A scoped identifier cannot express either mistake, and `decide` checks the scope it
+    /// carries, so the invariant is structural rather than a condition someone remembered.
+    pub grant_id: Option<&'a GrantId>,
     /// The consent decision recorded at approval.
     pub consent_ref: Option<&'a str>,
     /// The RFC 8176 authentication methods frozen from the approving session.
@@ -64165,7 +64175,7 @@ pub struct RedeemedBackchannelRequest {
     /// `auth_time` and a client registered with `require_auth_time` could not be served
     /// correctly. The device grant's sibling returns it for exactly this reason.
     pub auth_time_unix_micros: Option<i64>,
-    /// The consent decision recorded at approval, write-only for the same reason.
+    /// The consent decision recorded at approval, which was write-only for the same reason.
     pub consent_ref: Option<String>,
 }
 
@@ -64412,10 +64422,17 @@ impl BackchannelAuthRepo<'_> {
     ///   an approval, or re-approve something already redeemed.
     /// * **Not after expiry**, judged against the passed-in clock seam.
     ///
-    /// Returns whether a row was decided. `false` covers every refusal, because the surface
-    /// answers all of them the same way rather than telling a user which of them applied.
+    /// Returns whether a row was decided. `false` covers every refusal ABOUT THE REQUEST,
+    /// because the surface answers all of them the same way rather than telling a user which
+    /// of them applied: wrong subject, already decided, expired, absent.
     ///
     /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when an APPROVAL names no grant, or names one minted for
+    /// another scope. Those are not refusals about the request, they are a caller that has
+    /// asked for a state this store will not create, so they are errors rather than `false`.
+    /// The distinction matters to whoever maps this: `Ok(false)` is "your request could not
+    /// be decided", this is "your call was malformed".
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn decide(
@@ -64441,9 +64458,7 @@ impl BackchannelAuthRepo<'_> {
         // So an approval without a grant is refused where it is CREATED, before anything is
         // committed and while the caller is still in a position to fix it. A denial still
         // needs no grant: there is nothing to hang off a refusal.
-        if approved && linkage.grant_id.is_none() {
-            return Err(StoreError::NotFound);
-        }
+        approval_linkage_is_usable(approved, &linkage, self.scope)?;
         let mut tx = begin_scoped(self.store, self.scope).await?;
 
         // Open the grant FIRST when one is being bound: the composite foreign key requires
@@ -64484,7 +64499,7 @@ impl BackchannelAuthRepo<'_> {
                      VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, \
                              TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
                 )
-                .bind(grant_id)
+                .bind(grant_id.to_string())
                 .bind(self.scope.tenant().to_string())
                 .bind(self.scope.environment().to_string())
                 .bind(&request_client)
@@ -64511,7 +64526,7 @@ impl BackchannelAuthRepo<'_> {
         .bind(id.to_string())
         .bind(subject)
         .bind(approved)
-        .bind(linkage.grant_id)
+        .bind(linkage.grant_id.map(std::string::ToString::to_string))
         .bind(linkage.consent_ref)
         .bind(linkage.auth_methods)
         .bind(linkage.auth_time_micros)
@@ -64658,6 +64673,14 @@ impl BackchannelAuthRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
+    /// # The spine is required here too
+    ///
+    /// This is the THIRD reader of an approved request, and a previous round enforced the
+    /// spine on the other two and said so in the commit message, which was false for this
+    /// one. Review demonstrated it: a row written around `decide` with `grant_id NULL` was
+    /// refused by `approved_details`, and this method consumed it, returning
+    /// `grant_id: None` and leaving the request `redeemed`. The approval was BURNED, by the
+    /// method whose name a future caller is most likely to reach for.
     pub async fn redeem(
         &self,
         auth_req_id_digest: &str,
@@ -64673,6 +64696,7 @@ impl BackchannelAuthRepo<'_> {
                AND tenant_id = $3 \
                AND environment_id = $4 \
                AND status = 'approved' \
+               AND grant_id IS NOT NULL \
                AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $5 \
              RETURNING id, subject, grant_id, requested_scope, authorization_details, \
                        auth_methods, consent_ref, \
@@ -65165,6 +65189,38 @@ async fn verify_and_insert_opaque(
     Ok(())
 }
 
+/// An APPROVAL must open a grant, and it must be one of this scope's (issue #131).
+///
+/// Both halves refuse the same harm: an approved row whose spine cannot be redeemed. The
+/// person answered on their separate device, `decide` would report `Ok(true)`, ping mode
+/// would tell the client to come and collect, `approved_details` would report the request as
+/// redeemable, and the token endpoint would sign and then fail forever with no audit row and
+/// nothing distinguishing it from a bad `auth_req_id`.
+///
+/// The scope half exists because a null check is not the invariant. Review passed a `GrantId`
+/// minted for another scope straight through `is_none()` and produced exactly that stranded
+/// row. Typing the field stops a malformed id; only this stops a foreign one.
+///
+/// A DENIAL needs neither: a refusal has nothing to hang off.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] when an approval names no grant, or names another scope's.
+fn approval_linkage_is_usable(
+    approved: bool,
+    linkage: &BackchannelApprovalLinkage<'_>,
+    scope: Scope,
+) -> Result<(), StoreError> {
+    if !approved {
+        return Ok(());
+    }
+    match linkage.grant_id {
+        None => Err(StoreError::NotFound),
+        Some(grant) if grant.scope() != scope => Err(StoreError::NotFound),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Is every scope token in `issued` present in `approved`? (issue #131)
 ///
 /// Space-delimited per RFC 6749 3.3, order-insensitive, and a superset is always a refusal.
@@ -65172,9 +65228,6 @@ async fn verify_and_insert_opaque(
 /// under it: a request that named no scope cannot mint a token that claims one.
 fn scope_is_within(issued: Option<&str>, approved: Option<&str>) -> bool {
     let issued: Vec<&str> = issued.unwrap_or_default().split_whitespace().collect();
-    if issued.is_empty() {
-        return true;
-    }
     let approved: std::collections::HashSet<&str> =
         approved.unwrap_or_default().split_whitespace().collect();
     issued.iter().all(|token| approved.contains(token))

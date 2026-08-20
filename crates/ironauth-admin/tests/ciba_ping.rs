@@ -86,6 +86,10 @@ async fn seed_and_queue(
         })
         .await
         .expect("create");
+    // An approval must open a grant: `decide` refuses one whose linkage names none, because a
+    // spine-less approval is unredeemable and the client would be told to collect anyway.
+    // Not seeded, because `decide` INSERTs it.
+    let grant = ironauth_store::GrantId::generate(env, &scope);
     db.store()
         .scoped(scope)
         .backchannel_auth()
@@ -94,7 +98,12 @@ async fn seed_and_queue(
             &id,
             "usr_ada",
             true,
-            BackchannelApprovalLinkage::default(),
+            BackchannelApprovalLinkage {
+                grant_id: Some(&grant),
+                consent_ref: None,
+                auth_methods: None,
+                auth_time_micros: None,
+            },
             1_800_000_000_000_000,
         )
         .await

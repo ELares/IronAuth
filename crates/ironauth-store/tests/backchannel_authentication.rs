@@ -223,7 +223,10 @@ async fn the_client_binding_and_expiry_cannot_be_rewritten_by_the_data_plane() {
     // Positive control: a column the data plane IS granted.
     let mut tx = db.app_pool().begin().await.expect("begin");
     bind_scope(&mut tx, scope).await;
-    sqlx::query("UPDATE backchannel_authentication_requests SET status = 'approved'")
+    // 'redeemed' rather than 'approved': migration 0151 forbids an approved row with no
+    // grant, and this fixture has none. The point of the assertion is that `status` is
+    // WRITABLE by the data plane, which any legal value demonstrates.
+    sqlx::query("UPDATE backchannel_authentication_requests SET status = 'redeemed'")
         .execute(&mut *tx)
         .await
         .expect("status is a data-plane column and must be writable");
@@ -294,14 +297,13 @@ async fn a_request_is_invisible_from_another_scope() {
 /// A far-future instant in epoch microseconds, matching `FAR_FUTURE` above.
 const NOW_MICROS: i64 = 1_800_000_000_000_000;
 
-/// Seed an APPROVED request for `client`, returning its digest.
 /// The linkage an APPROVAL must carry: a grant for the tokens to hang off.
 ///
 /// `BackchannelApprovalLinkage::default()` leaves `grant_id` `None`, and `decide` now refuses
 /// that when approving, because an approval with no grant is one redemption can never honour
 /// and the user has already answered on their separate device. Denials still use `default()`:
 /// a refusal has nothing to hang off.
-fn approving_linkage(grant: &str) -> BackchannelApprovalLinkage<'_> {
+fn approving_linkage(grant: &ironauth_store::GrantId) -> BackchannelApprovalLinkage<'_> {
     BackchannelApprovalLinkage {
         grant_id: Some(grant),
         consent_ref: None,
@@ -397,8 +399,41 @@ async fn seed_approved_scoped(
     digest
 }
 
-async fn seed_approved(db: &TestDatabase, env: &Env, scope: Scope, client: &str) -> String {
-    seed_approved_with_grant(db, env, scope, client, None).await
+/// Seed an approved request with NO spine, by defeating the CHECK that forbids it.
+///
+/// Migration 0151 makes `status = 'approved' AND grant_id IS NULL` unrepresentable, which is
+/// the point: it is the enforcement that survives a writer who has not read `decide`. It also
+/// makes the shape unconstructible from a fixture, and three code guards exist precisely to
+/// refuse it (`decide` will not create it, `approved_details` will not report it, `redeem`
+/// will not consume it). Guards nothing can exercise are guards nothing measures, which is
+/// the defect this whole PR has been about.
+///
+/// So the constraint is dropped, the row inserted, and the constraint restored `NOT VALID`,
+/// which leaves the planted row in place while every future write is still checked. That is
+/// not a contrivance: it is exactly the state a database would be in if the row predated the
+/// constraint, which is the case the code guards are the last line against.
+async fn seed_approved_without_a_spine(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    client: &str,
+) -> String {
+    const CONSTRAINT: &str = "backchannel_authentication_requests_approved_has_grant";
+    sqlx::query(&format!(
+        "ALTER TABLE backchannel_authentication_requests DROP CONSTRAINT {CONSTRAINT}"
+    ))
+    .execute(db.owner_pool())
+    .await
+    .expect("drop the check");
+    let digest = seed_approved_scoped(db, env, scope, client, None, Some("openid profile")).await;
+    sqlx::query(&format!(
+        "ALTER TABLE backchannel_authentication_requests ADD CONSTRAINT {CONSTRAINT} \
+         CHECK (status <> 'approved' OR grant_id IS NOT NULL) NOT VALID"
+    ))
+    .execute(db.owner_pool())
+    .await
+    .expect("restore the check");
+    digest
 }
 
 /// An approved request redeems exactly once (#131 criterion 3, single-use).
@@ -407,7 +442,7 @@ async fn an_approved_request_redeems_exactly_once() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, _grant) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let repo = db.store().scoped(scope);
 
     let first = repo
@@ -440,7 +475,7 @@ async fn a_different_client_cannot_redeem_and_does_not_burn_the_request() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, _grant) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let repo = db.store().scoped(scope);
 
     let stolen = repo
@@ -467,7 +502,7 @@ async fn an_expired_request_does_not_redeem() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, _grant) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     // A "now" past the year-2100 expiry: the application clock seam decides, not the
     // database clock, which is why this can be tested at all without waiting.
     let after_expiry: i64 = 5_000_000_000_000_000;
@@ -704,7 +739,6 @@ async fn creating_a_ping_request_without_a_notification_target_is_refused() {
     );
 }
 
-/// Create a pending request and return `(digest, id)` so a decision can be submitted.
 /// Create a pending request with a digest that varies with `nonce`.
 ///
 /// `create_pending_with_id` derives its digest from the request id's LENGTH, which is the same
@@ -742,6 +776,7 @@ async fn create_pending_nonce(
     (digest, id)
 }
 
+/// Create a pending request, returning its digest and id.
 async fn create_pending_with_id(
     db: &TestDatabase,
     env: &Env,
@@ -817,8 +852,8 @@ async fn only_the_named_subject_can_decide_and_only_from_pending() {
     // carries none. These are NOT seeded, because `decide` INSERTs the grant itself; seeding
     // one first is a primary-key collision. One id per approval attempt, since a second
     // successful `decide` would collide on the first one's row.
-    let decide_grant = ironauth_store::GrantId::generate(&env, &scope).to_string();
-    let decide_grant_b = ironauth_store::GrantId::generate(&env, &scope).to_string();
+    let decide_grant = ironauth_store::GrantId::generate(&env, &scope);
+    let decide_grant_b = ironauth_store::GrantId::generate(&env, &scope);
     let (_digest, id) = create_pending_with_id(&db, &env, scope, "cli_owner", "usr_ada").await;
     let repo = db.store().scoped(scope);
 
@@ -879,7 +914,7 @@ async fn approval_makes_a_request_redeemable_and_denial_does_not() {
     // carries none. These are NOT seeded, because `decide` INSERTs the grant itself; seeding
     // one first is a primary-key collision. One id per approval attempt, since a second
     // successful `decide` would collide on the first one's row.
-    let decide_grant = ironauth_store::GrantId::generate(&env, &scope).to_string();
+    let decide_grant = ironauth_store::GrantId::generate(&env, &scope);
     let repo = db.store().scoped(scope);
 
     let (approved_digest, approved_id) =
@@ -1077,8 +1112,8 @@ async fn approving_a_ping_request_enqueues_one_notification_and_poll_enqueues_no
     // carries none. These are NOT seeded, because `decide` INSERTs the grant itself; seeding
     // one first is a primary-key collision. One id per approval attempt, since a second
     // successful `decide` would collide on the first one's row.
-    let decide_grant = ironauth_store::GrantId::generate(&env, &scope).to_string();
-    let decide_grant_b = ironauth_store::GrantId::generate(&env, &scope).to_string();
+    let decide_grant = ironauth_store::GrantId::generate(&env, &scope);
+    let decide_grant_b = ironauth_store::GrantId::generate(&env, &scope);
     let repo = db.store().scoped(scope);
 
     // POLL: approving must enqueue nothing.
@@ -1217,7 +1252,7 @@ async fn approving_with_a_grant_opens_it_for_the_requests_own_client_and_subject
                 "usr_ada",
                 true,
                 BackchannelApprovalLinkage {
-                    grant_id: Some(&grant_id.to_string()),
+                    grant_id: Some(&grant_id),
                     consent_ref: None,
                     auth_methods: Some("pwd"),
                     auth_time_micros: Some(NOW_MICROS),
@@ -1266,7 +1301,7 @@ async fn a_refused_decision_leaves_no_grant_behind() {
                 "usr_grace",
                 true,
                 BackchannelApprovalLinkage {
-                    grant_id: Some(&grant_id.to_string()),
+                    grant_id: Some(&grant_id),
                     consent_ref: None,
                     auth_methods: None,
                     auth_time_micros: None,
@@ -1312,7 +1347,7 @@ async fn the_opened_grant_is_the_one_redemption_reports() {
                 "usr_ada",
                 true,
                 BackchannelApprovalLinkage {
-                    grant_id: Some(&grant_id.to_string()),
+                    grant_id: Some(&grant_id),
                     consent_ref: None,
                     auth_methods: Some("pwd otp"),
                     auth_time_micros: Some(NOW_MICROS),
@@ -1782,7 +1817,7 @@ async fn redeeming_against_a_grant_the_approval_did_not_open_is_refused() {
             "usr_ada",
             true,
             BackchannelApprovalLinkage {
-                grant_id: Some(&opened.to_string()),
+                grant_id: Some(&opened),
                 consent_ref: None,
                 auth_methods: Some("pwd"),
                 auth_time_micros: Some(NOW_MICROS),
@@ -1866,7 +1901,7 @@ async fn an_approval_that_opened_no_grant_is_not_redeemable() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved_with_grant(&db, &env, scope, "cli_owner", None).await;
+    let digest = seed_approved_without_a_spine(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
@@ -2547,7 +2582,8 @@ async fn every_issued_token_is_metered_including_the_opaque_one() {
                 presenting_client_id: "cli_owner",
                 now_micros: NOW_MICROS,
                 grant_id: &grant_id,
-                // EMPTY, which is what the production builders pass for an opaque token.
+                // EMPTY. This is the BOUNDARY case, not the production shape: both builders push the
+                // ID token first, so the real list is `[Id]`. The production shape is asserted below.
                 tokens: &[],
                 opaque: Some(ironauth_store::NewOpaqueAccessToken {
                     token_digest: "digest-of-the-only-token",
@@ -3231,7 +3267,7 @@ async fn approving_without_a_grant_is_refused_and_denying_without_one_is_not() {
 
     // AND NOTHING WAS COMMITTED: the request is still pending, so a caller that fixes its
     // linkage can approve properly.
-    let grant = ironauth_store::GrantId::generate(&env, &scope).to_string();
+    let grant = ironauth_store::GrantId::generate(&env, &scope);
     assert!(
         repo()
             .backchannel_auth()
@@ -3386,4 +3422,259 @@ async fn scope_containment_is_case_sensitive_whole_token_and_closed_when_absent(
             "{why}: requested={requested:?} claimed={claimed:?} got {outcome:?}"
         );
     }
+}
+
+/// Everything the approval froze for the ID token is readable back (issue #131).
+///
+/// # Why this exists
+///
+/// `decide` freezes `auth_time`, `auth_methods` and `consent_ref` at approval, and the
+/// `auth_time` column says outright that it is there so the issued ID token's `auth_time` is
+/// truthful. Nothing read any of it back, and review measured the consequence: deleting the
+/// `auth_time` expression from BOTH readers, and the `consent_ref` column from one, left the
+/// suite at 48 passed. A client registered with `require_auth_time` could not have been
+/// served correctly and no test would have said so.
+///
+/// A value written on the assumption that someone downstream will read it is the same defect
+/// as a layer with no caller, from the other direction.
+#[tokio::test]
+async fn the_approval_instant_and_consent_are_readable_by_the_token_endpoint() {
+    const APPROVED_AT: i64 = 1_700_000_000_123_456;
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (digest, id) = create_pending_nonce(&db, &env, scope, "cli_app", "usr_ada", 77).await;
+    let grant = ironauth_store::GrantId::generate(&env, &scope);
+
+    db.store()
+        .scoped(scope)
+        .backchannel_auth()
+        .decide(
+            &env,
+            &id,
+            "usr_ada",
+            true,
+            BackchannelApprovalLinkage {
+                grant_id: Some(&grant),
+                consent_ref: Some("cns_the_user_said_yes"),
+                auth_methods: Some("pwd mfa"),
+                auth_time_micros: Some(APPROVED_AT),
+            },
+            NOW_MICROS,
+        )
+        .await
+        .expect("approve");
+
+    let details = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .approved_details(&digest, "cli_app", NOW_MICROS)
+        .await
+        .expect("read")
+        .expect("approved");
+
+    assert_eq!(
+        details.auth_time_unix_micros,
+        Some(APPROVED_AT),
+        "the approval instant must survive the round trip to the microsecond, or the ID \
+         token's auth_time is a guess"
+    );
+    assert_eq!(
+        details.consent_ref.as_deref(),
+        Some("cns_the_user_said_yes"),
+        "the consent decision must be readable, or nothing can point at what was agreed"
+    );
+    assert_eq!(
+        details.auth_methods.as_deref(),
+        Some("pwd mfa"),
+        "and the amr"
+    );
+}
+
+/// An issued token's KIND is recorded and metered as its own kind (issue #131).
+///
+/// `recorded_for` counts rows and `metering_events_for` filters on the grant, so neither
+/// distinguishes an access token from an ID token. Review measured all three consequences:
+/// binding `issued_tokens.token_kind` to a constant, and forcing either metering payload's
+/// `token_kind`, all left the suite green. `token.issued` feeds `tokens_issued`, so the kind
+/// breakdown is billable data that nothing pinned.
+#[tokio::test]
+async fn each_issued_token_is_recorded_and_metered_under_its_own_kind() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let audiences = vec!["https://api.one.test".to_string()];
+    let jti = ironauth_store::IssuedTokenId::generate(&env, &scope);
+
+    db.store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &grant_id,
+                // The production shape: an ID token record plus an opaque access token.
+                tokens: &[ironauth_store::IssuedTokenRecord {
+                    id: ironauth_store::IssuedTokenId::generate(&env, &scope),
+                    kind: ironauth_store::TokenKind::Id,
+                }],
+                opaque: Some(ironauth_store::NewOpaqueAccessToken {
+                    token_digest: "digest-kinds",
+                    grant_id: None,
+                    subject: "usr_subject",
+                    client_id: "cli_owner",
+                    audience: "https://api.one.test",
+                    audiences: &audiences,
+                    scope: Some("openid"),
+                    jti: &jti,
+                    expires_at_unix_micros: FAR_FUTURE_MICROS,
+                    dpop_jkt: None,
+                }),
+            },
+        )
+        .await
+        .expect("redeem");
+
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT token_kind FROM issued_tokens \
+         WHERE grant_id = $1 AND tenant_id = $2 AND environment_id = $3 ORDER BY token_kind",
+    )
+    .bind(grant_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(&mut *tx)
+    .await
+    .expect("read the issued token kinds");
+    let metered: Vec<String> = sqlx::query_scalar(
+        "SELECT payload->'payload'->>'token_kind' FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 \
+           AND payload->>'type' = 'token.issued' \
+           AND payload->'payload'->>'grant_id' = $3 \
+         ORDER BY 1",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(grant_id.to_string())
+    .fetch_all(&mut *tx)
+    .await
+    .expect("read the metered kinds");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(
+        kinds,
+        vec!["id".to_string()],
+        "the ID token row must record its own kind"
+    );
+    assert_eq!(
+        metered,
+        vec!["access".to_string(), "id".to_string()],
+        "and each token must be metered under its own kind, or the usage breakdown is wrong \
+         while the total happens to be right"
+    );
+}
+
+/// A redemption naming a grant from ANOTHER SCOPE is refused before the transaction opens.
+///
+/// Review measured this guard surviving: it is the only thing standing between a foreign
+/// grant id and the ownership predicate, and nothing exercised it.
+#[tokio::test]
+async fn a_redemption_naming_a_foreign_scope_grant_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let elsewhere = db.seed_scope(&env).await;
+    let (digest, _spine) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let foreign = ironauth_store::GrantId::generate(&env, &elsewhere);
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .redeem_approved(
+                &env,
+                &acting,
+                ironauth_store::BackchannelRedemption {
+                    auth_req_id_digest: &digest,
+                    presenting_client_id: "cli_owner",
+                    now_micros: NOW_MICROS,
+                    grant_id: &foreign,
+                    tokens: &[],
+                    opaque: None,
+                },
+            )
+            .await
+            .is_err(),
+        "a grant minted under another scope must be refused"
+    );
+
+    // AND THE APPROVAL SURVIVES, since the refusal happens before the flip.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .approved_details(&digest, "cli_owner", NOW_MICROS)
+            .await
+            .expect("read")
+            .is_some(),
+        "the refusal must not have consumed the approval"
+    );
+}
+
+/// `decide` refuses a grant minted for another scope (issue #131).
+///
+/// A typed id cannot be malformed, but it can have been minted elsewhere, and review showed
+/// that shape passing the `is_none()` guard: `Ok(true)`, a row `approved_details` reported as
+/// redeemable, and a redemption refused forever. Same stranding, one type away.
+#[tokio::test]
+async fn approving_with_a_foreign_scope_grant_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let elsewhere = db.seed_scope(&env).await;
+    let (digest, id) = create_pending_nonce(&db, &env, scope, "cli_app", "usr_ada", 78).await;
+    let foreign = ironauth_store::GrantId::generate(&env, &elsewhere);
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .decide(
+                &env,
+                &id,
+                "usr_ada",
+                true,
+                approving_linkage(&foreign),
+                NOW_MICROS,
+            )
+            .await
+            .is_err(),
+        "approving with another scope's grant must be refused, not stored for a redemption \
+         that can never succeed"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .approved_details(&digest, "cli_app", NOW_MICROS)
+            .await
+            .expect("read")
+            .is_none(),
+        "and nothing was approved"
+    );
 }
