@@ -25,12 +25,33 @@
  * rather than beside it. The shipper advances the cursor only on success and only to what was
  * accepted, so positions are monotonic per stream. Keep the last position you verified and:
  *
- *   - a position at or below it is a REPLAY;
- *   - a position beyond the next expected one is a GAP.
+ *   - a position at or below it is a REPLAY.
  *
- * Neither needs any server-side state, and neither is answerable if you verify the signature
- * alone -- which is why `verifyBatch` refuses to be used without a position and returns the
- * position it verified rather than a bare boolean.
+ * Replay is answerable with what a batch carries. `verifyBatch` refuses without a position
+ * (`missing-position`) and returns the position it verified rather than a bare boolean, so a
+ * caller can record it.
+ *
+ * GAP DETECTION IS NOT AVAILABLE, and this file used to imply it was. The position is a
+ * wall-clock microsecond timestamp of the last row in the batch, not a counter, so there is
+ * no "next expected" value to compare against: a consumer can prove it has not seen a
+ * position before, and cannot prove it has missed nothing in between. Detecting gaps would
+ * need the batch to carry its START position as well, so positions chain.
+ *
+ * ## Where the position comes from
+ *
+ * The `x-ironauth-log-position` header, as `<stream id> <cursor sequence> <cursor id>`, space
+ * separated. The S3 sink carries the same value as the `x-amz-meta-ironauth-log-position`
+ * object metadata key, since an object has no headers once written.
+ *
+ *     const [streamId, cursorSequence, cursorId] = positionHeader.split(' ');
+ *
+ * Split positionally: all three are opaque identifiers, which is why the separator is a space
+ * rather than a character that could occur inside one.
+ *
+ * This is worth stating here because it was missing for a while. The header was defined and
+ * documented in the shipper and sent by nothing, so this file required three values the wire
+ * never carried: a published verifier that could not be fed. See
+ * `docs/log-stream-verification.md` for the full wire description.
  *
  * ## Conformance
  *
@@ -92,6 +113,37 @@ export async function verifyBatch({
   eventsJson,
   lastVerifiedSequence = null,
 }) {
+  // A MISSING POSITION IS ITS OWN REFUSAL, and it has to be, because the alternative is
+  // silent. Without this, an omitted `cursorSequence` builds the canonical string with the
+  // literal `undefined` in it, the HMAC does not match, and the caller is told
+  // `bad-signature`: an integration bug reported as an attack. This file previously said it
+  // "refuses to be used without a position" while doing exactly that, which was measured.
+  if (
+    typeof streamId !== 'string' || streamId.length === 0 ||
+    !(Number.isInteger(cursorSequence) || typeof cursorSequence === 'bigint') ||
+    typeof cursorId !== 'string' || cursorId.length === 0
+  ) {
+    return { ok: false, reason: 'missing-position', position: null };
+  }
+
+  // The other two canonical inputs get the same treatment, for the same reason. Omitting
+  // `eventCount` or `eventsJson` also built the canonical string with `undefined` in it and
+  // reported `bad-signature`, so the guard above closed one third of the failure mode it was
+  // written for.
+  if (!Number.isInteger(eventCount) || typeof eventsJson !== 'string') {
+    return { ok: false, reason: 'missing-batch', position: null };
+  }
+
+  // A KEY THAT IS NOT KEY MATERIAL IS A REFUSAL, not a throw. `crypto.subtle.importKey`
+  // raises an uncaught TypeError on `undefined` (an unset environment variable is the common
+  // way), on `null`, and on a number or a plain object. This file promises above that
+  // malformed input is refused rather than thrown on, because a verifier that throws hands
+  // anyone who can reach it a denial of service in place of a `false`, and that promise was
+  // not kept for the one input most likely to arrive unset.
+  if (!(key instanceof Uint8Array || key instanceof ArrayBuffer || typeof key === 'string')) {
+    return { ok: false, reason: 'malformed-key', position: null };
+  }
+
   const canonical = await canonicalString({
     streamId,
     cursorSequence,

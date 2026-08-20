@@ -72,12 +72,20 @@ pub trait LogSink: Send + Sync {
     /// [`None`] when it ships unsigned. Computed by the shipper, never by the sink: it must be
     /// identical whatever carried it, and a per-sink signature would be four chances to get
     /// the canonical form subtly different.
+    ///
+    /// `position` is the cursor position that signature covers, and a sink MUST transmit it
+    /// alongside the signature. Without it a consumer cannot rebuild the canonical string, so
+    /// it cannot verify anything at all: the signature is over `(stream id, sequence, cursor
+    /// id, count, digest)` and only the last two are derivable from the payload. This
+    /// parameter exists because the trait previously did not carry it, which is why
+    /// `POSITION_HEADER` was defined, documented as sent, and sent by nothing.
     fn deliver<'a>(
         &'a self,
         stream: &'a LogStreamRecord,
         credential: Option<&'a str>,
         events: &'a [Value],
         signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>>;
 }
 
@@ -252,7 +260,8 @@ pub async fn replay_dead_letters(
                 &stream,
                 credential.as_deref(),
                 &events,
-                replay_signature.as_deref()
+                replay_signature.as_deref(),
+                (dead.from.0, dead.from.1.as_str())
             )
             .await,
             SinkOutcome::Accepted
@@ -418,7 +427,13 @@ async fn ship_stream(
     };
 
     match sink
-        .deliver(stream, credential.as_deref(), &events, signature.as_deref())
+        .deliver(
+            stream,
+            credential.as_deref(),
+            &events,
+            signature.as_deref(),
+            (position.0, position.1.as_str()),
+        )
         .await
     {
         SinkOutcome::Accepted => {
@@ -576,6 +591,7 @@ impl LogSink for HttpLogSink {
         _credential: Option<&'a str>,
         events: &'a [Value],
         signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = Self::endpoint(stream).map(str::to_owned);
@@ -608,6 +624,21 @@ impl LogSink for HttpLogSink {
                     );
                 };
                 request = request.header(http::HeaderName::from_static(SIGNATURE_HEADER), value);
+                // The position travels WITH the signature or the signature is unverifiable.
+                // Built from the same values the shipper signed, one line above the send, so
+                // the two cannot drift apart.
+                let position_value = position_header_value(&stream.id, position.0, position.1);
+                // REFUSED on an encode failure, exactly as the signature above is. Sending
+                // the signature without the position ships a batch that LOOKS verifiable and
+                // is not: a consumer cannot rebuild the canonical string without the
+                // position, so it would reject an honest batch as tampered. Dropping it
+                // quietly was the same shape as the defect this wiring repairs.
+                let Ok(value) = http::HeaderValue::from_str(&position_value) else {
+                    return SinkOutcome::Rejected(
+                        "the batch position could not be encoded as a header".to_string(),
+                    );
+                };
+                request = request.header(http::HeaderName::from_static(POSITION_HEADER), value);
             }
             // Matched by VARIANT rather than rendered with `Display`, so the reason
             // stored on the stream row is operator-safe by construction. This string is
@@ -772,6 +803,7 @@ impl LogSink for DatadogSink {
         credential: Option<&'a str>,
         events: &'a [Value],
         signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = configured_endpoint(stream).map(str::to_owned);
@@ -791,9 +823,7 @@ impl LogSink for DatadogSink {
                 );
             };
             let mut headers = vec![("dd-api-key", credential)];
-            if let Some(signature) = signature {
-                headers.push((SIGNATURE_HEADER, signature.to_owned()));
-            }
+            headers.extend(signed_batch_headers(&stream.id, signature, position));
             post_json(&fetcher, endpoint, headers, body).await
         })
     }
@@ -827,6 +857,7 @@ impl LogSink for SplunkHecSink {
         credential: Option<&'a str>,
         events: &'a [Value],
         signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = configured_endpoint(stream).map(str::to_owned);
@@ -850,9 +881,7 @@ impl LogSink for SplunkHecSink {
                 );
             };
             let mut headers = vec![("authorization", format!("Splunk {credential}"))];
-            if let Some(signature) = signature {
-                headers.push((SIGNATURE_HEADER, signature.to_owned()));
-            }
+            headers.extend(signed_batch_headers(&stream.id, signature, position));
             post_json(&fetcher, endpoint, headers, body).await
         })
     }
@@ -1013,8 +1042,109 @@ pub const SIGNATURE_HEADER: &str = "x-ironauth-log-signature";
 /// position to rebuild the canonical string before it can verify anything -- and it must then
 /// check the rebuilt string against the signature, which is what stops a sender rewriting the
 /// position it claims. A position a consumer cannot see is a position it cannot check for a
-/// gap or a replay.
+/// replay at all. (Not a gap: the position is a timestamp rather than a counter, so gaps are
+/// not detectable with what a batch carries. See `log_stream_signature`.)
 pub const POSITION_HEADER: &str = "x-ironauth-log-position";
+
+/// Render the position header's value.
+///
+/// `<stream id> <sequence> <cursor id>`, space separated, in the order the canonical string
+/// uses them. Space separated because all three are opaque identifiers a consumer splits
+/// positionally, and because a `:` or `.` would be a separator that could plausibly occur
+/// inside an id and turn a parse bug into a verification failure with no visible cause.
+///
+/// The STREAM ID is in here as well as the position, despite the constant's name, because a
+/// consumer needs all three to rebuild the canonical string and a second header would be a
+/// second thing to forget to send.
+#[must_use]
+pub fn position_header_value(stream_id: &str, sequence: i64, cursor_id: &str) -> String {
+    format!("{stream_id} {sequence} {cursor_id}")
+}
+
+/// The headers the S3 PUT actually carries, derived from the set that was signed.
+///
+/// `host` travels as the URL's authority rather than a header (which is what the outgoing
+/// list has always done), and `authorization` is the product of signing, so those two differ.
+/// Everything else, including the batch metadata, is by construction the same list the
+/// signature covers.
+///
+/// A function rather than an inline filter so the derivation itself is testable. It is the
+/// one remaining point where the signed and sent sets could disagree: widening the predicate
+/// would send fewer headers than `SignedHeaders` names. That direction is fail-loud, since
+/// real S3 answers `SignatureDoesNotMatch` rather than accepting a weaker object, but the
+/// dangerous direction was silent and this keeps both under one assertion.
+#[must_use]
+pub fn s3_outgoing_headers(
+    signed: Vec<(String, String)>,
+    authorization: String,
+) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = signed
+        .into_iter()
+        .filter(|(name, _)| name != "host")
+        .collect();
+    headers.push(("authorization".to_string(), authorization));
+    headers
+}
+
+/// The headers an S3 PUT of a batch is SIGNED over: host, the two `x-amz-*` request headers,
+/// and the batch metadata.
+///
+/// ONE source for both lists that follow. The canonical request is signed from this, and the
+/// outgoing request is derived from the same vector by dropping `host` (which travels as the
+/// URL's authority rather than a header) and adding `authorization`. Building the two
+/// independently made it a one-line edit to move the batch metadata OUTSIDE the signature
+/// while still sending it, which is exactly the "a metadata header `SigV4` did not sign can be
+/// stripped in flight" failure the comment below warns about, and it survived the suite.
+#[must_use]
+pub fn s3_signed_put_headers(
+    host: &str,
+    payload_hash: &str,
+    timestamp: &str,
+    stream_id: &str,
+    signature: Option<&str>,
+    position: (i64, &str),
+) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("host".to_string(), host.to_owned()),
+        ("x-amz-content-sha256".to_string(), payload_hash.to_owned()),
+        ("x-amz-date".to_string(), timestamp.to_owned()),
+    ];
+    // Object METADATA, because an S3 object has no headers once written and a consumer
+    // reading the bucket later has nowhere else to find it. INSIDE the signed set, so it
+    // cannot be stripped or rewritten in flight: the batch signature is exactly the thing an
+    // attacker would remove.
+    headers.extend(
+        s3_batch_metadata(stream_id, signature, position)
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value)),
+    );
+    headers
+}
+
+/// The headers a batch carries when the stream is signed: the signature, and the position it
+/// covers. Empty when the batch ships unsigned.
+///
+/// ONE function for all three HTTP-shaped sinks, because the two headers are only useful
+/// together. A sink that sent the signature and forgot the position would ship something that
+/// looks verifiable and is not, which is precisely the state this repaired: `POSITION_HEADER`
+/// was defined and documented as sent, and the only reference to it in the workspace was its
+/// own declaration.
+#[must_use]
+pub fn signed_batch_headers(
+    stream_id: &str,
+    signature: Option<&str>,
+    position: (i64, &str),
+) -> Vec<(&'static str, String)> {
+    signature.map_or_else(Vec::new, |signature| {
+        vec![
+            (SIGNATURE_HEADER, signature.to_owned()),
+            (
+                POSITION_HEADER,
+                position_header_value(stream_id, position.0, position.1),
+            ),
+        ]
+    })
+}
 
 /// The S3 object metadata key the batch signature travels in.
 ///
@@ -1022,6 +1152,40 @@ pub const POSITION_HEADER: &str = "x-ironauth-log-position";
 /// consumer reading the bucket has nowhere to find it. `x-amz-meta-` is the only prefix S3
 /// preserves.
 pub const S3_SIGNATURE_METADATA: &str = "x-amz-meta-ironauth-log-signature";
+
+/// The S3 object metadata key the batch POSITION travels in.
+///
+/// Same reasoning as the signature: an object carries no headers once written, so a consumer
+/// reading the bucket needs the position as metadata or it cannot rebuild the canonical
+/// string. Both go inside the `SigV4` canonical headers for the same reason, that a metadata
+/// header `SigV4` did not sign can be stripped or rewritten in flight, and a position an
+/// attacker can rewrite is a gap and replay check an attacker controls.
+pub const S3_POSITION_METADATA: &str = "x-amz-meta-ironauth-log-position";
+
+/// The S3 object metadata a signed batch carries: the signature, and the position it covers.
+/// Empty when the batch ships unsigned.
+///
+/// ONE function, called by both the canonical-header block and the outgoing-request block,
+/// because those two lists must agree. Building them independently made it possible to sign
+/// metadata that was not sent, or send metadata that was not signed, and both survived the
+/// suite: two edits where there should be one. This is the S3 twin of
+/// [`signed_batch_headers`], for the same reason.
+#[must_use]
+pub fn s3_batch_metadata(
+    stream_id: &str,
+    signature: Option<&str>,
+    position: (i64, &str),
+) -> Vec<(&'static str, String)> {
+    signature.map_or_else(Vec::new, |signature| {
+        vec![
+            (S3_SIGNATURE_METADATA, signature.to_owned()),
+            (
+                S3_POSITION_METADATA,
+                position_header_value(stream_id, position.0, position.1),
+            ),
+        ]
+    })
+}
 
 /// One PUT per batch, keyed by stream and cursor position, signed with AWS `SigV4`.
 ///
@@ -1061,12 +1225,18 @@ impl LogSink for S3LogSink {
         credential: Option<&'a str>,
         events: &'a [Value],
         signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         // Captured under its own name because this method shadows `signature` with the
         // SigV4 request signature further down, and the two are entirely different things:
         // one authenticates this PUT to S3, the other proves the BATCH to whoever reads the
         // object afterwards. Conflating them is the mistake this rename exists to prevent.
         let batch_signature = signature.map(str::to_owned);
+        // Owned before the async block, like the signature above and for the same reason: the
+        // future outlives the borrow of `position`. `stream_id` is already owned inside the
+        // block for the object key.
+        let position_sequence = position.0;
+        let position_cursor = position.1.to_owned();
         let fetcher = Arc::clone(&self.fetcher);
         let endpoint = configured_endpoint(stream).map(str::to_owned);
         let region = stream
@@ -1127,26 +1297,18 @@ impl LogSink for S3LogSink {
                 .to_owned();
             let path = format!("/{bucket}/{prefix}/{stream_id}/{last}.json");
             let payload_hash = crate::sigv4::sha256_hex(body.as_bytes());
+            let signed_headers = s3_signed_put_headers(
+                &host,
+                &payload_hash,
+                &timestamp,
+                &stream_id,
+                batch_signature.as_deref(),
+                (position_sequence, &position_cursor),
+            );
             let canonical = crate::sigv4::CanonicalRequest {
                 method: "PUT",
                 path: &path,
-                headers: {
-                    let mut headers = vec![
-                        ("host".to_string(), host.clone()),
-                        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-                        ("x-amz-date".to_string(), timestamp.clone()),
-                    ];
-                    // Object METADATA, because an S3 object has no headers once written and
-                    // a consumer reading the bucket later has nowhere else to find it.
-                    //
-                    // Inside the CANONICAL headers, not merely on the request: a metadata
-                    // header SigV4 did not sign can be stripped or rewritten in flight, and
-                    // the batch signature is exactly the thing an attacker would remove.
-                    if let Some(signature) = batch_signature.as_deref() {
-                        headers.push((S3_SIGNATURE_METADATA.to_string(), signature.to_owned()));
-                    }
-                    headers
-                },
+                headers: signed_headers.clone(),
                 payload_hash: &payload_hash,
             };
             let scope = crate::sigv4::credential_scope(&date, &region, "s3");
@@ -1162,17 +1324,7 @@ impl LogSink for S3LogSink {
             post_object(
                 &fetcher,
                 format!("{}{path}", endpoint.trim_end_matches('/')),
-                {
-                    let mut headers = vec![
-                        ("x-amz-content-sha256", payload_hash),
-                        ("x-amz-date", timestamp),
-                        ("authorization", authorization),
-                    ];
-                    if let Some(signature) = batch_signature {
-                        headers.push((S3_SIGNATURE_METADATA, signature));
-                    }
-                    headers
-                },
+                s3_outgoing_headers(signed_headers, authorization),
                 body,
             )
             .await
@@ -1226,7 +1378,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 async fn post_object(
     fetcher: &ironauth_fetch::Fetcher,
     url: String,
-    headers: Vec<(&'static str, String)>,
+    headers: Vec<(String, String)>,
     body: String,
 ) -> SinkOutcome {
     let mut request = ironauth_fetch::FetchRequest::new(

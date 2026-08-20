@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use ironauth_admin::log_shipper::{
     DatadogSink, HttpLogSink, LogSink, S3LogSink, SinkOutcome, SplunkHecSink, datadog_body,
+    s3_batch_metadata, s3_outgoing_headers, s3_signed_put_headers, signed_batch_headers,
     splunk_body,
 };
 use ironauth_store::log_stream::{LogStreamRecord, SinkType, StreamHealth, StreamSource};
@@ -102,7 +103,13 @@ async fn every_sink_refuses_a_stream_with_no_endpoint() {
     for (sink_type, sink) in sinks() {
         let configured = stream(sink_type, json!({}));
         let outcome = sink
-            .deliver(&configured, Some(CANARY), &events(), None)
+            .deliver(
+                &configured,
+                Some(CANARY),
+                &events(),
+                None,
+                (1, "aud_fixture"),
+            )
             .await;
         assert!(
             matches!(outcome, SinkOutcome::Rejected(_)),
@@ -127,7 +134,9 @@ async fn a_vendor_sink_refuses_without_a_credential() {
             continue;
         }
         let configured = stream(sink_type, complete_config(sink_type));
-        let outcome = sink.deliver(&configured, None, &events(), None).await;
+        let outcome = sink
+            .deliver(&configured, None, &events(), None, (1, "aud_fixture"))
+            .await;
         match outcome {
             SinkOutcome::Rejected(reason) => assert!(
                 reason.contains("credential_secret_name"),
@@ -165,7 +174,13 @@ async fn no_sink_leaks_the_credential_into_its_reason() {
             for config in [json!({}), complete_config(sink_type)] {
                 let configured = stream(sink_type, config);
                 let outcome = sink
-                    .deliver(&configured, Some(credential.as_str()), &events(), None)
+                    .deliver(
+                        &configured,
+                        Some(credential.as_str()),
+                        &events(),
+                        None,
+                        (1, "aud_fixture"),
+                    )
                     .await;
                 if let SinkOutcome::Rejected(reason) = outcome {
                     assert!(
@@ -192,7 +207,13 @@ async fn an_unsendable_credential_is_refused_at_the_header() {
         json!({"endpoint": "https://sink.invalid/in"}),
     );
     let outcome = sink
-        .deliver(&configured, Some(&format!("{CANARY}\nx")), &events(), None)
+        .deliver(
+            &configured,
+            Some(&format!("{CANARY}\nx")),
+            &events(),
+            None,
+            (1, "aud_fixture"),
+        )
         .await;
     match outcome {
         SinkOutcome::Rejected(reason) => assert!(
@@ -265,4 +286,188 @@ fn a_configured_splunk_index_is_carried_on_every_event() {
 fn an_empty_batch_produces_a_well_formed_body() {
     assert_eq!(datadog_body(&[]), "[]");
     assert_eq!(splunk_body(&[], None), "");
+}
+
+/// A signed batch carries its POSITION beside its signature, or nothing can verify it
+/// (issue #110 criterion 5).
+///
+/// # Why this test exists
+///
+/// `POSITION_HEADER` was defined, documented as "sent BESIDE the signature", and sent by
+/// nothing: the entire workspace held one reference to it, its own `pub const`. The `LogSink`
+/// trait did not carry the position at all, so no sink could have sent it.
+///
+/// That made the signed stream INERT. The signature covers
+/// `(stream id, sequence, cursor id, count, digest)` and only the last two are derivable from
+/// the payload, so a consumer holding the body and the signature could not rebuild the
+/// canonical string, and therefore could not verify it or detect a replay. (Not a gap: the
+/// position is a timestamp rather than a counter, so gaps are not detectable with what a
+/// batch carries.) The shipper spent an HMAC per batch that nothing could check.
+///
+/// The signature header had no test either, which is how both went unnoticed for so long.
+///
+/// This pins the VALUES, not the presence. A header carrying the wrong position verifies
+/// nothing while looking correct, and the position is the half a consumer cannot cross-check
+/// against the payload.
+#[test]
+fn a_signed_batch_carries_the_position_its_signature_covers() {
+    let headers = signed_batch_headers("lgs_stream", Some("deadbeefcafe"), (4242, "aud_01J8ZQ"));
+    assert_eq!(
+        headers,
+        vec![
+            ("x-ironauth-log-signature", "deadbeefcafe".to_string()),
+            (
+                "x-ironauth-log-position",
+                "lgs_stream 4242 aud_01J8ZQ".to_string()
+            ),
+        ],
+        "a signed batch ships the signature AND the position it covers"
+    );
+}
+
+/// An UNSIGNED batch carries neither header.
+///
+/// The pair is meaningless without a signing secret, and a position header on an unsigned
+/// batch would tell a consumer there is something to verify when there is not.
+#[test]
+fn an_unsigned_batch_carries_no_signature_and_no_position() {
+    assert!(
+        signed_batch_headers("lgs_stream", None, (4242, "aud_01J8ZQ")).is_empty(),
+        "an unsigned batch must not advertise a position to verify against"
+    );
+}
+
+/// The S3 sink's object metadata carries the signature AND the position (issue #110).
+///
+/// # Why this exists as a unit test rather than a wire test
+///
+/// The S3 metadata is built twice: once into the `SigV4` canonical headers that get signed,
+/// and once onto the outgoing request. Review mutated each half independently and both
+/// survived the suite, because the two lists were built separately: it was possible to sign
+/// metadata that was not sent, or send metadata that was not signed, and nothing noticed.
+///
+/// The fix is that both halves now call one function, so the two cannot diverge and deleting
+/// the position is a single edit in one place. This pins that function by value, which is the
+/// same shape that already catches the HTTP-side header pair.
+#[test]
+fn an_s3_batch_carries_the_signature_and_position_as_object_metadata() {
+    let metadata = s3_batch_metadata("lgs_stream", Some("deadbeefcafe"), (4242, "aud_01J8ZQ"));
+    assert_eq!(
+        metadata,
+        vec![
+            (
+                "x-amz-meta-ironauth-log-signature",
+                "deadbeefcafe".to_string()
+            ),
+            (
+                "x-amz-meta-ironauth-log-position",
+                "lgs_stream 4242 aud_01J8ZQ".to_string()
+            ),
+        ],
+        "an object has no headers once written, so both travel as metadata or a consumer \
+         reading the bucket cannot verify"
+    );
+}
+
+/// An UNSIGNED S3 batch carries neither metadata key, for the same reason the HTTP pair is
+/// absent: advertising a position to verify against when there is nothing to verify is worse
+/// than silence.
+#[test]
+fn an_unsigned_s3_batch_carries_no_metadata() {
+    assert!(s3_batch_metadata("lgs_stream", None, (4242, "aud_01J8ZQ")).is_empty());
+}
+
+/// The batch metadata is inside the set the `SigV4` signature is computed over (issue #110).
+///
+/// # Why this is the assertion that matters
+///
+/// The security claim is not that the metadata is SENT, it is that it is SIGNED: a metadata
+/// header the request signature did not cover can be stripped or rewritten in flight, and a
+/// position an attacker can rewrite is a replay check the attacker controls.
+///
+/// Review measured that deleting the metadata from the canonical block alone, or from the
+/// outgoing block alone, each survived the whole suite. Both lists now derive from this one
+/// function, so they cannot disagree, and this pins that the signed set is the one carrying
+/// the metadata rather than merely that some list somewhere does.
+#[test]
+fn the_s3_batch_metadata_is_inside_the_signed_header_set() {
+    let signed = s3_signed_put_headers(
+        "audit.s3.amazonaws.com",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "20260819T000000Z",
+        "lgs_stream",
+        Some("deadbeefcafe"),
+        (4242, "aud_01J8ZQ"),
+    );
+    let names: Vec<&str> = signed.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "host",
+            "x-amz-content-sha256",
+            "x-amz-date",
+            "x-amz-meta-ironauth-log-signature",
+            "x-amz-meta-ironauth-log-position",
+        ],
+        "both metadata keys must be in the SIGNED set, or they can be stripped in flight"
+    );
+    assert!(
+        signed.contains(&(
+            "x-amz-meta-ironauth-log-position".to_string(),
+            "lgs_stream 4242 aud_01J8ZQ".to_string()
+        )),
+        "and the signed position must be the one the batch was signed against: {signed:?}"
+    );
+}
+
+/// An UNSIGNED S3 batch signs only the three request headers, and carries no metadata.
+#[test]
+fn an_unsigned_s3_batch_signs_only_the_request_headers() {
+    let signed = s3_signed_put_headers("h", "p", "t", "lgs_stream", None, (4242, "aud_01J8ZQ"));
+    let names: Vec<&str> = signed.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["host", "x-amz-content-sha256", "x-amz-date"]);
+}
+
+/// What the S3 PUT SENDS is exactly what it SIGNED, minus `host` and plus `authorization`.
+///
+/// # The last divergence point
+///
+/// The signed set and the outgoing set now come from one vector, so metadata cannot be
+/// signed-but-not-sent by deleting a list. What remained was the filter PREDICATE: widening
+/// it by one clause would send fewer headers than `SignedHeaders` names.
+///
+/// That direction is fail-loud, because real S3 answers `SignatureDoesNotMatch` rather than
+/// accepting a weaker object, so it is not the dangerous case. It is pinned anyway, because
+/// "the signed set and the sent set agree" is one assertion covering both directions, and the
+/// other direction was silent.
+#[test]
+fn the_s3_put_sends_exactly_what_it_signed() {
+    let signed = s3_signed_put_headers(
+        "audit.s3.amazonaws.com",
+        "e3b0c442",
+        "20260819T000000Z",
+        "lgs_stream",
+        Some("deadbeefcafe"),
+        (4242, "aud_01J8ZQ"),
+    );
+    let outgoing = s3_outgoing_headers(signed.clone(), "AWS4-HMAC-SHA256 ...".to_string());
+
+    for (name, value) in signed.iter().filter(|(name, _)| name != "host") {
+        assert!(
+            outgoing.contains(&(name.clone(), value.clone())),
+            "{name} was signed but is not sent, so SignedHeaders names a header the request \
+             does not carry: {outgoing:?}"
+        );
+    }
+    let sent: Vec<&str> = outgoing.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(
+        !sent.contains(&"host"),
+        "host travels as the URL authority, not a header"
+    );
+    assert_eq!(
+        sent.len(),
+        signed.len(),
+        "one header out (host), one in (authorization): any other difference means the sent \
+         set and the signed set have drifted: {sent:?}"
+    );
 }

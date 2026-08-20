@@ -21,6 +21,13 @@ struct RecordingSink {
     sink_type: SinkType,
     accept: bool,
     batches: Mutex<Vec<Vec<Value>>>,
+    /// The `(signature, position)` pair each batch was handed.
+    ///
+    /// Recorded because binding these as `_signature` and `_position` is what let the
+    /// shipper's own wiring go unguarded: review mutated the replay path to send the wrong
+    /// position and the shipper to send one it had not signed, and the whole suite stayed
+    /// green. A test double that discards an argument cannot notice the argument being wrong.
+    signed: Mutex<Vec<(Option<String>, i64, String)>>,
 }
 
 impl RecordingSink {
@@ -29,6 +36,7 @@ impl RecordingSink {
             sink_type,
             accept,
             batches: Mutex::new(Vec::new()),
+            signed: Mutex::new(Vec::new()),
         })
     }
 
@@ -46,6 +54,11 @@ impl RecordingSink {
     fn batch_count(&self) -> usize {
         self.batches.lock().expect("not poisoned").len()
     }
+
+    /// The `(signature, sequence, cursor id)` handed to this sink, per batch, in order.
+    fn signed(&self) -> Vec<(Option<String>, i64, String)> {
+        self.signed.lock().expect("not poisoned").clone()
+    }
 }
 
 impl LogSink for RecordingSink {
@@ -58,12 +71,19 @@ impl LogSink for RecordingSink {
         _stream: &'a LogStreamRecord,
         _credential: Option<&'a str>,
         events: &'a [Value],
-        _signature: Option<&'a str>,
+        signature: Option<&'a str>,
+        position: (i64, &'a str),
     ) -> std::pin::Pin<Box<dyn Future<Output = SinkOutcome> + Send + 'a>> {
         let accept = self.accept;
         let recorded = events.to_vec();
+        let handed = (
+            signature.map(str::to_owned),
+            position.0,
+            position.1.to_owned(),
+        );
         Box::pin(async move {
             self.batches.lock().expect("not poisoned").push(recorded);
+            self.signed.lock().expect("not poisoned").push(handed);
             if accept {
                 SinkOutcome::Accepted
             } else {
@@ -119,6 +139,7 @@ async fn configure_for_org(
                 sink_type,
                 sink_config: serde_json::json!({ "endpoint": "https://sink.example/in" }),
                 credential_secret_name: None,
+                signing_secret_name: None,
                 event_type_filter: filter,
                 organization_id,
             },
@@ -174,6 +195,30 @@ async fn a_pass_ships_the_audit_rows_and_advances_the_cursor() {
     assert_eq!(
         health(db.store(), scope, &id).await.status(),
         StreamStatus::Healthy
+    );
+
+    // THE POSITION HANDED TO THE SINK IS THE ONE THE CURSOR ADVANCED TO, and that pairing is
+    // the whole point of sending it: a consumer rebuilds the canonical string from it, so a
+    // shipper that sends a position it did not sign produces batches that verify as tampered.
+    // Review mutated the shipper to send `position.0 + 1` and the entire suite stayed green,
+    // because the only sink double discarded the argument.
+    let handed = sink.signed();
+    let last = handed.last().expect("a batch was delivered");
+    let cursor = db
+        .store()
+        .scoped(scope)
+        .log_streams()
+        .list_active()
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|stream| stream.id == id)
+        .expect("the stream is listed")
+        .cursor;
+    assert_eq!(
+        cursor,
+        Some((last.1, last.2.clone())),
+        "the position sent to the sink must be the one the stream advanced to: {handed:?}"
     );
 
     // A second pass with nothing new ships nothing and does NOT re-deliver.
@@ -547,6 +592,18 @@ async fn a_permanently_failing_batch_dead_letters_stops_blocking_and_replays() {
     // Replay delivers the set-aside range and clears it.
     let replay_sink = RecordingSink::new(SinkType::Http, true);
     let replay: Vec<Arc<dyn LogSink>> = vec![replay_sink.clone()];
+    // The range the dead letter set aside, read BEFORE the replay clears it, so the
+    // assertion below compares against what was actually stored rather than a guess.
+    let set_aside = db
+        .store()
+        .scoped(scope)
+        .log_streams()
+        .outstanding_dead_letters(&id)
+        .await
+        .expect("read dead letters")
+        .first()
+        .map(|dead| dead.from.clone())
+        .expect("a dead letter is outstanding");
     let count = replay_dead_letters(db.store(), &env, scope, &id, &replay)
         .await
         .expect("replay");
@@ -563,6 +620,20 @@ async fn a_permanently_failing_batch_dead_letters_stops_blocking_and_replays() {
             .expect("read")
             .is_empty(),
         "a replayed dead letter must clear"
+    );
+
+    // A REPLAY SIGNS OVER THE RANGE IT SET ASIDE, so it must SEND that range too. Sending a
+    // current position instead would hand a consumer a signature over one position and a
+    // header claiming another, and the batch would verify as tampered: a replay that cannot
+    // be verified is not a recovery. Review mutated this to send the range END and the whole
+    // suite stayed green, because the sink double discarded the argument.
+    let replayed = replay_sink.signed();
+    let handed = replayed.first().expect("the replay delivered a batch");
+    assert_eq!(
+        (handed.1, handed.2.clone()),
+        set_aside,
+        "the replay must send the position it signed, the dead letter's own range start: \
+         {replayed:?}"
     );
 }
 
@@ -649,5 +720,95 @@ async fn the_metrics_observation_reports_status_and_the_outstanding_gap() {
     assert_eq!(
         after[0].outstanding_dead_letters, 1,
         "the export gap must be visible as a number, not only as a status: {after:?}"
+    );
+}
+
+/// A stream configured with a signing secret actually SIGNS, and ships the position that
+/// signature covers (issue #110 criterion 5).
+///
+/// # Why nothing caught this before
+///
+/// Review mutated the shipper so that a stream WITH a signing secret shipped every batch
+/// unsigned, and the whole suite stayed green. The reason was not a missing assertion: no
+/// fixture in this file could set `signing_secret_name`, because `NewLogStream` did not carry
+/// it and the INSERT did not write it. The column migration 0144 added was written by
+/// nothing, so `open_signing_secret` returned `None` for every stream on every deployment and
+/// every batch shipped unsigned. An unsigned batch is a legitimate configuration, so nothing
+/// failed anywhere.
+///
+/// That is why this test asserts the signature is PRESENT before asserting anything about it:
+/// the interesting failure is not a wrong signature, it is no signature at all on a stream
+/// the operator configured to sign.
+///
+/// It then rebuilds the canonical string from what the sink was handed and checks the
+/// signature verifies under the same secret. That is what makes the position assertion
+/// meaningful rather than decorative: a position that does not reconstruct the signed string
+/// is exactly as useless to a consumer as no position.
+#[tokio::test]
+async fn a_signing_stream_signs_its_batches_and_ships_the_position_it_signed() {
+    const SECRET_NAME: &str = "siem-signing-key";
+    const SECRET: &[u8] = b"a-shared-signing-secret";
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .environment_secrets()
+        .put(&env, &db.master_key(), SECRET_NAME, SECRET, None)
+        .await
+        .expect("put the signing secret");
+
+    let id = db
+        .control_store()
+        .scoped(scope)
+        .log_streams()
+        .create(
+            &env,
+            &NewLogStream {
+                id: None,
+                description: "signing stream",
+                source: StreamSource::Both,
+                sink_type: SinkType::Http,
+                sink_config: serde_json::json!({ "endpoint": "https://sink.example/in" }),
+                credential_secret_name: None,
+                signing_secret_name: Some(SECRET_NAME),
+                event_type_filter: None,
+                organization_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("configure a signing stream");
+
+    seed_admin(&db, &env, scope, 2, "signed").await;
+    let sink = RecordingSink::new(SinkType::Http, true);
+    let sinks: Vec<Arc<dyn LogSink>> = vec![sink.clone()];
+    let shipped = ship_once(db.store(), &env, scope, &sinks)
+        .await
+        .expect("ship");
+    assert!(shipped >= 2, "the seeded rows must ship: {shipped}");
+
+    let handed = sink.signed();
+    let (signature, sequence, cursor_id) = handed.last().expect("a batch was delivered").clone();
+    let signature = signature.expect(
+        "a stream configured with a signing secret must sign: an absent signature here is the          whole feature being inert, not a wrong value",
+    );
+
+    // The batch as the sink received it, which is what the digest is taken over.
+    let events = sink.events();
+    let events_json = serde_json::to_string(&events).expect("serializes");
+    let canonical = ironauth_admin::log_stream_signature::canonical_string(
+        &id,
+        sequence,
+        &cursor_id,
+        events.len(),
+        &events_json,
+    );
+    assert!(
+        ironauth_admin::log_stream_signature::verify(SECRET, &canonical, &signature),
+        "the signature must verify against the position the sink was handed, or a consumer          holding both cannot check anything"
     );
 }
