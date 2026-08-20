@@ -2019,3 +2019,69 @@ async fn replaying_needs_more_than_reading() {
         "a read-only credential must not be able to ship audit events to a sink: {body}"
     );
 }
+
+/// A replay for a stream that does not exist in this scope is REFUSED, not accepted.
+///
+/// The worst available shape here is 202. `replay_dead_letters` answers `Ok(0)` for a
+/// stream it cannot resolve, which is indistinguishable from a successful replay of a
+/// stream with nothing outstanding, so an operator watching for their gap to close would
+/// wait on a command that was never going to do anything.
+///
+/// The cross-scope arm is the same refusal on purpose: a stream in another tenant must be a
+/// uniform not-found rather than an existence oracle over other tenants' configuration.
+/// What DELIVERS that is row-level security on `log_streams`, not the scope predicate in
+/// the existence check; measured, removing the predicate leaves this test passing because
+/// the foreign row is already invisible to the statement. So this arm pins the OUTCOME an
+/// operator sees, and deliberately does not claim to pin which layer produces it.
+#[tokio::test]
+async fn a_replay_for_an_unknown_stream_is_refused() {
+    let h = Harness::start(74).await;
+    let (tenant, environment) = h.create_tenant("acme", "lgs-dl-unknown").await;
+    let (other_tenant, other_environment) = h.create_tenant("globex", "lgs-dl-other").await;
+
+    let other_scope = Scope::new(
+        TenantId::parse(&other_tenant).expect("tenant id"),
+        EnvironmentId::parse(&other_environment).expect("environment id"),
+    );
+    // A REAL stream, in a scope the caller below is not addressing.
+    let (foreign_stream, _dead) = seed_dead_letter(&h, other_scope, "sink_refused_503").await;
+
+    for (label, stream) in [
+        ("never existed", "lgs_definitely_not_a_stream"),
+        ("another tenant's", foreign_stream.as_str()),
+    ] {
+        let path = format!(
+            "/v1/tenants/{tenant}/environments/{environment}/log-streams/{stream}/dead-letters/replay"
+        );
+        let (status, _, body) = h
+            .post_as(&path, OPERATOR_TOKEN, &format!("lgs-unknown-{label}"), "")
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a replay for a {label} stream must be refused, not accepted: {body}"
+        );
+    }
+
+    // And nothing was queued for a worker that could never have served it.
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let queued = h
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &ironauth_env::Env::system(),
+            ironauth_store::LOG_STREAM_REPLAY_CONSUMER,
+            std::time::Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim");
+    assert!(
+        queued.is_empty(),
+        "a refused replay must queue no command: {queued:?}"
+    );
+}

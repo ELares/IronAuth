@@ -40504,6 +40504,33 @@ impl LogStreamRepo<'_> {
     ) -> Result<(), StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
+        // The stream must EXIST IN THIS SCOPE before a command is queued for it.
+        //
+        // Without this the endpoint answers 202 for a stream that was deleted, never
+        // existed, or belongs to another tenant, and the worker later resolves nothing and
+        // returns `Ok(0)`. That is the worst shape available: indistinguishable from a
+        // successful replay of a stream with nothing outstanding, so an operator watching
+        // for their gap to close waits on a command that was never going to do anything.
+        //
+        // A stream in ANOTHER scope is a uniform not-found rather than an existence oracle
+        // over other tenants' configuration. The `(tenant, environment)` predicate below is
+        // NOT what delivers that, and saying so matters: measured, removing it changes
+        // nothing, because `log_streams` carries FORCE row-level security and
+        // `begin_scoped` sets the session variables its policy reads, so a foreign row is
+        // already invisible to this statement. The predicate is defence in depth and reads
+        // like every other scoped query here; RLS is the fence.
+        let exists = sqlx::query(
+            "SELECT 1 FROM log_streams \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(stream_id)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound);
+        }
         // The command's idempotency key is the stream, so two replay commands for ONE
         // stream execute in the order they were asked for. They share no ordering group
         // with anything else, because a group is per (consumer, ordering key) and this is
