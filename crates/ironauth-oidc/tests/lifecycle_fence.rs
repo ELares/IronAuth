@@ -110,8 +110,8 @@ use common::{
 use ironauth_jose::{EmissionOptions, JwkSet, SigningKey, sign_jws};
 use ironauth_oidc::{ClientAuthMethod, GrantType};
 use ironauth_store::{
-    ActingTenantRepo, AuthorizationCodeId, ClientId, CorrelationId, DeviceCodeId, EnvironmentId,
-    IssuedTokenId, OperatorId, RefreshTokenId, Scope, TenantId,
+    ActingTenantRepo, AuthorizationCodeId, BackchannelAuthRequestId, ClientId, CorrelationId,
+    DeviceCodeId, EnvironmentId, IssuedTokenId, OperatorId, RefreshTokenId, Scope, TenantId,
 };
 use sqlx::Row;
 
@@ -264,6 +264,83 @@ async fn start_device_flow(harness: &Harness, client_id: &str) -> (String, Strin
 
 /// Sign a fresh human in and APPROVE the device flow identified by `user_code` at the
 /// verification page, exactly as `crates/ironauth-oidc/tests/device.rs` drives it.
+/// Start a CIBA backchannel authentication and APPROVE it, returning the `auth_req_id`.
+///
+/// Approved, and an earlier version of this was not, on the assumption that the fence runs
+/// before a grant looks at its credential's state. The opposite is true and `grant_issuer_entry`
+/// says so: it is "called AFTER the presented credential has been validated on every grant,
+/// which is what keeps the 503 from becoming an environment-existence oracle". An unapproved
+/// request therefore answers `authorization_pending` and never reaches the fence, which is
+/// correct behaviour and the wrong probe: this sweep compares grants that walked the same
+/// distance into the endpoint.
+///
+/// The approval goes through the STORE rather than an HTTP surface because CIBA has none yet.
+/// That is the one place this credential is built differently from its neighbours, and it is
+/// worth saying rather than hiding: when the approval surface lands, this should move to it.
+async fn start_ciba_flow(
+    harness: &Harness,
+    client_id: &str,
+    login_hint: &str,
+    subject: &str,
+) -> String {
+    let (status, _headers, body) = harness
+        .post_form(
+            "/backchannel_authenticate",
+            &form(&[
+                ("client_id", client_id),
+                ("login_hint", login_hint),
+                ("scope", "openid"),
+            ]),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "backchannel authenticate: {body}");
+    let auth_req_id = json(&body)["auth_req_id"]
+        .as_str()
+        .expect("auth_req_id")
+        .to_owned();
+
+    // `ira_bar_<id>~<secret>`: the handle is what names the request.
+    let handle = auth_req_id
+        .strip_prefix("ira_bar_")
+        .and_then(|rest| rest.split('~').next())
+        .expect("the auth_req_id carries its handle");
+    let id = BackchannelAuthRequestId::parse_in_scope(handle, &harness.scope())
+        .expect("the handle parses in this scope");
+    let grant = ironauth_store::GrantId::generate(harness.env(), &harness.scope());
+    let now_micros = i64::try_from(
+        harness
+            .env()
+            .clock()
+            .now_utc()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_micros(),
+    )
+    .expect("representable");
+    let approved = harness
+        .store()
+        .scoped(harness.scope())
+        .backchannel_auth()
+        .decide(
+            harness.env(),
+            &id,
+            subject,
+            true,
+            ironauth_store::BackchannelApprovalLinkage {
+                grant_id: Some(&grant),
+                consent_ref: None,
+                auth_methods: Some("pwd"),
+                auth_time_micros: Some(now_micros),
+            },
+            now_micros,
+        )
+        .await
+        .expect("approve the backchannel request");
+    assert!(approved, "the approval must land");
+    auth_req_id
+}
+
 async fn approve_device_flow(harness: &Harness, user_code: &str) {
     let scope = harness.scope();
     let path = format!("/t/{}/e/{}/device", scope.tenant(), scope.environment());
@@ -330,7 +407,11 @@ fn expected_probe_shape(grant: GrantType) -> (StatusCode, &'static str) {
         // The exchange authenticates its client BEFORE it looks at either presented
         // token, so a probe reaches the same wall as the other client-authenticated
         // grants rather than learning anything about the token it sent.
-        | GrantType::TokenExchange => (StatusCode::UNAUTHORIZED, "invalid_client"),
+        | GrantType::TokenExchange
+        // CIBA authenticates its client BEFORE it touches poll state, deliberately: an
+        // unauthenticated caller must not be able to advance a flow or move its interval. So
+        // a probe reaches the same wall as the other client-authenticated grants.
+        | GrantType::Ciba => (StatusCode::UNAUTHORIZED, "invalid_client"),
     }
 }
 
@@ -359,6 +440,13 @@ fn probe_forms(
         // `crate::tokens::OPAQUE_REFRESH_TOKEN_PREFIX` and `device::DEVICE_CODE_PREFIX`).
         let refresh = format!("ira_rt_{}~cHJvYmU", RefreshTokenId::generate(env, scope));
         let device = format!("ira_dc_{}~cHJvYmU", DeviceCodeId::generate(env, scope));
+        // Well formed the same way: prefix, a handle that parses and declares its scope, the
+        // delimiter, and a secret. It resolves to no stored row, which is the state the fence
+        // is about.
+        let auth_req = format!(
+            "ira_bar_{}~cHJvYmU",
+            BackchannelAuthRequestId::generate(env, scope)
+        );
         // A well-formed opaque ACCESS token for the exchange probe: it parses and
         // declares its scope, then resolves to no stored row, exactly like the others.
         let access = format!("ira_at_{}~cHJvYmU", IssuedTokenId::generate(env, scope));
@@ -408,6 +496,14 @@ fn probe_forms(
                 ]),
             ),
             (
+                GrantType::Ciba,
+                form(&[
+                    ("grant_type", GrantType::CIBA_URN),
+                    ("auth_req_id", &auth_req),
+                    ("client_id", &client),
+                ]),
+            ),
+            (
                 GrantType::TokenExchange,
                 form(&[
                     ("grant_type", GrantType::TOKEN_EXCHANGE_URN),
@@ -439,6 +535,8 @@ struct GrantCredentials {
     assertion: String,
     /// An APPROVED device code, so a poll with it is one that would have minted.
     device_code: String,
+    /// A real, unapproved CIBA request. See `start_ciba_flow` for why unapproved.
+    auth_req_id: String,
     /// A LIVE access token, minted while the scope was still serving, for the RFC 8693
     /// exchange to present as its `subject_token`.
     access_token: String,
@@ -489,12 +587,25 @@ async fn grant_credentials(
 
     let (device_code, user_code) = start_device_flow(harness, &public_client).await;
     approve_device_flow(harness, &user_code).await;
+    // Seeded by IDENTIFIER, because `login_hint` names the user the way a client would: an
+    // email, not the internal subject id `seed_unique_user` returns. Unique per call, because
+    // this builder runs once per fenced state and a fixed address conflicts on the second.
+    let ciba_login_hint = format!(
+        "ciba-fence-{}@example.test",
+        CorrelationId::generate(harness.env())
+    );
+    let ciba_subject = harness
+        .seed_user(&ciba_login_hint, common::SEED_PASSWORD)
+        .await;
+    let auth_req_id =
+        start_ciba_flow(harness, &public_client, &ciba_login_hint, &ciba_subject).await;
 
     GrantCredentials {
         code,
         refresh_token,
         assertion,
         device_code,
+        auth_req_id,
         access_token,
     }
 }
@@ -558,6 +669,15 @@ async fn grant_answers(
         ]))
         .await;
     answers.push((GrantType::DeviceCode, comparable(status, &headers, &body)));
+
+    let (status, headers, body) = harness
+        .token(&form(&[
+            ("grant_type", GrantType::CIBA_URN),
+            ("auth_req_id", &credentials.auth_req_id),
+            ("client_id", &public_client),
+        ]))
+        .await;
+    answers.push((GrantType::Ciba, comparable(status, &headers, &body)));
 
     let (status, headers, body) = harness
         .token_with_auth(
@@ -911,7 +1031,11 @@ async fn every_token_endpoint_grant_answers_a_fenced_scope_the_same_way() {
     harness
         .enable_device_grant(
             harness.client_id(),
-            "authorization_code urn:ietf:params:oauth:grant-type:device_code",
+            // CIBA too, because the backchannel endpoint gates on this allowlist: a client
+            // not registered for the grant cannot START a request, so the sweep would have no
+            // credential to fence.
+            "authorization_code urn:ietf:params:oauth:grant-type:device_code \
+             urn:openid:params:grant-type:ciba",
             None,
         )
         .await;

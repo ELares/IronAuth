@@ -22,12 +22,17 @@
 use ironauth_oidc::{GrantType, PkceMethod, ResponseMode, ResponseType};
 
 #[test]
-fn grant_type_registry_expresses_the_six_serviced_grants_and_no_ropc() {
-    // The whole registry is exactly six variants: the authorization-code grant, the
+fn grant_type_registry_expresses_the_seven_serviced_grants_and_no_ropc() {
+    // The whole registry is exactly seven variants: the authorization-code grant, the
     // refresh-token grant (issue #21), the client-credentials grant (issue #23), the
     // JWT bearer assertion grant (issue #26), the RFC 8628 device-code grant
-    // (issue #24), and the RFC 8693 token-exchange grant (issue #125). No other grant
-    // type is representable, and ROPC has no variant at all.
+    // (issue #24), the RFC 8693 token-exchange grant (issue #125), and the CIBA poll
+    // grant (issue #131). No other grant type is representable, and ROPC has no variant
+    // at all.
+    //
+    // The count is a deliberate checkpoint, not bookkeeping: a grant added here is a new
+    // minting path, and this list is what makes adding one a decision somebody has to
+    // write down rather than something that happens.
     assert_eq!(
         GrantType::ALL,
         &[
@@ -37,9 +42,10 @@ fn grant_type_registry_expresses_the_six_serviced_grants_and_no_ropc() {
             GrantType::JwtBearer,
             GrantType::DeviceCode,
             GrantType::TokenExchange,
+            GrantType::Ciba,
         ]
     );
-    assert_eq!(GrantType::ALL.len(), 6);
+    assert_eq!(GrantType::ALL.len(), 7);
 
     // Every offered grant round-trips through its exact wire spelling.
     assert_eq!(
@@ -76,6 +82,24 @@ fn grant_type_registry_expresses_the_six_serviced_grants_and_no_ropc() {
     assert_eq!(
         GrantType::TokenExchange.as_str(),
         "urn:ietf:params:oauth:grant-type:token-exchange"
+    );
+
+    // CIBA's URN is in the OPENID namespace, not the IETF one every other grant here uses.
+    // Spelled out rather than referenced through the constant, because a test that asserts
+    // `CIBA_URN` round-trips to `CIBA_URN` would pass with the wrong namespace baked in, and
+    // the wrong namespace is a grant no client ever reaches.
+    assert_eq!(
+        GrantType::parse("urn:openid:params:grant-type:ciba"),
+        Some(GrantType::Ciba)
+    );
+    assert_eq!(
+        GrantType::Ciba.as_str(),
+        "urn:openid:params:grant-type:ciba"
+    );
+    assert_eq!(
+        GrantType::parse("urn:ietf:params:oauth:grant-type:ciba"),
+        None,
+        "the IETF spelling is not CIBA's and must not resolve to a handler"
     );
 
     // Every forbidden or unknown grant type is unrepresentable: it parses to

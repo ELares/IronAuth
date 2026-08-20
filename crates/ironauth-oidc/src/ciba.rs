@@ -41,7 +41,13 @@ use crate::client_auth::{self, ClientAuthInputs};
 use crate::state::OidcState;
 
 /// The CIBA grant type a client must be allowed before it may use this endpoint.
-const CIBA_GRANT_TYPE: &str = "urn:openid:params:grant-type:ciba";
+/// The registry's spelling, not a second copy.
+///
+/// This was a local literal until the token grant landed and `GrantType::CIBA_URN` appeared
+/// beside it. Two spellings of one URN is a drift hazard with a specific failure: the
+/// backchannel endpoint and the token endpoint would disagree about which string means CIBA,
+/// so a client could be permitted to START a flow it can never finish, or the reverse.
+const CIBA_GRANT_TYPE: &str = crate::registry::GrantType::CIBA_URN;
 
 /// The longest `binding_message` this endpoint accepts.
 ///
@@ -53,7 +59,7 @@ const CIBA_GRANT_TYPE: &str = "urn:openid:params:grant-type:ciba";
 const MAX_BINDING_MESSAGE: usize = 140;
 
 /// The wire prefix of an `auth_req_id`, mirroring the device grant's `ira_dc_`.
-const AUTH_REQ_ID_PREFIX: &str = "ira_bar_";
+pub(crate) const AUTH_REQ_ID_PREFIX: &str = "ira_bar_";
 
 /// Bytes of entropy in an `auth_req_id`'s secret suffix: 32 bytes = 256 bits, the same
 /// budget the device code carries.
@@ -459,6 +465,15 @@ fn mint_auth_req_id(state: &OidcState, id: &BackchannelAuthRequestId) -> (String
 }
 
 /// The lowercase hex SHA-256 of `bytes`.
+/// The stored digest for an `auth_req_id` a client has just presented (issue #131).
+///
+/// The whole string is hashed, prefix and handle and secret together, which is what `create`
+/// stored. Hashing only the secret portion would make two requests with the same secret and
+/// different handles collide.
+pub(crate) fn auth_req_id_digest(presented: &str) -> String {
+    hex_sha256(presented.as_bytes())
+}
+
 fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

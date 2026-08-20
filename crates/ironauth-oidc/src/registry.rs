@@ -97,6 +97,11 @@ pub enum GrantType {
     /// same scope-bound, revocation-authoritative path an external caller gets, and treats
     /// nothing on the token as true because this server once signed it.
     TokenExchange,
+    /// The `urn:openid:params:grant-type:ciba` grant (CIBA Core 1.0, issue #131): a client
+    /// that started a backchannel authentication polls the token endpoint with its
+    /// `auth_req_id` and receives tokens once the user approved on their own device. Enabled
+    /// per client via the grant allowlist, exactly as the device grant is.
+    Ciba,
 }
 
 impl GrantType {
@@ -107,6 +112,13 @@ impl GrantType {
     /// The wire `grant_type` value of the RFC 8693 token-exchange grant (issue #125),
     /// named once for the same reason as [`DEVICE_CODE_URN`](Self::DEVICE_CODE_URN).
     pub const TOKEN_EXCHANGE_URN: &'static str = "urn:ietf:params:oauth:grant-type:token-exchange";
+    /// The CIBA poll grant, named once for the same reason as the two above.
+    ///
+    /// Note the `openid` namespace. Every other grant URN this server implements is
+    /// `urn:ietf:params:oauth:...`; CIBA Core is an OpenID Foundation specification and its
+    /// grant is `urn:openid:params:grant-type:ciba`. Writing the familiar `ietf` spelling
+    /// produces a URN no client will ever send, and the grant simply never fires.
+    pub const CIBA_URN: &'static str = "urn:openid:params:grant-type:ciba";
 
     /// Every grant type this build can express.
     pub const ALL: &'static [GrantType] = &[
@@ -116,6 +128,7 @@ impl GrantType {
         GrantType::JwtBearer,
         GrantType::DeviceCode,
         GrantType::TokenExchange,
+        GrantType::Ciba,
     ];
 
     /// The wire `grant_type` value.
@@ -128,6 +141,7 @@ impl GrantType {
             GrantType::JwtBearer => "urn:ietf:params:oauth:grant-type:jwt-bearer",
             GrantType::DeviceCode => Self::DEVICE_CODE_URN,
             GrantType::TokenExchange => Self::TOKEN_EXCHANGE_URN,
+            GrantType::Ciba => Self::CIBA_URN,
         }
     }
 
@@ -143,6 +157,7 @@ impl GrantType {
             "urn:ietf:params:oauth:grant-type:jwt-bearer" => Some(GrantType::JwtBearer),
             other if other == Self::DEVICE_CODE_URN => Some(GrantType::DeviceCode),
             other if other == Self::TOKEN_EXCHANGE_URN => Some(GrantType::TokenExchange),
+            other if other == Self::CIBA_URN => Some(GrantType::Ciba),
             _ => None,
         }
     }

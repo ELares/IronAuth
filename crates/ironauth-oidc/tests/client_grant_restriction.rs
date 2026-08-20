@@ -191,6 +191,7 @@ async fn every_grant_handler_consults_the_shared_seam() {
 
     // A well-formed device-code handle in this scope (see the device arm below).
     let device_code_handle = harness.mint_device_code_handle();
+    let auth_req_handle = harness.mint_auth_req_id_handle();
 
     // NOW strip the registration.
     set_grants(&harness, &client_id, "").await;
@@ -225,6 +226,14 @@ async fn every_grant_handler_consults_the_shared_seam() {
             // need only be present and well-typed. That ordering is the point: a client
             // not registered for this grant is refused without the server telling it
             // anything about the token it sent.
+            // CIBA recovers its scope from the `auth_req_id` before the client is
+            // authenticated, exactly as the device grant does, so the handle must be well
+            // formed in this scope to reach the seam. It need not name a live request: the
+            // seam runs right after authentication and before any poll state is touched.
+            GrantType::Ciba => vec![
+                ("grant_type", grant.as_str()),
+                ("auth_req_id", auth_req_handle.as_str()),
+            ],
             GrantType::TokenExchange => vec![
                 ("grant_type", grant.as_str()),
                 ("subject_token", "ira_at_not_a_real_token"),
