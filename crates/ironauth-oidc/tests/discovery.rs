@@ -724,6 +724,53 @@ fn rs256_floor_is_the_only_advertised_alg_that_need_not_be_policy_permitted() {
     assert!(id_token_signing_alg_values(&policy).contains(&"RS256".to_owned()));
 }
 
+/// Advertising the CIBA grant obliges the document to say where a flow starts.
+///
+/// `grant_types_supported` is generated from `GrantType::ALL`, so the CIBA variant
+/// advertised the grant to every environment the moment it was added to the enum. CIBA
+/// Core 1.0 section 4 makes `backchannel_authentication_endpoint` and
+/// `backchannel_token_delivery_modes_supported` REQUIRED of an OP that supports it, and
+/// for one release the document advertised the grant while naming neither, which is a
+/// self-contradictory document rather than an incomplete one.
+///
+/// Keyed on the ADVERTISED grant rather than on a constant, so a deployment that ever
+/// stops advertising CIBA drops the obligation with it instead of failing here.
+#[test]
+fn advertising_ciba_obliges_the_two_required_ciba_fields() {
+    let doc = discovery_document(
+        "https://issuer.test/t/tnt/e/env",
+        ISSUER_BASE,
+        "https://issuer.test/t/tnt/e/env/jwks.json",
+        &SigningPolicy::eddsa_default(),
+        &DiscoveryCapabilities::default(),
+    );
+
+    let advertises_ciba = string_array(&doc, "grant_types_supported")
+        .iter()
+        .any(|value| value == GrantType::CIBA_URN);
+    assert!(
+        advertises_ciba,
+        "this test is about the obligation that follows from advertising CIBA: {doc:?}"
+    );
+
+    // The DEPLOYMENT ROOT, not the per-environment issuer: `/backchannel_authenticate` is
+    // mounted beside `/device_authorization` and recovers its scope from the client_id.
+    assert_eq!(
+        doc["backchannel_authentication_endpoint"].as_str(),
+        Some(format!("{ISSUER_BASE}/backchannel_authenticate").as_str()),
+        "CIBA Core section 4 requires the endpoint, and it must be the mounted route: {doc:?}"
+    );
+    // `poll` only. Ping is unreachable for two reasons, neither of which is "nothing
+    // schedules the notification" (`decide` does enqueue one): `CibaPingConsumer` has no
+    // caller outside its own module and tests, and `backchannel_delivery_mode` has no
+    // production writer. See the generator for the full note.
+    assert_eq!(
+        string_array(&doc, "backchannel_token_delivery_modes_supported"),
+        vec!["poll".to_owned()],
+        "CIBA Core section 4 requires the delivery modes: {doc:?}"
+    );
+}
+
 /// A `*_supported` (or any) JSON array field as owned strings.
 fn string_array(doc: &Value, key: &str) -> Vec<String> {
     doc[key]

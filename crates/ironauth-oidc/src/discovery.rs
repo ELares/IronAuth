@@ -28,6 +28,9 @@
 //!
 //! - `response_types_supported`   <- [`ResponseType::DEFAULT`] (+ per-env legacy, #17)
 //! - `grant_types_supported`      <- [`GrantType::ALL`]
+//! - `backchannel_authentication_endpoint` and
+//!   `backchannel_token_delivery_modes_supported` <- REQUIRED by CIBA Core 1.0 section 4
+//!   once `GrantType::ALL` names the CIBA grant
 //! - `code_challenge_methods_supported` <- [`PkceMethod::ALL`]
 //! - `token_endpoint_auth_methods_supported` <- [`ClientAuthMethod::ALL`]
 //! - `token_endpoint_auth_signing_alg_values_supported` <- the asymmetric assertion
@@ -202,6 +205,17 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
     DiscoveryEndpoint {
         metadata_key: "revocation_endpoint",
         path: "/revoke",
+    },
+    // OpenID CIBA Core 1.0 section 4 backchannel-authentication endpoint (issue #131).
+    // A deployment-root endpoint like /device_authorization beside it in lib.rs: the
+    // client presents its client_id and the scope is recovered from it. It belongs in
+    // THIS registry rather than in a hand-written insert in the generator, because the
+    // registry is what the endpoint-coverage test checks the document against, and a
+    // hand-written one composed it from the per-environment issuer instead of the
+    // deployment root, advertising a URL nothing serves.
+    DiscoveryEndpoint {
+        metadata_key: "backchannel_authentication_endpoint",
+        path: "/backchannel_authenticate",
     },
     DiscoveryEndpoint {
         metadata_key: "introspection_endpoint",
@@ -537,6 +551,32 @@ pub fn discovery_document(
         json!(to_strings(
             GrantType::ALL.iter().map(|value| value.as_str())
         )),
+    );
+    // The two metadata fields OpenID CIBA Core 1.0 section 4 makes REQUIRED of an OP that
+    // supports the grant. `grant_types_supported` above is sourced from `GrantType::ALL`,
+    // so adding the CIBA variant advertised the grant to every client in every
+    // environment; without these two, a client that discovers CIBA support cannot discover
+    // where to start a flow, and the document is self-contradictory rather than merely
+    // incomplete.
+    //
+    // `poll` is the only delivery mode a client can actually be served, and the reason is
+    // NOT that "nothing schedules the notification": `decide` enqueues a ping outbox message
+    // inside the approval transaction, and `ironauth_admin::ciba_ping::CibaPingConsumer`
+    // exists with its own suite. Two other things make ping unreachable:
+    //
+    // - `CibaPingConsumer` has no caller outside its own module and tests, so nothing
+    //   registers it with a worker pool and the enqueued message is never consumed.
+    // - `backchannel_delivery_mode` has no production writer. Migration 0148 defaults it to
+    //   `poll` and the only write in the tree is test SQL, so no client can be registered
+    //   for ping in the first place.
+    //
+    // Written out because the earlier one-line reason was wrong in a way that would mislead
+    // exactly the person it is aimed at: whoever wires the consumer will read "nothing
+    // schedules the notification", find that something does, and not think to revisit this
+    // list. Both bullets have to stop being true before `ping` belongs here.
+    document.insert(
+        "backchannel_token_delivery_modes_supported".to_owned(),
+        json!(["poll"]),
     );
     document.insert(
         "subject_types_supported".to_owned(),

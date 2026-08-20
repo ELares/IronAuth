@@ -2376,6 +2376,15 @@ impl Harness {
         format!("ira_dc_{id}~unused-secret")
     }
 
+    /// A well-formed `auth_req_id` in this scope that names no stored request (issue #131).
+    ///
+    /// The CIBA grant recovers its scope from the handle before authenticating the client, so
+    /// a probe has to parse and declare its scope to reach the grant-restriction seam at all.
+    pub fn mint_auth_req_id_handle(&self) -> String {
+        let id = ironauth_store::BackchannelAuthRequestId::generate(&self.env, &self.scope);
+        format!("ira_bar_{id}~unused-secret")
+    }
+
     /// Set a client's registered `grant_types` allowlist (issue #763).
     ///
     /// Data-plane writable (migration 0021 granted the app role a column-scoped UPDATE

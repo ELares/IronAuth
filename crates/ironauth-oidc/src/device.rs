@@ -761,7 +761,7 @@ async fn issue_device_refresh(
 /// Build the RFC 6749 5.1 success body for a device exchange (issue #24): the access
 /// token, an ID token, `expires_in`, and (when present) the granted scope and a
 /// refresh token.
-fn device_token_response(
+pub(crate) fn device_token_response(
     minted: &IssuedTokens,
     oauth_scope: Option<&str>,
     refresh_token: Option<&str>,
@@ -784,7 +784,7 @@ fn device_token_response(
 /// Authenticate the token-endpoint client for the device grant through the ONE
 /// reusable seam. A public device client (auth method `none`) authenticates with only
 /// its `client_id`, exactly as the code grant permits.
-async fn authenticate_token_client(
+pub(crate) async fn authenticate_token_client(
     state: &OidcState,
     scope: Scope,
     headers: &HeaderMap,

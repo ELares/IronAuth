@@ -6,6 +6,50 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The OpenID CIBA token grant (issue #131).** `POST /token` now services
+  `grant_type=urn:openid:params:grant-type:ciba`, exchanging an approved `auth_req_id` for
+  an ID token and an access token. Note the `openid` namespace: CIBA Core is an OpenID
+  Foundation specification, so the URN is not the `urn:ietf:params:oauth:` one every other
+  grant in this crate uses.
+
+  Wire-visible in discovery: `grant_types_supported` is generated from `GrantType::ALL`, so
+  every environment now advertises the CIBA grant, and with it the two fields CIBA Core 1.0
+  section 4 makes REQUIRED of an OP that supports one, `backchannel_authentication_endpoint`
+  and `backchannel_token_delivery_modes_supported` (`["poll"]`; see the ping note below).
+
+  The grant authenticates the client before it touches any poll state, and mints before it
+  consumes: a signing failure must not burn an approval a person gave on another device. It issues no refresh
+  token, and the ID token carries no `sid`, because a backchannel approval records no
+  session for one to name.
+
+  TWO SECURITY BEHAVIOURS worth calling out, both of which are how the grant now behaves
+  rather than how it first shipped in review:
+
+  - **The user-lifecycle fence applies.** A blocked, disabled, pending-verification,
+    waitlisted, or soft-deleted user's outstanding approval mints nothing. Neither
+    mechanism that fences this crate's other mints reaches a CIBA request (the session
+    cascade does not touch backchannel requests, and grant revocation cascades through
+    refresh families this grant never opens), so the grant asks the user's state directly.
+    Registered in `docs/design/USER-BOUND-MINT-SITES.md`.
+  - **An approval that recorded no usable authentication method is refused**, and this is
+    WIRE VISIBLE: such a redemption answers `invalid_grant` where it would previously have
+    returned tokens. "No usable method" means absent, blank, or carrying only spellings
+    this crate does not recognize, because `parse_methods` substitutes a password
+    authentication for any of those, and the server must not sign an `amr` and `acr` for
+    an authentication it did not witness.
+
+  Ping delivery mode is NOT advertised, and the reason is not that the notification is
+  unscheduled: `decide` enqueues one. `CibaPingConsumer` has no caller outside its own
+  tests, and `backchannel_delivery_mode` has no production writer, so no client can be
+  registered for ping today.
+
+  Two `error_description` strings changed for every grant that shares them, because they
+  named a credential the caller may never have sent: `invalid_grant` now reads "the
+  presented grant is invalid, expired, or already used" (was "the authorization code ..."),
+  and `expired_token` now reads "the authorization request has expired; start a new one"
+  (was "the device code has expired; start a new device flow"). The `error` codes are
+  unchanged; only the human-readable descriptions differ.
+
 - **`jwks_uri` key resolution now works in a deployed server at all, which it did not
   before.** `OidcState::new` passes `None` for the client-key resolver and the shipped
   binary called exactly that, so the only `Some(resolver)` call site in the repository was a

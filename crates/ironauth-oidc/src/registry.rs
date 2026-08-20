@@ -8,15 +8,17 @@
 //! illegal states are unrepresentable, because the enums have no variant for
 //! them and the parsers map every forbidden spelling to `None`.
 //!
-//! - [`GrantType`] is closed around the six grants the token endpoint services,
+//! - [`GrantType`] is closed around the seven grants the token endpoint services,
 //!   which [`GrantType::ALL`] names: `authorization_code`, `refresh_token`,
 //!   `client_credentials`, the JWT bearer assertion grant, the RFC 8628 device
-//!   grant, and the RFC 8693 token-exchange grant. There is no `Password` variant,
-//!   so the resource-owner-password-credentials (ROPC) grant has no value to match
-//!   and no handler to route to: it is absent, not disabled. (This list read
-//!   "exactly one variant" until the four grants after the first had shipped past
-//!   it, and read "five" until the exchange landed; it is [`GrantType::ALL`] that
-//!   other code cites as the authority, so the two must agree.)
+//!   grant, the RFC 8693 token-exchange grant, and the OpenID CIBA grant. There is
+//!   no `Password` variant, so the resource-owner-password-credentials (ROPC) grant
+//!   has no value to match and no handler to route to: it is absent, not disabled.
+//!   (This list read "exactly one variant" until the four grants after the first had
+//!   shipped past it, read "five" until the exchange landed, and read "six" until
+//!   CIBA did; it is [`GrantType::ALL`] that other code cites as the authority, so
+//!   the two must agree. Three corrections in, the pattern is clear enough to say
+//!   plainly: a grant is not added until this sentence counts it.)
 //! - [`ResponseType`] is closed around a SET of exactly four members: `code`,
 //!   `code id_token`, `id_token`, and `none`. There is NO component for an
 //!   access token anywhere in the type, so NONE of the token-bearing response
@@ -54,7 +56,8 @@
 /// 2.1 rotation and reuse-detection rules, issue #21), the client-credentials
 /// grant (RFC 6749 4.4, machine-to-machine, issue #23), the JWT bearer assertion
 /// grant (RFC 7521 4.1 / RFC 7523 2.1, issue #26), the device grant (RFC 8628,
-/// issue #24), and the token-exchange grant (RFC 8693, issue #125).
+/// issue #24), the token-exchange grant (RFC 8693, issue #125), and the CIBA grant
+/// (OpenID CIBA Core 1.0, issue #131).
 /// [`GrantType::ALL`] is that list in code, and callers that need to be
 /// exhaustive over the token endpoint's grants drive off it. ROPC (`password`) and
 /// every other grant are simply absent, so there is no way to name one at this
@@ -97,6 +100,11 @@ pub enum GrantType {
     /// same scope-bound, revocation-authoritative path an external caller gets, and treats
     /// nothing on the token as true because this server once signed it.
     TokenExchange,
+    /// The `urn:openid:params:grant-type:ciba` grant (CIBA Core 1.0, issue #131): a client
+    /// that started a backchannel authentication polls the token endpoint with its
+    /// `auth_req_id` and receives tokens once the user approved on their own device. Enabled
+    /// per client via the grant allowlist, exactly as the device grant is.
+    Ciba,
 }
 
 impl GrantType {
@@ -107,6 +115,13 @@ impl GrantType {
     /// The wire `grant_type` value of the RFC 8693 token-exchange grant (issue #125),
     /// named once for the same reason as [`DEVICE_CODE_URN`](Self::DEVICE_CODE_URN).
     pub const TOKEN_EXCHANGE_URN: &'static str = "urn:ietf:params:oauth:grant-type:token-exchange";
+    /// The CIBA poll grant, named once for the same reason as the two above.
+    ///
+    /// Note the `openid` namespace. Every other grant URN this server implements is
+    /// `urn:ietf:params:oauth:...`; CIBA Core is an OpenID Foundation specification and its
+    /// grant is `urn:openid:params:grant-type:ciba`. Writing the familiar `ietf` spelling
+    /// produces a URN no client will ever send, and the grant simply never fires.
+    pub const CIBA_URN: &'static str = "urn:openid:params:grant-type:ciba";
 
     /// Every grant type this build can express.
     pub const ALL: &'static [GrantType] = &[
@@ -116,6 +131,7 @@ impl GrantType {
         GrantType::JwtBearer,
         GrantType::DeviceCode,
         GrantType::TokenExchange,
+        GrantType::Ciba,
     ];
 
     /// The wire `grant_type` value.
@@ -128,6 +144,7 @@ impl GrantType {
             GrantType::JwtBearer => "urn:ietf:params:oauth:grant-type:jwt-bearer",
             GrantType::DeviceCode => Self::DEVICE_CODE_URN,
             GrantType::TokenExchange => Self::TOKEN_EXCHANGE_URN,
+            GrantType::Ciba => Self::CIBA_URN,
         }
     }
 
@@ -143,6 +160,7 @@ impl GrantType {
             "urn:ietf:params:oauth:grant-type:jwt-bearer" => Some(GrantType::JwtBearer),
             other if other == Self::DEVICE_CODE_URN => Some(GrantType::DeviceCode),
             other if other == Self::TOKEN_EXCHANGE_URN => Some(GrantType::TokenExchange),
+            other if other == Self::CIBA_URN => Some(GrantType::Ciba),
             _ => None,
         }
     }

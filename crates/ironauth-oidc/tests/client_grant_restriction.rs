@@ -191,6 +191,7 @@ async fn every_grant_handler_consults_the_shared_seam() {
 
     // A well-formed device-code handle in this scope (see the device arm below).
     let device_code_handle = harness.mint_device_code_handle();
+    let auth_req_handle = harness.mint_auth_req_id_handle();
 
     // NOW strip the registration.
     set_grants(&harness, &client_id, "").await;
@@ -219,6 +220,14 @@ async fn every_grant_handler_consults_the_shared_seam() {
             GrantType::DeviceCode => vec![
                 ("grant_type", grant.as_str()),
                 ("device_code", device_code_handle.as_str()),
+            ],
+            // CIBA recovers its scope from the `auth_req_id` before the client is
+            // authenticated, exactly as the device grant does, so the handle must be well
+            // formed in this scope to reach the seam. It need not name a live request: the
+            // seam runs right after authentication and before any poll state is touched.
+            GrantType::Ciba => vec![
+                ("grant_type", grant.as_str()),
+                ("auth_req_id", auth_req_handle.as_str()),
             ],
             // The exchange runs the seam immediately after client authentication and
             // BEFORE it revalidates either presented token, so the subject token here

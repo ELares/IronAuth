@@ -768,6 +768,11 @@ name = "device"
 path = "tests/device.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "ciba_grant"
+path = "tests/ciba_grant.rs"
+required-features = ["testing"]
+
 # The generic OIDC upstream federated login (issue #75, PR B): the end-to-end and
 # adversarial flow against a mock upstream driven through the fetch test-harness.
 [[test]]
