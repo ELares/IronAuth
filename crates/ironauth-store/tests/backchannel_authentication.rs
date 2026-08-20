@@ -295,16 +295,64 @@ async fn a_request_is_invisible_from_another_scope() {
 const NOW_MICROS: i64 = 1_800_000_000_000_000;
 
 /// Seed an APPROVED request for `client`, returning its digest.
-async fn seed_approved(db: &TestDatabase, env: &Env, scope: Scope, client: &str) -> String {
+/// A distinct 64-hex digest per input, so fixtures cannot collide on the primary key.
+fn digest_of(seed: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    let a = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (seed, a).hash(&mut hasher);
+    let b = hasher.finish();
+    format!("{a:016x}{b:016x}{a:016x}{b:016x}")
+}
+
+/// An approved request WITH the grant its approval opened, which is the only redeemable
+/// shape.
+///
+/// It returns the grant because redemption now REQUIRES the spine. An approval that opened no
+/// grant has nothing for the tokens to hang off and nothing for a revocation to reach, so a
+/// fixture without one models a request that cannot legitimately be redeemed at all. Four
+/// rounds of review chased holes reachable only through that shape.
+///
+/// `requested_scope` is set, because it is the ceiling on what an issued token may claim and
+/// a NULL one bounds every token to no scope at all.
+async fn seed_approved_linked(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    client: &str,
+) -> (String, ironauth_store::GrantId) {
+    let grant = ironauth_store::GrantId::generate(env, &scope);
+    seed_grant(db, scope, &grant.to_string(), client, "usr_subject").await;
+    let digest = seed_approved_with_grant(db, env, scope, client, Some(&grant.to_string())).await;
+    (digest, grant)
+}
+
+/// The same, with explicit control over the spine, for the tests that need a NULL one or one
+/// pointing at a grant they built themselves.
+async fn seed_approved_with_grant(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    client: &str,
+    grant_id: Option<&str>,
+) -> String {
     let id = BackchannelAuthRequestId::generate(env, &scope);
-    let digest = format!("{:064x}", id.to_string().len() + 7);
+    // Derived from the ID, not from its LENGTH. The original derived it from
+    // `id.to_string().len()`, which is the same for every id, so two approved fixtures in one
+    // test collided on the primary key and the failure surfaced as an opaque `.expect` inside
+    // this helper rather than as anything about the test. `create_pending_with_id` has the
+    // same bug and the same workaround one function down.
+    let digest = digest_of(&id.to_string());
     let mut tx = db.app_pool().begin().await.expect("begin");
     bind_scope(&mut tx, scope).await;
     sqlx::query(
         "INSERT INTO backchannel_authentication_requests (
              auth_req_id_digest, tenant_id, environment_id, id, client_id,
-             delivery_mode, status, interval_secs, subject, expires_at
-         ) VALUES ($1, $2, $3, $4, $5, 'poll', 'approved', 5, $6, $7::timestamptz)",
+             delivery_mode, status, interval_secs, subject, expires_at,
+             grant_id, requested_scope
+         ) VALUES ($1, $2, $3, $4, $5, 'poll', 'approved', 5, $6, $7::timestamptz, $8, $9)",
     )
     .bind(&digest)
     .bind(scope.tenant().to_string())
@@ -313,11 +361,17 @@ async fn seed_approved(db: &TestDatabase, env: &Env, scope: Scope, client: &str)
     .bind(client)
     .bind("usr_subject")
     .bind(FAR_FUTURE)
+    .bind(grant_id)
+    .bind("openid profile")
     .execute(&mut *tx)
     .await
     .expect("seed an approved request");
     tx.commit().await.expect("commit");
     digest
+}
+
+async fn seed_approved(db: &TestDatabase, env: &Env, scope: Scope, client: &str) -> String {
+    seed_approved_with_grant(db, env, scope, client, None).await
 }
 
 /// An approved request redeems exactly once (#131 criterion 3, single-use).
@@ -1320,18 +1374,8 @@ async fn redeeming_records_its_tokens_atomically_and_only_once() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
-    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let token_id = ironauth_store::IssuedTokenId::generate(&env, &scope);
-
-    seed_grant(
-        &db,
-        scope,
-        &grant_id.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
 
     // The details are readable WITHOUT consuming: that is what lets the grant mint first.
     let details = db
@@ -1421,20 +1465,11 @@ async fn a_failed_token_insert_rolls_the_flip_back_and_leaves_the_request_redeem
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
-    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(
-        &db,
-        scope,
-        &grant_id.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
     // ONE ID, TWO RECORDS: the first row lands, the second violates the primary key.
     let duplicate = ironauth_store::IssuedTokenId::generate(&env, &scope);
 
@@ -1511,7 +1546,7 @@ async fn the_new_readers_refuse_another_client() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
@@ -1557,7 +1592,7 @@ async fn the_new_readers_refuse_another_client() {
         "another client must not redeem it"
     );
 
-    assert_owner_can_still_read_and_redeem(&db, &env, scope, &acting, &digest).await;
+    assert_owner_can_still_read_and_redeem(&db, &env, scope, &acting, &digest, &grant_id).await;
 }
 
 /// Neither new method answers AFTER EXPIRY (issue #131 criterion 3).
@@ -1566,20 +1601,11 @@ async fn the_new_readers_refuse_an_expired_request() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
-    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(
-        &db,
-        scope,
-        &grant_id.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
     let past_expiry = FAR_FUTURE_MICROS + 1;
 
     assert!(
@@ -1613,7 +1639,7 @@ async fn the_new_readers_refuse_an_expired_request() {
         "an expired request is not redeemable"
     );
 
-    assert_owner_can_still_read_and_redeem(&db, &env, scope, &acting, &digest).await;
+    assert_owner_can_still_read_and_redeem(&db, &env, scope, &acting, &digest, &grant_id).await;
 }
 
 /// The positive control both refusal tests need: the owner, in time, still reads AND redeems.
@@ -1626,6 +1652,7 @@ async fn assert_owner_can_still_read_and_redeem(
     scope: Scope,
     acting: &ironauth_store::ActingContext,
     digest: &str,
+    grant_id: &ironauth_store::GrantId,
 ) {
     assert!(
         db.store()
@@ -1637,15 +1664,10 @@ async fn assert_owner_can_still_read_and_redeem(
             .is_some(),
         "the owning client still reads it"
     );
-    let owner_grant = ironauth_store::GrantId::generate(env, &scope);
-    seed_grant(
-        db,
-        scope,
-        &owner_grant.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
+    // The SPINE grant, not a fresh one. An earlier version of this control invented a grant
+    // the approval never opened and redeemed against it, which only worked because a NULL
+    // spine accepted anything: review pointed out the control depended on the very
+    // permissiveness the neighbouring tests exist to refuse.
     assert!(
         db.store()
             .scoped(scope)
@@ -1657,7 +1679,7 @@ async fn assert_owner_can_still_read_and_redeem(
                     auth_req_id_digest: digest,
                     presenting_client_id: "cli_owner",
                     now_micros: NOW_MICROS,
-                    grant_id: &owner_grant,
+                    grant_id,
                     tokens: &[],
                     opaque: None,
                 },
@@ -1793,70 +1815,45 @@ async fn redeeming_against_a_grant_the_approval_did_not_open_is_refused() {
 /// attributed to the wrong client. Same harm as the linked case, through the default path.
 ///
 /// The guard is that the grant must BELONG to the presenting client, which closes both
-/// branches and needs no ruling on whether CIBA may approve without a grant.
+/// An approval that opened NO grant is not redeemable at all (issue #131).
+///
+/// # Why this replaces four rounds of patching
+///
+/// This test used to assert something narrower: that a request approved with no grant could
+/// not mint against ANOTHER CLIENT's grant. It passed, and it was the wrong shape, because
+/// each round of review found one more thing the NULL-spine branch still admitted. Round 2
+/// closed cross-client. Round 3 closed cross-subject. Round 4 then showed a caller could
+/// still present any live grant of the same client and user and have the tokens inherit its
+/// `claims_request`, `granted_resources` and `org_id` from an unrelated flow, while the
+/// request kept `grant_id NULL` and nothing linked the issued tokens to the `auth_req_id`.
+///
+/// The branch is gone. A CIBA approval with no grant has nothing for tokens to hang off and
+/// nothing for a revocation to reach, so redemption refuses it outright and there is no
+/// dimension left to patch.
 #[tokio::test]
-async fn a_request_approved_without_a_grant_cannot_mint_against_another_clients_grant() {
+async fn an_approval_that_opened_no_grant_is_not_redeemable() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let digest = seed_approved_with_grant(&db, &env, scope, "cli_owner", None).await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
 
-    // A real grant, owned by another CLIENT but by the SAME USER.
-    //
-    // The subject has to match. A fixture differing on both client and subject is refused by
-    // the ownership predicate's `subject` half, so its `client_id` half is never exercised:
-    // measured, disabling `client_id = $4` left this suite at 41 passed until the fixture
-    // stopped differing on two dimensions at once. Vary one thing per negative.
-    let theirs = ironauth_store::GrantId::generate(&env, &scope);
+    // A grant that is beyond reproach on every dimension the earlier rounds added: right
+    // client, right subject, live, in scope. It is still refused, because the approval did
+    // not open it.
+    let impeccable = ironauth_store::GrantId::generate(&env, &scope);
     seed_grant(
         &db,
         scope,
-        &theirs.to_string(),
-        "cli_someone_else",
+        &impeccable.to_string(),
+        "cli_owner",
         "usr_subject",
     )
     .await;
 
-    let stolen = db
-        .store()
-        .scoped(scope)
-        .backchannel_auth()
-        .redeem_approved(
-            &env,
-            &acting,
-            ironauth_store::BackchannelRedemption {
-                auth_req_id_digest: &digest,
-                presenting_client_id: "cli_owner",
-                now_micros: NOW_MICROS,
-                grant_id: &theirs,
-                tokens: &[ironauth_store::IssuedTokenRecord {
-                    id: ironauth_store::IssuedTokenId::generate(&env, &scope),
-                    kind: ironauth_store::TokenKind::Access,
-                }],
-                opaque: None,
-            },
-        )
-        .await;
-    assert!(
-        stolen.is_err(),
-        "a grant belonging to another client must be refused even when the approval linked \
-         none of its own"
-    );
-    let (tokens, audited) = recorded_for(&db, scope, &theirs.to_string()).await;
-    assert_eq!(
-        (tokens, audited),
-        (0, 0),
-        "and nothing may be recorded against it"
-    );
-
-    // Positive control: the client's OWN grant still redeems, so the refusal is about
-    // ownership rather than about a fixture that could never redeem.
-    let mine = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(&db, scope, &mine.to_string(), "cli_owner", "usr_subject").await;
     assert!(
         db.store()
             .scoped(scope)
@@ -1868,14 +1865,46 @@ async fn a_request_approved_without_a_grant_cannot_mint_against_another_clients_
                     auth_req_id_digest: &digest,
                     presenting_client_id: "cli_owner",
                     now_micros: NOW_MICROS,
-                    grant_id: &mine,
+                    grant_id: &impeccable,
+                    tokens: &[ironauth_store::IssuedTokenRecord {
+                        id: ironauth_store::IssuedTokenId::generate(&env, &scope),
+                        kind: ironauth_store::TokenKind::Access,
+                    }],
+                    opaque: None,
+                },
+            )
+            .await
+            .is_err(),
+        "an approval that opened no grant must not be redeemable, whatever grant is presented"
+    );
+    assert_eq!(
+        recorded_for(&db, scope, &impeccable.to_string()).await,
+        (0, 0),
+        "and nothing is recorded against the grant it was offered"
+    );
+
+    // POSITIVE CONTROL: the identical request WITH a linked grant redeems, so the refusal is
+    // about the missing spine and not about the rest of the fixture.
+    let (linked, spine) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .redeem_approved(
+                &env,
+                &acting,
+                ironauth_store::BackchannelRedemption {
+                    auth_req_id_digest: &linked,
+                    presenting_client_id: "cli_owner",
+                    now_micros: NOW_MICROS,
+                    grant_id: &spine,
                     tokens: &[],
                     opaque: None,
                 },
             )
             .await
-            .expect("redeem with the client's own grant"),
-        "the presenting client's own grant still redeems"
+            .expect("redeem the linked request"),
+        "the same shape with a spine redeems"
     );
 }
 
@@ -1898,20 +1927,11 @@ async fn an_opaque_token_keeps_its_audiences_and_its_dpop_binding() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
-    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(
-        &db,
-        scope,
-        &grant_id.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
 
     let audiences = vec![
         "https://api.one.test".to_string(),
@@ -1938,7 +1958,7 @@ async fn an_opaque_token_keeps_its_audiences_and_its_dpop_binding() {
                     client_id: "cli_owner",
                     audience: "https://api.one.test",
                     audiences: &audiences,
-                    scope: Some("read"),
+                    scope: Some("openid"),
                     jti: &jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: Some("thumbprint-of-the-clients-key"),
@@ -2001,20 +2021,11 @@ async fn a_token_id_from_another_scope_is_refused() {
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let elsewhere = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
-    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(
-        &db,
-        scope,
-        &grant_id.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
 
     let foreign = db
         .store()
@@ -2042,6 +2053,21 @@ async fn a_token_id_from_another_scope_is_refused() {
     );
     let (tokens, _) = recorded_for(&db, scope, &grant_id.to_string()).await;
     assert_eq!(tokens, 0, "and nothing lands");
+
+    // AND THE APPROVAL SURVIVES. The shipped code rolls back because the `Err` drops the
+    // transaction, but nothing asserted it: review committed before this refusal and the
+    // suite stayed green. A refusal that burned the approval would make the user re-approve
+    // on their separate device for a fault that was entirely ours.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .approved_details(&digest, "cli_owner", NOW_MICROS)
+            .await
+            .expect("read")
+            .is_some(),
+        "the refusal must not have consumed the approval"
+    );
 }
 
 /// A CIBA-issued token is a COUNTED token (issue #131).
@@ -2062,20 +2088,11 @@ async fn every_redeemed_token_is_metered_in_the_same_transaction() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
-    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(
-        &db,
-        scope,
-        &grant_id.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
 
     let before = metering_events_for(&db, scope, &grant_id.to_string()).await;
     assert_eq!(before, 0, "the fixture enqueues none of its own");
@@ -2169,56 +2186,36 @@ async fn seed_grant_revoked(db: &TestDatabase, scope: Scope, grant_id: &str, cli
 /// approval linked no grant, which is what `BackchannelApprovalLinkage::default()` does, so
 /// the spine comparison was skipped; the grant belonged to the right client, so the ownership
 /// predicate passed. Nothing looked at the subject. Measured before the fix: the redemption
-/// returned `Ok(true)` and the access token resolved as `usr_victim`.
+/// A spine pointing at ANOTHER USER's grant is refused (issue #131).
+///
+/// # Why the ownership predicate still earns its place
+///
+/// With the spine required, the caller can no longer choose the grant: it must equal the one
+/// the approval opened. So this guard is now about a MISLINKED spine, which is a real failure
+/// (a buggy or compromised approval surface calling `decide` with the wrong grant) and the
+/// one with the worst consequence.
+///
+/// `resolve_access_token` joins `grants` and returns the GRANT'S subject, and `UserInfo`
+/// answers from it. A token hung off another user's grant does not merely mis-attribute an
+/// issuance: it AUTHENTICATES AS THAT USER. Review demonstrated exactly that before the
+/// subject predicate existed, resolving the resulting token as `usr_victim`.
 #[tokio::test]
-async fn a_grant_belonging_to_another_user_of_the_same_client_is_refused() {
+async fn a_spine_pointing_at_another_users_grant_is_refused() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
 
-    // Same client, different user. Every multi-user client has one of these.
+    // Same client, DIFFERENT user, and the approval is linked to it. Only the subject differs
+    // from a good fixture, so only the subject predicate can refuse it.
     let victims = ironauth_store::GrantId::generate(&env, &scope);
     seed_grant(&db, scope, &victims.to_string(), "cli_owner", "usr_victim").await;
+    let digest =
+        seed_approved_with_grant(&db, &env, scope, "cli_owner", Some(&victims.to_string())).await;
 
-    let stolen = db
-        .store()
-        .scoped(scope)
-        .backchannel_auth()
-        .redeem_approved(
-            &env,
-            &acting,
-            ironauth_store::BackchannelRedemption {
-                auth_req_id_digest: &digest,
-                presenting_client_id: "cli_owner",
-                now_micros: NOW_MICROS,
-                grant_id: &victims,
-                tokens: &[ironauth_store::IssuedTokenRecord {
-                    id: ironauth_store::IssuedTokenId::generate(&env, &scope),
-                    kind: ironauth_store::TokenKind::Access,
-                }],
-                opaque: None,
-            },
-        )
-        .await;
-    assert!(
-        stolen.is_err(),
-        "a grant belonging to another user must be refused, or the token authenticates as \
-         that user"
-    );
-    assert_eq!(
-        recorded_for(&db, scope, &victims.to_string()).await,
-        (0, 0),
-        "and nothing is recorded against the victim's grant"
-    );
-
-    // Positive control: the request's OWN subject still redeems.
-    let mine = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(&db, scope, &mine.to_string(), "cli_owner", "usr_subject").await;
     assert!(
         db.store()
             .scoped(scope)
@@ -2230,13 +2227,45 @@ async fn a_grant_belonging_to_another_user_of_the_same_client_is_refused() {
                     auth_req_id_digest: &digest,
                     presenting_client_id: "cli_owner",
                     now_micros: NOW_MICROS,
-                    grant_id: &mine,
+                    grant_id: &victims,
+                    tokens: &[ironauth_store::IssuedTokenRecord {
+                        id: ironauth_store::IssuedTokenId::generate(&env, &scope),
+                        kind: ironauth_store::TokenKind::Access,
+                    }],
+                    opaque: None,
+                },
+            )
+            .await
+            .is_err(),
+        "a grant belonging to another user must be refused, or the token authenticates as \
+         that user"
+    );
+    assert_eq!(
+        recorded_for(&db, scope, &victims.to_string()).await,
+        (0, 0),
+        "and nothing is recorded against the victim's grant"
+    );
+
+    // POSITIVE CONTROL: the same shape whose spine names the REQUEST's own subject redeems.
+    let (good, spine) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .redeem_approved(
+                &env,
+                &acting,
+                ironauth_store::BackchannelRedemption {
+                    auth_req_id_digest: &good,
+                    presenting_client_id: "cli_owner",
+                    now_micros: NOW_MICROS,
+                    grant_id: &spine,
                     tokens: &[],
                     opaque: None,
                 },
             )
             .await
-            .expect("redeem with the approving user's own grant"),
+            .expect("redeem"),
         "the approving user's own grant still redeems"
     );
 }
@@ -2246,19 +2275,40 @@ async fn a_grant_belonging_to_another_user_of_the_same_client_is_refused() {
 /// Accepting one commits the flip and hands back tokens that `resolve_access_token` reports
 /// inactive. That burns an approval the user gave on a separate device, for a fault entirely
 /// ours, which is the exact harm this file's atomicity argument exists to prevent. The
-/// request must stay redeemable.
+/// A REVOKED spine grant is refused, and the approval is not consumed (issue #131).
+///
+/// Accepting one commits the flip and hands back tokens that `resolve_access_token` reports
+/// inactive. The client gets dead tokens, and the user has to approve again on their separate
+/// device for a fault that is entirely ours. That is the exact harm this file's atomicity
+/// argument exists to prevent, so the refusal has to happen BEFORE the flip.
 #[tokio::test]
-async fn a_revoked_grant_is_refused_and_the_approval_survives() {
+async fn a_revoked_spine_grant_is_refused_and_the_approval_is_not_consumed() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
     let dead = ironauth_store::GrantId::generate(&env, &scope);
     seed_grant_revoked(&db, scope, &dead.to_string(), "cli_owner").await;
+    let digest =
+        seed_approved_with_grant(&db, &env, scope, "cli_owner", Some(&dead.to_string())).await;
+
+    // A SECOND grant, live, same client, same subject. It exists so that the predicate's
+    // `id = $1` term is load-bearing here: without this row, neutralising `id = $1` still
+    // finds nothing and the refusal happens anyway, which is how review measured that term
+    // surviving mutation. With it, a predicate that forgot WHICH grant would accept this
+    // redemption and the test goes red.
+    let other_live = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(
+        &db,
+        scope,
+        &other_live.to_string(),
+        "cli_owner",
+        "usr_subject",
+    )
+    .await;
 
     assert!(
         db.store()
@@ -2281,28 +2331,18 @@ async fn a_revoked_grant_is_refused_and_the_approval_survives() {
         "a revoked grant must be refused"
     );
 
-    // AND THE APPROVAL SURVIVES, which is the half that matters to the user.
-    let live = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(&db, scope, &live.to_string(), "cli_owner", "usr_subject").await;
+    // THE APPROVAL SURVIVES. It cannot be redeemed against this grant ever again, but it must
+    // still READ as approved: the request was not consumed by our refusal, so an operator who
+    // repairs the grant linkage has something left to repair.
     assert!(
         db.store()
             .scoped(scope)
             .backchannel_auth()
-            .redeem_approved(
-                &env,
-                &acting,
-                ironauth_store::BackchannelRedemption {
-                    auth_req_id_digest: &digest,
-                    presenting_client_id: "cli_owner",
-                    now_micros: NOW_MICROS,
-                    grant_id: &live,
-                    tokens: &[],
-                    opaque: None,
-                },
-            )
+            .approved_details(&digest, "cli_owner", NOW_MICROS)
             .await
-            .expect("redeem"),
-        "the refusal must not have burned the approval"
+            .expect("read")
+            .is_some(),
+        "the refusal must not have consumed the approval"
     );
 }
 
@@ -2322,20 +2362,11 @@ async fn an_opaque_token_claiming_another_identity_is_refused() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
-    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(
-        &db,
-        scope,
-        &grant_id.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
     let audiences = vec!["https://api.one.test".to_string()];
 
     for (subject, client, why) in [
@@ -2371,7 +2402,7 @@ async fn an_opaque_token_claiming_another_identity_is_refused() {
                         client_id: client,
                         audience: "https://api.one.test",
                         audiences: &audiences,
-                        scope: Some("read"),
+                        scope: Some("openid"),
                         jti: &jti,
                         expires_at_unix_micros: FAR_FUTURE_MICROS,
                         dpop_jkt: None,
@@ -2400,20 +2431,11 @@ async fn a_foreign_scope_opaque_jti_is_refused() {
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let elsewhere = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
-    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(
-        &db,
-        scope,
-        &grant_id.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
     let audiences = vec!["https://api.one.test".to_string()];
     let foreign_jti = ironauth_store::IssuedTokenId::generate(&env, &elsewhere);
 
@@ -2437,7 +2459,7 @@ async fn a_foreign_scope_opaque_jti_is_refused() {
                     client_id: "cli_owner",
                     audience: "https://api.one.test",
                     audiences: &audiences,
-                    scope: Some("read"),
+                    scope: Some("openid"),
                     jti: &foreign_jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: None,
@@ -2456,31 +2478,27 @@ async fn a_foreign_scope_opaque_jti_is_refused() {
     );
 }
 
-/// An opaque-only redemption is metered (issue #131).
+/// Every issued token is metered, including the opaque one (issue #131).
 ///
-/// An opaque access token produces NO `IssuedTokenRecord`: both production builders put it
-/// only in `opaque` and pass an empty record list. So a metering loop over `tokens` alone
-/// counted zero for exactly the shape a real opaque issuance takes, while the comment beside
-/// it said a CIBA-issued token is a counted token. Review measured the zero.
+/// An opaque access token produces NO `IssuedTokenRecord`, so a metering loop over `tokens`
+/// alone never counts it.
+///
+/// The PRODUCTION shape is the first case here. An earlier version of this test used
+/// `tokens: &[]`, and its comment claimed both production builders pass an empty record list.
+/// Review measured that as false: `token.rs:420` and `device.rs:458` both push the ID token
+/// first, so the real shape is `[Id]` plus an opaque token, two tokens and two events, and
+/// the under-count was one event rather than all of them. The empty case is kept as the
+/// boundary, not as the representative one.
 #[tokio::test]
-async fn an_opaque_only_redemption_is_metered() {
+async fn every_issued_token_is_metered_including_the_opaque_one() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
-    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(
-        &db,
-        scope,
-        &grant_id.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
     let audiences = vec!["https://api.one.test".to_string()];
     let jti = ironauth_store::IssuedTokenId::generate(&env, &scope);
 
@@ -2504,7 +2522,7 @@ async fn an_opaque_only_redemption_is_metered() {
                     client_id: "cli_owner",
                     audience: "https://api.one.test",
                     audiences: &audiences,
-                    scope: Some("read"),
+                    scope: Some("openid"),
                     jti: &jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: None,
@@ -2518,6 +2536,47 @@ async fn an_opaque_only_redemption_is_metered() {
         metering_events_for(&db, scope, &grant_id.to_string()).await,
         1,
         "an opaque access token is one issued token and must be counted as one"
+    );
+
+    // AND THE PRODUCTION SHAPE: an ID token record alongside the opaque access token, which
+    // is what `token.rs:420` and `device.rs:458` actually build. Two tokens, two events.
+    let (prod_digest, prod_grant) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
+    let prod_jti = ironauth_store::IssuedTokenId::generate(&env, &scope);
+    db.store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &prod_digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &prod_grant,
+                tokens: &[ironauth_store::IssuedTokenRecord {
+                    id: ironauth_store::IssuedTokenId::generate(&env, &scope),
+                    kind: ironauth_store::TokenKind::Id,
+                }],
+                opaque: Some(ironauth_store::NewOpaqueAccessToken {
+                    token_digest: "digest-production-shape",
+                    grant_id: None,
+                    subject: "usr_subject",
+                    client_id: "cli_owner",
+                    audience: "https://api.one.test",
+                    audiences: &audiences,
+                    scope: Some("openid"),
+                    jti: &prod_jti,
+                    expires_at_unix_micros: FAR_FUTURE_MICROS,
+                    dpop_jkt: None,
+                }),
+            },
+        )
+        .await
+        .expect("redeem the production shape");
+    assert_eq!(
+        metering_events_for(&db, scope, &prod_grant.to_string()).await,
+        2,
+        "an ID token plus an opaque access token is two issued tokens and two events"
     );
 }
 
@@ -2577,16 +2636,7 @@ async fn approved_details_refuses_pending_denied_and_redeemed_requests() {
     );
 
     // REDEEMED: already consumed. Positive control first, so the transition is visible.
-    let redeemed = seed_approved(&db, &env, scope, "cli_owner").await;
-    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
-    seed_grant(
-        &db,
-        scope,
-        &grant_id.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
+    let (redeemed, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
     assert!(
         repo()
             .backchannel_auth()
@@ -2662,7 +2712,7 @@ async fn neither_new_reader_reaches_across_scopes() {
     let env = Env::system();
     let home = db.seed_scope(&env).await;
     let neighbour = db.seed_scope(&env).await;
-    let digest = seed_approved(&db, &env, home, "cli_owner").await;
+    let (digest, home_grant) = seed_approved_linked(&db, &env, home, "cli_owner").await;
     let acting = ironauth_store::ActingContext::new(
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
@@ -2711,15 +2761,6 @@ async fn neither_new_reader_reaches_across_scopes() {
 
     // AND IT IS STILL REDEEMABLE AT HOME, so the refusals above are about the scope rather
     // than about a request that was already consumed or was never valid.
-    let home_grant = ironauth_store::GrantId::generate(&env, &home);
-    seed_grant(
-        &db,
-        home,
-        &home_grant.to_string(),
-        "cli_owner",
-        "usr_subject",
-    )
-    .await;
     assert!(
         db.store()
             .scoped(home)
@@ -2739,5 +2780,250 @@ async fn neither_new_reader_reaches_across_scopes() {
             .await
             .expect("redeem"),
         "the request is untouched in its own scope"
+    );
+}
+
+/// The opaque row carries the REDEMPTION's identity, read back out of the database
+/// (issue #131).
+///
+/// # Why reading it back matters
+///
+/// Round 4 refused a mismatched `subject` or `client_id` and bound the authoritative values.
+/// Only the refusal was measured. Review showed the binding half was not: reverting
+/// `.bind(subject)` to `.bind(op.subject)`, reverting the client the same way, doing both at
+/// once, and TRANSPOSING the two arguments at the call site all left the suite green, because
+/// no test ever read those two columns back.
+///
+/// The transposition is the sharp one. The helper took five adjacent `&str` parameters, so
+/// swapping two of them compiled and wrote `subject = "cli_owner"`, `client_id = "usr_..."`
+/// into the exact columns the round-4 blocker was about. That is now impossible by
+/// construction (they are fields of `RedemptionIdentity`), and this test is the belt.
+#[tokio::test]
+async fn the_opaque_row_carries_the_redemptions_identity_and_scope() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let audiences = vec!["https://api.one.test".to_string()];
+    let jti = ironauth_store::IssuedTokenId::generate(&env, &scope);
+
+    db.store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &grant_id,
+                tokens: &[],
+                opaque: Some(ironauth_store::NewOpaqueAccessToken {
+                    token_digest: "digest-identity",
+                    grant_id: None,
+                    subject: "usr_subject",
+                    client_id: "cli_owner",
+                    audience: "https://api.one.test",
+                    audiences: &audiences,
+                    scope: Some("openid"),
+                    jti: &jti,
+                    expires_at_unix_micros: FAR_FUTURE_MICROS,
+                    dpop_jkt: None,
+                }),
+            },
+        )
+        .await
+        .expect("redeem");
+
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let row = sqlx::query(
+        "SELECT subject, client_id, scope FROM opaque_access_tokens \
+         WHERE token_digest = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind("digest-identity")
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the opaque row landed");
+    let subject: String = row.get("subject");
+    let client_id: String = row.get("client_id");
+    let stored_scope: Option<String> = row.get("scope");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(
+        subject, "usr_subject",
+        "the subject column must hold the approval's subject"
+    );
+    assert_eq!(
+        client_id, "cli_owner",
+        "the client column must hold the presenting client, not the subject"
+    );
+    assert_eq!(
+        stored_scope.as_deref(),
+        Some("openid"),
+        "the scope column must hold what was issued"
+    );
+}
+
+/// An opaque token may not claim a WIDER scope than the approval carried (issue #131).
+///
+/// # The fourth column introspection reports verbatim
+///
+/// `resolve_opaque_access_token` returns `scope` and `introspection.rs` echoes it into the RFC
+/// 7662 response, so a resource server authorises on it. Rounds 3 and 4 pinned the opaque
+/// row's `subject`, `client_id` and grant, and left `scope` as pure caller input. Review
+/// redeemed a request whose `requested_scope` was "openid profile" while presenting
+/// "openid profile admin:everything payments:write", and introspection reported the wider set.
+/// The user approved the narrower one.
+///
+/// CONTAINMENT, not equality: a grant may legitimately narrow what was asked for, so a subset
+/// is correct and a superset never is.
+#[tokio::test]
+async fn an_opaque_token_may_not_widen_the_approved_scope() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let audiences = vec!["https://api.one.test".to_string()];
+
+    // The fixture's requested_scope is "openid profile".
+    for (claimed, allowed, why) in [
+        (
+            Some("openid profile admin:everything"),
+            false,
+            "a scope the approval never carried",
+        ),
+        (
+            Some("payments:write"),
+            false,
+            "a scope wholly outside the approval",
+        ),
+        (
+            Some("profile openid"),
+            true,
+            "the same set in another order",
+        ),
+        (Some("openid"), true, "a narrower subset"),
+        (None, true, "no scope at all"),
+    ] {
+        let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
+        let jti = ironauth_store::IssuedTokenId::generate(&env, &scope);
+        let token_digest = format!("digest-{}", claimed.unwrap_or("none").replace(' ', "-"));
+        let outcome = db
+            .store()
+            .scoped(scope)
+            .backchannel_auth()
+            .redeem_approved(
+                &env,
+                &acting,
+                ironauth_store::BackchannelRedemption {
+                    auth_req_id_digest: &digest,
+                    presenting_client_id: "cli_owner",
+                    now_micros: NOW_MICROS,
+                    grant_id: &grant_id,
+                    tokens: &[],
+                    opaque: Some(ironauth_store::NewOpaqueAccessToken {
+                        token_digest: &token_digest,
+                        grant_id: None,
+                        subject: "usr_subject",
+                        client_id: "cli_owner",
+                        audience: "https://api.one.test",
+                        audiences: &audiences,
+                        scope: claimed,
+                        jti: &jti,
+                        expires_at_unix_micros: FAR_FUTURE_MICROS,
+                        dpop_jkt: None,
+                    }),
+                },
+            )
+            .await;
+        assert_eq!(
+            outcome.is_ok(),
+            allowed,
+            "{why}: expected allowed={allowed}, got {outcome:?}"
+        );
+        assert_eq!(
+            opaque_rows_for(&db, scope, &token_digest).await,
+            i64::from(allowed),
+            "{why}: the row must land only when the scope fits"
+        );
+    }
+}
+
+/// A grant named in the opaque struct that disagrees with the redemption is refused
+/// (issue #131).
+///
+/// Review found this field being silently IGNORED while its two neighbours in the same struct
+/// were refused on mismatch. That is a worse state than either rule alone: the row hung off
+/// the right grant so nothing broke, and a caller that had resolved the wrong one was never
+/// told. Consistency is the point.
+#[tokio::test]
+async fn an_opaque_struct_naming_a_different_grant_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (digest, grant_id) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let elsewhere = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(
+        &db,
+        scope,
+        &elsewhere.to_string(),
+        "cli_owner",
+        "usr_subject",
+    )
+    .await;
+    let audiences = vec!["https://api.one.test".to_string()];
+    let jti = ironauth_store::IssuedTokenId::generate(&env, &scope);
+
+    let refused = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &grant_id,
+                tokens: &[],
+                opaque: Some(ironauth_store::NewOpaqueAccessToken {
+                    token_digest: "digest-other-grant",
+                    grant_id: Some(&elsewhere),
+                    subject: "usr_subject",
+                    client_id: "cli_owner",
+                    audience: "https://api.one.test",
+                    audiences: &audiences,
+                    scope: Some("openid"),
+                    jti: &jti,
+                    expires_at_unix_micros: FAR_FUTURE_MICROS,
+                    dpop_jkt: None,
+                }),
+            },
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "an opaque struct naming a grant the redemption did not verify must be refused"
+    );
+    assert_eq!(
+        opaque_rows_for(&db, scope, "digest-other-grant").await,
+        0,
+        "and nothing lands"
     );
 }
