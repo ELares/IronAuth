@@ -64765,7 +64765,7 @@ impl BackchannelAuthRepo<'_> {
                AND environment_id = $4 \
                AND status = 'approved' \
                AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $5 \
-             RETURNING id, grant_id",
+             RETURNING grant_id, subject",
         )
         .bind(auth_req_id_digest)
         .bind(presenting_client_id)
@@ -64778,55 +64778,31 @@ impl BackchannelAuthRepo<'_> {
             tx.commit().await?;
             return Ok(false);
         };
-        // THE GRANT THE APPROVAL OPENED IS THE ONE THE TOKENS HANG OFF, and it is in this
-        // row, so it is checked rather than trusted. A caller-supplied grant that disagrees
-        // with the request's own is refused: review demonstrated redeeming with an unrelated
-        // grant owned by a DIFFERENT client, which recorded the tokens and the audit row
-        // against that grant, so revoking the CIBA grant revoked nothing and the issuance was
-        // mis-attributed. Naming the fields in a struct does not prevent that; comparing them
-        // does.
-        //
-        // A NULL row grant is the pre-linkage case: `decide` may open none, and the caller's
-        // grant stands alone there. That branch was a HOLE. With no spine to compare against,
-        // any grant the caller named was accepted, including one belonging to a DIFFERENT
-        // client, and the tokens and the audit row were recorded against it: the same harm
-        // the comparison above exists to stop, reachable whenever an approval linked no
-        // grant, which is what `BackchannelApprovalLinkage::default()` does.
-        let spine: Option<String> = row.get("grant_id");
-        if spine.is_some_and(|opened| opened != grant_id.to_string()) {
-            return Err(StoreError::NotFound);
-        }
-        // SO THE GRANT MUST BELONG TO THE PRESENTING CLIENT. That closes the cross-client
-        // harm in BOTH branches at once, linked or not, and needs no decision about whether
-        // CIBA may approve without a grant. On every legitimate path it already holds by
-        // construction: `decide` opens the grant with the client read off the request row,
-        // and the flip above filters on that same client.
-        //
-        // It does NOT subsume the comparison above, which is the easy thing to conclude from
-        // the fact that it catches every case the comparison catches in the fixtures as they
-        // were first written. The two guards answer different questions. This one asks WHOSE
-        // grant it is; the comparison asks WHICH of that client's grants the user approved.
-        // A client holding two grants that redeems against the wrong one passes this check
-        // and hangs its tokens off a grant the revocation spine does not name, so revoking
-        // the CIBA grant reaches none of them. Deleting either one leaves a live hole, and
-        // both holes are now measured: see the two same-client and cross-client tests in
-        // `tests/backchannel_authentication.rs`.
-        let owned: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM grants \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND client_id = $4",
+        // Both grant guards live in `verify_redemption_grant`, which returns the subject the
+        // approval was given by. Extracted as one unit because they are one decision (may
+        // this caller mint against this grant), and because inlining them pushed this
+        // function past the readable-length lint.
+        let approved_subject = verify_redemption_grant(
+            &mut tx,
+            &tenant,
+            &environment,
+            &row,
+            grant_id,
+            presenting_client_id,
         )
-        .bind(grant_id.to_string())
-        .bind(&tenant)
-        .bind(&environment)
-        .bind(presenting_client_id)
-        .fetch_optional(&mut *tx)
         .await?;
-        if owned.is_none() {
-            return Err(StoreError::NotFound);
-        }
-        // Foreign-scope token identifiers are refused, exactly as the device grant refuses
-        // them: a token id minted under another scope must not be written into this one.
-        if tokens.iter().any(|token| token.id.scope() != scope) {
+        // Foreign-scope identifiers are refused, exactly as the authorization-code `redeem`
+        // refuses them: an id minted under another scope must not be written into this one.
+        //
+        // The OPAQUE jti is checked too. An earlier round guarded only `tokens` and claimed
+        // parity with the sibling, which guards both; review measured the gap by landing a
+        // row in this scope carrying another environment's `tok_` id, which introspection
+        // then reports as the token's `jti`. `opaque_access_tokens` is UNIQUE on
+        // (tenant, environment, jti), so nothing at the database catches it.
+        let foreign_opaque = opaque.as_ref().is_some_and(|op| {
+            op.jti.scope() != scope || op.grant_id.is_some_and(|grant| grant.scope() != scope)
+        });
+        if foreign_opaque || tokens.iter().any(|token| token.id.scope() != scope) {
             return Err(StoreError::NotFound);
         }
         let grant_text = grant_id.to_string();
@@ -64845,21 +64821,34 @@ impl BackchannelAuthRepo<'_> {
             .await?;
         }
         if let Some(op) = opaque {
-            insert_opaque_access_token(&mut tx, &tenant, &environment, &grant_text, &op).await?;
+            // CHECKED, NOT TRUSTED, exactly as the grant above is. `subject` and `client_id`
+            // are the two columns `resolve_opaque_access_token` hands back verbatim to RFC
+            // 7662 introspection, and both arrived as caller input. Review landed a row with
+            // `subject = usr_victim` and `client_id = cli_someone_else` through a redemption
+            // that returned Ok: a resource server trusting introspection then sees a token
+            // owned by another client, for another user.
+            //
+            // Refused on mismatch rather than silently overwritten. Binding the authoritative
+            // values over a caller's wrong ones would store the right row and leave the
+            // caller believing it wrote a different one, and a caller confused about whose
+            // token it is minting should hear about it.
+            if op.subject != approved_subject || op.client_id != presenting_client_id {
+                return Err(StoreError::NotFound);
+            }
+            insert_opaque_access_token(
+                &mut tx,
+                &tenant,
+                &environment,
+                &grant_text,
+                &approved_subject,
+                presenting_client_id,
+                &op,
+            )
+            .await?;
         }
-        // METERED, in the same transaction, so a CIBA-issued token is a COUNTED token.
-        // Only the authorization-code `redeem` enqueues `token.issued` today, so every
-        // token minted through the device grant and every token minted here has been
-        // invisible to `tokens_issued`: usage under-reports by exactly the tokens issued
-        // over those two grants, and the under-report is silent because the metering fold
-        // sums whatever it is given and a missing producer looks like a quiet tenant.
-        //
-        // Wiring the path being ADDED here is what stops this grant from shipping with that
-        // gap already in it. The device grant's identical omission predates this change and
-        // is filed separately rather than fixed under a CIBA issue.
-        for token in tokens {
-            meter_token_issued(&mut tx, env, scope, &grant_text, token.kind.as_str()).await?;
-        }
+        // Metered in the SAME transaction, so a CIBA-issued token is a counted token. See
+        // `meter_redeemed_tokens` for why the opaque one needs its own emit.
+        meter_redeemed_tokens(&mut tx, env, scope, &grant_text, tokens, opaque.is_some()).await?;
         let spec = AuditedWrite {
             store: self.store,
             scope,
@@ -64877,6 +64866,131 @@ impl BackchannelAuthRepo<'_> {
     }
 }
 
+/// Enqueue one `token.issued` metering event per token a redemption actually issued.
+///
+async fn meter_redeemed_tokens(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    env: &Env,
+    scope: Scope,
+    grant_text: &str,
+    tokens: &[IssuedTokenRecord],
+    has_opaque: bool,
+) -> Result<(), StoreError> {
+    // METERED, in the same transaction, so a CIBA-issued token is a COUNTED token.
+    // `meter_token_issued` had exactly one caller before this, in the authorization-code
+    // `redeem`, so every token minted through the device grant and every token minted
+    // here was invisible to `tokens_issued`. The under-report is silent: the metering
+    // fold sums whatever it is given, and a producer that never fires is
+    // indistinguishable from a tenant that never issued anything.
+    //
+    // (`record_issued_tokens` one impl over is a SECOND in-tree producer of the same
+    // event. The claim worth making is the narrow one about this function's callers, not
+    // a broad one about the event, which an earlier draft of this comment got wrong.)
+    //
+    // The OPAQUE token is metered too. Counting only `tokens` was wrong for the shape a
+    // real opaque issuance takes: an opaque access token produces no `IssuedTokenRecord`
+    // at all, so both production builders pass an EMPTY record list and this loop counted
+    // nothing. Review measured zero events for an opaque-only redemption while the
+    // comment beside it claimed a CIBA-issued token is a counted one.
+    //
+    // Wiring the path being ADDED here is what stops this grant from shipping with that
+    // gap already in it. The device grant's identical omission predates this change and
+    // is filed separately rather than fixed under a CIBA issue.
+    for token in tokens {
+        meter_token_issued(tx, env, scope, grant_text, token.kind.as_str()).await?;
+    }
+    if has_opaque {
+        meter_token_issued(tx, env, scope, grant_text, TokenKind::Access.as_str()).await?;
+    }
+    Ok(())
+}
+
+/// Verify the caller may mint against `grant_id`, and return the subject the approval was
+/// given by (issue #131).
+///
+/// Two guards, extracted together because they are ONE decision and because inlining them put
+/// [`BackchannelAuthRepo::redeem_approved`] past the readable-length lint. Each closed a
+/// separate live hole found in review, and each is mutation covered in
+/// `tests/backchannel_authentication.rs`.
+async fn verify_redemption_grant(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &str,
+    environment: &str,
+    row: &sqlx::postgres::PgRow,
+    grant_id: &GrantId,
+    presenting_client_id: &str,
+) -> Result<String, StoreError> {
+    // THE GRANT THE APPROVAL OPENED IS THE ONE THE TOKENS HANG OFF, and it is in this
+    // row, so it is checked rather than trusted. A caller-supplied grant that disagrees
+    // with the request's own is refused: review demonstrated redeeming with an unrelated
+    // grant owned by a DIFFERENT client, which recorded the tokens and the audit row
+    // against that grant, so revoking the CIBA grant revoked nothing and the issuance was
+    // mis-attributed. Naming the fields in a struct does not prevent that; comparing them
+    // does.
+    //
+    // A NULL row grant is the pre-linkage case: `decide` may open none, and the caller's
+    // grant stands alone there. That branch was a HOLE. With no spine to compare against,
+    // any grant the caller named was accepted, including one belonging to a DIFFERENT
+    // client, and the tokens and the audit row were recorded against it: the same harm
+    // the comparison above exists to stop, reachable whenever an approval linked no
+    // grant, which is what `BackchannelApprovalLinkage::default()` does.
+    let spine: Option<String> = row.get("grant_id");
+    // THE AUTHORITATIVE SUBJECT, off the row being flipped. Everything below that needs
+    // to know who the user is reads THIS and never the caller's copy.
+    //
+    // Decoded infallibly on purpose: `backchannel_authentication_requests.subject` is
+    // `text NOT NULL` (migration 0147) with no later ALTER relaxing it. Were it ever made
+    // nullable, `row.get` would PANIC rather than error, so that migration has to change
+    // this line with it.
+    let approved_subject: String = row.get("subject");
+    if spine.is_some_and(|opened| opened != grant_id.to_string()) {
+        return Err(StoreError::NotFound);
+    }
+    // SO THE GRANT MUST BELONG TO THE PRESENTING CLIENT. That closes the cross-client
+    // harm in BOTH branches at once, linked or not, and needs no decision about whether
+    // CIBA may approve without a grant. On every legitimate path it already holds by
+    // construction: `decide` opens the grant with the client read off the request row,
+    // and the flip above filters on that same client.
+    //
+    // It does NOT subsume the comparison above, which is the easy thing to conclude from
+    // the fact that it catches every case the comparison catches in the fixtures as they
+    // were first written. The guards answer different questions. This one asks WHOSE
+    // grant it is, by client AND by subject; the comparison asks WHICH of that client's
+    // grants the user approved. A client holding two grants for the SAME user that
+    // redeems against the wrong one passes this check and hangs its tokens off a grant
+    // the revocation spine does not name, so revoking the CIBA grant reaches none of
+    // them. Deleting any one of them leaves a live hole, and all of them are measured in
+    // `tests/backchannel_authentication.rs`.
+    //
+    // `subject` is here because an earlier round checked only the client, and that is the
+    // dimension with the worst failure. `resolve_access_token` reads the GRANT'S subject
+    // and UserInfo answers from it, so a token hung off another user's grant does not
+    // merely mis-attribute the issuance: it AUTHENTICATES AS THAT OTHER USER. Review
+    // demonstrated it, redeeming against a same-client grant belonging to `usr_victim`
+    // and resolving the resulting token as `usr_victim`.
+    //
+    // `revoked_at IS NULL` is here because accepting a revoked grant commits the flip and
+    // hands back tokens that resolve as inactive, which burns an approval the user gave
+    // on a separate device for a fault that is entirely ours.
+    let owned: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM grants \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND client_id = $4 \
+           AND subject = $5 \
+           AND revoked_at IS NULL",
+    )
+    .bind(grant_id.to_string())
+    .bind(tenant)
+    .bind(environment)
+    .bind(presenting_client_id)
+    .bind(&approved_subject)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if owned.is_none() {
+        return Err(StoreError::NotFound);
+    }
+    Ok(approved_subject)
+}
+
 /// Insert one opaque access token row, with EVERY column the token's own claims imply
 /// (issue #131).
 ///
@@ -64892,13 +65006,17 @@ impl BackchannelAuthRepo<'_> {
 /// bound", so a sender-constrained token silently degrades to a bearer token anyone holding
 /// it can replay. Neither fails anything at issuance.
 ///
-/// `grant_text` is the caller's, deliberately, and NOT `op.grant_id`. The row must hang off
-/// the grant the redemption verified, not one the caller put in the struct beside it.
+/// `grant_text`, `subject` and `client_id` are the REDEMPTION'S, deliberately, and not
+/// `op.grant_id`, `op.subject` and `op.client_id`. All three columns are read straight back
+/// out by `resolve_opaque_access_token` and handed to RFC 7662 introspection, so they must be
+/// the values the caller was verified against rather than the ones it supplied beside them.
 async fn insert_opaque_access_token(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: &str,
     environment: &str,
     grant_text: &str,
+    subject: &str,
+    client_id: &str,
     op: &NewOpaqueAccessToken<'_>,
 ) -> Result<(), StoreError> {
     sqlx::query(
@@ -64912,8 +65030,8 @@ async fn insert_opaque_access_token(
     .bind(tenant)
     .bind(environment)
     .bind(grant_text)
-    .bind(op.subject)
-    .bind(op.client_id)
+    .bind(subject)
+    .bind(client_id)
     .bind(op.audience)
     .bind(resource_array_to_json(op.audiences))
     .bind(op.scope)
