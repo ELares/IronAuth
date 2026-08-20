@@ -1977,6 +1977,26 @@ async fn a_replay_request_enqueues_a_command_for_the_worker() {
         "the command must name the stream it replays"
     );
 
+    // And the domain event is on the feed. Without this the emission is unmeasured, and a
+    // replay would be invisible to anyone watching the event stream, which for this
+    // subsystem is where operator-visible actions are recorded (there is no audit row: see
+    // `request_dead_letter_replay`).
+    let feed = format!("/v1/tenants/{tenant}/environments/{environment}/events");
+    let (status, _, feed_body) = h.get_as(&feed, OPERATOR_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "event feed: {feed_body}");
+    let feed_doc: Value = serde_json::from_str(&feed_body).expect("json");
+    // `events`, and the type is inside the envelope `payload`, not a sibling field.
+    let types: Vec<&str> = feed_doc["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|item| item["payload"]["type"].as_str())
+        .collect();
+    assert!(
+        types.contains(&"log_stream.replay_requested"),
+        "the replay must announce itself on the event feed: {types:?}"
+    );
+
     // Idempotent: the same key returns the original response and queues nothing more.
     let (again, _, again_body) = h.post_as(&path, OPERATOR_TOKEN, "lgs-replay-1", "").await;
     assert_eq!(
@@ -2017,6 +2037,202 @@ async fn replaying_needs_more_than_reading() {
         status,
         StatusCode::FORBIDDEN,
         "a read-only credential must not be able to ship audit events to a sink: {body}"
+    );
+}
+
+/// The GET is fenced by `management.read`, and the listing bound is real in both directions.
+///
+/// Every one of these was a surviving mutant. Removing the permission check on the GET,
+/// forcing `truncated` to `false`, and widening the truncation each left the suite green,
+/// so the commit message's claim that the listing "bounds itself at 200 and says
+/// `truncated` when it did" was unmeasured. The bound itself was correct; nothing held it.
+#[tokio::test]
+async fn the_listing_is_fenced_and_its_bound_is_real() {
+    let h = Harness::start(75).await;
+    let (tenant, environment) = h.create_tenant("acme", "lgs-dl-bound").await;
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+
+    // A credential with NO management.read cannot list.
+    let (deny_id, deny_secret) = mint_key(&h, &tenant, &environment, "lgs-bound-deny").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &deny_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (stream_id, _dead) = seed_dead_letter(&h, scope, "sink_refused_502").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/log-streams/{stream_id}/dead-letters"
+    );
+    let (status, _, body) = h.get_as(&path, &deny_secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "listing undelivered audit needs management.read: {body}"
+    );
+
+    // The BOUND, at the boundary. 200 exactly is a complete page and must NOT be reported
+    // truncated; 201 must be. An off-by-one in either direction is a number an operator
+    // uses to decide whether they have seen their whole gap.
+    let env = ironauth_env::Env::system();
+    for extra in 0..200_u32 {
+        h.control_store()
+            .scoped(scope)
+            .log_streams()
+            .dead_letter(
+                &env,
+                &stream_id,
+                (
+                    1_700_000_100_000_000 + i64::from(extra),
+                    "aud_bulk_from",
+                    1_700_000_200_000_000 + i64::from(extra),
+                    "aud_bulk_to",
+                ),
+                1,
+                "sink_refused_502",
+            )
+            .await
+            .expect("record a dead letter");
+    }
+
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "lgs-bound-read").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        document["items"].as_array().expect("items").len(),
+        200,
+        "the page is capped at the documented limit: {body}"
+    );
+    assert_eq!(
+        document["truncated"], true,
+        "201 outstanding is more than one page, and an operator must be told: {body}"
+    );
+}
+
+/// The replay POST is sudo-fenced, environment-fenced, and requires an Idempotency-Key.
+///
+/// Three more surviving mutants. Removing `require_fresh_privilege`, removing
+/// `require_live_environment`, and defaulting the Idempotency-Key when absent each left the
+/// suite green, so all three guards were present and unmeasured.
+#[tokio::test]
+async fn the_replay_post_carries_its_three_guards() {
+    let h = Harness::start(76).await;
+    let (tenant, environment) = h.create_tenant("acme", "lgs-dl-guards").await;
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let (stream_id, _dead) = seed_dead_letter(&h, scope, "sink_refused_502").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/log-streams/{stream_id}/dead-letters/replay"
+    );
+
+    // No Idempotency-Key at all. Built inline rather than adding a helper to
+    // `common/mod.rs`, which every suite in this crate appends to.
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {OPERATOR_TOKEN}"),
+        )
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::empty())
+        .expect("request builds");
+    let (status, _, body) = h.send(request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a replay without an Idempotency-Key must be refused: {body}"
+    );
+
+    // A live environment still serves it, so the refusal below is the FENCE and not a
+    // permanently broken route.
+    let (status, _, body) = h.post_as(&path, OPERATOR_TOKEN, "lgs-guard-live", "").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "live control: {body}");
+
+    // The fingerprint covers the PATH, so the same key against a DIFFERENT stream is a
+    // conflict rather than a replay of the first stream's response. Without this the
+    // fingerprint could be a constant and nothing would notice: one operator's key would
+    // silently return another stream's answer.
+    let (second_stream, _second_dead) = seed_dead_letter(&h, scope, "sink_refused_504").await;
+    let second_path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/log-streams/{second_stream}/dead-letters/replay"
+    );
+    let (status, _, body) = h
+        .post_as(&second_path, OPERATOR_TOKEN, "lgs-guard-live", "")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "one key must not span two streams: {body}"
+    );
+
+    // Soft-delete the environment; the write must refuse.
+    let deleted = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (status, _, body) = h.delete_as(&deleted, OPERATOR_TOKEN).await;
+    assert!(
+        status.is_success(),
+        "soft-delete the environment: {status} {body}"
+    );
+    let (status, _, body) = h
+        .post_as(&path, OPERATOR_TOKEN, "lgs-guard-deleted", "")
+        .await;
+    assert_ne!(
+        status,
+        StatusCode::ACCEPTED,
+        "a soft-deleted environment must not accept a replay: {body}"
+    );
+}
+
+/// With sudo mode ARMED, a replay needs a fresh elevation.
+///
+/// `require_fresh_privilege` is a no-op while the flag is off, which is how the harness runs
+/// by default, so removing the call from the handler left every other test in this file
+/// green. That made the fence present and unmeasured. `Harness::start_with_sudo` arms it.
+#[tokio::test]
+async fn a_replay_needs_a_fresh_elevation_when_sudo_is_armed() {
+    let (h, _clock) = Harness::start_with_sudo(300).await;
+    let (tenant, environment) = h.create_tenant("acme", "lgs-dl-sudo").await;
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let (stream_id, _dead) = seed_dead_letter(&h, scope, "sink_refused_502").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/log-streams/{stream_id}/dead-letters/replay"
+    );
+
+    // Unelevated: refused.
+    let (status, _, body) = h.post_as(&path, OPERATOR_TOKEN, "lgs-sudo-1", "").await;
+    assert_ne!(
+        status,
+        StatusCode::ACCEPTED,
+        "an unelevated replay must be refused while sudo is armed: {status} {body}"
+    );
+
+    // Elevate, then the SAME request is served. Without this arm the assertion above would
+    // pass just as well against a route that refused everything.
+    let (status, _, body) = h
+        .post(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/admin/sudo/elevate"),
+            "lgs-sudo-elevate",
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "elevate: {body}");
+    let (status, _, body) = h.post_as(&path, OPERATOR_TOKEN, "lgs-sudo-2", "").await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "an elevated replay is served: {body}"
     );
 }
 

@@ -631,6 +631,7 @@ pub async fn list_log_stream_dead_letters(
     security(("bearer" = [])),
     responses(
         (status = 202, description = "The replay was queued. A worker performs it; poll the dead-letter listing to watch it drain", body = LogStreamReplayAccepted),
+        (status = 400, description = "The Idempotency-Key header is absent", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "The environment is absent or deleted, or the stream is in another scope", body = ErrorBody),

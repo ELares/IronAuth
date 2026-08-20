@@ -13090,6 +13090,15 @@ export interface operations {
                     "application/json": components["schemas"]["LogStreamReplayAccepted"];
                 };
             };
+            /** @description The Idempotency-Key header is absent */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             /** @description Missing or invalid credential, or fresh privilege required */
             401: {
                 headers: {

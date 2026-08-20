@@ -461,9 +461,14 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // named where they are decided: `outbox.reap_enabled` in `retention_sweeper_inputs`
         // and a missing control-plane DSN in `start_retention_sweeper`. BOUND rather than
         // detached, so the shutdown below can await it.
-        let log_shipper = match log_shipper_inputs {
-            Some(inputs) => start_log_shipper(inputs).await,
-            None => None,
+        // BOUND rather than detached, so the shutdown below can await both the shipper and
+        // the dead-letter replay pools it spawned.
+        let (log_shipper, log_stream_replay_pools) = match log_shipper_inputs {
+            Some(inputs) => match start_log_shipper(inputs).await {
+                Some((shipper, pools)) => (Some(shipper), pools),
+                None => (None, Vec::new()),
+            },
+            None => (None, Vec::new()),
         };
         let audit_retention_sweeper = match audit_retention_inputs {
             Some(inputs) => start_audit_retention_sweeper(inputs).await,
@@ -506,6 +511,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .chain(webhook_pools)
             .chain(trait_migration_pools)
             .chain(offboarding_pools)
+            .chain(log_stream_replay_pools)
         {
             pool.shutdown().await;
         }
@@ -3036,7 +3042,9 @@ fn log_shipper_inputs(config: &Config, env: &Env) -> Option<LogShipperInputs> {
 /// Every early return says WHAT is not running and WHY. A silent absence here means a
 /// configured export quietly stops advancing, and the operator's first symptom is a gap in
 /// their SIEM rather than an error anywhere.
-async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
+async fn start_log_shipper(
+    inputs: LogShipperInputs,
+) -> Option<(LogShipper, Vec<OutboxWorkerPool>)> {
     let LogShipperInputs {
         log_streams,
         data_dsn,
@@ -3112,10 +3120,17 @@ async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
             Vec::new()
         }
     };
-    tracing::info!(
-        pools = replay_pools.len(),
-        "log stream dead-letter replay worker started"
-    );
+    if replay_pools.is_empty() {
+        // Said out loud rather than logged as "started". The function's own contract is
+        // that every early return names WHAT is not running and WHY, and a "started" line
+        // over an empty pool set is the opposite of that.
+        tracing::error!("log stream dead-letter replay NOT running: no pool was spawned");
+    } else {
+        tracing::info!(
+            pools = replay_pools.len(),
+            "log stream dead-letter replay worker started"
+        );
+    }
 
     let observer: Arc<dyn LogShipperObserver> = Arc::new(MetricsShipperObserver);
     let shipper = LogShipper::spawn(
@@ -3130,7 +3145,17 @@ async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
         interval_secs = log_streams.interval_secs,
         "SIEM log stream shipping started"
     );
-    Some(shipper)
+    // The pools are RETURNED, not dropped here. `OutboxWorkerPool::drop` sets the stop flag
+    // and notifies waiters, so a pool bound to a local in this function is stopped the
+    // moment it returns and its workers halt before their first poll. Every other pool in
+    // this binary is returned to `main` and held for the process lifetime for exactly that
+    // reason, which is what "BOUND rather than detached" means at the webhook call site.
+    //
+    // Measured before this was fixed: the replay command the management endpoint enqueues
+    // was still non-terminal after 15 seconds, while the identical command under bound
+    // pools drained. The endpoint accepted, the worker existed, and nothing ran it, which
+    // is the exact failure this whole branch was written to remove.
+    Some((shipper, replay_pools))
 }
 
 /// What the audit retention sweeper (issue #109) needs, captured before `config` moves

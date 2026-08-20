@@ -8219,6 +8219,16 @@
               }
             }
           },
+          "400": {
+            "description": "The Idempotency-Key header is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Missing or invalid credential, or fresh privilege required",
             "content": {

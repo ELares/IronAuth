@@ -939,6 +939,13 @@ func (c *Client) ListInvitations(tenant_id string, environment_id string, query 
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/invitations", query, nil)
 }
 
+// ListLogStreamDeadLetters performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters.
+//
+// List a stream's outstanding dead letters.
+func (c *Client) ListLogStreamDeadLetters(tenant_id string, environment_id string, stream_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/log-streams/" + escape(stream_id) + "/dead-letters", query, nil)
+}
+
 // ListLogStreams performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams.
 //
 // List the environment's SIEM log streams and their delivery health.
@@ -1294,6 +1301,13 @@ func (c *Client) RemoveStepUpPolicy(tenant_id string, environment_id string, sco
 // Remove a login identifier from a user.
 func (c *Client) RemoveUserIdentifier(tenant_id string, environment_id string, user_id string, identifier_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/users/" + escape(user_id) + "/identifiers/" + escape(identifier_id), query, nil)
+}
+
+// ReplayLogStreamDeadLetters performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters/replay.
+//
+// Request a replay of a stream's outstanding dead letters.
+func (c *Client) ReplayLogStreamDeadLetters(tenant_id string, environment_id string, stream_id string, query url.Values) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/log-streams/" + escape(stream_id) + "/dead-letters/replay", query, nil)
 }
 
 // ReplayWebhookDeadLetters performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/replay.

@@ -209,6 +209,7 @@ fn operation_ids_are_the_stable_set() {
             "listEnvironments",
             "listFlowVersions",
             "listInvitations",
+            "listLogStreamDeadLetters",
             "listLogStreams",
             "listManagementKeys",
             "listMemberships",
@@ -260,6 +261,7 @@ fn operation_ids_are_the_stable_set() {
             "removeOrgGroupMember",
             "removeStepUpPolicy",
             "removeUserIdentifier",
+            "replayLogStreamDeadLetters",
             "replayWebhookDeadLetters",
             "resendInvitation",
             "restoreTenant",
@@ -802,7 +804,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        227,
+        229,
         "the documented route count is pinned"
     );
 

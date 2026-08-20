@@ -40531,10 +40531,16 @@ impl LogStreamRepo<'_> {
         if exists.is_none() {
             return Err(StoreError::NotFound);
         }
-        // The command's idempotency key is the stream, so two replay commands for ONE
-        // stream execute in the order they were asked for. They share no ordering group
-        // with anything else, because a group is per (consumer, ordering key) and this is
-        // its own consumer.
+        // The ORDERING KEY is the stream, so two replay commands for ONE stream execute in
+        // the order they were asked for. They share no ordering group with anything else,
+        // because a group is per (consumer, ordering key) and this is its own consumer.
+        //
+        // The IDEMPOTENCY KEY is deliberately unique per call, so outbox-level dedup never
+        // collapses two replays into one: a second replay after the first delivered is a
+        // legitimate request. Request-level idempotency is the endpoint's Idempotency-Key,
+        // which is a different mechanism at a different layer. An earlier version of this
+        // comment credited the idempotency key with the ordering property, which belongs to
+        // the field on the next line.
         let key = format!("{stream_id}:{}", CorrelationId::generate(env));
         enqueue_outbox_in_tx(
             &mut tx,

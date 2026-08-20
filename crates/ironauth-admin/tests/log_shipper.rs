@@ -936,3 +936,106 @@ async fn a_replay_command_without_a_stream_id_is_permanent() {
         "and the label an operator reads must name what was missing"
     );
 }
+
+/// A REAL POOL drains the command a real producer enqueued.
+///
+/// Two defects this pins that nothing else does.
+///
+/// The consumer's registered `name()` must equal the discriminator the producer writes. A
+/// consumer whose name differs drains NOTHING, silently: the claim matches no rows, the
+/// pool reports healthy, and the only symptom is replays that never happen. Mutating
+/// `name()` to a near-miss string survived every other test in this crate, because they all
+/// call `handle` directly and never go through a claim.
+///
+/// And the pool has to be HELD. `OutboxWorkerPool::drop` sets the stop flag, so a pool bound
+/// to a temporary is stopped before its workers' first poll. That shipped in this branch's
+/// first version: the boot path spawned the pool into a local that was dropped when the
+/// function returned, so the endpoint accepted commands nothing executed. A test that calls
+/// `handle` directly cannot see either fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_pool_drains_a_command_the_producer_enqueued() {
+    use std::time::Duration;
+
+    use ironauth_admin::log_shipper::{DEAD_LETTER_AFTER, LogStreamReplayConsumer};
+    use ironauth_store::outbox::{
+        ConsumerRegistry, OutboxConsumer, OutboxWorker, OutboxWorkerPool, ScopeSource,
+        SilentObserver, StaticScopes, WorkerSettings,
+    };
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = configure(&db, &env, scope, StreamSource::Both, SinkType::Http, None).await;
+    seed_admin(&db, &env, scope, 2, "poison").await;
+
+    let dead_sink = RecordingSink::new(SinkType::Http, false);
+    let failing: Vec<Arc<dyn LogSink>> = vec![dead_sink.clone()];
+    for _ in 0..DEAD_LETTER_AFTER {
+        ship_once(db.store(), &env, scope, &failing)
+            .await
+            .expect("ship");
+    }
+
+    // THE PRODUCER: the same store call the management endpoint makes.
+    db.store()
+        .scoped(scope)
+        .log_streams()
+        .request_dead_letter_replay(&env, &id, None, None)
+        .await
+        .expect("enqueue a replay command");
+
+    let healthy = RecordingSink::new(SinkType::Http, true);
+    let consumer = LogStreamReplayConsumer::new(
+        db.store().clone(),
+        vec![healthy.clone() as Arc<dyn LogSink>],
+    );
+    let mut registry = ConsumerRegistry::new();
+    registry
+        .register(Arc::new(consumer) as Arc<dyn OutboxConsumer>)
+        .expect("register");
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        env.clone(),
+        registry
+            .get(ironauth_store::LOG_STREAM_REPLAY_CONSUMER)
+            .expect("the consumer is registered under the name the producer writes"),
+        WorkerSettings {
+            concurrency: 1,
+            visibility_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(20),
+            batch: 16,
+            retry: ironauth_store::RetryPolicy::default(),
+        },
+    );
+    let scopes: Arc<dyn ScopeSource> = Arc::new(StaticScopes::new(vec![scope]));
+    let observer: Arc<dyn ironauth_store::outbox::OutboxObserver> = Arc::new(SilentObserver);
+    // BOUND, deliberately: dropping this binding stops the workers.
+    let pool = OutboxWorkerPool::spawn(&worker, &scopes, &observer);
+
+    let mut drained = false;
+    for _ in 0..200 {
+        if db
+            .store()
+            .scoped(scope)
+            .log_streams()
+            .outstanding_dead_letters(&id)
+            .await
+            .expect("read")
+            .is_empty()
+        {
+            drained = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    pool.shutdown().await;
+
+    assert!(
+        drained,
+        "the replay command a producer enqueued must be drained by a held pool"
+    );
+    assert!(
+        !healthy.events().is_empty(),
+        "and the replay must have reached the sink"
+    );
+}
