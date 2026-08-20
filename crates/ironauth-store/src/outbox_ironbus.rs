@@ -180,6 +180,36 @@ impl IronBusBackbone {
     }
 }
 
+/// The body of ONE wake-up, as published to the broker.
+///
+/// Extracted so the shape can be asserted directly. The two facts below are load-bearing
+/// and were, until issue #107's ordering criterion needed them, stated only in prose:
+///
+/// - `payload` is EMPTY. This backbone is a wake-up signal, not a transport, and the
+///   emptiness is what makes that true rather than merely intended. It is also what lets
+///   the ordering argument be made against the `OutboxBackbone` seam instead of against
+///   IronBus specifically: a signal that carries no event cannot reorder events.
+/// - `fire_and_forget` is FALSE. A fire-and-forget produce is not durably committed, so
+///   the record is not visible to a `fetch` and every wake vanishes. That was the actual
+///   cause of four failed live-broker runs.
+fn wake_body(consumer: &str) -> PubBody<'_> {
+    PubBody {
+        flags: 0,
+        timestamp_ms: 0,
+        key: consumer.as_bytes(),
+        headers: b"",
+        dedup: None,
+        // NOT fire-and-forget: the named-stream path (`publish_to`) accepts only
+        // at-least-once server-ack, and the subscriber reads that stream. Producing to the
+        // default stream instead is silently a no-op for this backbone, which is exactly
+        // how the first live-broker run failed: every wake was published where nobody was
+        // listening. IronBus's own round-trip test produces with `fire_and_forget: false`
+        // and only then is the record visible to a `fetch`.
+        fire_and_forget: false,
+        payload: b"",
+    }
+}
+
 impl OutboxBackbone for IronBusBackbone {
     fn notify(&self, consumer: &str, _scope: Scope) {
         // Infallible by contract. A produce that fails is dropped on the floor ON PURPOSE:
@@ -191,26 +221,7 @@ impl OutboxBackbone for IronBusBackbone {
         let Some(client) = guard.as_mut() else {
             return;
         };
-        let body = PubBody {
-            flags: 0,
-            timestamp_ms: 0,
-            key: consumer.as_bytes(),
-            headers: b"",
-            dedup: None,
-            // NOT fire-and-forget: the named-stream path (`publish_to`) accepts only
-            // at-least-once server-ack, and the subscriber reads that stream. Producing
-            // to the default stream instead is silently a no-op for this backbone, which
-            // is exactly how the first live-broker run failed: every wake was published
-            // where nobody was listening.
-            // NOT fire-and-forget, despite a wake being cheap to lose. IronBus's own
-            // round-trip test produces with `fire_and_forget: false` and only then is the
-            // record visible to a `fetch`; a fire-and-forget produce is not durably
-            // committed, so every wake vanished. That was the actual cause of four failed
-            // live-broker runs, and it is worth the round trip: a wake nobody can fetch
-            // is indistinguishable from having no backbone.
-            fire_and_forget: false,
-            payload: b"",
-        };
+        let body = wake_body(consumer);
         if client.produce(&body).is_err() {
             // Drop the connection rather than keep a broken one: a later notify makes a
             // fresh one, and until then the poll covers us.
@@ -233,5 +244,34 @@ impl OutboxBackbone for IronBusBackbone {
             // latency instead of an event.
             let _ = tokio::time::timeout(max_wait, self.woken.notified()).await;
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wake_body;
+
+    /// A wake carries NO event data.
+    ///
+    /// This is the fact the issue #107 ordering argument rests on: the IronBus mode cannot
+    /// reorder events because it never carries one. Asserted on the value rather than left
+    /// in a doc comment, so a future change that started attaching a payload here would
+    /// have to delete a failing test rather than quietly contradict a paragraph.
+    #[test]
+    fn a_wake_carries_no_payload() {
+        let body = wake_body("outbox-events");
+        assert!(
+            body.payload.is_empty(),
+            "the backbone is a wake-up signal, not a transport"
+        );
+        assert!(body.headers.is_empty(), "and it carries no headers either");
+        assert_eq!(
+            body.key, b"outbox-events",
+            "the key names the consumer to wake, which is the whole content of a wake"
+        );
+        assert!(
+            !body.fire_and_forget,
+            "a fire-and-forget wake is not durably committed, so no subscriber can fetch it"
+        );
     }
 }

@@ -49,7 +49,7 @@ use std::time::{Duration, SystemTime};
 use ironauth_env::Env;
 use ironauth_store::outbox::{
     ConsumerError, ConsumerRegistry, DrainStats, OutboxBackbone, OutboxConsumer, OutboxObserver,
-    OutboxReaper, OutboxWorker, OutboxWorkerPool, RetentionObserver, RetentionSettings,
+    OutboxReaper, OutboxWorker, OutboxWorkerPool, PollOnly, RetentionObserver, RetentionSettings,
     RetentionStats, RetentionSweeper, ScopeSource, SilentObserver, SilentRetentionObserver,
     StaticScopes, WorkerSettings,
 };
@@ -3621,4 +3621,156 @@ async fn a_signalling_backbone_wakes_the_drain_before_the_poll_interval() {
         "a signalled backbone drains without waiting out poll_interval; handled {:?}",
         consumer.handled()
     );
+}
+
+/// An aggressive backbone: every `notify` stores a permit, and `wait` returns the instant
+/// one is available. Where `SignallingBackbone` above proves a signal is HEARD, this one
+/// exists to make the drain spin as fast as the seam allows, so that if delivery order
+/// depended on the backbone at all, this is the shape that would expose it.
+#[derive(Default)]
+struct EagerBackbone {
+    notify: tokio::sync::Notify,
+}
+
+impl OutboxBackbone for EagerBackbone {
+    fn notify(&self, _consumer: &str, _scope: Scope) {
+        self.notify.notify_one();
+    }
+
+    fn wait<'a>(
+        &'a self,
+        _consumer: &'a str,
+        max_wait: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = tokio::time::timeout(max_wait, self.notify.notified()).await;
+        })
+    }
+}
+
+/// Drive `count` messages of ONE aggregate through a pool on `backbone` and return the
+/// order they were handled in.
+///
+/// Concurrency is 4 against a single ordering group on purpose: the ordering guarantee is
+/// enforced by `claim`, so the adversarial case is several workers awake at once, all
+/// eligible, all racing for the same group's head.
+async fn delivered_order_under(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    backbone: Arc<dyn OutboxBackbone>,
+    count: usize,
+) -> Vec<String> {
+    // Enqueued from NON-OVERLAPPING transactions, the producer precondition the strong
+    // ordering form requires (see the `OutboxRepo` type docs). `enqueue` awaits each
+    // write, so they commit in this order.
+    let mut expected = Vec::with_capacity(count);
+    for i in 0..count {
+        let key = format!("ord-{i:02}");
+        enqueue(db, env, scope, &key, "agg-ordered").await;
+        expected.push(key);
+    }
+
+    let consumer = CountingConsumer::new(CONSUMER);
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        env.clone(),
+        Arc::clone(&consumer) as Arc<dyn OutboxConsumer>,
+        WorkerSettings {
+            concurrency: 4,
+            visibility_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(20),
+            batch: 64,
+            retry: RetryPolicy::default(),
+        },
+    );
+    let scopes: Arc<dyn ScopeSource> = Arc::new(StaticScopes::new(vec![scope]));
+    let pool = OutboxWorkerPool::spawn_with_backbone(&worker, &scopes, &silent(), &backbone);
+
+    for _ in 0..400 {
+        if consumer.handled().len() >= count {
+            break;
+        }
+        backbone.notify(CONSUMER, scope);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    pool.shutdown().await;
+
+    let handled = consumer.handled();
+    assert_eq!(
+        handled.len(),
+        count,
+        "every message must be delivered exactly once: {handled:?}"
+    );
+    assert_eq!(handled, expected, "delivery must be in commit order");
+    handled
+}
+
+/// ACCEPTANCE CRITERION 2 of issue #107: event ordering within an environment matches the
+/// commit order of the originating transactions in BOTH Postgres-only and IronBus modes.
+///
+/// The Postgres-only half is pinned above, at the claim level and end to end. This is the
+/// other half, and it is written against the SEAM rather than against IronBus, because the
+/// seam is the entire difference between the two modes: `OutboxBackbone` has exactly two
+/// methods, `notify` and `wait`, and neither can carry an event. The IronBus
+/// implementation is a WAKE-UP signal whose published body has an empty payload
+/// (pinned separately in `outbox_ironbus.rs`), and the outbox row stays the durable source
+/// of truth in every mode. So a backbone can change WHEN a drain looks, never WHAT it
+/// finds or in WHICH ORDER.
+///
+/// That is an argument, and an argument is what the criterion had instead of a test. This
+/// runs the same workload under both backbones and asserts the delivered order is
+/// identical and equal to commit order. If a future change ever made the backbone carry
+/// payloads, or let a wake bypass the claim, the two orders would diverge here.
+///
+/// A live-broker arm is deliberately NOT the test of record for this criterion: it is
+/// gated on `IRONBUS_ADDR` and so skips in most lanes, which would leave the criterion
+/// unproven exactly where it is most often run.
+///
+/// # What this test actually holds down
+///
+/// Measured by mutation, because the obvious answer is wrong. Reversing the claim query's
+/// `ORDER BY m.sequence` to `DESC` does NOT fail this test: with one ordering group, only
+/// the group's head is ever eligible, so the sort has nothing to reorder. What DOES fail
+/// it is disabling the `NOT EXISTS (... b.sequence < m.sequence)` head rule, which is the
+/// clause that makes a group's messages strictly sequential. So the ordering guarantee
+/// lives in that predicate, not in the sort beside it, and a reader looking for the reason
+/// this passes should look there.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_aggregate_order_is_identical_under_a_backbone_and_under_poll_only() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0107);
+
+    // Separate scopes so the two runs cannot see each other's rows, and so a claim that
+    // ignored the scope fence would fail here as well.
+    let poll_scope = db.seed_scope(&env).await;
+    let bus_scope = db.seed_scope(&env).await;
+
+    let under_poll = delivered_order_under(
+        &db,
+        &env,
+        poll_scope,
+        Arc::new(PollOnly) as Arc<dyn OutboxBackbone>,
+        8,
+    )
+    .await;
+    let under_bus = delivered_order_under(
+        &db,
+        &env,
+        bus_scope,
+        Arc::new(EagerBackbone::default()) as Arc<dyn OutboxBackbone>,
+        8,
+    )
+    .await;
+
+    assert_eq!(
+        under_poll, under_bus,
+        "the two modes must deliver one aggregate's messages in the same order"
+    );
+    // Both equal commit order, which `delivered_order_under` already asserted per run.
+    // Restated here so that weakening THAT assertion cannot leave this one passing on two
+    // identically wrong sequences.
+    let expected: Vec<String> = (0..8).map(|i| format!("ord-{i:02}")).collect();
+    assert_eq!(under_poll, expected, "poll-only order is commit order");
+    assert_eq!(under_bus, expected, "backbone order is commit order");
 }
