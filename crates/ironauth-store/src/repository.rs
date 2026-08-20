@@ -63999,8 +63999,35 @@ pub enum BackchannelPoll {
     /// Past its TTL: `expired_token`.
     Expired,
     /// No such request for this client. Also the answer for a request belonging to ANOTHER
-    /// client, so polling is not an existence oracle either.
+    /// client, and for one in another SCOPE, so polling is not an existence oracle either.
+    ///
+    /// Three causes, one answer, and deliberately no error code on the variant: naming which
+    /// applied is the oracle. A caller answers all three `invalid_grant`, which CIBA Core
+    /// section 11 makes a MUST.
     NotFound,
+}
+
+/// What a CIBA redemption records alongside the flip (issue #131).
+///
+/// A struct rather than six parameters, because the four that matter arrive together and
+/// mean nothing apart: the tokens are recorded FOR this grant, in the same transaction that
+/// consumes this request. Passing them positionally is how a caller ends up recording one
+/// batch's tokens against another's grant.
+#[derive(Debug)]
+pub struct BackchannelRedemption<'a> {
+    /// The SHA-256 hex digest of the presented `auth_req_id`.
+    pub auth_req_id_digest: &'a str,
+    /// The client presenting it. The redemption is scoped to it, so another client's request
+    /// is not redeemable and is not distinguishable from an absent one.
+    pub presenting_client_id: &'a str,
+    /// The clock reading the expiry is checked against.
+    pub now_micros: i64,
+    /// The grant the minted tokens belong to.
+    pub grant_id: &'a GrantId,
+    /// The tokens minted BEFORE this call, recorded in the same transaction as the flip.
+    pub tokens: &'a [IssuedTokenRecord],
+    /// The opaque access token, when the client was issued one rather than an `at+jwt`.
+    pub opaque: Option<NewOpaqueAccessToken<'a>>,
 }
 
 /// A new CIBA request to persist.
@@ -64103,7 +64130,22 @@ pub struct PendingBackchannelRequest {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BackchannelApprovalLinkage<'a> {
     /// The grant opened at approval, the revocation spine the tokens hang off.
-    pub grant_id: Option<&'a str>,
+    ///
+    /// REQUIRED when approving, and `Option` only because a denial has nothing to hang off.
+    /// `decide` refuses an approval that leaves it `None`: redemption cannot proceed without
+    /// a spine, and discovering that at redemption time strands an approval the user has
+    /// already given on another device.
+    ///
+    /// TYPED, and not a `&str`, because a null check is not the invariant. Review passed a
+    /// `GrantId` minted for ANOTHER SCOPE and an EMPTY STRING through the `is_none()` guard:
+    /// both produced `Ok(true)`, both left a row that `approved_details` reported as
+    /// redeemable, and both were then refused by `redeem_approved` forever. That is the exact
+    /// harm the guard exists to prevent, reachable with a one-character argument. The empty
+    /// string also inserted a `grants` row with `id = ''`.
+    ///
+    /// A scoped identifier cannot express either mistake, and `decide` checks the scope it
+    /// carries, so the invariant is structural rather than a condition someone remembered.
+    pub grant_id: Option<&'a GrantId>,
     /// The consent decision recorded at approval.
     pub consent_ref: Option<&'a str>,
     /// The RFC 8176 authentication methods frozen from the approving session.
@@ -64121,13 +64163,32 @@ pub struct RedeemedBackchannelRequest {
     /// The subject the tokens are for.
     pub subject: String,
     /// The grant opened at approval, the revocation spine the tokens hang off.
-    pub grant_id: Option<String>,
+    ///
+    /// TYPED and NOT optional, because both readers filter `grant_id IS NOT NULL` and the
+    /// CHECK in migration 0151 makes the alternative unrepresentable. An `Option<String>`
+    /// here would ask the token endpoint to write a branch for a state the store guarantees
+    /// away, which is the dead untestable branch an earlier round deleted, and would make the
+    /// caller `parse_in_scope` a string the store had just read from its own row. The device
+    /// grant's `ApprovedDeviceGrant` carries a typed non-optional `GrantId` for these
+    /// reasons and this now matches it.
+    pub grant_id: GrantId,
     /// The OAuth scope to echo into the issued tokens.
     pub requested_scope: Option<String>,
     /// The RFC 9396 `authorization_details` to echo into the issued tokens.
     pub authorization_details: Option<serde_json::Value>,
     /// The frozen authentication methods the ID token's `amr` derives from.
     pub auth_methods: Option<String>,
+    /// The approving user's authentication instant, so the ID token's `auth_time` is
+    /// truthful.
+    ///
+    /// `decide` freezes this at approval and the column's own comment says it exists for the
+    /// ID token. Nothing read it back: neither `redeem` nor `approved_details` selected it and
+    /// this struct had no field for it, so a CIBA ID token could not carry a truthful
+    /// `auth_time` and a client registered with `require_auth_time` could not be served
+    /// correctly. The device grant's sibling returns it for exactly this reason.
+    pub auth_time_unix_micros: Option<i64>,
+    /// The consent decision recorded at approval, which was write-only for the same reason.
+    pub consent_ref: Option<String>,
 }
 
 impl BackchannelAuthRepo<'_> {
@@ -64373,10 +64434,17 @@ impl BackchannelAuthRepo<'_> {
     ///   an approval, or re-approve something already redeemed.
     /// * **Not after expiry**, judged against the passed-in clock seam.
     ///
-    /// Returns whether a row was decided. `false` covers every refusal, because the surface
-    /// answers all of them the same way rather than telling a user which of them applied.
+    /// Returns whether a row was decided. `false` covers every refusal ABOUT THE REQUEST,
+    /// because the surface answers all of them the same way rather than telling a user which
+    /// of them applied: wrong subject, already decided, expired, absent.
     ///
     /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when an APPROVAL names no grant, or names one minted for
+    /// another scope. Those are not refusals about the request, they are a caller that has
+    /// asked for a state this store will not create, so they are errors rather than `false`.
+    /// The distinction matters to whoever maps this: `Ok(false)` is "your request could not
+    /// be decided", this is "your call was malformed".
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn decide(
@@ -64388,6 +64456,21 @@ impl BackchannelAuthRepo<'_> {
         linkage: BackchannelApprovalLinkage<'_>,
         now_micros: i64,
     ) -> Result<bool, StoreError> {
+        // AN APPROVAL MUST OPEN A GRANT. This is the other end of the invariant redemption
+        // enforces, and enforcing only one end is what let five rounds of review find holes.
+        //
+        // Redemption refuses a spine-less approval, correctly: there is nothing for the tokens
+        // to hang off and nothing for a revocation to reach. But refusing only THERE strands
+        // the user. `decide` would return `Ok(true)`, the row would read `approved`,
+        // `approved_details` would answer `Some`, ping mode would notify the client to come
+        // and collect, and the token endpoint would do the signing work and then fail forever
+        // with no audit row and nothing distinguishing it from a bad `auth_req_id`. The user
+        // approved on their separate device and can never be told why it did not work.
+        //
+        // So an approval without a grant is refused where it is CREATED, before anything is
+        // committed and while the caller is still in a position to fix it. A denial still
+        // needs no grant: there is nothing to hang off a refusal.
+        approval_linkage_is_usable(approved, &linkage, self.scope)?;
         let mut tx = begin_scoped(self.store, self.scope).await?;
 
         // Open the grant FIRST when one is being bound: the composite foreign key requires
@@ -64428,7 +64511,7 @@ impl BackchannelAuthRepo<'_> {
                      VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, \
                              TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
                 )
-                .bind(grant_id)
+                .bind(grant_id.to_string())
                 .bind(self.scope.tenant().to_string())
                 .bind(self.scope.environment().to_string())
                 .bind(&request_client)
@@ -64455,7 +64538,7 @@ impl BackchannelAuthRepo<'_> {
         .bind(id.to_string())
         .bind(subject)
         .bind(approved)
-        .bind(linkage.grant_id)
+        .bind(spine_to_record(approved, &linkage))
         .bind(linkage.consent_ref)
         .bind(linkage.auth_methods)
         .bind(linkage.auth_time_micros)
@@ -64599,7 +64682,33 @@ impl BackchannelAuthRepo<'_> {
     /// `invalid_grant`, and a richer return type here would be a distinction waiting to leak
     /// into a response.
     ///
+    /// # The spine is required here too
+    ///
+    /// This is the THIRD reader of an approved request, and a previous round enforced the
+    /// spine on the other two and said so in the commit message, which was false for this
+    /// one. Review demonstrated it: a row written around `decide` with `grant_id NULL` was
+    /// refused by `approved_details`, and this method consumed it, returning no grant and
+    /// leaving the request `redeemed`. The approval was BURNED, by the method whose name a
+    /// future caller is most likely to reach for. So `None` here now covers a fourth case: a
+    /// row whose spine is missing, which is an inconsistent state rather than a refusal.
+    ///
     /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the stored `grant_id` is absent or does not parse in this
+    /// scope.
+    ///
+    /// An earlier version of this line said the query's own predicate made that unreachable.
+    /// It does not, and this method's own body says so further down: the predicate constrains
+    /// NULLITY, not parseability, and the test named
+    /// `an_unparseable_grant_id_refuses_without_consuming_the_request` reaches this error with
+    /// a `grants.id` the data plane can write.
+    /// The absent case is genuinely unreachable behind the predicate, and is refused
+    /// explicitly rather than decoded infallibly because an infallible decode panics from
+    /// inside the store.
+    ///
+    /// The request's own `id` parses here too and can fail the same way, by the same
+    /// argument: `backchannel_authentication_requests.id` is bare `text NOT NULL` with no
+    /// format check and the application role holds table-wide INSERT.
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn redeem(
@@ -64617,9 +64726,110 @@ impl BackchannelAuthRepo<'_> {
                AND tenant_id = $3 \
                AND environment_id = $4 \
                AND status = 'approved' \
+               AND grant_id IS NOT NULL \
                AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $5 \
              RETURNING id, subject, grant_id, requested_scope, authorization_details, \
-                       auth_methods",
+                       auth_methods, consent_ref, \
+                       (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_time_micros",
+        )
+        .bind(auth_req_id_digest)
+        .bind(presenting_client_id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        // PARSED BEFORE THE COMMIT, because this statement already flipped the row to
+        // `redeemed`. An earlier version committed first and parsed after, so a parse failure
+        // returned `Err` on a request that had ALREADY been consumed: the approval was burned,
+        // no tokens were issued, and the caller could not tell it apart from a bad
+        // `auth_req_id`. Review demonstrated it by planting a `grants` row whose id does not
+        // parse (`grants.id` is bare `text PRIMARY KEY`, migration 0004, with no format
+        // check), which the data plane can write and the composite foreign key accepts.
+        //
+        // That is the exact harm this file's atomicity argument exists to prevent, and the
+        // rule the sibling `redeem_approved` already keeps: a fault of ours must never burn an
+        // approval a person gave on a separate device. Every fallible step now happens while
+        // the transaction can still roll back.
+        //
+        // The previous comment here said the `grant_id IS NOT NULL` predicate made this
+        // infallible. It does not: the predicate constrains NULLITY, not parseability. What
+        // kept it unreachable was minting discipline, which is precisely the assumption
+        // migration 0151 exists so this code no longer has to make.
+        let id_text: String = row.get("id");
+        // `Option` and an explicit refusal, not an infallible decode: an infallible one
+        // PANICS on NULL, which review measured killing the spine tests from inside the store
+        // rather than at the assertions that name the property.
+        let grant_text: Option<String> = row.get("grant_id");
+        let details = RedeemedBackchannelRequest {
+            id: BackchannelAuthRequestId::parse_in_scope(&id_text, &self.scope)?,
+            subject: row.get("subject"),
+            grant_id: GrantId::parse_in_scope(
+                &grant_text.ok_or(StoreError::NotFound)?,
+                &self.scope,
+            )?,
+            requested_scope: row.get("requested_scope"),
+            authorization_details: row.get("authorization_details"),
+            auth_methods: row.get("auth_methods"),
+            auth_time_unix_micros: row.get("auth_time_micros"),
+            consent_ref: row.get("consent_ref"),
+        };
+        tx.commit().await?;
+        Ok(Some(details))
+    }
+
+    /// Read an APPROVED request's details without consuming it (CIBA Core section 10).
+    ///
+    /// The token endpoint needs these to mint before it consumes, exactly as the device grant
+    /// does: a signing failure after the flip would burn an approval the user gave on another
+    /// device, and they would have to approve again. `poll` deliberately returns a bare
+    /// `Approved` so that polling stays cheap, so the details come from here.
+    ///
+    /// Scoped to the presenting client for the same reason `poll` is: a request belonging to
+    /// another client answers `None`, so this is not an existence oracle either.
+    ///
+    /// # Not a poll
+    ///
+    /// This takes the same `(digest, client, now)` triple as `poll` and answers the same
+    /// question, but it does NOT advance `last_poll_at` or apply `interval_secs`, so the CIBA
+    /// `slow_down` mechanism does not reach it. That is intended for the wiring this is built
+    /// for (the token endpoint polls first, then reads), and it means this method must never
+    /// become a client-reachable surface on its own: it would be an unrated poll.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the stored `grant_id` is absent or does not parse in this
+    /// scope, or if the request's own `id` does not parse. The query's own predicate makes
+    /// the absent case unreachable and minting discipline makes the others unlikely, and
+    /// neither is a reason to decode infallibly: an infallible decode PANICS, from inside the
+    /// store, which is a worse answer than an error for a row somebody wrote around `decide`.
+    /// Documented here because `redeem` documents the same thing and a twin that stays silent
+    /// is how the pair drifts apart.
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn approved_details(
+        &self,
+        auth_req_id_digest: &str,
+        presenting_client_id: &str,
+        now_micros: i64,
+    ) -> Result<Option<RedeemedBackchannelRequest>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, grant_id, requested_scope, authorization_details, \
+                    auth_methods, consent_ref, \
+                    (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_time_micros \
+             FROM backchannel_authentication_requests \
+             WHERE auth_req_id_digest = $1 \
+               AND client_id = $2 \
+               AND tenant_id = $3 \
+               AND environment_id = $4 \
+               AND status = 'approved' \
+               AND grant_id IS NOT NULL \
+               AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $5",
         )
         .bind(auth_req_id_digest)
         .bind(presenting_client_id)
@@ -64633,15 +64843,603 @@ impl BackchannelAuthRepo<'_> {
             return Ok(None);
         };
         let id_text: String = row.get("id");
+        // `Option` and an explicit refusal rather than an infallible decode. The predicate
+        // above constrains NULLITY, not parseability, and an infallible decode panics on NULL
+        // from inside the store, which review measured killing the spine tests before the
+        // assertions that name the property could run.
+        let grant_text: Option<String> = row.get("grant_id");
         Ok(Some(RedeemedBackchannelRequest {
             id: BackchannelAuthRequestId::parse_in_scope(&id_text, &self.scope)?,
             subject: row.get("subject"),
-            grant_id: row.get("grant_id"),
+            grant_id: GrantId::parse_in_scope(
+                &grant_text.ok_or(StoreError::NotFound)?,
+                &self.scope,
+            )?,
             requested_scope: row.get("requested_scope"),
             authorization_details: row.get("authorization_details"),
             auth_methods: row.get("auth_methods"),
+            auth_time_unix_micros: row.get("auth_time_micros"),
+            consent_ref: row.get("consent_ref"),
         }))
     }
+
+    /// Consume an approved request AND record the tokens minted for it, in ONE transaction
+    /// (CIBA Core section 10, issue #131).
+    ///
+    /// The device grant's `redeem_approved` one table over, and for the same two reasons.
+    ///
+    /// ATOMIC WITH THE TOKEN RECORDS, because a token that is issued and not recorded cannot
+    /// be revoked. Recording them in a second transaction would leave a window where a crash
+    /// yields live tokens nothing knows about, which is worse than the endpoint not existing.
+    ///
+    /// SINGLE USE, because the flip is conditional on `status = 'approved'`: a second caller
+    /// that raced the first past the poll finds nothing to flip and gets `false`, so one
+    /// approval mints one set of tokens.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] from every guard this method exists to apply, and the list
+    /// matters more than usual because the token endpoint is the next thing to be written.
+    /// An implementer who reads only "a persistence failure" and maps `Err(_)` to a 500
+    /// answers a server error where the spec wants `invalid_grant`, for each of:
+    ///
+    /// * a `grant_id` minted under another scope
+    /// * an approval that opened no grant, so there is no spine
+    /// * a caller-supplied grant that is not the one the approval opened
+    /// * a grant that is revoked, or does not belong to the presenting client and the
+    ///   approving subject
+    /// * a token or opaque identifier minted under another scope
+    /// * an opaque token claiming a subject, client, grant or scope the approval did not
+    ///   carry
+    ///
+    /// `Ok(false)` is the separate answer for "the flip matched no row". Two earlier versions
+    /// of this paragraph miscounted its causes and mis-stated their mapping, so both are set
+    /// out here rather than summarised.
+    ///
+    /// The flip filters on the digest, the client, the SCOPE, `status = 'approved'` and the
+    /// expiry, so there are SEVEN causes: an unknown `auth_req_id`, a wrong client, a request
+    /// in another scope, one still `pending`, a `denied` one, an expired one, and one already
+    /// `redeemed`. The scope case is not hypothetical and is not the same as "unknown":
+    /// `neither_new_reader_reaches_across_scopes` presents a correct digest and a correct
+    /// client from a neighbouring scope and gets `Ok(false)`.
+    ///
+    /// They do NOT share one error code.
+    ///
+    /// * `pending`, `denied` and expired are mapped by [`BackchannelPoll`] in this same file,
+    ///   as `authorization_pending`, `access_denied` and `expired_token`.
+    /// * an unknown `auth_req_id`, one issued to another client, and one from another scope
+    ///   are `invalid_grant`, which CIBA Core section 11 makes a MUST. [`BackchannelPoll`]
+    ///   does NOT supply this: its `NotFound` variant deliberately carries no code, because
+    ///   at that layer the three are indistinguishable and saying which applied would be an
+    ///   existence oracle over other clients' requests.
+    /// * `redeemed` has no poll variant at all. `poll` folds it into `Expired`, deliberately,
+    ///   so a spent `auth_req_id` answers `expired_token` rather than announcing that it was
+    ///   once valid.
+    ///
+    /// Answering `invalid_grant` for a PENDING request is the worst mistake available here: a
+    /// conforming client must stop polling on any error other than `authorization_pending`
+    /// and `slow_down`, which is RFC 8628 section 3.5 and is why this repository states it in
+    /// `device_login.rs`. Such a client gives up before the person has answered on their
+    /// other device.
+    ///
+    /// The wiring that avoids all of this is the one the device grant already uses: poll
+    /// first, map each variant, and reach this method only for an approved request. Then
+    /// `Ok(false)` means a race with another redemption, and `invalid_grant` is right for it.
+    /// A caller that skips the poll must map the seven causes itself, and this method cannot
+    /// tell it which applied, by the same oracle argument.
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn redeem_approved(
+        &self,
+        env: &Env,
+        acting: &ActingContext,
+        request: BackchannelRedemption<'_>,
+    ) -> Result<bool, StoreError> {
+        let BackchannelRedemption {
+            auth_req_id_digest,
+            presenting_client_id,
+            now_micros,
+            grant_id,
+            tokens,
+            opaque,
+        } = request;
+        if grant_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let flipped = sqlx::query(
+            "UPDATE backchannel_authentication_requests \
+             SET status = 'redeemed' \
+             WHERE auth_req_id_digest = $1 \
+               AND client_id = $2 \
+               AND tenant_id = $3 \
+               AND environment_id = $4 \
+               AND status = 'approved' \
+               AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $5 \
+             RETURNING grant_id, subject, requested_scope",
+        )
+        .bind(auth_req_id_digest)
+        .bind(presenting_client_id)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = flipped else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        // Both grant guards live in `verify_redemption_grant`, which returns the subject the
+        // approval was given by. Extracted as one unit because they are one decision (may
+        // this caller mint against this grant), and because inlining them pushed this
+        // function past the readable-length lint.
+        let approved = verify_redemption_grant(
+            &mut tx,
+            &tenant,
+            &environment,
+            &row,
+            grant_id,
+            presenting_client_id,
+        )
+        .await?;
+        // Foreign-scope identifiers are refused, exactly as the authorization-code `redeem`
+        // refuses them: an id minted under another scope must not be written into this one.
+        //
+        // The OPAQUE jti is checked too. An earlier round guarded only `tokens` and claimed
+        // parity with the sibling, which guards both; review measured the gap by landing a
+        // row in this scope carrying another environment's `tok_` id, which introspection
+        // then reports as the token's `jti`. `opaque_access_tokens` is UNIQUE on
+        // (tenant, environment, jti), so nothing at the database catches it.
+        // Only the JTI is checked here. An earlier version also tested `op.grant_id`'s scope,
+        // and review measured that term SURVIVING mutation because it is fully subsumed: a
+        // foreign-scope `GrantId` can never equal the in-scope one, so the equality check in
+        // `verify_and_insert_opaque` refuses it first. Keeping a term no test can distinguish
+        // and presenting it as a measured guard is worse than not having it.
+        let foreign_opaque = opaque.as_ref().is_some_and(|op| op.jti.scope() != scope);
+        if foreign_opaque || tokens.iter().any(|token| token.id.scope() != scope) {
+            return Err(StoreError::NotFound);
+        }
+        let grant_text = grant_id.to_string();
+        for token in tokens {
+            sqlx::query(
+                "INSERT INTO issued_tokens \
+                 (id, tenant_id, environment_id, grant_id, token_kind) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(token.id.to_string())
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(&grant_text)
+            .bind(token.kind.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(op) = opaque {
+            verify_and_insert_opaque(
+                &mut tx,
+                &tenant,
+                &environment,
+                &grant_text,
+                grant_id,
+                presenting_client_id,
+                &approved,
+                &op,
+            )
+            .await?;
+        }
+        // Metered in the SAME transaction, so a CIBA-issued token is a counted token. See
+        // `meter_redeemed_tokens` for why the opaque one needs its own emit.
+        meter_redeemed_tokens(&mut tx, env, scope, &grant_text, tokens, opaque.is_some()).await?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting,
+            env,
+            action: Action::TokenIssue,
+            target: grant_id,
+        };
+        // In the SAME transaction as the flip and the token rows. A token issue that is not
+        // audited is a token nobody can account for, and the device grant makes the same
+        // guarantee one table over.
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
+/// Enqueue one `token.issued` metering event per token a redemption actually issued.
+///
+/// An opaque access token contributes no `IssuedTokenRecord`, so it is counted separately;
+/// see the call site for why counting only `tokens` under-reported.
+async fn meter_redeemed_tokens(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    env: &Env,
+    scope: Scope,
+    grant_text: &str,
+    tokens: &[IssuedTokenRecord],
+    has_opaque: bool,
+) -> Result<(), StoreError> {
+    // METERED, in the same transaction, so a CIBA-issued token is a COUNTED token.
+    // `meter_token_issued` had exactly one caller before this, in the authorization-code
+    // `redeem`, so every token minted through the device grant and every token minted
+    // here was invisible to `tokens_issued`. The under-report is silent: the metering
+    // fold sums whatever it is given, and a producer that never fires is
+    // indistinguishable from a tenant that never issued anything.
+    //
+    // (`record_issued_tokens` one impl over is a SECOND in-tree producer of the same
+    // event. The claim worth making is the narrow one about this function's callers, not
+    // a broad one about the event, which an earlier draft of this comment got wrong.)
+    //
+    // The OPAQUE token is metered too, because it produces no `IssuedTokenRecord` and a loop
+    // over `tokens` alone therefore never counts it.
+    //
+    // An earlier version of this comment said both production builders pass an EMPTY record
+    // list. That is FALSE and review measured it: `token.rs:420` and `device.rs:458` both push
+    // the ID token first, so the list is `[Id]` and the under-count was ONE event, the access
+    // token, not all of them. The only builder returning `Vec::new()` is
+    // `refresh_access_records`, and it feeds a different store method. The fix is unchanged
+    // and the arithmetic works out either way (`[Id]` plus an opaque token is two tokens and
+    // two events); the justification was wrong and is worth correcting because it is the
+    // sentence a future reader would reason from.
+    //
+    // Wiring the path being ADDED here is what stops this grant from shipping with that
+    // gap already in it. The device grant's identical omission predates this change and
+    // is filed separately rather than fixed under a CIBA issue.
+    for token in tokens {
+        meter_token_issued(tx, env, scope, grant_text, token.kind.as_str()).await?;
+    }
+    if has_opaque {
+        meter_token_issued(tx, env, scope, grant_text, TokenKind::Access.as_str()).await?;
+    }
+    Ok(())
+}
+
+/// Verify the caller may mint against `grant_id`, and return the subject the approval was
+/// given by (issue #131).
+///
+/// Two guards, extracted together because they are ONE decision and because inlining them put
+/// [`BackchannelAuthRepo::redeem_approved`] past the readable-length lint. Each closed a
+/// separate live hole found in review, and each is mutation covered in
+/// `tests/backchannel_authentication.rs`.
+async fn verify_redemption_grant(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &str,
+    environment: &str,
+    row: &sqlx::postgres::PgRow,
+    grant_id: &GrantId,
+    presenting_client_id: &str,
+) -> Result<ApprovedIdentity, StoreError> {
+    // THE GRANT THE APPROVAL OPENED IS THE ONE THE TOKENS HANG OFF, and it is in this
+    // row, so it is checked rather than trusted. A caller-supplied grant that disagrees
+    // with the request's own is refused: review demonstrated redeeming with an unrelated
+    // grant owned by a DIFFERENT client, which recorded the tokens and the audit row
+    // against that grant, so revoking the CIBA grant revoked nothing and the issuance was
+    // mis-attributed. Naming the fields in a struct does not prevent that; comparing them
+    // does.
+    //
+    // A NULL row grant is the pre-linkage case: `decide` may open none, and the caller's
+    // grant stands alone there. That branch was a HOLE. With no spine to compare against,
+    // any grant the caller named was accepted, including one belonging to a DIFFERENT
+    // client, and the tokens and the audit row were recorded against it: the same harm
+    // the comparison above exists to stop, reachable whenever an approval linked no
+    // grant, which is what `BackchannelApprovalLinkage::default()` does.
+    let spine: Option<String> = row.get("grant_id");
+    // THE AUTHORITATIVE SUBJECT, off the row being flipped. Everything below that needs
+    // to know who the user is reads THIS and never the caller's copy.
+    //
+    // Decoded infallibly on purpose: `backchannel_authentication_requests.subject` is
+    // `text NOT NULL` (migration 0147) with no later ALTER relaxing it. Were it ever made
+    // nullable, `row.get` would PANIC rather than error, so that migration has to change
+    // this line with it.
+    let approved_subject: String = row.get("subject");
+    // THE SPINE IS REQUIRED, and this is the structural end of a defect that four rounds of
+    // review each closed one dimension at a time.
+    //
+    // The history is the argument. Round 1 checked no grant. Round 2 compared the caller's
+    // grant to the spine, and a NULL spine skipped the comparison. Round 3 required the grant
+    // to belong to the presenting CLIENT. Round 4 required the SUBJECT and a live grant. Each
+    // round the NULL-spine branch admitted one more thing, and review then showed a caller
+    // could still present any live grant of the same client and user and have the tokens
+    // inherit ITS `claims_request`, `granted_resources` and `org_id` from an unrelated
+    // authorization-code flow, while the CIBA request kept `grant_id NULL` so nothing in the
+    // database linked the issued tokens to the `auth_req_id` at all.
+    //
+    // Patching that branch again would have been the fifth dimension. Removing it is the fix.
+    // A CIBA approval that opened no grant has nothing for the tokens to hang off and nothing
+    // for a revocation to reach, so it is not redeemable: `decide` opening a grant is a
+    // PRECONDITION of redemption, not an option. Nothing calls this in production yet, so
+    // this is the cheapest moment it will ever be to tighten.
+    let Some(opened) = spine else {
+        return Err(StoreError::NotFound);
+    };
+    if opened != grant_id.to_string() {
+        return Err(StoreError::NotFound);
+    }
+    // SO THE GRANT MUST BELONG TO THE PRESENTING CLIENT. That closes the cross-client
+    // harm in BOTH branches at once, linked or not, and needs no decision about whether
+    // CIBA may approve without a grant. On every legitimate path it already holds by
+    // construction: `decide` opens the grant with the client read off the request row,
+    // and the flip above filters on that same client.
+    //
+    // It does NOT subsume the comparison above, which is the easy thing to conclude from
+    // the fact that it catches every case the comparison catches in the fixtures as they
+    // were first written. The guards answer different questions. This one asks WHOSE
+    // grant it is, by client AND by subject; the comparison asks WHICH of that client's
+    // grants the user approved. A client holding two grants for the SAME user that
+    // redeems against the wrong one passes this check and hangs its tokens off a grant
+    // the revocation spine does not name, so revoking the CIBA grant reaches none of
+    // them. Deleting any one of them leaves a live hole, and all of them are measured in
+    // `tests/backchannel_authentication.rs`.
+    //
+    // `subject` is here because an earlier round checked only the client, and that is the
+    // dimension with the worst failure. `resolve_access_token` reads the GRANT'S subject
+    // and UserInfo answers from it, so a token hung off another user's grant does not
+    // merely mis-attribute the issuance: it AUTHENTICATES AS THAT OTHER USER. Review
+    // demonstrated it, redeeming against a same-client grant belonging to `usr_victim`
+    // and resolving the resulting token as `usr_victim`.
+    //
+    // `revoked_at IS NULL` is here because accepting a revoked grant commits the flip and
+    // hands back tokens that resolve as inactive, which burns an approval the user gave
+    // on a separate device for a fault that is entirely ours.
+    let owned: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM grants \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND client_id = $4 \
+           AND subject = $5 \
+           AND revoked_at IS NULL \
+         FOR SHARE",
+    )
+    .bind(grant_id.to_string())
+    .bind(tenant)
+    .bind(environment)
+    .bind(presenting_client_id)
+    .bind(&approved_subject)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if owned.is_none() {
+        return Err(StoreError::NotFound);
+    }
+    Ok(ApprovedIdentity {
+        subject: approved_subject,
+        requested_scope: row.get("requested_scope"),
+    })
+}
+
+/// What the APPROVAL established, read off the row the flip returned.
+///
+/// Returned as a value rather than left for the caller to `row.get` because every one of
+/// these is a bound on what may be issued, and a caller that has to remember to fetch one is
+/// a caller that will forget. `scope` was forgotten exactly that way: rounds 3 and 4 pinned
+/// the subject and the client of the opaque row and left its `scope` as caller input, which
+/// RFC 7662 introspection then reported verbatim.
+struct ApprovedIdentity {
+    /// The end user the request names. `backchannel_authentication_requests.subject` is
+    /// `text NOT NULL` (migration 0147, no later ALTER), so this is infallible.
+    subject: String,
+    /// What the client ASKED for, and therefore the ceiling on what the approval can grant.
+    /// Nullable in the schema: a request naming no scope bounds the issued token to none.
+    requested_scope: Option<String>,
+}
+
+/// Check everything the opaque row's caller-supplied fields claim, then write it (issue #131).
+///
+/// Extracted because the guards and the insert are ONE decision (may this opaque token be
+/// written, and under whose identity), and because inlining them put
+/// [`BackchannelAuthRepo::redeem_approved`] past the readable-length lint again.
+///
+/// Every guard here exists because review found the corresponding field being trusted:
+/// `subject` and `client_id` in round 4, `grant_id` and `scope` in round 5. All four are
+/// columns `resolve_opaque_access_token` hands back verbatim to RFC 7662 introspection.
+///
+/// # `audience` and `audiences` are NOT bounded here, and that is a gap rather than a choice
+///
+/// They belong to the same family: `resolve_opaque_access_token` returns both and
+/// introspection echoes them, so a resource server authorises on `aud` exactly as it does on
+/// `scope`. They are not checked because there is nothing to check them AGAINST. CIBA has no
+/// resource ceiling anywhere in this codebase: `BackchannelAuthParams` has no `resource`
+/// parameter, `backchannel_authentication_requests` has no resource column, and `decide`
+/// opens the grant with `granted_resources` unset. Inventing a bound here would be a fiction,
+/// and the authorization-code sibling does not bound them either.
+///
+/// So the honest state is that a CIBA opaque token's audience is whatever the token endpoint
+/// says it is, and the ceiling has to be built before it can be enforced. Filed as issue
+/// #937 rather than left as the next column for a review to find.
+#[allow(clippy::too_many_arguments)]
+async fn verify_and_insert_opaque(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &str,
+    environment: &str,
+    grant_text: &str,
+    grant_id: &GrantId,
+    presenting_client_id: &str,
+    approved: &ApprovedIdentity,
+    op: &NewOpaqueAccessToken<'_>,
+) -> Result<(), StoreError> {
+    // CHECKED, NOT TRUSTED, exactly as the grant above is. `subject` and `client_id`
+    // are the two columns `resolve_opaque_access_token` hands back verbatim to RFC
+    // 7662 introspection, and both arrived as caller input. Review landed a row with
+    // `subject = usr_victim` and `client_id = cli_someone_else` through a redemption
+    // that returned Ok: a resource server trusting introspection then sees a token
+    // owned by another client, for another user.
+    //
+    // Refused on mismatch rather than silently overwritten. Binding the authoritative
+    // values over a caller's wrong ones would store the right row and leave the
+    // caller believing it wrote a different one, and a caller confused about whose
+    // token it is minting should hear about it.
+    if op.subject != approved.subject || op.client_id != presenting_client_id {
+        return Err(StoreError::NotFound);
+    }
+    // AND THE GRANT, for the same reason and with the same answer. Review found this
+    // field being silently IGNORED while its two neighbours in the same struct were
+    // refused on mismatch, which is a worse state than either rule on its own: the
+    // row hung off the right grant, so nothing broke, and a caller that had resolved
+    // the wrong one was never told.
+    if op.grant_id.is_some_and(|named| named != grant_id) {
+        return Err(StoreError::NotFound);
+    }
+    // THE SCOPE IS BOUNDED BY WHAT WAS ASKED, which is the fourth column of this row
+    // that introspection reports verbatim and the fourth one review had to find.
+    //
+    // `resolve_opaque_access_token` returns `scope` and `introspection.rs` echoes it
+    // into the RFC 7662 response, so a resource server authorises on it. It arrived
+    // as pure caller input: review redeemed a request whose `requested_scope` was
+    // "openid profile" while presenting "openid profile admin:everything
+    // payments:write", and introspection reported the wider set. The user approved
+    // the narrower one.
+    //
+    // CONTAINMENT, not equality. A grant may legitimately narrow what was requested
+    // (the user declines part of it, policy trims it), so a subset is correct and a
+    // superset never is. A request naming no scope is a ceiling of none.
+    if !scope_is_within(op.scope, approved.requested_scope.as_deref()) {
+        return Err(StoreError::NotFound);
+    }
+    insert_opaque_access_token(
+        tx,
+        tenant,
+        environment,
+        &RedemptionIdentity {
+            grant_text,
+            subject: &approved.subject,
+            client_id: presenting_client_id,
+            scope: op.scope,
+        },
+        op,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The grant a decision records: the approval's, or NOTHING on a denial (issue #131).
+///
+/// `approval_linkage_is_usable` checks nothing on the denial path, correctly, because a
+/// refusal has nothing to hang off. Review found what `decide` then did with the field
+/// anyway: a denial naming any live in-scope grant WROTE it, including one belonging to
+/// another client for another user. No token can come of that, since every reader filters
+/// `status = 'approved'`, but the foreign key pins an unrelated grant against deletion and
+/// the index reports a link a future revocation or audit read would believe. Naming a grant
+/// that did not exist raised a raw foreign-key error rather than a clean refusal, too.
+fn spine_to_record(approved: bool, linkage: &BackchannelApprovalLinkage<'_>) -> Option<String> {
+    if !approved {
+        return None;
+    }
+    linkage.grant_id.map(std::string::ToString::to_string)
+}
+
+/// An APPROVAL must open a grant, and it must be one of this scope's (issue #131).
+///
+/// Both halves refuse the same harm: an approved row whose spine cannot be redeemed. The
+/// person answered on their separate device, `decide` would report `Ok(true)`, ping mode
+/// would tell the client to come and collect, `approved_details` would report the request as
+/// redeemable, and the token endpoint would sign and then fail forever with no audit row and
+/// nothing distinguishing it from a bad `auth_req_id`.
+///
+/// The scope half exists because a null check is not the invariant. Review passed a `GrantId`
+/// minted for another scope straight through `is_none()` and produced exactly that stranded
+/// row. Typing the field stops a malformed id; only this stops a foreign one.
+///
+/// A DENIAL needs neither: a refusal has nothing to hang off.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] when an approval names no grant, or names another scope's.
+fn approval_linkage_is_usable(
+    approved: bool,
+    linkage: &BackchannelApprovalLinkage<'_>,
+    scope: Scope,
+) -> Result<(), StoreError> {
+    if !approved {
+        return Ok(());
+    }
+    match linkage.grant_id {
+        None => Err(StoreError::NotFound),
+        Some(grant) if grant.scope() != scope => Err(StoreError::NotFound),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Is every scope token in `issued` present in `approved`? (issue #131)
+///
+/// Space-delimited per RFC 6749 3.3, order-insensitive, and a superset is always a refusal.
+/// `None` or an empty approved set is a ceiling of NOTHING, so only an empty issued set fits
+/// under it: a request that named no scope cannot mint a token that claims one.
+fn scope_is_within(issued: Option<&str>, approved: Option<&str>) -> bool {
+    let issued: Vec<&str> = issued.unwrap_or_default().split_whitespace().collect();
+    let approved: std::collections::HashSet<&str> =
+        approved.unwrap_or_default().split_whitespace().collect();
+    issued.iter().all(|token| approved.contains(token))
+}
+
+/// The identity an opaque row is written under, as one value rather than three adjacent
+/// `&str` parameters.
+///
+/// This is a struct because review measured what the parameter list allowed: TRANSPOSING the
+/// subject and the client compiled and left the suite at 41 passed, writing
+/// `subject = "cli_owner"` and `client_id = "usr_someone"` into the exact two columns the
+/// round-4 blocker was about. `FederatedSource` in this same file exists for this reason and
+/// says so; its argument applies here unchanged.
+///
+/// It raises the cost of that mistake; it does NOT make it impossible, and an earlier version
+/// of this comment claimed it did. These are still three adjacent `&str` fields, so
+/// `RedemptionIdentity { subject: presenting_client_id, client_id: &approved.subject, .. }`
+/// compiles, and review compiled it. What a named field buys is that the mistake has to be
+/// WRITTEN rather than merely inherited from argument order. The guarantee is
+/// `the_opaque_row_carries_the_redemptions_identity_and_scope`, which reads all three columns
+/// back; this type is the seatbelt and that test is the thing holding it.
+struct RedemptionIdentity<'a> {
+    /// The grant the redemption verified, NOT `op.grant_id`.
+    grant_text: &'a str,
+    /// The subject off the flipped request row, NOT `op.subject`.
+    subject: &'a str,
+    /// The authenticated presenting client, NOT `op.client_id`.
+    client_id: &'a str,
+    /// The scope the approval actually carried, bounded by the request's `requested_scope`.
+    scope: Option<&'a str>,
+}
+
+/// Insert one opaque access token row, with EVERY column the token's own claims imply
+/// (issue #131).
+///
+/// The twelve binds here are the ones the device grant writes only ten of, which is issue
+/// #934. `audiences` and `dpop_jkt` are the two whose absence is SILENT rather than loud: a
+/// NULL `audiences` makes `resolve_opaque_access_token` fall back to the single `audience`,
+/// so a multi-audience token introspects NARROWER than it was issued, and a NULL `dpop_jkt`
+/// reads back as "not key bound", so a sender-constrained token degrades to a bearer token
+/// anyone holding it can replay. Neither fails anything at issuance.
+///
+/// Everything identity-shaped arrives in `identity` and NOT from `op`, because those columns
+/// are read straight back out by `resolve_opaque_access_token` and handed to RFC 7662
+/// introspection. `verify_and_insert_opaque` is what establishes that they may be trusted.
+async fn insert_opaque_access_token(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &str,
+    environment: &str,
+    identity: &RedemptionIdentity<'_>,
+    op: &NewOpaqueAccessToken<'_>,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO opaque_access_tokens \
+         (token_digest, tenant_id, environment_id, grant_id, subject, client_id, \
+          audience, audiences, scope, jti, expires_at, dpop_jkt) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                 TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, $12)",
+    )
+    .bind(op.token_digest)
+    .bind(tenant)
+    .bind(environment)
+    .bind(identity.grant_text)
+    .bind(identity.subject)
+    .bind(identity.client_id)
+    .bind(op.audience)
+    .bind(resource_array_to_json(op.audiences))
+    .bind(identity.scope)
+    .bind(op.jti.to_string())
+    .bind(op.expires_at_unix_micros)
+    .bind(op.dpop_jkt)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Enqueue the `token.issued` metering event for one issued token (issue #107).

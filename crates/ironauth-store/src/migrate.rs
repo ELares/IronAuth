@@ -1196,6 +1196,18 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0150_scope_fk_naming.sql"),
         },
+        Migration {
+            version: 151,
+            name: "backchannel_approved_requires_grant",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0151_backchannel_approved_requires_grant.sql"),
+        },
+        Migration {
+            version: 152,
+            name: "backchannel_approved_grant_validated",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0152_backchannel_approved_grant_validated.sql"),
+        },
     ]
 }
 

@@ -70,7 +70,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      flow targets, \
      CIBA backchannel authentication requests, \
      client backchannel delivery, \
-     external issuer audience allow, scope fk naming.";
+     external issuer audience allow, scope fk naming, \
+     backchannel approved requires grant, backchannel approved grant validated.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -660,6 +661,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object() {
+    const APPROVED_HAS_GRANT: &str = "backchannel_authentication_requests_approved_has_grant";
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -676,7 +678,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        150,
+        152,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -715,7 +717,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108,
             109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
             126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
-            143, 144, 145, 146, 147, 148, 149, 150
+            143, 144, 145, 146, 147, 148, 149, 150, 151, 152
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1119,6 +1121,157 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
         .await,
         "signup_quarantines must carry the nonempty-scope CHECK"
     );
+    // AND THE SPLIT ITSELF, read off the files. The `convalidated` assertion further down
+    // proves the END STATE is
+    // right; it cannot prove HOW it got there, and the how is the entire point: one file
+    // holding both statements takes AccessExclusiveLock through the scan, which is what round
+    // 8 of review measured as buying nothing. These two assertions are what make that
+    // regression visible, since collapsing the files back into one leaves the schema
+    // identical.
+    let add_sql = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations/0151_backchannel_approved_requires_grant.sql"),
+    )
+    .expect("0151 is readable");
+    let validate_sql = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations/0152_backchannel_approved_grant_validated.sql"),
+    )
+    .expect("0152 is readable");
+    // STATEMENTS, not the file text, and UPPERCASED. Three ways this assertion has been
+    // measured passing for the wrong reason:
+    //
+    // * a `contains` over the whole FILE matched the headers, which mention `NOT VALID`, so
+    //   it stayed green with the SQL saying the opposite. Only that half was ever at risk
+    //   from the prose: neither header contains the string `VALIDATE CONSTRAINT`;
+    // * SQL keywords are case-insensitive, so appending `validate constraint ...` in
+    //   lowercase to 0151 restored the collapsed one-file form and stayed green;
+    // * `NOT VALID` left only inside a `PERFORM` string literal, with the real ALTER
+    //   validating, satisfied a whole-statement `contains` and produced an end state
+    //   `convalidated` cannot distinguish.
+    //
+    // Hence: comments stripped, uppercased, and the NOT VALID check anchored to the
+    // ADD CONSTRAINT statement rather than to the file.
+    let statements_of = |sql: &str| -> String {
+        // Line comments cut at `--`, not just whole lines that begin with it. A TRAILING
+        // `-- ... NOT VALID ...` beside a validating ALTER was a bypass, and a trailing
+        // `-- ... VALIDATE CONSTRAINT ...` was a false alarm on correct SQL. Both are the
+        // same omission: the previous version only dropped lines that STARTED with `--`.
+        let without_line_comments = sql
+            .lines()
+            .map(|line| line.split_once("--").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Block comments out, then whitespace collapsed. Both are about not raising a FALSE
+        // alarm on SQL that is correct: `ADD` and `CONSTRAINT` on separate lines, and
+        // `NOT/**/VALID`, are both accepted by Postgres and both produce exactly the intended
+        // `convalidated = false`, and both failed the previous version of this assertion.
+        // Stripping block comments also closes a real bypass, a trailing `/* NOT VALID */`
+        // beside an ALTER that validates.
+        let mut out = String::with_capacity(without_line_comments.len());
+        let mut rest = without_line_comments.as_str();
+        while let Some(open) = rest.find("/*") {
+            out.push_str(&rest[..open]);
+            out.push(' ');
+            let Some(close) = rest[open..].find("*/") else {
+                rest = "";
+                break;
+            };
+            rest = &rest[open + close + 2..];
+        }
+        out.push_str(rest);
+        out.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase()
+    };
+    let add_statements = statements_of(&add_sql);
+    let validate_statements = statements_of(&validate_sql);
+    // EVERY `ADD CONSTRAINT`, each cut at the next semicolon, with the constraint's NAME
+    // required in the same span as `NOT VALID`.
+    //
+    // WHAT THIS IS AND IS NOT. It is a text scan, so it catches the regression it exists for,
+    // which is somebody collapsing the two files back into one and writing a plain validating
+    // `ADD CONSTRAINT`. It is not a SQL parser and cannot be made into one by tightening:
+    // review has now defeated successive versions with a string literal, a `COMMENT ON`, a
+    // block comment, a decoy constraint of the same name on another table, and a nested block
+    // comment, and each tightening produced a new way in. Saying "cut at the next semicolon"
+    // rather than "at its own terminating semicolon" is part of that honesty: a `;` inside a
+    // string literal in the CHECK expression ends the span early.
+    //
+    // The enforcement that does not depend on spelling is elsewhere and is measured: the code
+    // guards in `decide`, `approved_details`, `redeem` and `redeem_approved`, and the
+    // `convalidated` assertion below. This one protects the LOCK property, which nothing in
+    // the schema can see.
+    //
+    // The previous version took everything from the FIRST `ADD CONSTRAINT` to end of file and
+    // called it a statement. Four ways past it, all measured, all leaving 0151 taking
+    // AccessExclusiveLock and scanning, which is the regression the split exists to prevent:
+    // the `NOT VALID` literal in a `PERFORM` placed AFTER the ALTER rather than before it; a
+    // `COMMENT ON CONSTRAINT ... IS '... NOT VALID ...'` after it; a trailing block comment,
+    // since only full-line `--` comments are stripped; and a DECOY `ADD CONSTRAINT ... NOT
+    // VALID` earlier in the file while the real one validates.
+    //
+    // None is visible to the database either: a validating ADD followed later by a VALIDATE
+    // leaves `convalidated` true and `pg_get_constraintdef` byte-identical, so the assertions
+    // below cannot stand in for this one.
+    let unvalidated_add = add_statements
+        .match_indices("ADD CONSTRAINT")
+        .map(|(at, _)| &add_statements[at..])
+        .map(|rest| rest.split_once(';').map_or(rest, |(head, _)| head))
+        .any(|statement| {
+            statement.contains(&APPROVED_HAS_GRANT.to_uppercase())
+                && statement.contains("NOT VALID")
+        });
+    assert!(
+        unvalidated_add && !add_statements.contains("VALIDATE CONSTRAINT"),
+        "0151 must ADD {APPROVED_HAS_GRANT} with NOT VALID in that same statement, and must \
+         not validate it: the runner wraps each FILE in one transaction, so both statements \
+         together hold AccessExclusiveLock across the scan and the split buys nothing. \
+         Uppercased, comment-stripped statements were: {add_statements}"
+    );
+    assert!(
+        validate_statements.contains("VALIDATE CONSTRAINT"),
+        "0152 must be the file that validates, so the scan runs in its own transaction under \
+         ShareUpdateExclusiveLock. Uppercased, comment-stripped statements were: \
+         {validate_statements}"
+    );
+
+    // The CIBA approved-has-grant CHECK is present AND VALIDATED (issue #131), which is the
+    // only observable difference between the two-file split and the one-file version it
+    // replaced.
+    //
+    // It needs asserting because nothing else can see it. Replacing 0152's
+    // `VALIDATE CONSTRAINT` with `SELECT 1` left this crate's suite byte-identical, and
+    // deleting `NOT VALID` from 0151 produces an END-STATE SCHEMA that is indistinguishable
+    // from the correct one, so no assertion about the constraint's definition could catch
+    // either. `convalidated` is the one column that separates them, and the split exists so
+    // the validating scan does not hold AccessExclusiveLock on a table that grows with
+    // production traffic.
+    let approved_has_grant = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def, convalidated \
+         FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'backchannel_authentication_requests'::regclass \
+           AND conname = 'backchannel_authentication_requests_approved_has_grant'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the CIBA approved-has-grant CHECK must exist");
+    let approved_has_grant_def: String = approved_has_grant.get("def");
+    let approved_has_grant_validated: bool = approved_has_grant.get("convalidated");
+    assert!(
+        approved_has_grant_def.contains("status <> 'approved'::text")
+            && approved_has_grant_def.contains("grant_id IS NOT NULL"),
+        "the CHECK must still say that an approved request names a grant: {approved_has_grant_def}"
+    );
+    assert!(
+        approved_has_grant_validated,
+        "0152 must VALIDATE the constraint 0151 adds NOT VALID. An unvalidated constraint is \
+         enforced on new rows but leaves a permanent 'we never checked' on a table whose \
+         whole argument is that the shape is unrepresentable, and this is the only column \
+         that can tell the two files apart from their end state"
+    );
+
     // The closed reason and state CHECKs pin their sets: an unknown reason or state can never
     // be written.
     let reason_check: String = sqlx::query(
