@@ -3893,6 +3893,15 @@ export interface components {
             event_type_filter?: string[] | null;
             /** @description Scope the stream to one organization. Absent means environment-wide. */
             organization_id?: string | null;
+            /**
+             * @description The NAME of the environment secret to SIGN batches with. Absent ships unsigned.
+             *
+             *     Signing is what lets a SIEM check authenticity and replay once a batch has left TLS
+             *     and landed in an object store or a log index. See `docs/log-stream-verification.md`.
+             *     Setting it here is a control-plane act by design: the app role that ships batches can
+             *     read this name and cannot change it, or it could sign with a key it chose.
+             */
+            signing_secret_name?: string | null;
             /** @description Sink shape: endpoint, and for S3 a bucket and region. NEVER a credential. */
             sink_config?: Record<string, never> | null;
             /** @description `http`, `s3`, `datadog`, or `splunk_hec`. */
@@ -4917,6 +4926,13 @@ export interface components {
             last_success_at_unix_micros?: number | null;
             /** @description The organization this stream is scoped to, or absent for the whole environment. */
             organization_id?: string | null;
+            /**
+             * @description The NAME of the environment secret batches are signed with, never its value, and
+             *     absent when the stream ships unsigned. An operator has to be able to see WHICH
+             *     streams are signed and with what, or they cannot tell a stream that lost its
+             *     signature from one that never had one.
+             */
+            signing_secret_name?: string | null;
             /** @description Where it ships to: `http`, `s3`, `datadog`, or `splunk_hec`. */
             sink_type: string;
             /** @description Which audit stream(s) this ships: `admin_action`, `authentication`, or `both`. */
