@@ -262,8 +262,6 @@ async fn start_device_flow(harness: &Harness, client_id: &str) -> (String, Strin
     )
 }
 
-/// Sign a fresh human in and APPROVE the device flow identified by `user_code` at the
-/// verification page, exactly as `crates/ironauth-oidc/tests/device.rs` drives it.
 /// Start a CIBA backchannel authentication and APPROVE it, returning the `auth_req_id`.
 ///
 /// Approved, and an earlier version of this was not, on the assumption that the fence runs
@@ -341,6 +339,8 @@ async fn start_ciba_flow(
     auth_req_id
 }
 
+/// Sign a fresh human in and APPROVE the device flow identified by `user_code` at the
+/// verification page, exactly as `crates/ironauth-oidc/tests/device.rs` drives it.
 async fn approve_device_flow(harness: &Harness, user_code: &str) {
     let scope = harness.scope();
     let path = format!("/t/{}/e/{}/device", scope.tenant(), scope.environment());
@@ -535,7 +535,11 @@ struct GrantCredentials {
     assertion: String,
     /// An APPROVED device code, so a poll with it is one that would have minted.
     device_code: String,
-    /// A real, unapproved CIBA request. See `start_ciba_flow` for why unapproved.
+    /// An APPROVED CIBA request, so a redemption with it is one that would have minted,
+    /// exactly as `device_code` above is approved. See `start_ciba_flow` for why: an
+    /// UNAPPROVED request answers `authorization_pending` and never reaches the fence,
+    /// which would put this credential a shorter distance into the endpoint than the
+    /// five it is being compared with.
     auth_req_id: String,
     /// A LIVE access token, minted while the scope was still serving, for the RFC 8693
     /// exchange to present as its `subject_token`.
@@ -994,7 +998,9 @@ async fn every_token_endpoint_grant_answers_a_fenced_scope_the_same_way() {
     // That census used to be a claim this file could not check, because the grants
     // were hand-written string labels: deleting one left the suite green. It is now
     // DRIVEN off `GrantType::ALL` and checked against it below, so an undriven grant
-    // and a sixth grant added later both fail here.
+    // and a newly added grant both fail here. Deliberately not "a sixth grant": this
+    // sentence has been wrong once per grant landed, and the census it describes is
+    // count-free, so its description should be too.
     //
     // Every credential below is obtained while the scope is healthy, because that is
     // the only way to hold one: a caller who has none never reaches this refusal at
@@ -1040,7 +1046,8 @@ async fn every_token_endpoint_grant_answers_a_fenced_scope_the_same_way() {
         )
         .await;
 
-    // The first bundle: one live credential per grant, all five taken while serving.
+    // The first bundle: one live credential per grant that needs one, every one taken
+    // while serving (client_credentials needs none, it authenticates on each request).
     let suspended_credentials = grant_credentials(&harness, &issuer_key, "jti-fence-suspend").await;
 
     // The fence goes up with every credential already in hand and the issuer entry
@@ -1109,7 +1116,7 @@ async fn every_token_endpoint_grant_answers_a_fenced_scope_the_same_way() {
     );
 
     // Resumed: every one of those credentials still works, so the fence refused them
-    // without spending any of them. This is the sweep's version of "the code is not
+    // without spending any of them (all five re-driven below, CIBA included). This is the sweep's version of "the code is not
     // burned", and it is what makes the refusal safe to retry after the suspension.
     set_serving(&harness, &scope, "active").await;
     let (status, body) = exchange(&harness, &suspended_credentials.code).await;
@@ -1149,6 +1156,28 @@ async fn every_token_endpoint_grant_answers_a_fenced_scope_the_same_way() {
         status,
         StatusCode::OK,
         "the approved device flow the fence refused was not consumed by it: {body}"
+    );
+    // CIBA is the arm this half most needs and for one release did not have. Every other
+    // credential here is refused by the fence having touched nothing; the CIBA grant polls
+    // FIRST, and a poll is a WRITE (it advances `last_poll_at` and can raise
+    // `interval_secs`). So this is the one grant where "the fence refused it" and "the
+    // fence cost it nothing" are genuinely separate claims, and the comment above, which
+    // says every one of those credentials still works, was describing four of five.
+    //
+    // Paced past the interval first, so a `slow_down` from the refused polls cannot be
+    // mistaken for the approval having survived.
+    harness.clock().advance(Duration::from_secs(6));
+    let (status, _headers, body) = harness
+        .token(&form(&[
+            ("grant_type", GrantType::CIBA_URN),
+            ("auth_req_id", &suspended_credentials.auth_req_id),
+            ("client_id", &public_client),
+        ]))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the approved backchannel request the fence refused was not consumed by it: {body}"
     );
 
     // THE OFFBOARD DIFFERENTIAL. "Suspended and offboarded render identically" is

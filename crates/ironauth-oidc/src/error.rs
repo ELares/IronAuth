@@ -443,9 +443,11 @@ impl TokenError {
         match self {
             TokenError::InvalidRequest(message) => message,
             TokenError::InvalidClient { .. } => "client authentication failed",
-            TokenError::InvalidGrant => {
-                "the authorization code is invalid, expired, or already used"
-            }
+            // Grant-AGNOSTIC. This variant is returned by the authorization-code,
+            // device, CIBA, refresh, and token-exchange grants alike, so naming one
+            // credential told a CIBA client its authorization code was bad when it had
+            // never sent one.
+            TokenError::InvalidGrant => "the presented grant is invalid, expired, or already used",
             TokenError::InvalidScope => "the requested scope is invalid for this grant",
             TokenError::InvalidTarget => {
                 "the requested resource is invalid, unknown, or not allowed for this client"
@@ -461,7 +463,9 @@ impl TokenError {
             }
             TokenError::SlowDown => "polling too frequently; increase the polling interval",
             TokenError::AccessDenied => "the authorization request was denied",
-            TokenError::ExpiredToken => "the device code has expired; start a new device flow",
+            // Also the CIBA answer for a request past its TTL, so it does not say
+            // "device" and does not tell a backchannel client to start a device flow.
+            TokenError::ExpiredToken => "the authorization request has expired; start a new one",
             TokenError::ServerError => "the request could not be processed",
             // Says only that the request cannot be served right now, and never
             // whether the environment is suspended, offboarded, or unknown to this

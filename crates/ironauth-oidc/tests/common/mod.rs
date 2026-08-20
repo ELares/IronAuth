@@ -2376,7 +2376,7 @@ impl Harness {
         format!("ira_dc_{id}~unused-secret")
     }
 
-    /// A well-formed  in this scope that names no stored request (issue #131).
+    /// A well-formed `auth_req_id` in this scope that names no stored request (issue #131).
     ///
     /// The CIBA grant recovers its scope from the handle before authenticating the client, so
     /// a probe has to parse and declare its scope to reach the grant-restriction seam at all.

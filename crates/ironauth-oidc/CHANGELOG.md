@@ -6,6 +6,30 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The OpenID CIBA token grant (issue #131).** `POST /token` now services
+  `grant_type=urn:openid:params:grant-type:ciba`, exchanging an approved `auth_req_id` for
+  an ID token and an access token. Note the `openid` namespace: CIBA Core is an OpenID
+  Foundation specification, so the URN is not the `urn:ietf:params:oauth:` one every other
+  grant in this crate uses.
+
+  Wire-visible in discovery: `grant_types_supported` is generated from `GrantType::ALL`, so
+  every environment now advertises the CIBA grant, and with it the two fields CIBA Core 1.0
+  section 4 makes REQUIRED of an OP that supports one, `backchannel_authentication_endpoint`
+  and `backchannel_token_delivery_modes_supported` (`["poll"]`; ping and push are not
+  implemented and are deliberately not advertised).
+
+  The grant authenticates the client before it touches any poll state, and mints before it
+  consumes: a signing failure must not burn an approval a person gave on another device. It issues no refresh
+  token, and the ID token carries no `sid`, because a backchannel approval records no
+  session for one to name.
+
+  Two `error_description` strings changed for every grant that shares them, because they
+  named a credential the caller may never have sent: `invalid_grant` now reads "the
+  presented grant is invalid, expired, or already used" (was "the authorization code ..."),
+  and `expired_token` now reads "the authorization request has expired; start a new one"
+  (was "the device code has expired; start a new device flow"). The `error` codes are
+  unchanged; only the human-readable descriptions differ.
+
 - **`jwks_uri` key resolution now works in a deployed server at all, which it did not
   before.** `OidcState::new` passes `None` for the client-key resolver and the shipped
   binary called exactly that, so the only `Some(resolver)` call site in the repository was a

@@ -464,7 +464,6 @@ fn mint_auth_req_id(state: &OidcState, id: &BackchannelAuthRequestId) -> (String
     (plaintext, digest)
 }
 
-/// The lowercase hex SHA-256 of `bytes`.
 /// The stored digest for an `auth_req_id` a client has just presented (issue #131).
 ///
 /// The whole string is hashed, prefix and handle and secret together, which is what `create`
@@ -474,6 +473,7 @@ pub(crate) fn auth_req_id_digest(presented: &str) -> String {
     hex_sha256(presented.as_bytes())
 }
 
+/// The lowercase hex SHA-256 of `bytes`.
 fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

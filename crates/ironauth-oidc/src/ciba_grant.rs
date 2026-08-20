@@ -12,7 +12,7 @@
 //! `BackchannelAuthRepo::redeem_approved`'s own documentation: `poll` maps each state to the
 //! error code CIBA Core section 11 requires, so redemption is reached ONLY for a request the
 //! user has approved. A caller that skipped the poll and redeemed directly would get
-//! `Ok(false)` for six different reasons and have to guess which applied, and answering
+//! `Ok(false)` for seven different reasons and have to guess which applied, and answering
 //! `invalid_grant` to a request the user has not yet decided would stop a conforming client
 //! polling before they answer (RFC 8628 section 3.5, which CIBA imports).
 //!
@@ -54,7 +54,16 @@ fn auth_req_id_scope(auth_req_id: &str) -> Option<Scope> {
 /// Every CIBA Core section 11 code, mapped from the poll: `authorization_pending` while the
 /// user has not answered, `slow_down` when the client polled faster than its interval,
 /// `access_denied` on refusal, `expired_token` past the TTL, and `invalid_grant` for an
-/// `auth_req_id` that is unknown, belongs to another client, or has already been redeemed.
+/// `auth_req_id` that is unknown, belongs to another client, or is in another scope.
+///
+/// An ALREADY REDEEMED `auth_req_id` is deliberately not in that list, because it does not
+/// answer `invalid_grant`. `poll` evaluates the interval before the status, so a spent
+/// request polled inside its interval answers `slow_down` and outside it `expired_token`.
+/// Neither is wrong for a client (both are terminal-or-retry codes it already handles), but
+/// the earlier version of this paragraph promised a code the endpoint does not send, and a
+/// spent request answering `slow_down` is worth knowing about: `slow_down` is defined as a
+/// variant of `authorization_pending`, so a client that redeemed once and asks again is told
+/// to keep polling something it has already spent. Bounded by the request TTL.
 pub async fn ciba_grant(
     state: &OidcState,
     headers: &HeaderMap,
@@ -123,6 +132,30 @@ async fn issue_ciba_tokens(
         .await
         .map_err(crate::token::map_store_error)?
         .ok_or(TokenError::InvalidGrant)?;
+
+    // THE user-lifecycle fence. Neither mechanism that fences this crate's other mints
+    // reaches a CIBA request, so this grant has to ask directly.
+    //
+    // The session cascade cannot: `cascade_user_sessions_ended` ends `sessions`,
+    // `client_sessions` and `refresh_families`, and a backchannel request row records no
+    // session at all (`decide` inserts its grant with `session_ref = NULL`). Grant
+    // revocation cannot either: `verify_redemption_grant`'s only liveness term is
+    // `revoked_at IS NULL`, and `cascade_families_for_subject` revokes a grant only under
+    // `hard_kill` and only when a `refresh_families` row names it. This grant issues no
+    // refresh token, so it has no family, so even `delete_user` leaves the approval live.
+    //
+    // Without this call a blocked, disabled, or soft-deleted user's outstanding approval
+    // still mints a full ID and access token for the whole request TTL, and since the
+    // access token is a self-contained `at+jwt` and the ID token carries no `sid`, nothing
+    // downstream can take it back. Measured, before it was added: 200 with live tokens for
+    // both a Blocked and a soft-deleted user.
+    //
+    // Unconditional rather than gated on the subject's SHAPE, for the reason
+    // `resolve_device_sid` gives for its own session-less branch: a CIBA `subject` is a
+    // `usr_` id by construction, copied from the `users` row that `ciba.rs` resolved the
+    // `login_hint` to. Nothing operator-authored reaches here, so there is no workload
+    // identity to exempt.
+    crate::token::ensure_subject_can_authenticate(state, scope, &approved.subject).await?;
 
     // MINTED BEFORE THE CONSUME, exactly as the device and authorization-code grants order
     // it: a signing failure must not burn an approval the person gave on another device.
@@ -227,6 +260,27 @@ async fn mint_ciba_tokens(
         .resolve_access_token_target(&scope, &[], &client_id)
         .await
         .map_err(|_| TokenError::ServerError)?;
+    // FAIL CLOSED on a missing `amr`, rather than passing `""` through.
+    //
+    // `authn::parse_methods("")` does not return "no methods": its `if methods.is_empty()`
+    // fallback returns `vec![AuthMethod::Password]`, and `achieved_acr` on that set returns
+    // the password ACR. So `unwrap_or("")` here made the server sign `amr: ["pwd"]` and a
+    // password `acr` for an authentication it never witnessed, which is precisely what the
+    // paragraph above says this grant must not do. Measured, before this guard: an approval
+    // stored with `auth_methods: None` minted `{"acr":"urn:ironauth:acr:pwd","amr":["pwd"]}`.
+    //
+    // The state is reachable: `BackchannelApprovalLinkage::auth_methods` is an `Option`
+    // defaulting to `None`, `decide` binds it straight through, and
+    // `approval_linkage_is_usable` checks only the grant. An approval that recorded no
+    // method cannot be turned into an honest assertion by this layer, so it is refused as
+    // an unusable grant instead of being guessed at.
+    let auth_methods = approved
+        .auth_methods
+        .as_deref()
+        .map(str::trim)
+        .filter(|methods| !methods.is_empty())
+        .ok_or(TokenError::InvalidGrant)?;
+
     let extra_claims = serde_json::Map::new();
     tokens::mint(
         state,
@@ -240,7 +294,7 @@ async fn mint_ciba_tokens(
             client_id: &client_id,
             nonce: None,
             oauth_scope: approved.requested_scope.as_deref(),
-            auth_methods: approved.auth_methods.as_deref().unwrap_or(""),
+            auth_methods,
             auth_time_unix_micros: approved.auth_time_unix_micros,
             sid: None,
             org_id: None,

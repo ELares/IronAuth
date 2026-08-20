@@ -138,7 +138,8 @@ pub struct TokenParams {
     /// redacted from `Debug`.
     pub assertion: Option<String>,
     /// The CIBA `auth_req_id` (issue #131), presented by a client polling for the tokens its
-    /// backchannel authentication request will produce once the user approves.
+    /// backchannel authentication request will produce once the user approves. A bearer
+    /// credential, so it is redacted from `Debug`.
     pub auth_req_id: Option<String>,
     /// The requested OAuth `scope` for the `client_credentials` grant (RFC 6749
     /// 4.4.2, issue #23) and the JWT bearer assertion grant (RFC 7521, issue #26).
@@ -183,6 +184,11 @@ impl fmt::Debug for TokenParams {
             .field("has_refresh_token", &self.refresh_token.is_some())
             .field("has_assertion", &self.assertion.is_some())
             .field("has_device_code", &self.device_code.is_some())
+            // The CIBA `auth_req_id` is a live bearer credential: presence only. It was
+            // safe by OMISSION for one release (this impl ends
+            // `finish_non_exhaustive`), which is the kind of safety a later edit removes
+            // without tripping anything, so it is now stated rather than inferred.
+            .field("has_auth_req_id", &self.auth_req_id.is_some())
             // Both exchange tokens are bearer credentials: presence only, never the value.
             .field("has_subject_token", &self.subject_token.is_some())
             .field("subject_token_type", &self.subject_token_type)

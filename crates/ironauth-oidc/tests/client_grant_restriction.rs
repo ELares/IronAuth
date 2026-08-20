@@ -221,11 +221,6 @@ async fn every_grant_handler_consults_the_shared_seam() {
                 ("grant_type", grant.as_str()),
                 ("device_code", device_code_handle.as_str()),
             ],
-            // The exchange runs the seam immediately after client authentication and
-            // BEFORE it revalidates either presented token, so the subject token here
-            // need only be present and well-typed. That ordering is the point: a client
-            // not registered for this grant is refused without the server telling it
-            // anything about the token it sent.
             // CIBA recovers its scope from the `auth_req_id` before the client is
             // authenticated, exactly as the device grant does, so the handle must be well
             // formed in this scope to reach the seam. It need not name a live request: the
@@ -234,6 +229,11 @@ async fn every_grant_handler_consults_the_shared_seam() {
                 ("grant_type", grant.as_str()),
                 ("auth_req_id", auth_req_handle.as_str()),
             ],
+            // The exchange runs the seam immediately after client authentication and
+            // BEFORE it revalidates either presented token, so the subject token here
+            // need only be present and well-typed. That ordering is the point: a client
+            // not registered for this grant is refused without the server telling it
+            // anything about the token it sent.
             GrantType::TokenExchange => vec![
                 ("grant_type", grant.as_str()),
                 ("subject_token", "ira_at_not_a_real_token"),

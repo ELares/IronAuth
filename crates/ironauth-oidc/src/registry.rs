@@ -8,15 +8,17 @@
 //! illegal states are unrepresentable, because the enums have no variant for
 //! them and the parsers map every forbidden spelling to `None`.
 //!
-//! - [`GrantType`] is closed around the six grants the token endpoint services,
+//! - [`GrantType`] is closed around the seven grants the token endpoint services,
 //!   which [`GrantType::ALL`] names: `authorization_code`, `refresh_token`,
 //!   `client_credentials`, the JWT bearer assertion grant, the RFC 8628 device
-//!   grant, and the RFC 8693 token-exchange grant. There is no `Password` variant,
-//!   so the resource-owner-password-credentials (ROPC) grant has no value to match
-//!   and no handler to route to: it is absent, not disabled. (This list read
-//!   "exactly one variant" until the four grants after the first had shipped past
-//!   it, and read "five" until the exchange landed; it is [`GrantType::ALL`] that
-//!   other code cites as the authority, so the two must agree.)
+//!   grant, the RFC 8693 token-exchange grant, and the OpenID CIBA grant. There is
+//!   no `Password` variant, so the resource-owner-password-credentials (ROPC) grant
+//!   has no value to match and no handler to route to: it is absent, not disabled.
+//!   (This list read "exactly one variant" until the four grants after the first had
+//!   shipped past it, read "five" until the exchange landed, and read "six" until
+//!   CIBA did; it is [`GrantType::ALL`] that other code cites as the authority, so
+//!   the two must agree. Three corrections in, the pattern is clear enough to say
+//!   plainly: a grant is not added until this sentence counts it.)
 //! - [`ResponseType`] is closed around a SET of exactly four members: `code`,
 //!   `code id_token`, `id_token`, and `none`. There is NO component for an
 //!   access token anywhere in the type, so NONE of the token-bearing response
@@ -54,7 +56,8 @@
 /// 2.1 rotation and reuse-detection rules, issue #21), the client-credentials
 /// grant (RFC 6749 4.4, machine-to-machine, issue #23), the JWT bearer assertion
 /// grant (RFC 7521 4.1 / RFC 7523 2.1, issue #26), the device grant (RFC 8628,
-/// issue #24), and the token-exchange grant (RFC 8693, issue #125).
+/// issue #24), the token-exchange grant (RFC 8693, issue #125), and the CIBA grant
+/// (OpenID CIBA Core 1.0, issue #131).
 /// [`GrantType::ALL`] is that list in code, and callers that need to be
 /// exhaustive over the token endpoint's grants drive off it. ROPC (`password`) and
 /// every other grant are simply absent, so there is no way to name one at this
