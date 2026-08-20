@@ -1061,6 +1061,31 @@ pub fn position_header_value(stream_id: &str, sequence: i64, cursor_id: &str) ->
     format!("{stream_id} {sequence} {cursor_id}")
 }
 
+/// The headers the S3 PUT actually carries, derived from the set that was signed.
+///
+/// `host` travels as the URL's authority rather than a header (which is what the outgoing
+/// list has always done), and `authorization` is the product of signing, so those two differ.
+/// Everything else, including the batch metadata, is by construction the same list the
+/// signature covers.
+///
+/// A function rather than an inline filter so the derivation itself is testable. It is the
+/// one remaining point where the signed and sent sets could disagree: widening the predicate
+/// would send fewer headers than `SignedHeaders` names. That direction is fail-loud, since
+/// real S3 answers `SignatureDoesNotMatch` rather than accepting a weaker object, but the
+/// dangerous direction was silent and this keeps both under one assertion.
+#[must_use]
+pub fn s3_outgoing_headers(
+    signed: Vec<(String, String)>,
+    authorization: String,
+) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = signed
+        .into_iter()
+        .filter(|(name, _)| name != "host")
+        .collect();
+    headers.push(("authorization".to_string(), authorization));
+    headers
+}
+
 /// The headers an S3 PUT of a batch is SIGNED over: host, the two `x-amz-*` request headers,
 /// and the batch metadata.
 ///
@@ -1299,20 +1324,7 @@ impl LogSink for S3LogSink {
             post_object(
                 &fetcher,
                 format!("{}{path}", endpoint.trim_end_matches('/')),
-                {
-                    // DERIVED from the signed set, not rebuilt beside it. `host` travels as
-                    // the URL's authority rather than a header, and `authorization` is the
-                    // product of signing, so those two differ; everything else, including the
-                    // batch metadata, is by construction the same list that was signed.
-                    // Rebuilding it made it a one-line edit to send metadata that was not
-                    // signed, or sign metadata that was not sent.
-                    let mut headers: Vec<(String, String)> = signed_headers
-                        .into_iter()
-                        .filter(|(name, _)| name != "host")
-                        .collect();
-                    headers.push(("authorization".to_string(), authorization));
-                    headers
-                },
+                s3_outgoing_headers(signed_headers, authorization),
                 body,
             )
             .await

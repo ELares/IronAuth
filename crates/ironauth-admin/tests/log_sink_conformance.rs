@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use ironauth_admin::log_shipper::{
     DatadogSink, HttpLogSink, LogSink, S3LogSink, SinkOutcome, SplunkHecSink, datadog_body,
-    s3_batch_metadata, s3_signed_put_headers, signed_batch_headers, splunk_body,
+    s3_batch_metadata, s3_outgoing_headers, s3_signed_put_headers, signed_batch_headers,
+    splunk_body,
 };
 use ironauth_store::log_stream::{LogStreamRecord, SinkType, StreamHealth, StreamSource};
 use serde_json::{Value, json};
@@ -425,4 +426,48 @@ fn an_unsigned_s3_batch_signs_only_the_request_headers() {
     let signed = s3_signed_put_headers("h", "p", "t", "lgs_stream", None, (4242, "aud_01J8ZQ"));
     let names: Vec<&str> = signed.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["host", "x-amz-content-sha256", "x-amz-date"]);
+}
+
+/// What the S3 PUT SENDS is exactly what it SIGNED, minus `host` and plus `authorization`.
+///
+/// # The last divergence point
+///
+/// The signed set and the outgoing set now come from one vector, so metadata cannot be
+/// signed-but-not-sent by deleting a list. What remained was the filter PREDICATE: widening
+/// it by one clause would send fewer headers than `SignedHeaders` names.
+///
+/// That direction is fail-loud, because real S3 answers `SignatureDoesNotMatch` rather than
+/// accepting a weaker object, so it is not the dangerous case. It is pinned anyway, because
+/// "the signed set and the sent set agree" is one assertion covering both directions, and the
+/// other direction was silent.
+#[test]
+fn the_s3_put_sends_exactly_what_it_signed() {
+    let signed = s3_signed_put_headers(
+        "audit.s3.amazonaws.com",
+        "e3b0c442",
+        "20260819T000000Z",
+        "lgs_stream",
+        Some("deadbeefcafe"),
+        (4242, "aud_01J8ZQ"),
+    );
+    let outgoing = s3_outgoing_headers(signed.clone(), "AWS4-HMAC-SHA256 ...".to_string());
+
+    for (name, value) in signed.iter().filter(|(name, _)| name != "host") {
+        assert!(
+            outgoing.contains(&(name.clone(), value.clone())),
+            "{name} was signed but is not sent, so SignedHeaders names a header the request \
+             does not carry: {outgoing:?}"
+        );
+    }
+    let sent: Vec<&str> = outgoing.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(
+        !sent.contains(&"host"),
+        "host travels as the URL authority, not a header"
+    );
+    assert_eq!(
+        sent.len(),
+        signed.len(),
+        "one header out (host), one in (authorization): any other difference means the sent \
+         set and the signed set have drifted: {sent:?}"
+    );
 }
