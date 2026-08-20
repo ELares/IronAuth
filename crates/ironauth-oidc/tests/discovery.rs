@@ -724,7 +724,6 @@ fn rs256_floor_is_the_only_advertised_alg_that_need_not_be_policy_permitted() {
     assert!(id_token_signing_alg_values(&policy).contains(&"RS256".to_owned()));
 }
 
-/// A `*_supported` (or any) JSON array field as owned strings.
 /// Advertising the CIBA grant obliges the document to say where a flow starts.
 ///
 /// `grant_types_supported` is generated from `GrantType::ALL`, so the CIBA variant
@@ -761,9 +760,10 @@ fn advertising_ciba_obliges_the_two_required_ciba_fields() {
         Some(format!("{ISSUER_BASE}/backchannel_authenticate").as_str()),
         "CIBA Core section 4 requires the endpoint, and it must be the mounted route: {doc:?}"
     );
-    // `poll` only. Ping mode's `client_notification_token` is accepted by the endpoint but
-    // nothing schedules the notification, so advertising it would promise a callback that
-    // never arrives.
+    // `poll` only. Ping is unreachable for two reasons, neither of which is "nothing
+    // schedules the notification" (`decide` does enqueue one): `CibaPingConsumer` has no
+    // caller outside its own module and tests, and `backchannel_delivery_mode` has no
+    // production writer. See the generator for the full note.
     assert_eq!(
         string_array(&doc, "backchannel_token_delivery_modes_supported"),
         vec!["poll".to_owned()],
@@ -771,6 +771,7 @@ fn advertising_ciba_obliges_the_two_required_ciba_fields() {
     );
 }
 
+/// A `*_supported` (or any) JSON array field as owned strings.
 fn string_array(doc: &Value, key: &str) -> Vec<String> {
     doc[key]
         .as_array()

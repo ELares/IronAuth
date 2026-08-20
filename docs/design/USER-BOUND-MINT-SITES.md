@@ -58,7 +58,7 @@ functions that produce a token artifact:
 It writes `<count>\t<path>` per file and diffs the result against the committed inventory.
 A new call in an existing file bumps its count; a call in a new file adds a row. Either
 way the diff is non-empty and CI fails until an author regenerates the inventory AND names
-the file in the table below. There are ten call sites across six files today.
+the file in the table below. The inventory is generated, so the count lives there rather than in this sentence: an earlier version of it read "ten call sites across six files" and went stale the moment CIBA landed, which is the same failure mode as a hand-written count beside a computed one.
 
 The doc check matches the FULL PATH, which is why the table below carries full paths. It
 matched a BASENAME first, and that was a hole of its own: a NEW mint file whose basename
@@ -153,27 +153,5 @@ what stops it.
 | `crates/ironauth-oidc/src/jwt_bearer.rs` | The RFC 7523 assertion grant's access token | **Operator-authored.** The `principal` string on a registered subject-mapping rule, which may be a lifecycle-bearing `usr_` user OR a workload identity (SPIRE, Kubernetes, GitHub Actions) | **Directly, and CONDITIONALLY.** The other path issue #241 was filed for. There is no session and no user credential here, so neither the cascade nor anything else reached it. `fence_mapped_principal` classifies the principal through `MappedPrincipal` and applies `subject_can_authenticate` to a user, refuses a user id from another scope as unfenceable, and deliberately SKIPS a workload. The skip is not laxity: `state_for_subject` queries the `users` table, so fencing a workload would fail closed on every legitimate workload assertion in the deployment |
 | `crates/ironauth-oidc/src/client_credentials.rs` | The RFC 6749 4.4 machine access token | An `sva_` service-account id | **Nothing, and correctly.** Not user bound. Its subject is not operator-authored the way jwt-bearer's is: it comes from `service_accounts().ensure()`, which mints an `sva_` id keyed to the client, so a `usr_` principal is unreachable here by construction rather than by convention. The client's own revocation is the fence |
 | `crates/ironauth-oidc/src/token_exchange.rs` | The RFC 8693 exchange's access token | **Whatever the subject token carried.** A `usr_` id when the subject token came from a user flow, an `sva_` service account when it came from the client-credentials grant | **Directly, and CONDITIONALLY**, like jwt-bearer and for the same reason: there is no live session between the presented subject token and this mint, so the cascade cannot reach it, and the subject token stays cryptographically valid for its full lifetime after the account is fenced. `fence_principal` classifies through the SAME `MappedPrincipal` and applies `subject_can_authenticate` to a user, refuses a user id from another scope as unfenceable, and skips a workload (fencing one would query `users` for an id that is not there and fail closed on every legitimate machine exchange). It is applied to BOTH principals: the subject, and in a delegation the ACTOR, because the issued token names the actor as the party driving it and fencing only the subject would leave open the half that hands out somebody else's authority. What makes this mint distinctive is that it REPEATS: an exchange yields a token that can itself be exchanged, so an unfenced path here does not merely outlive the block once, it renews indefinitely. MEASURED by `a_fenced_user_cannot_have_their_token_exchanged` (blocked and disabled) and `a_fenced_actor_cannot_delegate`, each against an ACTIVE control that mints first |
-
+| `crates/ironauth-oidc/src/ciba_grant.rs` | The CIBA grant's ID + access token | The `usr_` id the backchannel request named, resolved from the `login_hint` to a live `users` row by `ciba.rs` before the request is stored | **Directly, and UNCONDITIONALLY.** A third path of the shape issue #241 was filed for, and the one where BOTH existing mechanisms miss rather than one. The session cascade cannot reach it: `cascade_user_sessions_ended` updates `sessions`, `client_sessions` and `refresh_families`, and a backchannel request records no session at all (`decide` inserts its grant with `session_ref = NULL`). Grant revocation cannot either: `verify_redemption_grant`'s only liveness term is `revoked_at IS NULL`, and `cascade_families_for_subject` revokes a grant only under `hard_kill` and only when a `refresh_families` row names it. This grant issues no refresh token, so it has no family, so even `delete_user` leaves the approval live. `issue_ciba_tokens` therefore calls `ensure_subject_can_authenticate` before `mint_ciba_tokens`. Unconditional rather than shape-gated, for the reason `resolve_device_sid` gives on its session-less branch: the subject is a `usr_` id by construction and nothing operator-authored reaches here. MEASURED by `a_fenced_user_cannot_redeem_an_approved_backchannel_request` in `crates/ironauth-oidc/tests/ciba_grant.rs` across every `UserState` plus a soft delete, against an ACTIVE control that mints. Before the fence existed, a Blocked and a soft-deleted user each answered 200 with a live ID token and access token. What makes this mint distinctive is that there is no way to take one back: the access token is a self-contained `at+jwt`, and the ID token carries no `sid`, so back-channel logout has nothing to target |
 ## Adding a token mint
-
-1. Write the call. `scripts/invariant-lints.sh` fails.
-2. Answer one question: **can the account this token is minted for be blocked, disabled,
-   or deleted?** If no (a service account, a machine principal), say so in the table and
-   say what makes a user principal structurally unreachable there.
-3. If yes, the token must stop being mintable the moment that account is fenced. Two
-   mechanisms exist; pick deliberately and record which:
-   - **The session cascade**, if the mint is downstream of a read of live SSO-session
-     state. Cheap, and already there. Check for a branch that SKIPS the session read: all
-     three paths issue #241 fixed were exactly that branch, and two of them were reached
-     by a `let Some(..) = .. else { return Ok(None) }` whose doc said "no session to
-     check" and meant "no check".
-   - **The direct read**, `crate::token::ensure_subject_can_authenticate` (or
-     `subject_can_authenticate` when the caller needs its own error shape). Required
-     wherever no live session stands between the presented credential and the mint: the
-     refresh grant, because an offline family outlives the cascade by design, and
-     jwt-bearer, because a trusted external issuer holds the credential and the fenced
-     user holds nothing at all.
-4. If the principal might NOT be lifecycle bearing, discriminate STRUCTURALLY, by parsing
-   it as a `UserId`, never by comparing it against a spelled-out prefix. See
-   `jwt_bearer::MappedPrincipal` for why, and for the third case a two-valued test misses.
-5. Regenerate the inventory (run the lint; it rewrites the file) and commit it.

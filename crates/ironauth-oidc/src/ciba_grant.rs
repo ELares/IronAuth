@@ -54,7 +54,16 @@ fn auth_req_id_scope(auth_req_id: &str) -> Option<Scope> {
 /// Every CIBA Core section 11 code, mapped from the poll: `authorization_pending` while the
 /// user has not answered, `slow_down` when the client polled faster than its interval,
 /// `access_denied` on refusal, `expired_token` past the TTL, and `invalid_grant` for an
-/// `auth_req_id` that is unknown, belongs to another client, or is in another scope.
+/// `auth_req_id` that is unknown or belongs to another client.
+///
+/// NOT for one in another SCOPE, which the previous version of this sentence claimed and
+/// which is measurably false: `auth_req_id_scope` recovers the DECLARED scope from the
+/// credential, so `authenticate_token_client` runs in that scope, does not find the caller's
+/// client there, and answers `401 invalid_client`. Another scope is therefore always
+/// distinguishable from unknown. That does not weaken the oracle argument on the `NotFound`
+/// arm below, which is about not distinguishing an unknown request from ANOTHER CLIENT'S
+/// request within one scope, but the two had been written as though they were the same
+/// claim. A malformed or absent `auth_req_id` is `invalid_request`, not `invalid_grant`.
 ///
 /// An ALREADY REDEEMED `auth_req_id` is deliberately not in that list, because it does not
 /// answer `invalid_grant`. `poll` evaluates the interval before the status, so a spent
@@ -274,12 +283,39 @@ async fn mint_ciba_tokens(
     // `approval_linkage_is_usable` checks only the grant. An approval that recorded no
     // method cannot be turned into an honest assertion by this layer, so it is refused as
     // an unusable grant instead of being guessed at.
+    // The check is on RECOGNITION, not on emptiness. An earlier version of this guard
+    // rejected only `None` and blank-after-trim, which closed one door and left the wider
+    // one open: `parse_methods` filters to tokens it recognizes AND that are currently
+    // active, and falls back to `[AuthMethod::Password]` whenever THAT set comes out empty.
+    // So any non-blank string of unrecognized spellings landed in exactly the same
+    // fallback. Measured against the narrower guard: `Some("smartcard")` and
+    // `Some("pwd,otp")` (a comma, where the parser splits on whitespace) both minted
+    // `acr: "urn:ironauth:acr:pwd"` and `amr: ["pwd"]`.
+    //
+    // The wider door is the more reachable one. `BackchannelApprovalLinkage::auth_methods`
+    // is a free-form `Option<&str>` that `decide` binds through with no validation, and the
+    // approval surface that will eventually populate it passes a string: one wrong spelling
+    // ("webauthn" for the token this crate actually uses) silently asserts a password
+    // authentication that never happened.
+    //
+    // Every OTHER `parse_methods` caller reads a value written by `methods_token`, so it
+    // round-trips by construction and cannot reach the fallback. CIBA is the only caller
+    // whose input crosses a trust boundary this layer does not own, so the check belongs
+    // here rather than inside `parse_methods`, whose under-claiming fallback is correct for
+    // the callers it was written for.
     let auth_methods = approved
         .auth_methods
         .as_deref()
         .map(str::trim)
         .filter(|methods| !methods.is_empty())
         .ok_or(TokenError::InvalidGrant)?;
+    if !auth_methods
+        .split_whitespace()
+        .filter_map(crate::authn::AuthMethod::from_token)
+        .any(crate::authn::AuthMethod::is_active)
+    {
+        return Err(TokenError::InvalidGrant);
+    }
 
     let extra_claims = serde_json::Map::new();
     tokens::mint(

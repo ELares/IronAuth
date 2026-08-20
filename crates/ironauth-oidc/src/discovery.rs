@@ -559,10 +559,21 @@ pub fn discovery_document(
     // where to start a flow, and the document is self-contradictory rather than merely
     // incomplete.
     //
-    // `poll` is the only delivery mode this deployment implements. Ping and push are
-    // deliberately NOT listed: the endpoint accepts a `client_notification_token` for ping
-    // mode, but nothing schedules the notification, so listing it would advertise a
-    // callback that never arrives.
+    // `poll` is the only delivery mode a client can actually be served, and the reason is
+    // NOT that "nothing schedules the notification": `decide` enqueues a ping outbox message
+    // inside the approval transaction, and `ironauth_admin::ciba_ping::CibaPingConsumer`
+    // exists with its own suite. Two other things make ping unreachable:
+    //
+    // - `CibaPingConsumer` has no caller outside its own module and tests, so nothing
+    //   registers it with a worker pool and the enqueued message is never consumed.
+    // - `backchannel_delivery_mode` has no production writer. Migration 0148 defaults it to
+    //   `poll` and the only write in the tree is test SQL, so no client can be registered
+    //   for ping in the first place.
+    //
+    // Written out because the earlier one-line reason was wrong in a way that would mislead
+    // exactly the person it is aimed at: whoever wires the consumer will read "nothing
+    // schedules the notification", find that something does, and not think to revisit this
+    // list. Both bullets have to stop being true before `ping` belongs here.
     document.insert(
         "backchannel_token_delivery_modes_supported".to_owned(),
         json!(["poll"]),

@@ -1115,8 +1115,11 @@ async fn every_token_endpoint_grant_answers_a_fenced_scope_the_same_way() {
          here is a minting path whose fenced answer nothing checks"
     );
 
-    // Resumed: every one of those credentials still works, so the fence refused them
-    // without spending any of them (all five re-driven below, CIBA included). This is the sweep's version of "the code is not
+    // Resumed: the credentials re-driven below still work, so the fence refused them
+    // without spending them. Deliberately not a count: `GrantCredentials` carries six and
+    // this re-drives four of them (the assertion and the exchange's access token are not
+    // re-driven), and the census comment further up this file was just de-counted for
+    // exactly this reason. A hard number here would have gone stale the same way. This is the sweep's version of "the code is not
     // burned", and it is what makes the refusal safe to retry after the suspension.
     set_serving(&harness, &scope, "active").await;
     let (status, body) = exchange(&harness, &suspended_credentials.code).await;
@@ -1160,12 +1163,25 @@ async fn every_token_endpoint_grant_answers_a_fenced_scope_the_same_way() {
     // CIBA is the arm this half most needs and for one release did not have. Every other
     // credential here is refused by the fence having touched nothing; the CIBA grant polls
     // FIRST, and a poll is a WRITE (it advances `last_poll_at` and can raise
-    // `interval_secs`). So this is the one grant where "the fence refused it" and "the
-    // fence cost it nothing" are genuinely separate claims, and the comment above, which
-    // says every one of those credentials still works, was describing four of five.
+    // `interval_secs`).
     //
-    // Paced past the interval first, so a `slow_down` from the refused polls cannot be
-    // mistaken for the approval having survived.
+    // So state precisely what this proves and what it does not. It proves the APPROVAL
+    // survived: the fence did not consume it, and it still mints once the scope resumes.
+    // It does NOT prove the refusal was free. Measured by re-driving with no clock advance
+    // at all, the answer is `400 slow_down`: the refused 503s advanced `last_poll_at` and
+    // escalated the interval, because the poll runs before `grant_issuer_entry` (which is
+    // reached inside `mint_ciba_tokens`). An earlier version of this comment claimed the
+    // stronger property and then paced 6 seconds past the interval, which hid the very cost
+    // it had just named.
+    //
+    // That is a real asymmetry with `a_refused_call_does_not_advance_the_poll_interval` in
+    // `ciba_grant.rs`, which pins that a refused call must not advance the flow: the
+    // environment fence is a third kind of refusal that does advance it, and nothing
+    // notices. The device grant orders its poll the same way, so this is shared rather than
+    // a CIBA regression, and it is the CLAIM that was new. Left as behaviour and written
+    // down rather than quietly paced around.
+    //
+    // Paced past the interval, so what follows measures the approval and not the pacing.
     harness.clock().advance(Duration::from_secs(6));
     let (status, _headers, body) = harness
         .token(&form(&[

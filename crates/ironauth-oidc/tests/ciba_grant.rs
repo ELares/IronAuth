@@ -338,7 +338,29 @@ async fn an_expired_request_is_expired_token() {
 /// `sid`, so nothing downstream could take either back.
 #[tokio::test]
 async fn a_fenced_user_cannot_redeem_an_approved_backchannel_request() {
-    for state in [UserState::Blocked, UserState::Disabled] {
+    // EVERY state, not the two that were listed. `can_authenticate` is the predicate this
+    // fence delegates to, so driving its whole domain is what makes "a fenced user" mean the
+    // same thing here as it does there. Active and ScheduledOffboarding are authenticatable
+    // and are asserted to MINT, which is what keeps the loop from passing on a grant that
+    // refused everything.
+    for state in UserState::ALL {
+        // The skips are DERIVED from the store's own predicates rather than hand-picked, so
+        // a state added to `UserState::ALL` later lands here instead of being forgotten.
+        //
+        // A seeded user is Active, so `Active.can_transition_to` is exactly the set this
+        // fixture can reach: it refuses the no-op, and refuses `PendingVerification` and
+        // `Waitlisted`, which are creation-time states nothing transitions INTO.
+        // `ScheduledOffboarding` is reachable but needs an instant `set_state_with_event`
+        // demands and the harness helper does not pass; it is authenticatable anyway, so
+        // the fence is not what governs it.
+        //
+        // That currently leaves Blocked and Disabled, which is the same pair an earlier
+        // version listed by hand. The difference is that the pair is now a consequence of
+        // the predicates rather than a choice, and the states outside it are excluded for a
+        // stated reason instead of silently.
+        if !UserState::Active.can_transition_to(state) || state.can_authenticate() {
+            continue;
+        }
         let (harness, client_id) = ciba_harness().await;
         let (auth_req_id, subject) = start_request(&harness, &client_id).await;
         approve(&harness, &auth_req_id, &subject).await;
@@ -358,6 +380,103 @@ async fn a_fenced_user_cannot_redeem_an_approved_backchannel_request() {
         assert!(
             body["access_token"].is_null() && body["id_token"].is_null(),
             "no token may escape for a {state:?} user: {body:?}"
+        );
+    }
+
+    // The SOFT DELETE, which the doc above claims and no assertion made. It is a distinct
+    // path: a deleted row is absent rather than in a refusing state, and `delete_user` is
+    // also the case where grant revocation gets closest to reaching this approval and still
+    // misses, because there is no refresh family for it to cascade through.
+    let (harness, client_id) = ciba_harness().await;
+    let (auth_req_id, subject) = start_request(&harness, &client_id).await;
+    approve(&harness, &auth_req_id, &subject).await;
+    harness.delete_user(&subject).await;
+    pace(&harness);
+    let (status, body) = redeem(&harness, &auth_req_id, &client_id).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a soft-deleted user's approval must not mint: {body:?}"
+    );
+    assert_eq!(body["error"], "invalid_grant", "{body:?}");
+}
+
+/// An approval whose recorded method this layer does not RECOGNIZE is refused.
+///
+/// The wider half of the same defect as the blank case below it, and the more reachable
+/// one. `parse_methods` filters to tokens it recognizes and that are active, then falls
+/// back to `[Password]` when that set is empty, so an unrecognized spelling reaches the
+/// identical fallback that a missing value does. Measured against the earlier guard, which
+/// checked only for emptiness: both of these minted `acr: "urn:ironauth:acr:pwd"` and
+/// `amr: ["pwd"]` with a 200.
+#[tokio::test]
+async fn an_approval_with_an_unrecognized_auth_method_is_refused() {
+    for methods in ["smartcard", "pwd,otp", "PWD", "totally unknown tokens"] {
+        let (harness, client_id) = ciba_harness().await;
+        let (auth_req_id, subject) = start_request(&harness, &client_id).await;
+        decide(&harness, &auth_req_id, &subject, true, Some(methods)).await;
+        pace(&harness);
+
+        let (status, body) = redeem(&harness, &auth_req_id, &client_id).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{methods:?} must not mint a fabricated password authentication: {body:?}"
+        );
+        assert_eq!(body["error"], "invalid_grant", "{methods:?}: {body:?}");
+        assert!(
+            body["id_token"].is_null(),
+            "no ID token may assert a method the approval did not record: {body:?}"
+        );
+    }
+}
+
+/// Whitespace-only is refused, and the trim is what does it.
+///
+/// Without `.map(str::trim)` a `Some("   ")` reaches `parse_methods`, splits to nothing, and
+/// fabricates a password authentication. The trim was load-bearing and untested.
+#[tokio::test]
+async fn an_approval_whose_method_is_only_whitespace_is_refused() {
+    let (harness, client_id) = ciba_harness().await;
+    let (auth_req_id, subject) = start_request(&harness, &client_id).await;
+    decide(&harness, &auth_req_id, &subject, true, Some("   ")).await;
+    pace(&harness);
+
+    let (status, body) = redeem(&harness, &auth_req_id, &client_id).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["error"], "invalid_grant", "{body:?}");
+}
+
+/// A malformed or absent `auth_req_id` is `invalid_request`, and an unrecoverable scope is
+/// `invalid_grant`.
+///
+/// Both were unpinned, and the scope-recovery path is the one that was accidentally
+/// covering the `NotFound` arm before the unknown-request probe was rewritten, so it went
+/// from being over-relied on to being covered by nothing.
+#[tokio::test]
+async fn a_malformed_auth_req_id_is_refused_before_any_poll() {
+    let (harness, client_id) = ciba_harness().await;
+
+    for absent in ["", "   "] {
+        let (status, body) = redeem(&harness, absent, &client_id).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{absent:?}: {body:?}");
+        assert_eq!(
+            body["error"], "invalid_request",
+            "an absent credential is a malformed REQUEST: {body:?}"
+        );
+    }
+
+    // Well-formed enough to be present, but no scope can be recovered from it.
+    for unrecoverable in ["nonsense", "ira_bar_notahandle~c2VjcmV0"] {
+        let (status, body) = redeem(&harness, unrecoverable, &client_id).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{unrecoverable:?}: {body:?}"
+        );
+        assert_eq!(
+            body["error"], "invalid_grant",
+            "an unusable credential is a bad GRANT: {body:?}"
         );
     }
 }
@@ -405,8 +524,19 @@ async fn an_approval_with_no_recorded_auth_method_is_refused() {
     );
 }
 
-/// A redeemed request cannot be redeemed again. The approval is single-use, and the
-/// guard that makes it so is the `redeem_approved` return the grant checks after minting.
+/// A redeemed request cannot be redeemed again.
+///
+/// What answers the second call is the POLL, not the race guard. Measured: a paced replay
+/// answers `expired_token` and a replay an hour later answers `expired_token`, neither of
+/// which reaches `issue_ciba_tokens` at all. An earlier version of this comment credited
+/// the `if !redeemed` check after the mint, which is the same "right answer off the wrong
+/// code path" this file already caught once in its unknown-request probe.
+///
+/// That guard is a genuine race branch: it fires only when two redemptions of one approval
+/// interleave so that both pass the poll and one loses `redeem_approved`. Nothing in this
+/// suite can produce that interleaving, so it is untested here and is recorded as such
+/// rather than left looking covered. The single-use property below is worth pinning on its
+/// own terms: whatever refuses the second call, no second set of tokens may be issued.
 #[tokio::test]
 async fn an_approved_request_redeems_exactly_once() {
     let (harness, client_id) = ciba_harness().await;
