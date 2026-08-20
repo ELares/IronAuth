@@ -3,10 +3,18 @@
 -- An approved backchannel request must name the grant its tokens hang off (issue #131),
 -- added unvalidated. 0152 validates it.
 --
--- Nine rounds of review on the CIBA redemption path found the same family of defect, and
--- every one of them was reachable only through an approved row whose `grant_id` is NULL.
--- The tokens have nothing to hang off, a revocation has nothing to reach, and nothing in
--- the database links the issued tokens back to the `auth_req_id`.
+-- Review of the CIBA redemption path found a family of defects about WHICH grant a
+-- redemption may mint against. Several of them, including the first four rounds' worth, were
+-- reachable through an approved row whose `grant_id` is NULL: the tokens have nothing to hang
+-- off, a revocation has nothing to reach, and nothing in the database links the issued tokens
+-- back to the `auth_req_id`.
+--
+-- NOT all of them, and an earlier version of this sentence said "every one". Later rounds
+-- found holes with a grant_id present and wrong: one minted under another scope, an empty
+-- string, and one that is NOT NULL and simply does not parse, which this repository's own
+-- `an_unparseable_grant_id_refuses_without_consuming_the_request` exercises. This constraint
+-- closes the NULL case only. The others are closed in code, and saying otherwise here would
+-- overstate what a CHECK can do.
 --
 -- The code refuses that shape at three places: `decide` will not create it,
 -- `approved_details` will not report it as redeemable, and `redeem` and `redeem_approved`
@@ -30,22 +38,28 @@
 -- front of every new reader.
 --
 -- `lock_timeout` does not help with that, and an earlier version of this header claimed it
--- did. It bounds how long the migration WAITS FOR the lock, never how long it HOLDS it:
--- measured with `lock_timeout = 1s` against a 3.4s scan, a concurrent reader blocked 2.92s,
--- nearly three times the timeout. 0150 makes the same `lock_timeout` argument soundly only
+-- did. It bounds how long the migration WAITS FOR the lock, never how long it HOLDS it.
+-- Measured on PostgreSQL 18.4 with a deliberately slow CHECK so the scan is observable: a
+-- holder with `SET LOCAL lock_timeout = '1s'` blocked a concurrent reader for the whole of
+-- its hold, well past its own timeout. The absolute figures depend on the row count and the
+-- hardware, so the shape is what is claimed here and not a number. 0150 makes the same `lock_timeout` argument soundly only
 -- because it pairs it with "both tables are small per-environment configuration, so the scan
 -- is short". This table is the opposite of that by construction.
 --
 -- An earlier version also put `ADD ... NOT VALID` and `VALIDATE` in ONE file and claimed the
 -- scan then ran under a light lock. That was wrong, and measurably so: `MigrationRunner`
 -- wraps each FILE in one transaction, so the AccessExclusiveLock from the ADD is held
--- through the VALIDATE, and a reader blocked 2.95s either way.
+-- through the VALIDATE, and a concurrent reader blocked for the whole scan either way.
 --
 -- What that same runner loop gives, and what the earlier header wrongly said would need a
 -- new runner capability, is one transaction PER FILE. So two files are two transactions:
 -- this one takes the heavy lock for an instant and does no scan, and 0152 scans under
--- ShareUpdateExclusiveLock, which blocks neither readers nor writers. Measured: 0.02s for a
--- concurrent reader, against 2.92s for the validating single statement.
+-- ShareUpdateExclusiveLock, which blocks neither readers nor writers. Measured on the same
+-- cluster, and `pg_locks` shows the two modes: alongside the validating scan in its own
+-- transaction a concurrent reader ran to completion, where the single-statement form blocked
+-- it for the whole scan. `tests/migration.rs` pins the outcome, because the end-state schema
+-- is identical either way and only `pg_constraint.convalidated` and the files themselves can
+-- tell the two arrangements apart.
 --
 -- One consequence to know while this file has run and 0152 has not: a violating row is not
 -- merely unredeemable but UNPOLLABLE, because `poll` updates `last_poll_at` and Postgres

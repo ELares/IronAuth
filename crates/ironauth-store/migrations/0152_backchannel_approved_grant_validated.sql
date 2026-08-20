@@ -7,7 +7,7 @@
 -- only ShareUpdateExclusiveLock and blocks neither readers nor writers. Putting both
 -- statements in one file holds the heavy lock across the scan and buys nothing, which an
 -- earlier version of this change did and which was measured: a concurrent reader blocked
--- 2.95s in one file, 0.02s across two.
+-- for the whole scan in one file, and not at all across two.
 --
 -- `NOT VALID` alone would have been enough for correctness, since Postgres enforces such a
 -- constraint on every new row and only skips the back-scan. It is validated anyway because

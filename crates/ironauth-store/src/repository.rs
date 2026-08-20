@@ -64694,12 +64694,17 @@ impl BackchannelAuthRepo<'_> {
     /// scope.
     ///
     /// An earlier version of this line said the query's own predicate made that unreachable.
-    /// It does not, and this method's own body now says so forty lines down: the predicate
-    /// constrains NULLITY, not parseability, and `an_unparseable_grant_id_refuses_without_
-    /// consuming_the_request` reaches this error with a `grants.id` the data plane can write.
+    /// It does not, and this method's own body says so further down: the predicate constrains
+    /// NULLITY, not parseability, and the test named
+    /// `an_unparseable_grant_id_refuses_without_consuming_the_request` reaches this error with
+    /// a `grants.id` the data plane can write.
     /// The absent case is genuinely unreachable behind the predicate, and is refused
     /// explicitly rather than decoded infallibly because an infallible decode panics from
     /// inside the store.
+    ///
+    /// The request's own `id` parses here too and can fail the same way, by the same
+    /// argument: `backchannel_authentication_requests.id` is bare `text NOT NULL` with no
+    /// format check and the application role holds table-wide INSERT.
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn redeem(
@@ -64794,11 +64799,12 @@ impl BackchannelAuthRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the stored `grant_id` is absent or does not parse in this
-    /// scope. The query's own predicate makes the first unreachable and minting discipline
-    /// makes the second unlikely, and neither is a reason to decode infallibly: an infallible
-    /// decode PANICS, from inside the store, which is a worse answer than an error for a row
-    /// somebody wrote around `decide`. Documented here because `redeem` documents the same
-    /// thing and a twin that stays silent is how the pair drifts apart.
+    /// scope, or if the request's own `id` does not parse. The query's own predicate makes
+    /// the absent case unreachable and minting discipline makes the others unlikely, and
+    /// neither is a reason to decode infallibly: an infallible decode PANICS, from inside the
+    /// store, which is a worse answer than an error for a row somebody wrote around `decide`.
+    /// Documented here because `redeem` documents the same thing and a twin that stays silent
+    /// is how the pair drifts apart.
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn approved_details(
@@ -64867,6 +64873,24 @@ impl BackchannelAuthRepo<'_> {
     /// approval mints one set of tokens.
     ///
     /// # Errors
+    ///
+    /// [`StoreError::NotFound`] from every guard this method exists to apply, and the list
+    /// matters more than usual because the token endpoint is the next thing to be written.
+    /// An implementer who reads only "a persistence failure" and maps `Err(_)` to a 500
+    /// answers a server error where the spec wants `invalid_grant`, for each of:
+    ///
+    /// * a `grant_id` minted under another scope
+    /// * an approval that opened no grant, so there is no spine
+    /// * a caller-supplied grant that is not the one the approval opened
+    /// * a grant that is revoked, or does not belong to the presenting client and the
+    ///   approving subject
+    /// * a token or opaque identifier minted under another scope
+    /// * an opaque token claiming a subject, client, grant or scope the approval did not
+    ///   carry
+    ///
+    /// `Ok(false)` is the separate answer for "the request could not be flipped", which
+    /// covers a wrong client, an expired request, and one already redeemed. A caller maps
+    /// both to `invalid_grant`; the distinction is for logs and metrics, not the response.
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn redeem_approved(

@@ -1120,6 +1120,78 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
         .await,
         "signup_quarantines must carry the nonempty-scope CHECK"
     );
+    // AND THE SPLIT ITSELF, read off the files. `convalidated` above proves the END STATE is
+    // right; it cannot prove HOW it got there, and the how is the entire point: one file
+    // holding both statements takes AccessExclusiveLock through the scan, which is what round
+    // 8 of review measured as buying nothing. These two assertions are what make that
+    // regression visible, since collapsing the files back into one leaves the schema
+    // identical.
+    let add_sql = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations/0151_backchannel_approved_requires_grant.sql"),
+    )
+    .expect("0151 is readable");
+    let validate_sql = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations/0152_backchannel_approved_grant_validated.sql"),
+    )
+    .expect("0152 is readable");
+    // STATEMENTS, not the file text. Both headers discuss `NOT VALID` and
+    // `VALIDATE CONSTRAINT` at length, so a `contains` over the whole file matches the PROSE
+    // and passes even when the SQL says the opposite: measured, deleting `NOT VALID` from
+    // 0151's ALTER left that form of this assertion green.
+    let statements_of = |sql: &str| -> String {
+        sql.lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let add_statements = statements_of(&add_sql);
+    let validate_statements = statements_of(&validate_sql);
+    assert!(
+        add_statements.contains("NOT VALID") && !add_statements.contains("VALIDATE CONSTRAINT"),
+        "0151 must ADD the constraint NOT VALID and must NOT validate it: the runner wraps \
+         each FILE in one transaction, so both statements together hold AccessExclusiveLock \
+         across the scan and the split buys nothing. Statements were: {add_statements}"
+    );
+    assert!(
+        validate_statements.contains("VALIDATE CONSTRAINT"),
+        "0152 must be the file that validates, so the scan runs in its own transaction under \
+         ShareUpdateExclusiveLock. Statements were: {validate_statements}"
+    );
+
+    // The CIBA approved-has-grant CHECK is present AND VALIDATED (issue #131), which is the
+    // only observable difference between the two-file split and the one-file version it
+    // replaced.
+    //
+    // It needs asserting because nothing else can see it. Replacing 0152's
+    // `VALIDATE CONSTRAINT` with `SELECT 1` left this crate's suite byte-identical, and
+    // deleting `NOT VALID` from 0151 produces an END-STATE SCHEMA that is indistinguishable
+    // from the correct one, so no assertion about the constraint's definition could catch
+    // either. `convalidated` is the one column that separates them, and the split exists so
+    // the validating scan does not hold AccessExclusiveLock on a table that grows with
+    // production traffic.
+    let approved_has_grant = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def, convalidated          FROM pg_catalog.pg_constraint          WHERE conrelid = 'backchannel_authentication_requests'::regclass          AND conname = 'backchannel_authentication_requests_approved_has_grant'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the CIBA approved-has-grant CHECK must exist");
+    let approved_has_grant_def: String = approved_has_grant.get("def");
+    let approved_has_grant_validated: bool = approved_has_grant.get("convalidated");
+    assert!(
+        approved_has_grant_def.contains("status <> 'approved'::text")
+            && approved_has_grant_def.contains("grant_id IS NOT NULL"),
+        "the CHECK must still say that an approved request names a grant: {approved_has_grant_def}"
+    );
+    assert!(
+        approved_has_grant_validated,
+        "0152 must VALIDATE the constraint 0151 adds NOT VALID. An unvalidated constraint is \
+         enforced on new rows but leaves a permanent 'we never checked' on a table whose \
+         whole argument is that the shape is unrepresentable, and this is the only column \
+         that can tell the two files apart from their end state"
+    );
+
     // The closed reason and state CHECKs pin their sets: an unknown reason or state can never
     // be written.
     let reason_check: String = sqlx::query(
