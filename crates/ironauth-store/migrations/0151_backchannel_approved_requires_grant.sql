@@ -42,7 +42,9 @@
 -- Measured on PostgreSQL 18.4 with a deliberately slow CHECK so the scan is observable: a
 -- holder with `SET LOCAL lock_timeout = '1s'` blocked a concurrent reader for the whole of
 -- its hold, well past its own timeout. The absolute figures depend on the row count and the
--- hardware, so the shape is what is claimed here and not a number. 0150 makes the same `lock_timeout` argument soundly only
+-- hardware, so the shape is what is claimed here and not a number.
+--
+-- 0150 makes the same `lock_timeout` argument soundly only
 -- because it pairs it with "both tables are small per-environment configuration, so the scan
 -- is short". This table is the opposite of that by construction.
 --

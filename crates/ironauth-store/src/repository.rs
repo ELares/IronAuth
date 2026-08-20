@@ -64888,9 +64888,27 @@ impl BackchannelAuthRepo<'_> {
     /// * an opaque token claiming a subject, client, grant or scope the approval did not
     ///   carry
     ///
-    /// `Ok(false)` is the separate answer for "the request could not be flipped", which
-    /// covers a wrong client, an expired request, and one already redeemed. A caller maps
-    /// both to `invalid_grant`; the distinction is for logs and metrics, not the response.
+    /// `Ok(false)` is the separate answer for "the flip matched no row", and an earlier
+    /// version of this paragraph got both halves of it wrong.
+    ///
+    /// It has SIX causes, not the three first listed here. The flip filters on the digest,
+    /// the client, the scope, `status = 'approved'` and the expiry, so zero rows means an
+    /// unknown `auth_req_id`, a wrong client, a request still `pending`, a `denied` request,
+    /// an expired one, or one already `redeemed`.
+    ///
+    /// And they do NOT all map to `invalid_grant`. That claim contradicts
+    /// [`BackchannelPoll`] in this same file, which documents `pending` as
+    /// `authorization_pending`, `denied` as `access_denied` and expired as `expired_token`,
+    /// and it contradicts CIBA Core section 11. Answering `invalid_grant` for a PENDING
+    /// request is the worst of them: a conforming client must stop polling on any error other
+    /// than `authorization_pending` and `slow_down`, so it would give up before the person
+    /// has answered on their other device.
+    ///
+    /// The wiring that avoids this is the one the device grant already uses: poll first, map
+    /// each variant, and reach this method only for an approved request. Then `Ok(false)`
+    /// means a race, and `invalid_grant` is right for it. A caller that skips the poll must
+    /// map the six causes itself, and this method cannot tell it which applied, by design:
+    /// distinguishing them here would be an oracle over other clients' requests.
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn redeem_approved(
