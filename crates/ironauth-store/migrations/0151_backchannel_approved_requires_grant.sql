@@ -2,7 +2,7 @@
 --
 -- An approved backchannel request must name the grant its tokens hang off (issue #131).
 --
--- Seven rounds of review on the CIBA redemption path found the same family of defect, and
+-- Eight rounds of review on the CIBA redemption path found the same family of defect, and
 -- every one of them was reachable only through an approved row whose `grant_id` is NULL.
 -- The tokens have nothing to hang off, a revocation has nothing to reach, and nothing in
 -- the database links the issued tokens back to the `auth_req_id`.
@@ -16,40 +16,42 @@
 -- column-scoped UPDATE on this table, and `status` and `grant_id` are INDEPENDENTLY
 -- writable in that list, so the data plane can produce the shape with its granted
 -- privileges: an UPDATE setting `grant_id` to NULL on an approved row, or an INSERT naming
--- `status = 'approved'` and omitting the column. Review demonstrated both, as
--- `ironauth_app`, under RLS.
+-- `status = 'approved'` and omitting the column. Both were demonstrated as `ironauth_app`
+-- under RLS, and both are refused now.
 --
 -- Deliberately NOT `NOT NULL`: a pending, denied or expired request has no grant and must
 -- not be forced to invent one. The constraint is conditional on the one status where the
 -- column is load bearing.
 --
--- ADDED `NOT VALID`, THEN VALIDATED SEPARATELY, and that split is the whole reason this
--- file is longer than the one statement it contains.
+-- VALIDATING, in one statement, and the alternative was tried and reverted.
 --
--- `/backchannel_authenticate` is a MOUNTED PRODUCTION ROUTE, and 0147 says of this table
--- "No DELETE: a spent request is invalidated by status, never removed", so nothing prunes
--- it and it grows without bound. A validating `ADD CONSTRAINT ... CHECK` takes
--- AccessExclusiveLock and scans every row while holding it, queueing in front of every new
--- reader: every CIBA create and every poll blocks for the length of that scan. `NOT VALID`
--- takes the same lock for a moment and does no scan, and `VALIDATE CONSTRAINT` then scans
--- under ShareUpdateExclusiveLock, which does not block readers or writers at all. This is
--- the same argument 0150 makes one file earlier, and the same `lock_timeout` knob, because
--- an unbounded stall in front of every reader is worse than a migration an operator retries.
+-- The obvious worry is the lock. `/backchannel_authenticate` is a mounted production route
+-- and this table is never pruned (0147: "No DELETE: a spent request is invalidated by
+-- status, never removed"), so a validating `ADD CONSTRAINT` takes AccessExclusiveLock and
+-- scans while holding it, in front of every new reader. The textbook answer is `NOT VALID`
+-- plus a separate `VALIDATE CONSTRAINT`, and a previous version of this file did that.
 --
--- An earlier version of this file argued only that no existing row violates the
--- constraint. That is the VALIDATION question and it is true, and it is not the LOCKING
--- question, which is the one that reaches a live deployment.
+-- IT DOES NOTHING HERE, because `MigrationRunner` wraps each file in ONE transaction
+-- (`migrate.rs`: `begin`, `raw_sql(migration.sql)`, `commit`). The AccessExclusiveLock taken
+-- by the `ADD` is therefore held until COMMIT, across the `VALIDATE` scan, so the split
+-- buys exactly nothing: measured on a 12M-row table, a concurrent reader waited the same
+-- 0.52s with the split as without it, against 0.13s when the two statements really are in
+-- separate transactions. The split cannot be fixed by moving it out of the transaction
+-- either, because the `lock_timeout` below is `SET LOCAL` and only reaches these statements
+-- BECAUSE they share one.
 --
--- One consequence worth naming for whoever reads this next. While a violating row exists,
--- it is not merely unredeemable, it is UNPOLLABLE: `poll` updates `last_poll_at` on the
--- row, Postgres re-checks the constraint on the new row version, and the client gets an
--- error rather than the uniform answer the poll surface promises. With the constraint
--- validated that state is unreachable, which is exactly why it needs saying here rather
--- than being discovered later.
+-- So the honest argument is the one 0150 makes for the same shape one file earlier, and it
+-- is two parts. No existing row violates the constraint, because nothing in production has
+-- ever written an approved row: there is no approval surface yet and the CIBA store methods
+-- have no production caller. And the wait is BOUNDED rather than unbounded, by the
+-- `lock_timeout` below, so a busy table yields a migration an operator retries instead of a
+-- stall queued in front of every reader.
+--
+-- If this table is ever large and hot at the same time, the fix is a runner that can execute
+-- a designated file outside a transaction, not a split that reads as though it helps.
 
--- Bounded rather than unbounded: if the table is busy, fail and let the operator retry
--- rather than queue an AccessExclusive request in front of every new reader. TUNABLE for
--- the reasons 0150 sets out at length; the `nullif` is load bearing there and here.
+-- Bounded rather than unbounded. TUNABLE for the reasons 0150 sets out at length; the
+-- `nullif` is load bearing there and here.
 DO $$
 BEGIN
     PERFORM set_config(
@@ -62,8 +64,4 @@ $$;
 
 ALTER TABLE backchannel_authentication_requests
     ADD CONSTRAINT backchannel_authentication_requests_approved_has_grant
-    CHECK (status <> 'approved' OR grant_id IS NOT NULL) NOT VALID;
-
--- The scan, under a lock that blocks neither readers nor writers.
-ALTER TABLE backchannel_authentication_requests
-    VALIDATE CONSTRAINT backchannel_authentication_requests_approved_has_grant;
+    CHECK (status <> 'approved' OR grant_id IS NOT NULL);

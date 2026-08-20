@@ -3929,3 +3929,85 @@ async fn a_denial_records_no_grant_even_when_one_is_named() {
          reports a link that never existed"
     );
 }
+
+/// A grant id that does not parse refuses WITHOUT burning the approval (issue #131).
+///
+/// # The ordering this pins
+///
+/// `redeem` flips the row to `redeemed` in its own statement. An earlier version committed
+/// that flip and THEN parsed, so a parse failure returned `Err` on a request already
+/// consumed: the approval burned, no tokens issued, and nothing to distinguish it from a bad
+/// `auth_req_id`. The person had approved on a separate device and could never be told why.
+///
+/// It is reachable without any code being wrong. `grants.id` is bare `text PRIMARY KEY`
+/// (migration 0004) with no format check, the data plane may INSERT into `grants`, and the
+/// composite foreign key accepts any id that exists. So a row whose id was not minted by
+/// `GrantId` satisfies every constraint and fails only at the parse.
+///
+/// The previous comment claimed the `grant_id IS NOT NULL` predicate made the parse
+/// infallible. It constrains NULLITY, not parseability.
+#[tokio::test]
+async fn an_unparseable_grant_id_refuses_without_consuming_the_request() {
+    const LEGACY: &str = "legacy-grant-0001";
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // A grants row whose id was never minted by `GrantId`, written the way the data plane
+    // can write it.
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    sqlx::query(
+        "INSERT INTO grants (id, tenant_id, environment_id, client_id, subject, created_at) \
+         VALUES ($1, $2, $3, 'cli_owner', 'usr_subject', now())",
+    )
+    .bind(LEGACY)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("grants.id has no format check, so this is allowed");
+    tx.commit().await.expect("commit");
+
+    let digest = seed_approved_scoped(
+        &db,
+        &env,
+        scope,
+        "cli_owner",
+        Some(LEGACY),
+        Some("openid profile"),
+    )
+    .await;
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .redeem(&digest, "cli_owner", NOW_MICROS)
+            .await
+            .is_err(),
+        "an unparseable grant id must be refused"
+    );
+
+    // AND THE REQUEST SURVIVES. This is the assertion that matters: the refusal must roll
+    // back the flip, not report a failure on a request it already consumed.
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM backchannel_authentication_requests \
+         WHERE auth_req_id_digest = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(&digest)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the request survives");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(
+        status, "approved",
+        "the refusal must roll the flip back, or a fault of ours burns an approval a person \
+         gave on their other device"
+    );
+}

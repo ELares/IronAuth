@@ -64722,25 +64722,47 @@ impl BackchannelAuthRepo<'_> {
         .bind(now_micros)
         .fetch_optional(&mut *tx)
         .await?;
-        tx.commit().await?;
         let Some(row) = row else {
+            tx.commit().await?;
             return Ok(None);
         };
+        // PARSED BEFORE THE COMMIT, because this statement already flipped the row to
+        // `redeemed`. An earlier version committed first and parsed after, so a parse failure
+        // returned `Err` on a request that had ALREADY been consumed: the approval was burned,
+        // no tokens were issued, and the caller could not tell it apart from a bad
+        // `auth_req_id`. Review demonstrated it by planting a `grants` row whose id does not
+        // parse (`grants.id` is bare `text PRIMARY KEY`, migration 0004, with no format
+        // check), which the data plane can write and the composite foreign key accepts.
+        //
+        // That is the exact harm this file's atomicity argument exists to prevent, and the
+        // rule the sibling `redeem_approved` already keeps: a fault of ours must never burn an
+        // approval a person gave on a separate device. Every fallible step now happens while
+        // the transaction can still roll back.
+        //
+        // The previous comment here said the `grant_id IS NOT NULL` predicate made this
+        // infallible. It does not: the predicate constrains NULLITY, not parseability. What
+        // kept it unreachable was minting discipline, which is precisely the assumption
+        // migration 0151 exists so this code no longer has to make.
         let id_text: String = row.get("id");
-        // Both readers filter `grant_id IS NOT NULL`, so this is infallible by the query's
-        // own predicate; parsing it in scope is the second half of that guarantee, since the
-        // column is text and nothing else validates what was stored there.
-        let grant_text: String = row.get("grant_id");
-        Ok(Some(RedeemedBackchannelRequest {
+        // `Option` and an explicit refusal, not an infallible decode: an infallible one
+        // PANICS on NULL, which review measured killing the spine tests from inside the store
+        // rather than at the assertions that name the property.
+        let grant_text: Option<String> = row.get("grant_id");
+        let details = RedeemedBackchannelRequest {
             id: BackchannelAuthRequestId::parse_in_scope(&id_text, &self.scope)?,
             subject: row.get("subject"),
-            grant_id: GrantId::parse_in_scope(&grant_text, &self.scope)?,
+            grant_id: GrantId::parse_in_scope(
+                &grant_text.ok_or(StoreError::NotFound)?,
+                &self.scope,
+            )?,
             requested_scope: row.get("requested_scope"),
             authorization_details: row.get("authorization_details"),
             auth_methods: row.get("auth_methods"),
             auth_time_unix_micros: row.get("auth_time_micros"),
             consent_ref: row.get("consent_ref"),
-        }))
+        };
+        tx.commit().await?;
+        Ok(Some(details))
     }
 
     /// Read an APPROVED request's details without consuming it (CIBA Core section 10).
@@ -64762,6 +64784,13 @@ impl BackchannelAuthRepo<'_> {
     /// become a client-reachable surface on its own: it would be an unrated poll.
     ///
     /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the stored `grant_id` is absent or does not parse in this
+    /// scope. The query's own predicate makes the first unreachable and minting discipline
+    /// makes the second unlikely, and neither is a reason to decode infallibly: an infallible
+    /// decode PANICS, from inside the store, which is a worse answer than an error for a row
+    /// somebody wrote around `decide`. Documented here because `redeem` documents the same
+    /// thing and a twin that stays silent is how the pair drifts apart.
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn approved_details(
@@ -64796,14 +64825,18 @@ impl BackchannelAuthRepo<'_> {
             return Ok(None);
         };
         let id_text: String = row.get("id");
-        // Both readers filter `grant_id IS NOT NULL`, so this is infallible by the query's
-        // own predicate; parsing it in scope is the second half of that guarantee, since the
-        // column is text and nothing else validates what was stored there.
-        let grant_text: String = row.get("grant_id");
+        // `Option` and an explicit refusal rather than an infallible decode. The predicate
+        // above constrains NULLITY, not parseability, and an infallible decode panics on NULL
+        // from inside the store, which review measured killing the spine tests before the
+        // assertions that name the property could run.
+        let grant_text: Option<String> = row.get("grant_id");
         Ok(Some(RedeemedBackchannelRequest {
             id: BackchannelAuthRequestId::parse_in_scope(&id_text, &self.scope)?,
             subject: row.get("subject"),
-            grant_id: GrantId::parse_in_scope(&grant_text, &self.scope)?,
+            grant_id: GrantId::parse_in_scope(
+                &grant_text.ok_or(StoreError::NotFound)?,
+                &self.scope,
+            )?,
             requested_scope: row.get("requested_scope"),
             authorization_details: row.get("authorization_details"),
             auth_methods: row.get("auth_methods"),
