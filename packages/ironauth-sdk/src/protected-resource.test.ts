@@ -776,9 +776,18 @@ test('the optional arrays are also read exactly once', () => {
   // through them, but "every field once" was the claim.
   let scopeReads = 0;
   let bearerReads = 0;
+  // `maxAgeSeconds` was the one snapshot field with no read-count assertion. The shipped
+  // code reads it once, but a regression would go unnoticed: a second read returning
+  // something unrepresentable is stored AFTER the validation that would have refused it,
+  // and the middleware then emits `Cache-Control: public, max-age=NaN`.
+  let maxAgeReads = 0;
   const shifty: ProtectedResourceConfig = {
     resource: 'https://api.example/v1',
     authorizationServers: ['https://auth.example'],
+    get maxAgeSeconds() {
+      maxAgeReads += 1;
+      return maxAgeReads <= 1 ? 60 : Number.NaN;
+    },
     get scopesSupported() {
       scopeReads += 1;
       return scopeReads <= 1 ? ['read'] : ['evil:scope'];
@@ -794,6 +803,7 @@ test('the optional arrays are also read exactly once', () => {
     audience: 'https://api.example/v1',
   });
 
+  assert.equal(maxAgeReads, 1, 'maxAgeSeconds must be read exactly once');
   assert.equal(scopeReads, 1, 'scopesSupported must be read exactly once');
   assert.equal(
     bearerReads,
@@ -802,6 +812,17 @@ test('the optional arrays are also read exactly once', () => {
   );
   assert.deepEqual([...(defined.scopesSupported ?? [])], ['read']);
   assert.deepEqual([...(defined.bearerMethodsSupported ?? [])], ['header']);
+  assert.equal(
+    defined.maxAgeSeconds,
+    60,
+    'the validated max-age is the stored one',
+  );
+  // And it reaches the wire as the validated value, which is where a second read showed.
+  const served = protectedResourceMiddleware(defined)({
+    path: '/.well-known/oauth-protected-resource/v1',
+    outcome: 'no-token',
+  });
+  assert.equal(served?.headers['Cache-Control'], 'public, max-age=60');
 });
 
 test('a resource that cannot be put in a challenge is refused at startup', () => {
