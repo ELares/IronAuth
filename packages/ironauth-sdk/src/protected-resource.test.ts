@@ -6,6 +6,7 @@ import test from 'node:test';
 import {
   DEFAULT_PRM_MAX_AGE_SECONDS,
   PrmConfigError,
+  ProtectedResource,
   defineProtectedResource,
   forbidden,
   protectedResourceChallenge,
@@ -118,20 +119,6 @@ test('a value RFC 6750 forbids is REFUSED, not escaped', () => {
       bad,
     );
   }
-  for (const bad of ['a\r\nSet-Cookie: x=1', 'quote"d']) {
-    assert.equal(
-      refusalCode(() => forbidden(CHECKED, bad)),
-      'challenge_value_not_representable',
-      bad,
-    );
-  }
-});
-
-test('a description without an error is refused rather than silently dropped', () => {
-  assert.equal(
-    refusalCode(() => protectedResourceChallenge(CHECKED, { errorDescription: 'dropped?' })),
-    'challenge_value_not_representable',
-  );
 });
 
 test('the document must not contradict what the server verifies', () => {
@@ -309,4 +296,119 @@ test('a configured cache lifetime is honoured', () => {
   );
   const served = handle({ path: '/.well-known/oauth-protected-resource/v1/mcp', outcome: 'ok' });
   assert.equal(served?.headers['Cache-Control'], 'public, max-age=60');
+});
+
+test('the middleware serves the path its own challenge advertises', () => {
+  // The blocking defect this pins: the match path was derived through `new URL()`, which
+  // resolves dot segments and decodes `%2e`, so for these identifiers the challenge named a
+  // path the middleware then refused. The discovery chain dead-ending silently, produced by
+  // the module written to prevent it.
+  for (const resource of [
+    'https://api.example/v1/../secret',
+    'https://api.example/%2e%2e/x',
+    'https://api.example/v1/./mcp',
+    'https://api.example/v1/mcp',
+  ]) {
+    const checked = defineProtectedResource(
+      { resource, authorizationServers: [ISSUER] },
+      { issuer: ISSUER, audience: resource },
+    );
+    const advertised = protectedResourceMetadataUrl(resource);
+    const path = advertised.slice(advertised.indexOf('/', advertised.indexOf('://') + 3));
+    const served = protectedResourceMiddleware(checked)({ path, outcome: 'no-token' });
+    assert.equal(served?.status, 200, `advertised ${path} and did not serve it`);
+  }
+});
+
+test('the path table matches the crate: it accepts what http::Uri accepts', () => {
+  // Measured against the crate's PATH_MAP. An earlier version ran one regex over the whole
+  // identifier and refused all of these, which the crate accepts.
+  for (const resource of [
+    'https://api.example/v1/caf\u00e9',
+    'https://api.example/tenants/{id}',
+    'https://api.example/v1/a|b',
+    'https://api.example/v1/a^b',
+    'https://api.example/v1/a"b',
+  ]) {
+    assert.doesNotThrow(() => protectedResourceMetadataUrl(resource), resource);
+  }
+});
+
+test('the authority table matches the crate: it refuses what http::Uri refuses', () => {
+  // The other direction of the same defect: one regex over the whole string accepted these,
+  // and the crate rejects every one.
+  for (const resource of [
+    'https://api.example:80:90/v1',
+    'https://[not-ipv6/v1',
+    'https://api%2eexample/v1',
+    'https://user@/v1',
+    'https://a]b/v1',
+    'https://api.example\u00f1/v1',
+    // Delimiters that change how an authority parses. `validate_authority_bytes` rejects
+    // each of these, and without the delimiter half of the check they compose a URL.
+    'https://api{example/v1',
+    'https://api"example/v1',
+    'https://api^example/v1',
+    'https://api|example/v1',
+  ]) {
+    assert.equal(
+      refusalCode(() => protectedResourceMetadataUrl(resource)),
+      'resource_not_absolute',
+      resource,
+    );
+  }
+});
+
+test('a spread of a validated config is refused', () => {
+  // A brand survives a spread, so overriding `resource` afterwards produced a "validated"
+  // configuration that was never validated, and every emitter accepted it. That is the one
+  // line someone writes to derive a second resource from a first.
+  const spread = { ...CHECKED, resource: 'https://attacker.example/x' } as ProtectedResource;
+  assert.equal(refusalCode(() => unauthorized(spread)), 'resource_not_validated');
+  assert.equal(refusalCode(() => forbidden(spread, 'mcp:tools')), 'resource_not_validated');
+});
+
+test('a cache lifetime that cannot reach a header is refused', () => {
+  // Unchecked, these produced `max-age=-1`, `max-age=1.5`, `max-age=NaN`, `max-age=Infinity`.
+  for (const maxAgeSeconds of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 1e21]) {
+    assert.equal(
+      refusalCode(() => defineProtectedResource({ ...CONFIG, maxAgeSeconds }, VERIFIES)),
+      'cache_lifetime_not_representable',
+      String(maxAgeSeconds),
+    );
+  }
+});
+
+test('a scope the spec forbids costs the parameter, not the response', () => {
+  // `requiredScope` is a per-request input. Throwing here turns an intended 403 into a 500;
+  // the challenge is still correct without the optional `scope` parameter.
+  const challenge = forbidden(CHECKED, 'a\r\nSet-Cookie: x=1').headers['WWW-Authenticate'];
+  assert.ok(challenge.includes('error="insufficient_scope"'), challenge);
+  assert.ok(!challenge.includes('scope='), challenge);
+});
+
+test('a description with no error has its own code', () => {
+  // The value is representable; the fault is that there is nothing to attach it to.
+  assert.equal(
+    refusalCode(() => protectedResourceChallenge(CHECKED, { errorDescription: 'dropped?' })),
+    'error_description_without_an_error',
+  );
+});
+
+test('the middleware matches the well-known path regardless of trailing slashes', () => {
+  const handle = protectedResourceMiddleware(CHECKED);
+  for (const path of [
+    '/.well-known/oauth-protected-resource/v1/mcp',
+    '/.well-known/oauth-protected-resource/v1/mcp/',
+  ]) {
+    assert.equal(handle({ path, outcome: 'ok' })?.status, 200, path);
+  }
+});
+
+test('the document is served as JSON', () => {
+  const served = protectedResourceMiddleware(CHECKED)({
+    path: '/.well-known/oauth-protected-resource/v1/mcp',
+    outcome: 'ok',
+  });
+  assert.equal(served?.headers['Content-Type'], 'application/json');
 });

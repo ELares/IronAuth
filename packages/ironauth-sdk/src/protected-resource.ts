@@ -35,8 +35,13 @@ export type PrmConfigErrorCode =
   | 'no_authorization_servers'
   | 'issuer_not_absolute'
   | 'resource_audience_mismatch'
+  // The three below are SDK-only. `PrmConfigError` in the crate has five variants; these
+  // three name failures that only exist on this side of the boundary.
   | 'authorization_server_not_the_verified_issuer'
-  | 'challenge_value_not_representable';
+  | 'challenge_value_not_representable'
+  | 'cache_lifetime_not_representable'
+  | 'error_description_without_an_error'
+  | 'resource_not_validated';
 
 /**
  * A refused configuration.
@@ -70,6 +75,12 @@ const PRM_CONFIG_MESSAGES: Record<PrmConfigErrorCode, string> = {
     'the advertised authorization servers must include the issuer tokens are verified against',
   challenge_value_not_representable:
     'a challenge value must contain only characters RFC 6750 permits',
+  cache_lifetime_not_representable:
+    'the cache lifetime must be a non-negative whole number of seconds',
+  error_description_without_an_error:
+    'an error description needs an error code to attach to',
+  resource_not_validated:
+    'the configuration was not produced by defineProtectedResource',
 };
 
 const WELL_KNOWN = '/.well-known/oauth-protected-resource';
@@ -106,9 +117,36 @@ function splitResource(resource: string): SplitResource {
   if (authority.length === 0) {
     throw new PrmConfigError('resource_not_absolute', resource);
   }
-  // Anything a URI may not carry unescaped. `http::Uri` refuses these, so accepting them here
-  // would mean the SDK publishing for an identifier the crate rejects outright.
-  if (/[\s"<>\\^`{|}]/.test(resource) || /[^\x21-\x7e]/.test(resource)) {
+  // TWO tables, because `http::Uri` has two. An earlier version ran ONE regex over the whole
+  // string and was wrong in both directions, measured against the crate's own tables: too
+  // strict on the PATH, which accepts `{`, `}`, `"`, `\`, `^`, `|` and valid UTF-8, and too
+  // lenient on the AUTHORITY, which rejects a second colon, mismatched brackets, a percent
+  // outside userinfo, and an empty host after `@`. Its comment asserted the opposite.
+  //
+  // The authority: ASCII only, no delimiter that changes how it parses.
+  if (/[^\x21-\x7e]/.test(authority) || /[\s"<>\\^`{|}]/.test(authority)) {
+    throw new PrmConfigError('resource_not_absolute', resource);
+  }
+  const hostAndPort = authority.includes('@')
+    ? authority.slice(authority.indexOf('@') + 1)
+    : authority;
+  if (hostAndPort.length === 0 || hostAndPort.includes('%')) {
+    throw new PrmConfigError('resource_not_absolute', resource);
+  }
+  const opens = hostAndPort.match(/\[/g)?.length ?? 0;
+  const closes = hostAndPort.match(/\]/g)?.length ?? 0;
+  if (opens !== closes) {
+    throw new PrmConfigError('resource_not_absolute', resource);
+  }
+  const afterHost = hostAndPort.includes(']')
+    ? hostAndPort.slice(hostAndPort.lastIndexOf(']') + 1)
+    : hostAndPort;
+  if ((afterHost.match(/:/g)?.length ?? 0) > 1) {
+    throw new PrmConfigError('resource_not_absolute', resource);
+  }
+  // The path: only what the crate's PATH_MAP calls invalid. Controls, DEL, SP, `<`, `>` and
+  // the backtick. Notably NOT `{`, `}`, `"`, `\`, `^`, `|` or non-ASCII.
+  if (/[\x00-\x20\x7f<>`]/.test(path)) {
     throw new PrmConfigError('resource_not_absolute', resource);
   }
   return { scheme, authority, path };
@@ -157,7 +195,58 @@ export interface VerifiedTokenConfig {
 /** Mirrors `PRM_MAX_AGE_SECS` in `prm.rs`. */
 export const DEFAULT_PRM_MAX_AGE_SECONDS = 600;
 
-declare const validated: unique symbol;
+/**
+ * A configuration that has been checked against what the server actually verifies.
+ *
+ * A CLASS, not a branded object type, and the difference is measurable. A brand survives a
+ * spread, so `{ ...checked, resource: 'https://attacker.example/x' }` typechecked and every
+ * emitter accepted it: the one line a developer writes to derive a second resource from a
+ * validated first, silently skipping every check. A spread loses the prototype, so the
+ * emitters can refuse it at runtime as well as at the type level.
+ */
+export class ProtectedResource {
+  readonly resource: string;
+  readonly authorizationServers: readonly string[];
+  readonly issuer: string;
+  readonly audience: string;
+  readonly maxAgeSeconds: number;
+  readonly scopesSupported?: readonly string[];
+  readonly bearerMethodsSupported?: readonly string[];
+
+  /** @internal Constructed only by {@link defineProtectedResource}. */
+  private constructor(config: ProtectedResourceConfig, verifies: VerifiedTokenConfig, maxAge: number) {
+    this.resource = config.resource;
+    this.authorizationServers = [...config.authorizationServers];
+    this.issuer = verifies.issuer;
+    this.audience = verifies.audience;
+    this.maxAgeSeconds = maxAge;
+    this.scopesSupported = config.scopesSupported ? [...config.scopesSupported] : undefined;
+    this.bearerMethodsSupported = config.bearerMethodsSupported
+      ? [...config.bearerMethodsSupported]
+      : undefined;
+  }
+
+  /** @internal */
+  static build(
+    config: ProtectedResourceConfig,
+    verifies: VerifiedTokenConfig,
+    maxAge: number,
+  ): ProtectedResource {
+    return new ProtectedResource(config, verifies, maxAge);
+  }
+}
+
+/**
+ * Refuse anything that is not the real thing.
+ *
+ * A spread, a cast, or a hand-built lookalike all lose the prototype, and all of them mean
+ * the configuration was never checked against what the server verifies.
+ */
+function assertValidated(resource: ProtectedResource): void {
+  if (!(resource instanceof ProtectedResource)) {
+    throw new PrmConfigError('resource_not_validated');
+  }
+}
 
 /**
  * A configuration that has been checked against what the server actually verifies.
@@ -167,8 +256,7 @@ declare const validated: unique symbol;
  * made "refused at startup" opt-in: a server could emit challenges forever without ever
  * calling the validator.
  */
-export type ProtectedResource = ProtectedResourceConfig &
-  VerifiedTokenConfig & { maxAgeSeconds: number; readonly [validated]: true };
+
 
 /**
  * Validate a configuration against the `verify` options it must agree with, or throw.
@@ -205,11 +293,14 @@ export function defineProtectedResource(
   if (!config.authorizationServers.includes(verifies.issuer)) {
     throw new PrmConfigError('authorization_server_not_the_verified_issuer', verifies.issuer);
   }
-  return {
-    ...config,
-    ...verifies,
-    maxAgeSeconds: config.maxAgeSeconds ?? DEFAULT_PRM_MAX_AGE_SECONDS,
-  } as ProtectedResource;
+  // VALIDATED, because it reaches a `Cache-Control` header. Unchecked, this produced
+  // `max-age=-1`, `max-age=1.5`, `max-age=NaN` and `max-age=Infinity`; the crate's
+  // `PRM_MAX_AGE_SECS` is a `const u64` and cannot express any of them.
+  const maxAge = config.maxAgeSeconds ?? DEFAULT_PRM_MAX_AGE_SECONDS;
+  if (!Number.isSafeInteger(maxAge) || maxAge < 0) {
+    throw new PrmConfigError('cache_lifetime_not_representable', String(maxAge));
+  }
+  return ProtectedResource.build(config, verifies, maxAge);
 }
 
 function splitIssuer(issuer: string): void {
@@ -288,6 +379,7 @@ export function protectedResourceChallenge(
   resource: ProtectedResource,
   options: ChallengeOptions = {},
 ): string {
+  assertValidated(resource);
   const parameters = [`resource_metadata="${protectedResourceMetadataUrl(resource.resource)}"`];
   if (options.error) {
     parameters.push(`error="${challengeValue(options.error)}"`);
@@ -295,8 +387,10 @@ export function protectedResourceChallenge(
       parameters.push(`error_description="${challengeValue(options.errorDescription)}"`);
     }
   } else if (options.errorDescription) {
-    // Loud rather than silent. Dropping it quietly is a caller bug that never surfaces.
-    throw new PrmConfigError('challenge_value_not_representable', options.errorDescription);
+    // Loud rather than silent. Dropping it quietly is a caller bug that never surfaces. Its
+    // own code, because the value is perfectly representable and a log reader told otherwise
+    // gets the wrong diagnosis.
+    throw new PrmConfigError('error_description_without_an_error', options.errorDescription);
   }
   if (options.scope) {
     parameters.push(`scope="${challengeValue(options.scope)}"`);
@@ -326,12 +420,17 @@ export function forbidden(
   resource: ProtectedResource,
   requiredScope: string,
 ): ChallengeResponse {
+  // The scope is a PER-REQUEST input, so a value RFC 6750 forbids must not throw out of the
+  // middleware and turn an intended 403 into a 500. The challenge is still correct without
+  // the `scope` parameter, which is optional: the client learns it lacked scope, just not
+  // which one, and that is a better answer than a server error.
+  const advertisable = CHALLENGE_VALUE.test(requiredScope);
   return {
     status: 403,
     headers: {
       'WWW-Authenticate': protectedResourceChallenge(resource, {
         error: 'insufficient_scope',
-        scope: requiredScope,
+        scope: advertisable ? requiredScope : undefined,
       }),
     },
   };
@@ -358,8 +457,17 @@ export interface MiddlewareResponse {
 export function protectedResourceMiddleware(
   resource: ProtectedResource,
 ): (request: { path: string; outcome: 'ok' | 'no-token' | 'invalid-token' | { missingScope: string } }) => MiddlewareResponse | null {
-  const wellKnownPath = new URL(protectedResourceMetadataUrl(resource.resource), 'https://x')
-    .pathname;
+  // SLICED from the composed URL, never parsed out of it. Deriving it through `new URL()` was
+  // this module spending thirteen lines on why it does not compose through `URL`, and then
+  // doing exactly that in the one function that decides which requests get the document.
+  // `URL` still resolves dot segments and decodes `%2e`, so for an identifier containing
+  // `..`, `.` or `%2e%2e` the challenge advertised a path this middleware then refused to
+  // serve: the discovery chain dead-ending silently, produced inside the module written to
+  // prevent that.
+  const { scheme, authority } = splitResource(resource.resource);
+  const wellKnownPath = protectedResourceMetadataUrl(resource.resource).slice(
+    `${scheme}://${authority}`.length,
+  );
   const body = JSON.stringify(protectedResourceMetadata(resource));
   return (request) => {
     if (request.path.replace(/\/+$/, '') === wellKnownPath.replace(/\/+$/, '')) {
