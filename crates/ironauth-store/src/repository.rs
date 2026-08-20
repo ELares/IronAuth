@@ -64003,6 +64003,29 @@ pub enum BackchannelPoll {
     NotFound,
 }
 
+/// What a CIBA redemption records alongside the flip (issue #131).
+///
+/// A struct rather than six parameters, because the four that matter arrive together and
+/// mean nothing apart: the tokens are recorded FOR this grant, in the same transaction that
+/// consumes this request. Passing them positionally is how a caller ends up recording one
+/// batch's tokens against another's grant.
+#[derive(Debug)]
+pub struct BackchannelRedemption<'a> {
+    /// The SHA-256 hex digest of the presented `auth_req_id`.
+    pub auth_req_id_digest: &'a str,
+    /// The client presenting it. The redemption is scoped to it, so another client's request
+    /// is not redeemable and is not distinguishable from an absent one.
+    pub presenting_client_id: &'a str,
+    /// The clock reading the expiry is checked against.
+    pub now_micros: i64,
+    /// The grant the minted tokens belong to.
+    pub grant_id: &'a GrantId,
+    /// The tokens minted BEFORE this call, recorded in the same transaction as the flip.
+    pub tokens: &'a [IssuedTokenRecord],
+    /// The opaque access token, when the client was issued one rather than an `at+jwt`.
+    pub opaque: Option<NewOpaqueAccessToken<'a>>,
+}
+
 /// A new CIBA request to persist.
 #[derive(Debug, Clone)]
 pub struct NewBackchannelRequest<'a> {
@@ -64641,6 +64664,169 @@ impl BackchannelAuthRepo<'_> {
             authorization_details: row.get("authorization_details"),
             auth_methods: row.get("auth_methods"),
         }))
+    }
+
+    /// Read an APPROVED request's details without consuming it (CIBA Core section 10).
+    ///
+    /// The token endpoint needs these to mint before it consumes, exactly as the device grant
+    /// does: a signing failure after the flip would burn an approval the user gave on another
+    /// device, and they would have to approve again. `poll` deliberately returns a bare
+    /// `Approved` so that polling stays cheap, so the details come from here.
+    ///
+    /// Scoped to the presenting client for the same reason `poll` is: a request belonging to
+    /// another client answers `None`, so this is not an existence oracle either.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn approved_details(
+        &self,
+        auth_req_id_digest: &str,
+        presenting_client_id: &str,
+        now_micros: i64,
+    ) -> Result<Option<RedeemedBackchannelRequest>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, grant_id, requested_scope, authorization_details, \
+                    auth_methods \
+             FROM backchannel_authentication_requests \
+             WHERE auth_req_id_digest = $1 \
+               AND client_id = $2 \
+               AND tenant_id = $3 \
+               AND environment_id = $4 \
+               AND status = 'approved' \
+               AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $5",
+        )
+        .bind(auth_req_id_digest)
+        .bind(presenting_client_id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id_text: String = row.get("id");
+        Ok(Some(RedeemedBackchannelRequest {
+            id: BackchannelAuthRequestId::parse_in_scope(&id_text, &self.scope)?,
+            subject: row.get("subject"),
+            grant_id: row.get("grant_id"),
+            requested_scope: row.get("requested_scope"),
+            authorization_details: row.get("authorization_details"),
+            auth_methods: row.get("auth_methods"),
+        }))
+    }
+
+    /// Consume an approved request AND record the tokens minted for it, in ONE transaction
+    /// (CIBA Core section 10, issue #131).
+    ///
+    /// The device grant's `redeem_approved` one table over, and for the same two reasons.
+    ///
+    /// ATOMIC WITH THE TOKEN RECORDS, because a token that is issued and not recorded cannot
+    /// be revoked. Recording them in a second transaction would leave a window where a crash
+    /// yields live tokens nothing knows about, which is worse than the endpoint not existing.
+    ///
+    /// SINGLE USE, because the flip is conditional on `status = 'approved'`: a second caller
+    /// that raced the first past the poll finds nothing to flip and gets `false`, so one
+    /// approval mints one set of tokens.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn redeem_approved(
+        &self,
+        env: &Env,
+        acting: &ActingContext,
+        request: BackchannelRedemption<'_>,
+    ) -> Result<bool, StoreError> {
+        let BackchannelRedemption {
+            auth_req_id_digest,
+            presenting_client_id,
+            now_micros,
+            grant_id,
+            tokens,
+            opaque,
+        } = request;
+        if grant_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let flipped = sqlx::query(
+            "UPDATE backchannel_authentication_requests \
+             SET status = 'redeemed' \
+             WHERE auth_req_id_digest = $1 \
+               AND client_id = $2 \
+               AND tenant_id = $3 \
+               AND environment_id = $4 \
+               AND status = 'approved' \
+               AND (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint > $5 \
+             RETURNING id",
+        )
+        .bind(auth_req_id_digest)
+        .bind(presenting_client_id)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if flipped.is_none() {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        for token in tokens {
+            sqlx::query(
+                "INSERT INTO issued_tokens \
+                 (id, tenant_id, environment_id, grant_id, token_kind) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(token.id.to_string())
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(grant_id.to_string())
+            .bind(token.kind.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(op) = opaque {
+            sqlx::query(
+                "INSERT INTO opaque_access_tokens \
+                 (token_digest, tenant_id, environment_id, grant_id, subject, client_id, \
+                  audience, scope, jti, expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                         TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+            )
+            .bind(op.token_digest)
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(grant_id.to_string())
+            .bind(op.subject)
+            .bind(op.client_id)
+            .bind(op.audience)
+            .bind(op.scope)
+            .bind(op.jti.to_string())
+            .bind(op.expires_at_unix_micros)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting,
+            env,
+            action: Action::TokenIssue,
+            target: grant_id,
+        };
+        // In the SAME transaction as the flip and the token rows. A token issue that is not
+        // audited is a token nobody can account for, and the device grant makes the same
+        // guarantee one table over.
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 }
 

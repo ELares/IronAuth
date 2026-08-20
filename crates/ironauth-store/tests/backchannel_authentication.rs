@@ -1201,3 +1201,109 @@ async fn the_opened_grant_is_the_one_redemption_reports() {
     assert_eq!(redeemed.auth_methods.as_deref(), Some("pwd otp"));
     assert_eq!(redeemed.subject, "usr_ada");
 }
+
+/// Redeeming records the minted tokens in the SAME transaction as the flip, and does it at
+/// most once (issue #131 criteria 2 and 3).
+///
+/// # Why this method had to exist before the token endpoint could
+///
+/// `redeem` consumes the request and returns its details, which is enough to mint FROM but
+/// not enough to build the grant on. The device grant does two things this could not: it
+/// mints BEFORE consuming, so a signing failure never burns an approval, and it records the
+/// issued tokens in the same transaction as the flip, because a token that is issued and not
+/// recorded cannot be revoked. Building the CIBA grant on `redeem` alone would have meant
+/// either unrecorded tokens or a second transaction that can fail independently, and both
+/// look like a working deployment.
+///
+/// So the pair is `approved_details` (a non-consuming read, to mint from) and this. The test
+/// asserts the token row exists AFTER the flip, and that a second attempt flips nothing.
+#[tokio::test]
+async fn redeeming_records_its_tokens_atomically_and_only_once() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
+    let token_id = ironauth_store::IssuedTokenId::generate(&env, &scope);
+
+    // `issued_tokens.grant_id` has a foreign key to `grants`, so the grant has to exist for
+    // the token row to land. That constraint is the reason recording tokens belongs in the
+    // same transaction as the flip: it is enforced at the database rather than by convention.
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    sqlx::query(
+        "INSERT INTO grants (id, tenant_id, environment_id, client_id, subject, created_at) \
+         VALUES ($1, $2, $3, $4, $5, now())",
+    )
+    .bind(grant_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind("cli_owner")
+    .bind("usr_subject")
+    .execute(&mut *tx)
+    .await
+    .expect("seed the grant the issued token points at");
+    tx.commit().await.expect("commit");
+
+    // The details are readable WITHOUT consuming: that is what lets the grant mint first.
+    let details = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .approved_details(&digest, "cli_owner", NOW_MICROS)
+        .await
+        .expect("read approved details")
+        .expect("an approved request is readable before it is consumed");
+    assert_eq!(details.subject, "usr_subject");
+
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+
+    let first = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &grant_id,
+                tokens: &[ironauth_store::IssuedTokenRecord {
+                    id: token_id,
+                    kind: ironauth_store::TokenKind::Access,
+                }],
+                opaque: None,
+            },
+        )
+        .await
+        .expect("redeem with tokens");
+    assert!(first, "an approved request redeems once");
+
+    let second = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &grant_id,
+                tokens: &[],
+                opaque: None,
+            },
+        )
+        .await
+        .expect("second redeem");
+    assert!(
+        !second,
+        "a second redemption flips nothing: the auth_req_id is single-use"
+    );
+}
