@@ -35,8 +35,8 @@ export type PrmConfigErrorCode =
   | 'no_authorization_servers'
   | 'issuer_not_absolute'
   | 'resource_audience_mismatch'
-  // The three below are SDK-only. `PrmConfigError` in the crate has five variants; these
-  // three name failures that only exist on this side of the boundary.
+  // Five mirrored above, five SDK-only below: failures that only exist on this side of the
+  // boundary. An earlier version of this comment said three while listing five.
   | 'authorization_server_not_the_verified_issuer'
   | 'challenge_value_not_representable'
   | 'cache_lifetime_not_representable'
@@ -107,7 +107,8 @@ function splitResource(resource: string): SplitResource {
     throw new PrmConfigError('resource_not_absolute', resource);
   }
   const scheme = resource.slice(0, schemeEnd);
-  if (!/^[A-Za-z][A-Za-z0-9+\-.]*$/.test(scheme)) {
+  // MAX_SCHEME_LEN in the crate is 64.
+  if (scheme.length > 64 || !/^[A-Za-z][A-Za-z0-9+\-.]*$/.test(scheme)) {
     throw new PrmConfigError('resource_not_absolute', resource);
   }
   const rest = resource.slice(schemeEnd + 3);
@@ -127,21 +128,61 @@ function splitResource(resource: string): SplitResource {
   if (/[^\x21-\x7e]/.test(authority) || /[\s"<>\\^`{|}]/.test(authority)) {
     throw new PrmConfigError('resource_not_absolute', resource);
   }
-  const hostAndPort = authority.includes('@')
-    ? authority.slice(authority.indexOf('@') + 1)
-    : authority;
-  if (hostAndPort.length === 0 || hostAndPort.includes('%')) {
+  // A LEFT-TO-RIGHT SCAN, which is what the crate does, rather than counting.
+  //
+  // Counting could not express two of its rules. `has_percent` is reset at `@` AND at `]`, so
+  // a percent a later bracket forgives is legal: `https://[fe80::1%25eth0]` is an RFC 6874
+  // zone id and the crate accepts it. And the userinfo boundary is the LAST `@`, not the
+  // first. Counting brackets also cannot see order, so `[a][b]` and `]a[` passed while the
+  // crate refuses both.
+  let startBracket = false;
+  let endBracket = false;
+  let hasPercent = false;
+  let colons = 0;
+  for (const ch of authority) {
+    switch (ch) {
+      case '[':
+        if (endBracket || startBracket) {
+          throw new PrmConfigError('resource_not_absolute', resource);
+        }
+        startBracket = true;
+        break;
+      case ']':
+        if (!startBracket || endBracket) {
+          throw new PrmConfigError('resource_not_absolute', resource);
+        }
+        endBracket = true;
+        hasPercent = false;
+        colons = 0;
+        break;
+      case '@':
+        startBracket = false;
+        endBracket = false;
+        hasPercent = false;
+        colons = 0;
+        break;
+      case ':':
+        colons += 1;
+        break;
+      case '%':
+        hasPercent = true;
+        break;
+      default:
+        break;
+    }
+  }
+  if (startBracket !== endBracket) {
     throw new PrmConfigError('resource_not_absolute', resource);
   }
-  const opens = hostAndPort.match(/\[/g)?.length ?? 0;
-  const closes = hostAndPort.match(/\]/g)?.length ?? 0;
-  if (opens !== closes) {
+  // A percent that no later `@` or `]` cleared is `InvalidPercent` in the crate.
+  if (hasPercent) {
     throw new PrmConfigError('resource_not_absolute', resource);
   }
-  const afterHost = hostAndPort.includes(']')
-    ? hostAndPort.slice(hostAndPort.lastIndexOf(']') + 1)
-    : hostAndPort;
-  if ((afterHost.match(/:/g)?.length ?? 0) > 1) {
+  if (colons > 1) {
+    throw new PrmConfigError('resource_not_absolute', resource);
+  }
+  const host = authority.slice(authority.lastIndexOf('@') + 1);
+  if (host.length === 0) {
     throw new PrmConfigError('resource_not_absolute', resource);
   }
   // The path: only what the crate's PATH_MAP calls invalid. Controls, DEL, SP, `<`, `>` and
@@ -204,6 +245,19 @@ export const DEFAULT_PRM_MAX_AGE_SECONDS = 600;
  * validated first, silently skipping every check. A spread loses the prototype, so the
  * emitters can refuse it at runtime as well as at the type level.
  */
+/**
+ * The module-private way to build a validated value.
+ *
+ * Assigned in the class's static block, so nothing outside this file can reach it. Declared
+ * here rather than exported as a static because a public static made the private constructor
+ * decorative: review called it directly and rebuilt every configuration this module refuses.
+ */
+let construct: (
+  config: ProtectedResourceConfig,
+  verifies: VerifiedTokenConfig,
+  maxAge: number,
+) => ProtectedResource;
+
 export class ProtectedResource {
   readonly resource: string;
   readonly authorizationServers: readonly string[];
@@ -213,7 +267,18 @@ export class ProtectedResource {
   readonly scopesSupported?: readonly string[];
   readonly bearerMethodsSupported?: readonly string[];
 
-  /** @internal Constructed only by {@link defineProtectedResource}. */
+  /**
+   * The evidence that this value went through {@link defineProtectedResource}.
+   *
+   * A PRIVATE FIELD, not an `instanceof` check, because `instanceof` is satisfied by things
+   * that were never validated: `Object.create(ProtectedResource.prototype)` passes it, and so
+   * did a public `build` static that review called with a resource disagreeing with its
+   * audience, no authorization servers, and `max-age=NaN`. `#validated in value` is false for
+   * a spread, a cast, a hand-built lookalike and a prototype forgery alike.
+   */
+  readonly #validated = true;
+
+  /** @internal Reachable only through {@link defineProtectedResource}. */
   private constructor(config: ProtectedResourceConfig, verifies: VerifiedTokenConfig, maxAge: number) {
     this.resource = config.resource;
     this.authorizationServers = [...config.authorizationServers];
@@ -226,15 +291,25 @@ export class ProtectedResource {
       : undefined;
   }
 
-  /** @internal */
-  static build(
-    config: ProtectedResourceConfig,
-    verifies: VerifiedTokenConfig,
-    maxAge: number,
-  ): ProtectedResource {
-    return new ProtectedResource(config, verifies, maxAge);
+  /**
+   * Module-private construction.
+   *
+   * An earlier version exposed this as a public `static build`, which made the private
+   * constructor decorative: review called it directly and reconstituted every defect this
+   * module refuses, with no cast and no spread. `@internal` is a comment, and `stripInternal`
+   * is not set.
+   */
+  static {
+    construct = (config, verifies, maxAge) => new ProtectedResource(config, verifies, maxAge);
+  }
+
+  /** True only for a value this module constructed. */
+  static isValidated(value: unknown): value is ProtectedResource {
+    return #validated in Object(value);
   }
 }
+
+
 
 /**
  * Refuse anything that is not the real thing.
@@ -243,19 +318,11 @@ export class ProtectedResource {
  * the configuration was never checked against what the server verifies.
  */
 function assertValidated(resource: ProtectedResource): void {
-  if (!(resource instanceof ProtectedResource)) {
+  if (!ProtectedResource.isValidated(resource)) {
     throw new PrmConfigError('resource_not_validated');
   }
 }
 
-/**
- * A configuration that has been checked against what the server actually verifies.
- *
- * Branded, so the challenge builders below CANNOT be handed a raw object. An earlier version
- * of this module validated on request and let every emitter take an unchecked config, which
- * made "refused at startup" opt-in: a server could emit challenges forever without ever
- * calling the validator.
- */
 
 
 /**
@@ -300,7 +367,7 @@ export function defineProtectedResource(
   if (!Number.isSafeInteger(maxAge) || maxAge < 0) {
     throw new PrmConfigError('cache_lifetime_not_representable', String(maxAge));
   }
-  return ProtectedResource.build(config, verifies, maxAge);
+  return construct(config, verifies, maxAge);
 }
 
 function splitIssuer(issuer: string): void {
@@ -315,6 +382,10 @@ function splitIssuer(issuer: string): void {
 export function protectedResourceMetadata(
   resource: ProtectedResource,
 ): Record<string, unknown> {
+  // Asserted HERE too, not only on the challenge path. An earlier version guarded only the
+  // challenge builders, so a spread was refused when asked for a header and served happily
+  // when asked for the document, which is the artefact whose entire job is to not lie.
+  assertValidated(resource);
   const document: Record<string, unknown> = {
     resource: resource.resource,
     authorization_servers: [...resource.authorizationServers],
@@ -464,6 +535,7 @@ export function protectedResourceMiddleware(
   // `..`, `.` or `%2e%2e` the challenge advertised a path this middleware then refused to
   // serve: the discovery chain dead-ending silently, produced inside the module written to
   // prevent that.
+  assertValidated(resource);
   const { scheme, authority } = splitResource(resource.resource);
   const wellKnownPath = protectedResourceMetadataUrl(resource.resource).slice(
     `${scheme}://${authority}`.length,

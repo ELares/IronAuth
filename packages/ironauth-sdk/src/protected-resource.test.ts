@@ -412,3 +412,83 @@ test('the document is served as JSON', () => {
   });
   assert.equal(served?.headers['Content-Type'], 'application/json');
 });
+
+test('the document path refuses an unvalidated config too', () => {
+  // The guard was on the challenge builders only, so a spread was refused when asked for a
+  // header and served happily when asked for the DOCUMENT, which is the artefact whose whole
+  // job is to not lie.
+  const spread = { ...CHECKED, resource: 'https://attacker.example/x' } as ProtectedResource;
+  assert.equal(refusalCode(() => protectedResourceMetadata(spread)), 'resource_not_validated');
+  assert.equal(
+    refusalCode(() => protectedResourceMiddleware(spread)),
+    'resource_not_validated',
+  );
+});
+
+test('a prototype forgery is refused', () => {
+  // `instanceof` is satisfied by this; a private field is not.
+  const forged = Object.create(ProtectedResource.prototype) as ProtectedResource;
+  assert.equal(refusalCode(() => unauthorized(forged)), 'resource_not_validated');
+  assert.equal(refusalCode(() => protectedResourceMetadata(forged)), 'resource_not_validated');
+});
+
+test('there is no public construction path', () => {
+  // A public `static build` made the private constructor decorative: review called it with a
+  // resource disagreeing with its audience, no authorization servers and max-age NaN.
+  assert.equal(
+    (ProtectedResource as unknown as Record<string, unknown>).build,
+    undefined,
+    'ProtectedResource must expose no public construction path',
+  );
+});
+
+test('the authority scan matches the crate on order and percent resets', () => {
+  // Counting could not express these: `has_percent` resets at `@` and at `]`, the userinfo
+  // boundary is the LAST `@`, and bracket ORDER matters.
+  for (const accepted of [
+    'https://[fe80::1%25eth0]/v1',
+    'https://a@b%25@c.example/v1',
+  ]) {
+    assert.doesNotThrow(() => protectedResourceMetadataUrl(accepted), accepted);
+  }
+  for (const refused of ['https://[a][b]/v1', 'https://]a[/v1']) {
+    assert.equal(
+      refusalCode(() => protectedResourceMetadataUrl(refused)),
+      'resource_not_absolute',
+      refused,
+    );
+  }
+});
+
+test('the path table refuses what the crate refuses', () => {
+  // The accept side was pinned and the REFUSE side was not, so the half just corrected was
+  // the half with no test.
+  for (const refused of [
+    'https://api.example/v1/a<b',
+    'https://api.example/v1/a>b',
+    'https://api.example/v1/a`b',
+    'https://api.example/v1/a\x7fb',
+    'https://api.example/v1/a\x01b',
+  ]) {
+    assert.equal(
+      refusalCode(() => protectedResourceMetadataUrl(refused)),
+      'resource_not_absolute',
+      JSON.stringify(refused),
+    );
+  }
+});
+
+test('the scheme grammar is the only thing checking the scheme', () => {
+  // Nothing else looks at it: the two tables run on the authority and the path.
+  for (const refused of [
+    'ht tp://api.example/x',
+    '1http://api.example/x',
+    `${'s'.repeat(65)}://api.example/x`,
+  ]) {
+    assert.equal(
+      refusalCode(() => protectedResourceMetadataUrl(refused)),
+      'resource_not_absolute',
+      refused.slice(0, 20),
+    );
+  }
+});
