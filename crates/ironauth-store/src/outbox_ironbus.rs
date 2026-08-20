@@ -259,15 +259,27 @@ mod tests {
     /// have to delete a failing test rather than quietly contradict a paragraph.
     /// `notify` builds its body through `wake_body`, rather than beside it.
     ///
-    /// Without this, mutating the call site to `wake_body("")` survives: the test below
-    /// calls `wake_body` directly and never observes what `notify` passes it. Asserting on
-    /// the SOURCE is a weak check and is worth saying so, but the alternative needs a live
-    /// broker, and a wake that names the wrong consumer wakes the wrong drain.
+    /// The test below calls `wake_body` directly and never observes what `notify` passes
+    /// it, so without something here, mutating the call site to `wake_body("")` survives.
+    /// Asserting on the SOURCE is a weak check and is worth saying so, but the alternative
+    /// needs a live broker, and a wake that names the wrong consumer wakes the wrong drain.
+    ///
+    /// TWO THINGS make this scan an actual check rather than a tautology, and the first
+    /// version of it had neither. `include_str!` pulls in the WHOLE file, this module
+    /// included, so a needle written literally is satisfied by its own assertion: the
+    /// earlier version passed for every possible body of `notify`, and both the mutant it
+    /// was written to catch and one that removed `wake_body` from `notify` entirely
+    /// survived it. So the haystack is cut at the test module, and the needle is assembled
+    /// from pieces that never appear contiguously in this file.
     #[test]
     fn notify_builds_its_body_through_wake_body() {
         let source = include_str!("outbox_ironbus.rs");
+        let production = source
+            .split("mod tests")
+            .next()
+            .expect("split always yields a first element");
         assert!(
-            source.contains("let body = wake_body(consumer);"),
+            production.contains(concat!("let body = wake_", "body(consumer);")),
             "notify must pass its own `consumer` to `wake_body`"
         );
     }
