@@ -20759,6 +20759,21 @@ pub const WEBHOOK_DELIVERY_CONSUMER: &str = "webhook.delivery";
 /// head of an ordering group must not block the deliveries it is about to revive.
 pub const WEBHOOK_REPLAY_CONSUMER: &str = "webhook.replay";
 
+/// The registered consumer name a log-stream dead-letter REPLAY command drains under
+/// (issue #938).
+///
+/// A replay re-reads a set-aside audit range and re-ships it to the stream's sink, which is
+/// network work of unbounded duration against a third party. That is exactly what the
+/// webhook replay concluded must not happen inside the request that asks for it, so this
+/// takes the same shape: the management endpoint enqueues a COMMAND here and answers 202,
+/// and a worker executes it.
+///
+/// Its own consumer rather than a message on the shipper's path, for the reason
+/// [`WEBHOOK_REPLAY_CONSUMER`] is separate: a replay that keeps failing must not consume
+/// anything else's retry budget, and a stuck replay at the head of an ordering group must
+/// not block the ordinary forward shipping it has nothing to do with.
+pub const LOG_STREAM_REPLAY_CONSUMER: &str = "log_stream.replay";
+
 /// The registered consumer name an ASYNC flow target delivery drains under (issue #112).
 ///
 /// Issue #112 says async targets "deliver through the webhook machinery, inheriting retries,
@@ -40457,6 +40472,60 @@ impl LogStreamRepo<'_> {
                 last_error: row.get("last_error"),
             })
             .collect())
+    }
+
+    /// REQUEST a replay of this stream's outstanding dead letters (issue #938).
+    ///
+    /// Enqueues a command on [`LOG_STREAM_REPLAY_CONSUMER`] and returns; it does NOT replay
+    /// anything. A replay re-reads set-aside audit ranges and re-ships them to the stream's
+    /// sink, which is network work of unbounded duration against a third party, and the
+    /// webhook replay already established that such work must not happen inside the request
+    /// that asks for it. So the management endpoint answers 202 and a worker executes this.
+    ///
+    /// The idempotency record is written in the SAME transaction as the command, so a
+    /// crash between them cannot leave a client's retry enqueueing a SECOND replay of the
+    /// same ranges.
+    ///
+    /// Unlike the webhook replay this writes no audit row, because nothing in this module
+    /// does: log-stream writes are recorded through the domain-event stream instead. Making
+    /// this one call the exception would need an acting context `LogStreamRepo` does not
+    /// carry, and would leave the surface half-audited, which is worse than consistently
+    /// event-recorded. Stated rather than left as an omission a reader has to notice.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn request_dead_letter_replay(
+        &self,
+        env: &Env,
+        stream_id: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // The command's idempotency key is the stream, so two replay commands for ONE
+        // stream execute in the order they were asked for. They share no ordering group
+        // with anything else, because a group is per (consumer, ordering key) and this is
+        // its own consumer.
+        let key = format!("{stream_id}:{}", CorrelationId::generate(env));
+        enqueue_outbox_in_tx(
+            &mut tx,
+            env,
+            scope,
+            &NewOutboxMessage {
+                consumer: LOG_STREAM_REPLAY_CONSUMER,
+                idempotency_key: &key,
+                ordering_key: stream_id,
+                payload: serde_json::json!({ "log_stream_id": stream_id }),
+            },
+        )
+        .await?;
+        insert_idempotency(&mut tx, idempotency).await?;
+        // In the command's own transaction: a rolled-back request announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Mark `id` replayed.

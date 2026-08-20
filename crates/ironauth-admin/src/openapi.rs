@@ -430,6 +430,8 @@ use crate::views::{
         crate::log_streams::list_log_streams,
         crate::log_streams::create_log_stream,
         crate::log_streams::delete_log_stream,
+        crate::log_streams::list_log_stream_dead_letters,
+        crate::log_streams::replay_log_stream_dead_letters,
         crate::webhook_endpoints::list_webhook_endpoints,
         crate::webhook_endpoints::create_webhook_endpoint,
         crate::webhook_endpoints::rotate_webhook_endpoint_secret,

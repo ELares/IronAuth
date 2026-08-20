@@ -1402,6 +1402,22 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // An operator ASKED for a replay. Separate from any later "replayed" notice because
+        // the request and the delivery are separated by a worker: the command is accepted
+        // synchronously and executed later, so this is the only event that can be emitted in
+        // the request's own transaction.
+        "log_stream.replay_requested",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "log_stream_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["log_stream_id"]
+        }"#,
+    ),
+    (
         // The stream is gone AND so is every dead letter it recorded, which is why this
         // matters more than a configuration tidy-up: an operator watching for undelivered
         // audit will never see those again, and the event is the only notice they get.

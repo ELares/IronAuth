@@ -1061,6 +1061,24 @@
       "type": "log_stream.deleted"
     },
     {
+      "domain": "log_stream",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "log_stream_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "log_stream_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "log_stream.replay_requested"
+    },
+    {
       "domain": "management_key",
       "payload_schema": {
         "additionalProperties": false,

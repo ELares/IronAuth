@@ -3009,6 +3009,12 @@ struct LogShipperInputs {
     control_dsn: Option<String>,
     /// The environment seam (deterministic clock and entropy).
     env: Env,
+    /// The outbox settings the dead-letter REPLAY pool runs under (issue #938).
+    ///
+    /// The replay consumer lives on this path rather than with the webhook workers because
+    /// it needs the SINKS, and the sinks exist only here. A replay pool with no sink to
+    /// ship to would drain an operator's commands and deliver nothing.
+    outbox: OutboxConfig,
 }
 
 /// Capture the shipper's inputs, or `None` when shipping is switched off.
@@ -3021,6 +3027,7 @@ fn log_shipper_inputs(config: &Config, env: &Env) -> Option<LogShipperInputs> {
         data_dsn: Some(config.database.url.expose().to_owned()),
         control_dsn: select_control_dsn(config),
         env: env.clone(),
+        outbox: config.outbox.clone(),
     })
 }
 
@@ -3035,6 +3042,7 @@ async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
         data_dsn,
         control_dsn,
         env,
+        outbox,
     } = inputs;
 
     let (Some(data_dsn), Some(control_dsn)) = (data_dsn, control_dsn) else {
@@ -3070,6 +3078,45 @@ async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
         Arc::new(S3LogSink::new(fetcher, env.clone())),
     ];
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+
+    // The dead-letter REPLAY pool (issue #938), spawned beside the shipper because it needs
+    // the same sinks. The management endpoint enqueues a command and answers 202; this is
+    // what executes it. Without this pool an operator's replay request would sit in the
+    // outbox forever, which is a worse failure than the endpoint not existing: it looks
+    // accepted.
+    //
+    // A registration failure is logged and the SHIPPER still starts. Forward shipping and
+    // replaying set-aside batches are independent, and stopping the export because a replay
+    // worker could not start would turn a recovery feature into an outage.
+    let mut replay_consumers = ConsumerRegistry::new();
+    let replay_pools = match replay_consumers.register(Arc::new(
+        ironauth_admin::log_shipper::LogStreamReplayConsumer::new(
+            data_store.clone(),
+            sinks.clone(),
+        ),
+    ) as Arc<dyn OutboxConsumer>)
+    {
+        Ok(()) => {
+            let replay_observer = outbox_observer();
+            spawn_consumer_pools(
+                &replay_consumers,
+                &data_store,
+                &env,
+                &outbox,
+                &scopes,
+                &replay_observer,
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, "log stream dead-letter replay NOT running: duplicate consumer name");
+            Vec::new()
+        }
+    };
+    tracing::info!(
+        pools = replay_pools.len(),
+        "log stream dead-letter replay worker started"
+    );
+
     let observer: Arc<dyn LogShipperObserver> = Arc::new(MetricsShipperObserver);
     let shipper = LogShipper::spawn(
         data_store,

@@ -1813,3 +1813,209 @@ async fn read_is_required_and_sufficient_for_the_event_feed_and_usage_export() {
         );
     }
 }
+
+/// Configure one stream and set a dead letter aside for it, returning `(stream_id, dead_id)`.
+///
+/// Seeded through the STORE rather than by driving a failing sink, because what these tests
+/// are about is the operator surface over a dead letter, not the shipper's decision to
+/// create one. `log_shipper.rs` drives the creation end to end.
+async fn seed_dead_letter(h: &Harness, scope: Scope, error: &str) -> (String, String) {
+    let env = ironauth_env::Env::system();
+    let stream_id = h
+        .control_store()
+        .scoped(scope)
+        .log_streams()
+        .create(
+            &env,
+            &NewLogStream {
+                id: None,
+                description: "dead letter fixture",
+                source: StreamSource::Both,
+                sink_type: SinkType::Http,
+                sink_config: serde_json::json!({ "endpoint": "https://sink.example/in" }),
+                credential_secret_name: None,
+                signing_secret_name: None,
+                event_type_filter: None,
+                organization_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("configure a stream");
+    let dead_id = h
+        .control_store()
+        .scoped(scope)
+        .log_streams()
+        .dead_letter(
+            &env,
+            &stream_id,
+            (
+                1_700_000_000_000_000,
+                "aud_first",
+                1_700_000_009_000_000,
+                "aud_last",
+            ),
+            7,
+            error,
+        )
+        .await
+        .expect("record a dead letter");
+    (stream_id, dead_id)
+}
+
+/// An operator can READ what the shipper set aside.
+///
+/// Issue #938: the shipper dead-letters a batch after a bounded failure run and advances
+/// past it, which is what stops one poisoned batch blocking every later event. Before this
+/// surface an operator could see the COUNT of what was set aside, through the health
+/// observation, and could not read WHICH events or get them delivered. A number with no
+/// way to act on it is not a recovery path.
+#[tokio::test]
+async fn an_operator_can_list_a_streams_dead_letters() {
+    let h = Harness::start(71).await;
+    let (tenant, environment) = h.create_tenant("acme", "lgs-dl-list").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "lgs-dl-list-mint").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let (stream_id, dead_id) = seed_dead_letter(&h, scope, "sink_refused_502").await;
+
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/log-streams/{stream_id}/dead-letters"
+    );
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(status, StatusCode::OK, "dead letters under read: {body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    let items = document["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        1,
+        "the seeded dead letter must be listed: {body}"
+    );
+    assert_eq!(items[0]["id"], dead_id);
+    assert_eq!(items[0]["event_count"], 7, "the size of the gap: {body}");
+    assert_eq!(
+        items[0]["last_error"], "sink_refused_502",
+        "the failure that ended the retry run: {body}"
+    );
+    // The RANGE, which is the whole point: without both ends an operator cannot tell which
+    // events went undelivered, and a replay cannot be checked against anything.
+    assert_eq!(items[0]["from_audit_id"], "aud_first", "{body}");
+    assert_eq!(items[0]["to_audit_id"], "aud_last", "{body}");
+    assert_eq!(
+        items[0]["from_occurred_at_unix_ms"], 1_700_000_000_000_i64,
+        "{body}"
+    );
+    assert_eq!(
+        items[0]["to_occurred_at_unix_ms"], 1_700_000_009_000_i64,
+        "{body}"
+    );
+    assert_eq!(
+        document["truncated"], false,
+        "one dead letter is not a truncated page: {body}"
+    );
+}
+
+/// A replay REQUEST is accepted and enqueues a command for the worker.
+///
+/// 202 rather than 200, and a command rather than the replay itself, because a replay
+/// re-ships audit ranges to a third-party sink: network work of unbounded duration that
+/// must not happen inside the request asking for it. The assertion that a command was
+/// ENQUEUED is what separates this from an endpoint that accepts and does nothing, which
+/// is the worse failure because it looks like success.
+#[tokio::test]
+async fn a_replay_request_enqueues_a_command_for_the_worker() {
+    let h = Harness::start(72).await;
+    let (tenant, environment) = h.create_tenant("acme", "lgs-dl-replay").await;
+
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let (stream_id, _dead_id) = seed_dead_letter(&h, scope, "sink_unreachable").await;
+
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/log-streams/{stream_id}/dead-letters/replay"
+    );
+    let (status, _, body) = h.post_as(&path, OPERATOR_TOKEN, "lgs-replay-1", "").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "replay request: {body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(document["log_stream_id"], stream_id, "{body}");
+
+    // The command is on the outbox for the replay consumer. Without this the endpoint
+    // could answer 202 and drop the request on the floor.
+    //
+    // Claimed through the DATA store while the request went through the CONTROL-plane HTTP
+    // surface, which is the same split the webhook replay test drives and for the same
+    // reason. Migration 0099 gives the management plane INSERT on the queue and NOT the
+    // UPDATE a claim needs, precisely so a replay is asked for by one plane and executed by
+    // the other. Reading it back with the control store fails with `permission denied`,
+    // which is the grant working rather than the test being wrong, and driving both halves
+    // here means a grant missing on either side fails this rather than production.
+    let queued = h
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &ironauth_env::Env::system(),
+            ironauth_store::LOG_STREAM_REPLAY_CONSUMER,
+            std::time::Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim the replay command");
+    assert_eq!(
+        queued.len(),
+        1,
+        "exactly one replay command must be queued for the worker"
+    );
+    assert_eq!(
+        queued[0].payload["log_stream_id"], stream_id,
+        "the command must name the stream it replays"
+    );
+
+    // Idempotent: the same key returns the original response and queues nothing more.
+    let (again, _, again_body) = h.post_as(&path, OPERATOR_TOKEN, "lgs-replay-1", "").await;
+    assert_eq!(
+        again,
+        StatusCode::ACCEPTED,
+        "idempotent replay: {again_body}"
+    );
+    assert_eq!(again_body, body, "the original response is returned");
+}
+
+/// A read-only credential can LIST dead letters and cannot request a replay.
+///
+/// The split is deliberate and it is the reason the two routes carry different permissions:
+/// reading what went undelivered is a status question, and replaying it sends audit events
+/// to a third party.
+#[tokio::test]
+async fn replaying_needs_more_than_reading() {
+    let h = Harness::start(73).await;
+    let (tenant, environment) = h.create_tenant("acme", "lgs-dl-perm").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "lgs-dl-perm-mint").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let (stream_id, _dead) = seed_dead_letter(&h, scope, "sink_refused_500").await;
+
+    let list = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/log-streams/{stream_id}/dead-letters"
+    );
+    let (status, _, body) = h.get_as(&list, &secret).await;
+    assert_eq!(status, StatusCode::OK, "read may list: {body}");
+
+    let replay = format!("{list}/replay");
+    let (status, _, body) = h.post_as(&replay, &secret, "lgs-perm-1", "").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential must not be able to ship audit events to a sink: {body}"
+    );
+}

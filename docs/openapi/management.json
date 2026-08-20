@@ -8078,6 +8078,195 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters": {
+      "get": {
+        "tags": [
+          "log-streams"
+        ],
+        "summary": "List a stream's outstanding dead letters.",
+        "operationId": "listLogStreamDeadLetters",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream_id",
+            "in": "path",
+            "description": "The stream identifier (lgs_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The outstanding dead letters, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogStreamDeadLetterList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent, or the stream is in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters/replay": {
+      "post": {
+        "tags": [
+          "log-streams"
+        ],
+        "summary": "Request a replay of a stream's outstanding dead letters.",
+        "operationId": "replayLogStreamDeadLetters",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream_id",
+            "in": "path",
+            "description": "The stream identifier (lgs_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "The replay was queued. A worker performs it; poll the dead-letter listing to watch it drain",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogStreamReplayAccepted"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted, or the stream is in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
       "get": {
         "tags": [
@@ -25506,6 +25695,73 @@
           }
         }
       },
+      "LogStreamDeadLetterList": {
+        "type": "object",
+        "description": "A stream's outstanding dead letters.",
+        "required": [
+          "items",
+          "truncated"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogStreamDeadLetterView"
+            },
+            "description": "Oldest first, so an operator reads the gap in the order it happened."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when the stream has MORE outstanding dead letters than this page carries.\n\nPresent so a truncated read is distinguishable from a complete one. Without it an\noperator who sees exactly the limit cannot tell whether they are looking at the\nwhole gap, which is the number they are trying to establish."
+          }
+        }
+      },
+      "LogStreamDeadLetterView": {
+        "type": "object",
+        "description": "One set-aside audit range, as an operator reads it.",
+        "required": [
+          "id",
+          "event_count",
+          "last_error",
+          "from_occurred_at_unix_ms",
+          "from_audit_id",
+          "to_occurred_at_unix_ms",
+          "to_audit_id"
+        ],
+        "properties": {
+          "event_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many events the failed batch carried."
+          },
+          "from_audit_id": {
+            "type": "string",
+            "description": "The audit id at the start of the range."
+          },
+          "from_occurred_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The inclusive start of the undelivered range, in cursor order."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `lsd_` identifier."
+          },
+          "last_error": {
+            "type": "string",
+            "description": "The failure that ended the retry run. Operator-safe, never a sink's response body,\nfor the same reason `last_error` on the stream itself is not."
+          },
+          "to_audit_id": {
+            "type": "string",
+            "description": "The audit id at the end of the range."
+          },
+          "to_occurred_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The inclusive end of the undelivered range, in cursor order."
+          }
+        }
+      },
       "LogStreamList": {
         "type": "object",
         "description": "The environment's configured streams.",
@@ -25519,6 +25775,19 @@
               "$ref": "#/components/schemas/LogStreamView"
             },
             "description": "The streams, ordered by identifier."
+          }
+        }
+      },
+      "LogStreamReplayAccepted": {
+        "type": "object",
+        "description": "The answer to a replay request.",
+        "required": [
+          "log_stream_id"
+        ],
+        "properties": {
+          "log_stream_id": {
+            "type": "string",
+            "description": "The stream the replay was requested for."
           }
         }
       },
