@@ -257,6 +257,21 @@ mod tests {
     /// reorder events because it never carries one. Asserted on the value rather than left
     /// in a doc comment, so a future change that started attaching a payload here would
     /// have to delete a failing test rather than quietly contradict a paragraph.
+    /// `notify` builds its body through `wake_body`, rather than beside it.
+    ///
+    /// Without this, mutating the call site to `wake_body("")` survives: the test below
+    /// calls `wake_body` directly and never observes what `notify` passes it. Asserting on
+    /// the SOURCE is a weak check and is worth saying so, but the alternative needs a live
+    /// broker, and a wake that names the wrong consumer wakes the wrong drain.
+    #[test]
+    fn notify_builds_its_body_through_wake_body() {
+        let source = include_str!("outbox_ironbus.rs");
+        assert!(
+            source.contains("let body = wake_body(consumer);"),
+            "notify must pass its own `consumer` to `wake_body`"
+        );
+    }
+
     #[test]
     fn a_wake_carries_no_payload() {
         let body = wake_body("outbox-events");
