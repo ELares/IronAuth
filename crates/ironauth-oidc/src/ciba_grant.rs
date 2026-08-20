@@ -322,6 +322,14 @@ async fn mint_ciba_tokens(
     // `Some("trusted_device")` mints the remembered-MFA `acr` with an empty `amr`. This
     // guard only stops an unrecognized string from becoming `pwd`; bounding what an approval
     // may claim belongs with the surface that writes it.
+    //
+    // And a THIRD residual, the widest of them: `authn`'s reserved `fedamr:` token carries an
+    // upstream `amr` through verbatim. A value like `"pwd fedamr:<base64>"` passes this guard
+    // on its `pwd` token, and the decoded payload is then appended to the signed `amr` as-is,
+    // so an approval could assert arbitrary upstream method strings. Same deferral and the
+    // same reason as the two above: `auth_methods` has no production writer today, because
+    // `decide` has no non-test caller. All three want bounding where the approval surface
+    // lands, and they are enumerated here so that work does not have to rediscover them.
     let auth_methods = approved
         .auth_methods
         .as_deref()
