@@ -64159,7 +64159,15 @@ pub struct RedeemedBackchannelRequest {
     /// The subject the tokens are for.
     pub subject: String,
     /// The grant opened at approval, the revocation spine the tokens hang off.
-    pub grant_id: Option<String>,
+    ///
+    /// TYPED and NOT optional, because both readers filter `grant_id IS NOT NULL` and the
+    /// CHECK in migration 0151 makes the alternative unrepresentable. An `Option<String>`
+    /// here would ask the token endpoint to write a branch for a state the store guarantees
+    /// away, which is the dead untestable branch an earlier round deleted, and would make the
+    /// caller `parse_in_scope` a string the store had just read from its own row. The device
+    /// grant's `ApprovedDeviceGrant` carries a typed non-optional `GrantId` for these
+    /// reasons and this now matches it.
+    pub grant_id: GrantId,
     /// The OAuth scope to echo into the issued tokens.
     pub requested_scope: Option<String>,
     /// The RFC 9396 `authorization_details` to echo into the issued tokens.
@@ -64526,7 +64534,7 @@ impl BackchannelAuthRepo<'_> {
         .bind(id.to_string())
         .bind(subject)
         .bind(approved)
-        .bind(linkage.grant_id.map(std::string::ToString::to_string))
+        .bind(spine_to_record(approved, &linkage))
         .bind(linkage.consent_ref)
         .bind(linkage.auth_methods)
         .bind(linkage.auth_time_micros)
@@ -64670,17 +64678,22 @@ impl BackchannelAuthRepo<'_> {
     /// `invalid_grant`, and a richer return type here would be a distinction waiting to leak
     /// into a response.
     ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`] on a persistence failure.
     /// # The spine is required here too
     ///
     /// This is the THIRD reader of an approved request, and a previous round enforced the
     /// spine on the other two and said so in the commit message, which was false for this
     /// one. Review demonstrated it: a row written around `decide` with `grant_id NULL` was
-    /// refused by `approved_details`, and this method consumed it, returning
-    /// `grant_id: None` and leaving the request `redeemed`. The approval was BURNED, by the
-    /// method whose name a future caller is most likely to reach for.
+    /// refused by `approved_details`, and this method consumed it, returning no grant and
+    /// leaving the request `redeemed`. The approval was BURNED, by the method whose name a
+    /// future caller is most likely to reach for. So `None` here now covers a fourth case: a
+    /// row whose spine is missing, which is an inconsistent state rather than a refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the stored `grant_id` does not parse in this scope, which
+    /// the query's own predicate makes unreachable and nothing else validates.
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
     pub async fn redeem(
         &self,
         auth_req_id_digest: &str,
@@ -64714,10 +64727,14 @@ impl BackchannelAuthRepo<'_> {
             return Ok(None);
         };
         let id_text: String = row.get("id");
+        // Both readers filter `grant_id IS NOT NULL`, so this is infallible by the query's
+        // own predicate; parsing it in scope is the second half of that guarantee, since the
+        // column is text and nothing else validates what was stored there.
+        let grant_text: String = row.get("grant_id");
         Ok(Some(RedeemedBackchannelRequest {
             id: BackchannelAuthRequestId::parse_in_scope(&id_text, &self.scope)?,
             subject: row.get("subject"),
-            grant_id: row.get("grant_id"),
+            grant_id: GrantId::parse_in_scope(&grant_text, &self.scope)?,
             requested_scope: row.get("requested_scope"),
             authorization_details: row.get("authorization_details"),
             auth_methods: row.get("auth_methods"),
@@ -64779,10 +64796,14 @@ impl BackchannelAuthRepo<'_> {
             return Ok(None);
         };
         let id_text: String = row.get("id");
+        // Both readers filter `grant_id IS NOT NULL`, so this is infallible by the query's
+        // own predicate; parsing it in scope is the second half of that guarantee, since the
+        // column is text and nothing else validates what was stored there.
+        let grant_text: String = row.get("grant_id");
         Ok(Some(RedeemedBackchannelRequest {
             id: BackchannelAuthRequestId::parse_in_scope(&id_text, &self.scope)?,
             subject: row.get("subject"),
-            grant_id: row.get("grant_id"),
+            grant_id: GrantId::parse_in_scope(&grant_text, &self.scope)?,
             requested_scope: row.get("requested_scope"),
             authorization_details: row.get("authorization_details"),
             auth_methods: row.get("auth_methods"),
@@ -65187,6 +65208,22 @@ async fn verify_and_insert_opaque(
     )
     .await?;
     Ok(())
+}
+
+/// The grant a decision records: the approval's, or NOTHING on a denial (issue #131).
+///
+/// `approval_linkage_is_usable` checks nothing on the denial path, correctly, because a
+/// refusal has nothing to hang off. Review found what `decide` then did with the field
+/// anyway: a denial naming any live in-scope grant WROTE it, including one belonging to
+/// another client for another user. No token can come of that, since every reader filters
+/// `status = 'approved'`, but the foreign key pins an unrelated grant against deletion and
+/// the index reports a link a future revocation or audit read would believe. Naming a grant
+/// that did not exist raised a raw foreign-key error rather than a clean refusal, too.
+fn spine_to_record(approved: bool, linkage: &BackchannelApprovalLinkage<'_>) -> Option<String> {
+    if !approved {
+        return None;
+    }
+    linkage.grant_id.map(std::string::ToString::to_string)
 }
 
 /// An APPROVAL must open a grant, and it must be one of this scope's (issue #131).

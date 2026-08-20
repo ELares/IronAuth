@@ -1528,6 +1528,9 @@ async fn authorizing_an_impersonation_announces_it_without_the_operator_prose() 
 /// the raw feed, which is the half that matters here.
 #[tokio::test]
 async fn a_real_sign_in_is_metered_as_an_active_user() {
+    // This test folds the feed, so it takes the same lock the counter assertions hold.
+    // Without it, its fold can land between their `before` and `after` and inflate the delta.
+    let _serialised = FEED_COUNTER.lock().await;
     let db = TestDatabase::start().await;
     let env = ironauth_env::Env::system();
     let scope = db.seed_scope(&env).await;
@@ -1597,6 +1600,21 @@ async fn a_real_sign_in_is_metered_as_an_active_user() {
     );
 }
 
+/// Serialises the tests that assert on the PROCESS-WIDE feed-read counter (issue #936).
+///
+/// `ironauth_store::feed_reads()` is a `static AtomicU64`, so a delta measured around one
+/// operation is only that operation's if nothing else in this binary folds the feed meanwhile.
+/// Two tests here do, and `cargo test` runs them concurrently, so the delta assertions raced:
+/// measured, `a_sign_in_reads_the_event_feed_zero_times` failed intermittently in a full-crate
+/// run and passed every time in isolation.
+///
+/// A lower-bound assertion would have hidden the race and cost the property: "at least one"
+/// cannot distinguish a live counter from a busy one, and distinguishing exactly that is what
+/// the probe below exists for. Serialising keeps the exact delta, which is the evidence #107
+/// criterion 5 actually needs.
+static FEED_COUNTER: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Neither a sign-in nor a token issuance reads the event feed (issue #107 criterion 5).
 ///
 /// The criterion is that metering adds no work to the hot paths. Metering is a READ of the
@@ -1619,6 +1637,9 @@ async fn a_sign_in_reads_the_event_feed_zero_times() {
     let scope = db.seed_scope(&env).await;
     let user = seed_user(&db, &env, scope, "hotpath@example.test").await;
     let id = issue_authorization(&db, &env, scope, &user, 30 * MINUTE_MICROS).await;
+
+    // Held across every read of the shared counter, including the probe below.
+    let _serialised = FEED_COUNTER.lock().await;
 
     let before = ironauth_store::feed_reads();
     db.store()

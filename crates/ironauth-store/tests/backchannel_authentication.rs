@@ -1364,10 +1364,7 @@ async fn the_opened_grant_is_the_one_redemption_reports() {
         .await
         .expect("redeem")
         .expect("an approved request redeems");
-    assert_eq!(
-        redeemed.grant_id.as_deref(),
-        Some(grant_id.to_string().as_str())
-    );
+    assert_eq!(redeemed.grant_id, grant_id);
     assert_eq!(redeemed.auth_methods.as_deref(), Some("pwd otp"));
     assert_eq!(redeemed.subject, "usr_ada");
 }
@@ -3211,8 +3208,7 @@ async fn approved_details_reports_the_spine_and_the_requested_scope() {
         .expect("the request is approved");
 
     assert_eq!(
-        details.grant_id.as_deref(),
-        Some(grant_id.to_string().as_str()),
+        details.grant_id, grant_id,
         "the spine must be reported, or the token endpoint cannot build a redemption at all"
     );
     assert_eq!(
@@ -3249,20 +3245,26 @@ async fn approving_without_a_grant_is_refused_and_denying_without_one_is_not() {
         create_pending_nonce(&db, &env, scope, "cli_app", "usr_ada", 42).await;
     let repo = || db.store().scoped(scope);
 
+    let refused = repo()
+        .backchannel_auth()
+        .decide(
+            &env,
+            &approve_id,
+            "usr_ada",
+            true,
+            BackchannelApprovalLinkage::default(),
+            NOW_MICROS,
+        )
+        .await
+        .unwrap_err();
     assert!(
-        repo()
-            .backchannel_auth()
-            .decide(
-                &env,
-                &approve_id,
-                "usr_ada",
-                true,
-                BackchannelApprovalLinkage::default(),
-                NOW_MICROS,
-            )
-            .await
-            .is_err(),
-        "approving without a grant must be refused, or the approval is unredeemable forever"
+        matches!(refused, ironauth_store::StoreError::NotFound),
+        "the CODE guard must refuse this, not the CHECK constraint. `.is_err()` cannot tell \
+         them apart: with the guard removed the constraint raises StoreError::Database and \
+         the weaker assertion still passes, which is how review measured BOTH enforcement \
+         points surviving mutation while the test stayed green. It matters to a caller too, \
+         because `decide`'s own doc makes NotFound the malformed-call answer and a Database \
+         error is a 500. Got {refused:?}"
     );
 
     // AND NOTHING WAS COMMITTED: the request is still pending, so a caller that fixes its
@@ -3523,11 +3525,22 @@ async fn each_issued_token_is_recorded_and_metered_under_its_own_kind() {
                 presenting_client_id: "cli_owner",
                 now_micros: NOW_MICROS,
                 grant_id: &grant_id,
-                // The production shape: an ID token record plus an opaque access token.
-                tokens: &[ironauth_store::IssuedTokenRecord {
-                    id: ironauth_store::IssuedTokenId::generate(&env, &scope),
-                    kind: ironauth_store::TokenKind::Id,
-                }],
+                // BOTH kinds in the record list, which is the `at+jwt` production shape
+                // (`token.rs:420`, `device.rs:458`). The earlier version passed `[Id]` only,
+                // and review measured why that cannot work: with one record of one kind, a
+                // mutant binding a CONSTANT kind still produces the expected single value.
+                // A fixture whose expectation is one element cannot distinguish "the kind was
+                // read" from "the kind was assumed".
+                tokens: &[
+                    ironauth_store::IssuedTokenRecord {
+                        id: ironauth_store::IssuedTokenId::generate(&env, &scope),
+                        kind: ironauth_store::TokenKind::Id,
+                    },
+                    ironauth_store::IssuedTokenRecord {
+                        id: ironauth_store::IssuedTokenId::generate(&env, &scope),
+                        kind: ironauth_store::TokenKind::Access,
+                    },
+                ],
                 opaque: Some(ironauth_store::NewOpaqueAccessToken {
                     token_digest: "digest-kinds",
                     grant_id: None,
@@ -3574,21 +3587,28 @@ async fn each_issued_token_is_recorded_and_metered_under_its_own_kind() {
 
     assert_eq!(
         kinds,
-        vec!["id".to_string()],
-        "the ID token row must record its own kind"
+        vec!["access".to_string(), "id".to_string()],
+        "each issued-token row must record ITS OWN kind, not a constant"
     );
     assert_eq!(
         metered,
-        vec!["access".to_string(), "id".to_string()],
-        "and each token must be metered under its own kind, or the usage breakdown is wrong \
-         while the total happens to be right"
+        vec!["access".to_string(), "access".to_string(), "id".to_string()],
+        "and every token must be metered under its own kind: two from the record list plus \
+         the opaque access token. A constant here leaves the TOTAL right and the usage \
+         breakdown wrong, which is the half nothing was checking"
     );
 }
 
 /// A redemption naming a grant from ANOTHER SCOPE is refused before the transaction opens.
 ///
-/// Review measured this guard surviving: it is the only thing standing between a foreign
-/// grant id and the ownership predicate, and nothing exercised it.
+/// # What actually refuses it, corrected
+///
+/// An earlier version of this doc said the top-of-function scope check "is the only thing
+/// standing between a foreign grant id and the ownership predicate". Measurably false:
+/// review disabled that check and the suite stayed green, because a foreign-scope `GrantId`
+/// can never equal the in-scope spine, so the spine comparison refuses it first. The early
+/// return is a cheap exit before the transaction opens, not the load-bearing guard, and the
+/// behaviour this test pins holds either way.
 #[tokio::test]
 async fn a_redemption_naming_a_foreign_scope_grant_is_refused() {
     let db = TestDatabase::start().await;
@@ -3676,5 +3696,236 @@ async fn approving_with_a_foreign_scope_grant_is_refused() {
             .expect("read")
             .is_none(),
         "and nothing was approved"
+    );
+}
+
+/// The CHECK refuses the two shapes the data plane can otherwise write (issue #131).
+///
+/// # Why this exists separately from the code guard
+///
+/// `decide` refusing a grant-less approval and migration 0151's CHECK mask each other. The
+/// only test of the code guard asserted `.is_err()`, which the CHECK satisfies too, so review
+/// measured BOTH surviving mutation independently: remove either and the suite stayed green.
+/// Two enforcement points that are only jointly observable are one enforcement point with
+/// extra steps.
+///
+/// So this asserts the CHECK on its own terms, through the DATA PLANE role under RLS, which
+/// is the writer it exists to survive. `status` and `grant_id` are independently writable in
+/// the table's column-scoped GRANT list, so both shapes below are within that role's granted
+/// privileges and neither goes anywhere near `decide`.
+#[tokio::test]
+async fn the_check_refuses_a_spine_less_approval_written_by_the_data_plane() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // 1. An INSERT naming `approved` and omitting the grant.
+    let id = BackchannelAuthRequestId::generate(&env, &scope);
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let inserted = sqlx::query(
+        "INSERT INTO backchannel_authentication_requests (
+             auth_req_id_digest, tenant_id, environment_id, id, client_id,
+             delivery_mode, status, interval_secs, subject, expires_at
+         ) VALUES ($1, $2, $3, $4, 'cli_app', 'poll', 'approved', 5, 'usr_ada', $5::timestamptz)",
+    )
+    .bind(digest_of("check-insert"))
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(id.to_string())
+    .bind(FAR_FUTURE)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        inserted.is_err(),
+        "the data plane must not be able to INSERT an approved request with no grant"
+    );
+    drop(tx);
+
+    // 2. An UPDATE moving a pending request to approved without setting one.
+    let (_, pending_id) = create_pending_nonce(&db, &env, scope, "cli_app", "usr_ada", 91).await;
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let updated = sqlx::query(
+        "UPDATE backchannel_authentication_requests SET status = 'approved' \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(pending_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        updated.is_err(),
+        "nor UPDATE one into existence, which is the shape a future writer who has not read \
+         `decide` produces"
+    );
+    drop(tx);
+
+    // POSITIVE CONTROL: the same UPDATE with a grant is allowed, so the refusals above are
+    // about the constraint and not about the role's privileges.
+    let grant = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(&db, scope, &grant.to_string(), "cli_app", "usr_ada").await;
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    sqlx::query(
+        "UPDATE backchannel_authentication_requests SET status = 'approved', grant_id = $4 \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(pending_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(grant.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("approving WITH a grant is permitted");
+    tx.commit().await.expect("commit");
+}
+
+/// `redeem` refuses a spine-less row, and reports what the approval froze (issue #131).
+///
+/// # Three unmeasured changes in one method
+///
+/// Review found every change a previous round made to `redeem` surviving mutation: its new
+/// `grant_id IS NOT NULL` predicate, its `auth_time` read, and its `consent_ref` read. The
+/// predicate was the fix for a blocking finding (this method was consuming spine-less rows
+/// and BURNING the approval) and it shipped with no test, because the only fixture that can
+/// produce that row was written for `approved_details` and never pointed here.
+#[tokio::test]
+async fn redeem_refuses_a_spine_less_row_and_reports_the_approval_instant() {
+    const APPROVED_AT: i64 = 1_700_000_000_123_456;
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let planted = seed_approved_without_a_spine(&db, &env, scope, "cli_owner").await;
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .redeem(&planted, "cli_owner", NOW_MICROS)
+            .await
+            .expect("read")
+            .is_none(),
+        "a spine-less row must not be consumable, or the approval is burned for a token that \
+         can hang off nothing"
+    );
+
+    // AND IT IS STILL THERE: the refusal must not have flipped it.
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM backchannel_authentication_requests \
+         WHERE auth_req_id_digest = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(&planted)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the row survives");
+    tx.commit().await.expect("commit");
+    assert_eq!(
+        status, "approved",
+        "the refusal must not consume the request"
+    );
+
+    // AND THE READS: a properly approved request reports what `decide` froze.
+    let (digest, id) = create_pending_nonce(&db, &env, scope, "cli_app", "usr_ada", 92).await;
+    let grant = ironauth_store::GrantId::generate(&env, &scope);
+    db.store()
+        .scoped(scope)
+        .backchannel_auth()
+        .decide(
+            &env,
+            &id,
+            "usr_ada",
+            true,
+            BackchannelApprovalLinkage {
+                grant_id: Some(&grant),
+                consent_ref: Some("cns_redeem_side"),
+                auth_methods: Some("pwd"),
+                auth_time_micros: Some(APPROVED_AT),
+            },
+            NOW_MICROS,
+        )
+        .await
+        .expect("approve");
+
+    let redeemed = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem(&digest, "cli_app", NOW_MICROS)
+        .await
+        .expect("read")
+        .expect("an approved request redeems");
+    assert_eq!(redeemed.grant_id, grant, "and it reports its spine");
+    assert_eq!(
+        redeemed.auth_time_unix_micros,
+        Some(APPROVED_AT),
+        "the approval instant must survive this reader too, not only the other one"
+    );
+    assert_eq!(
+        redeemed.consent_ref.as_deref(),
+        Some("cns_redeem_side"),
+        "and the consent decision"
+    );
+}
+
+/// A denial records no grant, whatever the caller named (issue #131).
+///
+/// `approval_linkage_is_usable` checks nothing on the denial path, correctly, because a
+/// refusal has nothing to hang off. Review found that `decide` then WROTE whatever grant the
+/// linkage carried anyway, including one belonging to another client for another user. No
+/// token can come of it, since every reader filters on `approved`, but the foreign key pins
+/// an unrelated grant against deletion and the index reports a link a revocation or an audit
+/// read would believe.
+#[tokio::test]
+async fn a_denial_records_no_grant_even_when_one_is_named() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (digest, id) = create_pending_nonce(&db, &env, scope, "cli_app", "usr_ada", 93).await;
+
+    // A real grant belonging to somebody else entirely.
+    let theirs = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(&db, scope, &theirs.to_string(), "cli_other", "usr_victim").await;
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .decide(
+                &env,
+                &id,
+                "usr_ada",
+                false,
+                approving_linkage(&theirs),
+                NOW_MICROS,
+            )
+            .await
+            .expect("deny"),
+        "the denial itself is recorded"
+    );
+
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT grant_id FROM backchannel_authentication_requests \
+         WHERE auth_req_id_digest = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(&digest)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read the denied row");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(
+        stored, None,
+        "a denial must record no grant, or it pins an unrelated one against deletion and \
+         reports a link that never existed"
     );
 }
