@@ -1955,15 +1955,19 @@ async fn an_approval_that_opened_no_grant_is_not_redeemable() {
     // state, so it fails closed rather than minting against no grant"). Without this
     // assertion the guard is unmeasured: review measured `AND grant_id IS NOT NULL` surviving
     // its removal, because every other fixture reaches this method through `decide`.
+    // Matched on the whole Result rather than `.expect("read").is_none()`. With the predicate
+    // disabled the row comes back and the explicit NULL refusal fires, so `.expect` panicked
+    // before this assertion ran and the message naming the property never printed.
+    let read = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .approved_details(&digest, "cli_owner", NOW_MICROS)
+        .await;
     assert!(
-        db.store()
-            .scoped(scope)
-            .backchannel_auth()
-            .approved_details(&digest, "cli_owner", NOW_MICROS)
-            .await
-            .expect("read")
-            .is_none(),
-        "an approved row with no spine must not read as redeemable, or the token endpoint          mints first and discovers the problem afterwards"
+        matches!(read, Ok(None)),
+        "an approved row with no spine must not read as redeemable, or the token endpoint \
+         mints first and discovers the problem afterwards. Got {read:?}"
     );
 
     // POSITIVE CONTROL: the identical request WITH a linked grant redeems, so the refusal is
@@ -3799,16 +3803,17 @@ async fn redeem_refuses_a_spine_less_row_and_reports_the_approval_instant() {
     let scope = db.seed_scope(&env).await;
     let planted = seed_approved_without_a_spine(&db, &env, scope, "cli_owner").await;
 
+    // Whole Result, for the same reason as its twin.
+    let consumed = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem(&planted, "cli_owner", NOW_MICROS)
+        .await;
     assert!(
-        db.store()
-            .scoped(scope)
-            .backchannel_auth()
-            .redeem(&planted, "cli_owner", NOW_MICROS)
-            .await
-            .expect("read")
-            .is_none(),
+        matches!(consumed, Ok(None)),
         "a spine-less row must not be consumable, or the approval is burned for a token that \
-         can hang off nothing"
+         can hang off nothing. Got {consumed:?}"
     );
 
     // AND IT IS STILL THERE: the refusal must not have flipped it.
@@ -3979,14 +3984,18 @@ async fn an_unparseable_grant_id_refuses_without_consuming_the_request() {
     )
     .await;
 
+    let refused = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem(&digest, "cli_owner", NOW_MICROS)
+        .await
+        .unwrap_err();
     assert!(
-        db.store()
-            .scoped(scope)
-            .backchannel_auth()
-            .redeem(&digest, "cli_owner", NOW_MICROS)
-            .await
-            .is_err(),
-        "an unparseable grant id must be refused"
+        matches!(refused, ironauth_store::StoreError::NotFound),
+        "an unparseable grant id must be refused as NotFound. `.is_err()` alone cannot tell \
+         that apart from a refusal for ANY reason: review inserted an unconditional error \
+         after the flip and this test passed both assertions. Got {refused:?}"
     );
 
     // AND THE REQUEST SURVIVES. This is the assertion that matters: the refusal must roll

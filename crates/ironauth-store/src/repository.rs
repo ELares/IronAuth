@@ -64690,8 +64690,16 @@ impl BackchannelAuthRepo<'_> {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the stored `grant_id` does not parse in this scope, which
-    /// the query's own predicate makes unreachable and nothing else validates.
+    /// [`StoreError::NotFound`] if the stored `grant_id` is absent or does not parse in this
+    /// scope.
+    ///
+    /// An earlier version of this line said the query's own predicate made that unreachable.
+    /// It does not, and this method's own body now says so forty lines down: the predicate
+    /// constrains NULLITY, not parseability, and `an_unparseable_grant_id_refuses_without_
+    /// consuming_the_request` reaches this error with a `grants.id` the data plane can write.
+    /// The absent case is genuinely unreachable behind the predicate, and is refused
+    /// explicitly rather than decoded infallibly because an infallible decode panics from
+    /// inside the store.
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn redeem(
