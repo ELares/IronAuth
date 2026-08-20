@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::{Harness, form, json};
-use ironauth_config::OidcConfig;
+use ironauth_config::{OidcConfig, TokenFormat as ConfigTokenFormat};
 use ironauth_jose::verify;
 use ironauth_store::{BackchannelApprovalLinkage, BackchannelAuthRequestId, GrantId, UserState};
 use serde_json::Value;
@@ -145,6 +145,42 @@ async fn decide(
 /// Approve `auth_req_id` with an ordinary recorded authentication method.
 async fn approve(harness: &Harness, auth_req_id: &str, subject: &str) {
     decide(harness, auth_req_id, subject, true, Some("pwd")).await;
+}
+
+/// Approve, and return the `GrantId` the approval was linked to.
+///
+/// Only the opaque-format test needs it, and it needs it because the revocation path this
+/// grant DOES have runs through the grant rather than through a refresh family.
+async fn approve_returning_grant(harness: &Harness, auth_req_id: &str, subject: &str) -> GrantId {
+    let handle = auth_req_id
+        .strip_prefix("ira_bar_")
+        .and_then(|rest| rest.split('~').next())
+        .expect("the auth_req_id carries its handle");
+    let id = BackchannelAuthRequestId::parse_in_scope(handle, &harness.scope())
+        .expect("the handle parses in this scope");
+    let grant = GrantId::generate(harness.env(), &harness.scope());
+    let at = now_micros(harness);
+    let landed = harness
+        .store()
+        .scoped(harness.scope())
+        .backchannel_auth()
+        .decide(
+            harness.env(),
+            &id,
+            subject,
+            true,
+            BackchannelApprovalLinkage {
+                grant_id: Some(&grant),
+                consent_ref: None,
+                auth_methods: Some("pwd"),
+                auth_time_micros: Some(at),
+            },
+            at,
+        )
+        .await
+        .expect("record the decision");
+    assert!(landed, "the approval must land");
+    grant
 }
 
 /// Redeem `auth_req_id` at the token endpoint.
@@ -346,9 +382,15 @@ async fn a_fenced_user_cannot_redeem_an_approved_backchannel_request() {
     let mut seeded = 0;
     // EVERY state, not the two that were listed. `can_authenticate` is the predicate this
     // fence delegates to, so driving its whole domain is what makes "a fenced user" mean the
-    // same thing here as it does there. Active and ScheduledOffboarding are authenticatable
-    // and are asserted to MINT, which is what keeps the loop from passing on a grant that
-    // refused everything.
+    // same thing here as it does there.
+    //
+    // The authenticatable states are SKIPPED, not asserted. An earlier version of this
+    // comment said they "are asserted to MINT, which is what keeps the loop from passing on
+    // a grant that refused everything", and the `continue` below skips both. Measured: with
+    // `mint_ciba_tokens` made to fail unconditionally, THIS test still passes. The real
+    // control is four other tests in this file, chiefly `an_unfenced_user_still_redeems`.
+    // ScheduledOffboarding is asserted nowhere, because this harness cannot transition into
+    // it.
     for state in UserState::ALL {
         // The skips are DERIVED from the store's own predicates rather than hand-picked, so
         // a state added to `UserState::ALL` later lands here instead of being forgotten.
@@ -437,7 +479,7 @@ async fn a_fenced_user_cannot_redeem_an_approved_backchannel_request() {
         );
         assert_eq!(body["error"], "invalid_grant", "{state:?}: {body:?}");
         assert!(
-            body["id_token"].is_null(),
+            body["access_token"].is_null() && body["id_token"].is_null(),
             "no token may escape for a {state:?} user: {body:?}"
         );
         seeded += 1;
@@ -505,10 +547,16 @@ async fn an_approval_with_an_unrecognized_auth_method_is_refused() {
     }
 }
 
-/// Whitespace-only is refused, and the trim is what does it.
+/// Whitespace-only is refused. The trim is NOT what does it, any more.
 ///
-/// Without `.map(str::trim)` a `Some("   ")` reaches `parse_methods`, splits to nothing, and
-/// fabricates a password authentication. The trim was load-bearing and untested.
+/// This used to read "the trim was load-bearing and untested", which was true of the guard
+/// that only checked emptiness. Since the recognition guard landed, removing
+/// `.map(str::trim)` OR the blank filter fails nothing, measured both ways: whitespace
+/// splits to no tokens, so `.any(is_active)` is false either way. Both terms are
+/// behaviourally dead and this test cannot distinguish them.
+///
+/// It stays because it pins the ANSWER for an input an approval surface can plausibly
+/// write, independently of which guard happens to produce it.
 #[tokio::test]
 async fn an_approval_whose_method_is_only_whitespace_is_refused() {
     let (harness, client_id) = ciba_harness().await;
@@ -521,8 +569,14 @@ async fn an_approval_whose_method_is_only_whitespace_is_refused() {
     assert_eq!(body["error"], "invalid_grant", "{body:?}");
 }
 
-/// A malformed or absent `auth_req_id` is `invalid_request`, and an unrecoverable scope is
+/// An ABSENT or blank `auth_req_id` is `invalid_request`; a PRESENT but unusable one is
 /// `invalid_grant`.
+///
+/// This sentence read "a malformed or absent `auth_req_id` is `invalid_request`" while the
+/// body ten lines below asserted `invalid_grant` for the malformed half. The source
+/// paragraph it mirrors was corrected three times and this copy was not touched once, which
+/// is the point: a retraction has to reach every site carrying the claim, and the site
+/// furthest from the analysis is the one that outlives it.
 ///
 /// Both were unpinned, and the scope-recovery path is the one that was accidentally
 /// covering the `NotFound` arm before the unknown-request probe was rewritten, so it went
@@ -729,4 +783,87 @@ async fn a_client_without_the_ciba_grant_is_refused() {
     let (status, body) = redeem(&harness, &auth_req_id, &client_id).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["error"], "unauthorized_client", "{body:?}");
+}
+
+/// Under the opaque access-token format the grant mints a REFERENCE token, and revoking the
+/// grant takes it back.
+///
+/// Three places in this branch assert that behaviour in prose (`ciba_grant.rs`, the fence
+/// test's doc, and the mint-site registry row) and nothing measured it. The claim they
+/// replaced was worse: it said the access token is always a self-contained `at+jwt` that
+/// nothing can revoke, which is true only under the DEFAULT setting and false under this
+/// one, whose `MintedAccessToken::Opaque` arm sits in the same function as the claim.
+///
+/// The revocation works through a path worth naming, because the same registry row says
+/// grant revocation cannot fence this grant: that is about the CASCADE, which reaches a
+/// grant only through a `refresh_families` row this grant never creates. A DIRECT
+/// `revoke_grant` still works, because `redeem_approved` records the token under the
+/// authoritative grant id and `resolve_opaque_access_token` filters on
+/// `g.revoked_at IS NULL`. Both sentences are true and they are about different things.
+#[tokio::test]
+async fn under_the_opaque_format_the_access_token_is_a_revocable_reference() {
+    let harness = Harness::start_with(OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        default_access_token_format: ConfigTokenFormat::Opaque,
+        ..OidcConfig::default()
+    })
+    .await;
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, CIBA_GRANTS, None)
+        .await;
+    let client_id = client.to_string();
+
+    let (auth_req_id, subject) = start_request(&harness, &client_id).await;
+    let grant = approve_returning_grant(&harness, &auth_req_id, &subject).await;
+    pace(&harness);
+
+    let (status, body) = redeem(&harness, &auth_req_id, &client_id).await;
+    assert_eq!(status, StatusCode::OK, "opaque redemption: {body:?}");
+    let access = body["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+    assert!(
+        access.starts_with("ira_at_"),
+        "the opaque format mints a reference token, not an at+jwt: {access}"
+    );
+
+    // It resolves before the revocation, so what follows measures the revocation and not
+    // some other reason the token never worked.
+    let scoped = harness.store().scoped(harness.scope());
+    assert!(
+        scoped
+            .authorization()
+            .resolve_opaque_access_token(&access, now_micros(&harness))
+            .await
+            .expect("resolve")
+            .is_some(),
+        "the freshly minted reference token must resolve"
+    );
+
+    // Revocation is an AUDITED write, so it needs an acting context. Built here rather than
+    // added to the shared harness: `common/mod.rs` is appended to by every suite in this
+    // crate and one more helper there is one more merge conflict for everyone.
+    let actor = harness.db().test_actor(harness.env());
+    let correlation = ironauth_store::CorrelationId::generate(harness.env());
+    assert!(
+        scoped
+            .acting(actor, correlation)
+            .authorization()
+            .revoke_grant(harness.env(), &grant)
+            .await
+            .expect("revoke the grant"),
+        "the grant must exist to be revoked"
+    );
+
+    assert!(
+        scoped
+            .authorization()
+            .resolve_opaque_access_token(&access, now_micros(&harness))
+            .await
+            .expect("resolve")
+            .is_none(),
+        "revoking the CIBA grant must stop its access token resolving"
+    );
 }
