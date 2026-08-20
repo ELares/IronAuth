@@ -1202,6 +1202,30 @@ async fn the_opened_grant_is_the_one_redemption_reports() {
     assert_eq!(redeemed.subject, "usr_ada");
 }
 
+/// Seed a grant row for `client`.
+///
+/// `issued_tokens.grant_id` has a foreign key to `grants`, so a token row cannot land without
+/// one, and `redeem_approved` additionally requires the grant to BELONG to the presenting
+/// client. Both are database-enforced rather than conventions, which is why recording the
+/// tokens belongs in the redeeming transaction.
+async fn seed_grant(db: &TestDatabase, scope: Scope, grant_id: &str, client: &str, subject: &str) {
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    sqlx::query(
+        "INSERT INTO grants (id, tenant_id, environment_id, client_id, subject, created_at) \
+         VALUES ($1, $2, $3, $4, $5, now())",
+    )
+    .bind(grant_id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(client)
+    .bind(subject)
+    .execute(&mut *tx)
+    .await
+    .expect("seed the grant");
+    tx.commit().await.expect("commit");
+}
+
 /// How many issued-token rows and `token.issue` audit rows exist for `grant_id`.
 ///
 /// Read back out of the database rather than inferred, because "recorded in the same
@@ -1263,24 +1287,14 @@ async fn redeeming_records_its_tokens_atomically_and_only_once() {
     let grant_id = ironauth_store::GrantId::generate(&env, &scope);
     let token_id = ironauth_store::IssuedTokenId::generate(&env, &scope);
 
-    // `issued_tokens.grant_id` has a foreign key to `grants`, so the grant has to exist for
-    // the token row to land. That constraint is the reason recording tokens belongs in the
-    // same transaction as the flip: it is enforced at the database rather than by convention.
-    let mut tx = db.app_pool().begin().await.expect("begin");
-    bind_scope(&mut tx, scope).await;
-    sqlx::query(
-        "INSERT INTO grants (id, tenant_id, environment_id, client_id, subject, created_at) \
-         VALUES ($1, $2, $3, $4, $5, now())",
+    seed_grant(
+        &db,
+        scope,
+        &grant_id.to_string(),
+        "cli_owner",
+        "usr_subject",
     )
-    .bind(grant_id.to_string())
-    .bind(scope.tenant().to_string())
-    .bind(scope.environment().to_string())
-    .bind("cli_owner")
-    .bind("usr_subject")
-    .execute(&mut *tx)
-    .await
-    .expect("seed the grant the issued token points at");
-    tx.commit().await.expect("commit");
+    .await;
 
     // The details are readable WITHOUT consuming: that is what lets the grant mint first.
     let details = db
@@ -1360,9 +1374,11 @@ async fn redeeming_records_its_tokens_atomically_and_only_once() {
 /// the flip that consumed the request anyway would make them approve again for a fault that
 /// was ours.
 ///
-/// The failure is real rather than simulated: `issued_tokens.grant_id` has a foreign key to
-/// `grants`, so naming a grant that was never seeded fails the INSERT after the flip has
-/// already happened inside the same transaction.
+/// The failure is real rather than simulated, and lands MID-BATCH: two token records share
+/// one id, so the first row lands and the second violates the primary key, after the flip has
+/// already happened inside the same transaction. An earlier version used an unseeded grant,
+/// which the ownership check now refuses before the insert is ever reached: the test would
+/// have kept passing for a reason that had nothing to do with atomicity.
 #[tokio::test]
 async fn a_failed_token_insert_rolls_the_flip_back_and_leaves_the_request_redeemable() {
     let db = TestDatabase::start().await;
@@ -1373,7 +1389,17 @@ async fn a_failed_token_insert_rolls_the_flip_back_and_leaves_the_request_redeem
         db.test_actor(&env),
         ironauth_store::CorrelationId::generate(&env),
     );
-    let absent_grant = ironauth_store::GrantId::generate(&env, &scope);
+    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(
+        &db,
+        scope,
+        &grant_id.to_string(),
+        "cli_owner",
+        "usr_subject",
+    )
+    .await;
+    // ONE ID, TWO RECORDS: the first row lands, the second violates the primary key.
+    let duplicate = ironauth_store::IssuedTokenId::generate(&env, &scope);
 
     let failed = db
         .store()
@@ -1386,11 +1412,17 @@ async fn a_failed_token_insert_rolls_the_flip_back_and_leaves_the_request_redeem
                 auth_req_id_digest: &digest,
                 presenting_client_id: "cli_owner",
                 now_micros: NOW_MICROS,
-                grant_id: &absent_grant,
-                tokens: &[ironauth_store::IssuedTokenRecord {
-                    id: ironauth_store::IssuedTokenId::generate(&env, &scope),
-                    kind: ironauth_store::TokenKind::Access,
-                }],
+                grant_id: &grant_id,
+                tokens: &[
+                    ironauth_store::IssuedTokenRecord {
+                        id: duplicate,
+                        kind: ironauth_store::TokenKind::Access,
+                    },
+                    ironauth_store::IssuedTokenRecord {
+                        id: duplicate,
+                        kind: ironauth_store::TokenKind::Id,
+                    },
+                ],
                 opaque: None,
             },
         )
@@ -1410,6 +1442,15 @@ async fn a_failed_token_insert_rolls_the_flip_back_and_leaves_the_request_redeem
             .is_some(),
         "the flip must roll back with the failed insert, or the user approves again on their \
          other device for a failure that was ours"
+    );
+
+    // AND THE ROW THAT DID LAND rolled back with it: a partial batch would leave live tokens
+    // against a request the store still thinks is approved.
+    let (tokens, audited) = recorded_for(&db, scope, &grant_id.to_string()).await;
+    assert_eq!(
+        (tokens, audited),
+        (0, 0),
+        "the first token row landed before the failure and must roll back with the flip"
     );
 }
 
@@ -1521,6 +1562,18 @@ async fn the_new_readers_refuse_another_client_and_an_expired_request() {
 ///
 /// Naming the fields in a struct does not prevent that. Comparing them does, and the row
 /// being flipped already carries the answer, so it is checked rather than trusted.
+///
+/// # Why the wrong grant here belongs to the SAME client
+///
+/// A grant owned by someone else is refused one guard earlier, by the ownership predicate, so
+/// a fixture using one would pass with the spine comparison DELETED. Measured: disabling the
+/// comparison left this suite green until the grant below was seeded to `cli_owner`.
+///
+/// Same-client confusion is the harm ownership cannot reach. One client holding two grants
+/// that redeems against the wrong one attaches the tokens to a grant the CIBA revocation
+/// spine does not name, so revoking the CIBA grant reaches none of them, and both grants pass
+/// every ownership test that could be written. Only the spine says which one the user
+/// actually approved.
 #[tokio::test]
 async fn redeeming_against_a_grant_the_approval_did_not_open_is_refused() {
     let db = TestDatabase::start().await;
@@ -1552,6 +1605,10 @@ async fn redeeming_against_a_grant_the_approval_did_not_open_is_refused() {
         )
         .await
         .expect("approve with a grant");
+
+    // A REAL grant, owned by the SAME client, so the ownership predicate accepts it and the
+    // spine comparison is the only thing left that can refuse it.
+    seed_grant(&db, scope, &unrelated.to_string(), "cli_owner", "usr_ada").await;
 
     let wrong = db
         .store()
@@ -1601,4 +1658,356 @@ async fn redeeming_against_a_grant_the_approval_did_not_open_is_refused() {
         "the grant the approval opened still redeems: the check is about WHICH grant, not a \
          fixture that was never redeemable"
     );
+}
+
+/// A request approved with NO grant still cannot mint against another client's grant
+/// (issue #131).
+///
+/// # The branch this closes
+///
+/// Comparing the caller's grant against the request's spine only bites when there IS a spine.
+/// `decide` may open none, which is what `BackchannelApprovalLinkage::default()` does and
+/// what most of this file's fixtures use, and in that branch any grant the caller named was
+/// accepted, including one belonging to a different client. The tokens and the audit row
+/// landed against it, so revoking the CIBA grant reached nothing and the issuance was
+/// attributed to the wrong client. Same harm as the linked case, through the default path.
+///
+/// The guard is that the grant must BELONG to the presenting client, which closes both
+/// branches and needs no ruling on whether CIBA may approve without a grant.
+#[tokio::test]
+async fn a_request_approved_without_a_grant_cannot_mint_against_another_clients_grant() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+
+    // A real grant, owned by someone else.
+    let theirs = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(
+        &db,
+        scope,
+        &theirs.to_string(),
+        "cli_someone_else",
+        "usr_them",
+    )
+    .await;
+
+    let stolen = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &theirs,
+                tokens: &[ironauth_store::IssuedTokenRecord {
+                    id: ironauth_store::IssuedTokenId::generate(&env, &scope),
+                    kind: ironauth_store::TokenKind::Access,
+                }],
+                opaque: None,
+            },
+        )
+        .await;
+    assert!(
+        stolen.is_err(),
+        "a grant belonging to another client must be refused even when the approval linked \
+         none of its own"
+    );
+    let (tokens, audited) = recorded_for(&db, scope, &theirs.to_string()).await;
+    assert_eq!(
+        (tokens, audited),
+        (0, 0),
+        "and nothing may be recorded against it"
+    );
+
+    // Positive control: the client's OWN grant still redeems, so the refusal is about
+    // ownership rather than about a fixture that could never redeem.
+    let mine = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(&db, scope, &mine.to_string(), "cli_owner", "usr_subject").await;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .backchannel_auth()
+            .redeem_approved(
+                &env,
+                &acting,
+                ironauth_store::BackchannelRedemption {
+                    auth_req_id_digest: &digest,
+                    presenting_client_id: "cli_owner",
+                    now_micros: NOW_MICROS,
+                    grant_id: &mine,
+                    tokens: &[],
+                    opaque: None,
+                },
+            )
+            .await
+            .expect("redeem with the client's own grant"),
+        "the presenting client's own grant still redeems"
+    );
+}
+
+/// The opaque branch runs, keeps every audience, and keeps the `DPoP` binding (issue #131).
+///
+/// # Why this test exists
+///
+/// Every other case in this file passes `opaque: None`, so the opaque INSERT was never
+/// executed once: it could have been renumbered wrongly, or dropped a column, and the suite
+/// would not have noticed. Review caught that the rewrite from ten binds to twelve was
+/// unexercised.
+///
+/// The two columns it asserts are the ones whose absence is silent rather than loud. A NULL
+/// `audiences` makes the resolver fall back to the single `audience`, so a multi-audience
+/// token INTROSPECTS NARROWER than it was issued. A NULL `dpop_jkt` reads back as "not key
+/// bound", so a sender-constrained token degrades to a bearer token that anyone holding it
+/// can replay. Neither fails anything at issuance.
+#[tokio::test]
+async fn an_opaque_token_keeps_its_audiences_and_its_dpop_binding() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(
+        &db,
+        scope,
+        &grant_id.to_string(),
+        "cli_owner",
+        "usr_subject",
+    )
+    .await;
+
+    let audiences = vec![
+        "https://api.one.test".to_string(),
+        "https://api.two.test".to_string(),
+    ];
+    let jti = ironauth_store::IssuedTokenId::generate(&env, &scope);
+    let redeemed = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &grant_id,
+                tokens: &[],
+                opaque: Some(ironauth_store::NewOpaqueAccessToken {
+                    token_digest: "digest-of-the-opaque-token",
+                    grant_id: None,
+                    subject: "usr_subject",
+                    client_id: "cli_owner",
+                    audience: "https://api.one.test",
+                    audiences: &audiences,
+                    scope: Some("read"),
+                    jti: &jti,
+                    expires_at_unix_micros: FAR_FUTURE_MICROS,
+                    dpop_jkt: Some("thumbprint-of-the-clients-key"),
+                }),
+            },
+        )
+        .await
+        .expect("redeem with an opaque token");
+    assert!(redeemed, "the redemption flips");
+
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let row = sqlx::query(
+        "SELECT audiences, dpop_jkt, grant_id FROM opaque_access_tokens \
+         WHERE token_digest = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind("digest-of-the-opaque-token")
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the opaque row landed");
+    let stored_audiences: Option<String> = row.get("audiences");
+    let stored_jkt: Option<String> = row.get("dpop_jkt");
+    let stored_grant: String = row.get("grant_id");
+    tx.commit().await.expect("commit");
+
+    // The column is `text` holding a JSON array (migration 0019), so compare the PARSED
+    // value: asserting on the raw string would also be asserting serde's spacing.
+    let parsed: Option<serde_json::Value> = stored_audiences
+        .as_deref()
+        .map(|raw| serde_json::from_str(raw).expect("the stored audiences parse as JSON"));
+    assert_eq!(
+        parsed,
+        Some(serde_json::json!([
+            "https://api.one.test",
+            "https://api.two.test"
+        ])),
+        "every audience must be stored, or the token introspects narrower than it was issued"
+    );
+    assert_eq!(
+        stored_jkt.as_deref(),
+        Some("thumbprint-of-the-clients-key"),
+        "the DPoP thumbprint must be stored, or a sender-constrained token degrades to bearer"
+    );
+    assert_eq!(
+        stored_grant,
+        grant_id.to_string(),
+        "the row hangs off the redemption's grant, not the one the caller put in the struct"
+    );
+}
+
+/// A token identifier minted in ANOTHER scope is refused (issue #131).
+///
+/// The device grant already guards this and this did not. Untested until review pointed out
+/// that disabling the guard left the suite green.
+#[tokio::test]
+async fn a_token_id_from_another_scope_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let elsewhere = db.seed_scope(&env).await;
+    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(
+        &db,
+        scope,
+        &grant_id.to_string(),
+        "cli_owner",
+        "usr_subject",
+    )
+    .await;
+
+    let foreign = db
+        .store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &grant_id,
+                tokens: &[ironauth_store::IssuedTokenRecord {
+                    id: ironauth_store::IssuedTokenId::generate(&env, &elsewhere),
+                    kind: ironauth_store::TokenKind::Access,
+                }],
+                opaque: None,
+            },
+        )
+        .await;
+    assert!(
+        foreign.is_err(),
+        "a token id minted under another scope must not be written into this one"
+    );
+    let (tokens, _) = recorded_for(&db, scope, &grant_id.to_string()).await;
+    assert_eq!(tokens, 0, "and nothing lands");
+}
+
+/// A CIBA-issued token is a COUNTED token (issue #131).
+///
+/// # Why this is here and not left to the token endpoint
+///
+/// `token.issued` had exactly one producer, in the authorization-code `redeem`. Tokens minted
+/// through the device grant and tokens minted here were never counted, so `tokens_issued`
+/// under-reports by exactly those tokens, and it under-reports SILENTLY: the metering fold
+/// sums whatever rows it is handed, and a producer that never fires is indistinguishable from
+/// a tenant that never issued anything.
+///
+/// The assertion reads the OUTBOX rather than appending envelopes and counting them back, so
+/// it measures the producer being wired rather than the fold's arithmetic. Deleting the emit
+/// loop must turn this red.
+#[tokio::test]
+async fn every_redeemed_token_is_metered_in_the_same_transaction() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let digest = seed_approved(&db, &env, scope, "cli_owner").await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let grant_id = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(
+        &db,
+        scope,
+        &grant_id.to_string(),
+        "cli_owner",
+        "usr_subject",
+    )
+    .await;
+
+    let before = metering_events_for(&db, scope, &grant_id.to_string()).await;
+    assert_eq!(before, 0, "the fixture enqueues none of its own");
+
+    db.store()
+        .scoped(scope)
+        .backchannel_auth()
+        .redeem_approved(
+            &env,
+            &acting,
+            ironauth_store::BackchannelRedemption {
+                auth_req_id_digest: &digest,
+                presenting_client_id: "cli_owner",
+                now_micros: NOW_MICROS,
+                grant_id: &grant_id,
+                tokens: &[
+                    ironauth_store::IssuedTokenRecord {
+                        id: ironauth_store::IssuedTokenId::generate(&env, &scope),
+                        kind: ironauth_store::TokenKind::Access,
+                    },
+                    ironauth_store::IssuedTokenRecord {
+                        id: ironauth_store::IssuedTokenId::generate(&env, &scope),
+                        kind: ironauth_store::TokenKind::Id,
+                    },
+                ],
+                opaque: None,
+            },
+        )
+        .await
+        .expect("redeem");
+
+    assert_eq!(
+        metering_events_for(&db, scope, &grant_id.to_string()).await,
+        2,
+        "one metering event per issued token, or usage under-reports CIBA issuance"
+    );
+}
+
+/// Count enqueued `token.issued` metering events for one grant.
+///
+/// Reads `outbox_messages` directly: the point is that the PRODUCER fired, and a helper that
+/// went through the metering fold would pass just as happily on seeded envelopes.
+async fn metering_events_for(db: &TestDatabase, scope: ironauth_store::Scope, grant: &str) -> i64 {
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    bind_scope(&mut tx, scope).await;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 \
+           AND payload->>'type' = 'token.issued' \
+           AND payload->'payload'->>'grant_id' = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(grant)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("count metering events");
+    tx.commit().await.expect("commit");
+    count
 }

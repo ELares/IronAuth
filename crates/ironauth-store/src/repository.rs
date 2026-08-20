@@ -64786,10 +64786,42 @@ impl BackchannelAuthRepo<'_> {
         // mis-attributed. Naming the fields in a struct does not prevent that; comparing them
         // does.
         //
-        // A NULL row grant is the pre-linkage case (`decide` may open none), and the caller's
-        // grant stands alone there.
+        // A NULL row grant is the pre-linkage case: `decide` may open none, and the caller's
+        // grant stands alone there. That branch was a HOLE. With no spine to compare against,
+        // any grant the caller named was accepted, including one belonging to a DIFFERENT
+        // client, and the tokens and the audit row were recorded against it: the same harm
+        // the comparison above exists to stop, reachable whenever an approval linked no
+        // grant, which is what `BackchannelApprovalLinkage::default()` does.
         let spine: Option<String> = row.get("grant_id");
         if spine.is_some_and(|opened| opened != grant_id.to_string()) {
+            return Err(StoreError::NotFound);
+        }
+        // SO THE GRANT MUST BELONG TO THE PRESENTING CLIENT. That closes the cross-client
+        // harm in BOTH branches at once, linked or not, and needs no decision about whether
+        // CIBA may approve without a grant. On every legitimate path it already holds by
+        // construction: `decide` opens the grant with the client read off the request row,
+        // and the flip above filters on that same client.
+        //
+        // It does NOT subsume the comparison above, which is the easy thing to conclude from
+        // the fact that it catches every case the comparison catches in the fixtures as they
+        // were first written. The two guards answer different questions. This one asks WHOSE
+        // grant it is; the comparison asks WHICH of that client's grants the user approved.
+        // A client holding two grants that redeems against the wrong one passes this check
+        // and hangs its tokens off a grant the revocation spine does not name, so revoking
+        // the CIBA grant reaches none of them. Deleting either one leaves a live hole, and
+        // both holes are now measured: see the two same-client and cross-client tests in
+        // `tests/backchannel_authentication.rs`.
+        let owned: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM grants \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND client_id = $4",
+        )
+        .bind(grant_id.to_string())
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(presenting_client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if owned.is_none() {
             return Err(StoreError::NotFound);
         }
         // Foreign-scope token identifiers are refused, exactly as the device grant refuses
@@ -64797,6 +64829,7 @@ impl BackchannelAuthRepo<'_> {
         if tokens.iter().any(|token| token.id.scope() != scope) {
             return Err(StoreError::NotFound);
         }
+        let grant_text = grant_id.to_string();
         for token in tokens {
             sqlx::query(
                 "INSERT INTO issued_tokens \
@@ -64806,39 +64839,26 @@ impl BackchannelAuthRepo<'_> {
             .bind(token.id.to_string())
             .bind(&tenant)
             .bind(&environment)
-            .bind(grant_id.to_string())
+            .bind(&grant_text)
             .bind(token.kind.as_str())
             .execute(&mut *tx)
             .await?;
         }
         if let Some(op) = opaque {
-            sqlx::query(
-                // `audiences` and `dpop_jkt` are WRITTEN here, unlike the device grant's
-                // copy of this insert, which omits both. That omission is not cosmetic: a
-                // NULL `audiences` makes `resolve_opaque_access_token` fall back to the
-                // single `audience`, so a multi-audience token introspects NARROWER than it
-                // was issued, and a NULL `dpop_jkt` reads back as "not key bound", silently
-                // downgrading a sender-constrained token to a bearer token.
-                "INSERT INTO opaque_access_tokens \
-                 (token_digest, tenant_id, environment_id, grant_id, subject, client_id, \
-                  audience, audiences, scope, jti, expires_at, dpop_jkt) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                         TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, $12)",
-            )
-            .bind(op.token_digest)
-            .bind(&tenant)
-            .bind(&environment)
-            .bind(grant_id.to_string())
-            .bind(op.subject)
-            .bind(op.client_id)
-            .bind(op.audience)
-            .bind(resource_array_to_json(op.audiences))
-            .bind(op.scope)
-            .bind(op.jti.to_string())
-            .bind(op.expires_at_unix_micros)
-            .bind(op.dpop_jkt)
-            .execute(&mut *tx)
-            .await?;
+            insert_opaque_access_token(&mut tx, &tenant, &environment, &grant_text, &op).await?;
+        }
+        // METERED, in the same transaction, so a CIBA-issued token is a COUNTED token.
+        // Only the authorization-code `redeem` enqueues `token.issued` today, so every
+        // token minted through the device grant and every token minted here has been
+        // invisible to `tokens_issued`: usage under-reports by exactly the tokens issued
+        // over those two grants, and the under-report is silent because the metering fold
+        // sums whatever it is given and a missing producer looks like a quiet tenant.
+        //
+        // Wiring the path being ADDED here is what stops this grant from shipping with that
+        // gap already in it. The device grant's identical omission predates this change and
+        // is filed separately rather than fixed under a CIBA issue.
+        for token in tokens {
+            meter_token_issued(&mut tx, env, scope, &grant_text, token.kind.as_str()).await?;
         }
         let spec = AuditedWrite {
             store: self.store,
@@ -64855,6 +64875,54 @@ impl BackchannelAuthRepo<'_> {
         tx.commit().await?;
         Ok(true)
     }
+}
+
+/// Insert one opaque access token row, with EVERY column the token's own claims imply
+/// (issue #131).
+///
+/// Extracted from `BackchannelAuthRepo::redeem_approved` so the same twelve binds can be
+/// reused by the device grant, which currently writes only ten of them (issue #934). The
+/// extraction is also what keeps the redemption under the readable-length lint, the same
+/// reason [`meter_token_issued`] is a function rather than an inlined block.
+///
+/// `audiences` and `dpop_jkt` are the two whose absence is SILENT rather than loud, which is
+/// why they are called out here and covered by a test. A NULL `audiences` makes
+/// `resolve_opaque_access_token` fall back to the single `audience`, so a multi-audience
+/// token introspects NARROWER than it was issued. A NULL `dpop_jkt` reads back as "not key
+/// bound", so a sender-constrained token silently degrades to a bearer token anyone holding
+/// it can replay. Neither fails anything at issuance.
+///
+/// `grant_text` is the caller's, deliberately, and NOT `op.grant_id`. The row must hang off
+/// the grant the redemption verified, not one the caller put in the struct beside it.
+async fn insert_opaque_access_token(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &str,
+    environment: &str,
+    grant_text: &str,
+    op: &NewOpaqueAccessToken<'_>,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO opaque_access_tokens \
+         (token_digest, tenant_id, environment_id, grant_id, subject, client_id, \
+          audience, audiences, scope, jti, expires_at, dpop_jkt) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                 TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, $12)",
+    )
+    .bind(op.token_digest)
+    .bind(tenant)
+    .bind(environment)
+    .bind(grant_text)
+    .bind(op.subject)
+    .bind(op.client_id)
+    .bind(op.audience)
+    .bind(resource_array_to_json(op.audiences))
+    .bind(op.scope)
+    .bind(op.jti.to_string())
+    .bind(op.expires_at_unix_micros)
+    .bind(op.dpop_jkt)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Enqueue the `token.issued` metering event for one issued token (issue #107).
