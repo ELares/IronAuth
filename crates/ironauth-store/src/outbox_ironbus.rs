@@ -199,12 +199,19 @@ fn wake_body(consumer: &str) -> PubBody<'_> {
         key: consumer.as_bytes(),
         headers: b"",
         dedup: None,
-        // NOT fire-and-forget: the named-stream path (`publish_to`) accepts only
-        // at-least-once server-ack, and the subscriber reads that stream. Producing to the
-        // default stream instead is silently a no-op for this backbone, which is exactly
-        // how the first live-broker run failed: every wake was published where nobody was
-        // listening. IronBus's own round-trip test produces with `fire_and_forget: false`
-        // and only then is the record visible to a `fetch`.
+        // NOT fire-and-forget, and the reason is DURABILITY rather than which stream is
+        // used. A fire-and-forget produce is not durably committed, so the record is never
+        // visible to the reader's `fetch` and every wake vanishes; IronBus's own round-trip
+        // test produces with `fire_and_forget: false` for exactly that reason. That was the
+        // cause of four failed live-broker runs.
+        //
+        // The stream half of this comment used to say the opposite of what the code does:
+        // that the subscriber reads the NAMED stream and that producing to the default one
+        // is "silently a no-op". Both halves are false. This calls `client.produce`, the
+        // DEFAULT stream, and the reader thread above subscribes to the default stream and
+        // says so. The live-broker lane is green, which it could not be if the produce went
+        // nowhere. Corrected rather than carried, since extracting `wake_body` moved this
+        // paragraph and a relocated falsehood is one a reader is more likely to trust.
         fire_and_forget: false,
         payload: b"",
     }
