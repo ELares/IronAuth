@@ -4020,3 +4020,113 @@ async fn an_unparseable_grant_id_refuses_without_consuming_the_request() {
          gave on their other device"
     );
 }
+
+/// `redeem_approved` refuses a PENDING and a DENIED request (issue #131).
+///
+/// # The two causes nothing measured
+///
+/// The flip's `status = 'approved'` predicate has three jobs: single-use (already covered by
+/// `an_approved_request_redeems_exactly_once`), and refusing the two states where the user
+/// has not said yes. Review measured the second and third going unmeasured: widening the
+/// predicate to `status IN ('approved', 'pending')` and to `status IN ('approved', 'denied')`
+/// each left the suite at 56 passed, because every pending and denied fixture in this file
+/// drives `redeem` or `approved_details` and never this method.
+///
+/// The blast radius was bounded by the grant spine, since a flipped pending row then fails
+/// the ownership check and rolls back, so this is coverage rather than a live hole. It is
+/// still the difference between a guard that works and a guard that is known to work.
+#[tokio::test]
+async fn redeem_approved_refuses_a_pending_and_a_denied_request() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acting = ironauth_store::ActingContext::new(
+        db.test_actor(&env),
+        ironauth_store::CorrelationId::generate(&env),
+    );
+    let repo = || db.store().scoped(scope);
+
+    // PENDING: created, nobody has decided. A grant is seeded so the ownership predicate
+    // cannot be what refuses it: the status filter must be.
+    let (pending, _) = create_pending_nonce(&db, &env, scope, "cli_app", "usr_ada", 94).await;
+    let grant = ironauth_store::GrantId::generate(&env, &scope);
+    seed_grant(&db, scope, &grant.to_string(), "cli_app", "usr_ada").await;
+    assert!(
+        !repo()
+            .backchannel_auth()
+            .redeem_approved(
+                &env,
+                &acting,
+                ironauth_store::BackchannelRedemption {
+                    auth_req_id_digest: &pending,
+                    presenting_client_id: "cli_app",
+                    now_micros: NOW_MICROS,
+                    grant_id: &grant,
+                    tokens: &[],
+                    opaque: None,
+                },
+            )
+            .await
+            .expect("redeem"),
+        "a pending request must not redeem, or the token endpoint mints before the person \
+         has answered on their other device"
+    );
+
+    // DENIED: the user said no.
+    let (denied, denied_id) =
+        create_pending_nonce(&db, &env, scope, "cli_app", "usr_ada", 95).await;
+    repo()
+        .backchannel_auth()
+        .decide(
+            &env,
+            &denied_id,
+            "usr_ada",
+            false,
+            BackchannelApprovalLinkage::default(),
+            NOW_MICROS,
+        )
+        .await
+        .expect("deny");
+    assert!(
+        !repo()
+            .backchannel_auth()
+            .redeem_approved(
+                &env,
+                &acting,
+                ironauth_store::BackchannelRedemption {
+                    auth_req_id_digest: &denied,
+                    presenting_client_id: "cli_app",
+                    now_micros: NOW_MICROS,
+                    grant_id: &grant,
+                    tokens: &[],
+                    opaque: None,
+                },
+            )
+            .await
+            .expect("redeem"),
+        "a denied request must not redeem, or a refusal mints tokens"
+    );
+
+    // POSITIVE CONTROL: the same shape, approved, does redeem. Without it both refusals
+    // above could be about the fixture rather than about the status.
+    let (approved, spine) = seed_approved_linked(&db, &env, scope, "cli_owner").await;
+    assert!(
+        repo()
+            .backchannel_auth()
+            .redeem_approved(
+                &env,
+                &acting,
+                ironauth_store::BackchannelRedemption {
+                    auth_req_id_digest: &approved,
+                    presenting_client_id: "cli_owner",
+                    now_micros: NOW_MICROS,
+                    grant_id: &spine,
+                    tokens: &[],
+                    opaque: None,
+                },
+            )
+            .await
+            .expect("redeem"),
+        "an approved request still redeems"
+    );
+}

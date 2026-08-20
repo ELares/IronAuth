@@ -661,6 +661,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object() {
+    const APPROVED_HAS_GRANT: &str = "backchannel_authentication_requests_approved_has_grant";
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -1140,8 +1141,9 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     // STATEMENTS, not the file text, and UPPERCASED. Three ways this assertion has been
     // measured passing for the wrong reason:
     //
-    // * a `contains` over the whole FILE matched the headers, which discuss `NOT VALID` and
-    //   `VALIDATE CONSTRAINT` at length, so it stayed green with the SQL saying the opposite;
+    // * a `contains` over the whole FILE matched the headers, which mention `NOT VALID`, so
+    //   it stayed green with the SQL saying the opposite. Only that half was ever at risk
+    //   from the prose: neither header contains the string `VALIDATE CONSTRAINT`;
     // * SQL keywords are case-insensitive, so appending `validate constraint ...` in
     //   lowercase to 0151 restored the collapsed one-file form and stayed green;
     // * `NOT VALID` left only inside a `PERFORM` string literal, with the real ALTER
@@ -1151,29 +1153,70 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     // Hence: comments stripped, uppercased, and the NOT VALID check anchored to the
     // ADD CONSTRAINT statement rather than to the file.
     let statements_of = |sql: &str| -> String {
-        sql.lines()
+        let without_line_comments = sql
+            .lines()
             .filter(|line| !line.trim_start().starts_with("--"))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        // Block comments out, then whitespace collapsed. Both are about not raising a FALSE
+        // alarm on SQL that is correct: `ADD` and `CONSTRAINT` on separate lines, and
+        // `NOT/**/VALID`, are both accepted by Postgres and both produce exactly the intended
+        // `convalidated = false`, and both failed the previous version of this assertion.
+        // Stripping block comments also closes a real bypass, a trailing `/* NOT VALID */`
+        // beside an ALTER that validates.
+        let mut out = String::with_capacity(without_line_comments.len());
+        let mut rest = without_line_comments.as_str();
+        while let Some(open) = rest.find("/*") {
+            out.push_str(&rest[..open]);
+            out.push(' ');
+            let Some(close) = rest[open..].find("*/") else {
+                rest = "";
+                break;
+            };
+            rest = &rest[open + close + 2..];
+        }
+        out.push_str(rest);
+        out.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
             .to_uppercase()
     };
     let add_statements = statements_of(&add_sql);
     let validate_statements = statements_of(&validate_sql);
-    let add_constraint_statement = add_statements
-        .split_once("ADD CONSTRAINT")
-        .map(|(_, rest)| rest.to_owned())
-        .unwrap_or_default();
+    // EVERY `ADD CONSTRAINT`, each truncated at its own terminating semicolon, with the
+    // constraint's NAME required in the same segment as `NOT VALID`.
+    //
+    // The previous version took everything from the FIRST `ADD CONSTRAINT` to end of file and
+    // called it a statement. Four ways past it, all measured, all leaving 0151 taking
+    // AccessExclusiveLock and scanning, which is the regression the split exists to prevent:
+    // the `NOT VALID` literal in a `PERFORM` placed AFTER the ALTER rather than before it; a
+    // `COMMENT ON CONSTRAINT ... IS '... NOT VALID ...'` after it; a trailing block comment,
+    // since only full-line `--` comments are stripped; and a DECOY `ADD CONSTRAINT ... NOT
+    // VALID` earlier in the file while the real one validates.
+    //
+    // None is visible to the database either: a validating ADD followed later by a VALIDATE
+    // leaves `convalidated` true and `pg_get_constraintdef` byte-identical, so the assertions
+    // below cannot stand in for this one.
+    let unvalidated_add = add_statements
+        .match_indices("ADD CONSTRAINT")
+        .map(|(at, _)| &add_statements[at..])
+        .map(|rest| rest.split_once(';').map_or(rest, |(head, _)| head))
+        .any(|statement| {
+            statement.contains(&APPROVED_HAS_GRANT.to_uppercase())
+                && statement.contains("NOT VALID")
+        });
     assert!(
-        add_constraint_statement.contains("NOT VALID")
-            && !add_statements.contains("VALIDATE CONSTRAINT"),
-        "0151 must ADD the constraint NOT VALID and must NOT validate it: the runner wraps \
-         each FILE in one transaction, so both statements together hold AccessExclusiveLock \
-         across the scan and the split buys nothing. Statements were: {add_statements}"
+        unvalidated_add && !add_statements.contains("VALIDATE CONSTRAINT"),
+        "0151 must ADD {APPROVED_HAS_GRANT} with NOT VALID in that same statement, and must \
+         not validate it: the runner wraps each FILE in one transaction, so both statements \
+         together hold AccessExclusiveLock across the scan and the split buys nothing. \
+         Uppercased, comment-stripped statements were: {add_statements}"
     );
     assert!(
         validate_statements.contains("VALIDATE CONSTRAINT"),
         "0152 must be the file that validates, so the scan runs in its own transaction under \
-         ShareUpdateExclusiveLock. Statements were: {validate_statements}"
+         ShareUpdateExclusiveLock. Uppercased, comment-stripped statements were: \
+         {validate_statements}"
     );
 
     // The CIBA approved-has-grant CHECK is present AND VALIDATED (issue #131), which is the

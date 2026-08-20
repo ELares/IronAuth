@@ -64888,27 +64888,41 @@ impl BackchannelAuthRepo<'_> {
     /// * an opaque token claiming a subject, client, grant or scope the approval did not
     ///   carry
     ///
-    /// `Ok(false)` is the separate answer for "the flip matched no row", and an earlier
-    /// version of this paragraph got both halves of it wrong.
+    /// `Ok(false)` is the separate answer for "the flip matched no row". Two earlier versions
+    /// of this paragraph miscounted its causes and mis-stated their mapping, so both are set
+    /// out here rather than summarised.
     ///
-    /// It has SIX causes, not the three first listed here. The flip filters on the digest,
-    /// the client, the scope, `status = 'approved'` and the expiry, so zero rows means an
-    /// unknown `auth_req_id`, a wrong client, a request still `pending`, a `denied` request,
-    /// an expired one, or one already `redeemed`.
+    /// The flip filters on the digest, the client, the SCOPE, `status = 'approved'` and the
+    /// expiry, so there are SEVEN causes: an unknown `auth_req_id`, a wrong client, a request
+    /// in another scope, one still `pending`, a `denied` one, an expired one, and one already
+    /// `redeemed`. The scope case is not hypothetical and is not the same as "unknown":
+    /// `neither_new_reader_reaches_across_scopes` presents a correct digest and a correct
+    /// client from a neighbouring scope and gets `Ok(false)`.
     ///
-    /// And they do NOT all map to `invalid_grant`. That claim contradicts
-    /// [`BackchannelPoll`] in this same file, which documents `pending` as
-    /// `authorization_pending`, `denied` as `access_denied` and expired as `expired_token`,
-    /// and it contradicts CIBA Core section 11. Answering `invalid_grant` for a PENDING
-    /// request is the worst of them: a conforming client must stop polling on any error other
-    /// than `authorization_pending` and `slow_down`, so it would give up before the person
-    /// has answered on their other device.
+    /// They do NOT share one error code.
     ///
-    /// The wiring that avoids this is the one the device grant already uses: poll first, map
-    /// each variant, and reach this method only for an approved request. Then `Ok(false)`
-    /// means a race, and `invalid_grant` is right for it. A caller that skips the poll must
-    /// map the six causes itself, and this method cannot tell it which applied, by design:
-    /// distinguishing them here would be an oracle over other clients' requests.
+    /// * `pending`, `denied` and expired are mapped by [`BackchannelPoll`] in this same file,
+    ///   as `authorization_pending`, `access_denied` and `expired_token`.
+    /// * an unknown `auth_req_id`, one issued to another client, and one from another scope
+    ///   are `invalid_grant`, which CIBA Core section 11 makes a MUST. [`BackchannelPoll`]
+    ///   does NOT supply this: its `NotFound` variant deliberately carries no code, because
+    ///   at that layer the three are indistinguishable and saying which applied would be an
+    ///   existence oracle over other clients' requests.
+    /// * `redeemed` has no poll variant at all. `poll` folds it into `Expired`, deliberately,
+    ///   so a spent `auth_req_id` answers `expired_token` rather than announcing that it was
+    ///   once valid.
+    ///
+    /// Answering `invalid_grant` for a PENDING request is the worst mistake available here: a
+    /// conforming client must stop polling on any error other than `authorization_pending`
+    /// and `slow_down`, which is RFC 8628 section 3.5 and is why this repository states it in
+    /// `device_login.rs`. Such a client gives up before the person has answered on their
+    /// other device.
+    ///
+    /// The wiring that avoids all of this is the one the device grant already uses: poll
+    /// first, map each variant, and reach this method only for an approved request. Then
+    /// `Ok(false)` means a race with another redemption, and `invalid_grant` is right for it.
+    /// A caller that skips the poll must map the seven causes itself, and this method cannot
+    /// tell it which applied, by the same oracle argument.
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn redeem_approved(
