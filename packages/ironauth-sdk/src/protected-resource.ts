@@ -30,18 +30,18 @@
 
 /** Why a protected-resource configuration was refused. Mirrors `PrmConfigError`. */
 export type PrmConfigErrorCode =
-  | "resource_not_absolute"
-  | "resource_has_query_or_fragment"
-  | "no_authorization_servers"
-  | "issuer_not_absolute"
-  | "resource_audience_mismatch"
+  | 'resource_not_absolute'
+  | 'resource_has_query_or_fragment'
+  | 'no_authorization_servers'
+  | 'issuer_not_absolute'
+  | 'resource_audience_mismatch'
   // Five mirrored above, five SDK-only below: failures that only exist on this side of the
   // boundary. An earlier version of this comment said three while listing five.
-  | "authorization_server_not_the_verified_issuer"
-  | "challenge_value_not_representable"
-  | "cache_lifetime_not_representable"
-  | "error_description_without_an_error"
-  | "resource_not_validated";
+  | 'authorization_server_not_the_verified_issuer'
+  | 'challenge_value_not_representable'
+  | 'cache_lifetime_not_representable'
+  | 'error_description_without_an_error'
+  | 'resource_not_validated';
 
 /**
  * A refused configuration.
@@ -56,7 +56,7 @@ export class PrmConfigError extends Error {
 
   constructor(code: PrmConfigErrorCode, value?: string) {
     super(PRM_CONFIG_MESSAGES[code]);
-    this.name = "PrmConfigError";
+    this.name = 'PrmConfigError';
     this.code = code;
     this.value = value;
   }
@@ -64,28 +64,28 @@ export class PrmConfigError extends Error {
 
 const PRM_CONFIG_MESSAGES: Record<PrmConfigErrorCode, string> = {
   resource_not_absolute:
-    "the resource identifier must be an absolute URI with a scheme and host",
+    'the resource identifier must be an absolute URI with a scheme and host',
   resource_has_query_or_fragment:
-    "the resource identifier must carry no query and no fragment",
+    'the resource identifier must carry no query and no fragment',
   no_authorization_servers:
-    "at least one authorization server issuer must be advertised",
+    'at least one authorization server issuer must be advertised',
   issuer_not_absolute:
-    "every authorization server issuer must be an absolute URI",
+    'every authorization server issuer must be an absolute URI',
   resource_audience_mismatch:
-    "the advertised resource identifier and the enforced audience must be identical",
+    'the advertised resource identifier and the enforced audience must be identical',
   authorization_server_not_the_verified_issuer:
-    "the advertised authorization servers must include the issuer tokens are verified against",
+    'the advertised authorization servers must include the issuer tokens are verified against',
   challenge_value_not_representable:
-    "a challenge value must contain only characters RFC 6750 permits",
+    'a challenge value must contain only characters RFC 6750 permits',
   cache_lifetime_not_representable:
-    "the cache lifetime must be a non-negative whole number of seconds",
+    'the cache lifetime must be a non-negative whole number of seconds',
   error_description_without_an_error:
-    "an error description needs an error code to attach to",
+    'an error description needs an error code to attach to',
   resource_not_validated:
-    "the configuration was not produced by defineProtectedResource",
+    'the configuration was not produced by defineProtectedResource',
 };
 
-const WELL_KNOWN = "/.well-known/oauth-protected-resource";
+const WELL_KNOWN = '/.well-known/oauth-protected-resource';
 
 /** A resource identifier split the way `http::Uri` splits it, with nothing normalised. */
 interface SplitResource {
@@ -98,15 +98,15 @@ function splitResource(resource: string): SplitResource {
   // Fragment checked on the RAW string, before any parsing. `prm.rs` does the same and says
   // why: parse-then-inspect lets `https://api.example/x#` through as a distinct identity for
   // the same resource, and an EMPTY fragment is the form that slips past a parsed check.
-  if (resource.includes("#")) {
-    throw new PrmConfigError("resource_has_query_or_fragment", resource);
+  if (resource.includes('#')) {
+    throw new PrmConfigError('resource_has_query_or_fragment', resource);
   }
-  if (resource.includes("?")) {
-    throw new PrmConfigError("resource_has_query_or_fragment", resource);
+  if (resource.includes('?')) {
+    throw new PrmConfigError('resource_has_query_or_fragment', resource);
   }
-  const schemeEnd = resource.indexOf("://");
+  const schemeEnd = resource.indexOf('://');
   if (schemeEnd <= 0) {
-    throw new PrmConfigError("resource_not_absolute", resource);
+    throw new PrmConfigError('resource_not_absolute', resource);
   }
   const rawScheme = resource.slice(0, schemeEnd);
   // MAX_SCHEME_LEN in the crate is 64 (`http-1.5.0/src/uri/scheme.rs:194`).
@@ -119,7 +119,7 @@ function splitResource(resource: string): SplitResource {
   // accepted there), so it never published a wrong URL, but a resource identifier the
   // server accepts and the SDK rejects is still a broken discovery chain.
   if (rawScheme.length > 64 || !/^[A-Za-z0-9+\-.~]+$/.test(rawScheme)) {
-    throw new PrmConfigError("resource_not_absolute", resource);
+    throw new PrmConfigError('resource_not_absolute', resource);
   }
   // CANONICALIZE `http` AND `https` TO LOWERCASE, AND NOTHING ELSE.
   //
@@ -136,15 +136,15 @@ function splitResource(resource: string): SplitResource {
   // does not touch those, and `new URL()` would rewrite all of them, which is why this
   // module still does not use it.
   const scheme =
-    rawScheme.toLowerCase() === "http" || rawScheme.toLowerCase() === "https"
+    rawScheme.toLowerCase() === 'http' || rawScheme.toLowerCase() === 'https'
       ? rawScheme.toLowerCase()
       : rawScheme;
   const rest = resource.slice(schemeEnd + 3);
-  const pathStart = rest.indexOf("/");
+  const pathStart = rest.indexOf('/');
   const authority = pathStart === -1 ? rest : rest.slice(0, pathStart);
-  const path = pathStart === -1 ? "" : rest.slice(pathStart);
+  const path = pathStart === -1 ? '' : rest.slice(pathStart);
   if (authority.length === 0) {
-    throw new PrmConfigError("resource_not_absolute", resource);
+    throw new PrmConfigError('resource_not_absolute', resource);
   }
   // TWO tables, because `http::Uri` has two. An earlier version ran ONE regex over the whole
   // string and was wrong in both directions, measured against the crate's own tables: too
@@ -154,7 +154,7 @@ function splitResource(resource: string): SplitResource {
   //
   // The authority: ASCII only, no delimiter that changes how it parses.
   if (/[^\x21-\x7e]/.test(authority) || /[\s"<>\\^`{|}]/.test(authority)) {
-    throw new PrmConfigError("resource_not_absolute", resource);
+    throw new PrmConfigError('resource_not_absolute', resource);
   }
   // A LEFT-TO-RIGHT SCAN, which is what the crate does, rather than counting.
   //
@@ -169,24 +169,24 @@ function splitResource(resource: string): SplitResource {
   let colons = 0;
   for (const ch of authority) {
     switch (ch) {
-      case "[":
+      case '[':
         // `has_percent || start_bracket` (`authority.rs:524`), NOT `endBracket`. The
         // `endBracket` half was dead (it implies `startBracket`), and checking it instead
         // of `hasPercent` accepted `https://a%25[b]/v1`, which the crate refuses.
         if (hasPercent || startBracket) {
-          throw new PrmConfigError("resource_not_absolute", resource);
+          throw new PrmConfigError('resource_not_absolute', resource);
         }
         startBracket = true;
         break;
-      case "]":
+      case ']':
         if (!startBracket || endBracket) {
-          throw new PrmConfigError("resource_not_absolute", resource);
+          throw new PrmConfigError('resource_not_absolute', resource);
         }
         endBracket = true;
         hasPercent = false;
         colons = 0;
         break;
-      case "@":
+      case '@':
         // Resets ONLY the colon count and the percent flag (`authority.rs:538-545`). It
         // does NOT clear the brackets, and clearing them here diverged in both directions:
         // it accepted `https://[a]@[b]/v1` and `https://aaa[@a/v1` (an unclosed bracket
@@ -195,17 +195,17 @@ function splitResource(resource: string): SplitResource {
         hasPercent = false;
         colons = 0;
         break;
-      case ":":
+      case ':':
         // MAX_COLONS is 8 and the crate checks it MID-SCAN, before incrementing and before
         // any `]` or `@` reset can forgive it (`authority.rs:486,518-522`). Without this
         // the SDK accepted `https://[::1:2:3:4:5:6:7:8]/v1`, `https://[:::::::::]/v1` and
         // `https://a:1:2:3:4:5:6:7:8:9@b/v1`, all of which the crate refuses.
         if (colons >= 8) {
-          throw new PrmConfigError("resource_not_absolute", resource);
+          throw new PrmConfigError('resource_not_absolute', resource);
         }
         colons += 1;
         break;
-      case "%":
+      case '%':
         hasPercent = true;
         break;
       default:
@@ -213,23 +213,23 @@ function splitResource(resource: string): SplitResource {
     }
   }
   if (startBracket !== endBracket) {
-    throw new PrmConfigError("resource_not_absolute", resource);
+    throw new PrmConfigError('resource_not_absolute', resource);
   }
   // A percent that no later `@` or `]` cleared is `InvalidPercent` in the crate.
   if (hasPercent) {
-    throw new PrmConfigError("resource_not_absolute", resource);
+    throw new PrmConfigError('resource_not_absolute', resource);
   }
   if (colons > 1) {
-    throw new PrmConfigError("resource_not_absolute", resource);
+    throw new PrmConfigError('resource_not_absolute', resource);
   }
-  const host = authority.slice(authority.lastIndexOf("@") + 1);
+  const host = authority.slice(authority.lastIndexOf('@') + 1);
   if (host.length === 0) {
-    throw new PrmConfigError("resource_not_absolute", resource);
+    throw new PrmConfigError('resource_not_absolute', resource);
   }
   // The path: only what the crate's PATH_MAP calls invalid. Controls, DEL, SP, `<`, `>` and
   // the backtick. Notably NOT `{`, `}`, `"`, `\`, `^`, `|` or non-ASCII.
   if (/[\x00-\x20\x7f<>`]/.test(path)) {
-    throw new PrmConfigError("resource_not_absolute", resource);
+    throw new PrmConfigError('resource_not_absolute', resource);
   }
   return { scheme, authority, path };
 }
@@ -249,7 +249,7 @@ function splitResource(resource: string): SplitResource {
  */
 export function protectedResourceMetadataUrl(resource: string): string {
   const { scheme, authority, path } = splitResource(resource);
-  return `${scheme}://${authority}${WELL_KNOWN}${path.replace(/\/+$/, "")}`;
+  return `${scheme}://${authority}${WELL_KNOWN}${path.replace(/\/+$/, '')}`;
 }
 
 /** What a resource server publishes, derived from what it already verifies. */
@@ -278,21 +278,21 @@ export interface VerifiedTokenConfig {
 export const DEFAULT_PRM_MAX_AGE_SECONDS = 600;
 
 /**
- * The module-private way to build a validated value.
- *
- * Assigned in the class's static block, so nothing outside this file can reach it. Declared
- * here rather than exported as a static because a public static made the private constructor
- * decorative: review called it directly and rebuilt every configuration this module refuses.
- */
-/**
  * The runtime capability to construct a {@link ProtectedResource}.
  *
  * Module-scoped and never exported, so no consumer can obtain it. This is what makes the
  * constructor genuinely unreachable; the `private` keyword only makes it unreachable to
  * code that is type-checked against these declarations.
  */
-const CONSTRUCT_TOKEN = Symbol("ironauth.prm.construct");
+const CONSTRUCT_TOKEN = Symbol('ironauth.prm.construct');
 
+/**
+ * The module-private way to build a validated value.
+ *
+ * Assigned in the class's static block, so nothing outside this file can reach it. Declared
+ * here rather than exported as a static because a public static made the private constructor
+ * decorative: review called it directly and rebuilt every configuration this module refuses.
+ */
 let construct: (
   config: ProtectedResourceConfig,
   verifies: VerifiedTokenConfig,
@@ -348,7 +348,7 @@ export class ProtectedResource {
     token?: symbol,
   ) {
     if (token !== CONSTRUCT_TOKEN) {
-      throw new PrmConfigError("resource_not_validated");
+      throw new PrmConfigError('resource_not_validated');
     }
     this.resource = config.resource;
     this.authorizationServers = [...config.authorizationServers];
@@ -403,7 +403,7 @@ export class ProtectedResource {
  */
 function assertValidated(resource: ProtectedResource): void {
   if (!ProtectedResource.isValidated(resource)) {
-    throw new PrmConfigError("resource_not_validated");
+    throw new PrmConfigError('resource_not_validated');
   }
 }
 
@@ -427,42 +427,74 @@ export function defineProtectedResource(
   config: ProtectedResourceConfig,
   verifies: VerifiedTokenConfig,
 ): ProtectedResource {
-  splitResource(config.resource);
-  if (config.authorizationServers.length === 0) {
-    throw new PrmConfigError("no_authorization_servers");
+  // SNAPSHOT FIRST, then validate the snapshot, then construct from the SAME snapshot.
+  //
+  // Every field used to be read straight off `config` at each step: `config.resource` three
+  // times (the parse, the audience comparison, and again inside the constructor) and
+  // `authorizationServers` four. A property whose reads are not stable therefore got
+  // validated on one value and stored on another, and the result reported `isValidated`
+  // true while disagreeing with the audience it was checked against. That needs no
+  // adversarial intent, only a config object backed by getters or a proxy, which is what a
+  // live or lazily-resolved configuration is. Measured on the previous head: three reads of
+  // a `resource` getter, `stored resource https://evil.example/x` against
+  // `stored audience https://api.example/v1`, and the middleware serving that document.
+  //
+  // Worth naming as a class rather than a bug: the crate cannot have this, because
+  // `ProtectedResource<'a>` holds `&'a str` and a Rust reference cannot change under the
+  // check. The divergence exists only because this side re-reads, so the fix is to stop
+  // re-reading rather than to add another check.
+  const snapshot: ProtectedResourceConfig = {
+    resource: config.resource,
+    authorizationServers: [...config.authorizationServers],
+    scopesSupported: config.scopesSupported
+      ? [...config.scopesSupported]
+      : undefined,
+    bearerMethodsSupported: config.bearerMethodsSupported
+      ? [...config.bearerMethodsSupported]
+      : undefined,
+    maxAgeSeconds: config.maxAgeSeconds,
+  };
+  const verified: VerifiedTokenConfig = {
+    issuer: verifies.issuer,
+    audience: verifies.audience,
+  };
+
+  splitResource(snapshot.resource);
+  if (snapshot.authorizationServers.length === 0) {
+    throw new PrmConfigError('no_authorization_servers');
   }
-  for (const issuer of config.authorizationServers) {
+  for (const issuer of snapshot.authorizationServers) {
     splitIssuer(issuer);
   }
   // EXACT, never normalised, because the token endpoint compares exactly. `prm.rs` pins this
   // with a test: normalising here would pass a pairing the endpoint still rejects.
-  if (config.resource !== verifies.audience) {
-    throw new PrmConfigError("resource_audience_mismatch", verifies.audience);
+  if (snapshot.resource !== verified.audience) {
+    throw new PrmConfigError('resource_audience_mismatch', verified.audience);
   }
-  if (!config.authorizationServers.includes(verifies.issuer)) {
+  if (!snapshot.authorizationServers.includes(verified.issuer)) {
     throw new PrmConfigError(
-      "authorization_server_not_the_verified_issuer",
-      verifies.issuer,
+      'authorization_server_not_the_verified_issuer',
+      verified.issuer,
     );
   }
   // VALIDATED, because it reaches a `Cache-Control` header. Unchecked, this produced
   // `max-age=-1`, `max-age=1.5`, `max-age=NaN` and `max-age=Infinity`; the crate's
   // `PRM_MAX_AGE_SECS` is a `const u64` and cannot express any of them.
-  const maxAge = config.maxAgeSeconds ?? DEFAULT_PRM_MAX_AGE_SECONDS;
+  const maxAge = snapshot.maxAgeSeconds ?? DEFAULT_PRM_MAX_AGE_SECONDS;
   if (!Number.isSafeInteger(maxAge) || maxAge < 0) {
     throw new PrmConfigError(
-      "cache_lifetime_not_representable",
+      'cache_lifetime_not_representable',
       String(maxAge),
     );
   }
-  return construct(config, verifies, maxAge);
+  return construct(snapshot, verified, maxAge);
 }
 
 function splitIssuer(issuer: string): void {
   try {
     splitResource(issuer);
   } catch {
-    throw new PrmConfigError("issuer_not_absolute", issuer);
+    throw new PrmConfigError('issuer_not_absolute', issuer);
   }
 }
 
@@ -490,7 +522,7 @@ export function protectedResourceMetadata(
 }
 
 /** An RFC 6750 error code a challenge may carry. */
-export type ChallengeError = "invalid_token" | "insufficient_scope";
+export type ChallengeError = 'invalid_token' | 'insufficient_scope';
 
 export interface ChallengeOptions {
   /** Omitted on a bare 401, which is the right answer to a request with no credentials. */
@@ -514,7 +546,7 @@ const CHALLENGE_VALUE = /^[\x20\x21\x23-\x5b\x5d-\x7e]*$/;
 
 function challengeValue(value: string): string {
   if (!CHALLENGE_VALUE.test(value)) {
-    throw new PrmConfigError("challenge_value_not_representable", value);
+    throw new PrmConfigError('challenge_value_not_representable', value);
   }
   return value;
 }
@@ -554,14 +586,14 @@ export function protectedResourceChallenge(
     // own code, because the value is perfectly representable and a log reader told otherwise
     // gets the wrong diagnosis.
     throw new PrmConfigError(
-      "error_description_without_an_error",
+      'error_description_without_an_error',
       options.errorDescription,
     );
   }
   if (options.scope) {
     parameters.push(`scope="${challengeValue(options.scope)}"`);
   }
-  return `Bearer ${parameters.join(", ")}`;
+  return `Bearer ${parameters.join(', ')}`;
 }
 
 /** A ready-to-send challenge response. */
@@ -573,12 +605,12 @@ export interface ChallengeResponse {
 /** The 401 for a request with no token, or one that failed validation. */
 export function unauthorized(
   resource: ProtectedResource,
-  options: Omit<ChallengeOptions, "scope"> = {},
+  options: Omit<ChallengeOptions, 'scope'> = {},
 ): ChallengeResponse {
   return {
     status: 401,
     headers: {
-      "WWW-Authenticate": protectedResourceChallenge(resource, options),
+      'WWW-Authenticate': protectedResourceChallenge(resource, options),
     },
   };
 }
@@ -596,8 +628,8 @@ export function forbidden(
   return {
     status: 403,
     headers: {
-      "WWW-Authenticate": protectedResourceChallenge(resource, {
-        error: "insufficient_scope",
+      'WWW-Authenticate': protectedResourceChallenge(resource, {
+        error: 'insufficient_scope',
         scope: advertisable ? requiredScope : undefined,
       }),
     },
@@ -626,7 +658,7 @@ export function protectedResourceMiddleware(
   resource: ProtectedResource,
 ): (request: {
   path: string;
-  outcome: "ok" | "no-token" | "invalid-token" | { missingScope: string };
+  outcome: 'ok' | 'no-token' | 'invalid-token' | { missingScope: string };
 }) => MiddlewareResponse | null {
   // SLICED from the composed URL, never parsed out of it. Deriving it through `new URL()` was
   // this module spending thirteen lines on why it does not compose through `URL`, and then
@@ -656,25 +688,25 @@ export function protectedResourceMiddleware(
   const maxAgeSeconds = resource.maxAgeSeconds;
   return (request) => {
     if (
-      request.path.replace(/\/+$/, "") === wellKnownPath.replace(/\/+$/, "")
+      request.path.replace(/\/+$/, '') === wellKnownPath.replace(/\/+$/, '')
     ) {
       return {
         status: 200,
         headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": `public, max-age=${maxAgeSeconds}`,
+          'Content-Type': 'application/json',
+          'Cache-Control': `public, max-age=${maxAgeSeconds}`,
         },
         body,
       };
     }
-    if (request.outcome === "ok") {
+    if (request.outcome === 'ok') {
       return null;
     }
-    if (request.outcome === "no-token") {
+    if (request.outcome === 'no-token') {
       return unauthorized(resource);
     }
-    if (request.outcome === "invalid-token") {
-      return unauthorized(resource, { error: "invalid_token" });
+    if (request.outcome === 'invalid-token') {
+      return unauthorized(resource, { error: 'invalid_token' });
     }
     return forbidden(resource, request.outcome.missingScope);
   };
