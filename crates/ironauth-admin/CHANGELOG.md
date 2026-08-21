@@ -7,16 +7,19 @@ range per docs/RELEASING.md.
 ## Unreleased
 
 - **BREAKING: `DeliveryHeaders` changed shape** (issue #112 criterion 2). Its `timestamp` and
-  `signature` fields are replaced by `signature: Option<SignaturePair>`, and `id` is now
-  unconditional. `WebhookSender::deliver` takes `&DeliveryHeaders` rather than an `Option`.
+  `signature` fields are replaced by one `signature: Option<SignaturePair>`, where
+  `SignaturePair` is a new public type carrying both. `id` and `WebhookSender::deliver`'s
+  signature are unchanged.
 
-  The shape is the point. `webhook-id` is the delivery's IDENTITY, not part of its signature:
-  it is what a receiver deduplicates an at-least-once queue on. An intermediate revision made
-  the whole header set optional so an unsigned flow target could be delivered, which dropped
-  the dedup handle along with the signature and left an unsigned receiver unable to tell a
-  redelivery from a second event. Optionality now lives one level down, where it belongs, and
-  `SignaturePair` keeps the timestamp and signature together because either alone is
-  unverifiable.
+  The shape is the point. A delivery may now be deliberately UNSIGNED, which an HTTP flow
+  target may legitimately be and a webhook endpoint never is, so the two signature headers had
+  to become optional. They became optional TOGETHER, in one type, because a timestamp without
+  a signature and a signature without a timestamp are both unverifiable: a shape that can
+  express one without the other can express a delivery no receiver can check.
+
+  `id` stayed unconditional deliberately. `webhook-id` is the delivery's IDENTITY rather than
+  part of its signature -- it is what a receiver deduplicates an at-least-once queue on -- so
+  an unsigned delivery needs it exactly as much as a signed one.
 
 - **New module `flow_target_delivery`** (issue #112 criterion 2): the outbox consumer that
   signs a queued flow-target delivery and POSTs it. Retries, backoff, the attempts cap,

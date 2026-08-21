@@ -41,11 +41,18 @@ range per docs/RELEASING.md.
   `list` hides deleted rows. The distinction decides the message's fate and is expensive in
   both directions. A deregistered target is gone and its secret with it, so the message
   completes; retrying would burn the attempt budget against a row that will never return. A
-  disabled one is a switch an operator can flip back, so the message dead-letters and stays
-  RETRIES, so a re-enable inside the backoff window drains the backlog; completing it would
-  drop a real signup notification with nothing behind it, and dead-lettering it would preserve
-  the backlog only if something could revive a dead letter for this consumer, which nothing
-  can today.
+  disabled one is a switch an operator can flip back, so the delivery RETRIES: completing it
+  would drop a real signup notification with nothing behind it, and dead-lettering it would
+  preserve the backlog only if something could revive a dead letter for this consumer, which
+  nothing can today.
+
+  Retrying is bounded rather than free, and the bound is worth knowing before disabling a busy
+  target. At the shipped outbox defaults one message takes roughly 37 hours of backoff to
+  reach the attempts cap, and the queue leases only the lowest-sequenced non-terminal message
+  of a target's group, so while a target stays off its backlog GROWS: new signups enqueue
+  behind a head that is asleep. Re-enabling does not re-arm the head's already-scheduled
+  attempt either, so the first delivery after a re-enable waits out whatever backoff it was
+  already in (up to ten hours at the cap) before the rest follow.
 - **Migration 0146's header overstates when a pre-persist flow target runs.**
   `0146_flow_targets.sql:40` says `pre_persist` "runs inside the write's transaction so a
   rejection leaves no row". MEASURED: nothing runs a flow target inside a write

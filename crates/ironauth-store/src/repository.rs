@@ -40391,9 +40391,13 @@ impl ActingFlowTargetRepo<'_> {
     /// silently converting a blocking fraud check into a fire-and-forget one. Refused rather
     /// than accepted-and-ignored, because the second is indistinguishable from working.
     ///
-    /// Returns the enqueued message id, so a caller can correlate the delivery it just
-    /// scheduled with the attempt rows and dead letters it may later produce -- rather than
-    /// re-deriving it from the idempotency key and hoping the derivation matches.
+    /// Returns the enqueued message id rather than making a caller re-derive it from the
+    /// idempotency key and hope the derivation matches.
+    ///
+    /// Today's caller discards it: this consumer records no per-attempt history (its module
+    /// doc says why), and no dead-letter route is mounted for it, so there is nothing yet to
+    /// correlate against. The id is returned anyway because deriving it later is the thing
+    /// that goes wrong silently.
     ///
     /// # Errors
     ///
@@ -40419,8 +40423,10 @@ impl ActingFlowTargetRepo<'_> {
                 // The TARGET is the ordering key. What that buys UNCONDITIONALLY is that only
                 // the lowest-sequenced non-terminal message of a target's group is ever
                 // leased, so a slow or failing target cannot delay another target's
-                // deliveries, and the per-target dead-letter view narrows on exactly this
-                // column.
+                // deliveries, and a per-target dead-letter view would narrow on exactly this
+                // column -- WOULD, because none is mounted for this consumer yet. The generic
+                // read takes the ordering key, so the column is the right one when the route
+                // lands; today the rows are reachable only from the database.
                 //
                 // It does NOT buy strict per-target ORDERING, and an earlier revision of this
                 // comment claimed it did. The substrate's contract is explicit that the
@@ -40607,11 +40613,9 @@ impl FlowTargetRepo<'_> {
 
     /// Every ENABLED ASYNC target in this scope, of every class, by name.
     ///
-    /// Deliberately unfiltered by class. All four classes are registrable, and a class filter
-    /// here would make some registrable combination silently inert, which is the defect this
-    /// whole issue keeps producing. `Timing` is not filtered either: the migration's CHECK
-    /// already forces an async target to be post-persist, so filtering again here would be a
-    /// second copy of a rule that lives in the schema.
+    /// `Timing` is not filtered: the migration's CHECK already forces an async target to be
+    /// post-persist, so filtering again here would be a second copy of a rule that lives in
+    /// the schema. Class is not filtered either, for the reason set out below.
     ///
     /// Distinct from [`Self::enabled_for_class`] on the axis each filters: that one narrows by
     /// CLASS and returns sync rows, this one narrows by INVOCATION and spans every class.

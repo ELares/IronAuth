@@ -654,6 +654,36 @@ mod tests {
         assert_eq!(set[2].1.as_bytes(), b"v1,abc");
     }
 
+    /// `for_purpose` actually changes the purpose the sender attributes its calls to.
+    ///
+    /// Its doc says a webhook delivery and a flow-target delivery are different destinations
+    /// with different operators behind them, and that one metric series covering both would
+    /// make neither debuggable. Nothing measured that: `pub fn for_purpose(self, _) -> Self
+    /// { self }` survives the entire tree and silently collapses the flow-target series into
+    /// the webhook one, which is exactly what the doc says must not happen.
+    #[test]
+    fn for_purpose_changes_the_attributed_purpose() {
+        // `Fetcher::for_tests` rather than the production constructor, which loads the OS
+        // trust store. An earlier revision of this test built a real fetcher and failed under
+        // parallel load with `NoTrustRoots`: this asserts which purpose a sender attributes
+        // its calls to, and has no business depending on the platform's certificate store.
+        let sender = FetchWebhookSender::new(Arc::new(ironauth_fetch::Fetcher::for_tests(
+            ironauth_fetch::FetchLimits::default(),
+        )));
+        assert_eq!(
+            sender.purpose,
+            ironauth_fetch::FetchPurpose::WebhookDelivery,
+            "a sender is a webhook deliverer until told otherwise"
+        );
+        assert_eq!(
+            sender
+                .for_purpose(ironauth_fetch::FetchPurpose::FlowTarget)
+                .purpose,
+            ironauth_fetch::FetchPurpose::FlowTarget,
+            "and takes the purpose it is given"
+        );
+    }
+
     /// A value that will not encode REFUSES the whole delivery rather than dropping one
     /// header, which would present an unsigned or undedupable POST to the receiver.
     #[test]
