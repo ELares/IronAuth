@@ -30,6 +30,7 @@ use ironauth_store::{
     SignupStep, UserState,
 };
 
+use super::flow_target;
 use super::message::{self, Message, MessageId};
 use super::model::{Autocomplete, InputType, Node, NodeAttributes, NodeGroup, Transport};
 use super::signup_fields::{self, FieldFailure, SignupValidation};
@@ -452,6 +453,47 @@ pub(super) async fn advance_registration(
         }
     }
 
+    // Registered HTTP flow targets, PRE-PERSIST (issue #112). Placed here deliberately:
+    // after IronAuth's own cheap defences (throttle, disposable, proof of work, breach
+    // screen), so a bot attempt is never shipped to a customer's endpoint, and BEFORE the
+    // Argon2 hash and the write, so a rejected signup spends no hashing work and leaves no
+    // row. The password is never in the payload.
+    let target_data = serde_json::json!({
+        "identifier": identifier,
+        "traits": collected_traits
+            .as_ref()
+            .and_then(|(document, _)| serde_json::from_str::<serde_json::Value>(document).ok()),
+    });
+    match flow_target::dispatch_sync(
+        state,
+        scope,
+        ironauth_store::flow_target::Timing::PrePersist,
+        &target_data,
+        signup.as_ref().map(|(config, _, _)| config),
+    )
+    .await
+    {
+        flow_target::Decision::Allow => {}
+        flow_target::Decision::Interrupt(errors) => {
+            // The target named the offending fields. They render on the SAME nodes, with the
+            // same ids, that IronAuth's own validation failures use, on both transports.
+            let (id_err, pw_err, failures) = flow_target::split_for_render(&errors);
+            return Ok(RegistrationStep::Render {
+                nodes: details_with_signup(id_err, pw_err, &failures),
+                messages: Vec::new(),
+            });
+        }
+        flow_target::Decision::Refuse => {
+            // A fail-closed target could not be consulted. Uniform and field free: there is
+            // nothing truthful to say about WHICH field was wrong, and naming one would
+            // invent a rejection the target never made.
+            return Ok(RegistrationStep::Render {
+                nodes: details_with_signup(None, None, &[]),
+                messages: vec![flow_target::refusal_message()],
+            });
+        }
+    }
+
     // Hash through the dedicated, admission controlled pool (issue #62). A saturated pool or
     // a pool fault is the neutral store error (never an oracle), exactly as `register_post`.
     let Ok(password_hash) = state.hash_password(&scope, password).await else {
@@ -519,6 +561,32 @@ pub(super) async fn advance_registration(
         }),
         Ok(user_id) => {
             let subject = user_id.to_string();
+            // Registered HTTP flow targets, POST-PERSIST (issue #112). The row is committed,
+            // so the payload carries `subject` and the target observes state that is
+            // guaranteed to still be there when it looks. That asymmetry (a subject at this
+            // timing and none at pre-persist) is criterion 4's observable difference.
+            //
+            // The verdict is ADVISORY and deliberately not acted on. Honouring a rejection
+            // after commit would leave an account created while telling the person it failed,
+            // which is worse than either honest outcome. The issue's own wording for this
+            // timing is "the target OBSERVES committed state".
+            let observed = serde_json::json!({
+                "identifier": identifier,
+                "subject": subject,
+                "traits": collected_traits
+                    .as_ref()
+                    .and_then(|(document, _)| {
+                        serde_json::from_str::<serde_json::Value>(document).ok()
+                    }),
+            });
+            let _advisory = flow_target::dispatch_sync(
+                state,
+                scope,
+                ironauth_store::flow_target::Timing::PostPersist,
+                &observed,
+                signup.as_ref().map(|(config, _, _)| config),
+            )
+            .await;
             Ok(RegistrationStep::Complete(Box::new(RegistrationSuccess {
                 subject,
             })))

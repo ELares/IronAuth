@@ -46,6 +46,15 @@ mod builtin_artifacts;
 mod consent;
 mod eval_ctx;
 mod federation;
+mod flow_target;
+
+/// The ceiling on a sync HTTP flow target's configured timeout (issue #112).
+///
+/// Re-exported because the BOOT path needs it: the flow-target `Fetcher` must be constructed
+/// with exactly this as its `total_timeout`. A per-request timeout only ever SHORTENS that
+/// ceiling, so a fetcher built with a smaller one would silently truncate every target
+/// registered above it and the operator's stated bound would be quietly false.
+pub use flow_target::MAX_SYNC_TIMEOUT_MS as FLOW_TARGET_MAX_SYNC_TIMEOUT_MS;
 mod login;
 mod mfa;
 mod orchestration;

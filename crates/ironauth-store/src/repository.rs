@@ -40408,6 +40408,41 @@ impl FlowTargetRepo<'_> {
             })
             .collect()
     }
+
+    /// Open a target's per-target signing secret, or [`None`] when it has no secret name.
+    ///
+    /// The record carries the secret's NAME, never its bytes, so resolving it is a store act:
+    /// `Store::master()` is `pub(crate)`, which is why this cannot live in the dispatcher's
+    /// own crate.
+    ///
+    /// A target WITH a configured name whose secret cannot be opened is an error rather than
+    /// `Ok(None)`. The distinction is the whole point: `None` means "this target is
+    /// deliberately unsigned", and collapsing the two would silently downgrade a signed
+    /// target to an unsigned call, which is exactly what the webhook delivery path refuses to
+    /// do.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] when the master key is absent, and [`StoreError`] on a
+    /// persistence fault or an undecryptable secret.
+    pub async fn open_signing_secret(
+        &self,
+        target: &crate::flow_target::FlowTargetRecord,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(name) = target.signing_secret_name.as_deref() else {
+            return Ok(None);
+        };
+        let Some(master) = self.store.master() else {
+            return Err(StoreError::Encryption);
+        };
+        let opened = self
+            .store
+            .scoped(self.scope)
+            .environment_secrets()
+            .open_value(master, name)
+            .await?;
+        Ok(Some(opened))
+    }
 }
 
 /// The wire spelling of a target class, in ONE place beside its parser.

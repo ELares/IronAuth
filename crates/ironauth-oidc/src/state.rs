@@ -393,6 +393,11 @@ pub struct OidcState {
     // The claims-enrichment hook (issue #100): the seam an external PDP or FGA merges
     // extra claims through at issuance. `None` (the default) leaves issuance unchanged.
     claims_enrichment_hook: Option<Arc<crate::enrichment::ClaimsEnrichmentHook>>,
+    // The outbound client SYNC HTTP flow targets are called through (issue #112). `None`
+    // (the default) is not "skip the targets": a registered target with no fetcher takes the
+    // unavailable path and its failure policy, so a boot that forgot to install one cannot
+    // silently disarm a fail-closed integration.
+    flow_target_fetcher: Option<Arc<ironauth_fetch::Fetcher>>,
     // The dedicated, admission-controlled Argon2id hashing pool (issue #62). Kept
     // OUTSIDE `Inner` and installed by the boot path (built from [password_hashing]
     // config, sharing the SAME quota enforcer as the request path so hashing
@@ -997,6 +1002,7 @@ impl OidcState {
             quota: None,
             migration_hook: None,
             claims_enrichment_hook: None,
+            flow_target_fetcher: None,
             hashing_pool: None,
             custom_journey_source: None,
             dpop_replay: Arc::new(crate::dpop::DpopReplayCache::new()),
@@ -1580,6 +1586,23 @@ impl OidcState {
     #[must_use]
     pub fn claims_enrichment_hook(&self) -> Option<&Arc<crate::enrichment::ClaimsEnrichmentHook>> {
         self.claims_enrichment_hook.as_ref()
+    }
+
+    /// Install the outbound client sync HTTP flow targets are called through (issue #112).
+    ///
+    /// Build it with a `total_timeout` of [`crate::flow::FLOW_TARGET_MAX_SYNC_TIMEOUT_MS`]:
+    /// a per-request timeout only ever SHORTENS the fetcher's ceiling, so a fetcher built
+    /// with a lower one would silently truncate every target registered above it.
+    #[must_use]
+    pub fn with_flow_target_fetcher(mut self, fetcher: Arc<ironauth_fetch::Fetcher>) -> Self {
+        self.flow_target_fetcher = Some(fetcher);
+        self
+    }
+
+    /// The installed flow-target fetcher, if any (issue #112).
+    #[must_use]
+    pub fn flow_target_fetcher(&self) -> Option<&Arc<ironauth_fetch::Fetcher>> {
+        self.flow_target_fetcher.as_ref()
     }
 
     /// Charge one request against the tenant and environment request-rate quota
