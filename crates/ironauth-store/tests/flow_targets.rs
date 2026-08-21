@@ -410,8 +410,8 @@ async fn dispatch_reads_only_enabled_targets_of_the_class() {
          an integration nobody thought was running"
     );
     assert!(
-        targets[0].runs_in_transaction(),
-        "a sync pre-persist target runs inside the write's transaction, which is what makes \
+        targets[0].runs_before_write(),
+        "a sync pre-persist target runs before the write is attempted, which is what makes \
          its rejection leave no row"
     );
 }
@@ -582,8 +582,8 @@ async fn registration_round_trips_plain_json_and_reconfigures_in_place() {
     );
     assert_eq!(after[0].config, relaxed);
     assert!(
-        !after[0].runs_in_transaction(),
-        "the timing changed to post-persist, so it no longer runs inside the write"
+        !after[0].runs_before_write(),
+        "the timing changed to post-persist, so it no longer runs before the write"
     );
 }
 

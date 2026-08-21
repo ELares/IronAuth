@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Migration 0146's header overstates when a pre-persist flow target runs.**
+  `0146_flow_targets.sql:40` says `pre_persist` "runs inside the write's transaction so a
+  rejection leaves no row". MEASURED: nothing runs a flow target inside a write
+  transaction, and nothing can. `Store::pool()` is `pub(crate)`, the `write_audited`
+  transaction seam is module-private, and `sqlx::Transaction` is not re-exported, so no
+  dispatcher outside `ironauth-store` can run anything inside one. It also should not: an
+  outbound HTTP call there would hold a pooled connection and the write's row locks for the
+  target's whole timeout, so a slow third party would consume the pool rather than its own
+  budget. Running BEFORE the write satisfies criterion 4 anyway, because a target that
+  refuses means the write call is never made. A shipped migration's text is never edited,
+  so the correction is recorded here and on `Timing::PrePersist`, whose doc carries it. An
+  earlier revision of this PR corrected 0146 in place, which would have made every
+  already-migrated database refuse to boot on `ChecksumMismatch`; it was reverted to its
+  shipped bytes.
 - **The per-test-database reclaim threshold is overridable**, through
   `IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS`, clamped at a five-minute floor. The six-hour
   default is correct on a developer machine, where the cluster outlives many runs, and

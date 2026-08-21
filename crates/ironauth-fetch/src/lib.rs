@@ -133,6 +133,14 @@ pub enum FetchPurpose {
     /// trail, and a policy or a rate limit that is right for one is not
     /// automatically right for the other.
     LogStreamDelivery,
+    /// Invoking an operator-registered FLOW TARGET (issue #112): a sync or async HTTP call
+    /// out to a customer's own service at a point in a signup or login flow. Distinct from
+    /// [`FetchPurpose::WebhookDelivery`] for the reason [`FetchPurpose::LogStreamDelivery`]
+    /// is: a webhook is a notification a tenant may drop, and a SYNC flow target is on the
+    /// critical path of a live signup and can interrupt it. A latency budget or a failure
+    /// rate that is unremarkable for one is an outage for the other, and collapsing them
+    /// into one metric series would hide exactly that.
+    FlowTarget,
     /// Fetching a client `logo_uri` for a consent page.
     Logo,
     /// Talking to an ACME certificate authority (RFC 8555) for a custom domain
@@ -211,6 +219,7 @@ impl FetchPurpose {
             FetchPurpose::ClientMetadata => "client_metadata",
             FetchPurpose::WebhookDelivery => "webhook_delivery",
             FetchPurpose::LogStreamDelivery => "log_stream_delivery",
+            FetchPurpose::FlowTarget => "flow_target",
             FetchPurpose::Logo => "logo",
             FetchPurpose::AcmeDirectory => "acme_directory",
             FetchPurpose::KmsRequest => "kms_request",
@@ -275,6 +284,7 @@ pub struct FetchRequest {
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
     allow_http: bool,
+    timeout: Option<Duration>,
 }
 
 impl FetchRequest {
@@ -297,6 +307,7 @@ impl FetchRequest {
             headers: Vec::new(),
             body: Bytes::new(),
             allow_http: false,
+            timeout: None,
         }
     }
 
@@ -306,6 +317,27 @@ impl FetchRequest {
     #[must_use]
     pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.push((name, value));
+        self
+    }
+
+    /// Bound THIS request to `timeout`, never longer than the `Fetcher`'s configured
+    /// `total_timeout`.
+    ///
+    /// The per-request override exists because a per-target deadline cannot be expressed
+    /// otherwise: `total_timeout` is fixed on the `Fetcher` at construction, and a `Fetcher`
+    /// per target would rebuild the TLS trust store per registered target. It is CAPPED
+    /// rather than replacing the configured bound, so a caller can only ever ask for less
+    /// time, and an operator's ceiling stays a ceiling.
+    ///
+    /// Honoured at the ONE existing deadline in `connect.rs`, deliberately, rather than by
+    /// wrapping the call in an outer `tokio::time::timeout`. An outer wrapper does cancel the
+    /// inner exchange when it fires, but it yields `tokio` `Elapsed`, never
+    /// [`FetchError::Timeout`], so it never reaches the arm that records
+    /// `Outcome::Timeout`: every per-target timeout would vanish from the per-purpose metric
+    /// series, which is the signal an operator tunes the target's budget from.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -468,6 +500,12 @@ impl Fetcher {
         // SSRF hardening are untouched.
         let mut limits = self.limits;
         limits.max_response_bytes = purpose.response_cap(self.limits.max_response_bytes);
+        // A per-request deadline may only SHORTEN the configured one. `min` rather than a
+        // replacement, so a caller asking for longer than the operator allowed gets the
+        // operator's bound and not its own.
+        if let Some(requested) = request.timeout {
+            limits.total_timeout = limits.total_timeout.min(requested);
+        }
 
         let dispatch = Dispatch {
             target: &target,
