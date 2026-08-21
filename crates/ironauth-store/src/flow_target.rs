@@ -107,7 +107,6 @@ pub struct FlowTargetRecord {
 impl FlowTargetRecord {
     /// Whether this target must run BEFORE the write, so a refusal leaves no row.
     ///
-    /// The name says "in transaction" and the guarantee is narrower than that, deliberately.
     /// The dispatcher calls a pre-persist target before it calls the store at all; the target
     /// does not run inside the write's database transaction, and should not. An outbound HTTP
     /// call made inside one would hold a pooled Postgres connection and whatever rows the
