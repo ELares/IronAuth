@@ -547,9 +547,10 @@ pub(super) enum TargetField {
 
 /// Resolve a flow target's pointer onto a form field, or [`None`] if it names nothing.
 ///
-/// [`None`] is not "skip this error": the dispatcher discards the WHOLE verdict when any
-/// pointer fails to resolve, because attaching only the resolvable subset would let one typo
-/// in a pointer silently defang a fail-closed rejection.
+/// [`None`] is not "skip this error". When any pointer fails to resolve the dispatcher
+/// discards the whole field MAPPING, because attaching only the resolvable subset would let
+/// one typo silently defang a rejection. It does NOT discard the rejection: an unmappable
+/// interrupt still stops the flow, under either failure policy, as a uniform refusal.
 ///
 /// Resolution is by EXACT match, which is what makes it safe against a malformed pointer
 /// without a separate syntax check. A built-in is matched literally, so a pointer missing its
@@ -565,8 +566,8 @@ pub(super) enum TargetField {
 /// "Configured" means configured FOR THIS STEP and still present in the active schema, which
 /// is the same pair of conditions [`signup_field_nodes_with_messages`] builds nodes under. An
 /// earlier revision matched any configured field, and the gap was not academic: a target
-/// naming a `LaterLogin` field resolved, so the whole-verdict-discard rule never fired, and
-/// the resulting failure matched no node. The person then got the unchanged form back with no
+/// naming a `LaterLogin` field resolved, so the discard rule never fired, and the resulting
+/// failure matched no node. The person then got the unchanged form back with no
 /// field error, no flow-level notice, and no way forward, while the signup was refused.
 pub(super) fn resolve_target_pointer(
     pointer: &str,

@@ -87,21 +87,42 @@ pub(super) enum Decision {
     Refuse,
 }
 
-// There is deliberately NO struct for the whole response body.
-//
-// Deserializing the body into one type is what made this contract breakable: a type error
-// anywhere in it discarded the verdict along with it, so a target that answered `interrupt`
-// was read as silence and, under FailOpen, as approval. Four rounds of review found four
-// different inputs that did it. The verdict is now read on its own, and only the error
-// entries are deserialized, so nothing about the shape of the rest can change what the
-// answer MEANS.
+/// Just the verdict, ignoring everything else in the body.
+///
+/// TWO narrow derives rather than one wide struct, and rather than a whole-body
+/// `serde_json::Value`. Both of the obvious alternatives have now been measured to break the
+/// same contract:
+///
+/// * One struct covering the whole body: a type error ANYWHERE discarded the verdict with it,
+///   so a target that answered `interrupt` was read as silence and, under `FailOpen`, approved.
+///   Four rounds of review found four separate inputs that did it.
+/// * A whole-body `Value`: materialising every member applies `serde_json`'s recursion limit to
+///   parts of the body this contract never reads, so a perfectly good rejection carrying an
+///   unrelated deeply nested diagnostic key was forgiven. That was a FIFTH instance, authored
+///   by the fix for the fourth.
+///
+/// A derive skips unknown fields without materialising them, so neither the shape nor the
+/// depth of anything this contract does not read can change what the answer MEANS.
+#[derive(Debug, Deserialize)]
+struct VerdictProbe {
+    verdict: String,
+}
+
+/// Just the error list, ignoring everything else in the body.
+#[derive(Debug, Deserialize)]
+struct ErrorsProbe {
+    #[serde(default)]
+    errors: Vec<TargetResponseError>,
+}
 
 /// One field-level error inside an `interrupt` verdict.
 #[derive(Debug, Deserialize)]
 struct TargetResponseError {
-    /// Defaulted so a single malformed entry degrades to an unresolvable pointer, which is a
-    /// uniform refusal, rather than failing the whole list and turning a legible rejection
-    /// into silence.
+    /// Defaulted so an entry missing its pointer parses. It changes no OUTCOME: an empty
+    /// pointer resolves to nothing, and a list that fails to parse at all already degrades to
+    /// the same uniform refusal. Measured: the whole classification table is byte-identical
+    /// with and without this attribute. It is here so the common case, one entry of several
+    /// missing its pointer, still maps the others.
     #[serde(default)]
     pointer: String,
     #[serde(default)]
@@ -416,28 +437,26 @@ fn classify_response(
     // So: once `verdict` reads `interrupt`, NOTHING about the rest of the body can turn it
     // back into silence. A malformed, null, wrongly-typed or unmappable error list is a
     // rejection this flow cannot render, which is a uniform refusal under either policy.
-    let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(response.body()) else {
-        // Not JSON at all. Genuinely unusable, and genuinely silence.
+    // Not JSON at all, or carrying no readable verdict: genuinely unusable, genuinely silence.
+    let Ok(probe) = serde_json::from_slice::<VerdictProbe>(response.body()) else {
         return Outcome::Unavailable;
     };
 
-    match envelope.get("verdict").and_then(serde_json::Value::as_str) {
-        Some("allow") => Outcome::Allow,
-        Some("interrupt") => {
+    match probe.verdict.as_str() {
+        "allow" => Outcome::Allow,
+        "interrupt" => {
             // Any failure below yields an EMPTY list, never `Unavailable`: an answer that
             // rejects stays a rejection however badly it is spelled.
-            let errors: Vec<ironauth_store::flow_target::FieldError> = envelope
-                .get("errors")
-                .and_then(|value| {
-                    serde_json::from_value::<Vec<TargetResponseError>>(value.clone()).ok()
-                })
-                .unwrap_or_default()
-                .into_iter()
-                .map(|error| ironauth_store::flow_target::FieldError {
-                    pointer: error.pointer,
-                    message: error.message.unwrap_or_default(),
-                })
-                .collect();
+            let errors: Vec<ironauth_store::flow_target::FieldError> =
+                serde_json::from_slice::<ErrorsProbe>(response.body())
+                    .map(|parsed| parsed.errors)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|error| ironauth_store::flow_target::FieldError {
+                        pointer: error.pointer,
+                        message: error.message.unwrap_or_default(),
+                    })
+                    .collect();
 
             // Built through the SHIPPED type: `TargetVerdict` owns the rule that a verdict
             // carrying no errors is not a renderable interruption, and a second copy of that
@@ -449,8 +468,8 @@ fn classify_response(
             };
             Outcome::Interrupt(resolve_errors(parsed_errors, signup))
         }
-        // An unknown or absent verdict is a contract violation, not an approval. This is the
-        // one branch that stays silence, because nothing here says the target rejected.
+        // An unknown verdict is a contract violation, not an approval. This is the one branch
+        // that stays silence, because nothing here says the target rejected.
         _ => Outcome::Unavailable,
     }
 }
@@ -853,6 +872,78 @@ mod tests {
                 ),
                 Step::Stop(Decision::Refuse),
                 "and fail open must not forgive it, because it is an answer, not silence"
+            );
+        }
+    }
+
+    /// A deeply nested key the contract never reads must not change what the answer means.
+    ///
+    /// This is the fifth instance of one defect and the only one authored by a FIX. Reading
+    /// the body as a whole `serde_json::Value` applied `serde_json`'s recursion limit to
+    /// members this contract ignores, so a perfectly good rejection carrying an unrelated
+    /// diagnostic key was forgiven under `FailOpen`. Two narrow derives skip unknown fields
+    /// without materialising them; the depth below is past the limit that broke it.
+    #[test]
+    fn an_unrelated_deeply_nested_key_cannot_change_the_verdict() {
+        let mut junk = String::from("null");
+        for _ in 0..200 {
+            junk = format!("[{junk}]");
+        }
+        let body = format!(
+            r#"{{"verdict":"interrupt","errors":[{{"pointer":"/identifier","message":"blocked"}}],"junk":{junk}}}"#
+        );
+        let outcome = classify_response(&response(200, &body), None, "dlv", 0, None);
+        let Outcome::Interrupt(errors) = &outcome else {
+            panic!(
+                "a rejection carrying an unrelated nested key must stay a rejection: {outcome:?}"
+            );
+        };
+        assert_eq!(
+            errors.len(),
+            1,
+            "and it must still MAP its field, not degrade to a bare refusal"
+        );
+
+        // The same depth on the allow side, so the property is about the parse and not about
+        // the interrupt branch alone.
+        let body = format!(r#"{{"verdict":"allow","junk":{junk}}}"#);
+        assert_eq!(
+            classify_response(&response(200, &body), None, "dlv", 0, None),
+            Outcome::Allow
+        );
+    }
+
+    /// A resolvable pointer MAPS, rather than degrading to a bare refusal.
+    ///
+    /// The eight-spelling test above pins the refusal side thoroughly and the mapping side not
+    /// at all: dropping the mapping entirely survived mutation.
+    #[test]
+    fn a_resolvable_pointer_reaches_the_field_it_names() {
+        let body = r#"{"verdict":"interrupt","errors":[{"pointer":"/identifier","message":"blocked by policy"}]}"#;
+        let Outcome::Interrupt(errors) =
+            classify_response(&response(200, body), None, "dlv", 0, None)
+        else {
+            panic!("a resolvable rejection must interrupt");
+        };
+        assert_eq!(errors.len(), 1, "the field must be carried, not dropped");
+        assert_eq!(errors[0].field, TargetField::Identifier);
+        assert_eq!(errors[0].reason.as_deref(), Some("blocked by policy"));
+    }
+
+    /// A verdict of the wrong TYPE is not an approval.
+    #[test]
+    fn a_verdict_that_is_not_a_string_is_silence() {
+        for body in [
+            r#"{"verdict":123}"#,
+            r#"{"verdict":null}"#,
+            r#"{"verdict":true}"#,
+            r#"{"verdict":["interrupt"]}"#,
+            r#"{"verdict":{"value":"interrupt"}}"#,
+        ] {
+            assert_eq!(
+                classify_response(&response(200, body), None, "dlv", 0, None),
+                Outcome::Unavailable,
+                "a non-string verdict says nothing, so it is silence: {body}"
             );
         }
     }
