@@ -312,10 +312,10 @@ run() {
 # the fix-one-thing-rerun-everything loop this rewrite exists to remove, for what is by far
 # clippy's most common failure mode.
 #
-# The scope is also narrower than it looks. Counted on this file: 66 checks, 63 of them below
-# this prerequisite. FOURTEEN of those 63 reach cargo -- two on gate.sh's own lines and
+# The scope is also narrower than it looks. Counted on this file: 67 checks, 64 of them below
+# this prerequisite. FOURTEEN of those 64 reach cargo -- two on gate.sh's own lines and
 # twelve through leaf scripts that shell out to it -- or sixteen when cargo-deny and the
-# ironbus lane are both available. The remaining 47 to 49 do not need a compiling tree at
+# ironbus lane are both available. The remaining 48 to 50 do not need a compiling tree at
 # all: mostly grep and python scans, plus six `git diff --exit-code` freshness assertions,
 # a `go build` and FOUR node-toolchain lanes (two guarded by a `node_modules` probe and
 # two not). An earlier version said "two npm lanes", which is the count of the OPTIONAL
