@@ -118,11 +118,19 @@ struct ErrorsProbe {
 /// One field-level error inside an `interrupt` verdict.
 #[derive(Debug, Deserialize)]
 struct TargetResponseError {
-    /// Defaulted so an entry missing its pointer parses. It changes no OUTCOME: an empty
-    /// pointer resolves to nothing, and a list that fails to parse at all already degrades to
-    /// the same uniform refusal. Measured: the whole classification table is byte-identical
-    /// with and without this attribute. It is here so the common case, one entry of several
-    /// missing its pointer, still maps the others.
+    /// Defaulted so an entry missing its pointer parses rather than failing the list.
+    ///
+    /// It changes no OUTCOME, and measurement says so: the whole classification table is
+    /// byte-identical with and without it. An empty pointer resolves to nothing, and
+    /// `resolve_errors` is ALL OR NOTHING, so one unresolvable entry discards the mapping for
+    /// the whole list either way. The rejection survives in both cases as a uniform refusal.
+    ///
+    /// An earlier revision of this comment claimed it let "one entry of several missing its
+    /// pointer still map the others". That is false, and worth recording rather than quietly
+    /// deleting: a maintainer who believed it would either keep a decorative attribute for a
+    /// wrong reason, or write the test it implies, watch it fail, and "fix" `resolve_errors`
+    /// to attach the resolvable subset. That subset attach is exactly the collapse five
+    /// rounds of review were spent closing.
     #[serde(default)]
     pointer: String,
     #[serde(default)]
