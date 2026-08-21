@@ -87,17 +87,22 @@ pub(super) enum Decision {
     Refuse,
 }
 
-/// The wire response a sync target returns.
-#[derive(Debug, Deserialize)]
-struct TargetResponse {
-    verdict: String,
-    #[serde(default)]
-    errors: Vec<TargetResponseError>,
-}
+// There is deliberately NO struct for the whole response body.
+//
+// Deserializing the body into one type is what made this contract breakable: a type error
+// anywhere in it discarded the verdict along with it, so a target that answered `interrupt`
+// was read as silence and, under FailOpen, as approval. Four rounds of review found four
+// different inputs that did it. The verdict is now read on its own, and only the error
+// entries are deserialized, so nothing about the shape of the rest can change what the
+// answer MEANS.
 
 /// One field-level error inside an `interrupt` verdict.
 #[derive(Debug, Deserialize)]
 struct TargetResponseError {
+    /// Defaulted so a single malformed entry degrades to an unresolvable pointer, which is a
+    /// uniform refusal, rather than failing the whole list and turning a legible rejection
+    /// into silence.
+    #[serde(default)]
     pointer: String,
     #[serde(default)]
     message: Option<String>,
@@ -396,42 +401,56 @@ fn classify_response(
         }
     }
 
-    let Ok(parsed) = serde_json::from_slice::<TargetResponse>(response.body()) else {
+    // Read the VERDICT independently of the rest of the body.
+    //
+    // This is the class fix, arrived at on the fourth instance of one defect. Every earlier
+    // version deserialized the whole body into one struct before looking at the verdict, so a
+    // type error ANYWHERE discarded the verdict with it and the rejection became silence,
+    // which under FailOpen means allow. Each round fixed the input in front of it:
+    // an unresolvable pointer, then `signup: None` on the legacy route, then an empty or
+    // absent `errors` array. The fourth was `"errors": null`, which is what Go's
+    // `encoding/json` emits for a nil slice, and Jackson and System.Text.Json for a null
+    // list. In other words the single most likely way a real integrator spells the very
+    // "interrupt with nothing to say" the previous round existed to make a rejection.
+    //
+    // So: once `verdict` reads `interrupt`, NOTHING about the rest of the body can turn it
+    // back into silence. A malformed, null, wrongly-typed or unmappable error list is a
+    // rejection this flow cannot render, which is a uniform refusal under either policy.
+    let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(response.body()) else {
+        // Not JSON at all. Genuinely unusable, and genuinely silence.
         return Outcome::Unavailable;
     };
 
-    match parsed.verdict.as_str() {
-        "allow" => Outcome::Allow,
-        "interrupt" => {
-            // Built through the SHIPPED type rather than re-checking here: `TargetVerdict`
-            // owns the rule that a verdict carrying no errors is not an interruption, and a
-            // second copy of that rule in this module is a second place for it to drift.
-            let errors = parsed
-                .errors
+    match envelope.get("verdict").and_then(serde_json::Value::as_str) {
+        Some("allow") => Outcome::Allow,
+        Some("interrupt") => {
+            // Any failure below yields an EMPTY list, never `Unavailable`: an answer that
+            // rejects stays a rejection however badly it is spelled.
+            let errors: Vec<ironauth_store::flow_target::FieldError> = envelope
+                .get("errors")
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<TargetResponseError>>(value.clone()).ok()
+                })
+                .unwrap_or_default()
                 .into_iter()
                 .map(|error| ironauth_store::flow_target::FieldError {
                     pointer: error.pointer,
                     message: error.message.unwrap_or_default(),
                 })
                 .collect();
-            let Ok(verdict) = ironauth_store::flow_target::TargetVerdict::interrupt(errors) else {
-                // An interrupt with NOTHING to say is still an interrupt. It cannot be
-                // rendered on any field, so it carries no mapping, but it is an answer that
-                // rejects and must not be routed through the failure policy: under FailOpen
-                // that is "allow", and the target's refusal would be discarded.
-                //
-                // This is the third input on which that collapse has been found. The wire
-                // contract makes it reachable two ways, and `errors` is `#[serde(default)]`,
-                // so a target may legally omit the key entirely.
-                return Outcome::Interrupt(Vec::new());
-            };
-            let ironauth_store::flow_target::TargetVerdict::Interrupt(parsed_errors) = verdict
+
+            // Built through the SHIPPED type: `TargetVerdict` owns the rule that a verdict
+            // carrying no errors is not a renderable interruption, and a second copy of that
+            // rule here is a second place for it to drift.
+            let Ok(ironauth_store::flow_target::TargetVerdict::Interrupt(parsed_errors)) =
+                ironauth_store::flow_target::TargetVerdict::interrupt(errors)
             else {
-                return Outcome::Unavailable;
+                return Outcome::Interrupt(Vec::new());
             };
             Outcome::Interrupt(resolve_errors(parsed_errors, signup))
         }
-        // An unknown verdict string is a contract violation, not an approval.
+        // An unknown or absent verdict is a contract violation, not an approval. This is the
+        // one branch that stays silence, because nothing here says the target rejected.
         _ => Outcome::Unavailable,
     }
 }
@@ -806,8 +825,20 @@ mod tests {
     #[test]
     fn an_interrupt_is_a_rejection_however_little_it_says() {
         for body in [
+            // The two spellings round 3 fixed.
             r#"{"verdict":"interrupt","errors":[]}"#,
             r#"{"verdict":"interrupt"}"#,
+            // `null` is what Go's encoding/json emits for a nil slice, and Jackson and
+            // System.Text.Json for a null list. It is the MOST LIKELY way a real target
+            // spells "interrupt with nothing to say", and it was still being forgiven.
+            r#"{"verdict":"interrupt","errors":null}"#,
+            // An entry that cannot be mapped at all does not make the rejection vanish.
+            r#"{"verdict":"interrupt","errors":[{"message":"blocked"}]}"#,
+            r#"{"verdict":"interrupt","errors":[null]}"#,
+            r#"{"verdict":"interrupt","errors":[{"pointer":1}]}"#,
+            // Nor does an errors member of entirely the wrong shape.
+            r#"{"verdict":"interrupt","errors":{"pointer":"/identifier"}}"#,
+            r#"{"verdict":"interrupt","errors":"blocked"}"#,
         ] {
             let outcome = classify_response(&response(200, body), None, "dlv", 0, None);
             assert_eq!(

@@ -642,9 +642,13 @@ mod tests {
     /// A flow target's pointer resolves onto a form field, or onto nothing at all.
     ///
     /// The whole table matters, not just the happy row. `None` is what makes the dispatcher
-    /// discard a verdict, so a resolver that were too PERMISSIVE would let a typo attach a
-    /// rejection to the wrong field, and one too STRICT would turn a legitimate rejection
-    /// into an unavailable and hand a fail-open target an approval it never gave.
+    /// discard the field MAPPING, so a resolver that were too PERMISSIVE would let a typo
+    /// attach a rejection to the wrong field, and one too STRICT would strip a legitimate
+    /// rejection of the field it names and render it as a uniform refusal instead.
+    ///
+    /// It can no longer hand a fail-open target an approval it never gave: an unmappable
+    /// rejection is still a rejection, and stops the flow under either policy. That sentence
+    /// described the behaviour for three rounds after it stopped being true.
     #[test]
     fn a_target_pointer_resolves_only_to_a_field_that_exists() {
         let form = (
