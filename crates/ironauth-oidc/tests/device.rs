@@ -1464,7 +1464,7 @@ async fn metering_events(harness: &Harness) -> i64 {
 /// issuance produces two `IssuedTokenRecord`s; an OPAQUE one produces a record for the ID
 /// token and no record at all for the access token, so a fix that counted records alone
 /// would report one where two were minted. That asymmetry is what made the authorization
-/// code's own metering wrong for years while its at+jwt half looked correct.
+/// code's own metering half-wrong, undetected, while its at+jwt half looked correct.
 #[tokio::test]
 async fn a_device_redemption_meters_every_token_it_mints() {
     for (label, format, expected) in [

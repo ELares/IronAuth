@@ -19,9 +19,10 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, IssuedTokenId,
-    IssuedTokenRecord, NewRefreshFamily, NewSession, RefreshFamilyId, RefreshFamilyOpenOutcome,
-    RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId, RotatedRefreshToken, Scope,
-    SessionEndCause, SessionId, StoredClientId, TokenKind, refresh_token_digest,
+    IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, NewSession, RefreshFamilyId,
+    RefreshFamilyOpenOutcome, RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId,
+    RotatedRefreshToken, Scope, SessionEndCause, SessionId, StoredClientId, TokenKind,
+    refresh_token_digest,
 };
 use sqlx::Row;
 
@@ -1079,5 +1080,87 @@ async fn a_rotation_meters_the_access_token_it_mints() {
         metering_events_for(&db, scope, &grant_text).await,
         1,
         "the rotated access token must be counted for billing"
+    );
+}
+
+/// An OPAQUE rotation counts its access token too (#107).
+///
+/// The at+jwt arm above cannot see this one. Under the opaque format
+/// `refresh_access_records` returns `Vec::new()`, so `record_refresh_access` receives an
+/// EMPTY record list and the count comes entirely from `redeem.opaque.is_some()`. Forcing
+/// that argument to `false` leaves every other test in this repository green while every
+/// opaque-format rotation counts zero, which is exactly the defect class this change exists
+/// to remove.
+///
+/// That argument is the one the call site's own comment calls "the correctness of this call
+/// rather than a detail of it", and it was the last argument in the change with nothing
+/// measuring it. Review found it by mutation after three siblings had been fixed for the
+/// same reason.
+#[tokio::test]
+async fn an_opaque_rotation_meters_its_access_token() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let grant_id = seed_grant(&db, &env, scope, "usr_meter_opaque", None).await;
+    let grant_text = grant_id.to_string();
+    let (_family, token, _jti, _digest) = open_family(
+        &db,
+        &env,
+        scope,
+        &grant_id,
+        "usr_meter_opaque",
+        true,
+        FAR_FUTURE_MICROS,
+        FAR_FUTURE_MICROS,
+    )
+    .await;
+
+    // EMPTY records plus an opaque token: exactly the shape the opaque mint produces.
+    let (succ_token, succ_jti, succ_digest) = make_refresh_token(&env, scope);
+    let opaque_jti = IssuedTokenId::generate(&env, &scope);
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .refresh()
+        .redeem(
+            &env,
+            RefreshRedeem {
+                presented_token: &token,
+                rotate: true,
+                successor: RotatedRefreshToken {
+                    jti: &succ_jti,
+                    token_digest: &succ_digest,
+                    generation: 1,
+                    idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                },
+                access_records: &[],
+                opaque: Some(NewOpaqueAccessToken {
+                    token_digest: "opaque-rotation-digest",
+                    grant_id: Some(&grant_id),
+                    subject: "usr_meter_opaque",
+                    client_id: "cli_meter_opaque",
+                    audience: "https://api.example",
+                    audiences: &[],
+                    scope: Some("openid"),
+                    jti: &opaque_jti,
+                    expires_at_unix_micros: FAR_FUTURE_MICROS,
+                    dpop_jkt: None,
+                }),
+                grace: Duration::from_secs(0),
+            },
+        )
+        .await
+        .expect("redeem");
+    assert!(
+        matches!(outcome, RefreshRedeemOutcome::Rotated),
+        "the fixture must rotate, or this measures nothing: {outcome:?}"
+    );
+    let _ = succ_token;
+
+    assert_eq!(
+        metering_events_for(&db, scope, &grant_text).await,
+        1,
+        "an opaque rotation mints ONE access token and must count exactly one"
     );
 }
