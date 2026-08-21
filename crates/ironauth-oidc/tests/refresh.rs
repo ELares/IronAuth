@@ -17,7 +17,7 @@ use base64::engine::general_purpose::STANDARD;
 use common::{
     Harness, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location, location_param, send_through,
 };
-use ironauth_config::OidcConfig;
+use ironauth_config::{OidcConfig, TokenFormat as ConfigTokenFormat};
 use ironauth_oidc::ClientAuthMethod;
 use ironauth_store::{ActorRef, ServiceId};
 
@@ -1229,4 +1229,88 @@ async fn a_fenced_user_cannot_exchange_a_session_less_authorization_code() {
         json(&body).get("refresh_token").is_none(),
         "an offline family that survives the cascade is never opened for a deleted user: {body}"
     );
+}
+
+/// Count `token.issued` metering events for a scope.
+///
+/// Reads `outbox_messages` DIRECTLY, because the property is that the PRODUCER fired. A
+/// helper reading through the metering fold would pass just as happily on seeded envelopes,
+/// which is why the existing fold test could not catch a grant that emitted nothing.
+async fn metering_events(harness: &Harness) -> i64 {
+    let scope = harness.scope();
+    let mut tx = harness.db().app_pool().begin().await.expect("begin");
+    for (key, value) in [
+        ("ironauth.tenant_id", scope.tenant().to_string()),
+        ("ironauth.environment_id", scope.environment().to_string()),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .expect("bind scope");
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 \
+           AND payload->>'type' = 'token.issued'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("count metering events");
+    tx.commit().await.expect("commit");
+    count
+}
+
+/// A code exchange COUNTS every token it mints, in both access-token formats (#107).
+///
+/// The OPAQUE arm is the live defect this pins. Metering happened inside the
+/// `IssuedTokenRecord` loop, and an opaque access token contributes no such record, so a
+/// deployment configured for the opaque format emitted ONE event per redemption where an
+/// at+jwt deployment emitted two. Every opaque access token ever issued was uncounted, and
+/// `tokens_issued` is what `GET /usage` reports and `usage.reported` publishes.
+///
+/// The at+jwt arm is the control. Without it, an assertion that the opaque arm counts two
+/// would pass just as well against a change that counted two of everything, and a
+/// double-count is as wrong as an under-count when the number is billing input.
+#[tokio::test]
+async fn a_code_exchange_meters_every_token_it_mints() {
+    for (label, format) in [
+        ("at+jwt", ConfigTokenFormat::AtJwt),
+        ("opaque", ConfigTokenFormat::Opaque),
+    ] {
+        let harness = Harness::start_with(OidcConfig {
+            default_access_token_format: format,
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        })
+        .await;
+
+        assert_eq!(
+            metering_events(&harness).await,
+            0,
+            "{label}: nothing is counted before an issuance"
+        );
+
+        let (_subject, client_id, secret, code) =
+            outstanding_code_for_new_user(&harness, "openid").await;
+        let (status, _headers, body) = harness
+            .token_with_auth(
+                &code_exchange_form(&code),
+                Some(&basic_header(&client_id, &secret)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{label}: exchange: {body}");
+        let document = json(&body);
+        assert!(document["id_token"].is_string(), "{label}: {body}");
+        assert!(document["access_token"].is_string(), "{label}: {body}");
+
+        assert_eq!(
+            metering_events(&harness).await,
+            2,
+            "{label}: an ID token and an access token are TWO counted tokens"
+        );
+    }
 }
