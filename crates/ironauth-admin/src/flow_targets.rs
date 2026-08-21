@@ -207,9 +207,30 @@ fn parse_enums(
 /// per-request timeout only ever SHORTENS the fetcher's bound: a target accepted above the
 /// ceiling would be silently truncated to it and the operator's stated bound would be quietly
 /// false. Refusing at registration is the difference between a bound and a suggestion.
-fn validate(request: &SetFlowTargetRequest, invocation: Invocation) -> Result<(), ApiError> {
+fn validate(
+    request: &SetFlowTargetRequest,
+    invocation: Invocation,
+    timing: Timing,
+) -> Result<(), ApiError> {
     if request.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name must not be empty".to_owned()));
+    }
+    // The migration refuses an ASYNC target that is not post-persist, and refuses any
+    // non-positive timeout. Both were reachable from the wire and surfaced as a 500 from a
+    // constraint violation, which is the outcome parsing at the boundary exists to prevent.
+    if matches!(invocation, Invocation::Async) && !matches!(timing, Timing::PostPersist) {
+        return Err(ApiError::BadRequest(
+            "an async target must be post_persist: the flow does not wait for it, so it \
+             cannot observe anything before the write"
+                .to_owned(),
+        ));
+    }
+    if let Some(timeout) = request.timeout_ms {
+        if timeout <= 0 {
+            return Err(ApiError::BadRequest(
+                "timeout_ms must be greater than zero".to_owned(),
+            ));
+        }
     }
     if matches!(invocation, Invocation::Sync) {
         let Some(timeout) = request.timeout_ms else {
@@ -235,15 +256,57 @@ fn validate(request: &SetFlowTargetRequest, invocation: Invocation) -> Result<()
     // A secret must be NAMED, never inlined. Refusing here keeps the one rule this table
     // rests on at the boundary: it never holds a secret value.
     if let Some(config) = &request.config {
-        if config.get("secret").is_some() || config.get("signing_secret").is_some() {
-            return Err(ApiError::BadRequest(
-                "config must not carry a secret; name an environment secret with \
-                 signing_secret_name"
-                    .to_owned(),
-            ));
+        if let Some(key) = secret_shaped_key(config) {
+            return Err(ApiError::BadRequest(format!(
+                "config must not carry a secret (found `{key}`); name an environment secret \
+                 with signing_secret_name"
+            )));
         }
     }
     Ok(())
+}
+
+/// The first secret-shaped key anywhere in `config`, or [`None`].
+///
+/// Recursive, and over a VOCABULARY rather than two names. The first version checked
+/// `secret` and `signing_secret` at the top level only, which stored `{"auth":{"secret":..}}`,
+/// `[{"secret":..}]`, `api_key`, `token`, and every case variant. That guard was theatre: it
+/// refused the spelling an honest operator would use by accident and passed every other one.
+///
+/// This cannot be airtight, and is not meant to be: `config` is opaque operator JSON and a
+/// determined caller can always name a field something else. It exists so that a secret
+/// pasted in by mistake is caught at the boundary, because `config` travels further than the
+/// table -- it is returned by the listing at `management.read` and sent to the target in
+/// every dispatch payload.
+fn secret_shaped_key(value: &serde_json::Value) -> Option<String> {
+    const SHAPES: &[&str] = &[
+        "secret",
+        "signing_secret",
+        "credential",
+        "password",
+        "token",
+        "api_key",
+        "apikey",
+        "private_key",
+        "client_secret",
+        "authorization",
+    ];
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map {
+                let folded = key.to_ascii_lowercase().replace('-', "_");
+                if SHAPES.contains(&folded.as_str()) {
+                    return Some(key.clone());
+                }
+                if let Some(found) = secret_shaped_key(nested) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(secret_shaped_key),
+        _ => None,
+    }
 }
 
 fn flow_target_event(
@@ -323,7 +386,10 @@ pub async fn list_flow_targets(
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     principal.require_permission(ManagementPermission::Read)?;
-    require_live_environment(&state, &scope).await?;
+    // No liveness fence on a READ: a soft-deleted environment stays readable across this
+    // surface and only writes refuse it. The two siblings this route was modelled on say so
+    // in as many words, and the live-surface sweep requires every GET to answer the live
+    // control's status.
 
     let targets = state
         .store()
@@ -378,7 +444,7 @@ pub async fn create_flow_target(
 
     let request: SetFlowTargetRequest = parse_json(&body)?;
     let (class, invocation, timing, policy) = parse_enums(&request)?;
-    validate(&request, invocation)?;
+    validate(&request, invocation, timing)?;
 
     let key = idempotency::required_key(&headers)?;
     let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
@@ -389,9 +455,31 @@ pub async fn create_flow_target(
         return Ok(replay);
     }
 
-    let id = ironauth_store::FlowTargetId::generate(state.env(), &scope);
-    let body_string = serde_json::to_string(&FlowTargetCreated { id: id.to_string() })
-        .map_err(|_| ApiError::Internal)?;
+    // Resolve the id BEFORE the write, by name.
+    //
+    // The upsert arbitrates on NAME, and its ON CONFLICT branch keeps the EXISTING row's id
+    // without listing `id` in its SET. So a freshly minted candidate is DISCARDED whenever
+    // the name already names a row, and returning it would hand the caller an id that
+    // resolves nowhere, 404s on its own DELETE, and is stamped into the emitted event as the
+    // subject. Reading the name first makes the candidate the id the write will actually
+    // keep, so the response, the event and the audit target all name the same row.
+    //
+    // The write still takes the resolved id from `RETURNING id`, which is what makes this
+    // correct rather than merely likely: if a concurrent create wins the race between this
+    // read and the insert, the response and its stored replay are rendered from the id the
+    // database returned, not from this one.
+    let existing = state
+        .store()
+        .scoped(scope)
+        .flow_targets()
+        .list()
+        .await?
+        .into_iter()
+        .find(|listing| listing.record.name == request.name)
+        .map(|listing| listing.record.id);
+    let candidate =
+        existing.unwrap_or_else(|| ironauth_store::FlowTargetId::generate(state.env(), &scope));
+
     let config = request
         .config
         .clone()
@@ -399,11 +487,11 @@ pub async fn create_flow_target(
     let pending = flow_target_event(
         &state,
         scope,
-        &id.to_string(),
+        &candidate.to_string(),
         &request.name,
         Some((class, invocation, timing)),
     );
-    state
+    let live_id = state
         .store()
         .scoped(scope)
         .acting(
@@ -413,7 +501,7 @@ pub async fn create_flow_target(
         .flow_targets()
         .set_with_event(
             state.env(),
-            &id,
+            &candidate,
             state.now_unix_micros(),
             ironauth_store::NewFlowTarget {
                 name: &request.name,
@@ -427,12 +515,32 @@ pub async fn create_flow_target(
                 signing_secret_name: request.signing_secret_name.as_deref(),
                 enabled: request.enabled,
             },
+            Some(ironauth_store::ResolvedIdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 201,
+                // Rendered from what the write RESOLVED, inside its own transaction, so the
+                // stored response and the row it names commit together and agree. A body
+                // built up front would be stored for every replay of this key forever after,
+                // so it has to describe what was persisted rather than what was requested.
+                response_body: &|resolved: &ironauth_store::FlowTargetId| {
+                    serde_json::to_string(&FlowTargetCreated {
+                        id: resolved.to_string(),
+                    })
+                },
+            }),
             pending
                 .as_ref()
                 .map(crate::events::PendingEvent::domain_event)
                 .as_ref(),
         )
         .await?;
+
+    let body_string = serde_json::to_string(&FlowTargetCreated {
+        id: live_id.to_string(),
+    })
+    .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::CREATED, body_string))
 }
 
@@ -449,7 +557,8 @@ pub async fn create_flow_target(
     ),
     security(("bearer" = [])),
     responses(
-        (status = 204, description = "Deregistered, or already absent"),
+        (status = 204, description = "Deregistered"),
+        (status = 404, description = "No such target in this environment", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "The environment is absent or deleted", body = ErrorBody)
@@ -482,8 +591,10 @@ pub async fn delete_flow_target(
         .find(|listing| listing.record.id == id)
         .map(|listing| listing.record.name);
 
-    // No Idempotency-Key: deregistering an absent target is a no-op success, so DELETE is
-    // idempotent on its own.
+    // No Idempotency-Key: the write is keyed by id and carries no payload, so a replay is
+    // the same act. Deregistering an ABSENT target is a 404 rather than a no-op success,
+    // because the store guards on rows affected; the sibling comment this was adapted from
+    // belongs to a delete that has no such guard.
     let pending = name
         .as_ref()
         .and_then(|name| flow_target_event(&state, scope, &target_id, name, None));

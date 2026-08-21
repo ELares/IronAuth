@@ -811,6 +811,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List every registered HTTP flow target in the environment. */
+        get: operations["listFlowTargets"];
+        put?: never;
+        /** Register an HTTP flow target. */
+        post: operations["createFlowTarget"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Deregister an HTTP flow target. */
+        delete: operations["deleteFlowTarget"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness": {
         parameters: {
             query?: never;
@@ -4621,6 +4656,50 @@ export interface components {
             /** @description The transport it was created on. */
             transport: string;
         };
+        /** @description The identifier a registration returns. */
+        FlowTargetCreated: {
+            /** @description The `ftg_` identifier. */
+            id: string;
+        };
+        /** @description Every registered target in the environment. */
+        FlowTargetList: {
+            /** @description The targets, by name. */
+            targets: components["schemas"]["FlowTargetView"][];
+        };
+        /** @description One registered target, as an operator reads it. */
+        FlowTargetView: {
+            /** @description Plain JSON, returned verbatim. Never code. */
+            config: Record<string, never>;
+            /**
+             * @description Whether the dispatcher will call it. A DISABLED target is listed, not hidden: one
+             *     missing from the listing would read as deregistered.
+             */
+            enabled: boolean;
+            /** @description Where it POSTs. */
+            endpoint: string;
+            /** @description What to do when a sync target does not answer: `fail_open` or `fail_closed`. */
+            failure_policy: string;
+            /** @description The `ftg_` identifier. */
+            id: string;
+            /** @description Whether the flow waits: `sync` or `async`. */
+            invocation: string;
+            /** @description The operator-facing name, unique among live targets in the environment. */
+            name: string;
+            /**
+             * @description The NAME of the environment secret this target's payloads are signed with, never its
+             *     value, and [`None`] when the target is deliberately unsigned.
+             */
+            signing_secret_name?: string | null;
+            /** @description Which class of flow point invokes it: `request`, `response`, `function`, or `event`. */
+            target_class: string;
+            /**
+             * Format: int32
+             * @description The bound on a sync call, in milliseconds.
+             */
+            timeout_ms?: number | null;
+            /** @description When it runs relative to the write: `pre_persist` or `post_persist`. */
+            timing: string;
+        };
         /** @description A custom-journey version, as returned by the management API (issue #92, PR 5). */
         FlowVersionView: {
             /** @description The canonical journey artifact (a JSON document). */
@@ -6601,6 +6680,36 @@ export interface components {
              *     is required so that "everything" is stated rather than inferred from an omission.
              */
             event_types?: string[] | null;
+        };
+        /** @description Register or reconfigure a target. */
+        SetFlowTargetRequest: {
+            /** @description Plain JSON. Never code. */
+            config?: Record<string, never> | null;
+            /** @description Whether the dispatcher calls it. Defaults to true. */
+            enabled?: boolean;
+            /**
+             * @description Where it POSTs. Reached through the outbound policy, so a private or link-local
+             *     address is refused at call time.
+             */
+            endpoint: string;
+            /** @description `fail_open` or `fail_closed`. */
+            failure_policy: string;
+            /** @description `sync` or `async`. */
+            invocation: string;
+            /** @description The operator-facing name, unique among live targets in the environment. */
+            name: string;
+            /** @description The NAME of an environment secret, never a secret value. */
+            signing_secret_name?: string | null;
+            /** @description `request`, `response`, `function`, or `event`. */
+            target_class: string;
+            /**
+             * Format: int32
+             * @description The bound on a sync call, in milliseconds. Required for a sync target and refused
+             *     above the ceiling.
+             */
+            timeout_ms?: number | null;
+            /** @description `pre_persist` or `post_persist`. */
+            timing: string;
         };
         /**
          * @description The body to set (create or overwrite) a per-environment locale bundle (issue #86, PR 2).
@@ -11474,6 +11583,187 @@ export interface operations {
                 };
             };
             /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listFlowTargets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The registered targets */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FlowTargetList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createFlowTarget: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetFlowTargetRequest"];
+            };
+        };
+        responses: {
+            /** @description The registered target */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FlowTargetCreated"];
+                };
+            };
+            /** @description Malformed request, an unknown vocabulary value, a sync target without a bound, or a bound above the ceiling */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteFlowTarget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The flow target identifier */
+                target_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deregistered */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
             404: {
                 headers: {
                     [name: string]: unknown;

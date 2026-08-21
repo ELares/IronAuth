@@ -1527,6 +1527,156 @@ async fn the_log_stream_status_read_demands_read_and_never_answers_unauthenticat
     );
 }
 
+/// The flow-target surface splits read from configure, and both directions matter (#112).
+///
+/// Registering a flow target points IronAuth at an endpoint it will CALL during a live
+/// signup, and a fail-closed one can refuse every signup in the environment. So a read-only
+/// credential must not be able to register one, and the refusal has to name the permission it
+/// wanted rather than a generic denial: substituting one write permission for another would
+/// otherwise pass unnoticed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_flow_target_surface_splits_reading_from_registering() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "ftg-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ftg-mint").await;
+    let targets = format!("/v1/tenants/{tenant}/environments/{environment}/flow-targets");
+
+    // Read-granted: served.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&targets, &secret).await;
+    assert_eq!(status, StatusCode::OK, "flow targets under read: {body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        document["targets"].is_array(),
+        "the listing must answer with its targets array even when empty: {body}"
+    );
+
+    // A credential holding a WRITE but not read is refused, and the refusal names what it
+    // wanted.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&targets, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "flow targets answered a credential without management.read: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the refusal must name the permission it wanted: {body}"
+    );
+
+    // And with no credential at all. An EMPTY bearer is the unauthenticated case.
+    let (status, _, body) = h.get_as(&targets, "").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "flow targets answered an unauthenticated caller: {body}"
+    );
+}
+
+/// Registering a flow target demands `write_config`, and the id it returns names a real row.
+///
+/// Split from the read above only because the two together exceed the length lint; they are
+/// one property in two halves. Registering points IronAuth at an endpoint it will CALL during
+/// a live signup, and a fail-closed target refuses every signup until it answers, so a
+/// read-only credential must not be able to do it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registering_a_flow_target_demands_write_config() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "ftg-write-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ftg-write-mint").await;
+    let targets = format!("/v1/tenants/{tenant}/environments/{environment}/flow-targets");
+
+    // A read-only credential that could point a signup at an endpoint of its choosing, or
+    // register a fail-closed target that refuses every signup, would make the split
+    // meaningless.
+    let create_body = serde_json::json!({
+        "name": "delegated-admin-probe",
+        "target_class": "request",
+        "invocation": "sync",
+        "timing": "pre_persist",
+        "endpoint": "https://target.example/check",
+        "timeout_ms": 500,
+        "failure_policy": "fail_closed",
+    })
+    .to_string();
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.post_as(&targets, &secret, "ftg-1", &create_body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential must not register a flow target: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal must name the permission it wanted: {body}"
+    );
+
+    // write_config is served, so the refusal above is the permission talking rather than the
+    // route being broken. The id it returns is used for the delete below, which is what makes
+    // that half a real deregistration rather than a not-found.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h.post_as(&targets, &secret, "ftg-2", &create_body).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "write_config must be able to register a target: {body}"
+    );
+    let registered: Value = serde_json::from_str(&body).expect("json");
+    let target_id = registered["id"]
+        .as_str()
+        .expect("the registered id")
+        .to_owned();
+
+    // The id the create returned must NAME A ROW. The upsert arbitrates on name and keeps the
+    // existing row's id, so a handler returning its own freshly minted candidate would hand
+    // back an id that 404s here.
+    let (status, _, body) = h.get_as(&targets, &secret).await;
+    assert_eq!(status, StatusCode::OK, "listing after register: {body}");
+    assert!(
+        body.contains(&target_id),
+        "the id the create returned must appear in the listing: {body}"
+    );
+
+    // Deregistering is write_config too, and read alone must not do it.
+    let one = format!("{targets}/{target_id}");
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.delete_as(&one, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential must not deregister a flow target: {body}"
+    );
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h.delete_as(&one, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "write_config must be able to deregister a target: {body}"
+    );
+}
+
 /// Configure one stream per SINK TYPE, each naming a credential secret.
 ///
 /// One per type because a view field resolved only for some sink types renders no key for the

@@ -5981,7 +5981,7 @@
         ],
         "responses": {
           "204": {
-            "description": "Deregistered, or already absent"
+            "description": "Deregistered"
           },
           "401": {
             "description": "Missing or invalid credential, or fresh privilege required",
