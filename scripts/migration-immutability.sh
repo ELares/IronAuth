@@ -99,6 +99,12 @@ violations=0
 while IFS= read -r -d '' file; do
   [ -n "$file" ] || continue
 
+  # `--with-tree` lists the UNION of the index and the tree, not the tree alone, so a
+  # migration this branch ADDS is in the list too. That is the normal case and must pass:
+  # a file the base does not carry is not frozen, it is new. Without this probe every PR
+  # that adds a migration fails, which is most of them.
+  git cat-file -e "$BASE:$file" 2>/dev/null || continue
+
   if ! before=$(git show "$BASE:$file" | shasum -a 256 | cut -d' ' -f1); then
     echo "migration-immutability: FAILED. Could not read '$file' at '$BASE'." >&2
     exit 1
@@ -108,7 +114,7 @@ while IFS= read -r -d '' file; do
     # not this path's own bytes.
     after="(not a regular file)"
   elif [ -f "$file" ]; then
-    after=$(shasum -a 256 "$file" | cut -d' ' -f1)
+    after=$(shasum -a 256 < "$file" | cut -d' ' -f1)
   elif [ -e "$file" ]; then
     after="(not a regular file)"
   else
