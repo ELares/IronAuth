@@ -14,8 +14,11 @@ range per docs/RELEASING.md.
   data, so no door can put something in it that the outbox cannot later delete. The outbox row
   is invisible until commit, so a delivery is only ever attempted against a signup that
   actually happened and a rolled-back one announces nothing to a third party.
-  `enqueue_async_delivery` takes a `Transaction`, which no type outside this crate can name,
-  so there is no way to schedule one from beside the write rather than inside it.
+  `enqueue_async_delivery` takes a `Transaction`, and while a caller outside this crate could
+  name that type (it is `sqlx`'s, and the workspace shares one version), it could not obtain
+  one for this database: the store exposes no public `pool()` or `begin()`. So scheduling a
+  delivery from beside the write rather than inside it would mean standing up a second pool,
+  which is a deliberate act rather than an easy mistake.
 - **The signup envelope carries the SUBJECT and nothing else about the person**, and that is
   a retention decision rather than a minimal one. `outbox_messages.payload` is plaintext
   `jsonb` and immutable once enqueued. A reaper exists (migration 0102 grants DELETE to
@@ -23,7 +26,7 @@ range per docs/RELEASING.md.
   deletes by TIME WINDOW and SCOPE, never by subject, and `dead_letter_retention_secs` ships
   at `0`, which for that knob means keep forever. So an identifier written there outlives an
   erasure request, which deletes only the sealed copy in `users` -- sealed under a DEK by
-  migration 0027 for exactly that reason. The webhook path reached the same answer
+  migration 0028 for exactly that reason. The webhook path reached the same answer
   independently: `user.created` carries `{user_id, state}` and no identifier. Receivers
   needing more resolve it through the management API; rendering it at delivery time instead is
   issue #954.

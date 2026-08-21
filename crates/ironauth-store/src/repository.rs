@@ -17050,7 +17050,7 @@ impl ActingUserRepo<'_> {
                         //
                         // So an identifier here would outlive an erasure request, which
                         // deletes only the SEALED copy in `users` -- sealed under a DEK by
-                        // migration 0027 to keep it out of the clear in the first place.
+                        // migration 0028 to keep it out of the clear in the first place.
                         //
                         // The webhook path reached the same answer independently:
                         // `user.created` carries `{user_id, state}` and no identifier. A

@@ -55,8 +55,11 @@ const HEADER_SIGNATURE: &str = "webhook-signature";
 /// The returned future is declared `Send` so a worker built on this seam stays spawnable
 /// on a multi-threaded runtime.
 pub trait WebhookSender: Send + Sync {
-    /// POST `body` to `url` under the three Standard Webhooks headers. This is the ONLY
-    /// outbound path the consumer has.
+    /// POST `body` to `url` under the Standard Webhooks headers. This is the ONLY outbound
+    /// path the consumer has.
+    ///
+    /// THREE headers for a signed delivery, ONE for an unsigned one: see
+    /// [`DeliveryHeaders`], whose `id` is unconditional and whose signature pair is not.
     ///
     /// It returns what the RECEIVER said rather than merely whether the call worked,
     /// because the attempt history (#106) records the status code on a success as well as
@@ -112,12 +115,15 @@ impl DeliveryOutcome {
     }
 }
 
-/// The three Standard Webhooks headers one delivery carries.
+/// The Standard Webhooks headers one delivery carries: three when it is signed, one when it
+/// is not.
 ///
-/// A struct rather than three parameters because the values are not interchangeable and
-/// two of them are strings: transposing the id and the signature at a call site would
-/// produce deliveries no consumer could verify and nothing in the type system would have
-/// objected.
+/// A struct rather than loose parameters because the values are not interchangeable. It used
+/// to hold three strings, where transposing the id and the signature at a call site would
+/// have produced deliveries no consumer could verify with nothing in the type system
+/// objecting. That particular transposition is no longer expressible -- the id is a `String`
+/// and the pair is an `Option<SignaturePair>` -- but the reason for grouping them stands, and
+/// the split is now what carries the rule that an unsigned delivery still has an id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryHeaders {
     /// `webhook-id`: stable across every retry of the same delivery.
