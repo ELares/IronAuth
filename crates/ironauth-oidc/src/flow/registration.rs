@@ -494,9 +494,10 @@ pub(super) async fn advance_registration(
             });
         }
         flow_target::Decision::Refuse => {
-            // A fail-closed target could not be consulted. Uniform and field free: there is
-            // nothing truthful to say about WHICH field was wrong, and naming one would
-            // invent a rejection the target never made.
+            // Either a target REJECTED with a mapping this step cannot render, or a
+            // fail-closed target could not be consulted. Uniform and field free in both
+            // cases: there is nothing truthful to say about WHICH field was wrong, and
+            // naming one would invent a rejection the target never made.
             return Ok(RegistrationStep::Render {
                 nodes: details_with_signup(None, None, &[]),
                 messages: vec![flow_target::refusal_message()],

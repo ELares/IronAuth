@@ -14,9 +14,10 @@
 //!   approval", never "ignore a rejection", and collapsing the two would make a fail-open
 //!   fraud check unable to reject anything.
 //! * A rejection names its field with an RFC 6901 pointer, which is resolved onto the form's
-//!   nodes. If ANY pointer fails to resolve, the whole verdict is discarded and the
-//!   unavailable path runs, because attaching the resolvable subset would let one typo
-//!   silently defang a fail-closed rejection.
+//!   nodes. If ANY pointer fails to resolve, the whole MAPPING is discarded and the flow
+//!   refuses uniformly, because attaching the resolvable subset would let one typo silently
+//!   defang a rejection. The refusal itself is never discarded: a rejection stops the flow
+//!   under EITHER policy, and only silence is forgivable.
 //!
 //! What this module does NOT do: it does not mount a management route, so an operator cannot
 //! yet register a target over HTTP (`flow_targets` grants INSERT to `ironauth_control` only).
@@ -79,7 +80,8 @@ pub(super) enum Decision {
     Allow,
     /// A target rejected the flow, naming these fields.
     Interrupt(Vec<ResolvedFieldError>),
-    /// A fail-closed target could not be consulted, or the target registry could not be read.
+    /// A target REJECTED with a mapping this step cannot render (under either policy), or a
+    /// fail-closed target could not be consulted, or the registry could not be read.
     /// The flow stops without a field-level explanation, because there is nothing truthful to
     /// say about which field was wrong.
     Refuse,
@@ -413,8 +415,15 @@ fn classify_response(
                 })
                 .collect();
             let Ok(verdict) = ironauth_store::flow_target::TargetVerdict::interrupt(errors) else {
-                // An interrupt with nothing to say cannot be rendered on any field.
-                return Outcome::Unavailable;
+                // An interrupt with NOTHING to say is still an interrupt. It cannot be
+                // rendered on any field, so it carries no mapping, but it is an answer that
+                // rejects and must not be routed through the failure policy: under FailOpen
+                // that is "allow", and the target's refusal would be discarded.
+                //
+                // This is the third input on which that collapse has been found. The wire
+                // contract makes it reachable two ways, and `errors` is `#[serde(default)]`,
+                // so a target may legally omit the key entirely.
+                return Outcome::Interrupt(Vec::new());
             };
             let ironauth_store::flow_target::TargetVerdict::Interrupt(parsed_errors) = verdict
             else {
@@ -610,7 +619,8 @@ pub(super) fn refusal_message() -> Message {
 mod tests {
     use super::{
         Decision, Duration, MAX_DISPATCH_BUDGET_MS, MAX_REASON_CHARS, Outcome, ResolvedFieldError,
-        Step, apply_policy, budget_remaining_ms, cap_reason, resolve_errors, split_for_render,
+        Step, apply_policy, budget_remaining_ms, cap_reason, classify_response, resolve_errors,
+        split_for_render,
     };
     use crate::flow::message;
     use crate::flow::signup_fields::TargetField;
@@ -770,6 +780,86 @@ mod tests {
         assert_eq!(
             apply_policy(Outcome::Unavailable, FailurePolicy::FailOpen),
             Step::Continue,
+        );
+    }
+
+    /// Build a response with no network, no TLS, no `Env` and no record.
+    ///
+    /// `FetchResponse`'s three fields are public, so the whole classification surface is
+    /// reachable from a unit test. An earlier revision of this PR claimed the response half
+    /// "needs TLS because this path never permits plaintext" and left it untested on that
+    /// basis. The justification was wrong, and the cost of believing it was three review
+    /// rounds finding the same collapse on three different inputs.
+    fn response(status: u16, body: &str) -> ironauth_fetch::FetchResponse {
+        ironauth_fetch::FetchResponse {
+            status: http::StatusCode::from_u16(status).expect("a legal status"),
+            headers: http::HeaderMap::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// An `interrupt` verdict is a REJECTION however little it says.
+    ///
+    /// The wire contract reaches this two ways, and `errors` is `#[serde(default)]`, so a
+    /// target may legally omit the key entirely. Both spellings used to become `Unavailable`,
+    /// which under `FailOpen` means allow: the target refused and was ignored.
+    #[test]
+    fn an_interrupt_is_a_rejection_however_little_it_says() {
+        for body in [
+            r#"{"verdict":"interrupt","errors":[]}"#,
+            r#"{"verdict":"interrupt"}"#,
+        ] {
+            let outcome = classify_response(&response(200, body), None, "dlv", 0, None);
+            assert_eq!(
+                outcome,
+                Outcome::Interrupt(Vec::new()),
+                "an interrupt carrying no renderable field is still an interrupt: {body}"
+            );
+            assert_eq!(
+                apply_policy(
+                    classify_response(&response(200, body), None, "dlv", 0, None),
+                    FailurePolicy::FailOpen
+                ),
+                Step::Stop(Decision::Refuse),
+                "and fail open must not forgive it, because it is an answer, not silence"
+            );
+        }
+    }
+
+    /// Everything that is NOT an answer reaches the failure policy, and an approval does not.
+    #[test]
+    fn only_a_non_answer_reaches_the_failure_policy() {
+        for (status, body, why) in [
+            (
+                500,
+                r#"{"verdict":"allow"}"#,
+                "a non-2xx carrying a well formed allow",
+            ),
+            (200, "not json at all", "a malformed body"),
+            (
+                200,
+                r#"{"verdict":"maybe"}"#,
+                "a verdict this contract does not define",
+            ),
+            (200, "{}", "no verdict at all"),
+        ] {
+            assert_eq!(
+                classify_response(&response(status, body), None, "dlv", 0, None),
+                Outcome::Unavailable,
+                "{why} is not an answer"
+            );
+        }
+
+        assert_eq!(
+            classify_response(
+                &response(200, r#"{"verdict":"allow"}"#),
+                None,
+                "dlv",
+                0,
+                None
+            ),
+            Outcome::Allow,
+            "and a well formed allow is an approval"
         );
     }
 
