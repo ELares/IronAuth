@@ -97,7 +97,10 @@ pub(super) async fn load_active_signup_form(
 /// The message context key naming a field's RFC 6901 trait pointer (issue #87). Every generic
 /// field message (the label and each validation error) carries the pointer here, so a locale
 /// bundle keys per field copy on the pointer while the numeric id registry stays finite.
-const FIELD_CONTEXT_KEY: &str = "field";
+pub(super) const FIELD_CONTEXT_KEY: &str = "field";
+
+/// The context key carrying an HTTP flow target's own explanation of a rejection (issue #112).
+pub(super) const REASON_CONTEXT_KEY: &str = "reason";
 
 /// The IronAuth annotation keyword (mirrors `trait_schema`'s private constant), read off a
 /// field's sub-schema to pick the email or phone input type for a verification address.
@@ -111,6 +114,14 @@ pub(super) struct FieldFailure {
     pub trait_pointer: String,
     /// The generic numeric message id for the failure kind.
     pub message_id: MessageId,
+    /// Free text from an HTTP flow target explaining THIS field's rejection (issue #112), or
+    /// [`None`] for a failure IronAuth itself produced, which needs no parameter because its
+    /// message id already says what went wrong.
+    ///
+    /// It rides the message CONTEXT rather than `Message.text` because the browser transport
+    /// recomputes text from the registry: a string placed in `text` would appear over the API
+    /// and silently vanish in rendered HTML.
+    pub reason: Option<String>,
 }
 
 /// The outcome of validating a signup submission (issue #87): the assembled partial trait
@@ -162,10 +173,14 @@ pub(super) fn signup_field_nodes_with_messages(
                     .iter()
                     .find(|failure| failure.trait_pointer == field.trait_pointer)
                 {
-                    node.messages.push(Message::with_context(
-                        failure.message_id,
-                        MessageContext::one(FIELD_CONTEXT_KEY, &field.trait_pointer),
-                    ));
+                    let mut context = MessageContext::one(FIELD_CONTEXT_KEY, &field.trait_pointer);
+                    if let Some(reason) = &failure.reason {
+                        context
+                            .0
+                            .insert(REASON_CONTEXT_KEY.to_owned(), reason.clone());
+                    }
+                    node.messages
+                        .push(Message::with_context(failure.message_id, context));
                 }
                 node
             })
@@ -204,6 +219,7 @@ pub(super) fn validate_signup_submission(
                 failures.push(FieldFailure {
                     trait_pointer: field.trait_pointer.clone(),
                     message_id: message::SIGNUP_FIELD_REQUIRED,
+                    reason: None,
                 });
             }
             continue;
@@ -212,6 +228,7 @@ pub(super) fn validate_signup_submission(
             failures.push(FieldFailure {
                 trait_pointer: field.trait_pointer.clone(),
                 message_id,
+                reason: None,
             });
         } else {
             insert_at_pointer(&mut document, &field.trait_pointer, value);
@@ -511,6 +528,72 @@ fn insert_tokens(map: &mut Map<String, Value>, tokens: &[String], value: Value) 
     }
 }
 
+/// Where an HTTP flow target's RFC 6901 pointer lands on the registration form (issue #112).
+///
+/// A target rejects a field by naming it with a pointer into the payload it was SENT, so the
+/// namespace here is the submitted-form-data one (`/traits/email`), not the trait-schema one
+/// (`/email`) the internal [`FieldFailure`] uses. The two sit one token apart and nothing else
+/// reconciles them, which is exactly why this conversion is a named function with a table of
+/// tests rather than an inline `strip_prefix`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TargetField {
+    /// The built-in identifier input.
+    Identifier,
+    /// The built-in password input.
+    Password,
+    /// A configured signup field, carrying its TRAIT pointer (the node mapping key).
+    Trait(String),
+}
+
+/// Resolve a flow target's pointer onto a form field, or [`None`] if it names nothing.
+///
+/// [`None`] is not "skip this error". When any pointer fails to resolve the dispatcher
+/// discards the whole field MAPPING, because attaching only the resolvable subset would let
+/// one typo silently defang a rejection. It does NOT discard the rejection: an unmappable
+/// interrupt still stops the flow, under either failure policy, as a uniform refusal.
+///
+/// Resolution is by EXACT match, which is what makes it safe against a malformed pointer
+/// without a separate syntax check. A built-in is matched literally, so a pointer missing its
+/// leading slash cannot match one. A trait pointer must equal a CONFIGURED field's pointer, so
+/// a bad RFC 6901 escape, an unknown field, or a trailing-garbage pointer all fail the same
+/// way: they equal nothing. Explicit leading-slash and escape guards were written here first
+/// and removed, because no input could make them change the answer and a guard that cannot
+/// fail is not protection, it is decoration.
+///
+/// An unconfigured `/traits/...` field is [`None`] rather than a resolved miss: it has no node
+/// to carry the message, so pretending it resolved would drop the rejection on the floor.
+///
+/// "Configured" means configured FOR THIS STEP and still present in the active schema, which
+/// is the same pair of conditions [`signup_field_nodes_with_messages`] builds nodes under. An
+/// earlier revision matched any configured field, and the gap was not academic: a target
+/// naming a `LaterLogin` field resolved, so the discard rule never fired, and the resulting
+/// failure matched no node. The person then got the unchanged form back with no
+/// field error, no flow-level notice, and no way forward, while the signup was refused.
+pub(super) fn resolve_target_pointer(
+    pointer: &str,
+    signup: Option<&(SignupFormConfig, TraitSchema, i32)>,
+    step: SignupStep,
+) -> Option<TargetField> {
+    match pointer {
+        "/identifier" => return Some(TargetField::Identifier),
+        "/password" => return Some(TargetField::Password),
+        _ => {}
+    }
+    let rest = pointer.strip_prefix("/traits")?;
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let (config, schema, _) = signup?;
+    config
+        .fields
+        .iter()
+        .filter(|field| field.step == step)
+        .any(|field| {
+            field.trait_pointer == rest && schema.subschema_at(&field.trait_pointer).is_some()
+        })
+        .then(|| TargetField::Trait(rest.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +638,204 @@ mod tests {
 
     fn config(fields: Vec<SignupFormField>) -> SignupFormConfig {
         SignupFormConfig { fields }
+    }
+
+    /// A flow target's pointer resolves onto a form field, or onto nothing at all.
+    ///
+    /// The whole table matters, not just the happy row. `None` is what makes the dispatcher
+    /// discard the field MAPPING, so a resolver that were too PERMISSIVE would let a typo
+    /// attach a rejection to the wrong field, and one too STRICT would strip a legitimate
+    /// rejection of the field it names and render it as a uniform refusal instead.
+    ///
+    /// It can no longer hand a fail-open target an approval it never gave: an unmappable
+    /// rejection is still a rejection, and stops the flow under either policy. That sentence
+    /// described the behaviour for three rounds after it stopped being true.
+    #[test]
+    fn a_target_pointer_resolves_only_to_a_field_that_exists() {
+        let form = (
+            config(vec![
+                field("/email", 0, true, json!({})),
+                field("/address/zip", 1, false, json!({})),
+            ]),
+            schema(),
+            1,
+        );
+        let cfg = Some(&form);
+
+        assert_eq!(
+            resolve_target_pointer("/identifier", cfg, SignupStep::Signup),
+            Some(TargetField::Identifier),
+            "the built-in identifier input"
+        );
+        assert_eq!(
+            resolve_target_pointer("/password", cfg, SignupStep::Signup),
+            Some(TargetField::Password),
+            "the built-in password input"
+        );
+        assert_eq!(
+            resolve_target_pointer("/traits/email", cfg, SignupStep::Signup),
+            Some(TargetField::Trait("/email".to_owned())),
+            "the wire namespace is /traits/<x>; the node mapping key is the TRAIT pointer /<x>"
+        );
+        assert_eq!(
+            resolve_target_pointer("/traits/address/zip", cfg, SignupStep::Signup),
+            Some(TargetField::Trait("/address/zip".to_owned())),
+            "a nested field keeps its whole trait pointer"
+        );
+
+        assert_eq!(
+            resolve_target_pointer("traits/email", cfg, SignupStep::Signup),
+            None,
+            "an RFC 6901 pointer must start with a slash"
+        );
+        assert_eq!(
+            resolve_target_pointer("/traits/~2bad", cfg, SignupStep::Signup),
+            None,
+            "~ must be followed by 0 or 1; an invalid escape must not resolve by accident"
+        );
+        assert_eq!(
+            resolve_target_pointer("/traits/nope", cfg, SignupStep::Signup),
+            None,
+            "a field the form does not configure has no node to carry the message"
+        );
+        assert_eq!(
+            resolve_target_pointer("/email", cfg, SignupStep::Signup),
+            None,
+            "the TRAIT namespace is not the wire namespace: /email is not /traits/email"
+        );
+        assert_eq!(
+            resolve_target_pointer("/traits", cfg, SignupStep::Signup),
+            None,
+            "the prefix alone names no field"
+        );
+        assert_eq!(
+            resolve_target_pointer("/", cfg, SignupStep::Signup),
+            None,
+            "the whole document is not a field"
+        );
+        assert_eq!(
+            resolve_target_pointer("/traits/email", None, SignupStep::Signup),
+            None,
+            "with no signup form configured there is no field to resolve onto"
+        );
+
+        // A field configured for a DIFFERENT step renders no node at this one. Resolving it
+        // would produce a failure that matches nothing, and the person would get the
+        // unchanged form back with the signup refused and not one word about why.
+        let later = (
+            config(vec![SignupFormField {
+                step: SignupStep::LaterLogin,
+                ..field("/phone", 0, false, json!({}))
+            }]),
+            schema(),
+            1,
+        );
+        assert_eq!(
+            resolve_target_pointer("/traits/phone", Some(&later), SignupStep::Signup),
+            None,
+            "a later-login field renders no node at signup, so it must not resolve here"
+        );
+        assert_eq!(
+            resolve_target_pointer("/traits/phone", Some(&later), SignupStep::LaterLogin),
+            Some(TargetField::Trait("/phone".to_owned())),
+            "and it DOES resolve at the step that renders it"
+        );
+
+        // A field configured for THIS step whose pointer is no longer in the active schema
+        // renders no node either: `signup_field_nodes_with_messages` builds under BOTH
+        // conditions, so resolution has to match both. Without this case the schema half of
+        // the check was decorative, and deleting it left every test green.
+        let descheduled = (
+            config(vec![field("/removed_from_schema", 0, false, json!({}))]),
+            schema(),
+            1,
+        );
+        assert_eq!(
+            resolve_target_pointer(
+                "/traits/removed_from_schema",
+                Some(&descheduled),
+                SignupStep::Signup
+            ),
+            None,
+            "a configured field absent from the active schema renders no node, so resolving \
+             it would produce a failure that attaches to nothing"
+        );
+    }
+
+    /// A target's own text reaches the node it named, and only that node.
+    #[test]
+    fn a_target_reason_rides_the_context_of_the_named_field_only() {
+        let cfg = config(vec![
+            field("/email", 0, true, json!({})),
+            field("/age", 1, false, json!({})),
+        ]);
+        // TWO failures, with DIFFERENT reasons, deliberately. With one, a mapper that read
+        // `failures.first()` instead of the field's own failure would be indistinguishable
+        // from a correct one, and the test would pass for a reason unrelated to its property.
+        let failures = vec![
+            FieldFailure {
+                trait_pointer: "/age".to_owned(),
+                message_id: message::FLOW_TARGET_REJECTED_WITH_REASON,
+                reason: Some("under the minimum age".to_owned()),
+            },
+            FieldFailure {
+                trait_pointer: "/email".to_owned(),
+                message_id: message::FLOW_TARGET_REJECTED_WITH_REASON,
+                reason: Some("blocked by fraud policy".to_owned()),
+            },
+        ];
+        let nodes =
+            signup_field_nodes_with_messages(&cfg, &schema(), SignupStep::Signup, &failures);
+
+        let email = nodes
+            .iter()
+            .find(|node| match &node.attributes {
+                NodeAttributes::Input { name, .. } => name == "email",
+                NodeAttributes::Text { .. } => false,
+            })
+            .expect("the email node is built");
+        let message = email
+            .messages
+            .first()
+            .expect("the rejection attaches to the field the target named");
+        assert_eq!(message.id, message::FLOW_TARGET_REJECTED_WITH_REASON);
+        assert_eq!(
+            message
+                .context
+                .0
+                .get(REASON_CONTEXT_KEY)
+                .map(String::as_str),
+            Some("blocked by fraud policy"),
+            "the target's text rides the CONTEXT: the browser transport recomputes text from \
+             the registry, so a string placed in `text` would vanish in rendered HTML"
+        );
+        assert_eq!(
+            message.context.0.get(FIELD_CONTEXT_KEY).map(String::as_str),
+            Some("/email"),
+            "the field pointer rides alongside it, exactly as a native validation failure"
+        );
+
+        let age = nodes
+            .iter()
+            .find(|node| match &node.attributes {
+                NodeAttributes::Input { name, .. } => name == "age",
+                NodeAttributes::Text { .. } => false,
+            })
+            .expect("the age node is built");
+        let age_message = age
+            .messages
+            .first()
+            .expect("the second rejection attaches to its own field");
+        assert_eq!(
+            age_message
+                .context
+                .0
+                .get(REASON_CONTEXT_KEY)
+                .map(String::as_str),
+            Some("under the minimum age"),
+            "each field carries ITS OWN reason: a mapper reading the first failure for every \
+             field would put the email reason here"
+        );
     }
 
     #[test]
@@ -690,6 +971,7 @@ mod tests {
             SignupValidation::Invalid(vec![FieldFailure {
                 trait_pointer: "/email".to_owned(),
                 message_id: message::SIGNUP_FIELD_REQUIRED,
+                reason: None,
             }])
         );
     }
@@ -736,6 +1018,7 @@ mod tests {
             SignupValidation::Invalid(vec![FieldFailure {
                 trait_pointer: "/email".to_owned(),
                 message_id: message::SIGNUP_FIELD_TOO_SHORT,
+                reason: None,
             }]),
             "an empty rule must still enforce the trait's minLength"
         );
@@ -748,6 +1031,7 @@ mod tests {
             SignupValidation::Invalid(vec![FieldFailure {
                 trait_pointer: "/email".to_owned(),
                 message_id: message::SIGNUP_FIELD_TOO_SHORT,
+                reason: None,
             }]),
             "a partial rule must still enforce the trait's unrestated minLength"
         );
@@ -777,6 +1061,7 @@ mod tests {
             SignupValidation::Invalid(vec![FieldFailure {
                 trait_pointer: "/email".to_owned(),
                 message_id: message::SIGNUP_FIELD_TOO_SHORT,
+                reason: None,
             }])
         );
     }

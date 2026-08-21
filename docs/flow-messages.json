@@ -558,6 +558,32 @@
       "text": "This value is not in the expected format."
     },
     {
+      "context_keys": [
+        "field"
+      ],
+      "id": 4280001,
+      "kind": "error",
+      "name": "flow_target.rejected",
+      "text": "This value was rejected."
+    },
+    {
+      "context_keys": [
+        "field",
+        "reason"
+      ],
+      "id": 4280002,
+      "kind": "error",
+      "name": "flow_target.rejected_with_reason",
+      "text": "{reason}"
+    },
+    {
+      "context_keys": [],
+      "id": 4280003,
+      "kind": "error",
+      "name": "flow_target.unavailable",
+      "text": "We could not complete your request. Try again."
+    },
+    {
       "context_keys": [],
       "id": 4300001,
       "kind": "error",

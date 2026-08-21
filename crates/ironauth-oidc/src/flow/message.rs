@@ -352,6 +352,27 @@ pub const SIGNUP_FIELD_NOT_ALLOWED: MessageId = MessageId(4_270_004);
 /// field's effective type. The field pointer rides the `field` context.
 pub const SIGNUP_FIELD_INVALID_FORMAT: MessageId = MessageId(4_270_005);
 
+/// A registered HTTP flow target rejected this field WITHOUT saying why (issue #112). The
+/// field pointer rides the `field` context.
+///
+/// Separate from [`FLOW_TARGET_REJECTED_WITH_REASON`] because interpolation leaves an
+/// unreferenced `{placeholder}` VERBATIM: a single id whose text were `{reason}` would render
+/// the literal string `{reason}` to a person whenever the target sent no message. The id
+/// selects the template, so there are two ids because there are genuinely two templates.
+pub const FLOW_TARGET_REJECTED: MessageId = MessageId(4_280_001);
+/// A registered HTTP flow target rejected this field AND explained why (issue #112). The
+/// field pointer rides the `field` context and the target's own text, capped, rides `reason`.
+///
+/// The text is the target's, so it is a message PARAMETER and never a minted id: a third
+/// party cannot add ids to the registry, and the render path escapes the value.
+pub const FLOW_TARGET_REJECTED_WITH_REASON: MessageId = MessageId(4_280_002);
+/// A sync HTTP flow target could not be consulted and its policy is fail closed (issue #112):
+/// it timed out, failed at the transport, answered non 2xx, answered unverifiably, or answered
+/// something this contract does not define. Deliberately uniform, and deliberately carries NO
+/// field: there is nothing truthful to say about which field was wrong, and naming one would
+/// invent a rejection the target never made.
+pub const FLOW_TARGET_UNAVAILABLE: MessageId = MessageId(4_280_003);
+
 /// The uniform MFA failure: the code was incorrect or expired. The SAME id whether the
 /// code was a wrong TOTP, a replay, or a wrong recovery code (never an oracle).
 pub const MFA_CODE_INCORRECT: MessageId = MessageId(4_300_001);
@@ -918,6 +939,27 @@ pub const REGISTRY: &[MessageSpec] = &[
         kind: MessageKind::Error,
         text: "This value is not in the expected format.",
         context_keys: &["field"],
+    },
+    MessageSpec {
+        id: FLOW_TARGET_REJECTED,
+        name: "flow_target.rejected",
+        kind: MessageKind::Error,
+        text: "This value was rejected.",
+        context_keys: &["field"],
+    },
+    MessageSpec {
+        id: FLOW_TARGET_REJECTED_WITH_REASON,
+        name: "flow_target.rejected_with_reason",
+        kind: MessageKind::Error,
+        text: "{reason}",
+        context_keys: &["field", "reason"],
+    },
+    MessageSpec {
+        id: FLOW_TARGET_UNAVAILABLE,
+        name: "flow_target.unavailable",
+        kind: MessageKind::Error,
+        text: "We could not complete your request. Try again.",
+        context_keys: &[],
     },
     MessageSpec {
         id: MFA_CODE_INCORRECT,

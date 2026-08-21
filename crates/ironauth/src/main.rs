@@ -1337,6 +1337,36 @@ async fn build_oidc_plane(
         Some(hook) => state.with_claims_enrichment_hook(std::sync::Arc::clone(hook)),
         None => state,
     };
+    // The outbound client sync HTTP flow targets are called through (issue #112). Its
+    // `total_timeout` is the flow-target ceiling EXACTLY, because a per-request timeout only
+    // shortens it: a smaller ceiling here would silently truncate a target registered above
+    // it, and a larger one would let a target outlast the bound the ceiling promises.
+    //
+    // Installed unconditionally. There is no feature flag to forget, and with no target
+    // registered the dispatcher performs no outbound call at all, so a deployment that uses
+    // none is byte-for-byte unchanged.
+    let state = match shared_config::outbound_fetcher(ironauth_fetch::FetchLimits {
+        total_timeout: std::time::Duration::from_millis(
+            u64::try_from(ironauth_oidc::flow::FLOW_TARGET_MAX_SYNC_TIMEOUT_MS).unwrap_or(30_000),
+        ),
+        ..ironauth_fetch::FetchLimits::default()
+    }) {
+        Ok(fetcher) => state.with_flow_target_fetcher(std::sync::Arc::new(fetcher)),
+        Err(error) => {
+            // A trust-store failure must not take the process down, but it must not be
+            // silent either: with no fetcher every registered target takes the unavailable
+            // path, and `flow_targets.failure_policy` DEFAULTS to fail_closed, so a
+            // deployment with one registered target refuses every signup for the process
+            // lifetime. Without this line the only symptom is generic copy on a form.
+            tracing::warn!(
+                %error,
+                "the flow-target outbound fetcher could not be built; every registered HTTP \
+                 flow target will take its failure policy without being called, and a \
+                 fail-closed target will refuse the flow it guards"
+            );
+            state
+        }
+    };
     // Everything that reaches BOTH planes (issue #414): the two config sections that
     // live outside `[oidc]` because both planes consume them (the `[organizations]`
     // group nesting bound, issue #97, which bounds the ancestor walk the mint-path

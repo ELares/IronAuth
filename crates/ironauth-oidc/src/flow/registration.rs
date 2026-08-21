@@ -30,6 +30,7 @@ use ironauth_store::{
     SignupStep, UserState,
 };
 
+use super::flow_target;
 use super::message::{self, Message, MessageId};
 use super::model::{Autocomplete, InputType, Node, NodeAttributes, NodeGroup, Transport};
 use super::signup_fields::{self, FieldFailure, SignupValidation};
@@ -92,12 +93,18 @@ pub(super) struct RegistrationSuccess {
 /// submit control (Submit group, rank 90, so it renders after any collected profile fields).
 /// On the browser transport a hidden `flow` node carries the flow id back on the form post.
 /// `id_error` / `pw_error` attach a node level message to the offending node.
+///
+/// A whole [`Message`] rather than a [`MessageId`], because an HTTP flow target's rejection
+/// (issue #112) carries the target's own explanation in the message CONTEXT. Passing an id
+/// alone forces `Message::of`, which builds an EMPTY context, and interpolation leaves an
+/// unreferenced `{placeholder}` verbatim: the person would read the literal string
+/// `{reason}` and the target's text would be discarded on the way.
 fn details_nodes(
     transport: Transport,
     flow_id: &str,
     identifier_prefill: &str,
-    id_error: Option<MessageId>,
-    pw_error: Option<MessageId>,
+    id_error: Option<Message>,
+    pw_error: Option<Message>,
 ) -> Vec<Node> {
     let mut nodes = Vec::new();
 
@@ -119,8 +126,8 @@ fn details_nodes(
         },
         Some(Message::of(message::REGISTER_IDENTIFIER_LABEL)),
     );
-    if let Some(id) = id_error {
-        identifier.messages.push(Message::of(id));
+    if let Some(message) = id_error {
+        identifier.messages.push(message);
     }
     nodes.push(identifier);
 
@@ -138,8 +145,8 @@ fn details_nodes(
         },
         Some(Message::of(message::REGISTER_PASSWORD_LABEL)),
     );
-    if let Some(id) = pw_error {
-        password.messages.push(Message::of(id));
+    if let Some(message) = pw_error {
+        password.messages.push(message);
     }
     nodes.push(password);
 
@@ -248,7 +255,7 @@ pub(super) async fn advance_registration(
     // Profile group signup nodes always render after the identifier and password regardless of
     // append order.
     let details_with_signup =
-        |id_err: Option<MessageId>, pw_err: Option<MessageId>, failures: &[FieldFailure]| {
+        |id_err: Option<Message>, pw_err: Option<Message>, failures: &[FieldFailure]| {
             let mut nodes = details_nodes(transport, flow_id, identifier, id_err, pw_err);
             if let Some((config, schema, _)) = &signup {
                 nodes.extend(signup_fields::signup_field_nodes_with_messages(
@@ -288,7 +295,11 @@ pub(super) async fn advance_registration(
     if state.registration_closed() {
         if identifier.is_empty() {
             return Ok(RegistrationStep::Render {
-                nodes: details_with_signup(Some(message::REGISTER_IDENTIFIER_REQUIRED), None, &[]),
+                nodes: details_with_signup(
+                    Some(Message::of(message::REGISTER_IDENTIFIER_REQUIRED)),
+                    None,
+                    &[],
+                ),
                 messages: Vec::new(),
             });
         }
@@ -323,7 +334,7 @@ pub(super) async fn advance_registration(
         .then_some(message::REGISTER_PASSWORD_REQUIRED);
     if id_error.is_some() || pw_error.is_some() {
         return Ok(RegistrationStep::Render {
-            nodes: details_with_signup(id_error, pw_error, &[]),
+            nodes: details_with_signup(id_error.map(Message::of), pw_error.map(Message::of), &[]),
             messages: Vec::new(),
         });
     }
@@ -361,7 +372,7 @@ pub(super) async fn advance_registration(
     };
 
     let render_details =
-        |id_err: Option<MessageId>, pw_err: Option<MessageId>| RegistrationStep::Render {
+        |id_err: Option<Message>, pw_err: Option<Message>| RegistrationStep::Render {
             nodes: details_with_signup(id_err, pw_err, &[]),
             messages: Vec::new(),
         };
@@ -381,7 +392,7 @@ pub(super) async fn advance_registration(
         } else {
             return Ok(render_details(
                 None,
-                Some(message::REGISTER_ADDRESS_UNUSABLE),
+                Some(Message::of(message::REGISTER_ADDRESS_UNUSABLE)),
             ));
         }
     }
@@ -417,7 +428,7 @@ pub(super) async fn advance_registration(
             } else {
                 return Ok(render_details(
                     None,
-                    Some(message::REGISTER_VERIFICATION_REQUIRED),
+                    Some(Message::of(message::REGISTER_VERIFICATION_REQUIRED)),
                 ));
             }
         }
@@ -438,7 +449,7 @@ pub(super) async fn advance_registration(
     {
         return Ok(render_details(
             None,
-            Some(message::REGISTER_PASSWORD_REJECTED),
+            Some(Message::of(message::REGISTER_PASSWORD_REJECTED)),
         ));
     }
     match state.screen_password(&scope, &normalized).await {
@@ -447,8 +458,50 @@ pub(super) async fn advance_registration(
         | crate::state::ScreenDecision::RefusedUnavailable => {
             return Ok(render_details(
                 None,
-                Some(message::REGISTER_PASSWORD_REJECTED),
+                Some(Message::of(message::REGISTER_PASSWORD_REJECTED)),
             ));
+        }
+    }
+
+    // Registered HTTP flow targets, PRE-PERSIST (issue #112). Placed here deliberately:
+    // after IronAuth's own cheap defences (throttle, disposable, proof of work, breach
+    // screen), so a bot attempt is never shipped to a customer's endpoint, and BEFORE the
+    // Argon2 hash and the write, so a rejected signup spends no hashing work and leaves no
+    // row. The password is never in the payload.
+    let target_data = serde_json::json!({
+        "identifier": identifier,
+        "traits": collected_traits
+            .as_ref()
+            .and_then(|(document, _)| serde_json::from_str::<serde_json::Value>(document).ok()),
+    });
+    match flow_target::dispatch_sync(
+        state,
+        scope,
+        ironauth_store::flow_target::Timing::PrePersist,
+        &target_data,
+        signup.as_ref(),
+    )
+    .await
+    {
+        flow_target::Decision::Allow => {}
+        flow_target::Decision::Interrupt(errors) => {
+            // The target named the offending fields. They render on the SAME nodes, with the
+            // same ids, that IronAuth's own validation failures use, on both transports.
+            let (id_err, pw_err, failures) = flow_target::split_for_render(&errors);
+            return Ok(RegistrationStep::Render {
+                nodes: details_with_signup(id_err, pw_err, &failures),
+                messages: Vec::new(),
+            });
+        }
+        flow_target::Decision::Refuse => {
+            // Either a target REJECTED with a mapping this step cannot render, or a
+            // fail-closed target could not be consulted. Uniform and field free in both
+            // cases: there is nothing truthful to say about WHICH field was wrong, and
+            // naming one would invent a rejection the target never made.
+            return Ok(RegistrationStep::Render {
+                nodes: details_with_signup(None, None, &[]),
+                messages: vec![flow_target::refusal_message()],
+            });
         }
     }
 
@@ -510,6 +563,36 @@ pub(super) async fn advance_registration(
             .await
     };
 
+    // Registered HTTP flow targets, POST-PERSIST (issue #112). Runs for EVERY committed row,
+    // before the outcome is branched on, because a waitlisted signup commits a real row too:
+    // returning the pending acknowledgment first would leave the post-persist half dead and
+    // silent in any deployment with the waitlist on, which is a supported configuration.
+    //
+    // The row is committed, so the payload carries `subject` and the target observes state
+    // guaranteed to still be there when it looks. That asymmetry (a subject at this timing
+    // and none at pre-persist) is criterion 4's observable difference.
+    //
+    // The verdict is ADVISORY and deliberately not acted on. Honouring a rejection after
+    // commit would leave an account created while telling the person it failed, which is
+    // worse than either honest outcome. The issue's own word for this timing is "observes".
+    if let Ok(user_id) = &result {
+        let observed = serde_json::json!({
+            "identifier": identifier,
+            "subject": user_id.to_string(),
+            "traits": collected_traits
+                .as_ref()
+                .and_then(|(document, _)| serde_json::from_str::<serde_json::Value>(document).ok()),
+        });
+        let _advisory = flow_target::dispatch_sync(
+            state,
+            scope,
+            ironauth_store::flow_target::Timing::PostPersist,
+            &observed,
+            signup.as_ref(),
+        )
+        .await;
+    }
+
     match result {
         // A waitlisted (non quarantined) account cannot authenticate: the uniform pending
         // acknowledgment, no session. A quarantined signup is Active, so it falls through to
@@ -527,7 +610,7 @@ pub(super) async fn advance_registration(
         // registration, where duplicate disclosure is the accepted posture). The closed/
         // uniform path above never reaches this.
         Err(ironauth_store::StoreError::Conflict) => Ok(render_details(
-            Some(message::REGISTER_ALREADY_REGISTERED),
+            Some(Message::of(message::REGISTER_ALREADY_REGISTERED)),
             None,
         )),
         Err(_) => Err(FlowError::Store),
