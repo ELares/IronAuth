@@ -380,7 +380,7 @@ mod tests {
         assert!(!target(Invocation::Sync, Timing::PostPersist).runs_before_write());
         assert!(
             !target(Invocation::Async, Timing::PostPersist).runs_before_write(),
-            "fire-and-forget must never hold a transaction open"
+            "a fire-and-forget target must never make the flow wait for it"
         );
         assert!(
             !target(Invocation::Async, Timing::PrePersist).runs_before_write(),
