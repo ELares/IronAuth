@@ -236,3 +236,51 @@ async fn caps_have_safe_defaults_and_are_configurable() {
     assert_eq!(custom.max_response_bytes, 4096);
     assert_eq!(custom.total_timeout, Duration::from_secs(2));
 }
+
+/// A per-request timeout SHORTENS the configured deadline, and only shortens it.
+///
+/// Issue #112 criterion 6 needs a per-target timeout: a sync flow target that exceeds its
+/// own bound must trigger its failure policy instead of hanging the flow it sits in. There
+/// was no way to express one. `total_timeout` is fixed on the `Fetcher` at construction, and
+/// a `Fetcher` per target would throw away the TLS trust-store setup and connection reuse on
+/// the signup path.
+///
+/// Both directions are driven, and the second is the one that matters. If the override
+/// REPLACED the configured bound rather than capping it, a target registered with a
+/// ten-minute timeout would hold a request for ten minutes and the operator's ceiling would
+/// be advisory. A test for the shortening half alone cannot tell the two apart.
+#[tokio::test]
+async fn a_per_request_timeout_only_ever_shortens_the_configured_one() {
+    let server = common::start(Behavior::Hang).await;
+    // Generous at the Fetcher level, so the SHORT bound below is what fires.
+    let limits = FetchLimits {
+        max_response_bytes: 1 << 20,
+        total_timeout: Duration::from_secs(30),
+    };
+    let (fetcher, _dialer) = fetcher_for(server.addr, limits);
+
+    let short = FetchRequest::get(FetchPurpose::FlowTarget, "http://issuer.example/slow")
+        .allow_plaintext_http()
+        .timeout(Duration::from_millis(150));
+    // Well inside the Fetcher's 30s: only the per-request bound can end this in time.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), fetcher.fetch(short)).await;
+    let result = outcome.expect("the per-request deadline fires well within 5s");
+    assert_eq!(result.map(|_| ()), Err(FetchError::Timeout));
+
+    // The other direction: a request asking for LONGER than the configured bound gets the
+    // configured bound. Driven against a Fetcher whose own deadline is short, so a request
+    // asking for 30s must still end at ~200ms.
+    let tight = FetchLimits {
+        max_response_bytes: 1 << 20,
+        total_timeout: Duration::from_millis(200),
+    };
+    let (fetcher, _dialer) = fetcher_for(server.addr, tight);
+    let greedy = FetchRequest::get(FetchPurpose::FlowTarget, "http://issuer.example/slow")
+        .allow_plaintext_http()
+        .timeout(Duration::from_secs(30));
+    let outcome = tokio::time::timeout(Duration::from_secs(5), fetcher.fetch(greedy)).await;
+    let result = outcome.expect(
+        "a request may not raise the operator's ceiling; the configured 200ms must still fire",
+    );
+    assert_eq!(result.map(|_| ()), Err(FetchError::Timeout));
+}

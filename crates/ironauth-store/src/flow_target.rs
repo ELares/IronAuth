@@ -99,13 +99,24 @@ pub struct FlowTargetRecord {
 }
 
 impl FlowTargetRecord {
-    /// Whether this target runs inside the write's transaction.
+    /// Whether this target must run BEFORE the write, so a refusal leaves no row.
     ///
-    /// The question the dispatcher asks BEFORE opening one, which is why it is a method on the
-    /// record rather than something a caller derives: a caller that reconstructed it from
-    /// `timing` and `invocation` separately could get the async case wrong, and the async case
-    /// is the one where getting it wrong means holding a transaction open for a target that
-    /// nothing waits for.
+    /// The name says "in transaction" and the guarantee is narrower than that, deliberately.
+    /// The dispatcher calls a pre-persist target before it calls the store at all; the target
+    /// does not run inside the write's database transaction, and should not. An outbound HTTP
+    /// call made inside one would hold a pooled Postgres connection and whatever rows the
+    /// write has locked for the target's entire timeout, so a slow third party would consume
+    /// the connection pool rather than just its own budget.
+    ///
+    /// Running before the write satisfies criterion 4 anyway, which asks that "a rejecting
+    /// pre-persist target leaves no row": a target that refuses means the write call is never
+    /// made, and a call never made writes nothing. The stronger reading, an HTTP round trip
+    /// inside a database transaction, buys nothing over that and costs the pool.
+    ///
+    /// It is a method on the record rather than something a caller derives because a caller
+    /// reconstructing it from `timing` and `invocation` separately could get the async case
+    /// wrong, and the async case is the one where getting it wrong means blocking a flow on
+    /// something nothing waits for.
     #[must_use]
     pub fn runs_in_transaction(&self) -> bool {
         // An ASYNC target never does, whatever its timing says -- and the migration's CHECK
