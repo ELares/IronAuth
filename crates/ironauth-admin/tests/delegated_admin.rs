@@ -1985,10 +1985,16 @@ async fn a_replay_request_enqueues_a_command_for_the_worker() {
     // POLLED, and the wait is the semantics rather than flakiness dressed up. The feed
     // gates every row on `pg_snapshot_xmin(pg_current_snapshot())`, which is CLUSTER-wide,
     // so a just-committed event is withheld until every transaction open anywhere on the
-    // instance has finished, including ones touching other databases. A single-shot read
-    // here failed roughly two runs in five under the parallel test binary, and a
-    // comment-only edit was enough to turn the suite red. `events_cursor_ordering.rs`
-    // carries the same wait for the same reason.
+    // instance has finished, including ones touching other databases.
+    //
+    // The rate is machine-dependent and worth stating as such rather than as a property of
+    // the code. One reviewer measured a single-shot read here failing 5 of 12 runs, with a
+    // comment-only edit enough to turn the suite red; a second could not reproduce that on
+    // their machine at all, 8 of 8 green with the poll reverted. Both are consistent with a
+    // watermark held down by whatever else happens to be open on the cluster, which is
+    // exactly why it must not be read once. `events_cursor_ordering.rs` carries the same
+    // wait for the same reason, and its comment is the one to read: the wait IS the
+    // semantics.
     let feed = format!("/v1/tenants/{tenant}/environments/{environment}/events");
     let mut types: Vec<String> = Vec::new();
     for _ in 0..100 {
@@ -2058,6 +2064,15 @@ async fn replaying_needs_more_than_reading() {
         status,
         StatusCode::FORBIDDEN,
         "a read-only credential must not be able to ship audit events to a sink: {body}"
+    );
+    // The refusal must NAME the permission, which is what `PERMISSION_PROVEN` means by
+    // proven: without it, asserting only the status leaves the SPECIFIC permission unpinned,
+    // and substituting `write_config` for another write permission survives the whole crate.
+    // An entry in that list claiming more than its test measures is a coverage registry
+    // that lies, which is worse than an honest gap in it.
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal must name the permission the route requires: {body}"
     );
 }
 

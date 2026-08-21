@@ -594,9 +594,12 @@ const PERMISSION_PROVEN: &[&str] = &[
     "createLogStream",
     "deleteLogStream",
     // Proven in `the_listing_is_fenced_and_its_bound_is_real` and
-    // `replaying_needs_more_than_reading` in `delegated_admin`, which drive the pair in
-    // both directions: the listing served under read and refused without it, and the
-    // replay refused for a credential holding read alone.
+    // `replaying_needs_more_than_reading` in `delegated_admin`. The listing is served under
+    // read and refused without it; the replay is refused for a credential holding read
+    // alone, AND the refusal is asserted to name `management.write_config`. That last
+    // assertion is what earns the entry: without it, substituting one write permission for
+    // another survived the whole crate, so the specific permission was unpinned and this
+    // list said otherwise.
     "listLogStreamDeadLetters",
     "replayLogStreamDeadLetters",
     // Proven in `the_authzen_endpoints_demand_read_and_never_answer_unauthenticated`, which

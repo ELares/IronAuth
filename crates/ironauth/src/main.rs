@@ -3156,13 +3156,21 @@ async fn start_log_shipper(
     // pools drained. The endpoint accepted, the worker existed, and nothing ran it, which
     // is the exact failure this whole branch was written to remove.
     //
-    // WHAT KEEPS IT FIXED is the compiler, not a test, and that is worth stating rather
-    // than implying otherwise. `start_log_shipper` is a private `async fn` in the binary
-    // crate, so nothing can drive it; the guarantee is that `main` MOVES the returned Vec
-    // into the shutdown loop's `.chain(...)`, so re-binding these pools to a local here
-    // would be a use-after-move and would not compile. A test in `log_shipper.rs` builds
-    // and holds its OWN pool, which proves the drain path and would stay green through a
-    // regression at this call site.
+    // WHAT KEEPS IT FIXED, stated precisely, because the previous two attempts at this
+    // sentence were both wrong.
+    //
+    // NOT a test. `start_log_shipper` is a private `async fn` in the binary crate, so
+    // nothing drives it. The test in `log_shipper.rs` builds and holds its OWN pool, which
+    // proves the drain path and would stay green through a regression here.
+    //
+    // NOT the compiler AT THIS RETURN either, which is what the last version claimed.
+    // Measured: replacing this with `Some((shipper, Vec::new()))` and discarding
+    // `replay_pools` compiles clean. The move-checker only binds one step further out, in
+    // `serve`, where the returned Vec is consumed by the shutdown loop's `.chain(...)`:
+    // re-binding it to a local THERE is a use-after-move and does not compile.
+    //
+    // So this line is held by review and by that one structural fact at the call site, and
+    // a future edit that drops the pools on the floor right here would compile and ship.
     Some((shipper, replay_pools))
 }
 
