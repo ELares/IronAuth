@@ -55,46 +55,76 @@ fi
 # edit relative to the merge base.
 BASE=$(git merge-base "$BASE_REF" HEAD 2>/dev/null || echo "$BASE_REF")
 
-# --no-renames is load bearing. With rename detection ON (the default) `--name-only` prints
-# only the DESTINATION path for a rename, and the base-side existence probe below then asks
-# about a path that by definition is not in the base, so the entry silently vanishes. That is
-# not a hypothetical: deleting a migration while adding a similar one, which is the ordinary
-# way a new migration gets written (copy the last one), is detected as a rename.
+# Enumerate from the BASE SIDE rather than diffing.
 #
-# No --diff-filter either. It is an allowlist, so any status not named is exempt: a type
-# change (replacing a migration with a symlink) alters the digest and would pass. The
-# base-side existence probe is the correct and complete discriminator on its own.
+# `git diff --name-only` was the original approach and it leaked three different ways, each
+# of which made an entry vanish with no diagnostic:
 #
-# The git failure is NOT swallowed. `|| true` here would turn a broken git invocation into a
-# clean report, which is the same vacuous pass this script's own base-ref handling refuses.
-if ! changed=$(git diff --no-renames --name-only "$BASE" -- 'crates/*/migrations/*.sql'); then
-  echo "migration-immutability: FAILED. 'git diff' against '$BASE' did not complete, so the" >&2
-  echo "  check could not run. That is not the same as 'no migration changed'." >&2
+#   * RENAMES. Detection is on by default and `--name-only` prints only the DESTINATION
+#     path, which by definition is not in the base, so the probe found nothing. Deleting a
+#     migration while adding a similar one is detected as a rename, and that is the ordinary
+#     way a new migration gets written: copy the last one.
+#   * C-QUOTED PATHS. `core.quotePath` defaults to true, so a path containing a non-ASCII
+#     byte, a quote, a backslash or a control character is printed as a quoted C string,
+#     which does not resolve as a path either. `-c core.quotePath=false` is NOT enough: it
+#     un-quotes the non-ASCII case and still quotes the rest.
+#   * CLEAN/SMUDGE FILTERS. A `.gitattributes` entry such as `*.sql text eol=crlf` makes the
+#     WORKTREE bytes differ from the blob while `git diff` reports NOTHING, because the
+#     filter is applied before comparison. `include_str!` compiles the worktree bytes, so
+#     every checksum would move at once while the diff listed zero files.
+#
+# Listing the base's own migrations and comparing each one's blob against the bytes on disk
+# has none of those failure modes: there is no rename to detect, `-z` output is never quoted,
+# and neither side passes through a filter. A file the base does not carry is simply absent
+# from the list, which is what makes a brand new migration the normal case.
+list_file=$(mktemp)
+cleanup() { rm -f "$list_file"; }
+trap cleanup EXIT
+
+if ! git ls-files -z --with-tree="$BASE" -- 'crates/*/migrations/*.sql' > "$list_file"; then
+  echo "migration-immutability: FAILED. Could not list migrations at '$BASE', so the check" >&2
+  echo "  could not run. That is not the same as 'no migration changed'." >&2
+  exit 1
+fi
+
+if [ ! -s "$list_file" ]; then
+  echo "migration-immutability: FAILED. '$BASE' carries NO migrations, which cannot be right" >&2
+  echo "  for this repository. Refusing to report clean on an empty comparison set." >&2
   exit 1
 fi
 
 violations=0
-while IFS= read -r file; do
+# NUL delimited, and read from a FILE rather than a pipe: a pipe would run the loop in a
+# subshell and `violations` would be discarded when it exited.
+while IFS= read -r -d '' file; do
   [ -n "$file" ] || continue
-  # Only files that EXIST in the base are frozen. A brand new migration is the normal case.
-  git cat-file -e "$BASE:$file" 2>/dev/null || continue
 
-  before=$(git show "$BASE:$file" | shasum -a 256 | cut -d' ' -f1)
-  if [ -f "$file" ]; then
-    after=$(shasum -a 256 "$file" | cut -d' ' -f1)
-  else
-    after="(deleted)"
+  if ! before=$(git show "$BASE:$file" | shasum -a 256 | cut -d' ' -f1); then
+    echo "migration-immutability: FAILED. Could not read '$file' at '$BASE'." >&2
+    exit 1
   fi
+  if [ -L "$file" ]; then
+    # A symlink where a regular file has to be. Whatever `include_str!` would compile, it is
+    # not this path's own bytes.
+    after="(not a regular file)"
+  elif [ -f "$file" ]; then
+    after=$(shasum -a 256 "$file" | cut -d' ' -f1)
+  elif [ -e "$file" ]; then
+    after="(not a regular file)"
+  else
+    after="(missing)"
+  fi
+
   # A mode-only change (chmod) leaves the bytes, and therefore the digest, untouched. It is
   # not what this gate is about, and reporting it would print two identical checksums under a
-  # heading that says the file changed.
+  # heading saying the file changed.
   [ "$before" = "$after" ] && continue
 
-  echo "migration-immutability: FROZEN MIGRATION MODIFIED: $file"
+  echo "migration-immutability: FROZEN MIGRATION CHANGED: $file"
   echo "    checksum in $BASE : $before"
   echo "    checksum here     : $after"
   violations=$((violations + 1))
-done <<< "$changed"
+done < "$list_file"
 
 if [ "$violations" -gt 0 ]; then
   cat >&2 <<'MSG'
