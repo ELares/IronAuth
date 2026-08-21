@@ -395,6 +395,7 @@ run "invariant lints" scripts/invariant-lints.sh
 run "query audit (no scoped-table SQL outside the repository module)" scripts/query-audit.sh
 run "scoped table registration (every forced-RLS table in the migrations is in the query audit list)" scripts/scoped-table-registration.sh
 run "audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)" scripts/audit-fk-claim-scan.sh
+run "migration immutability (a landed migration's bytes never change)" scripts/migration-immutability.sh
 run "test registration (every tests/*.rs file has a [[test]] entry; autotests are off)" scripts/test-registration.sh
 
 run "independently publishable crates" scripts/publishable-crates.sh

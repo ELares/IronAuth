@@ -603,6 +603,14 @@ jobs:
         run: scripts/scoped-table-registration.sh
       - name: audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)
         run: scripts/audit-fk-claim-scan.sh
+      # A landed migration's bytes are frozen, comments included: migrate.rs digests the whole
+      # file, so editing one makes every already-migrated database refuse to boot with
+      # ChecksumMismatch. No test catches it, because every suite runs against a FRESH database
+      # whose ledger is empty, so the drift comparison iterates zero times. This job checks out
+      # with fetch-depth: 0, which the check requires; it FAILS rather than skipping if the base
+      # ref cannot be resolved, since "could not run" is not "nothing changed".
+      - name: migration immutability (a landed migration's bytes never change)
+        run: scripts/migration-immutability.sh "origin/${{ github.base_ref || 'main' }}"
       - name: test registration (every tests/*.rs file has a [[test]] entry; autotests are off)
         run: scripts/test-registration.sh
       - name: idempotent write audit (no admin handler splits two store writes behind one Idempotency-Key)
