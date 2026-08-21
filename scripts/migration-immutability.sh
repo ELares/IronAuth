@@ -103,7 +103,23 @@ while IFS= read -r -d '' file; do
   # migration this branch ADDS is in the list too. That is the normal case and must pass:
   # a file the base does not carry is not frozen, it is new. Without this probe every PR
   # that adds a migration fails, which is most of them.
-  git cat-file -e "$BASE:$file" 2>/dev/null || continue
+  #
+  # The probe asks whether the base carries the PATH, not whether its blob is readable.
+  # `git cat-file -e` exits 128 for both "no such path" and "the object is unreadable", so
+  # skipping on its failure would report a corrupt object database as clean, which is the one
+  # thing every other failure path in this file refuses to do. `rev-parse --verify` answers
+  # from the tree and still succeeds when the blob itself is destroyed, so the two conditions
+  # separate cleanly: absent from the base means new, present but unreadable means the check
+  # could not run.
+  if ! git rev-parse --verify --quiet "$BASE:$file" >/dev/null 2>&1; then
+    continue
+  fi
+  if ! git cat-file -e "$BASE:$file" 2>/dev/null; then
+    echo "migration-immutability: FAILED. '$file' is present at '$BASE' but its object could" >&2
+    echo "  not be read, so the check could not run. That is not the same as 'no migration" >&2
+    echo "  changed'." >&2
+    exit 1
+  fi
 
   if ! before=$(git show "$BASE:$file" | shasum -a 256 | cut -d' ' -f1); then
     echo "migration-immutability: FAILED. Could not read '$file' at '$BASE'." >&2
