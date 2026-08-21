@@ -1639,3 +1639,91 @@ mod signed_stream_tests {
         );
     }
 }
+
+/// The payload key a replay command carries the stream in.
+const REPLAY_PAYLOAD_STREAM_ID: &str = "log_stream_id";
+
+/// How a failed replay is classified for the outbox.
+///
+/// RETRYABLE. A replay fails because the store faulted or the sink is down again, and both
+/// can succeed later, so dropping the operator's request on the first failure would be
+/// wrong. The outbox's own attempt budget is what bounds the retrying, and a dead letter is
+/// marked replayed only when the sink ACCEPTED it, so a retry cannot double-count a partial
+/// pass.
+///
+/// A named function rather than an inline expression so the classification can be asserted.
+/// Inverting it to `permanent` is a one-word edit that would dead-letter an operator's
+/// replay command the first time a sink blinked, and it survived every test in this crate
+/// while the choice lived inline.
+#[must_use]
+pub fn replay_failure_for_test() -> ironauth_store::outbox::ConsumerError {
+    replay_failure()
+}
+
+fn replay_failure() -> ironauth_store::outbox::ConsumerError {
+    ironauth_store::outbox::ConsumerError::retryable("replay_failed")
+}
+
+/// Executes the dead-letter replay commands the management API enqueues (issue #938).
+///
+/// A replay re-reads set-aside audit ranges and re-ships them to the stream's sink. That is
+/// network work of unbounded duration against a third party, so the endpoint that asks for
+/// it answers 202 and this performs it, exactly as the webhook replay is arranged and for
+/// the same reason.
+///
+/// It holds the SINKS as well as the store, which the webhook replay consumer does not need:
+/// a webhook replay only revives queue rows and lets the existing deliverer pick them up,
+/// while a log-stream replay does the delivering itself, because a log stream is a cursor
+/// pipeline with no queue rows to revive.
+pub struct LogStreamReplayConsumer {
+    store: Store,
+    sinks: Vec<Arc<dyn LogSink>>,
+}
+
+impl LogStreamReplayConsumer {
+    /// Build the consumer over a store and the sinks this deployment implements.
+    #[must_use]
+    pub fn new(store: Store, sinks: Vec<Arc<dyn LogSink>>) -> Self {
+        Self { store, sinks }
+    }
+
+    /// Execute ONE replay command.
+    async fn replay_one(
+        &self,
+        env: &Env,
+        scope: Scope,
+        message: &ironauth_store::OutboxMessage,
+    ) -> Result<(), ironauth_store::outbox::ConsumerError> {
+        let stream_id = message
+            .payload
+            .get(REPLAY_PAYLOAD_STREAM_ID)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ironauth_store::outbox::ConsumerError::permanent(format!(
+                    "payload_missing_{REPLAY_PAYLOAD_STREAM_ID}"
+                ))
+            })?;
+        let replayed = replay_dead_letters(&self.store, env, scope, stream_id, &self.sinks)
+            .await
+            .map_err(|_| replay_failure())?;
+        tracing::info!(stream_id, replayed, "replayed log stream dead letters");
+        Ok(())
+    }
+}
+
+impl ironauth_store::outbox::OutboxConsumer for LogStreamReplayConsumer {
+    fn name(&self) -> &str {
+        ironauth_store::LOG_STREAM_REPLAY_CONSUMER
+    }
+
+    fn handle<'a>(
+        &'a self,
+        env: &'a Env,
+        scope: Scope,
+        message: &'a ironauth_store::OutboxMessage,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<(), ironauth_store::outbox::ConsumerError>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.replay_one(env, scope, message).await })
+    }
+}

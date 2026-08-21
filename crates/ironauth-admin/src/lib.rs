@@ -1088,6 +1088,18 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}",
             axum::routing::delete(log_streams::delete_log_stream),
         )
+        // The dead-letter surface (issue #938). The shipper sets a batch aside after a
+        // bounded failure run and advances past it, which is what stops one poisoned batch
+        // blocking every later event; without these two an operator could see the COUNT of
+        // what was set aside and neither read it nor get it delivered.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters",
+            axum::routing::get(log_streams::list_log_stream_dead_letters),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters/replay",
+            post(log_streams::replay_log_stream_dead_letters),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints",
             post(webhook_endpoints::create_webhook_endpoint)

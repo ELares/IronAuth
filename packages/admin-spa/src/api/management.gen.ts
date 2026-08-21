@@ -1125,6 +1125,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List a stream's outstanding dead letters. */
+        get: operations["listLogStreamDeadLetters"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters/replay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Request a replay of a stream's outstanding dead letters. */
+        post: operations["replayLogStreamDeadLetters"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
         parameters: {
             query?: never;
@@ -4877,10 +4911,57 @@ export interface components {
             /** @description The `lgs_` identifier. */
             id: string;
         };
+        /** @description A stream's outstanding dead letters. */
+        LogStreamDeadLetterList: {
+            /** @description Oldest first, so an operator reads the gap in the order it happened. */
+            items: components["schemas"]["LogStreamDeadLetterView"][];
+            /**
+             * @description True when the stream has MORE outstanding dead letters than this page carries.
+             *
+             *     Present so a truncated read is distinguishable from a complete one. Without it an
+             *     operator who sees exactly the limit cannot tell whether they are looking at the
+             *     whole gap, which is the number they are trying to establish.
+             */
+            truncated: boolean;
+        };
+        /** @description One set-aside audit range, as an operator reads it. */
+        LogStreamDeadLetterView: {
+            /**
+             * Format: int32
+             * @description How many events the failed batch carried.
+             */
+            event_count: number;
+            /** @description The audit id at the start of the range. */
+            from_audit_id: string;
+            /**
+             * Format: int64
+             * @description The inclusive start of the undelivered range, in cursor order.
+             */
+            from_occurred_at_unix_ms: number;
+            /** @description The `lsd_` identifier. */
+            id: string;
+            /**
+             * @description The failure that ended the retry run. Operator-safe, never a sink's response body,
+             *     for the same reason `last_error` on the stream itself is not.
+             */
+            last_error: string;
+            /** @description The audit id at the end of the range. */
+            to_audit_id: string;
+            /**
+             * Format: int64
+             * @description The inclusive end of the undelivered range, in cursor order.
+             */
+            to_occurred_at_unix_ms: number;
+        };
         /** @description The environment's configured streams. */
         LogStreamList: {
             /** @description The streams, ordered by identifier. */
             items: components["schemas"]["LogStreamView"][];
+        };
+        /** @description The answer to a replay request. */
+        LogStreamReplayAccepted: {
+            /** @description The stream the replay was requested for. */
+            log_stream_id: string;
         };
         /** @description One configured stream, as an operator reads it. */
         LogStreamView: {
@@ -12918,6 +12999,135 @@ export interface operations {
             };
             /** @description The environment is absent or deleted */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listLogStreamDeadLetters: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The stream identifier (lgs_...) */
+                stream_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The outstanding dead letters, oldest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogStreamDeadLetterList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent, or the stream is in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    replayLogStreamDeadLetters: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The stream identifier (lgs_...) */
+                stream_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The replay was queued. A worker performs it; poll the dead-letter listing to watch it drain */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogStreamReplayAccepted"];
+                };
+            };
+            /** @description The Idempotency-Key header is absent */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted, or the stream is in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

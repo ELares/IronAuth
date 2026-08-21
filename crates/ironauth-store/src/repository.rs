@@ -20759,6 +20759,21 @@ pub const WEBHOOK_DELIVERY_CONSUMER: &str = "webhook.delivery";
 /// head of an ordering group must not block the deliveries it is about to revive.
 pub const WEBHOOK_REPLAY_CONSUMER: &str = "webhook.replay";
 
+/// The registered consumer name a log-stream dead-letter REPLAY command drains under
+/// (issue #938).
+///
+/// A replay re-reads a set-aside audit range and re-ships it to the stream's sink, which is
+/// network work of unbounded duration against a third party. That is exactly what the
+/// webhook replay concluded must not happen inside the request that asks for it, so this
+/// takes the same shape: the management endpoint enqueues a COMMAND here and answers 202,
+/// and a worker executes it.
+///
+/// Its own consumer rather than a message on the shipper's path, for the reason
+/// [`WEBHOOK_REPLAY_CONSUMER`] is separate: a replay that keeps failing must not consume
+/// anything else's retry budget, and a stuck replay at the head of an ordering group must
+/// not block the ordinary forward shipping it has nothing to do with.
+pub const LOG_STREAM_REPLAY_CONSUMER: &str = "log_stream.replay";
+
 /// The registered consumer name an ASYNC flow target delivery drains under (issue #112).
 ///
 /// Issue #112 says async targets "deliver through the webhook machinery, inheriting retries,
@@ -40371,6 +40386,33 @@ pub struct LogStreamRepo<'a> {
     scope: Scope,
 }
 
+/// Whether `stream_id` names a stream in `scope`, inside an already-scoped transaction.
+///
+/// Shared by the dead-letter listing and the replay request so the two cannot answer
+/// differently about the same id. A listing that returned an empty page where the replay
+/// returned a not-found would tell an operator two different things about one typo.
+///
+/// The `(tenant, environment)` predicate is defence in depth rather than the fence:
+/// `log_streams` carries FORCE row-level security and `begin_scoped` sets the session
+/// variables its policy reads, so a foreign row is already invisible here. Measured, and
+/// worth stating because the predicate reads like it is doing the work.
+async fn stream_exists_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    stream_id: &str,
+) -> Result<bool, StoreError> {
+    let found = sqlx::query(
+        "SELECT 1 FROM log_streams \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(stream_id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(found.is_some())
+}
+
 impl LogStreamRepo<'_> {
     /// Record a dead-lettered batch RANGE for `stream_id`, returning its id.
     ///
@@ -40423,8 +40465,14 @@ impl LogStreamRepo<'_> {
 
     /// Every dead letter for `stream_id` that has not been replayed, oldest first.
     ///
+    /// Answers [`StoreError::NotFound`] when the stream does not exist in this scope, rather
+    /// than an empty list. An operator who mistypes a stream id would otherwise read an
+    /// empty gap and be unable to tell it from a stream with nothing outstanding, which is
+    /// the same confusion `request_dead_letter_replay` refuses to create.
+    ///
     /// # Errors
     ///
+    /// [`StoreError::NotFound`] when no such stream exists in this scope;
     /// [`StoreError`] on a persistence fault.
     pub async fn outstanding_dead_letters(
         &self,
@@ -40432,6 +40480,9 @@ impl LogStreamRepo<'_> {
     ) -> Result<Vec<crate::log_stream::DeadLetter>, StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
+        if !stream_exists_in_tx(&mut tx, scope, stream_id).await? {
+            return Err(StoreError::NotFound);
+        }
         let rows = sqlx::query(
             "SELECT id, event_count, last_error, from_audit_id, to_audit_id, \
                     (EXTRACT(EPOCH FROM from_occurred_at) * 1000000)::bigint AS from_micros, \
@@ -40457,6 +40508,84 @@ impl LogStreamRepo<'_> {
                 last_error: row.get("last_error"),
             })
             .collect())
+    }
+
+    /// REQUEST a replay of this stream's outstanding dead letters (issue #938).
+    ///
+    /// Enqueues a command on [`LOG_STREAM_REPLAY_CONSUMER`] and returns; it does NOT replay
+    /// anything. A replay re-reads set-aside audit ranges and re-ships them to the stream's
+    /// sink, which is network work of unbounded duration against a third party, and the
+    /// webhook replay already established that such work must not happen inside the request
+    /// that asks for it. So the management endpoint answers 202 and a worker executes this.
+    ///
+    /// The idempotency record is written in the SAME transaction as the command, so a
+    /// crash between them cannot leave a client's retry enqueueing a SECOND replay of the
+    /// same ranges.
+    ///
+    /// Unlike the webhook replay this writes no audit row, because nothing in this module
+    /// does: log-stream writes are recorded through the domain-event stream instead. Making
+    /// this one call the exception would need an acting context `LogStreamRepo` does not
+    /// carry, and would leave the surface half-audited, which is worse than consistently
+    /// event-recorded. Stated rather than left as an omission a reader has to notice.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn request_dead_letter_replay(
+        &self,
+        env: &Env,
+        stream_id: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // The stream must EXIST IN THIS SCOPE before a command is queued for it.
+        //
+        // Without this the endpoint answers 202 for a stream that was deleted, never
+        // existed, or belongs to another tenant, and the worker later resolves nothing and
+        // returns `Ok(0)`. That is the worst shape available: indistinguishable from a
+        // successful replay of a stream with nothing outstanding, so an operator watching
+        // for their gap to close waits on a command that was never going to do anything.
+        //
+        // A stream in ANOTHER scope is a uniform not-found rather than an existence oracle
+        // over other tenants' configuration. The `(tenant, environment)` predicate below is
+        // NOT what delivers that, and saying so matters: measured, removing it changes
+        // nothing, because `log_streams` carries FORCE row-level security and
+        // `begin_scoped` sets the session variables its policy reads, so a foreign row is
+        // already invisible to this statement. The predicate is defence in depth and reads
+        // like every other scoped query here; RLS is the fence.
+        if !stream_exists_in_tx(&mut tx, scope, stream_id).await? {
+            return Err(StoreError::NotFound);
+        }
+        // The ORDERING KEY is the stream, so two replay commands for ONE stream execute in
+        // the order they were asked for. They share no ordering group with anything else,
+        // because a group is per (consumer, ordering key) and this is its own consumer.
+        //
+        // The IDEMPOTENCY KEY is deliberately unique per call, so outbox-level dedup never
+        // collapses two replays into one: a second replay after the first delivered is a
+        // legitimate request. Request-level idempotency is the endpoint's Idempotency-Key,
+        // which is a different mechanism at a different layer. An earlier version of this
+        // comment credited the idempotency key with the ordering property, which belongs to
+        // the field on the next line.
+        let key = format!("{stream_id}:{}", CorrelationId::generate(env));
+        enqueue_outbox_in_tx(
+            &mut tx,
+            env,
+            scope,
+            &NewOutboxMessage {
+                consumer: LOG_STREAM_REPLAY_CONSUMER,
+                idempotency_key: &key,
+                ordering_key: stream_id,
+                payload: serde_json::json!({ "log_stream_id": stream_id }),
+            },
+        )
+        .await?;
+        insert_idempotency(&mut tx, idempotency).await?;
+        // In the command's own transaction: a rolled-back request announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Mark `id` replayed.

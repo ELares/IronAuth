@@ -510,3 +510,215 @@ pub async fn delete_log_stream(
         .await?;
     Ok(no_content())
 }
+
+/// The most dead letters ONE listing returns.
+///
+/// A stream that has been failing for a long time can accumulate an unbounded number of
+/// them, and the store read is deliberately unbounded because the SHIPPER needs every one
+/// to replay. An operator listing is a different question, so it is bounded here and says
+/// when it truncated rather than silently showing a prefix.
+const DEAD_LETTER_LIMIT: usize = 200;
+
+/// One set-aside audit range, as an operator reads it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LogStreamDeadLetterView {
+    /// The `lsd_` identifier.
+    pub id: String,
+    /// How many events the failed batch carried.
+    pub event_count: i32,
+    /// The failure that ended the retry run. Operator-safe, never a sink's response body,
+    /// for the same reason `last_error` on the stream itself is not.
+    pub last_error: String,
+    /// The inclusive start of the undelivered range, in cursor order.
+    pub from_occurred_at_unix_ms: i64,
+    /// The audit id at the start of the range.
+    pub from_audit_id: String,
+    /// The inclusive end of the undelivered range, in cursor order.
+    pub to_occurred_at_unix_ms: i64,
+    /// The audit id at the end of the range.
+    pub to_audit_id: String,
+}
+
+/// A stream's outstanding dead letters.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LogStreamDeadLetterList {
+    /// Oldest first, so an operator reads the gap in the order it happened.
+    pub items: Vec<LogStreamDeadLetterView>,
+    /// True when the stream has MORE outstanding dead letters than this page carries.
+    ///
+    /// Present so a truncated read is distinguishable from a complete one. Without it an
+    /// operator who sees exactly the limit cannot tell whether they are looking at the
+    /// whole gap, which is the number they are trying to establish.
+    pub truncated: bool,
+}
+
+/// The answer to a replay request.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LogStreamReplayAccepted {
+    /// The stream the replay was requested for.
+    pub log_stream_id: String,
+}
+
+/// List a stream's outstanding dead letters.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters",
+    operation_id = "listLogStreamDeadLetters",
+    tag = "log-streams",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("stream_id" = String, Path, description = "The stream identifier (lgs_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The outstanding dead letters, oldest first", body = LogStreamDeadLetterList),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent, or the stream is in another scope", body = ErrorBody)
+    )
+)]
+pub async fn list_log_stream_dead_letters(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, stream_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    // No liveness fence on a READ, matching the stream listing beside it: a soft-deleted
+    // environment stays readable across this surface and only writes refuse it.
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`.
+    principal.require_permission(ManagementPermission::Read)?;
+    let mut dead = state
+        .store()
+        .scoped(scope)
+        .log_streams()
+        .outstanding_dead_letters(&stream_id)
+        .await?;
+    let truncated = dead.len() > DEAD_LETTER_LIMIT;
+    dead.truncate(DEAD_LETTER_LIMIT);
+    let view = LogStreamDeadLetterList {
+        items: dead
+            .into_iter()
+            .map(|entry| LogStreamDeadLetterView {
+                id: entry.id,
+                event_count: entry.event_count,
+                last_error: entry.last_error,
+                from_occurred_at_unix_ms: entry.from.0 / 1000,
+                from_audit_id: entry.from.1,
+                to_occurred_at_unix_ms: entry.to.0 / 1000,
+                to_audit_id: entry.to.1,
+            })
+            .collect(),
+        truncated,
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// Request a replay of a stream's outstanding dead letters.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters/replay",
+    operation_id = "replayLogStreamDeadLetters",
+    tag = "log-streams",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("stream_id" = String, Path, description = "The stream identifier (lgs_...)"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 202, description = "The replay was queued. A worker performs it; poll the dead-letter listing to watch it drain", body = LogStreamReplayAccepted),
+        (status = 400, description = "The Idempotency-Key header is absent", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the stream is in another scope", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn replay_log_stream_dead_letters(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, stream_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`, and
+    // sudo-fenced, matching the webhook replay. This causes outbound traffic carrying AUDIT
+    // events to a third-party SIEM, which is a larger act than reading configuration.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+    require_live_environment(&state, &scope).await?;
+
+    let key = idempotency::required_key(&headers)?;
+    // Fingerprinted over the path alone, because this command HAS no body: unlike the
+    // webhook replay there is no `since` bound that could make two requests under one key
+    // mean different things. The stream is in the path, so replays of different streams
+    // already fingerprint differently, which is the distinction this exists to make.
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &[]);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    // The response is knowable BEFORE the write, because this is a COMMAND rather than the
+    // replay itself. A count could only ever describe the instant the statement ran, and a
+    // retry of the same request would report zero because the first call already queued it.
+    let view = LogStreamReplayAccepted {
+        log_stream_id: stream_id.clone(),
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    let pending = log_stream_replay_event(&state, scope, &stream_id);
+    state
+        .store()
+        .scoped(scope)
+        .log_streams()
+        .request_dead_letter_replay(
+            state.env(),
+            &stream_id,
+            Some(ironauth_store::IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &key,
+                request_fingerprint: &fingerprint,
+                response_status: 202,
+                response_body: &body_string,
+            }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
+        .await?;
+    Ok(json(StatusCode::ACCEPTED, body_string))
+}
+
+/// The `log_stream.replay_requested` event for a replay command.
+fn log_stream_replay_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    stream_id: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!(
+        "evt_{}",
+        ironauth_store::CorrelationId::generate(state.env())
+    );
+    let payload = serde_json::json!({ "log_stream_id": stream_id });
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "log_stream.replay_requested",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: stream_id.to_owned(),
+        envelope,
+    })
+}

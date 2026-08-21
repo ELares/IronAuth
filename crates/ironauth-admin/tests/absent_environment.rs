@@ -273,6 +273,12 @@ fn log_stream_cases(base: &str) -> Vec<Case> {
             ),
         },
         Case {
+            label: "log_streams.replayLogStreamDeadLetters",
+            method: "POST",
+            path: format!("{base}/log-streams/lgs_absent/dead-letters/replay"),
+            body: None,
+        },
+        Case {
             label: "log_streams.deleteLogStream",
             method: "DELETE",
             path: format!("{base}/log-streams/lgs_absent"),

@@ -318,6 +318,10 @@ struct Fixture {
     /// A live personal access token handle, so the PAT cases address a real one (issue #99).
     pat: String,
     connector: String,
+    /// A live log stream, so the dead-letter cases address a real one. With `lgs_absent`
+    /// they answer the uniform not-found at a LIVE environment too, and driving them at a
+    /// soft-deleted one would measure nothing about the fence.
+    log_stream: String,
     webhook_endpoint: String,
     family: String,
     recovery_flow: String,
@@ -586,6 +590,24 @@ impl Fixture {
             "create webhook endpoint: {body}"
         );
         let webhook_endpoint = field(&body, "/id", "seed webhook endpoint");
+
+        // A live log stream, so the dead-letter cases address a real one. Without it they
+        // answer the uniform not-found at a LIVE environment as well, and the soft-deleted
+        // sweep says so by name rather than passing on a case that measures nothing.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/log-streams"),
+                "seed-log-stream",
+                &serde_json::json!({
+                    "source": "both",
+                    "sink_type": "http",
+                    "sink_config": {"endpoint": "https://sink.example/in"},
+                })
+                .to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed log stream: {body}");
+        let log_stream = field(&body, "/id", "seed log stream");
 
         let (status, _, body) = h
             .post(
@@ -1094,6 +1116,7 @@ impl Fixture {
             operator,
             client,
             connector,
+            log_stream,
             webhook_endpoint,
             family,
             recovery_flow,
@@ -1146,6 +1169,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         sa_api_key,
         pat,
         connector,
+        log_stream,
         webhook_endpoint,
         family,
         recovery_flow,
@@ -1252,6 +1276,16 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/log-streams"),
             &serde_json::json!({"source": "both", "sink_type": "http",
                                "sink_config": {"endpoint": "https://sink.example/in"}}),
+        ),
+        Case::empty(
+            "log_streams.listLogStreamDeadLetters",
+            "GET",
+            format!("{base}/log-streams/{log_stream}/dead-letters"),
+        ),
+        Case::empty(
+            "log_streams.replayLogStreamDeadLetters",
+            "POST",
+            format!("{base}/log-streams/{log_stream}/dead-letters/replay"),
         ),
         Case::empty(
             "log_streams.deleteLogStream",
@@ -2506,6 +2540,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         project_grant: "pgt_0".to_owned(),
         api_key: "akey_0".to_owned(),
         connector: "con_0".to_owned(),
+        log_stream: "lgs_0".to_owned(),
         webhook_endpoint: "whe_0".to_owned(),
         family: "rfm_0".to_owned(),
         recovery_flow: "rcf_0".to_owned(),

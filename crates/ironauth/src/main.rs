@@ -461,9 +461,14 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // named where they are decided: `outbox.reap_enabled` in `retention_sweeper_inputs`
         // and a missing control-plane DSN in `start_retention_sweeper`. BOUND rather than
         // detached, so the shutdown below can await it.
-        let log_shipper = match log_shipper_inputs {
-            Some(inputs) => start_log_shipper(inputs).await,
-            None => None,
+        // BOUND rather than detached, so the shutdown below can await both the shipper and
+        // the dead-letter replay pools it spawned.
+        let (log_shipper, log_stream_replay_pools) = match log_shipper_inputs {
+            Some(inputs) => match start_log_shipper(inputs).await {
+                Some((shipper, pools)) => (Some(shipper), pools),
+                None => (None, Vec::new()),
+            },
+            None => (None, Vec::new()),
         };
         let audit_retention_sweeper = match audit_retention_inputs {
             Some(inputs) => start_audit_retention_sweeper(inputs).await,
@@ -506,6 +511,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .chain(webhook_pools)
             .chain(trait_migration_pools)
             .chain(offboarding_pools)
+            .chain(log_stream_replay_pools)
         {
             pool.shutdown().await;
         }
@@ -3009,6 +3015,12 @@ struct LogShipperInputs {
     control_dsn: Option<String>,
     /// The environment seam (deterministic clock and entropy).
     env: Env,
+    /// The outbox settings the dead-letter REPLAY pool runs under (issue #938).
+    ///
+    /// The replay consumer lives on this path rather than with the webhook workers because
+    /// it needs the SINKS, and the sinks exist only here. A replay pool with no sink to
+    /// ship to would drain an operator's commands and deliver nothing.
+    outbox: OutboxConfig,
 }
 
 /// Capture the shipper's inputs, or `None` when shipping is switched off.
@@ -3021,6 +3033,7 @@ fn log_shipper_inputs(config: &Config, env: &Env) -> Option<LogShipperInputs> {
         data_dsn: Some(config.database.url.expose().to_owned()),
         control_dsn: select_control_dsn(config),
         env: env.clone(),
+        outbox: config.outbox.clone(),
     })
 }
 
@@ -3029,12 +3042,15 @@ fn log_shipper_inputs(config: &Config, env: &Env) -> Option<LogShipperInputs> {
 /// Every early return says WHAT is not running and WHY. A silent absence here means a
 /// configured export quietly stops advancing, and the operator's first symptom is a gap in
 /// their SIEM rather than an error anywhere.
-async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
+async fn start_log_shipper(
+    inputs: LogShipperInputs,
+) -> Option<(LogShipper, Vec<OutboxWorkerPool>)> {
     let LogShipperInputs {
         log_streams,
         data_dsn,
         control_dsn,
         env,
+        outbox,
     } = inputs;
 
     let (Some(data_dsn), Some(control_dsn)) = (data_dsn, control_dsn) else {
@@ -3070,6 +3086,52 @@ async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
         Arc::new(S3LogSink::new(fetcher, env.clone())),
     ];
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+
+    // The dead-letter REPLAY pool (issue #938), spawned beside the shipper because it needs
+    // the same sinks. The management endpoint enqueues a command and answers 202; this is
+    // what executes it. Without this pool an operator's replay request would sit in the
+    // outbox forever, which is a worse failure than the endpoint not existing: it looks
+    // accepted.
+    //
+    // A registration failure is logged and the SHIPPER still starts. Forward shipping and
+    // replaying set-aside batches are independent, and stopping the export because a replay
+    // worker could not start would turn a recovery feature into an outage.
+    let mut replay_consumers = ConsumerRegistry::new();
+    let replay_pools = match replay_consumers.register(Arc::new(
+        ironauth_admin::log_shipper::LogStreamReplayConsumer::new(
+            data_store.clone(),
+            sinks.clone(),
+        ),
+    ) as Arc<dyn OutboxConsumer>)
+    {
+        Ok(()) => {
+            let replay_observer = outbox_observer();
+            spawn_consumer_pools(
+                &replay_consumers,
+                &data_store,
+                &env,
+                &outbox,
+                &scopes,
+                &replay_observer,
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, "log stream dead-letter replay NOT running: duplicate consumer name");
+            Vec::new()
+        }
+    };
+    if replay_pools.is_empty() {
+        // Said out loud rather than logged as "started". The function's own contract is
+        // that every early return names WHAT is not running and WHY, and a "started" line
+        // over an empty pool set is the opposite of that.
+        tracing::error!("log stream dead-letter replay NOT running: no pool was spawned");
+    } else {
+        tracing::info!(
+            pools = replay_pools.len(),
+            "log stream dead-letter replay worker started"
+        );
+    }
+
     let observer: Arc<dyn LogShipperObserver> = Arc::new(MetricsShipperObserver);
     let shipper = LogShipper::spawn(
         data_store,
@@ -3083,7 +3145,33 @@ async fn start_log_shipper(inputs: LogShipperInputs) -> Option<LogShipper> {
         interval_secs = log_streams.interval_secs,
         "SIEM log stream shipping started"
     );
-    Some(shipper)
+    // The pools are RETURNED, not dropped here. `OutboxWorkerPool::drop` sets the stop flag
+    // and notifies waiters, so a pool bound to a local in this function is stopped the
+    // moment it returns and its workers halt before their first poll. Every other pool in
+    // this binary is returned to `main` and held for the process lifetime for exactly that
+    // reason, which is what "BOUND rather than detached" means at the webhook call site.
+    //
+    // Measured before this was fixed: the replay command the management endpoint enqueues
+    // was still non-terminal after 15 seconds, while the identical command under bound
+    // pools drained. The endpoint accepted, the worker existed, and nothing ran it, which
+    // is the exact failure this whole branch was written to remove.
+    //
+    // WHAT KEEPS IT FIXED, stated precisely, because the previous two attempts at this
+    // sentence were both wrong.
+    //
+    // NOT a test. `start_log_shipper` is a private `async fn` in the binary crate, so
+    // nothing drives it. The test in `log_shipper.rs` builds and holds its OWN pool, which
+    // proves the drain path and would stay green through a regression here.
+    //
+    // NOT the compiler AT THIS RETURN either, which is what the last version claimed.
+    // Measured: replacing this with `Some((shipper, Vec::new()))` and discarding
+    // `replay_pools` compiles clean. The move-checker only binds one step further out, in
+    // `serve`, where the returned Vec is consumed by the shutdown loop's `.chain(...)`:
+    // re-binding it to a local THERE is a use-after-move and does not compile.
+    //
+    // So this line is held by review and by that one structural fact at the call site, and
+    // a future edit that drops the pools on the floor right here would compile and ship.
+    Some((shipper, replay_pools))
 }
 
 /// What the audit retention sweeper (issue #109) needs, captured before `config` moves

@@ -812,3 +812,252 @@ async fn a_signing_stream_signs_its_batches_and_ships_the_position_it_signed() {
         "the signature must verify against the position the sink was handed, or a consumer          holding both cannot check anything"
     );
 }
+
+/// The REPLAY CONSUMER executes the command the management endpoint enqueues (issue #938).
+///
+/// `replay_dead_letters` is tested above by calling it directly. That proves the mechanism
+/// and says nothing about whether anything in production reaches it, which is exactly the
+/// gap issue #938 was filed for: the function was `pub`, correct, and its only callers were
+/// tests. This drives the consumer's own `handle`, so the command shape, the payload key
+/// and the wiring between them are what is measured.
+#[tokio::test]
+async fn the_replay_consumer_executes_a_queued_command() {
+    use ironauth_admin::log_shipper::{DEAD_LETTER_AFTER, LogStreamReplayConsumer};
+    use ironauth_store::outbox::OutboxConsumer;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = configure(&db, &env, scope, StreamSource::Both, SinkType::Http, None).await;
+    seed_admin(&db, &env, scope, 2, "poison").await;
+
+    // Drive a real dead letter rather than seeding one, so the consumer replays something
+    // the shipper actually set aside.
+    let dead_sink = RecordingSink::new(SinkType::Http, false);
+    let failing: Vec<Arc<dyn LogSink>> = vec![dead_sink.clone()];
+    for _ in 0..DEAD_LETTER_AFTER {
+        ship_once(db.store(), &env, scope, &failing)
+            .await
+            .expect("ship");
+    }
+    assert!(
+        !db.store()
+            .scoped(scope)
+            .log_streams()
+            .outstanding_dead_letters(&id)
+            .await
+            .expect("read")
+            .is_empty(),
+        "the fixture must leave a dead letter outstanding, or this test replays nothing"
+    );
+
+    // The command the management endpoint enqueues, executed through the consumer's own
+    // `handle` with a sink that now ACCEPTS.
+    let healthy = RecordingSink::new(SinkType::Http, true);
+    let consumer = LogStreamReplayConsumer::new(
+        db.store().clone(),
+        vec![healthy.clone() as Arc<dyn LogSink>],
+    );
+    let message = ironauth_store::OutboxMessage {
+        id: "obm_replay_probe".to_owned(),
+        consumer: ironauth_store::LOG_STREAM_REPLAY_CONSUMER.to_owned(),
+        idempotency_key: format!("{id}:probe"),
+        ordering_key: id.clone(),
+        payload: serde_json::json!({ "log_stream_id": id }),
+        sequence: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at_unix_micros: 0,
+        enqueued_at_unix_micros: 0,
+        lease_stamp_unix_micros: None,
+        completed_at_unix_micros: None,
+        dead_lettered_at_unix_micros: None,
+    };
+    consumer
+        .handle(&env, scope, &message)
+        .await
+        .expect("the consumer executes the command");
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .log_streams()
+            .outstanding_dead_letters(&id)
+            .await
+            .expect("read")
+            .is_empty(),
+        "the consumer must have replayed the outstanding dead letter"
+    );
+    assert!(
+        !healthy.events().is_empty(),
+        "and it must have reached the SINK, not merely cleared the row"
+    );
+}
+
+/// A command whose payload does not name a stream is PERMANENT, not retried forever.
+#[tokio::test]
+async fn a_replay_command_without_a_stream_id_is_permanent() {
+    use ironauth_admin::log_shipper::LogStreamReplayConsumer;
+    use ironauth_store::outbox::OutboxConsumer;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let consumer = LogStreamReplayConsumer::new(db.store().clone(), Vec::new());
+    let message = ironauth_store::OutboxMessage {
+        id: "obm_replay_malformed".to_owned(),
+        consumer: ironauth_store::LOG_STREAM_REPLAY_CONSUMER.to_owned(),
+        idempotency_key: "malformed".to_owned(),
+        ordering_key: "malformed".to_owned(),
+        payload: serde_json::json!({ "not_the_key": "x" }),
+        sequence: 1,
+        attempts: 0,
+        last_error: None,
+        next_attempt_at_unix_micros: 0,
+        enqueued_at_unix_micros: 0,
+        lease_stamp_unix_micros: None,
+        completed_at_unix_micros: None,
+        dead_lettered_at_unix_micros: None,
+    };
+    let error = consumer
+        .handle(&env, scope, &message)
+        .await
+        .expect_err("a malformed command must not report success");
+    // Asserted on the CLASSIFICATION, not on the Debug rendering. A `contains("permanent")`
+    // over the formatted error passes or fails for reasons that have nothing to do with
+    // whether the message will be retried.
+    assert!(
+        !error.is_retryable(),
+        "a payload that can never become valid must not consume a retry budget: {error:?}"
+    );
+    assert_eq!(
+        error.label(),
+        "payload_missing_log_stream_id",
+        "and the label an operator reads must name what was missing"
+    );
+}
+
+/// A REAL POOL drains the command a real producer enqueued.
+///
+/// Two defects this pins that nothing else does.
+///
+/// The consumer's registered `name()` must equal the discriminator the producer writes. A
+/// consumer whose name differs drains NOTHING, silently: the claim matches no rows, the
+/// pool reports healthy, and the only symptom is replays that never happen. Mutating
+/// `name()` to a near-miss string survived every other test in this crate, because they all
+/// call `handle` directly and never go through a claim.
+///
+/// And the pool has to be HELD. `OutboxWorkerPool::drop` sets the stop flag, so a pool bound
+/// to a temporary is stopped before its workers' first poll. That shipped in this branch's
+/// first version: the boot path spawned the pool into a local that was dropped when the
+/// function returned, so the endpoint accepted commands nothing executed. A test that calls
+/// `handle` directly cannot see either fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_pool_drains_a_command_the_producer_enqueued() {
+    use std::time::Duration;
+
+    use ironauth_admin::log_shipper::{DEAD_LETTER_AFTER, LogStreamReplayConsumer};
+    use ironauth_store::outbox::{
+        ConsumerRegistry, OutboxConsumer, OutboxWorker, OutboxWorkerPool, ScopeSource,
+        SilentObserver, StaticScopes, WorkerSettings,
+    };
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = configure(&db, &env, scope, StreamSource::Both, SinkType::Http, None).await;
+    seed_admin(&db, &env, scope, 2, "poison").await;
+
+    let dead_sink = RecordingSink::new(SinkType::Http, false);
+    let failing: Vec<Arc<dyn LogSink>> = vec![dead_sink.clone()];
+    for _ in 0..DEAD_LETTER_AFTER {
+        ship_once(db.store(), &env, scope, &failing)
+            .await
+            .expect("ship");
+    }
+
+    // THE PRODUCER: the same store call the management endpoint makes.
+    db.store()
+        .scoped(scope)
+        .log_streams()
+        .request_dead_letter_replay(&env, &id, None, None)
+        .await
+        .expect("enqueue a replay command");
+
+    let healthy = RecordingSink::new(SinkType::Http, true);
+    let consumer = LogStreamReplayConsumer::new(
+        db.store().clone(),
+        vec![healthy.clone() as Arc<dyn LogSink>],
+    );
+    let mut registry = ConsumerRegistry::new();
+    registry
+        .register(Arc::new(consumer) as Arc<dyn OutboxConsumer>)
+        .expect("register");
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        env.clone(),
+        registry
+            .get(ironauth_store::LOG_STREAM_REPLAY_CONSUMER)
+            .expect("the consumer is registered under the name the producer writes"),
+        WorkerSettings {
+            concurrency: 1,
+            visibility_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(20),
+            batch: 16,
+            retry: ironauth_store::RetryPolicy::default(),
+        },
+    );
+    let scopes: Arc<dyn ScopeSource> = Arc::new(StaticScopes::new(vec![scope]));
+    let observer: Arc<dyn ironauth_store::outbox::OutboxObserver> = Arc::new(SilentObserver);
+    // BOUND, deliberately: dropping this binding stops the workers.
+    let pool = OutboxWorkerPool::spawn(&worker, &scopes, &observer);
+
+    let mut drained = false;
+    for _ in 0..200 {
+        if db
+            .store()
+            .scoped(scope)
+            .log_streams()
+            .outstanding_dead_letters(&id)
+            .await
+            .expect("read")
+            .is_empty()
+        {
+            drained = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    pool.shutdown().await;
+
+    assert!(
+        drained,
+        "the replay command a producer enqueued must be drained by a held pool"
+    );
+    assert!(
+        !healthy.events().is_empty(),
+        "and the replay must have reached the sink"
+    );
+}
+
+/// A failed replay is RETRYABLE, not permanent.
+///
+/// Inverting it is a one-word edit that dead-letters an operator's replay command the first
+/// time a sink blinks, and it survived every test in this crate while the choice lived
+/// inline in the error path. Its sibling, `permanent` for a payload that can never become
+/// valid, is pinned by `a_replay_command_without_a_stream_id_is_permanent`; the two together
+/// are the whole classification.
+///
+/// This asserts the CHOICE rather than driving a store fault to reach it. Inducing a real
+/// fault here would mean breaking the database out from under a live consumer, which tests
+/// something else and leaves the classification just as unpinned if it were ever reached by
+/// a different path.
+#[test]
+fn a_failed_replay_is_retryable() {
+    let error = ironauth_admin::log_shipper::replay_failure_for_test();
+    assert!(
+        error.is_retryable(),
+        "a sink that is down again must not permanently dead-letter the request: {error:?}"
+    );
+    assert_eq!(error.label(), "replay_failed");
+}

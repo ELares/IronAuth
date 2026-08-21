@@ -49,6 +49,7 @@ crates/ironauth-admin/src/keys.rs:scope_from_path:0
 crates/ironauth-admin/src/locales.rs:resolve_scope:0
 crates/ironauth-admin/src/log_shipper.rs:observe:0
 crates/ironauth-admin/src/log_streams.rs:create_log_stream:0
+crates/ironauth-admin/src/log_streams.rs:replay_log_stream_dead_letters:0
 crates/ironauth-admin/src/memberships.rs:create_membership:1
 crates/ironauth-admin/src/migration_runs.rs:abandon_migration_run:1
 crates/ironauth-admin/src/migration_runs.rs:detail_view:0

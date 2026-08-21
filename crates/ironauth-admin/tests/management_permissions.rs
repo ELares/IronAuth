@@ -231,6 +231,14 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // registration uses: both name an outbound destination the server will send to.
     ("createLogStream", ManagementPermission::WriteConfig),
     ("deleteLogStream", ManagementPermission::WriteConfig),
+    // The dead-letter surface (issue #938). Reading what went undelivered is a status
+    // question; requesting a replay ships those audit events to a third-party sink, which
+    // is why it sits with the configuration writes rather than with the read.
+    ("listLogStreamDeadLetters", ManagementPermission::Read),
+    (
+        "replayLogStreamDeadLetters",
+        ManagementPermission::WriteConfig,
+    ),
     ("listWebhookEndpoints", ManagementPermission::Read),
     ("listWebhookDeliveryAttempts", ManagementPermission::Read),
     ("listWebhookDeadLetters", ManagementPermission::Read),
@@ -585,6 +593,15 @@ const PERMISSION_PROVEN: &[&str] = &[
     // Proven in the same test, which drives all three in both directions.
     "createLogStream",
     "deleteLogStream",
+    // Proven in `the_listing_is_fenced_and_its_bound_is_real` and
+    // `replaying_needs_more_than_reading` in `delegated_admin`. The listing is served under
+    // read and refused without it; the replay is refused for a credential holding read
+    // alone, AND the refusal is asserted to name `management.write_config`. That last
+    // assertion is what earns the entry: without it, substituting one write permission for
+    // another survived the whole crate, so the specific permission was unpinned and this
+    // list said otherwise.
+    "listLogStreamDeadLetters",
+    "replayLogStreamDeadLetters",
     // Proven in `the_authzen_endpoints_demand_read_and_never_answer_unauthenticated`, which
     // drives a credential holding a WRITE but not read and asserts each refusal names read.
     "getAuthzenConfiguration",
@@ -608,7 +625,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 166 operations declare a required permission and 22 have that permission proven. The other
+/// 168 operations declare a required permission and 24 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -637,12 +654,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        166,
+        168,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        22,
+        24,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
