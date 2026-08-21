@@ -203,6 +203,10 @@ pub struct Config {
     /// next consumer needing.
     pub webhooks: WebhooksConfig,
 
+    /// Outbound async flow-target delivery (issue #112).
+    #[serde(default)]
+    pub flow_targets: FlowTargetsConfig,
+
     /// Audit retention (issue #109): the per-stream windows, and whether THIS process
     /// sweeps to them.
     ///
@@ -587,6 +591,40 @@ impl Default for AuditRetentionConfig {
     }
 }
 
+/// Outbound ASYNC flow-target delivery settings (issue #112 criterion 2).
+///
+/// Its own section rather than a field on `[webhooks]`, for exactly the reason the webhook
+/// worker has its own switch rather than riding the OIDC logout switches: gating one
+/// subsystem's worker on another's setting makes a deployment that uses neither unable to run
+/// the one it does use. A deployment that registers flow targets and no webhook endpoints
+/// should not have to enable webhook delivery to get its targets called.
+///
+/// OFF by default, matching `[webhooks]` and the same covenant every background worker here
+/// is held to: no mandatory background infrastructure. The consequence is worth stating
+/// plainly, because it is a real edge: an operator who registers an async target through the
+/// management API and never opens this section gets NOTHING delivered. The queue is durable,
+/// so nothing is lost and enabling the worker drains the backlog, but the target is silent
+/// until then. That is the same trade `[webhooks]` already makes, and it is what lets the API
+/// tier register targets while a separate worker tier delivers them.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct FlowTargetsConfig {
+    /// Whether THIS process drains the `flow_target.delivery` queue and POSTs to registered
+    /// async targets. OFF by default.
+    pub delivery_enabled: bool,
+
+    /// The per-delivery HTTP budget, in seconds.
+    ///
+    /// Must be at least 1 and at most [`FLOW_TARGET_MAX_DELIVERY_TIMEOUT_SECS`], which is
+    /// checked whether or not `delivery_enabled` is set: a zero budget is meaningless even
+    /// while no worker is reading it.
+    ///
+    /// And, once delivery IS enabled, STRICTLY LESS than `outbox.visibility_timeout_secs`,
+    /// or a delivery still in flight when its lease expires is redelivered underneath itself
+    /// and the receiver sees the same signup twice under one `webhook-id`.
+    pub delivery_timeout_secs: u64,
+}
+
 /// Outbound webhook delivery settings (issue #105).
 ///
 /// These belong to the webhook CONSUMER, not to the queue: how the queue itself is
@@ -713,6 +751,16 @@ impl Default for TraitsConfig {
         Self {
             migration_worker_enabled: false,
             migration_batch_size: 500,
+        }
+    }
+}
+
+impl Default for FlowTargetsConfig {
+    fn default() -> Self {
+        Self {
+            delivery_enabled: false,
+            // Under the 30s outbox visibility timeout, so a delivery cannot outlive its lease.
+            delivery_timeout_secs: 10,
         }
     }
 }
@@ -5320,6 +5368,8 @@ impl Config {
         // report is never produced from a value that is independently out of range.
         validate_backchannel_logout_lease(&self.oidc, &self.outbox)?;
         validate_webhook_delivery_lease(&self.webhooks, &self.outbox)?;
+        validate_flow_targets(&self.flow_targets)?;
+        validate_flow_target_delivery_lease(&self.flow_targets, &self.outbox)?;
         Ok(())
     }
 }
@@ -7134,6 +7184,55 @@ fn validate_webhooks(webhooks: &WebhooksConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// The hard ceiling on `flow_targets.delivery_timeout_secs` (issue #112 criterion 2).
+///
+/// An ALIAS rather than an independent number, deliberately: two constants holding 300 for
+/// the same reason are two places for that reason to drift apart.
+///
+/// The number is the WEBHOOK budget ceiling, adopted so both outbound consumers answer to one
+/// bound. It is NOT derived from the visibility lease, which an earlier revision of this
+/// comment claimed: `outbox.visibility_timeout_secs` is bounded by `OIDC_MAX_LIFETIME_SECS`
+/// (86,400), far above 300. The practical consequence is worth knowing rather than hiding: an
+/// operator who raises the lease to 600 and wants a 400 second budget is refused a
+/// configuration the lease would have covered. That matches `[webhooks]`, and the lease rule
+/// below is the bound that actually tracks the queue.
+pub const FLOW_TARGET_MAX_DELIVERY_TIMEOUT_SECS: u64 = WEBHOOK_MAX_DELIVERY_TIMEOUT_SECS;
+
+/// Bound the ASYNC flow-target delivery budget (issue #112 criterion 2).
+///
+/// UNCONDITIONAL, unlike the lease rule below, and that difference is the point. The lease
+/// rule compares two sections and is only meaningful where a worker runs, so it is gated on
+/// the same switch the boot path spawns the pool under. These bounds are about whether the
+/// number means anything at all, and a zero budget is meaningless whether or not a worker is
+/// reading it today: `Duration::from_secs(0)` is a fetcher that times out before it connects,
+/// so every delivery would exhaust its attempts and dead-letter without one POST reaching a
+/// receiver. Refusing it at boot is how an operator learns that at deploy time rather than
+/// from an empty inbox and a filling dead-letter queue.
+///
+/// Found by running the webhook section's checklist against this one rather than by a report:
+/// [`validate_webhooks`] bounds its budget with no switch gate, and this section had only the
+/// gated half.
+fn validate_flow_targets(flow_targets: &FlowTargetsConfig) -> Result<(), ConfigError> {
+    if flow_targets.delivery_timeout_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "flow_targets.delivery_timeout_secs must be at least 1: a zero \
+                      budget times out before it connects, so every delivery dead-letters \
+                      without one POST reaching a receiver"
+                .to_owned(),
+        });
+    }
+    if flow_targets.delivery_timeout_secs > FLOW_TARGET_MAX_DELIVERY_TIMEOUT_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "flow_targets.delivery_timeout_secs ({}) must not exceed \
+                 {FLOW_TARGET_MAX_DELIVERY_TIMEOUT_SECS}",
+                flow_targets.delivery_timeout_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Refuse a webhook delivery budget that its outbox LEASE cannot cover (issue #105).
 ///
 /// The SAME cross-section defect [`validate_backchannel_logout_lease`] exists for, found
@@ -7167,6 +7266,32 @@ fn validate_webhook_delivery_lease(
                  outbox.visibility_timeout_secs ({}): a webhook POST allowed to outrun its \
                  visibility lease is re-claimed mid-flight and delivered twice",
                 webhooks.delivery_timeout_secs, outbox.visibility_timeout_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The same lease rule for ASYNC flow-target delivery (issue #112 criterion 2).
+///
+/// A separate function rather than a parameter on the webhook one, because the two switches
+/// are independent: a deployment can run flow-target delivery with webhook delivery off, and
+/// a check that returned early on the WEBHOOK switch would silently stop validating this one.
+fn validate_flow_target_delivery_lease(
+    flow_targets: &FlowTargetsConfig,
+    outbox: &OutboxConfig,
+) -> Result<(), ConfigError> {
+    if !flow_targets.delivery_enabled {
+        return Ok(());
+    }
+    if flow_targets.delivery_timeout_secs >= outbox.visibility_timeout_secs {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "flow_targets.delivery_timeout_secs ({}) must be less than \
+                 outbox.visibility_timeout_secs ({}): a delivery allowed to outrun its \
+                 visibility lease is re-claimed mid-flight and delivered twice, and the \
+                 receiver sees one signup twice under one webhook-id",
+                flow_targets.delivery_timeout_secs, outbox.visibility_timeout_secs
             ),
         });
     }
@@ -7533,6 +7658,52 @@ impl std::error::Error for ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zero flow-target delivery budget is refused whether or not the worker is enabled.
+    ///
+    /// The bound is UNCONDITIONAL by design, unlike the lease rule below it, and that split is
+    /// the thing worth pinning: a zero budget is meaningless even while no worker is reading
+    /// it, because `Duration::from_secs(0)` times out before it connects, so every delivery
+    /// would exhaust its attempts without one POST reaching a receiver.
+    #[test]
+    fn a_zero_flow_target_delivery_budget_is_refused_with_the_worker_off() {
+        let mut config = Config::default();
+        config.flow_targets.delivery_timeout_secs = 0;
+        // Deliberately OFF, so this pins the unconditional half rather than the lease rule.
+        config.flow_targets.delivery_enabled = false;
+        let refused = config.validate().expect_err("a zero budget is refused");
+        assert!(
+            format!("{refused:?}").contains("flow_targets.delivery_timeout_secs"),
+            "the refusal names the setting an operator must change: {refused:?}"
+        );
+    }
+
+    /// A budget that cannot fit inside the outbox visibility lease is refused, and ONLY when
+    /// the worker that would use it is enabled.
+    ///
+    /// Both directions matter. Enabled: a delivery allowed to outrun its lease is re-claimed
+    /// mid-flight and delivered twice, and the receiver sees one signup twice under one
+    /// `webhook-id`. Disabled: the two numbers are inert, and refusing a boot over an inert
+    /// pair would make a deployment that runs no delivery worker unbootable.
+    #[test]
+    fn the_flow_target_lease_rule_binds_only_while_delivery_is_enabled() {
+        let mut config = Config::default();
+        config.flow_targets.delivery_timeout_secs = config.outbox.visibility_timeout_secs;
+
+        config.flow_targets.delivery_enabled = false;
+        config
+            .validate()
+            .expect("an inert pair does not refuse a boot");
+
+        config.flow_targets.delivery_enabled = true;
+        let refused = config
+            .validate()
+            .expect_err("a budget equal to the lease is refused once the worker runs");
+        assert!(
+            format!("{refused:?}").contains("visibility_timeout_secs"),
+            "the refusal names the other half of the comparison: {refused:?}"
+        );
+    }
 
     // The signup-quarantine sensitive-scope denylist (issue #82, PR 2): the conservative
     // default strips offline access and admin/management scopes (exact or namespaced), while

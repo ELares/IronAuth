@@ -48,6 +48,14 @@ mod eval_ctx;
 mod federation;
 mod flow_target;
 
+/// The enabled ASYNC flow targets for a scope, reachable from the LEGACY signup door as well
+/// as this module's own (issue #112 criterion 2).
+///
+/// Re-exported rather than duplicated, because `flow_target` is private to `flow` and both
+/// signup doors need the same fail-open read. See [`flow_target::enabled_async_targets`] for
+/// why a failed read announces nothing instead of refusing the signup.
+pub(crate) use flow_target::enabled_async_targets;
+
 /// The ceiling on a sync HTTP flow target's configured timeout (issue #112).
 ///
 /// Re-exported because the BOOT path needs it: the flow-target `Fetcher` must be constructed

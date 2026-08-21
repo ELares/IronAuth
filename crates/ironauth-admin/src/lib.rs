@@ -79,6 +79,7 @@ pub mod log_shipper;
 pub mod log_stream_signature;
 
 pub mod ciba_ping;
+pub mod flow_target_delivery;
 mod flow_targets;
 mod log_streams;
 mod mds3_health;

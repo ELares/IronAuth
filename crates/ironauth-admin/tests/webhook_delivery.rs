@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use common::Harness;
 use ironauth_admin::webhook_delivery::{
-    DeliveryHeaders, DeliveryOutcome, WebhookDeliveryConsumer, WebhookReplayConsumer, WebhookSender,
+    DeliveryHeaders, DeliveryOutcome, SignaturePair, WebhookDeliveryConsumer,
+    WebhookReplayConsumer, WebhookSender,
 };
 use ironauth_env::Env;
 use ironauth_jose::webhooks::{WebhookSecret, verify_delivery};
@@ -37,6 +38,27 @@ struct Recorded {
     url: String,
     headers: DeliveryHeaders,
     body: String,
+}
+
+impl Recorded {
+    /// The delivery's id, which is present whether or not it is signed.
+    fn id(&self) -> &str {
+        &self.headers.id
+    }
+
+    /// The signature pair, which every WEBHOOK delivery has.
+    ///
+    /// It is an [`Option`] on the type because an HTTP flow target may legitimately be
+    /// unsigned (issue #112). A webhook endpoint always carries a secret, so an unsigned
+    /// delivery arriving HERE is the silent-downgrade defect, not a case to handle: this
+    /// expect is what makes the trait's "always Some from that consumer" claim a tested one
+    /// rather than a comment.
+    fn signed(&self) -> &SignaturePair {
+        self.headers
+            .signature
+            .as_ref()
+            .expect("a webhook delivery is always signed")
+    }
 }
 
 /// A sender that records instead of sending, and answers with a programmable outcome.
@@ -304,18 +326,19 @@ async fn a_queued_delivery_is_signed_under_the_secret_the_api_issued_at_registra
     // is what makes it IDENTICAL across a redelivery, which is the only reason a receiver
     // can deduplicate at-least-once delivery at all.
     assert_eq!(
-        delivery.headers.id, "evt_42",
+        delivery.id(),
+        "evt_42",
         "the receiver's dedupe key is the message's own idempotency key"
     );
 
     let held = WebhookSecret::parse(&secret).expect("the issued secret parses");
-    let now: i64 = delivery.headers.timestamp.parse().expect("unix seconds");
+    let now: i64 = delivery.signed().timestamp.parse().expect("unix seconds");
     verify_delivery(
         &[held],
-        &delivery.headers.id,
-        &delivery.headers.timestamp,
+        delivery.id(),
+        &delivery.signed().timestamp,
         delivery.body.as_bytes(),
-        &delivery.headers.signature,
+        &delivery.signed().signature,
         300,
         now,
     )
@@ -326,10 +349,10 @@ async fn a_queued_delivery_is_signed_under_the_secret_the_api_issued_at_registra
     let stranger = WebhookSecret::from_bytes(vec![7; 32]);
     verify_delivery(
         &[stranger],
-        &delivery.headers.id,
-        &delivery.headers.timestamp,
+        delivery.id(),
+        &delivery.signed().timestamp,
         delivery.body.as_bytes(),
-        &delivery.headers.signature,
+        &delivery.signed().signature,
         300,
         now,
     )
@@ -371,20 +394,20 @@ async fn a_delivery_during_a_rotation_window_verifies_under_either_secret() {
     let sent = sender.recorded();
     let delivery = &sent[0];
     assert_eq!(
-        delivery.headers.signature.split(' ').count(),
+        delivery.signed().signature.split(' ').count(),
         2,
         "one signature per live secret while the window is open: {}",
-        delivery.headers.signature
+        delivery.signed().signature
     );
-    let now: i64 = delivery.headers.timestamp.parse().expect("unix seconds");
+    let now: i64 = delivery.signed().timestamp.parse().expect("unix seconds");
     for (label, raw) in [("outgoing", &old_secret), ("incoming", &new_secret)] {
         let held = WebhookSecret::parse(raw).expect("parses");
         verify_delivery(
             &[held],
-            &delivery.headers.id,
-            &delivery.headers.timestamp,
+            delivery.id(),
+            &delivery.signed().timestamp,
             delivery.body.as_bytes(),
-            &delivery.headers.signature,
+            &delivery.signed().signature,
             300,
             now,
         )
@@ -503,13 +526,13 @@ async fn a_paused_endpoint_receives_nothing_and_resuming_restores_its_original_s
     let sent = resumed.recorded();
     assert_eq!(sent.len(), 1, "deliveries resume");
     let delivery = &sent[0];
-    let now: i64 = delivery.headers.timestamp.parse().expect("unix seconds");
+    let now: i64 = delivery.signed().timestamp.parse().expect("unix seconds");
     verify_delivery(
         &[WebhookSecret::parse(&secret).expect("parses")],
-        &delivery.headers.id,
-        &delivery.headers.timestamp,
+        delivery.id(),
+        &delivery.signed().timestamp,
         delivery.body.as_bytes(),
-        &delivery.headers.signature,
+        &delivery.signed().signature,
         300,
         now,
     )
@@ -632,16 +655,17 @@ async fn a_dead_letter_is_listed_replayed_across_planes_and_redelivered_under_it
     let sent = sender.recorded();
     assert_eq!(sent.len(), 1, "one replay, one POST");
     assert_eq!(
-        sent[0].headers.id, "evt_dead",
+        sent[0].id(),
+        "evt_dead",
         "the replay carries the ORIGINAL webhook-id, so consumer-side dedupe still works"
     );
-    let now: i64 = sent[0].headers.timestamp.parse().expect("unix seconds");
+    let now: i64 = sent[0].signed().timestamp.parse().expect("unix seconds");
     verify_delivery(
         &[WebhookSecret::parse(&secret).expect("parses")],
-        &sent[0].headers.id,
-        &sent[0].headers.timestamp,
+        sent[0].id(),
+        &sent[0].signed().timestamp,
         sent[0].body.as_bytes(),
-        &sent[0].headers.signature,
+        &sent[0].signed().signature,
         300,
         now,
     )
@@ -1365,13 +1389,13 @@ async fn deliver_and_verify(
         .expect("the delivery is made");
     let sent = sender.recorded();
     assert_eq!(sent.len(), 1, "one message, one POST");
-    let now: i64 = sent[0].headers.timestamp.parse().expect("unix seconds");
+    let now: i64 = sent[0].signed().timestamp.parse().expect("unix seconds");
     verify_delivery(
         &[WebhookSecret::parse(secret).expect("parses")],
-        &sent[0].headers.id,
-        &sent[0].headers.timestamp,
+        sent[0].id(),
+        &sent[0].signed().timestamp,
         sent[0].body.as_bytes(),
-        &sent[0].headers.signature,
+        &sent[0].signed().signature,
         300,
         now,
     )

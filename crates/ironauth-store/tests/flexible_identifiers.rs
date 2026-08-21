@@ -40,7 +40,7 @@ async fn register_user(db: &TestDatabase, env: &Env, scope: Scope, handle: &str)
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env))
         .users()
-        .register(env, handle, PASSWORD_HASH)
+        .register(env, handle, PASSWORD_HASH, None)
         .await
         .expect("register user")
 }

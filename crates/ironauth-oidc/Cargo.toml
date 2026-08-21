@@ -384,6 +384,15 @@ name = "registration_abuse"
 path = "tests/registration_abuse.rs"
 required-features = ["testing"]
 
+# A real signup over HTTP announces itself to a registered ASYNC flow target (issue #112
+# criterion 2). Every other test of that half proves ONE layer: the store enqueues when
+# handed deliveries, the consumer delivers when handed a message. This is the one that says
+# the front door is wired to them. Needs a real database.
+[[test]]
+name = "flow_target_async"
+path = "tests/flow_target_async.rs"
+required-features = ["testing"]
+
 # The self-service end-user account API (issue #61): a user lists and revokes their
 # OWN sessions, changes their OWN password, and enrolls/lists/removes their OWN
 # credentials, always bound to the authenticated subject (a cross-user id is the

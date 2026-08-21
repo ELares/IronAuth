@@ -2,8 +2,10 @@
 
 //! Every outbox pool in this binary reports through ONE observer constructor (issue #104).
 //!
-//! There are four separate boot seams that spawn pools: session ended and offboarding,
-//! back-channel logout, webhook delivery, and trait migration. Each one used to build its
+//! There are five separate boot seams that spawn pools matching the spelling this scans for:
+//! session ended and offboarding, back-channel logout, webhook delivery, trait migration, and
+//! async flow-target delivery. A sixth constructs the observer under a different binding name
+//! (the log-stream replay seam), which this exact-string scan cannot see and does not count. Each one used to build its
 //! own observer, and that is a wiring decision written four times.
 //!
 //! The failure mode this pins against is silent in a way that matters. A seam that keeps
@@ -15,15 +17,22 @@
 //! This is a TEXT SCAN, and its ceiling is worth stating plainly rather than discovering:
 //! it can only see `main.rs`. A fifth pool seam added in another module of this crate, or
 //! in another crate, is invisible to it, and so is an observer constructed through an alias.
-//! It pins the four seams that exist against the specific regression of one of them
-//! drifting back to a private observer, which is what actually happened four times over.
+//! It pins the seams that exist against the specific regression of one of them drifting back
+//! to a private observer, which is what actually happened four times over.
 
 /// The binary's boot module, read at COMPILE time so this test cannot be fooled by a
 /// working tree that differs from what was built.
 const MAIN_RS: &str = include_str!("../src/main.rs");
 
-/// The number of boot seams that spawn outbox worker pools.
-const POOL_SEAMS: usize = 4;
+/// The number of boot seams that spawn outbox worker pools AND construct the observer under
+/// the exact spelling scanned for below. Not the number of pool seams in the binary: one more
+/// binds it under a different name and is invisible here, which is the ceiling this file's
+/// header states.
+///
+/// MOVED 4 -> 5 for async flow-target delivery (issue #112 criterion 2), which is a new seam
+/// rather than a relaxation: the count moves WITH a seam being added, which is exactly what
+/// the assertion below says to do.
+const POOL_SEAMS: usize = 5;
 
 #[test]
 fn every_pool_seam_reports_through_the_shared_observer() {

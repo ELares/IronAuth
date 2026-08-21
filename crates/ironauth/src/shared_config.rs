@@ -764,6 +764,18 @@ mod tests {
              validates identities lives on AdminState and holds none of these knobs.",
         ),
         (
+            "flow_targets",
+            Reach::OnePlaneOrNoState,
+            "the async flow-target delivery consumer's own settings (issue #112 criterion \
+             2): whether this process drains the queue, and the per-delivery time budget. \
+             Read once at boot by flow_target_delivery_inputs, which builds the consumer and \
+             its sender and hands them to a worker pool. It reaches NEITHER plane state, for \
+             the same reason `outbox` and `webhooks` do not: a pool is not plane state. The \
+             HTTP surface that registers targets lives on AdminState and holds none of these \
+             knobs, and the SYNC dispatcher's own ceiling is a constant in ironauth-oidc \
+             rather than a config value, so there is no shared value here to install.",
+        ),
+        (
             "webhooks",
             Reach::OnePlaneOrNoState,
             "the outbound webhook delivery consumer's own settings (issue #105): whether \

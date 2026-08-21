@@ -30,6 +30,7 @@ async fn quarantine_signup(db: &TestDatabase, env: &Env, scope: Scope, identifie
             identifier,
             "$argon2id$dummy",
             SignupQuarantineReason::RiskOutput,
+            None,
         )
         .await
         .expect("register a quarantined signup")

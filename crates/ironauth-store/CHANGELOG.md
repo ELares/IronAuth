@@ -6,6 +6,44 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Async flow-target deliveries ride the signup's own transaction** (issue #112 criterion 2).
+  `register`, `register_in_state`, `register_quarantined` and their `_with_traits` variants
+  now take `Option<AsyncFlowDeliveries>`, which names the targets and nothing else:
+  `register_inner` composes the whole envelope from ids it already holds and enqueues one per
+  target inside the account's existing `write_audited` closure. No caller supplies payload
+  data, so no door can put something in it that the outbox cannot later delete. The outbox row
+  is invisible until commit, so a delivery is only ever attempted against a signup that
+  actually happened and a rolled-back one announces nothing to a third party.
+  `enqueue_async_delivery` takes a `Transaction`, which no type outside this crate can name,
+  so there is no way to schedule one from beside the write rather than inside it.
+- **The signup envelope carries the SUBJECT and nothing else about the person**, and that is
+  a retention decision rather than a minimal one. `outbox_messages.payload` is plaintext
+  `jsonb` and immutable once enqueued. A reaper exists (migration 0102 grants DELETE to
+  `ironauth_control`, superseding 0099's "no deletion path" sentence) but does not help: it
+  deletes by TIME WINDOW and SCOPE, never by subject, and `dead_letter_retention_secs` ships
+  at `0`, which for that knob means keep forever. So an identifier written there outlives an
+  erasure request, which deletes only the sealed copy in `users` -- sealed under a DEK by
+  migration 0027 for exactly that reason. The webhook path reached the same answer
+  independently: `user.created` carries `{user_id, state}` and no identifier. Receivers
+  needing more resolve it through the management API; rendering it at delivery time instead is
+  issue #954.
+- **The signup envelope names what the account BECAME**, as `state` and `quarantined` on the
+  body. This is a WIRE addition, so it is recorded here. Three doors reach the same enqueue
+  and produce materially different accounts: active, waitlisted (which cannot authenticate
+  until an admin approves it), and active-but-quarantined pending fraud review. Their
+  envelopes were otherwise byte-identical, so a receiver that provisions on signup would
+  provision for an account nobody has approved. Both fields are needed rather than one: a
+  quarantined signup is `active` AND quarantined, so `state` alone reads as an ordinary
+  signup. Stamped from `register_inner`'s own parameters rather than from the caller's data
+  closure, so every door gets it right and no future door can forget.
+- **`FlowTargetDelivery` distinguishes DELETED from DISABLED** for a queued delivery, which no
+  existing read did: `enabled_for_class` and `enabled_async_deliveries` filter both out and
+  `list` hides deleted rows. The distinction decides the message's fate and is expensive in
+  both directions. A deregistered target is gone and its secret with it, so the message
+  completes; retrying would burn the attempt budget against a row that will never return. A
+  disabled one is a switch an operator can flip back, so the message dead-letters and stays
+  replayable; completing it would drop a real signup notification with nothing behind it and
+  no record that it was dropped.
 - **Migration 0146's header overstates when a pre-persist flow target runs.**
   `0146_flow_targets.sql:40` says `pre_persist` "runs inside the write's transaction so a
   rejection leaves no row". MEASURED: nothing runs a flow target inside a write

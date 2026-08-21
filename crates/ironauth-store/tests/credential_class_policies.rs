@@ -28,6 +28,7 @@ async fn register_user(db: &TestDatabase, env: &Env, scope: Scope, handle: &str)
             env,
             handle,
             "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
+            None,
         )
         .await
         .expect("register user")

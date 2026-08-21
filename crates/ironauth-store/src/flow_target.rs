@@ -109,6 +109,26 @@ pub struct FlowTargetRecord {
     pub signing_secret_name: Option<String>,
 }
 
+/// What a queued ASYNC delivery finds when it looks its target up (issue #112 criterion 2).
+///
+/// Three answers, because a delivery enqueued minutes ago may find the world changed, and the
+/// three demand different handling. Collapsing any two is a real defect: retrying forever
+/// against a deleted row, or silently dropping a notification an operator only switched off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlowTargetDelivery {
+    /// Live and enabled: deliver to it.
+    Deliverable(Box<FlowTargetRecord>),
+    /// Registered but switched OFF. A delivery to it RETRIES, because a disable is a pause an
+    /// operator can undo, and retrying is what lets the backlog survive the undo. Dead-lettering
+    /// would preserve it only if something could revive a dead letter for this consumer, and
+    /// nothing can today.
+    Disabled,
+    /// Deregistered, or never existed in this scope. Nothing to deliver to, and the secret is
+    /// gone with it, so the message completes rather than retrying against a row that will
+    /// never come back.
+    Absent,
+}
+
 /// One registered target as the MANAGEMENT surface reads it (issue #112).
 ///
 /// Carries `enabled` where [`FlowTargetRecord`] does not, because the dispatcher's read
@@ -202,14 +222,25 @@ pub fn sign_payload(
     )
 }
 
-/// The id one consultation is signed under: `<target id>.<per-call nonce>`.
+/// The id one delivery is signed under: `<target id>.<discriminator>`.
 ///
-/// Per call because `webhook-id` is the receiver's deduplication handle; prefixed by the
-/// target so a payload signed for one target still cannot verify at another that happens to
-/// share a secret. See [`sign_payload`].
+/// Prefixed by the target so a payload signed for one target cannot verify at another that
+/// happens to share a secret. What the DISCRIMINATOR should be depends on which half is
+/// calling, and the two are opposites:
+///
+/// * a SYNC consultation passes a per-call nonce. Each consultation is its own event, and a
+///   constant id would make every one after the first look like a replay of the first, so a
+///   receiver following this repository's own guidance would drop it or echo a cached verdict
+///   and a fraud check would be bypassed with nobody attacking anything.
+/// * an ASYNC announcement passes the DOMAIN FACT it announces (the subject). One signup
+///   announced to one target is ONE event however many times it is retried or replayed, and
+///   `webhook-id` is what a receiver deduplicates on, so a minted nonce there would turn every
+///   retry into a new signup in the receiver's records.
+///
+/// Both are correct; neither is the default. See [`sign_payload`].
 #[must_use]
-pub fn delivery_id(target_id: &crate::id::FlowTargetId, nonce: &str) -> String {
-    format!("{target_id}.{nonce}")
+pub fn delivery_id(target_id: &crate::id::FlowTargetId, discriminator: &str) -> String {
+    format!("{target_id}.{discriminator}")
 }
 
 /// A field-level validation error from a SYNC target (issue #112 criterion 1).

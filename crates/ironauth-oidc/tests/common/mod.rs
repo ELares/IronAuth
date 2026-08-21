@@ -1764,7 +1764,7 @@ impl Harness {
             .scoped(self.scope)
             .acting(actor, corr)
             .users()
-            .register(&self.env, identifier, &hash)
+            .register(&self.env, identifier, &hash, None)
             .await
             .expect("register user")
             .to_string()
@@ -1787,7 +1787,7 @@ impl Harness {
             .scoped(self.scope)
             .acting(actor, corr)
             .users()
-            .register_in_state(&self.env, identifier, &hash, state)
+            .register_in_state(&self.env, identifier, &hash, state, None)
             .await
             .expect("register user in state")
             .to_string()
@@ -1803,7 +1803,7 @@ impl Harness {
             .scoped(self.scope)
             .acting(actor, corr)
             .users()
-            .register(&self.env, identifier, hash)
+            .register(&self.env, identifier, hash, None)
             .await
             .expect("register user with hash")
             .to_string()
@@ -1818,7 +1818,7 @@ impl Harness {
             .scoped(self.scope)
             .acting(actor, corr)
             .users()
-            .register(&self.env, identifier, "!")
+            .register(&self.env, identifier, "!", None)
             .await
             .expect("register passwordless user")
             .to_string()

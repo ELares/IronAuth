@@ -361,6 +361,20 @@ pub async fn register_post(
     // resumes the normal verification/login flow.
     let waitlisted = state.registration_abuse_config().waitlist.enabled;
 
+    // ASYNC flow targets (issue #112 criterion 2) on the LEGACY door too. PR B closed the
+    // sync bypass here for the same reason: this route creates accounts, is mounted
+    // unconditionally, and is the default landing point, so a target that fired only on the
+    // flow API would miss most signups in a default deployment.
+    //
+    // The same helper as the flow door, which is where the fail-open reasoning lives.
+    let async_targets = crate::flow::enabled_async_targets(&state, resume.scope).await;
+    // The envelope is composed entirely by the store, from ids it already holds. See the
+    // enqueue in `register_inner` for why an identifier must not be written into an outbox
+    // payload.
+    let deliveries = (!async_targets.is_empty()).then(|| ironauth_store::AsyncFlowDeliveries {
+        targets: &async_targets,
+    });
+
     // A fresh human actor for the self-registration audit; the audit target is the
     // new user id, so the created account is still identified.
     let actor = ActorRef::human(HumanId::generate(state.env()));
@@ -374,7 +388,7 @@ pub async fn register_post(
         // pending review-queue row, rather than parked unauthenticatable in the waitlist.
         scoped
             .users()
-            .register_quarantined(state.env(), identifier, &password_hash, reason)
+            .register_quarantined(state.env(), identifier, &password_hash, reason, deliveries)
             .await
     } else if waitlisted {
         scoped
@@ -384,12 +398,13 @@ pub async fn register_post(
                 identifier,
                 &password_hash,
                 ironauth_store::UserState::Waitlisted,
+                deliveries,
             )
             .await
     } else {
         scoped
             .users()
-            .register(state.env(), identifier, &password_hash)
+            .register(state.env(), identifier, &password_hash, deliveries)
             .await
     };
 

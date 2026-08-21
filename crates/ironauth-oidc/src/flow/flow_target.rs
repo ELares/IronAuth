@@ -151,6 +151,62 @@ fn cap_reason(message: Option<String>) -> Option<String> {
     Some(trimmed.chars().take(MAX_REASON_CHARS).collect())
 }
 
+/// The enabled ASYNC targets for `scope`, or an EMPTY list when the registry cannot be read
+/// (issue #112 criterion 2).
+///
+/// # Why the read is outside the write's transaction
+///
+/// Not because it could not be done inside one: [`enqueue_async_delivery`] already runs on
+/// the account's `tx`, so a `SELECT` on that same `tx` is available. It is because of the
+/// fail-open covenant below. In Postgres an error inside a transaction POISONS it, so a
+/// registry read that failed inside the write would take the signup down with it, which is
+/// exactly the trade this function refuses to make. Expressing "log it and announce nothing"
+/// needs the read outside the write, or a savepoint wrapped around it inside.
+///
+/// # Why a failure is empty rather than an error
+///
+/// A registry read that fails dispatches nothing and logs, rather than refusing the signup
+/// the way the sync path does. The asymmetry is deliberate: a sync target is something the
+/// flow WAITS for and whose verdict can reject, so an unavailable one is a decision the
+/// operator's failure policy owns. An async target is fire and forget, and refusing to create
+/// an account because a notification could not be scheduled is the wrong trade.
+///
+/// ONE function rather than a copy at each signup door, because two copies of a fail-open
+/// decision are two places for one of them to quietly become fail-closed.
+///
+/// # What this covenant does NOT cover
+///
+/// The READ fails open; the ENQUEUE does not. `register_inner` propagates an outbox insert
+/// failure out of the account's write closure, so a fault there rolls the signup back and the
+/// registration fails. That is deliberate -- an announcement committing while the thing it
+/// announces rolled back is the defect the whole transactional design exists to prevent -- but
+/// it means the blast radius of an outbox-table fault includes the registration path in any
+/// environment with at least one enabled async target. Stated because reading only the
+/// paragraph above would leave an operator believing flow targets can never affect signup
+/// availability, and that is not true.
+pub(crate) async fn enabled_async_targets(
+    state: &OidcState,
+    scope: Scope,
+) -> Vec<FlowTargetRecord> {
+    match state
+        .store()
+        .scoped(scope)
+        .flow_targets()
+        .enabled_async_deliveries()
+        .await
+    {
+        Ok(targets) => targets,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "the async flow-target registry could not be read; this signup will not be \
+                 announced to any async target"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Dispatch every enabled SYNC target of `timing` for the request class, in name order.
 ///
 /// Returns [`Decision::Allow`] when nothing objected, INCLUDING the common case where no

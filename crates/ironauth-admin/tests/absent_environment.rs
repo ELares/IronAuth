@@ -1997,6 +1997,7 @@ async fn the_signup_quarantine_queue_refuses_an_absent_environment_when_armed() 
             "risky@example.test",
             "$argon2id$dummy",
             SignupQuarantineReason::RiskOutput,
+            None,
         )
         .await
         .expect("seed a quarantined signup");

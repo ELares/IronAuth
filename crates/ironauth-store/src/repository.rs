@@ -16472,6 +16472,10 @@ impl ActingUserRepo<'_> {
         env: &Env,
         identifier: &str,
         password_hash: &str,
+        // The ASYNC flow-target deliveries this signup should announce (issue #112
+        // criterion 2), enqueued INSIDE the account's own transaction so a delivery is only
+        // ever attempted against committed state and a rolled-back signup announces nothing.
+        deliveries: Option<AsyncFlowDeliveries<'_>>,
     ) -> Result<UserId, StoreError> {
         // The registration surface (issue #20) records no standard claims; the
         // column defaults to the empty object, released as no claims by UserInfo.
@@ -16485,6 +16489,7 @@ impl ActingUserRepo<'_> {
             UserState::Active,
             None,
             None,
+            deliveries,
         )
         .await
     }
@@ -16508,6 +16513,10 @@ impl ActingUserRepo<'_> {
         identifier: &str,
         password_hash: &str,
         state: UserState,
+        // The ASYNC flow-target deliveries this signup should announce (issue #112
+        // criterion 2), enqueued INSIDE the account's own transaction so a delivery is only
+        // ever attempted against committed state and a rolled-back signup announces nothing.
+        deliveries: Option<AsyncFlowDeliveries<'_>>,
     ) -> Result<UserId, StoreError> {
         if !state.is_creatable() {
             return Err(StoreError::Conflict);
@@ -16522,6 +16531,7 @@ impl ActingUserRepo<'_> {
             state,
             None,
             None,
+            deliveries,
         )
         .await
     }
@@ -16547,6 +16557,10 @@ impl ActingUserRepo<'_> {
         identifier: &str,
         password_hash: &str,
         reason: SignupQuarantineReason,
+        // The ASYNC flow-target deliveries this signup should announce (issue #112
+        // criterion 2), enqueued INSIDE the account's own transaction so a delivery is only
+        // ever attempted against committed state and a rolled-back signup announces nothing.
+        deliveries: Option<AsyncFlowDeliveries<'_>>,
     ) -> Result<UserId, StoreError> {
         let open = SignupQuarantineOpen {
             id: SignupQuarantineId::generate(env, &self.scope),
@@ -16562,6 +16576,7 @@ impl ActingUserRepo<'_> {
             UserState::Active,
             Some(open),
             None,
+            deliveries,
         )
         .await
     }
@@ -16601,6 +16616,7 @@ impl ActingUserRepo<'_> {
             UserState::Active,
             None,
             None,
+            None,
         )
         .await
     }
@@ -16637,6 +16653,7 @@ impl ActingUserRepo<'_> {
             UserState::Active,
             None,
             None,
+            None,
         )
         .await
     }
@@ -16656,6 +16673,10 @@ impl ActingUserRepo<'_> {
         identifier: &str,
         password_hash: &str,
         traits: Option<RegisteredTraits<'_>>,
+        // The ASYNC flow-target deliveries this signup should announce (issue #112
+        // criterion 2), enqueued INSIDE the account's own transaction so a delivery is only
+        // ever attempted against committed state and a rolled-back signup announces nothing.
+        deliveries: Option<AsyncFlowDeliveries<'_>>,
     ) -> Result<UserId, StoreError> {
         self.register_inner(
             env,
@@ -16667,6 +16688,7 @@ impl ActingUserRepo<'_> {
             UserState::Active,
             None,
             traits,
+            deliveries,
         )
         .await
     }
@@ -16688,6 +16710,10 @@ impl ActingUserRepo<'_> {
         password_hash: &str,
         state: UserState,
         traits: Option<RegisteredTraits<'_>>,
+        // The ASYNC flow-target deliveries this signup should announce (issue #112
+        // criterion 2), enqueued INSIDE the account's own transaction so a delivery is only
+        // ever attempted against committed state and a rolled-back signup announces nothing.
+        deliveries: Option<AsyncFlowDeliveries<'_>>,
     ) -> Result<UserId, StoreError> {
         if !state.is_creatable() {
             return Err(StoreError::Conflict);
@@ -16702,6 +16728,7 @@ impl ActingUserRepo<'_> {
             state,
             None,
             traits,
+            deliveries,
         )
         .await
     }
@@ -16723,6 +16750,10 @@ impl ActingUserRepo<'_> {
         password_hash: &str,
         reason: SignupQuarantineReason,
         traits: Option<RegisteredTraits<'_>>,
+        // The ASYNC flow-target deliveries this signup should announce (issue #112
+        // criterion 2), enqueued INSIDE the account's own transaction so a delivery is only
+        // ever attempted against committed state and a rolled-back signup announces nothing.
+        deliveries: Option<AsyncFlowDeliveries<'_>>,
     ) -> Result<UserId, StoreError> {
         let open = SignupQuarantineOpen {
             id: SignupQuarantineId::generate(env, &self.scope),
@@ -16738,6 +16769,7 @@ impl ActingUserRepo<'_> {
             UserState::Active,
             Some(open),
             traits,
+            deliveries,
         )
         .await
     }
@@ -16797,6 +16829,10 @@ impl ActingUserRepo<'_> {
         // as the identifier and claims, exactly like `admin_create`, so the account and its
         // collected traits are created together or neither is.
         traits: Option<RegisteredTraits<'_>>,
+        // The ASYNC flow-target deliveries this signup should announce (issue #112
+        // criterion 2), enqueued INSIDE the account's own transaction so a delivery is only
+        // ever attempted against committed state and a rolled-back signup announces nothing.
+        deliveries: Option<AsyncFlowDeliveries<'_>>,
     ) -> Result<UserId, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         // The SELF-SERVICE class (issue #53), applied here and stated here rather than
@@ -16842,6 +16878,9 @@ impl ActingUserRepo<'_> {
         // The blind index is deterministic under the master key alone (no DEK), so
         // compute it up front; it is what a later `by_identifier` lookup queries.
         let bidx = user_identifier_blind_index(master, scope, identifier);
+        // Read BEFORE the write closure, which consumes `quarantine` to open the review
+        // case. The flow-target envelope needs only whether one was opened.
+        let quarantined = quarantine.is_some();
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -16951,6 +16990,97 @@ impl ActingUserRepo<'_> {
                     .bind(open.reason.as_str())
                     .execute(&mut **tx)
                     .await?;
+                }
+
+                // The ASYNC flow-target deliveries (issue #112 criterion 2), in the SAME
+                // transaction as the account INSERT and its audit row. The outbox row is
+                // invisible until commit, so a delivery is only ever attempted against a
+                // signup that actually happened, and a rolled-back one announces nothing to
+                // a third party. That is why this rides the write rather than sitting beside
+                // it, and it is also the only way to reach `enqueue_async_delivery` at all:
+                // it takes a `Transaction`, and no type outside this crate can name one.
+                //
+                // The payload is rendered from the LIVE id, for the reason every resolved
+                // builder here exists: the subject is not knowable before the insert.
+                if let Some(deliveries) = &deliveries {
+                    for target in deliveries.targets {
+                        // The envelope is composed PER TARGET, because `target_id`, the class
+                        // and whether the delivery is signed all differ per target. `signed`
+                        // records what was true at ENQUEUE, so the consumer can refuse to
+                        // deliver unsigned a target that was signed when the signup happened.
+                        //
+                        // `config` is deliberately NOT here. It is resolved at delivery from
+                        // the live record, like `endpoint` and the signing secret: freezing
+                        // it would mean editing a target's config left every queued delivery
+                        // carrying the old one, while editing its secret name took effect
+                        // immediately -- two adjacent fields with opposite behaviour. It also
+                        // kept unbounded operator JSON in one row per signup per target, and
+                        // the registration-time secret-shaped-key scan is documented as not
+                        // airtight, so a key it missed went from transient-in-flight to
+                        // durable-at-rest.
+                        // The data is the SUBJECT and nothing else about the person, and
+                        // that is a retention decision rather than a minimal one.
+                        //
+                        // `outbox_messages.payload` is plaintext `jsonb` and immutable once
+                        // enqueued. A reaper DOES exist: migration 0102 grants DELETE to
+                        // `ironauth_control` and supersedes 0099's "no deletion path"
+                        // sentence, which an earlier revision of this comment cited as
+                        // current state and was wrong to.
+                        //
+                        // It does not help here, for two reasons that both hold at the
+                        // shipped defaults. It deletes by TIME WINDOW and SCOPE, never by
+                        // subject, so nothing can find one person's rows. And
+                        // `dead_letter_retention_secs` ships at `0`, which for that knob
+                        // means KEEP FOREVER, deliberately: a dead letter is work that will
+                        // not happen unless replayed, and the row is the only record it
+                        // happened.
+                        //
+                        // So an identifier here would outlive an erasure request, which
+                        // deletes only the SEALED copy in `users` -- sealed under a DEK by
+                        // migration 0027 to keep it out of the clear in the first place.
+                        //
+                        // The webhook path reached the same answer independently:
+                        // `user.created` carries `{user_id, state}` and no identifier. A
+                        // receiver that needs more resolves it through the management API;
+                        // rendering it at DELIVERY time instead is issue #954.
+                        let payload = serde_json::json!({
+                            "target_id": target.id.to_string(),
+                            "signed": target.signing_secret_name.is_some(),
+                            "body": {
+                                "target_id": target.id.to_string(),
+                                "class": target_class_wire(target.target_class),
+                                "timing": "post_persist",
+                                "tenant_id": scope.tenant().to_string(),
+                                "environment_id": scope.environment().to_string(),
+                                // What this signup actually BECAME, stamped from the write's
+                                // own parameters rather than from the caller's data closure.
+                                //
+                                // Three materially different outcomes reach this line: an
+                                // active account that can log in, a WAITLISTED one that
+                                // cannot until an admin approves it, and an active one held
+                                // QUARANTINED pending review. Without these two fields their
+                                // envelopes are byte-identical, so a receiver that
+                                // provisions on signup provisions for an account nobody has
+                                // approved and cannot tell afterwards which it was.
+                                //
+                                // Stamped HERE and not by each caller for the reason the
+                                // self-service class above is: every door into this function
+                                // gets it right for free, and no future door can forget.
+                                "state": state.as_str(),
+                                "quarantined": quarantined,
+                                "data": { "subject": id.to_string() },
+                            },
+                        });
+                        // Keyed on the DOMAIN FACT rather than a fresh nonce: one signup
+                        // announced to one target is ONE delivery however many times it is
+                        // retried or replayed, and the receiver deduplicates on exactly this
+                        // value. A minted nonce would make every retry a new event.
+                        let key = crate::flow_target::delivery_id(&target.id, &id.to_string());
+                        ActingFlowTargetRepo::enqueue_async_delivery(
+                            tx, env, scope, target, &key, &payload,
+                        )
+                        .await?;
+                    }
                 }
                 Ok(())
             },
@@ -40273,8 +40403,25 @@ impl ActingFlowTargetRepo<'_> {
             scope,
             &NewOutboxMessage {
                 consumer: FLOW_TARGET_DELIVERY_CONSUMER,
-                // The TARGET is the ordering key, so deliveries to one target stay ordered and
-                // a target that is slow or failing cannot delay another's.
+                // The TARGET is the ordering key. What that buys UNCONDITIONALLY is that only
+                // the lowest-sequenced non-terminal message of a target's group is ever
+                // leased, so a slow or failing target cannot delay another target's
+                // deliveries, and the per-target dead-letter view narrows on exactly this
+                // column.
+                //
+                // It does NOT buy strict per-target ORDERING, and an earlier revision of this
+                // comment claimed it did. The substrate's contract is explicit that the
+                // stronger reading needs the producer to hold the aggregate's own row lock in
+                // the transaction it enqueues from; this producer locks `users`, not
+                // `flow_targets`, so two concurrent signups enqueue under one key from
+                // overlapping transactions.
+                //
+                // The cost of the group is head-of-line blocking WITHIN one target: a
+                // delivery that keeps failing occupies the head for its whole retry schedule
+                // while later announcements to that target wait behind it. That is the same
+                // trade the webhook path makes for the same reason, and it is why a target
+                // pointed at a wrong URL is an operator problem worth surfacing rather than a
+                // queue that quietly absorbs it.
                 ordering_key: &target.id.to_string(),
                 idempotency_key,
                 payload: payload.clone(),
@@ -40360,6 +40507,51 @@ pub struct FlowTargetRepo<'a> {
     scope: Scope,
 }
 
+/// Decode one `flow_targets` row.
+///
+/// Shared by every read of this table. Three reads now select the same columns, and a
+/// per-read copy of a closed vocabulary is three places for one rule to drift: a value one
+/// decoder knows and another does not would make a target visible to the management listing
+/// and invisible to the dispatcher, or the reverse.
+///
+/// A value no enum knows is a DECODE FAILURE, never a row to skip. Skipping would drop a
+/// configured integration with nothing in any log, which is the silent misconfiguration the
+/// closed vocabulary exists to prevent.
+fn decode_flow_target_row(
+    row: &sqlx::postgres::PgRow,
+    scope: &Scope,
+) -> Result<crate::flow_target::FlowTargetRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let class_text: String = row.get("target_class");
+    let invocation_text: String = row.get("invocation");
+    let timing_text: String = row.get("timing");
+    let policy_text: String = row.get("failure_policy");
+    Ok(crate::flow_target::FlowTargetRecord {
+        id: FlowTargetId::parse_in_scope(&id_text, scope)?,
+        name: row.get("name"),
+        target_class: parse_target_class(&class_text)?,
+        invocation: match invocation_text.as_str() {
+            "sync" => crate::flow_target::Invocation::Sync,
+            "async" => crate::flow_target::Invocation::Async,
+            other => return Err(decode_error("flow target invocation", other)),
+        },
+        timing: match timing_text.as_str() {
+            "pre_persist" => crate::flow_target::Timing::PrePersist,
+            "post_persist" => crate::flow_target::Timing::PostPersist,
+            other => return Err(decode_error("flow target timing", other)),
+        },
+        endpoint: row.get("endpoint"),
+        timeout_ms: row.get("timeout_ms"),
+        failure_policy: match policy_text.as_str() {
+            "fail_open" => crate::flow_target::FailurePolicy::FailOpen,
+            "fail_closed" => crate::flow_target::FailurePolicy::FailClosed,
+            other => return Err(decode_error("flow target failure policy", other)),
+        },
+        config: row.get("config"),
+        signing_secret_name: row.get("signing_secret_name"),
+    })
+}
+
 impl FlowTargetRepo<'_> {
     /// Every ENABLED target of one class in this scope, by name.
     ///
@@ -40396,41 +40588,113 @@ impl FlowTargetRepo<'_> {
         tx.commit().await?;
 
         rows.iter()
-            .map(|row| {
-                let id_text: String = row.get("id");
-                let class_text: String = row.get("target_class");
-                let invocation_text: String = row.get("invocation");
-                let timing_text: String = row.get("timing");
-                let policy_text: String = row.get("failure_policy");
-                Ok(crate::flow_target::FlowTargetRecord {
-                    id: FlowTargetId::parse_in_scope(&id_text, &self.scope)?,
-                    name: row.get("name"),
-                    // A value the enum does not know is a DECODE failure, never a row to skip.
-                    // Skipping would drop a configured integration with nothing in any log,
-                    // which is the silent misconfiguration the closed vocabulary prevents.
-                    target_class: parse_target_class(&class_text)?,
-                    invocation: match invocation_text.as_str() {
-                        "sync" => crate::flow_target::Invocation::Sync,
-                        "async" => crate::flow_target::Invocation::Async,
-                        other => return Err(decode_error("flow target invocation", other)),
-                    },
-                    timing: match timing_text.as_str() {
-                        "pre_persist" => crate::flow_target::Timing::PrePersist,
-                        "post_persist" => crate::flow_target::Timing::PostPersist,
-                        other => return Err(decode_error("flow target timing", other)),
-                    },
-                    endpoint: row.get("endpoint"),
-                    timeout_ms: row.get("timeout_ms"),
-                    failure_policy: match policy_text.as_str() {
-                        "fail_open" => crate::flow_target::FailurePolicy::FailOpen,
-                        "fail_closed" => crate::flow_target::FailurePolicy::FailClosed,
-                        other => return Err(decode_error("flow target failure policy", other)),
-                    },
-                    config: row.get("config"),
-                    signing_secret_name: row.get("signing_secret_name"),
-                })
-            })
+            .map(|row| decode_flow_target_row(row, &self.scope))
             .collect()
+    }
+
+    /// Every ENABLED ASYNC target in this scope, of every class, by name.
+    ///
+    /// Deliberately unfiltered by class. All four classes are registrable, and a class filter
+    /// here would make some registrable combination silently inert, which is the defect this
+    /// whole issue keeps producing. `Timing` is not filtered either: the migration's CHECK
+    /// already forces an async target to be post-persist, so filtering again here would be a
+    /// second copy of a rule that lives in the schema.
+    ///
+    /// Distinct from [`Self::enabled_for_class`] on the axis each filters: that one narrows by
+    /// CLASS and returns sync rows, this one narrows by INVOCATION and spans every class.
+    ///
+    /// An earlier revision of this sentence justified the split with two mechanisms that do
+    /// not exist -- that the migration forbids `timeout_ms` on an async row (its CHECK only
+    /// REQUIRES one on sync) and that the sync path would then reject it for having no bound
+    /// (`dispatch_sync` filters on `invocation` and never reaches a timeout check). The real
+    /// distinction is the one above and needs no mechanism.
+    ///
+    /// Spanning every class is a deliberate trade and not an oversight. A class filter would
+    /// make some registrable combination silently inert, which is the defect this issue keeps
+    /// producing; the cost is that a target registered under a class with no async producer of
+    /// its own still receives signup announcements, including `quarantined`. The operator owns
+    /// both ends of that connection, but the trade is real and is stated here rather than
+    /// hidden behind an invented rule.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, including a column carrying a value
+    /// outside its closed vocabulary.
+    pub async fn enabled_async_deliveries(
+        &self,
+    ) -> Result<Vec<crate::flow_target::FlowTargetRecord>, StoreError> {
+        let statement = sqlx::query(
+            "SELECT id, name, target_class, invocation, timing, endpoint, timeout_ms, \
+                    failure_policy, config, signing_secret_name \
+             FROM flow_targets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND invocation = 'async' \
+               AND deleted_at IS NULL AND enabled \
+             ORDER BY name",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string());
+
+        // Scoped, because `flow_targets` is FORCE RLS: an unscoped read returns an EMPTY set
+        // rather than an error, which here would present as "no async targets are registered"
+        // and silently deliver nothing.
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = statement.fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| decode_flow_target_row(row, &self.scope))
+            .collect()
+    }
+
+    /// One target by id, distinguishing DELETED from DISABLED (issue #112 criterion 2).
+    ///
+    /// The delivery consumer needs all three answers and no existing read gives them:
+    /// `enabled_for_class` and `enabled_async_deliveries` filter both states out, and `list`
+    /// hides deleted rows. The distinction decides what happens to a queued delivery, and
+    /// getting it wrong is expensive in both directions. A DELETED target is gone and its
+    /// secret with it, so the message completes and nothing is sent; treating that as a
+    /// failure would retry fourteen times against a row that will never return. A DISABLED
+    /// target is a switch an operator can flip back, so the message dead-letters and stays
+    /// replayable; completing it would drop a real signup notification with nothing behind it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, including a column carrying a value
+    /// outside its closed vocabulary.
+    pub async fn delivery_target(
+        &self,
+        id: &FlowTargetId,
+    ) -> Result<crate::flow_target::FlowTargetDelivery, StoreError> {
+        let statement = sqlx::query(
+            "SELECT id, name, target_class, invocation, timing, endpoint, timeout_ms, \
+                    failure_policy, config, signing_secret_name, enabled, \
+                    (deleted_at IS NULL) AS live \
+             FROM flow_targets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string());
+
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = statement.fetch_optional(&mut *tx).await?;
+        tx.commit().await?;
+
+        let Some(row) = row else {
+            return Ok(crate::flow_target::FlowTargetDelivery::Absent);
+        };
+        // A soft delete keeps the row, so "absent" means absent OR tombstoned. Both are the
+        // same answer to the consumer: there is nothing to deliver to. Tested in SQL, as every
+        // other read of this column in this module does, rather than decoding a timestamp
+        // nothing then looks at.
+        if !row.get::<bool, _>("live") {
+            return Ok(crate::flow_target::FlowTargetDelivery::Absent);
+        }
+        if !row.get::<bool, _>("enabled") {
+            return Ok(crate::flow_target::FlowTargetDelivery::Disabled);
+        }
+        Ok(crate::flow_target::FlowTargetDelivery::Deliverable(
+            Box::new(decode_flow_target_row(&row, &self.scope)?),
+        ))
     }
 
     /// Open a target's per-target signing secret, or [`None`] when it has no secret name.
@@ -40503,44 +40767,9 @@ impl FlowTargetRepo<'_> {
 
         rows.iter()
             .map(|row| {
-                let id_text: String = row.get("id");
-                let class_text: String = row.get("target_class");
-                let invocation_text: String = row.get("invocation");
-                let timing_text: String = row.get("timing");
-                let policy_text: String = row.get("failure_policy");
                 Ok(crate::flow_target::FlowTargetListing {
                     enabled: row.get("enabled"),
-                    record: crate::flow_target::FlowTargetRecord {
-                        id: crate::id::FlowTargetId::parse_in_scope(&id_text, &self.scope)
-                            .map_err(|_| decode_error("flow target id", &id_text))?,
-                        name: row.get("name"),
-                        target_class: match class_text.as_str() {
-                            "request" => crate::flow_target::TargetClass::Request,
-                            "response" => crate::flow_target::TargetClass::Response,
-                            "function" => crate::flow_target::TargetClass::Function,
-                            "event" => crate::flow_target::TargetClass::Event,
-                            other => return Err(decode_error("flow target class", other)),
-                        },
-                        invocation: match invocation_text.as_str() {
-                            "sync" => crate::flow_target::Invocation::Sync,
-                            "async" => crate::flow_target::Invocation::Async,
-                            other => return Err(decode_error("flow target invocation", other)),
-                        },
-                        timing: match timing_text.as_str() {
-                            "pre_persist" => crate::flow_target::Timing::PrePersist,
-                            "post_persist" => crate::flow_target::Timing::PostPersist,
-                            other => return Err(decode_error("flow target timing", other)),
-                        },
-                        endpoint: row.get("endpoint"),
-                        timeout_ms: row.get("timeout_ms"),
-                        failure_policy: match policy_text.as_str() {
-                            "fail_open" => crate::flow_target::FailurePolicy::FailOpen,
-                            "fail_closed" => crate::flow_target::FailurePolicy::FailClosed,
-                            other => return Err(decode_error("flow target failure policy", other)),
-                        },
-                        config: row.get("config"),
-                        signing_secret_name: row.get("signing_secret_name"),
-                    },
+                    record: decode_flow_target_row(row, &self.scope)?,
                 })
             })
             .collect()
@@ -59702,6 +59931,20 @@ impl OwnedDomainEvent {
 /// A named alias because the bare type is unreadable and clippy refuses it. See
 /// [`OwnedDomainEvent`] for why the event cannot simply be passed in already built.
 pub type ResolvedEventBuilder<'a, R> = &'a (dyn Fn(&R) -> Option<OwnedDomainEvent> + Sync);
+
+/// The ASYNC flow-target deliveries a signup should enqueue (issue #112 criterion 2).
+///
+/// Carried into the registration write rather than enqueued beside it, because
+/// [`ActingFlowTargetRepo::enqueue_async_delivery`] takes a `Transaction` and the flow layer
+/// has none: `Store::pool` is `pub(crate)` and no type outside this crate can name a
+/// `Transaction`. Riding the account INSERT's own transaction is also the CORRECT answer
+/// rather than merely the available one: the outbox row is invisible until commit, so a
+/// delivery is only ever attempted against committed state, and a rolled-back signup can no
+/// longer announce itself to a third party.
+pub struct AsyncFlowDeliveries<'a> {
+    /// The enabled async targets for this scope.
+    pub targets: &'a [crate::flow_target::FlowTargetRecord],
+}
 
 /// The scheduled-offboarding half of a user state change (issue #52).
 ///

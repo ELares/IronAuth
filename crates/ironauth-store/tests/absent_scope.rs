@@ -291,7 +291,12 @@ async fn a_genuine_database_fault_is_still_a_database_fault() {
         .acting(db.test_actor(&env), CorrelationId::generate(&env));
     acting
         .users()
-        .register(&env, "duplicate@example.test", "argon2-placeholder-hash")
+        .register(
+            &env,
+            "duplicate@example.test",
+            "argon2-placeholder-hash",
+            None,
+        )
         .await
         .expect("the first registration succeeds");
     let duplicate = db
@@ -299,7 +304,12 @@ async fn a_genuine_database_fault_is_still_a_database_fault() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .users()
-        .register(&env, "duplicate@example.test", "argon2-placeholder-hash")
+        .register(
+            &env,
+            "duplicate@example.test",
+            "argon2-placeholder-hash",
+            None,
+        )
         .await;
     assert!(
         matches!(duplicate, Err(StoreError::Conflict)),

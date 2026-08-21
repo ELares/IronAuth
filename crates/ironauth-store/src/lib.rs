@@ -335,12 +335,12 @@ pub use repository::{
     opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use repository::{
-    ActingWebhookEndpointRepo, DeliveryAttemptRecord, DeliveryTargetLookup, DomainEvent,
-    LOG_STREAM_REPLAY_CONSUMER, NewDeliveryAttempt, NewWebhookEndpoint, OFFBOARDING_CONSUMER,
-    OUTBOX_MAX_BACKOFF_SECS, OffboardingSchedule, OwnedDomainEvent, TRAIT_MIGRATION_CONSUMER,
-    TraitMigrationStart, WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_EVENT_CONSUMER,
-    WEBHOOK_REPLAY_CONSUMER, WebhookDeliveryAttemptRepo, WebhookDeliveryTarget,
-    WebhookEndpointRecord, WebhookEndpointRepo,
+    ActingWebhookEndpointRepo, AsyncFlowDeliveries, DeliveryAttemptRecord, DeliveryTargetLookup,
+    DomainEvent, LOG_STREAM_REPLAY_CONSUMER, NewDeliveryAttempt, NewWebhookEndpoint,
+    OFFBOARDING_CONSUMER, OUTBOX_MAX_BACKOFF_SECS, OffboardingSchedule, OwnedDomainEvent,
+    TRAIT_MIGRATION_CONSUMER, TraitMigrationStart, WEBHOOK_DELIVERY_CONSUMER,
+    WEBHOOK_EVENT_CONSUMER, WEBHOOK_REPLAY_CONSUMER, WebhookDeliveryAttemptRepo,
+    WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,
 };
 pub use repository::{
     AuditChainRepo, ChainEntry, ChainFault, ChainVerified, ChainedAuditRow, CursorOrigin,

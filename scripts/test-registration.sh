@@ -65,7 +65,12 @@ the failure mode this script exists to catch and which its own first version had
 one tolerated trailing comment took the walk from 8 crates and 214 entries to 7
 and 150, and it still printed clean."""
 MINIMUM_CRATES = 8
-MINIMUM_ENTRIES = 228
+# Raised to the ACTUAL count while adding two entries (issue #112 PR D-1). It stood at 228
+# against a walk that finds 288, so 60 test binaries could have stopped being examined and
+# this check would still have printed clean -- which is precisely the silent shrink it exists
+# to make impossible, sitting in the guard itself. A floor is only a floor when it is snug
+# against the number it guards.
+MINIMUM_ENTRIES = 288
 
 
 def autotests_off_narrow(text):

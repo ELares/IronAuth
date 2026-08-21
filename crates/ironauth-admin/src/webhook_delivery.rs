@@ -62,6 +62,15 @@ pub trait WebhookSender: Send + Sync {
     /// because the attempt history (#106) records the status code on a success as well as
     /// on a failure. A boolean outcome would have left "it returned 204" and "it returned
     /// 200" indistinguishable in the record an operator debugs from.
+    ///
+    /// `headers` is NOT optional. Every delivery carries `webhook-id`; what varies is whether
+    /// [`DeliveryHeaders::signature`] is present. Optionality lives one level down for a
+    /// reason measured here: making the whole set optional dropped the dedup handle along with
+    /// the signature, and an unsigned receiver then could not tell a redelivery from a second
+    /// event on an at-least-once queue.
+    ///
+    /// One sender rather than two, so the header-encoding refusal below stays in ONE place: a
+    /// second outbound path is a second chance to send a delivery the receiver cannot verify.
     fn deliver(
         &self,
         url: &str,
@@ -112,7 +121,29 @@ impl DeliveryOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryHeaders {
     /// `webhook-id`: stable across every retry of the same delivery.
+    ///
+    /// ALWAYS sent, signed or not. This is the delivery's IDENTITY, not part of its
+    /// signature: it is the handle a receiver deduplicates an at-least-once queue on, and a
+    /// delivery without one cannot be deduplicated at all. An earlier revision made the whole
+    /// header set optional so an unsigned flow target could be delivered, which dropped this
+    /// with the other two and left an unsigned receiver unable to tell a redelivery from a
+    /// second event.
     pub id: String,
+    /// The signature pair, or [`None`] for a deliberately UNSIGNED delivery.
+    ///
+    /// A webhook endpoint always has a secret, so this is always `Some` from that consumer;
+    /// an HTTP flow target may legitimately have none (issue #112) and the store permits it.
+    pub signature: Option<SignaturePair>,
+}
+
+/// The two headers that carry a signature, present together or not at all.
+///
+/// One type rather than two `Option`s, because a timestamp without a signature and a signature
+/// without a timestamp are both unverifiable: `verify_delivery` needs the pair to reconstruct
+/// what was signed, so a shape that can express one without the other can express a delivery
+/// no receiver can check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignaturePair {
     /// `webhook-timestamp`: Unix seconds, as a decimal string.
     pub timestamp: String,
     /// `webhook-signature`: the space-delimited `v1,<base64>` list.
@@ -122,13 +153,27 @@ pub struct DeliveryHeaders {
 /// The production sender: a POST through the SSRF-hardened outbound fetcher.
 pub struct FetchWebhookSender {
     fetcher: Arc<ironauth_fetch::Fetcher>,
+    /// Which outbound purpose the metric series is attributed to. A webhook delivery and a
+    /// flow-target delivery are different destinations with different operators behind them,
+    /// and one series covering both would make neither debuggable.
+    purpose: ironauth_fetch::FetchPurpose,
 }
 
 impl FetchWebhookSender {
     /// Wrap a shared hardened fetcher.
     #[must_use]
     pub fn new(fetcher: Arc<ironauth_fetch::Fetcher>) -> Self {
-        Self { fetcher }
+        Self {
+            fetcher,
+            purpose: ironauth_fetch::FetchPurpose::WebhookDelivery,
+        }
+    }
+
+    /// The same sender, attributing its calls to a different outbound purpose.
+    #[must_use]
+    pub fn for_purpose(mut self, purpose: ironauth_fetch::FetchPurpose) -> Self {
+        self.purpose = purpose;
+        self
     }
 
     /// Build a production sender whose per-delivery time budget is `total_timeout`, so a
@@ -155,25 +200,25 @@ impl WebhookSender for FetchWebhookSender {
         body: &str,
     ) -> impl Future<Output = DeliveryOutcome> + Send {
         let fetcher = Arc::clone(&self.fetcher);
+        let purpose = self.purpose;
         let url = url.to_owned();
         let body = body.to_owned();
         let headers = headers.clone();
         async move {
-            let mut request = ironauth_fetch::FetchRequest::new(
-                ironauth_fetch::FetchPurpose::WebhookDelivery,
-                http::Method::POST,
-                url,
-            )
-            .header(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/json"),
-            )
-            .body(body);
-            for (name, value) in [
-                (HEADER_ID, headers.id.as_str()),
-                (HEADER_TIMESTAMP, headers.timestamp.as_str()),
-                (HEADER_SIGNATURE, headers.signature.as_str()),
-            ] {
+            let mut request = ironauth_fetch::FetchRequest::new(purpose, http::Method::POST, url)
+                .header(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/json"),
+                )
+                .body(body);
+            // The id first and unconditionally; the signature pair only when the delivery is
+            // signed.
+            let mut emit = vec![(HEADER_ID, headers.id.as_str())];
+            if let Some(signed) = headers.signature.as_ref() {
+                emit.push((HEADER_TIMESTAMP, signed.timestamp.as_str()));
+                emit.push((HEADER_SIGNATURE, signed.signature.as_str()));
+            }
+            for (name, value) in emit {
                 // A header value that will not encode means the delivery cannot be made
                 // correctly, and sending it WITHOUT the header would present an unsigned
                 // POST to the receiver. Refusing is the only safe answer.
@@ -360,13 +405,16 @@ impl<S: WebhookSender> WebhookDeliveryConsumer<S> {
             // therefore IDENTICAL on every retry of this message. That is exactly what
             // `webhook-id` has to be for a receiver to deduplicate at-least-once delivery.
             id: message.idempotency_key.clone(),
-            timestamp: now_secs.to_string(),
-            signature: sign_delivery(
-                &secrets,
-                &message.idempotency_key,
-                now_secs,
-                body.as_bytes(),
-            ),
+            // Always `Some` here: a webhook endpoint always carries a secret.
+            signature: Some(SignaturePair {
+                timestamp: now_secs.to_string(),
+                signature: sign_delivery(
+                    &secrets,
+                    &message.idempotency_key,
+                    now_secs,
+                    body.as_bytes(),
+                ),
+            }),
         };
 
         // Latency is measured across the send through the CLOCK SEAM rather than a

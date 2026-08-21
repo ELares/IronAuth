@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use ironauth_admin::events::WebhookFanoutConsumer;
+use ironauth_admin::flow_target_delivery::FlowTargetDeliveryConsumer;
 use ironauth_admin::offboarding_worker::OffboardingConsumer;
 use ironauth_admin::trait_migration_worker::TraitMigrationConsumer;
 use ironauth_admin::webhook_delivery::{
@@ -343,6 +344,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let log_shipper_inputs = log_shipper_inputs(&config, &env);
         let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
+        let flow_target_inputs = flow_target_delivery_inputs(&config, &env);
         let trait_migration = trait_migration_inputs(&config, &env);
         let offboarding = offboarding_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
@@ -440,6 +442,16 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => spawn_webhook_delivery_pools(inputs).await,
             None => Vec::new(),
         };
+        // The async flow-target delivery worker (issue #112 criterion 2), behind its OWN
+        // switch for the same reason webhook delivery is: a deployment that registers flow
+        // targets and no webhook endpoints must not have to enable webhook delivery to get
+        // its targets called. BOUND rather than detached, so the shutdown below can await it:
+        // an `OutboxWorkerPool` dropped here would stop its workers at the next flag check,
+        // which is the opposite of a graceful stop.
+        let flow_target_pools = match flow_target_inputs {
+            Some(inputs) => spawn_flow_target_delivery_pools(inputs).await,
+            None => Vec::new(),
+        };
         // The trait migration worker (issue #53), behind its own switch for the same
         // reason webhook delivery is: it is a different subsystem and must not require
         // another one's configuration to run. BOUND so the shutdown below can await it.
@@ -509,6 +521,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         for pool in logout_pools
             .into_iter()
             .chain(webhook_pools)
+            .chain(flow_target_pools)
             .chain(trait_migration_pools)
             .chain(offboarding_pools)
             .chain(log_stream_replay_pools)
@@ -1629,6 +1642,28 @@ struct BackChannelWorkerInputs {
     env: Env,
 }
 
+/// What the ASYNC flow-target delivery worker (issue #112 criterion 2) needs, captured
+/// before `config` moves into the server.
+struct FlowTargetDeliveryInputs {
+    /// The flow-target consumer's own settings (the per-delivery HTTP budget).
+    flow_targets: ironauth_config::FlowTargetsConfig,
+    /// The shared `[outbox]` tuning the pool is built from, exactly as every other
+    /// consumer's pool is.
+    outbox: OutboxConfig,
+    /// The data-plane DSN the worker drains and reads targets through.
+    data_plane_dsn: String,
+    /// The control-plane DSN the worker enumerates `(tenant, environment)` scopes on;
+    /// [`None`] disables the worker, since without it there are no scopes to drain.
+    control_dsn: Option<String>,
+    /// The master key a target's sealed signing secret is opened under. [`None`] disables
+    /// the worker: a deliverer that cannot open a secret cannot sign, and the alternative to
+    /// refusing to start is a worker that burns every message's attempt budget and turns a
+    /// missing configuration value into permanently discarded deliveries.
+    master: Option<Arc<MasterKey>>,
+    /// The environment seam (deterministic clock and entropy).
+    env: Env,
+}
+
 /// What the webhook delivery worker (issue #105) needs, captured before `config` moves
 /// into the server.
 struct WebhookDeliveryInputs {
@@ -1777,6 +1812,26 @@ fn webhook_delivery_inputs(config: &Config, env: &Env) -> Option<WebhookDelivery
     }
     Some(WebhookDeliveryInputs {
         webhooks: config.webhooks.clone(),
+        outbox: config.outbox.clone(),
+        data_plane_dsn: config.database.url.expose().to_owned(),
+        control_dsn: select_control_dsn(config),
+        master: resolve_master_key(config),
+        env: env.clone(),
+    })
+}
+
+/// Capture the async flow-target delivery inputs from config (issue #112 criterion 2), or
+/// `None` when the switch is off.
+///
+/// Its OWN switch rather than the webhook one, for the reason the webhook worker has its own
+/// rather than riding the OIDC logout switches: a deployment that registers flow targets and
+/// no webhook endpoints should not have to enable webhook delivery to get its targets called.
+fn flow_target_delivery_inputs(config: &Config, env: &Env) -> Option<FlowTargetDeliveryInputs> {
+    if !config.flow_targets.delivery_enabled {
+        return None;
+    }
+    Some(FlowTargetDeliveryInputs {
+        flow_targets: config.flow_targets.clone(),
         outbox: config.outbox.clone(),
         data_plane_dsn: config.database.url.expose().to_owned(),
         control_dsn: select_control_dsn(config),
@@ -2798,6 +2853,96 @@ async fn spawn_backchannel_logout_pools(
         consumers = ?consumers.names(),
         pools = pools.len(),
         "back-channel logout delivery started on the outbox consumer pools"
+    );
+    pools
+}
+
+/// Start the ASYNC flow-target delivery worker (issue #112 criterion 2) on the generic
+/// outbox worker pool.
+///
+/// A separate function from [`spawn_webhook_delivery_pools`] for the same reason that one is
+/// separate from the logout pools: the switches are independent, and a deployment that
+/// registers flow targets and no webhook endpoints should not have to run webhook delivery to
+/// get its targets called. Everything generic is shared: [`spawn_consumer_pools`],
+/// [`ControlPlaneScopes`] and the observer. Only the consumer and its sender are specific.
+///
+/// Every early return is logged and starts NOTHING; the rest of the server runs unaffected
+/// and the queue is durable, so the work waits rather than being lost.
+async fn spawn_flow_target_delivery_pools(
+    inputs: FlowTargetDeliveryInputs,
+) -> Vec<OutboxWorkerPool> {
+    let FlowTargetDeliveryInputs {
+        flow_targets,
+        outbox,
+        data_plane_dsn,
+        control_dsn,
+        master,
+        env,
+    } = inputs;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "flow-target delivery worker not started: no control-plane DSN to enumerate \
+             scopes (set admin.control_database_url, or run in dev_mode). The delivery queue \
+             is durable, so nothing is lost; enable the control plane to drain it."
+        );
+        return Vec::new();
+    };
+    // Refusing to start beats starting a worker that cannot sign. Without a master key every
+    // signed target's secret read fails at the unseal, so each message would burn its whole
+    // attempt budget and dead-letter, turning a missing configuration value into permanently
+    // discarded deliveries.
+    let Some(master) = master else {
+        tracing::error!(
+            "flow-target delivery worker not started: database.master_key is unset, so a \
+             target's sealed signing secret cannot be opened and no delivery could be signed. \
+             The queue is durable; set database.master_key to drain it."
+        );
+        return Vec::new();
+    };
+
+    let data_store = match Store::connect(&data_plane_dsn).await {
+        Ok(store) => store.with_master_key(master),
+        Err(error) => {
+            tracing::error!(%error, "flow-target delivery worker not started: data-plane connect failed");
+            return Vec::new();
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "flow-target delivery worker not started: control-plane connect failed");
+            return Vec::new();
+        }
+    };
+
+    let timeout = std::time::Duration::from_secs(flow_targets.delivery_timeout_secs);
+    let sender = match FetchWebhookSender::with_timeout(timeout) {
+        Ok(sender) => sender.for_purpose(ironauth_fetch::FetchPurpose::FlowTarget),
+        Err(error) => {
+            tracing::error!(%error, "flow-target delivery worker not started: fetcher setup failed");
+            return Vec::new();
+        }
+    };
+
+    let mut consumers = ConsumerRegistry::new();
+    if let Err(error) = consumers.register(Arc::new(FlowTargetDeliveryConsumer::new(
+        data_store.clone(),
+        sender,
+    )) as Arc<dyn OutboxConsumer>)
+    {
+        tracing::error!(%error, "flow-target delivery worker not started: duplicate consumer name");
+        return Vec::new();
+    }
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer = outbox_observer();
+    let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
+
+    tracing::info!(
+        consumers = ?consumers.names(),
+        pools = pools.len(),
+        "async flow-target delivery started on the outbox consumer pools"
     );
     pools
 }

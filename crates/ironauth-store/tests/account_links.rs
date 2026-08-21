@@ -36,7 +36,7 @@ async fn register_password_user(
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env))
         .users()
-        .register(env, handle, REAL_HASH)
+        .register(env, handle, REAL_HASH, None)
         .await
         .expect("register password user")
 }

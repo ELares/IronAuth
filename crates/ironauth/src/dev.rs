@@ -580,7 +580,11 @@ pub async fn seed_user(
             ironauth_store::CorrelationId::generate(env),
         )
         .users()
-        .register(env, DEV_USER_IDENTIFIER, &password_hash)
+        // No async flow-target deliveries: the dev seed is an operator-initiated fixture
+        // rather than a self-service signup, and the envelope says "signup" without
+        // qualification. Announcing it would tell an integration a person signed up when an
+        // operator ran a seed.
+        .register(env, DEV_USER_IDENTIFIER, &password_hash, None)
         .await
     {
         // A Conflict is ALREADY SEEDED, not a failure: a dev restart against an existing
