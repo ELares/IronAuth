@@ -24,7 +24,9 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::{Harness, REDIRECT_URI, enc, form, form_field, json};
-use ironauth_config::{QuotaConfig, ScopeQuotaConfig};
+use ironauth_config::{
+    OidcConfig, QuotaConfig, ScopeQuotaConfig, TokenFormat as ConfigTokenFormat,
+};
 use ironauth_jose::verify;
 use ironauth_oidc::{Argon2Params, HashRejection, HashingPool};
 use ironauth_quota::{Limit, QuotaEnforcer, ScopeLimits, TenantId as QuotaTenantId};
@@ -1415,4 +1417,99 @@ async fn a_fenced_user_redeems_no_legacy_session_less_device_grant() {
         "a deleted user's legacy device grant mints nothing: {body:?}"
     );
     assert_eq!(body["error"], "invalid_grant");
+}
+
+/// Count `token.issued` metering events for a scope.
+///
+/// Reads `outbox_messages` DIRECTLY, because the property is that the PRODUCER fired. A
+/// helper that went through the metering fold would pass just as happily on seeded
+/// envelopes, which is precisely why the existing fold test could not catch a grant that
+/// emitted nothing.
+async fn metering_events(harness: &Harness) -> i64 {
+    let scope = harness.scope();
+    let mut tx = harness.db().app_pool().begin().await.expect("begin");
+    for (key, value) in [
+        ("ironauth.tenant_id", scope.tenant().to_string()),
+        ("ironauth.environment_id", scope.environment().to_string()),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .expect("bind scope");
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 \
+           AND payload->>'type' = 'token.issued'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("count metering events");
+    tx.commit().await.expect("commit");
+    count
+}
+
+/// A device redemption COUNTS every token it mints, in both access-token formats (#107).
+///
+/// `tokens_issued` is billing input: `GET /usage` reports it and `usage.reported` publishes
+/// it. This grant inserted `issued_tokens` rows and emitted nothing, so every token a device
+/// flow minted was invisible to that number, silently -- the fold sums what it is given, and
+/// a producer that never fires looks exactly like a tenant that never issued anything.
+///
+/// BOTH formats are driven because the counts come from different places. An `at+jwt`
+/// issuance produces two `IssuedTokenRecord`s; an OPAQUE one produces a record for the ID
+/// token and no record at all for the access token, so a fix that counted records alone
+/// would report one where two were minted. That asymmetry is what made the authorization
+/// code's own metering wrong for years while its at+jwt half looked correct.
+#[tokio::test]
+async fn a_device_redemption_meters_every_token_it_mints() {
+    for (label, format, expected) in [
+        ("at+jwt", ConfigTokenFormat::AtJwt, 2_i64),
+        ("opaque", ConfigTokenFormat::Opaque, 2_i64),
+    ] {
+        let harness = Harness::start_with(OidcConfig {
+            default_access_token_format: format,
+            ..OidcConfig::default()
+        })
+        .await;
+        let client = *harness.client_id();
+        // The logo is registered because `approve_via_page` drives the real confirmation
+        // page and asserts the client identity renders on it.
+        harness
+            .enable_device_grant(&client, DEVICE_GRANTS, Some(TEST_LOGO))
+            .await;
+        let client_str = client.to_string();
+
+        assert_eq!(
+            metering_events(&harness).await,
+            0,
+            "{label}: nothing is counted before an issuance"
+        );
+
+        let start = start_flow(&harness, &client_str, Some("openid")).await;
+        let device_code = start["device_code"]
+            .as_str()
+            .expect("device_code")
+            .to_owned();
+        let user_code = start["user_code"].as_str().expect("user_code").to_owned();
+        approve_via_page(&harness, &user_code).await;
+        harness
+            .clock()
+            .advance(Duration::from_secs(INTERVAL_SECS + 1));
+
+        let (status, body) = poll(&harness, &device_code, &client_str).await;
+        assert_eq!(status, StatusCode::OK, "{label}: redemption: {body:?}");
+        assert!(body["id_token"].is_string(), "{label}: {body:?}");
+        assert!(body["access_token"].is_string(), "{label}: {body:?}");
+
+        assert_eq!(
+            metering_events(&harness).await,
+            expected,
+            "{label}: an ID token and an access token are TWO counted tokens"
+        );
+    }
 }

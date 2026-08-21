@@ -1070,7 +1070,7 @@ async fn a_rotation_meters_the_access_token_it_mints() {
         .await
         .expect("redeem");
     assert!(
-        matches!(outcome, RefreshRedeemOutcome::Rotated { .. }),
+        matches!(outcome, RefreshRedeemOutcome::Rotated),
         "the fixture must rotate, or this measures nothing: {outcome:?}"
     );
     let _ = succ_token;
