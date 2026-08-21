@@ -1645,6 +1645,13 @@ async fn registering_a_flow_target_demands_write_config() {
     // The id the create returned must NAME A ROW. The upsert arbitrates on name and keeps the
     // existing row's id, so a handler returning its own freshly minted candidate would hand
     // back an id that 404s here.
+    //
+    // The credential is re-granted READ first, because the listing is classified
+    // `management.read` while the create above needed `management.write_config`, and this
+    // test holds exactly one restriction at a time. Without this the listing answered 403 and
+    // the assertion below read as "the create returned a phantom id" when the truth was "this
+    // credential may not list". Measured: that is how this test shipped in #951, red.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
     let (status, _, body) = h.get_as(&targets, &secret).await;
     assert_eq!(status, StatusCode::OK, "listing after register: {body}");
     assert!(
@@ -1652,7 +1659,9 @@ async fn registering_a_flow_target_demands_write_config() {
         "the id the create returned must appear in the listing: {body}"
     );
 
-    // Deregistering is write_config too, and read alone must not do it.
+    // Deregistering is write_config too, and read alone must not do it. The credential is
+    // already read-only from the listing above; restated rather than dropped, so this case
+    // states the precondition it depends on instead of inheriting it from a neighbour.
     let one = format!("{targets}/{target_id}");
     restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
     let (status, _, body) = h.delete_as(&one, &secret).await;
