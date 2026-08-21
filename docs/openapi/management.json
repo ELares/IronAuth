@@ -28761,7 +28761,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "The bound on a sync call, in milliseconds. Required for a sync target and refused\nabove the ceiling."
+            "description": "The bound on a sync call, in milliseconds. Required for a sync target and refused\nabove the ceiling.\n\nRefused ENTIRELY on an async target: an async delivery is bounded by\n`flow_targets.delivery_timeout_secs` and nothing reads a per-target value, so accepting\none here would store a setting that never applies."
           },
           "timing": {
             "type": "string",

@@ -150,6 +150,41 @@ pub struct SignaturePair {
     pub signature: String,
 }
 
+/// The header set one delivery carries, or [`None`] when a value will not encode.
+///
+/// Extracted from [`FetchWebhookSender::deliver`] so the RULE is reachable by a test. Every
+/// delivery suite in this crate drives a recording sender, which captures the
+/// [`DeliveryHeaders`] struct and never runs this loop, so the rule that actually reaches the
+/// wire had no cover: moving the id inside the signed branch would send an unsigned delivery
+/// with no `webhook-id`, and the whole suite would stay green. That is the exact defect this
+/// shape exists to prevent, so it is measured here rather than trusted.
+fn delivery_header_set(
+    headers: &DeliveryHeaders,
+) -> Option<Vec<(http::HeaderName, http::HeaderValue)>> {
+    // The id first and UNCONDITIONALLY; the signature pair only when the delivery is signed.
+    // The id is the delivery's IDENTITY rather than part of its signature, and an
+    // at-least-once queue without one cannot be deduplicated by any receiver.
+    let mut emit = vec![(HEADER_ID, headers.id.as_str())];
+    if let Some(signed) = headers.signature.as_ref() {
+        emit.push((HEADER_TIMESTAMP, signed.timestamp.as_str()));
+        emit.push((HEADER_SIGNATURE, signed.signature.as_str()));
+    }
+    let mut encoded = Vec::with_capacity(emit.len());
+    for (name, value) in emit {
+        // A value that will not encode means the delivery cannot be made correctly. Sending it
+        // WITHOUT the header would present either an unsigned POST or an undedupable one, so
+        // refusing the whole delivery is the only safe answer.
+        let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) else {
+            return None;
+        };
+        encoded.push((name, value));
+    }
+    Some(encoded)
+}
+
 /// The production sender: a POST through the SSRF-hardened outbound fetcher.
 pub struct FetchWebhookSender {
     fetcher: Arc<ironauth_fetch::Fetcher>,
@@ -205,29 +240,16 @@ impl WebhookSender for FetchWebhookSender {
         let body = body.to_owned();
         let headers = headers.clone();
         async move {
+            let Some(emit) = delivery_header_set(&headers) else {
+                return DeliveryOutcome::failed(None, SendFailure::Transport);
+            };
             let mut request = ironauth_fetch::FetchRequest::new(purpose, http::Method::POST, url)
                 .header(
                     http::header::CONTENT_TYPE,
                     http::HeaderValue::from_static("application/json"),
                 )
                 .body(body);
-            // The id first and unconditionally; the signature pair only when the delivery is
-            // signed.
-            let mut emit = vec![(HEADER_ID, headers.id.as_str())];
-            if let Some(signed) = headers.signature.as_ref() {
-                emit.push((HEADER_TIMESTAMP, signed.timestamp.as_str()));
-                emit.push((HEADER_SIGNATURE, signed.signature.as_str()));
-            }
             for (name, value) in emit {
-                // A header value that will not encode means the delivery cannot be made
-                // correctly, and sending it WITHOUT the header would present an unsigned
-                // POST to the receiver. Refusing is the only safe answer.
-                let (Ok(name), Ok(value)) = (
-                    http::HeaderName::from_bytes(name.as_bytes()),
-                    http::HeaderValue::from_str(value),
-                ) else {
-                    return DeliveryOutcome::failed(None, SendFailure::Transport);
-                };
                 request = request.header(name, value);
             }
             match fetcher.fetch(request).await {
@@ -583,5 +605,64 @@ fn unix_secs(at: std::time::SystemTime) -> i64 {
     match at.duration_since(std::time::UNIX_EPOCH) {
         Ok(delta) => i64::try_from(delta.as_secs()).unwrap_or(i64::MAX),
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(signed: bool) -> DeliveryHeaders {
+        DeliveryHeaders {
+            id: "evt_42".to_owned(),
+            signature: signed.then(|| SignaturePair {
+                timestamp: "1700000000".to_owned(),
+                signature: "v1,abc".to_owned(),
+            }),
+        }
+    }
+
+    fn names(set: &[(http::HeaderName, http::HeaderValue)]) -> Vec<String> {
+        set.iter().map(|(n, _)| n.as_str().to_owned()).collect()
+    }
+
+    /// An UNSIGNED delivery still carries `webhook-id`, and carries neither signature header.
+    #[test]
+    fn an_unsigned_delivery_still_emits_the_dedup_handle() {
+        let set = delivery_header_set(&headers(false)).expect("the header set builds");
+        assert_eq!(
+            names(&set),
+            vec![HEADER_ID.to_owned()],
+            "exactly the dedup handle, and nothing that claims a signature"
+        );
+        assert_eq!(set[0].1.as_bytes(), b"evt_42");
+    }
+
+    /// A SIGNED delivery carries all three, id first.
+    #[test]
+    fn a_signed_delivery_emits_all_three_headers() {
+        let set = delivery_header_set(&headers(true)).expect("the header set builds");
+        assert_eq!(
+            names(&set),
+            vec![
+                HEADER_ID.to_owned(),
+                HEADER_TIMESTAMP.to_owned(),
+                HEADER_SIGNATURE.to_owned(),
+            ],
+        );
+        assert_eq!(set[1].1.as_bytes(), b"1700000000");
+        assert_eq!(set[2].1.as_bytes(), b"v1,abc");
+    }
+
+    /// A value that will not encode REFUSES the whole delivery rather than dropping one
+    /// header, which would present an unsigned or undedupable POST to the receiver.
+    #[test]
+    fn a_header_value_that_will_not_encode_refuses_the_delivery() {
+        let mut bad = headers(true);
+        bad.id = "evt\u{0}bad".to_owned();
+        assert!(
+            delivery_header_set(&bad).is_none(),
+            "an unencodable header refuses the whole delivery"
+        );
     }
 }

@@ -5,18 +5,19 @@
 //! There are five separate boot seams that spawn pools matching the spelling this scans for:
 //! session ended and offboarding, back-channel logout, webhook delivery, trait migration, and
 //! async flow-target delivery. A sixth constructs the observer under a different binding name
-//! (the log-stream replay seam), which this exact-string scan cannot see and does not count. Each one used to build its
-//! own observer, and that is a wiring decision written four times.
+//! (the log-stream replay seam), which this exact-string scan cannot see and does not count.
+//! Each one used to build its own observer, and that is a wiring decision repeated per seam.
 //!
 //! The failure mode this pins against is silent in a way that matters. A seam that keeps
 //! its own observer still runs: its pools drain, its logs appear, and the metrics endpoint
-//! has plenty of `ironauth_outbox_*` series on it from the other three. What is missing is
+//! has plenty of `ironauth_outbox_*` series on it from the others. What is missing is
 //! one consumer's worth of counters, on a dashboard that looks populated. Nothing goes red,
 //! and the reading an operator takes from it is wrong in the direction of reassurance.
 //!
 //! This is a TEXT SCAN, and its ceiling is worth stating plainly rather than discovering:
-//! it can only see `main.rs`. A fifth pool seam added in another module of this crate, or
-//! in another crate, is invisible to it, and so is an observer constructed through an alias.
+//! it can only see `main.rs`. A pool seam added in another module of this crate, or in
+//! another crate, is invisible to it, and so is an observer constructed through an alias --
+//! as the log-stream replay seam already is, by binding name.
 //! It pins the seams that exist against the specific regression of one of them drifting back
 //! to a private observer, which is what actually happened four times over.
 

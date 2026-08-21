@@ -82,6 +82,10 @@ pub struct SetFlowTargetRequest {
     pub endpoint: String,
     /// The bound on a sync call, in milliseconds. Required for a sync target and refused
     /// above the ceiling.
+    ///
+    /// Refused ENTIRELY on an async target: an async delivery is bounded by
+    /// `flow_targets.delivery_timeout_secs` and nothing reads a per-target value, so accepting
+    /// one here would store a setting that never applies.
     #[serde(default)]
     pub timeout_ms: Option<i32>,
     /// `fail_open` or `fail_closed`.

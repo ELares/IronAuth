@@ -42,8 +42,10 @@ range per docs/RELEASING.md.
   both directions. A deregistered target is gone and its secret with it, so the message
   completes; retrying would burn the attempt budget against a row that will never return. A
   disabled one is a switch an operator can flip back, so the message dead-letters and stays
-  replayable; completing it would drop a real signup notification with nothing behind it and
-  no record that it was dropped.
+  RETRIES, so a re-enable inside the backoff window drains the backlog; completing it would
+  drop a real signup notification with nothing behind it, and dead-lettering it would preserve
+  the backlog only if something could revive a dead letter for this consumer, which nothing
+  can today.
 - **Migration 0146's header overstates when a pre-persist flow target runs.**
   `0146_flow_targets.sql:40` says `pre_persist` "runs inside the write's transaction so a
   rejection leaves no row". MEASURED: nothing runs a flow target inside a write

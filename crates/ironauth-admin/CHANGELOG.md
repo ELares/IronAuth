@@ -6,6 +6,31 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **BREAKING: `DeliveryHeaders` changed shape** (issue #112 criterion 2). Its `timestamp` and
+  `signature` fields are replaced by `signature: Option<SignaturePair>`, and `id` is now
+  unconditional. `WebhookSender::deliver` takes `&DeliveryHeaders` rather than an `Option`.
+
+  The shape is the point. `webhook-id` is the delivery's IDENTITY, not part of its signature:
+  it is what a receiver deduplicates an at-least-once queue on. An intermediate revision made
+  the whole header set optional so an unsigned flow target could be delivered, which dropped
+  the dedup handle along with the signature and left an unsigned receiver unable to tell a
+  redelivery from a second event. Optionality now lives one level down, where it belongs, and
+  `SignaturePair` keeps the timestamp and signature together because either alone is
+  unverifiable.
+
+- **New module `flow_target_delivery`** (issue #112 criterion 2): the outbox consumer that
+  signs a queued flow-target delivery and POSTs it. Retries, backoff, the attempts cap,
+  dead-lettering, per-target head-of-group serialization and scope fencing are inherited from
+  the generic outbox unchanged; the module contributes only which record to look up, which
+  secret to sign under, and how each answer from the world is classified.
+
+- **The flow-target registration route refuses `timeout_ms` on an ASYNC target**, which it
+  previously accepted and stored. Nothing read it: an async delivery is bounded by
+  `flow_targets.delivery_timeout_secs`. This is a behaviour change on a published route, so an
+  async target registered with one can no longer be re-registered unchanged; drop the field.
+  Accepting a setting that never applies is indistinguishable from working, which is the shape
+  the enqueue guard one layer down already refuses.
+
 - **Creating and deleting an organization through the management API emit their events
   (issue #108).** Both ride the transaction of the write they announce.
 

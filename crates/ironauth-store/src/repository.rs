@@ -16616,6 +16616,17 @@ impl ActingUserRepo<'_> {
             UserState::Active,
             None,
             None,
+            // NO async flow-target deliveries, and this is a GAP rather than a decision.
+            //
+            // The one production caller is the passkey-only signup ceremony, which creates a
+            // real self-service account, so an operator with an async event target registered
+            // sees password signups announced and passkey signups silently not. Wiring it
+            // wants the envelope to say WHICH door produced a signup first, or a receiver gets
+            // several materially different events in one indistinguishable shape -- the same
+            // defect `state` and `quarantined` were added to fix. Tracked as issue #953.
+            //
+            // Written down because the dev seed's `None` carries a justification and this one
+            // did not, so a reader could not tell an omission from a decision.
             None,
         )
         .await
@@ -17027,13 +17038,15 @@ impl ActingUserRepo<'_> {
                         // sentence, which an earlier revision of this comment cited as
                         // current state and was wrong to.
                         //
-                        // It does not help here, for two reasons that both hold at the
-                        // shipped defaults. It deletes by TIME WINDOW and SCOPE, never by
-                        // subject, so nothing can find one person's rows. And
-                        // `dead_letter_retention_secs` ships at `0`, which for that knob
-                        // means KEEP FOREVER, deliberately: a dead letter is work that will
-                        // not happen unless replayed, and the row is the only record it
-                        // happened.
+                        // It does not help here, and the load-bearing reason is the first of
+                        // these two. It deletes by TIME WINDOW and SCOPE, never by subject,
+                        // so no erasure request has an instrument that can reach one person's
+                        // rows at all. Separately, a DEAD-LETTERED row is kept forever at the
+                        // shipped default (`dead_letter_retention_secs = 0` means keep, since
+                        // a dead letter is work that will not happen unless replayed and the
+                        // row is the only record it happened) -- though that is the minority
+                        // path, since a delivered announcement completes and is reaped on
+                        // `completed_retention_secs`. The first reason stands on its own.
                         //
                         // So an identifier here would outlive an erasure request, which
                         // deletes only the SEALED copy in `users` -- sealed under a DEK by
@@ -40652,9 +40665,11 @@ impl FlowTargetRepo<'_> {
     /// hides deleted rows. The distinction decides what happens to a queued delivery, and
     /// getting it wrong is expensive in both directions. A DELETED target is gone and its
     /// secret with it, so the message completes and nothing is sent; treating that as a
-    /// failure would retry fourteen times against a row that will never return. A DISABLED
-    /// target is a switch an operator can flip back, so the message dead-letters and stays
-    /// replayable; completing it would drop a real signup notification with nothing behind it.
+    /// failure would retry against a row that will never return. A DISABLED target is a switch
+    /// an operator can flip back, so the delivery RETRIES and a re-enable inside the backoff
+    /// window drains the backlog; completing it would drop a real signup notification with
+    /// nothing behind it, and dead-lettering it would preserve the backlog only if something
+    /// could revive a dead letter for this consumer, which nothing can.
     ///
     /// # Errors
     ///

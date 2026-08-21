@@ -750,3 +750,189 @@ async fn an_exhausted_delivery_dead_letters_through_the_real_queue() {
     assert_eq!(sent.len(), 1, "one claim, one POST attempt");
     assert_eq!(error.label(), "http_status_500");
 }
+
+#[tokio::test]
+async fn an_async_registration_may_not_set_a_per_target_timeout() {
+    // The consumer bounds every POST with `flow_targets.delivery_timeout_secs` and never reads
+    // `timeout_ms`, so a value accepted here would round-trip through the API, appear in the
+    // listing, and do nothing. That is the accepted-and-ignored shape the enqueue guard
+    // refuses one layer down, on the grounds that it is indistinguishable from working.
+    //
+    // The migration does NOT enforce this: its CHECK only REQUIRES a timeout on sync. So the
+    // rule lives at the boundary, and this is what says the boundary still holds it.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+
+    let (status, _, body) = h
+        .post(
+            &targets_base(&tenant, &environment),
+            "k-async-timeout",
+            &serde_json::json!({
+                "name": "async-with-timeout",
+                "target_class": "event",
+                "invocation": "async",
+                "timing": "post_persist",
+                "endpoint": "https://target.example/hook",
+                "timeout_ms": 500,
+                "failure_policy": "fail_closed",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an async target must not carry a per-call timeout: {body}"
+    );
+    assert!(
+        body.contains("delivery_timeout_secs"),
+        "the refusal names the setting that DOES bound an async delivery: {body}"
+    );
+
+    // The same registration without it is accepted, so the refusal above is the rule talking
+    // rather than the route being broken.
+    let (status, _, body) = h
+        .post(
+            &targets_base(&tenant, &environment),
+            "k-async-ok",
+            &serde_json::json!({
+                "name": "async-without-timeout",
+                "target_class": "event",
+                "invocation": "async",
+                "timing": "post_persist",
+                "endpoint": "https://target.example/hook",
+                "failure_policy": "fail_closed",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the same target without it: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_target_that_became_sync_does_not_deliver_its_queued_async_messages() {
+    // Re-registering a target as SYNC rewrites `invocation` in place. Without this guard the
+    // already-queued async deliveries still POST to a receiver that is now written as a GATE:
+    // it would answer `interrupt`, nothing reads an async response, and the message would be
+    // marked completed. The operator would see a clean queue and believe the new gate covered
+    // those signups.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let target = register_target(&h, &tenant, &environment, "k-t1", "gate", None).await;
+    let message = queued(&target, "ftg_delivery_1", false, &signup_body(&target));
+
+    // Hardened into a gate AFTER the delivery was queued. A sync target requires a timeout,
+    // which is what makes this a realistic re-registration rather than a contrived one.
+    let (status, _, body) = h
+        .post(
+            &targets_base(&tenant, &environment),
+            "k-harden",
+            &serde_json::json!({
+                "name": "gate",
+                "target_class": "request",
+                "invocation": "sync",
+                "timing": "pre_persist",
+                "endpoint": "https://target.example/hook",
+                "timeout_ms": 500,
+                "failure_policy": "fail_closed",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "re-register as sync: {body}");
+
+    let sender = RecordingSender::accepting();
+    let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
+    let error = consumer
+        .handle(&Env::system(), scope_of(&tenant, &environment), &message)
+        .await
+        .expect_err("a target that became sync must not receive an async delivery");
+
+    assert_eq!(error.label(), "target_became_sync");
+    assert!(
+        !error.is_retryable(),
+        "the target will not become async again on its own, so this dead-letters rather than \
+         retrying against a receiver that is now a gate"
+    );
+    assert!(
+        sender.recorded().is_empty(),
+        "nothing was POSTed to the gate"
+    );
+}
+
+#[tokio::test]
+async fn the_delivered_body_carries_the_targets_config_as_it_is_now() {
+    // `config` is resolved at DELIVERY from the live record, like `endpoint` and the signing
+    // secret, rather than frozen into the payload at enqueue. Editing a target's config
+    // therefore reaches deliveries that are already queued -- which is the behaviour its
+    // neighbour fields have, and the inconsistency that motivated moving it.
+    //
+    // Asserted on the DELIVERED body rather than on the payload, because the payload's half of
+    // this (config absent) is pinned in the store suite; this is the half that says the
+    // consumer puts it back.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+
+    let (status, _, body) = h
+        .post(
+            &targets_base(&tenant, &environment),
+            "k-t1",
+            &serde_json::json!({
+                "name": "crm",
+                "target_class": "event",
+                "invocation": "async",
+                "timing": "post_persist",
+                "endpoint": "https://target.example/hook",
+                "failure_policy": "fail_closed",
+                "config": { "route": "before" },
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "register: {body}");
+    let target = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let message = queued(&target, "ftg_delivery_1", false, &signup_body(&target));
+
+    // Edited AFTER the delivery was queued.
+    let (status, _, body) = h
+        .post(
+            &targets_base(&tenant, &environment),
+            "k-edit",
+            &serde_json::json!({
+                "name": "crm",
+                "target_class": "event",
+                "invocation": "async",
+                "timing": "post_persist",
+                "endpoint": "https://target.example/hook",
+                "failure_policy": "fail_closed",
+                "config": { "route": "after" },
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "reconfigure: {body}");
+
+    let sender = RecordingSender::accepting();
+    let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
+    consumer
+        .handle(&Env::system(), scope_of(&tenant, &environment), &message)
+        .await
+        .expect("the delivery is made");
+
+    let sent = sender.recorded();
+    assert_eq!(sent.len(), 1, "one message, one POST");
+    let delivered: Value = serde_json::from_str(&sent[0].body).expect("the body is json");
+    assert_eq!(
+        delivered["config"],
+        serde_json::json!({ "route": "after" }),
+        "the delivery carries the config the target holds NOW, not the one it held at \
+         enqueue: {delivered}"
+    );
+}

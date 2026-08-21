@@ -1171,19 +1171,29 @@ async fn the_signup_envelope_states_what_the_account_actually_became() {
     }
 }
 
-/// A signup that ROLLS BACK announces nothing (issue #112 criterion 2).
+/// A signup that is REFUSED announces nothing (issue #112 criterion 2).
 ///
-/// This is the headline claim of the whole design -- it is why the enqueue rides the account's
-/// own transaction instead of sitting beside it, and it is asserted in four separate doc
-/// blocks. None of them was measured. A claim repeated in four places and tested in none is
-/// this repository's most repeated defect shape, so here it is driven for real.
+/// The failure is caused rather than simulated: a duplicate identifier violates the unique
+/// index and `register` returns `Conflict`. Nothing is poisoned by hand, so what this reads
+/// back is what the substrate actually did, and the positive control above it proves the
+/// producer is live in this fixture rather than inert.
 ///
-/// The rollback is caused rather than simulated: a duplicate identifier violates the unique
-/// index, `register` returns an error, and the transaction that would have carried the outbox
-/// row unwinds with it. Nothing is poisoned by hand, so what this reads back is what the
-/// substrate actually did.
+/// # What this does NOT prove, and why the name says "refused" rather than "rolled back"
+///
+/// The unique violation is caught INSIDE the write closure and returns before the enqueue
+/// block is reached, so no outbox row is ever staged and nothing unwinds. This therefore
+/// measures "a refused signup announces nothing" -- worth having, since it is the case an
+/// operator meets -- and NOT the joint-rollback property that the enqueue and the account
+/// INSERT commit or abort together.
+///
+/// That stronger claim is structural: `write_audited_detailed` runs the closure, the audit
+/// row and the commit on one transaction and returns only on a committed one, so there is no
+/// path that commits the account without the outbox row. Proving it by test needs a failure
+/// forced AFTER the enqueue, which the `poison_after_audit` seam exists for and which no
+/// public register variant exposes. An earlier revision of this test was named for the
+/// stronger claim, which would have left a reader believing it was measured.
 #[tokio::test]
-async fn a_rolled_back_signup_announces_nothing() {
+async fn a_refused_signup_announces_nothing() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;

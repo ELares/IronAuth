@@ -9,8 +9,10 @@
 //! It rides the generic transactional outbox rather than a bespoke queue, which is what
 //! criterion 2 means by "deliver through the webhook machinery". Retries, the backoff curve,
 //! the attempts cap, dead-lettering, per-target ordering, scope fencing and panic containment
-//! are all inherited unchanged; this file contributes only the parts that are flow-target
-//! specific: which record to look up, which secret to sign under, and how each answer from the
+//! are all inherited unchanged -- "ordering" here meaning the per-target head-of-group
+//! serialization the queue guarantees unconditionally, not strict ordering, which needs a
+//! producer-side row lock this producer does not take (see `enqueue_async_delivery`). This
+//! file contributes only the parts that are flow-target specific: which record to look up, which secret to sign under, and how each answer from the
 //! world is classified.
 //!
 //! ## What is deliberately NOT reimplemented

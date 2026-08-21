@@ -212,10 +212,11 @@ async fn a_signup_with_no_registered_target_queues_nothing() {
 
 #[tokio::test]
 async fn a_disabled_target_is_not_announced_to() {
-    // Disabled means the dispatcher does not call it. The delivery consumer ALSO dead-letters
-    // a message whose target was switched off after enqueue, and the two are different
-    // moments: this pins the PRODUCER, so a target switched off before the signup never
-    // produces a message at all rather than producing one that dead-letters immediately.
+    // Disabled means the dispatcher does not call it. The delivery consumer ALSO refuses a
+    // message whose target was switched off after enqueue (retryably, since a disable is a
+    // pause), and the two are different moments: this pins the PRODUCER, so a target switched
+    // off before the signup never produces a message at all rather than producing one that
+    // retries until the attempts cap.
     let harness = Harness::start().await;
     let id = register_async_target(&harness, "crm").await;
     let env = harness.env().clone();
@@ -283,7 +284,7 @@ async fn flows_harness() -> Harness {
     harness
 }
 
-/// Drive a registration to completion through the FLOW API and return the subject.
+/// Drive a registration to completion through the FLOW API.
 async fn flow_api_signup(harness: &Harness, identifier: &str) {
     let (flow_id, token, _) = create_flow(
         harness.state(),
