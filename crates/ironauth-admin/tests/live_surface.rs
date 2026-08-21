@@ -1264,6 +1264,26 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/queues"),
         ),
+        // ---- HTTP flow targets (issue #112) ----
+        Case::empty(
+            "flow_targets.listFlowTargets",
+            "GET",
+            format!("{base}/flow-targets"),
+        ),
+        Case::json(
+            "flow_targets.createFlowTarget",
+            "POST",
+            format!("{base}/flow-targets"),
+            &serde_json::json!({"name": "live-surface-probe", "target_class": "request",
+                               "invocation": "sync", "timing": "pre_persist",
+                               "endpoint": "https://target.example/check",
+                               "timeout_ms": 500, "failure_policy": "fail_closed"}),
+        ),
+        Case::empty(
+            "flow_targets.deleteFlowTarget",
+            "DELETE",
+            format!("{base}/flow-targets/ftg_absent"),
+        ),
         // ---- SIEM log streams (issue #110) ----
         Case::empty(
             "log_streams.listLogStreams",

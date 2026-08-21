@@ -109,6 +109,20 @@ pub struct FlowTargetRecord {
     pub signing_secret_name: Option<String>,
 }
 
+/// One registered target as the MANAGEMENT surface reads it (issue #112).
+///
+/// Carries `enabled` where [`FlowTargetRecord`] does not, because the dispatcher's read
+/// filters disabled targets out and therefore never needs to know, while an operator's list
+/// must show a target they switched OFF: a disabled target that vanished from the listing
+/// would read as deregistered, and the natural next act is to register it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowTargetListing {
+    /// The target itself.
+    pub record: FlowTargetRecord,
+    /// Whether the dispatcher will call it.
+    pub enabled: bool,
+}
+
 impl FlowTargetRecord {
     /// Whether this target must run BEFORE the write, so a refusal leaves no row.
     ///

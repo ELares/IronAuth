@@ -683,6 +683,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     ),
     ("impersonation.rs", include_str!("../src/impersonation.rs")),
     ("authzen.rs", include_str!("../src/authzen.rs")),
+    ("flow_targets.rs", include_str!("../src/flow_targets.rs")),
     ("log_streams.rs", include_str!("../src/log_streams.rs")),
     ("event_feed.rs", include_str!("../src/event_feed.rs")),
     ("usage.rs", include_str!("../src/usage.rs")),

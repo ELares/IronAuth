@@ -1,0 +1,508 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Registering HTTP flow targets (issue #112).
+//!
+//! An operator registers an endpoint IronAuth calls out to at a point in a flow. Until this
+//! surface existed the table granted INSERT to `ironauth_control` only and nothing mounted a
+//! route, so the dispatcher was reachable by nothing an operator could do: a control that
+//! ships its enforcement and not its granting path is a control nobody can turn on.
+//!
+//! ## What a listing must never return
+//!
+//! The signing secret, in any form. `flow_targets` holds the NAME of an environment secret
+//! and never its bytes, and this view carries that name unresolved, so there is no path from
+//! this endpoint to a secret value.
+//!
+//! ## What the CONFIG must never be
+//!
+//! Code. Issue #112 names Ory's base64-embedded Jsonnet as the ergonomic failure this design
+//! exists to avoid, so `config` is plain JSON, stored and returned verbatim, and nothing here
+//! ever evaluates it.
+
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::Response;
+use ironauth_store::flow_target::{FailurePolicy, Invocation, TargetClass, Timing};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::auth::{ManagementPermission, Principal};
+use crate::error::{ApiError, ErrorBody};
+use crate::idempotency;
+use crate::input::parse_json;
+use crate::org_context::{require_live_environment, resolve_scope};
+use crate::response::{json, no_content};
+use crate::state::AdminState;
+
+/// One registered target, as an operator reads it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FlowTargetView {
+    /// The `ftg_` identifier.
+    pub id: String,
+    /// The operator-facing name, unique among live targets in the environment.
+    pub name: String,
+    /// Which class of flow point invokes it: `request`, `response`, `function`, or `event`.
+    pub target_class: String,
+    /// Whether the flow waits: `sync` or `async`.
+    pub invocation: String,
+    /// When it runs relative to the write: `pre_persist` or `post_persist`.
+    pub timing: String,
+    /// Where it POSTs.
+    pub endpoint: String,
+    /// The bound on a sync call, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<i32>,
+    /// What to do when a sync target does not answer: `fail_open` or `fail_closed`.
+    pub failure_policy: String,
+    /// Plain JSON, returned verbatim. Never code.
+    #[schema(value_type = Object)]
+    pub config: serde_json::Value,
+    /// The NAME of the environment secret this target's payloads are signed with, never its
+    /// value, and [`None`] when the target is deliberately unsigned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_secret_name: Option<String>,
+    /// Whether the dispatcher will call it. A DISABLED target is listed, not hidden: one
+    /// missing from the listing would read as deregistered.
+    pub enabled: bool,
+}
+
+/// Register or reconfigure a target.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetFlowTargetRequest {
+    /// The operator-facing name, unique among live targets in the environment.
+    pub name: String,
+    /// `request`, `response`, `function`, or `event`.
+    pub target_class: String,
+    /// `sync` or `async`.
+    pub invocation: String,
+    /// `pre_persist` or `post_persist`.
+    pub timing: String,
+    /// Where it POSTs. Reached through the outbound policy, so a private or link-local
+    /// address is refused at call time.
+    pub endpoint: String,
+    /// The bound on a sync call, in milliseconds. Required for a sync target and refused
+    /// above the ceiling.
+    #[serde(default)]
+    pub timeout_ms: Option<i32>,
+    /// `fail_open` or `fail_closed`.
+    pub failure_policy: String,
+    /// Plain JSON. Never code.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub config: Option<serde_json::Value>,
+    /// The NAME of an environment secret, never a secret value.
+    #[serde(default)]
+    pub signing_secret_name: Option<String>,
+    /// Whether the dispatcher calls it. Defaults to true.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// The identifier a registration returns.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FlowTargetCreated {
+    /// The `ftg_` identifier.
+    pub id: String,
+}
+
+/// Every registered target in the environment.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FlowTargetList {
+    /// The targets, by name.
+    pub targets: Vec<FlowTargetView>,
+}
+
+fn view(listing: ironauth_store::flow_target::FlowTargetListing) -> FlowTargetView {
+    let record = listing.record;
+    FlowTargetView {
+        id: record.id.to_string(),
+        name: record.name,
+        target_class: class_wire(record.target_class).to_owned(),
+        invocation: match record.invocation {
+            Invocation::Sync => "sync",
+            Invocation::Async => "async",
+        }
+        .to_owned(),
+        timing: match record.timing {
+            Timing::PrePersist => "pre_persist",
+            Timing::PostPersist => "post_persist",
+        }
+        .to_owned(),
+        endpoint: record.endpoint,
+        timeout_ms: record.timeout_ms,
+        failure_policy: match record.failure_policy {
+            FailurePolicy::FailOpen => "fail_open",
+            FailurePolicy::FailClosed => "fail_closed",
+        }
+        .to_owned(),
+        config: record.config,
+        signing_secret_name: record.signing_secret_name,
+        enabled: listing.enabled,
+    }
+}
+
+fn class_wire(class: TargetClass) -> &'static str {
+    match class {
+        TargetClass::Request => "request",
+        TargetClass::Response => "response",
+        TargetClass::Function => "function",
+        TargetClass::Event => "event",
+    }
+}
+
+/// Parse the four closed vocabularies HERE rather than leaving them to the table's CHECK
+/// constraints, so an unknown value is a 400 naming what was wrong instead of a 500 from a
+/// constraint violation.
+fn parse_enums(
+    request: &SetFlowTargetRequest,
+) -> Result<(TargetClass, Invocation, Timing, FailurePolicy), ApiError> {
+    let class = match request.target_class.as_str() {
+        "request" => TargetClass::Request,
+        "response" => TargetClass::Response,
+        "function" => TargetClass::Function,
+        "event" => TargetClass::Event,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "target_class must be request, response, function, or event".to_owned(),
+            ));
+        }
+    };
+    let invocation = match request.invocation.as_str() {
+        "sync" => Invocation::Sync,
+        "async" => Invocation::Async,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "invocation must be sync or async".to_owned(),
+            ));
+        }
+    };
+    let timing = match request.timing.as_str() {
+        "pre_persist" => Timing::PrePersist,
+        "post_persist" => Timing::PostPersist,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "timing must be pre_persist or post_persist".to_owned(),
+            ));
+        }
+    };
+    let policy = match request.failure_policy.as_str() {
+        "fail_open" => FailurePolicy::FailOpen,
+        "fail_closed" => FailurePolicy::FailClosed,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "failure_policy must be fail_open or fail_closed".to_owned(),
+            ));
+        }
+    };
+    Ok((class, invocation, timing, policy))
+}
+
+/// Refuse a registration the dispatcher could not honour as written.
+///
+/// The ceiling is enforced HERE, at the only place a target can be registered, because a
+/// per-request timeout only ever SHORTENS the fetcher's bound: a target accepted above the
+/// ceiling would be silently truncated to it and the operator's stated bound would be quietly
+/// false. Refusing at registration is the difference between a bound and a suggestion.
+fn validate(request: &SetFlowTargetRequest, invocation: Invocation) -> Result<(), ApiError> {
+    if request.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("name must not be empty".to_owned()));
+    }
+    if matches!(invocation, Invocation::Sync) {
+        let Some(timeout) = request.timeout_ms else {
+            return Err(ApiError::BadRequest(
+                "a sync target requires timeout_ms: a target with no bound to exceed cannot \
+                 trigger its failure policy"
+                    .to_owned(),
+            ));
+        };
+        if timeout <= 0 {
+            return Err(ApiError::BadRequest(
+                "timeout_ms must be greater than zero".to_owned(),
+            ));
+        }
+        if timeout > ironauth_oidc::flow::FLOW_TARGET_MAX_SYNC_TIMEOUT_MS {
+            return Err(ApiError::BadRequest(format!(
+                "timeout_ms must not exceed {}: a sync target sits on a live signup, and a \
+                 larger bound would be silently shortened to this one rather than honoured",
+                ironauth_oidc::flow::FLOW_TARGET_MAX_SYNC_TIMEOUT_MS
+            )));
+        }
+    }
+    // A secret must be NAMED, never inlined. Refusing here keeps the one rule this table
+    // rests on at the boundary: it never holds a secret value.
+    if let Some(config) = &request.config {
+        if config.get("secret").is_some() || config.get("signing_secret").is_some() {
+            return Err(ApiError::BadRequest(
+                "config must not carry a secret; name an environment secret with \
+                 signing_secret_name"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn flow_target_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    id: &str,
+    name: &str,
+    set: Option<(TargetClass, Invocation, Timing)>,
+) -> Option<crate::events::PendingEvent> {
+    let event_id = format!(
+        "evt_{}",
+        ironauth_store::CorrelationId::generate(state.env())
+    );
+    // The ENDPOINT deliberately does not travel, matching the catalog's own note: it is
+    // operator-configured infrastructure detail, often an internal address, and a webhook is
+    // a wider audience than the management surface that returns it.
+    let (event_type, payload) = match set {
+        Some((class, invocation, timing)) => (
+            "flow_target.set",
+            serde_json::json!({
+                "flow_target_id": id,
+                "name": name,
+                "target_class": class_wire(class),
+                "invocation": match invocation {
+                    Invocation::Sync => "sync",
+                    Invocation::Async => "async",
+                },
+                "timing": match timing {
+                    Timing::PrePersist => "pre_persist",
+                    Timing::PostPersist => "post_persist",
+                },
+            }),
+        ),
+        None => (
+            "flow_target.deleted",
+            serde_json::json!({ "flow_target_id": id, "name": name }),
+        ),
+    };
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id: event_id,
+        subject: id.to_owned(),
+        envelope,
+    })
+}
+
+/// List every registered HTTP flow target in the environment.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets",
+    operation_id = "listFlowTargets",
+    tag = "flow-targets",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The registered targets", body = FlowTargetList),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody)
+    )
+)]
+pub async fn list_flow_targets(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`.
+    principal.require_permission(ManagementPermission::Read)?;
+    require_live_environment(&state, &scope).await?;
+
+    let targets = state
+        .store()
+        .scoped(scope)
+        .flow_targets()
+        .list()
+        .await?
+        .into_iter()
+        .map(view)
+        .collect();
+    let body =
+        serde_json::to_string(&FlowTargetList { targets }).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// Register an HTTP flow target.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets",
+    operation_id = "createFlowTarget",
+    tag = "flow-targets",
+    request_body = SetFlowTargetRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 201, description = "The registered target", body = FlowTargetCreated),
+        (status = 400, description = "Malformed request, an unknown vocabulary value, a sync target without a bound, or a bound above the ceiling", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn create_flow_target(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+    require_live_environment(&state, &scope).await?;
+
+    let request: SetFlowTargetRequest = parse_json(&body)?;
+    let (class, invocation, timing, policy) = parse_enums(&request)?;
+    validate(&request, invocation)?;
+
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    let id = ironauth_store::FlowTargetId::generate(state.env(), &scope);
+    let body_string = serde_json::to_string(&FlowTargetCreated { id: id.to_string() })
+        .map_err(|_| ApiError::Internal)?;
+    let config = request
+        .config
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let pending = flow_target_event(
+        &state,
+        scope,
+        &id.to_string(),
+        &request.name,
+        Some((class, invocation, timing)),
+    );
+    state
+        .store()
+        .scoped(scope)
+        .acting(
+            principal.actor(),
+            ironauth_store::CorrelationId::generate(state.env()),
+        )
+        .flow_targets()
+        .set_with_event(
+            state.env(),
+            &id,
+            state.now_unix_micros(),
+            ironauth_store::NewFlowTarget {
+                name: &request.name,
+                target_class: class,
+                invocation,
+                timing,
+                endpoint: &request.endpoint,
+                timeout_ms: request.timeout_ms,
+                failure_policy: policy,
+                config: &config,
+                signing_secret_name: request.signing_secret_name.as_deref(),
+                enabled: request.enabled,
+            },
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
+        .await?;
+    Ok(json(StatusCode::CREATED, body_string))
+}
+
+/// Deregister an HTTP flow target.
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}",
+    operation_id = "deleteFlowTarget",
+    tag = "flow-targets",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("target_id" = String, Path, description = "The flow target identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "Deregistered, or already absent"),
+        (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted", body = ErrorBody)
+    )
+)]
+pub async fn delete_flow_target(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, target_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
+    require_live_environment(&state, &scope).await?;
+
+    let id = ironauth_store::FlowTargetId::parse_in_scope(&target_id, &scope)
+        .map_err(|_| ApiError::NotFound)?;
+
+    // The name rides the event, and it can only be read BEFORE the delete. A consumer that
+    // received `flow_target.deleted` without one would have to hold its own mapping from id
+    // to name to know which integration stopped.
+    let name = state
+        .store()
+        .scoped(scope)
+        .flow_targets()
+        .list()
+        .await?
+        .into_iter()
+        .find(|listing| listing.record.id == id)
+        .map(|listing| listing.record.name);
+
+    // No Idempotency-Key: deregistering an absent target is a no-op success, so DELETE is
+    // idempotent on its own.
+    let pending = name
+        .as_ref()
+        .and_then(|name| flow_target_event(&state, scope, &target_id, name, None));
+    state
+        .store()
+        .scoped(scope)
+        .acting(
+            principal.actor(),
+            ironauth_store::CorrelationId::generate(state.env()),
+        )
+        .flow_targets()
+        .delete_with_event(
+            state.env(),
+            &id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
+        .await?;
+    Ok(no_content())
+}

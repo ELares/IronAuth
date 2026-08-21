@@ -40443,6 +40443,84 @@ impl FlowTargetRepo<'_> {
             .await?;
         Ok(Some(opened))
     }
+
+    /// EVERY live target in this scope, of every class, enabled or not, by name.
+    ///
+    /// The management read, distinct from [`Self::enabled_for_class`] in both directions:
+    /// that one answers "which targets fire here", so it filters to one class and to enabled
+    /// only. This one answers "what has an operator registered", so it filters neither. A
+    /// disabled target missing from the listing would read as deregistered, and the natural
+    /// next act is to register it a second time.
+    ///
+    /// Deleted targets stay excluded: `deleted_at` is a tombstone, not a state an operator
+    /// can see or restore from here.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, including a column carrying a value
+    /// outside its closed vocabulary.
+    pub async fn list(&self) -> Result<Vec<crate::flow_target::FlowTargetListing>, StoreError> {
+        let statement = sqlx::query(
+            "SELECT id, name, target_class, invocation, timing, endpoint, timeout_ms, \
+                    failure_policy, config, signing_secret_name, enabled \
+             FROM flow_targets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+             ORDER BY name",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string());
+
+        // Scoped, because `flow_targets` is FORCE RLS: an unscoped read returns an EMPTY set
+        // rather than an error, which here would present as "nothing is registered" and
+        // invite an operator to register a duplicate.
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = statement.fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                let class_text: String = row.get("target_class");
+                let invocation_text: String = row.get("invocation");
+                let timing_text: String = row.get("timing");
+                let policy_text: String = row.get("failure_policy");
+                Ok(crate::flow_target::FlowTargetListing {
+                    enabled: row.get("enabled"),
+                    record: crate::flow_target::FlowTargetRecord {
+                        id: crate::id::FlowTargetId::parse_in_scope(&id_text, &self.scope)
+                            .map_err(|_| decode_error("flow target id", &id_text))?,
+                        name: row.get("name"),
+                        target_class: match class_text.as_str() {
+                            "request" => crate::flow_target::TargetClass::Request,
+                            "response" => crate::flow_target::TargetClass::Response,
+                            "function" => crate::flow_target::TargetClass::Function,
+                            "event" => crate::flow_target::TargetClass::Event,
+                            other => return Err(decode_error("flow target class", other)),
+                        },
+                        invocation: match invocation_text.as_str() {
+                            "sync" => crate::flow_target::Invocation::Sync,
+                            "async" => crate::flow_target::Invocation::Async,
+                            other => return Err(decode_error("flow target invocation", other)),
+                        },
+                        timing: match timing_text.as_str() {
+                            "pre_persist" => crate::flow_target::Timing::PrePersist,
+                            "post_persist" => crate::flow_target::Timing::PostPersist,
+                            other => return Err(decode_error("flow target timing", other)),
+                        },
+                        endpoint: row.get("endpoint"),
+                        timeout_ms: row.get("timeout_ms"),
+                        failure_policy: match policy_text.as_str() {
+                            "fail_open" => crate::flow_target::FailurePolicy::FailOpen,
+                            "fail_closed" => crate::flow_target::FailurePolicy::FailClosed,
+                            other => return Err(decode_error("flow target failure policy", other)),
+                        },
+                        config: row.get("config"),
+                        signing_secret_name: row.get("signing_secret_name"),
+                    },
+                })
+            })
+            .collect()
+    }
 }
 
 /// The wire spelling of a target class, in ONE place beside its parser.
