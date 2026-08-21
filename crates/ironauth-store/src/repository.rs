@@ -40386,6 +40386,33 @@ pub struct LogStreamRepo<'a> {
     scope: Scope,
 }
 
+/// Whether `stream_id` names a stream in `scope`, inside an already-scoped transaction.
+///
+/// Shared by the dead-letter listing and the replay request so the two cannot answer
+/// differently about the same id. A listing that returned an empty page where the replay
+/// returned a not-found would tell an operator two different things about one typo.
+///
+/// The `(tenant, environment)` predicate is defence in depth rather than the fence:
+/// `log_streams` carries FORCE row-level security and `begin_scoped` sets the session
+/// variables its policy reads, so a foreign row is already invisible here. Measured, and
+/// worth stating because the predicate reads like it is doing the work.
+async fn stream_exists_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    stream_id: &str,
+) -> Result<bool, StoreError> {
+    let found = sqlx::query(
+        "SELECT 1 FROM log_streams \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(stream_id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(found.is_some())
+}
+
 impl LogStreamRepo<'_> {
     /// Record a dead-lettered batch RANGE for `stream_id`, returning its id.
     ///
@@ -40438,8 +40465,14 @@ impl LogStreamRepo<'_> {
 
     /// Every dead letter for `stream_id` that has not been replayed, oldest first.
     ///
+    /// Answers [`StoreError::NotFound`] when the stream does not exist in this scope, rather
+    /// than an empty list. An operator who mistypes a stream id would otherwise read an
+    /// empty gap and be unable to tell it from a stream with nothing outstanding, which is
+    /// the same confusion `request_dead_letter_replay` refuses to create.
+    ///
     /// # Errors
     ///
+    /// [`StoreError::NotFound`] when no such stream exists in this scope;
     /// [`StoreError`] on a persistence fault.
     pub async fn outstanding_dead_letters(
         &self,
@@ -40447,6 +40480,9 @@ impl LogStreamRepo<'_> {
     ) -> Result<Vec<crate::log_stream::DeadLetter>, StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
+        if !stream_exists_in_tx(&mut tx, scope, stream_id).await? {
+            return Err(StoreError::NotFound);
+        }
         let rows = sqlx::query(
             "SELECT id, event_count, last_error, from_audit_id, to_audit_id, \
                     (EXTRACT(EPOCH FROM from_occurred_at) * 1000000)::bigint AS from_micros, \
@@ -40519,16 +40555,7 @@ impl LogStreamRepo<'_> {
         // `begin_scoped` sets the session variables its policy reads, so a foreign row is
         // already invisible to this statement. The predicate is defence in depth and reads
         // like every other scoped query here; RLS is the fence.
-        let exists = sqlx::query(
-            "SELECT 1 FROM log_streams \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
-        )
-        .bind(stream_id)
-        .bind(scope.tenant().to_string())
-        .bind(scope.environment().to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
-        if exists.is_none() {
+        if !stream_exists_in_tx(&mut tx, scope, stream_id).await? {
             return Err(StoreError::NotFound);
         }
         // The ORDERING KEY is the stream, so two replay commands for ONE stream execute in

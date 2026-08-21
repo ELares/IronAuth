@@ -1981,19 +1981,40 @@ async fn a_replay_request_enqueues_a_command_for_the_worker() {
     // replay would be invisible to anyone watching the event stream, which for this
     // subsystem is where operator-visible actions are recorded (there is no audit row: see
     // `request_dead_letter_replay`).
+    //
+    // POLLED, and the wait is the semantics rather than flakiness dressed up. The feed
+    // gates every row on `pg_snapshot_xmin(pg_current_snapshot())`, which is CLUSTER-wide,
+    // so a just-committed event is withheld until every transaction open anywhere on the
+    // instance has finished, including ones touching other databases. A single-shot read
+    // here failed roughly two runs in five under the parallel test binary, and a
+    // comment-only edit was enough to turn the suite red. `events_cursor_ordering.rs`
+    // carries the same wait for the same reason.
     let feed = format!("/v1/tenants/{tenant}/environments/{environment}/events");
-    let (status, _, feed_body) = h.get_as(&feed, OPERATOR_TOKEN).await;
-    assert_eq!(status, StatusCode::OK, "event feed: {feed_body}");
-    let feed_doc: Value = serde_json::from_str(&feed_body).expect("json");
-    // `events`, and the type is inside the envelope `payload`, not a sibling field.
-    let types: Vec<&str> = feed_doc["events"]
-        .as_array()
-        .expect("events")
-        .iter()
-        .filter_map(|item| item["payload"]["type"].as_str())
-        .collect();
+    let mut types: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        let (status, _, feed_body) = h.get_as(&feed, OPERATOR_TOKEN).await;
+        assert_eq!(status, StatusCode::OK, "event feed: {feed_body}");
+        let feed_doc: Value = serde_json::from_str(&feed_body).expect("json");
+        // `events`, and the type is inside the envelope `payload`, not a sibling field.
+        types = feed_doc["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter_map(|item| item["payload"]["type"].as_str())
+            .map(ToOwned::to_owned)
+            .collect();
+        if types
+            .iter()
+            .any(|kind| kind == "log_stream.replay_requested")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(
-        types.contains(&"log_stream.replay_requested"),
+        types
+            .iter()
+            .any(|kind| kind == "log_stream.replay_requested"),
         "the replay must announce itself on the event feed: {types:?}"
     );
 
@@ -2113,6 +2134,39 @@ async fn the_listing_is_fenced_and_its_bound_is_real() {
     assert_eq!(
         document["truncated"], true,
         "201 outstanding is more than one page, and an operator must be told: {body}"
+    );
+
+    // THE OTHER SIDE of the boundary. With 201 seeded, `>` and `>=` agree, so the arm above
+    // alone leaves the comparison unpinned: measured, widening it to `>=` survived. Replay
+    // the outstanding set down to exactly 200 and the page must report itself COMPLETE.
+    // Reading `truncated: true` on a full-but-complete page tells an operator they have a
+    // gap they cannot see, which is the number this endpoint exists to give them.
+    let outstanding = h
+        .control_store()
+        .scoped(scope)
+        .log_streams()
+        .outstanding_dead_letters(&stream_id)
+        .await
+        .expect("read");
+    assert_eq!(outstanding.len(), 201, "the fixture seeded 201");
+    h.control_store()
+        .scoped(scope)
+        .log_streams()
+        .mark_replayed(&env, &outstanding[0].id)
+        .await
+        .expect("retire one");
+
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        document["items"].as_array().expect("items").len(),
+        200,
+        "exactly the limit: {body}"
+    );
+    assert_eq!(
+        document["truncated"], false,
+        "200 outstanding is a COMPLETE page and must not be reported truncated: {body}"
     );
 }
 
@@ -2266,16 +2320,32 @@ async fn a_replay_for_an_unknown_stream_is_refused() {
         ("never existed", "lgs_definitely_not_a_stream"),
         ("another tenant's", foreign_stream.as_str()),
     ] {
-        let path = format!(
-            "/v1/tenants/{tenant}/environments/{environment}/log-streams/{stream}/dead-letters/replay"
+        let base = format!(
+            "/v1/tenants/{tenant}/environments/{environment}/log-streams/{stream}/dead-letters"
         );
         let (status, _, body) = h
-            .post_as(&path, OPERATOR_TOKEN, &format!("lgs-unknown-{label}"), "")
+            .post_as(
+                &format!("{base}/replay"),
+                OPERATOR_TOKEN,
+                &format!("lgs-unknown-{label}"),
+                "",
+            )
             .await;
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
             "a replay for a {label} stream must be refused, not accepted: {body}"
+        );
+
+        // The LISTING answers the same way. An empty page for a stream that does not exist
+        // is indistinguishable from a stream with nothing outstanding, so an operator who
+        // mistypes an id reads "no gap" and believes it. Both routes document a 404 for a
+        // stream in another scope, and until this the listing could not return one.
+        let (status, _, body) = h.get_as(&base, OPERATOR_TOKEN).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "listing a {label} stream's dead letters must not answer an empty page: {body}"
         );
     }
 

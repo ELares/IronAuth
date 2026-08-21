@@ -3155,6 +3155,14 @@ async fn start_log_shipper(
     // was still non-terminal after 15 seconds, while the identical command under bound
     // pools drained. The endpoint accepted, the worker existed, and nothing ran it, which
     // is the exact failure this whole branch was written to remove.
+    //
+    // WHAT KEEPS IT FIXED is the compiler, not a test, and that is worth stating rather
+    // than implying otherwise. `start_log_shipper` is a private `async fn` in the binary
+    // crate, so nothing can drive it; the guarantee is that `main` MOVES the returned Vec
+    // into the shutdown loop's `.chain(...)`, so re-binding these pools to a local here
+    // would be a use-after-move and would not compile. A test in `log_shipper.rs` builds
+    // and holds its OWN pool, which proves the drain path and would stay green through a
+    // regression at this call site.
     Some((shipper, replay_pools))
 }
 

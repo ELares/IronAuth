@@ -1643,6 +1643,27 @@ mod signed_stream_tests {
 /// The payload key a replay command carries the stream in.
 const REPLAY_PAYLOAD_STREAM_ID: &str = "log_stream_id";
 
+/// How a failed replay is classified for the outbox.
+///
+/// RETRYABLE. A replay fails because the store faulted or the sink is down again, and both
+/// can succeed later, so dropping the operator's request on the first failure would be
+/// wrong. The outbox's own attempt budget is what bounds the retrying, and a dead letter is
+/// marked replayed only when the sink ACCEPTED it, so a retry cannot double-count a partial
+/// pass.
+///
+/// A named function rather than an inline expression so the classification can be asserted.
+/// Inverting it to `permanent` is a one-word edit that would dead-letter an operator's
+/// replay command the first time a sink blinked, and it survived every test in this crate
+/// while the choice lived inline.
+#[must_use]
+pub fn replay_failure_for_test() -> ironauth_store::outbox::ConsumerError {
+    replay_failure()
+}
+
+fn replay_failure() -> ironauth_store::outbox::ConsumerError {
+    ironauth_store::outbox::ConsumerError::retryable("replay_failed")
+}
+
 /// Executes the dead-letter replay commands the management API enqueues (issue #938).
 ///
 /// A replay re-reads set-aside audit ranges and re-ships them to the stream's sink. That is
@@ -1684,11 +1705,7 @@ impl LogStreamReplayConsumer {
             })?;
         let replayed = replay_dead_letters(&self.store, env, scope, stream_id, &self.sinks)
             .await
-            // A failed replay can succeed later (the sink may simply be down again), so this
-            // RETRIES rather than dropping the operator's request; the outbox's own attempt
-            // budget is what bounds it, and a dead letter is only marked replayed when the
-            // sink accepted it, so a retry cannot double-count a partial pass.
-            .map_err(|_| ironauth_store::outbox::ConsumerError::retryable("replay_failed"))?;
+            .map_err(|_| replay_failure())?;
         tracing::info!(stream_id, replayed, "replayed log stream dead letters");
         Ok(())
     }

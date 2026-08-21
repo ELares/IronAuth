@@ -1039,3 +1039,25 @@ async fn a_held_pool_drains_a_command_the_producer_enqueued() {
         "and the replay must have reached the sink"
     );
 }
+
+/// A failed replay is RETRYABLE, not permanent.
+///
+/// Inverting it is a one-word edit that dead-letters an operator's replay command the first
+/// time a sink blinks, and it survived every test in this crate while the choice lived
+/// inline in the error path. Its sibling, `permanent` for a payload that can never become
+/// valid, is pinned by `a_replay_command_without_a_stream_id_is_permanent`; the two together
+/// are the whole classification.
+///
+/// This asserts the CHOICE rather than driving a store fault to reach it. Inducing a real
+/// fault here would mean breaking the database out from under a live consumer, which tests
+/// something else and leaves the classification just as unpinned if it were ever reached by
+/// a different path.
+#[test]
+fn a_failed_replay_is_retryable() {
+    let error = ironauth_admin::log_shipper::replay_failure_for_test();
+    assert!(
+        error.is_retryable(),
+        "a sink that is down again must not permanently dead-letter the request: {error:?}"
+    );
+    assert_eq!(error.label(), "replay_failed");
+}
