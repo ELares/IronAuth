@@ -35,7 +35,12 @@ PROVIDER_DIR="terraform-provider-ironauth/internal/provider"
 # belongs with the rest of the provider work and is not something to bolt on inside the
 # API's own change; doing that would mean shipping a provider resource with no acceptance
 # test alongside it.
-UNCOVERED_CEILING=21
+# RAISED 21 -> 22 for `createFlowTarget` (issue #112), for the same reason and on the same
+# terms as the log-stream raise above: HTTP flow targets are new surface, so the denominator
+# grew rather than coverage slipping. A Terraform resource for registering a flow target
+# belongs with the provider work, and bolting one on inside the API's own change would mean
+# shipping a provider resource with no acceptance test beside it.
+UNCOVERED_CEILING=22
 
 python3 - "$SPEC" "$PROVIDER_DIR" "$UNCOVERED_CEILING" <<'PY'
 import collections, json, pathlib, re, sys

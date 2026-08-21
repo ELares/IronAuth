@@ -135,6 +135,10 @@ class Client:
         """Create an environment under a tenant. POST /v1/tenants/{tenant_id}/environments."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments", query, body)
 
+    def create_flow_target(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Register an HTTP flow target. POST /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/flow-targets", query, body)
+
     def create_flow_version(self, tenant_id: str, environment_id: str, journey_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Create a new version of a custom journey. POST /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/journeys/{urllib.parse.quote(journey_id)}/versions", query, body)
@@ -238,6 +242,10 @@ class Client:
     def delete_environment(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Deactivate an environment (soft delete; idempotent). DELETE /v1/tenants/{tenant_id}/environments/{environment_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}", query, None)
+
+    def delete_flow_target(self, tenant_id: str, environment_id: str, target_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Deregister an HTTP flow target. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/flow-targets/{urllib.parse.quote(target_id)}", query, None)
 
     def delete_locale(self, tenant_id: str, environment_id: str, locale: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Delete a per-environment locale bundle by tag. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}."""
@@ -538,6 +546,10 @@ class Client:
     def list_environments(self, tenant_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List environments under a tenant (cursor paginated). GET /v1/tenants/{tenant_id}/environments."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments", query, None)
+
+    def list_flow_targets(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List every registered HTTP flow target in the environment. GET /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/flow-targets", query, None)
 
     def list_flow_versions(self, tenant_id: str, environment_id: str, journey_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List every version of a custom journey (ascending by version). GET /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions."""

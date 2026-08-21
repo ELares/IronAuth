@@ -322,6 +322,10 @@ struct Fixture {
     /// they answer the uniform not-found at a LIVE environment too, and driving them at a
     /// soft-deleted one would measure nothing about the fence.
     log_stream: String,
+    /// A live flow target, so the DELETE case addresses a real one. A synthetic `ftg_absent`
+    /// does not decode as a scoped id, so the handler answers the uniform not-found at a LIVE
+    /// environment too, and driving it at a soft-deleted one would measure nothing.
+    flow_target: String,
     webhook_endpoint: String,
     family: String,
     recovery_flow: String,
@@ -608,6 +612,31 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "seed log stream: {body}");
         let log_stream = field(&body, "/id", "seed log stream");
+
+        // A live flow target, so the DELETE case addresses a REAL row. A synthetic id like
+        // `ftg_absent` does not decode as a scoped id, so the handler answers the uniform
+        // not-found at a LIVE environment too, and driving it at a soft-deleted one would
+        // measure nothing about the fence. That is this file's own rule, stated in its
+        // header, and the log-stream idiom it was copied from only works because that delete
+        // takes a bare string and never parses it.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/flow-targets"),
+                "seed-flow-target",
+                &serde_json::json!({
+                    "name": "live-surface-seed",
+                    "target_class": "request",
+                    "invocation": "sync",
+                    "timing": "pre_persist",
+                    "endpoint": "https://target.example/check",
+                    "timeout_ms": 500,
+                    "failure_policy": "fail_closed",
+                })
+                .to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed flow target: {body}");
+        let flow_target = field(&body, "/id", "seed flow target");
 
         let (status, _, body) = h
             .post(
@@ -1117,6 +1146,7 @@ impl Fixture {
             client,
             connector,
             log_stream,
+            flow_target,
             webhook_endpoint,
             family,
             recovery_flow,
@@ -1170,6 +1200,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         pat,
         connector,
         log_stream,
+        flow_target,
         webhook_endpoint,
         family,
         recovery_flow,
@@ -1263,6 +1294,26 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "queues.listQueueDepths",
             "GET",
             format!("{base}/queues"),
+        ),
+        // ---- HTTP flow targets (issue #112) ----
+        Case::empty(
+            "flow_targets.listFlowTargets",
+            "GET",
+            format!("{base}/flow-targets"),
+        ),
+        Case::json(
+            "flow_targets.createFlowTarget",
+            "POST",
+            format!("{base}/flow-targets"),
+            &serde_json::json!({"name": "live-surface-probe", "target_class": "request",
+                               "invocation": "sync", "timing": "pre_persist",
+                               "endpoint": "https://target.example/check",
+                               "timeout_ms": 500, "failure_policy": "fail_closed"}),
+        ),
+        Case::empty(
+            "flow_targets.deleteFlowTarget",
+            "DELETE",
+            format!("{base}/flow-targets/{flow_target}"),
         ),
         // ---- SIEM log streams (issue #110) ----
         Case::empty(
@@ -2541,6 +2592,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         api_key: "akey_0".to_owned(),
         connector: "con_0".to_owned(),
         log_stream: "lgs_0".to_owned(),
+        flow_target: "ftg_0".to_owned(),
         webhook_endpoint: "whe_0".to_owned(),
         family: "rfm_0".to_owned(),
         recovery_flow: "rcf_0".to_owned(),

@@ -256,6 +256,35 @@ impl Ids {
     }
 }
 
+/// The HTTP flow target registration writes (issue #112).
+fn flow_target_cases(base: &str) -> Vec<Case> {
+    vec![
+        Case {
+            label: "flow_targets.createFlowTarget",
+            method: "POST",
+            path: format!("{base}/flow-targets"),
+            body: Some(
+                serde_json::json!({
+                    "name": "absent-environment-probe",
+                    "target_class": "request",
+                    "invocation": "sync",
+                    "timing": "pre_persist",
+                    "endpoint": "https://target.example/check",
+                    "timeout_ms": 500,
+                    "failure_policy": "fail_closed",
+                })
+                .to_string(),
+            ),
+        },
+        Case {
+            label: "flow_targets.deleteFlowTarget",
+            method: "DELETE",
+            path: format!("{base}/flow-targets/ftg_absent"),
+            body: None,
+        },
+    ]
+}
+
 /// The SIEM log stream configuration writes (issue #110).
 fn log_stream_cases(base: &str) -> Vec<Case> {
     vec![
@@ -1276,6 +1305,7 @@ fn all_cases(tenant: &str, environment: &str) -> Vec<Case> {
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
     let ids = Ids::mint(tenant, environment);
     let mut cases = abuse_and_sudo_cases(&base);
+    cases.extend(flow_target_cases(&base));
     cases.extend(log_stream_cases(&base));
     cases.extend(client_cases(&base, &ids));
     cases.extend(secret_cases(&base));

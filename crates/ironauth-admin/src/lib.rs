@@ -79,6 +79,7 @@ pub mod log_shipper;
 pub mod log_stream_signature;
 
 pub mod ciba_ping;
+mod flow_targets;
 mod log_streams;
 mod mds3_health;
 mod memberships;
@@ -1077,6 +1078,18 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/queues",
             axum::routing::get(queues::list_queue_depths),
+        )
+        // HTTP flow target registration (issue #112). Until this existed the table granted
+        // INSERT to `ironauth_control` only and nothing mounted a route, so the dispatcher
+        // was reachable by nothing an operator could do.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets",
+            axum::routing::get(flow_targets::list_flow_targets)
+                .post(flow_targets::create_flow_target),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}",
+            axum::routing::delete(flow_targets::delete_flow_target),
         )
         // Standard Webhooks endpoint registration (issue #105).
         .route(

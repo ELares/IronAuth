@@ -5754,6 +5754,273 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets": {
+      "get": {
+        "tags": [
+          "flow-targets"
+        ],
+        "summary": "List every registered HTTP flow target in the environment.",
+        "operationId": "listFlowTargets",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The registered targets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowTargetList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "flow-targets"
+        ],
+        "summary": "Register an HTTP flow target.",
+        "operationId": "createFlowTarget",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetFlowTargetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The registered target",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowTargetCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, an unknown vocabulary value, a sync target without a bound, or a bound above the ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}": {
+      "delete": {
+        "tags": [
+          "flow-targets"
+        ],
+        "summary": "Deregister an HTTP flow target.",
+        "operationId": "deleteFlowTarget",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target_id",
+            "in": "path",
+            "description": "The flow target identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deregistered"
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such target, or the environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness": {
       "get": {
         "tags": [
@@ -25212,6 +25479,103 @@
           }
         }
       },
+      "FlowTargetCreated": {
+        "type": "object",
+        "description": "The identifier a registration returns.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The `ftg_` identifier."
+          }
+        }
+      },
+      "FlowTargetList": {
+        "type": "object",
+        "description": "Every registered target in the environment.",
+        "required": [
+          "targets"
+        ],
+        "properties": {
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FlowTargetView"
+            },
+            "description": "The targets, by name."
+          }
+        }
+      },
+      "FlowTargetView": {
+        "type": "object",
+        "description": "One registered target, as an operator reads it.",
+        "required": [
+          "id",
+          "name",
+          "target_class",
+          "invocation",
+          "timing",
+          "endpoint",
+          "failure_policy",
+          "config",
+          "enabled"
+        ],
+        "properties": {
+          "config": {
+            "type": "object",
+            "description": "Plain JSON, returned verbatim. Never code."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the dispatcher will call it. A DISABLED target is listed, not hidden: one\nmissing from the listing would read as deregistered."
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "Where it POSTs."
+          },
+          "failure_policy": {
+            "type": "string",
+            "description": "What to do when a sync target does not answer: `fail_open` or `fail_closed`."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `ftg_` identifier."
+          },
+          "invocation": {
+            "type": "string",
+            "description": "Whether the flow waits: `sync` or `async`."
+          },
+          "name": {
+            "type": "string",
+            "description": "The operator-facing name, unique among live targets in the environment."
+          },
+          "signing_secret_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The NAME of the environment secret this target's payloads are signed with, never its\nvalue, and [`None`] when the target is deliberately unsigned."
+          },
+          "target_class": {
+            "type": "string",
+            "description": "Which class of flow point invokes it: `request`, `response`, `function`, or `event`."
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The bound on a sync call, in milliseconds."
+          },
+          "timing": {
+            "type": "string",
+            "description": "When it runs relative to the write: `pre_persist` or `post_persist`."
+          }
+        }
+      },
       "FlowVersionView": {
         "type": "object",
         "description": "A custom-journey version, as returned by the management API (issue #92, PR 5).",
@@ -28338,6 +28702,70 @@
               "type": "string"
             },
             "description": "The event types to receive, or an explicit `null` to receive EVERY type. The field\nis required so that \"everything\" is stated rather than inferred from an omission."
+          }
+        }
+      },
+      "SetFlowTargetRequest": {
+        "type": "object",
+        "description": "Register or reconfigure a target.",
+        "required": [
+          "name",
+          "target_class",
+          "invocation",
+          "timing",
+          "endpoint",
+          "failure_policy"
+        ],
+        "properties": {
+          "config": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Plain JSON. Never code."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the dispatcher calls it. Defaults to true."
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "Where it POSTs. Reached through the outbound policy, so a private or link-local\naddress is refused at call time."
+          },
+          "failure_policy": {
+            "type": "string",
+            "description": "`fail_open` or `fail_closed`."
+          },
+          "invocation": {
+            "type": "string",
+            "description": "`sync` or `async`."
+          },
+          "name": {
+            "type": "string",
+            "description": "The operator-facing name, unique among live targets in the environment."
+          },
+          "signing_secret_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The NAME of an environment secret, never a secret value."
+          },
+          "target_class": {
+            "type": "string",
+            "description": "`request`, `response`, `function`, or `event`."
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The bound on a sync call, in milliseconds. Required for a sync target and refused\nabove the ceiling."
+          },
+          "timing": {
+            "type": "string",
+            "description": "`pre_persist` or `post_persist`."
           }
         }
       },

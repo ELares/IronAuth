@@ -40108,14 +40108,17 @@ impl ActingFlowTargetRepo<'_> {
     /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Database`] on a
     /// persistence failure, including the CHECKs that keep an async target post-persist and a
     /// sync target bounded.
+    /// Returns the LIVE id, which is the caller's `id` on an insert and the EXISTING row's id
+    /// when the name already names one. They differ, and the difference matters: see
+    /// [`Self::set_with_event`].
     pub async fn set(
         &self,
         env: &Env,
         id: &FlowTargetId,
         created_at_micros: i64,
         params: NewFlowTarget<'_>,
-    ) -> Result<(), StoreError> {
-        self.set_with_event(env, id, created_at_micros, params, None)
+    ) -> Result<FlowTargetId, StoreError> {
+        self.set_with_event(env, id, created_at_micros, params, None, None)
             .await
     }
 
@@ -40130,13 +40133,19 @@ impl ActingFlowTargetRepo<'_> {
         id: &FlowTargetId,
         created_at_micros: i64,
         params: NewFlowTarget<'_>,
-        event: Option<&DomainEvent<'_>>,
-    ) -> Result<(), StoreError> {
+        idempotency: Option<ResolvedIdempotencyWrite<'_, FlowTargetId>>,
+        // RESOLVED, for the same reason the idempotent body is. The event's subject and its
+        // `flow_target_id` must name the row the upsert KEPT, and that is knowable only after
+        // `RETURNING id`. A pre-built event carries the caller's guess, and on an overwrite,
+        // or under a concurrent create of the same name, it announces a row that does not
+        // exist. `Sync` because the write is held across an await inside an axum handler
+        // whose future must be `Send`.
+        event: Option<ResolvedEventBuilder<'_, FlowTargetId>>,
+    ) -> Result<FlowTargetId, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
-        let target = *id;
         let name = params.name.to_owned();
         let class = target_class_wire(params.target_class);
         let invocation = match params.invocation {
@@ -40151,64 +40160,79 @@ impl ActingFlowTargetRepo<'_> {
             crate::flow_target::FailurePolicy::FailOpen => "fail_open",
             crate::flow_target::FailurePolicy::FailClosed => "fail_closed",
         };
-        let endpoint = params.endpoint.to_owned();
-        let timeout = params.timeout_ms;
-        let config = params.config.clone();
-        let secret = params.signing_secret_name.map(ToOwned::to_owned);
-        let enabled = params.enabled;
-        write_audited(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::FlowTargetSet,
-                target: &target,
-            },
-            async move |tx| {
-                sqlx::query(
-                    "INSERT INTO flow_targets \
-                     (id, tenant_id, environment_id, name, target_class, invocation, timing, \
-                      endpoint, timeout_ms, failure_policy, config, signing_secret_name, \
-                      enabled, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, \
-                             TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval) \
-                     ON CONFLICT (tenant_id, environment_id, name) WHERE deleted_at IS NULL \
-                     DO UPDATE SET target_class = EXCLUDED.target_class, \
-                                   invocation = EXCLUDED.invocation, \
-                                   timing = EXCLUDED.timing, \
-                                   endpoint = EXCLUDED.endpoint, \
-                                   timeout_ms = EXCLUDED.timeout_ms, \
-                                   failure_policy = EXCLUDED.failure_policy, \
-                                   config = EXCLUDED.config, \
-                                   signing_secret_name = EXCLUDED.signing_secret_name, \
-                                   enabled = EXCLUDED.enabled, \
-                                   updated_at = EXCLUDED.updated_at",
-                )
-                .bind(target.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(&name)
-                .bind(class)
-                .bind(invocation)
-                .bind(timing)
-                .bind(&endpoint)
-                .bind(timeout)
-                .bind(policy)
-                .bind(&config)
-                .bind(secret.as_deref())
-                .bind(enabled)
-                .bind(created_at_micros)
-                .execute(&mut **tx)
-                .await?;
-                // In the write's transaction: a rolled-back registration announces nothing.
-                enqueue_domain_event(tx, env, scope, event).await?;
-                Ok(())
-            },
-            false,
+
+        // The live id is known only AFTER the upsert (the same defect issue #436 fixed on
+        // `ScopeStepUpPolicyRepo::set`): the ON CONFLICT branch arbitrates on NAME and does
+        // not list `id` in its SET, so on every overwrite the caller's freshly minted
+        // candidate names a row that is persisted nowhere. Returning it would hand the
+        // caller an id that 404s on the very next request, stamp it into the emitted event,
+        // and audit against a row that does not exist. So this write inlines its own audited
+        // transaction and takes the target from `RETURNING id`.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "INSERT INTO flow_targets \
+             (id, tenant_id, environment_id, name, target_class, invocation, timing, \
+              endpoint, timeout_ms, failure_policy, config, signing_secret_name, \
+              enabled, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, \
+                     TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, name) WHERE deleted_at IS NULL \
+             DO UPDATE SET target_class = EXCLUDED.target_class, \
+                           invocation = EXCLUDED.invocation, \
+                           timing = EXCLUDED.timing, \
+                           endpoint = EXCLUDED.endpoint, \
+                           timeout_ms = EXCLUDED.timeout_ms, \
+                           failure_policy = EXCLUDED.failure_policy, \
+                           config = EXCLUDED.config, \
+                           signing_secret_name = EXCLUDED.signing_secret_name, \
+                           enabled = EXCLUDED.enabled, \
+                           updated_at = EXCLUDED.updated_at \
+             RETURNING id",
         )
-        .await
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&name)
+        .bind(class)
+        .bind(invocation)
+        .bind(timing)
+        .bind(params.endpoint)
+        .bind(params.timeout_ms)
+        .bind(policy)
+        .bind(params.config)
+        .bind(params.signing_secret_name)
+        .bind(params.enabled)
+        .bind(created_at_micros)
+        .fetch_one(&mut *tx)
+        .await?;
+        let live_id = FlowTargetId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::FlowTargetSet,
+            target: &live_id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        // In the SAME transaction as the upsert and its audit row, so a replayed request
+        // cannot re-execute the write. Without this the key is demanded and checked and
+        // never recorded, so the replay lookup can never hit and the documented promise that
+        // a retry returns the original response is false.
+        //
+        // RESOLVED, not pre-serialized: the stored body is rendered from the id the upsert
+        // actually returned. A body built up front from the candidate would store a phantom
+        // id on every overwrite, and store it forever, which is the failure this type exists
+        // for and which its own doc describes.
+        insert_resolved_idempotency(&mut tx, idempotency, &live_id).await?;
+        // BEFORE the commit, in the upsert's own transaction, and built from the LIVE id.
+        let resolved_event = event.and_then(|build| build(&live_id));
+        let borrowed = resolved_event.as_ref().map(OwnedDomainEvent::borrowed);
+        enqueue_domain_event(&mut tx, env, scope, borrowed.as_ref()).await?;
+        tx.commit().await?;
+        Ok(live_id)
     }
 
     /// Enqueue an ASYNC target delivery, inheriting the outbox's retries and dead-lettering
@@ -40442,6 +40466,84 @@ impl FlowTargetRepo<'_> {
             .open_value(master, name)
             .await?;
         Ok(Some(opened))
+    }
+
+    /// EVERY live target in this scope, of every class, enabled or not, by name.
+    ///
+    /// The management read, distinct from [`Self::enabled_for_class`] in both directions:
+    /// that one answers "which targets fire here", so it filters to one class and to enabled
+    /// only. This one answers "what has an operator registered", so it filters neither. A
+    /// disabled target missing from the listing would read as deregistered, and the natural
+    /// next act is to register it a second time.
+    ///
+    /// Deleted targets stay excluded: `deleted_at` is a tombstone, not a state an operator
+    /// can see or restore from here.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, including a column carrying a value
+    /// outside its closed vocabulary.
+    pub async fn list(&self) -> Result<Vec<crate::flow_target::FlowTargetListing>, StoreError> {
+        let statement = sqlx::query(
+            "SELECT id, name, target_class, invocation, timing, endpoint, timeout_ms, \
+                    failure_policy, config, signing_secret_name, enabled \
+             FROM flow_targets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+             ORDER BY name",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string());
+
+        // Scoped, because `flow_targets` is FORCE RLS: an unscoped read returns an EMPTY set
+        // rather than an error, which here would present as "nothing is registered" and
+        // invite an operator to register a duplicate.
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = statement.fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                let class_text: String = row.get("target_class");
+                let invocation_text: String = row.get("invocation");
+                let timing_text: String = row.get("timing");
+                let policy_text: String = row.get("failure_policy");
+                Ok(crate::flow_target::FlowTargetListing {
+                    enabled: row.get("enabled"),
+                    record: crate::flow_target::FlowTargetRecord {
+                        id: crate::id::FlowTargetId::parse_in_scope(&id_text, &self.scope)
+                            .map_err(|_| decode_error("flow target id", &id_text))?,
+                        name: row.get("name"),
+                        target_class: match class_text.as_str() {
+                            "request" => crate::flow_target::TargetClass::Request,
+                            "response" => crate::flow_target::TargetClass::Response,
+                            "function" => crate::flow_target::TargetClass::Function,
+                            "event" => crate::flow_target::TargetClass::Event,
+                            other => return Err(decode_error("flow target class", other)),
+                        },
+                        invocation: match invocation_text.as_str() {
+                            "sync" => crate::flow_target::Invocation::Sync,
+                            "async" => crate::flow_target::Invocation::Async,
+                            other => return Err(decode_error("flow target invocation", other)),
+                        },
+                        timing: match timing_text.as_str() {
+                            "pre_persist" => crate::flow_target::Timing::PrePersist,
+                            "post_persist" => crate::flow_target::Timing::PostPersist,
+                            other => return Err(decode_error("flow target timing", other)),
+                        },
+                        endpoint: row.get("endpoint"),
+                        timeout_ms: row.get("timeout_ms"),
+                        failure_policy: match policy_text.as_str() {
+                            "fail_open" => crate::flow_target::FailurePolicy::FailOpen,
+                            "fail_closed" => crate::flow_target::FailurePolicy::FailClosed,
+                            other => return Err(decode_error("flow target failure policy", other)),
+                        },
+                        config: row.get("config"),
+                        signing_secret_name: row.get("signing_secret_name"),
+                    },
+                })
+            })
+            .collect()
     }
 }
 
@@ -59564,6 +59666,42 @@ pub struct DomainEvent<'a> {
     /// specifies.
     pub envelope: &'a serde_json::Value,
 }
+
+/// A [`DomainEvent`] that OWNS its parts, for a write that can only build the event after it
+/// knows what it wrote.
+///
+/// An upsert that arbitrates on a natural key does not know the row's id until `RETURNING id`,
+/// so an event built beforehand carries the caller's guess and, on an overwrite, announces a
+/// row that does not exist. A borrowing [`DomainEvent`] cannot be returned from a builder
+/// called INSIDE the write, because there is nothing outside it for the borrow to point at.
+/// This owns its parts so the store can hold it locally and borrow from it for the enqueue.
+#[derive(Debug, Clone)]
+pub struct OwnedDomainEvent {
+    /// The event's stable id.
+    pub id: String,
+    /// The entity the event is about.
+    pub subject: String,
+    /// The envelope a receiver is sent.
+    pub envelope: serde_json::Value,
+}
+
+impl OwnedDomainEvent {
+    /// Borrow this as the carrier an emitting store write takes.
+    #[must_use]
+    pub fn borrowed(&self) -> DomainEvent<'_> {
+        DomainEvent {
+            id: &self.id,
+            subject: &self.subject,
+            envelope: &self.envelope,
+        }
+    }
+}
+
+/// Builds the event a write emits, from what that write RESOLVED.
+///
+/// A named alias because the bare type is unreadable and clippy refuses it. See
+/// [`OwnedDomainEvent`] for why the event cannot simply be passed in already built.
+pub type ResolvedEventBuilder<'a, R> = &'a (dyn Fn(&R) -> Option<OwnedDomainEvent> + Sync);
 
 /// The scheduled-offboarding half of a user state change (issue #52).
 ///

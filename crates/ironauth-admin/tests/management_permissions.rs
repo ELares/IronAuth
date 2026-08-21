@@ -227,6 +227,13 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // SIEM log streams (issue #110). A READ: the status surface exposes delivery health
     // and the NAME of the sink credential, never its value.
     ("listLogStreams", ManagementPermission::Read),
+    // Registering an HTTP flow target (issue #112) is `write_config` for the same reason the
+    // two below are: it names an outbound destination the server will call. It is if anything
+    // the stronger case, because a fail-closed target refuses every signup in the environment
+    // until it answers, so registering one is closer to a kill switch than to configuration.
+    ("listFlowTargets", ManagementPermission::Read),
+    ("createFlowTarget", ManagementPermission::WriteConfig),
+    ("deleteFlowTarget", ManagementPermission::WriteConfig),
     // The configuration writes are `write_config`, the same class the webhook endpoint
     // registration uses: both name an outbound destination the server will send to.
     ("createLogStream", ManagementPermission::WriteConfig),
@@ -586,6 +593,15 @@ const PERMISSION_PROVEN: &[&str] = &[
     // Proven in `only_a_credential_holding_impersonate_can_authorize_one`, which drives a
     // credential holding every OTHER permission and asserts the refusal names this one.
     "authorizeUserImpersonation",
+    // Proven across `the_flow_target_surface_splits_reading_from_registering` and
+    // `registering_a_flow_target_demands_write_config`, which drive all three in both
+    // directions: the listing served under read and refused (naming `management.read`) under
+    // a different permission and unauthenticated; the register and the deregister refused
+    // under read alone, with the register's refusal asserted to name
+    // `management.write_config`, then both served under it.
+    "listFlowTargets",
+    "createFlowTarget",
+    "deleteFlowTarget",
     // Proven in `the_log_stream_status_read_demands_read_and_never_answers_unauthenticated`,
     // which drives it in BOTH directions: served under read, refused with the required
     // permission named under a different one.
@@ -625,7 +641,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 168 operations declare a required permission and 24 have that permission proven. The other
+/// 171 operations declare a required permission and 27 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -640,7 +656,9 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// without somebody editing this assertion and noticing what they are doing.
 ///
 /// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 166 minus 22 is always 144. That is deliberate rather than an oversight. The
+/// its own: 171 minus 27 is always 144. (It read "166 minus 22" for two raises before this
+/// one, which is the hazard of writing an arithmetic identity beside the numbers it derives
+/// from rather than deriving it.) That is deliberate rather than an oversight. The
 /// ratchet's job was to catch a drift nothing else measured, and two exact pins catch it
 /// earlier and name which set moved. What the ratchet still carries is its message, which is
 /// the instruction for the person who just made one of those pins fail.
@@ -654,12 +672,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        168,
+        171,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        24,
+        27,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -683,6 +701,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     ),
     ("impersonation.rs", include_str!("../src/impersonation.rs")),
     ("authzen.rs", include_str!("../src/authzen.rs")),
+    ("flow_targets.rs", include_str!("../src/flow_targets.rs")),
     ("log_streams.rs", include_str!("../src/log_streams.rs")),
     ("event_feed.rs", include_str!("../src/event_feed.rs")),
     ("usage.rs", include_str!("../src/usage.rs")),

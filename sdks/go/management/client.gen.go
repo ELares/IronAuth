@@ -218,6 +218,13 @@ func (c *Client) CreateEnvironment(tenant_id string, query url.Values, body any)
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments", query, body)
 }
 
+// CreateFlowTarget performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets.
+//
+// Register an HTTP flow target.
+func (c *Client) CreateFlowTarget(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/flow-targets", query, body)
+}
+
 // CreateFlowVersion performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions.
 //
 // Create a new version of a custom journey.
@@ -398,6 +405,13 @@ func (c *Client) DeleteConnector(tenant_id string, environment_id string, connec
 // Deactivate an environment (soft delete; idempotent).
 func (c *Client) DeleteEnvironment(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id), query, nil)
+}
+
+// DeleteFlowTarget performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}.
+//
+// Deregister an HTTP flow target.
+func (c *Client) DeleteFlowTarget(tenant_id string, environment_id string, target_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/flow-targets/" + escape(target_id), query, nil)
 }
 
 // DeleteLocale performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}.
@@ -923,6 +937,13 @@ func (c *Client) ListDcrPolicies(tenant_id string, environment_id string, query 
 // List environments under a tenant (cursor paginated).
 func (c *Client) ListEnvironments(tenant_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments", query, nil)
+}
+
+// ListFlowTargets performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets.
+//
+// List every registered HTTP flow target in the environment.
+func (c *Client) ListFlowTargets(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/flow-targets", query, nil)
 }
 
 // ListFlowVersions performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/journeys/{journey_id}/versions.
