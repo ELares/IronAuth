@@ -55,6 +55,48 @@ mod flow_target;
 /// ceiling, so a fetcher built with a smaller one would silently truncate every target
 /// registered above it and the operator's stated bound would be quietly false.
 pub use flow_target::MAX_SYNC_TIMEOUT_MS as FLOW_TARGET_MAX_SYNC_TIMEOUT_MS;
+
+/// What a non-flow caller should do about the registered sync flow targets (issue #112).
+///
+/// Deliberately coarser than the flow API's own decision: it carries no field mapping,
+/// because the caller has no node model to attach one to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetDecision {
+    /// No sync pre-persist target objected. Continue.
+    Allow,
+    /// A target rejected the registration, or a fail-closed one could not be consulted.
+    Refuse,
+}
+
+/// Consult the registered sync PRE-PERSIST targets for a registration outside the flow API.
+///
+/// The legacy `POST /register` route creates accounts and is mounted unconditionally, so it
+/// needs the same consultation the flow path gets, or an operator's fail-closed target is
+/// bypassed by posting to the other door. It cannot render a field-mapped rejection, so an
+/// interruption collapses to [`TargetDecision::Refuse`]: a worse message, the same security
+/// answer.
+pub async fn dispatch_registration_targets(
+    state: &crate::state::OidcState,
+    scope: ironauth_store::Scope,
+    identifier: &str,
+    traits: Option<&serde_json::Value>,
+) -> TargetDecision {
+    let data = serde_json::json!({ "identifier": identifier, "traits": traits });
+    match flow_target::dispatch_sync(
+        state,
+        scope,
+        ironauth_store::flow_target::Timing::PrePersist,
+        &data,
+        None,
+    )
+    .await
+    {
+        flow_target::Decision::Allow => TargetDecision::Allow,
+        flow_target::Decision::Interrupt(_) | flow_target::Decision::Refuse => {
+            TargetDecision::Refuse
+        }
+    }
+}
 mod login;
 mod mfa;
 mod orchestration;

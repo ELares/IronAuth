@@ -153,16 +153,26 @@ impl FlowTargetRecord {
 /// wrong, and signature verification is the code where subtle wrongness is silent -- a
 /// verifier that accepts too much reports nothing at all.
 ///
-/// # Why the target id is the delivery id
+/// # Why the id is PER CALL, and why it still names the target
 ///
 /// `sign_delivery` binds an id into what it signs, which is what stops a payload being
-/// replayed against a different delivery. For a flow target the natural binding is the target
-/// itself: a payload signed for one target must not verify at another that happens to share a
-/// secret, which is the same property the log-stream signature gets from binding the stream id.
+/// replayed against a different delivery. An earlier revision bound the TARGET id, reasoning
+/// that a payload signed for one target must not verify at another sharing a secret. That
+/// property is real, but the id it chose is wrong for a second reason that outweighs it:
+/// `webhook-id` is the RECEIVER'S DEDUPLICATION HANDLE. The webhook delivery path says so in
+/// as many words, and the configuration reference repeats it. A constant id makes every
+/// consultation after the first look like a replay of the first, so a receiver written to
+/// this repository's own guidance drops it or echoes its cached first answer, and a fraud
+/// check is bypassed with nobody attacking anything.
+///
+/// So the caller passes [`delivery_id`], which is `<target id>.<per-call nonce>`: unique per
+/// call, so deduplication works and a captured response cannot be replayed against a later
+/// consultation inside the tolerance window, and still prefixed by the target, so the
+/// cross-target property the earlier revision wanted is kept.
 #[must_use]
 pub fn sign_payload(
     secret: &ironauth_jose::webhooks::WebhookSecret,
-    target_id: &crate::id::FlowTargetId,
+    delivery_id: &str,
     timestamp_secs: i64,
     payload: &[u8],
 ) -> String {
@@ -172,10 +182,20 @@ pub fn sign_payload(
     // not own.
     ironauth_jose::webhooks::sign_delivery(
         std::slice::from_ref(secret),
-        &target_id.to_string(),
+        delivery_id,
         timestamp_secs,
         payload,
     )
+}
+
+/// The id one consultation is signed under: `<target id>.<per-call nonce>`.
+///
+/// Per call because `webhook-id` is the receiver's deduplication handle; prefixed by the
+/// target so a payload signed for one target still cannot verify at another that happens to
+/// share a secret. See [`sign_payload`].
+#[must_use]
+pub fn delivery_id(target_id: &crate::id::FlowTargetId, nonce: &str) -> String {
+    format!("{target_id}.{nonce}")
 }
 
 /// A field-level validation error from a SYNC target (issue #112 criterion 1).
@@ -286,12 +306,14 @@ mod tests {
         let signed_for = target(Invocation::Sync, Timing::PrePersist);
         let payload = br#"{"email":"person@example.test"}"#;
         let now = 1_735_689_600_i64;
-        let header = sign_payload(&secret, &signed_for.id, now, payload);
+        // The PER-CALL id, as the dispatcher builds it.
+        let this_call = delivery_id(&signed_for.id, "call-one");
+        let header = sign_payload(&secret, &this_call, now, payload);
 
         assert!(
             ironauth_jose::webhooks::verify_delivery(
                 std::slice::from_ref(&secret),
-                &signed_for.id.to_string(),
+                &this_call,
                 &now.to_string(),
                 payload,
                 &header,
@@ -303,14 +325,13 @@ mod tests {
              for the same deployment"
         );
 
-        // A payload signed for ONE target must not verify at another. `sign_delivery` binds
-        // the id into what it signs, and binding the TARGET is what stops a payload being
-        // replayed at a different target that happens to share a secret.
+        // A payload signed for ONE target must not verify at another. The delivery id is
+        // PREFIXED by the target, so that property survives the move to a per-call id.
         let other = target(Invocation::Sync, Timing::PrePersist);
         assert!(
             ironauth_jose::webhooks::verify_delivery(
                 std::slice::from_ref(&secret),
-                &other.id.to_string(),
+                &delivery_id(&other.id, "call-one"),
                 &now.to_string(),
                 payload,
                 &header,
@@ -319,6 +340,26 @@ mod tests {
             )
             .is_err(),
             "a payload lifted to another target must not verify"
+        );
+
+        // And a payload must not verify against a DIFFERENT CALL to the same target. This is
+        // the property the per-call id exists for: `webhook-id` is the receiver's dedup
+        // handle, so a constant one made every consultation after the first look like a
+        // replay of the first, and a receiver following this repository's own guidance would
+        // drop it or echo its cached first answer, bypassing the check with no attacker.
+        assert!(
+            ironauth_jose::webhooks::verify_delivery(
+                std::slice::from_ref(&secret),
+                &delivery_id(&signed_for.id, "call-two"),
+                &now.to_string(),
+                payload,
+                &header,
+                300,
+                now,
+            )
+            .is_err(),
+            "a captured delivery must not verify against a later consultation of the same \
+             target, or a response can be replayed inside the tolerance window"
         );
     }
 

@@ -97,7 +97,7 @@ pub(super) async fn load_active_signup_form(
 /// The message context key naming a field's RFC 6901 trait pointer (issue #87). Every generic
 /// field message (the label and each validation error) carries the pointer here, so a locale
 /// bundle keys per field copy on the pointer while the numeric id registry stays finite.
-const FIELD_CONTEXT_KEY: &str = "field";
+pub(super) const FIELD_CONTEXT_KEY: &str = "field";
 
 /// The context key carrying an HTTP flow target's own explanation of a rejection (issue #112).
 pub(super) const REASON_CONTEXT_KEY: &str = "reason";
@@ -561,9 +561,17 @@ pub(super) enum TargetField {
 ///
 /// An unconfigured `/traits/...` field is [`None`] rather than a resolved miss: it has no node
 /// to carry the message, so pretending it resolved would drop the rejection on the floor.
+///
+/// "Configured" means configured FOR THIS STEP and still present in the active schema, which
+/// is the same pair of conditions [`signup_field_nodes_with_messages`] builds nodes under. An
+/// earlier revision matched any configured field, and the gap was not academic: a target
+/// naming a `LaterLogin` field resolved, so the whole-verdict-discard rule never fired, and
+/// the resulting failure matched no node. The person then got the unchanged form back with no
+/// field error, no flow-level notice, and no way forward, while the signup was refused.
 pub(super) fn resolve_target_pointer(
     pointer: &str,
-    signup: Option<&SignupFormConfig>,
+    signup: Option<&(SignupFormConfig, TraitSchema, i32)>,
+    step: SignupStep,
 ) -> Option<TargetField> {
     match pointer {
         "/identifier" => return Some(TargetField::Identifier),
@@ -574,10 +582,14 @@ pub(super) fn resolve_target_pointer(
     if !rest.starts_with('/') {
         return None;
     }
-    signup?
+    let (config, schema, _) = signup?;
+    config
         .fields
         .iter()
-        .any(|field| field.trait_pointer == rest)
+        .filter(|field| field.step == step)
+        .any(|field| {
+            field.trait_pointer == rest && schema.subschema_at(&field.trait_pointer).is_some()
+        })
         .then(|| TargetField::Trait(rest.to_owned()))
 }
 
@@ -635,67 +647,93 @@ mod tests {
     /// into an unavailable and hand a fail-open target an approval it never gave.
     #[test]
     fn a_target_pointer_resolves_only_to_a_field_that_exists() {
-        let cfg = config(vec![
-            field("/email", 0, true, json!({})),
-            field("/address/zip", 1, false, json!({})),
-        ]);
-        let cfg = Some(&cfg);
+        let form = (
+            config(vec![
+                field("/email", 0, true, json!({})),
+                field("/address/zip", 1, false, json!({})),
+            ]),
+            schema(),
+            1,
+        );
+        let cfg = Some(&form);
 
         assert_eq!(
-            resolve_target_pointer("/identifier", cfg),
+            resolve_target_pointer("/identifier", cfg, SignupStep::Signup),
             Some(TargetField::Identifier),
             "the built-in identifier input"
         );
         assert_eq!(
-            resolve_target_pointer("/password", cfg),
+            resolve_target_pointer("/password", cfg, SignupStep::Signup),
             Some(TargetField::Password),
             "the built-in password input"
         );
         assert_eq!(
-            resolve_target_pointer("/traits/email", cfg),
+            resolve_target_pointer("/traits/email", cfg, SignupStep::Signup),
             Some(TargetField::Trait("/email".to_owned())),
             "the wire namespace is /traits/<x>; the node mapping key is the TRAIT pointer /<x>"
         );
         assert_eq!(
-            resolve_target_pointer("/traits/address/zip", cfg),
+            resolve_target_pointer("/traits/address/zip", cfg, SignupStep::Signup),
             Some(TargetField::Trait("/address/zip".to_owned())),
             "a nested field keeps its whole trait pointer"
         );
 
         assert_eq!(
-            resolve_target_pointer("traits/email", cfg),
+            resolve_target_pointer("traits/email", cfg, SignupStep::Signup),
             None,
             "an RFC 6901 pointer must start with a slash"
         );
         assert_eq!(
-            resolve_target_pointer("/traits/~2bad", cfg),
+            resolve_target_pointer("/traits/~2bad", cfg, SignupStep::Signup),
             None,
             "~ must be followed by 0 or 1; an invalid escape must not resolve by accident"
         );
         assert_eq!(
-            resolve_target_pointer("/traits/nope", cfg),
+            resolve_target_pointer("/traits/nope", cfg, SignupStep::Signup),
             None,
             "a field the form does not configure has no node to carry the message"
         );
         assert_eq!(
-            resolve_target_pointer("/email", cfg),
+            resolve_target_pointer("/email", cfg, SignupStep::Signup),
             None,
             "the TRAIT namespace is not the wire namespace: /email is not /traits/email"
         );
         assert_eq!(
-            resolve_target_pointer("/traits", cfg),
+            resolve_target_pointer("/traits", cfg, SignupStep::Signup),
             None,
             "the prefix alone names no field"
         );
         assert_eq!(
-            resolve_target_pointer("/", cfg),
+            resolve_target_pointer("/", cfg, SignupStep::Signup),
             None,
             "the whole document is not a field"
         );
         assert_eq!(
-            resolve_target_pointer("/traits/email", None),
+            resolve_target_pointer("/traits/email", None, SignupStep::Signup),
             None,
             "with no signup form configured there is no field to resolve onto"
+        );
+
+        // A field configured for a DIFFERENT step renders no node at this one. Resolving it
+        // would produce a failure that matches nothing, and the person would get the
+        // unchanged form back with the signup refused and not one word about why.
+        let later = (
+            config(vec![SignupFormField {
+                step: SignupStep::LaterLogin,
+                ..field("/phone", 0, false, json!({}))
+            }]),
+            schema(),
+            1,
+        );
+        assert_eq!(
+            resolve_target_pointer("/traits/phone", Some(&later), SignupStep::Signup),
+            None,
+            "a later-login field renders no node at signup, so it must not resolve here"
+        );
+        assert_eq!(
+            resolve_target_pointer("/traits/phone", Some(&later), SignupStep::LaterLogin),
+            Some(TargetField::Trait("/phone".to_owned())),
+            "and it DOES resolve at the step that renders it"
         );
     }
 

@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime};
 use http::header::CONTENT_TYPE;
 use http::{HeaderName, HeaderValue, Method};
 use ironauth_store::flow_target::{FailurePolicy, FlowTargetRecord, TargetClass, Timing};
-use ironauth_store::{Scope, SignupFormConfig};
+use ironauth_store::{Scope, SignupFormConfig, SignupStep, TraitSchema};
 use serde::Deserialize;
 
 use super::message::{self, Message, MessageContext};
@@ -45,6 +45,19 @@ use crate::state::OidcState;
 /// be quietly false. Rather than cap without saying so, a record above the ceiling is treated
 /// as misconfigured and takes the unavailable path.
 pub const MAX_SYNC_TIMEOUT_MS: i32 = 30_000;
+
+/// The whole budget one dispatch may spend, across EVERY target of that timing.
+///
+/// The per-target ceiling bounds one call; nothing bounded the sum. Dispatch is sequential
+/// and the registry read has no `LIMIT`, so N registered targets put `N * 30s` on a live
+/// signup and the person waits for all of it. This is the aggregate, and a target reached
+/// with less than its own bound remaining is given only what is left rather than the full
+/// ceiling.
+///
+/// Once it is gone the remaining targets take the unavailable path and their own failure
+/// policy, which is the same answer a target that did not respond in time would get, because
+/// from the flow's point of view that is exactly what happened.
+const MAX_DISPATCH_BUDGET_MS: i64 = 45_000;
 
 /// How long a signed response stays acceptable, in seconds. The same tolerance the webhook
 /// delivery path uses, so an integrator's receiver code carries over unchanged.
@@ -111,7 +124,7 @@ pub(super) async fn dispatch_sync(
     scope: Scope,
     timing: Timing,
     data: &serde_json::Value,
-    signup: Option<&SignupFormConfig>,
+    signup: Option<&(SignupFormConfig, TraitSchema, i32)>,
 ) -> Decision {
     // A registry read that failed refuses rather than continues: a target that cannot be
     // listed cannot be consulted, and continuing would silently skip every fail-closed
@@ -141,7 +154,17 @@ pub(super) async fn dispatch_sync(
         return Decision::Allow;
     }
 
+    let started = unix_millis(state.env().clock().now_utc());
     for target in due {
+        // What remains of the SHARED budget, not the full per-target ceiling.
+        let remaining = MAX_DISPATCH_BUDGET_MS
+            .saturating_sub(unix_millis(state.env().clock().now_utc()).saturating_sub(started));
+        if remaining <= 0 {
+            match apply_policy(Outcome::Unavailable, target.failure_policy) {
+                Step::Continue => continue,
+                Step::Stop(decision) => return decision,
+            }
+        }
         // The two store reads live HERE so that `consult_target` below, which owns every
         // HTTP and policy decision, needs no database and is reachable from a unit test.
         // A target configured to be signed whose secret will not open is never called
@@ -169,6 +192,13 @@ pub(super) async fn dispatch_sync(
             }
         };
         let now = unix_secs(state.env().clock().now_utc());
+        // Minted PER CONSULTATION. See `flow_target::delivery_id`: `webhook-id` is the
+        // receiver's deduplication handle, so a constant one silently turns every call after
+        // the first into a replay of the first.
+        let delivery = ironauth_store::flow_target::delivery_id(
+            &target.id,
+            &ironauth_store::CorrelationId::generate(state.env()).to_string(),
+        );
         let outcome = consult_target(
             fetcher,
             target,
@@ -178,6 +208,8 @@ pub(super) async fn dispatch_sync(
             data,
             signup,
             now,
+            &delivery,
+            remaining,
         )
         .await;
         match apply_policy(outcome, target.failure_policy) {
@@ -236,8 +268,10 @@ async fn consult_target(
     timing: Timing,
     scope: Scope,
     data: &serde_json::Value,
-    signup: Option<&SignupFormConfig>,
+    signup: Option<&(SignupFormConfig, TraitSchema, i32)>,
     now: i64,
+    delivery_id: &str,
+    budget_remaining_ms: i64,
 ) -> Outcome {
     // A sync target without a bound cannot satisfy criterion 6 at all, and one above the
     // ceiling would be silently truncated. Both are misconfiguration, not a network event,
@@ -248,6 +282,11 @@ async fn consult_target(
     if timeout_ms <= 0 || timeout_ms > MAX_SYNC_TIMEOUT_MS {
         return Outcome::Unavailable;
     }
+    // Never more than what is left of the shared budget, so the aggregate holds however many
+    // targets are registered.
+    let Ok(timeout_ms) = u64::try_from(i64::from(timeout_ms).min(budget_remaining_ms)) else {
+        return Outcome::Unavailable;
+    };
 
     // Built PER TARGET, not once for the batch: `target_id` and `config` differ per target,
     // and a shared envelope would ship one target's configuration to another.
@@ -273,9 +312,7 @@ async fn consult_target(
         Method::POST,
         target.endpoint.clone(),
     )
-    .timeout(Duration::from_millis(
-        u64::try_from(timeout_ms).unwrap_or(0),
-    ))
+    .timeout(Duration::from_millis(timeout_ms))
     .body(body.clone());
 
     let Ok(content_type) = HeaderValue::from_str("application/json") else {
@@ -285,13 +322,19 @@ async fn consult_target(
 
     if let Some(bytes) = secret {
         let webhook_secret = ironauth_jose::webhooks::WebhookSecret::from_bytes(bytes.to_vec());
+        // Signed under the PER-CALL delivery id, not the target id. `webhook-id` is the
+        // receiver's deduplication handle (the webhook delivery path says so in as many
+        // words, and the config docs repeat it), so a constant one makes every consultation
+        // after the first look like a replay of the first: a receiver written to this
+        // repository's own guidance would drop it, or echo its cached first answer, and a
+        // fraud check would be bypassed with nobody attacking it.
         let signature = ironauth_store::flow_target::sign_payload(
             &webhook_secret,
-            &target.id,
+            delivery_id,
             timestamp,
             &body,
         );
-        let Some(headers) = signed_headers(&target.id.to_string(), timestamp, &signature) else {
+        let Some(headers) = signed_headers(delivery_id, timestamp, &signature) else {
             return Outcome::Unavailable;
         };
         for (name, value) in headers {
@@ -306,6 +349,22 @@ async fn consult_target(
         return Outcome::Unavailable;
     };
 
+    classify_response(&response, secret, delivery_id, now, signup)
+}
+
+/// What ONE target's answer means.
+///
+/// Split from the call itself because it is a different question, and because every branch
+/// below is a decision an operator's fail-closed target depends on: a non-2xx honoured as
+/// approval, an unverifiable signature accepted, or an unknown verdict string read as
+/// `allow` would each silently disarm the check.
+fn classify_response(
+    response: &ironauth_fetch::FetchResponse,
+    secret: Option<&[u8]>,
+    delivery_id: &str,
+    now: i64,
+    signup: Option<&(SignupFormConfig, TraitSchema, i32)>,
+) -> Outcome {
     // `fetch` returns `Ok` for any COMPLETED exchange, so a 500 carrying a well-formed
     // `allow` body would otherwise be honoured as approval.
     if !response.status().is_success() {
@@ -313,7 +372,9 @@ async fn consult_target(
     }
 
     if let Some(bytes) = secret {
-        if !response_signature_verifies(&target.id.to_string(), bytes, &response, now) {
+        // Verified under the SAME per-call id the request was signed with, so a captured
+        // response cannot be replayed against a later consultation inside the tolerance.
+        if !response_signature_verifies(delivery_id, bytes, response, now) {
             return Outcome::Unavailable;
         }
     }
@@ -325,20 +386,41 @@ async fn consult_target(
     match parsed.verdict.as_str() {
         "allow" => Outcome::Allow,
         "interrupt" => {
-            if parsed.errors.is_empty() {
+            // Built through the SHIPPED type rather than re-checking here: `TargetVerdict`
+            // owns the rule that a verdict carrying no errors is not an interruption, and a
+            // second copy of that rule in this module is a second place for it to drift.
+            let errors = parsed
+                .errors
+                .into_iter()
+                .map(|error| ironauth_store::flow_target::FieldError {
+                    pointer: error.pointer,
+                    message: error.message.unwrap_or_default(),
+                })
+                .collect();
+            let Ok(verdict) = ironauth_store::flow_target::TargetVerdict::interrupt(errors) else {
                 // An interrupt with nothing to say cannot be rendered on any field.
                 return Outcome::Unavailable;
-            }
-            let mut resolved = Vec::with_capacity(parsed.errors.len());
-            for error in parsed.errors {
-                let Some(field) = signup_fields::resolve_target_pointer(&error.pointer, signup)
-                else {
+            };
+            let ironauth_store::flow_target::TargetVerdict::Interrupt(parsed_errors) = verdict
+            else {
+                return Outcome::Unavailable;
+            };
+            let mut resolved = Vec::with_capacity(parsed_errors.len());
+            for error in parsed_errors {
+                // Resolved against THIS STEP's rendered fields. A pointer naming a field
+                // the step does not render has no node to carry the message, so it must
+                // discard the verdict rather than produce a failure that renders nowhere.
+                let Some(field) = signup_fields::resolve_target_pointer(
+                    &error.pointer,
+                    signup,
+                    SignupStep::Signup,
+                ) else {
                     // One unresolvable pointer discards the WHOLE verdict.
                     return Outcome::Unavailable;
                 };
                 resolved.push(ResolvedFieldError {
                     field,
-                    reason: cap_reason(error.message),
+                    reason: cap_reason(Some(error.message)),
                 });
             }
             Outcome::Interrupt(resolved)
@@ -406,6 +488,14 @@ fn response_signature_verifies(
     .is_ok()
 }
 
+/// Milliseconds since the Unix epoch for a wall-clock instant (saturating).
+fn unix_millis(at: SystemTime) -> i64 {
+    match at.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(delta) => i64::try_from(delta.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
 /// Seconds since the Unix epoch for a wall-clock instant (saturating), the same derivation
 /// `backchannel.rs` and the webhook delivery path use, so a receiver sees one timestamp
 /// discipline across every signed IronAuth call.
@@ -425,8 +515,8 @@ fn unix_secs(at: SystemTime) -> i64 {
 pub(super) fn split_for_render(
     errors: &[ResolvedFieldError],
 ) -> (
-    Option<message::MessageId>,
-    Option<message::MessageId>,
+    Option<Message>,
+    Option<Message>,
     Vec<signup_fields::FieldFailure>,
 ) {
     let mut identifier = None;
@@ -442,8 +532,14 @@ pub(super) fn split_for_render(
             message::FLOW_TARGET_REJECTED
         };
         match &error.field {
-            TargetField::Identifier => identifier = Some(id),
-            TargetField::Password => password = Some(id),
+            // The built-ins take a whole MESSAGE, carrying the reason in its context. An
+            // earlier revision handed back an id alone, which forced `Message::of` and an
+            // EMPTY context at the node: the with-reason template then rendered its
+            // placeholder literally and the target's text was dropped on the way. The
+            // signup-field arm below never had that bug, which is exactly why it went
+            // unnoticed: one of the three arms was right.
+            TargetField::Identifier => identifier = Some(built_in_message(id, error)),
+            TargetField::Password => password = Some(built_in_message(id, error)),
             TargetField::Trait(pointer) => failures.push(signup_fields::FieldFailure {
                 trait_pointer: pointer.clone(),
                 message_id: id,
@@ -452,6 +548,27 @@ pub(super) fn split_for_render(
         }
     }
     (identifier, password, failures)
+}
+
+/// Build a built-in field's rejection message, carrying the pointer and, when the target
+/// sent one, its own explanation.
+///
+/// The `field` key is the WIRE pointer rather than a node name, so a client keying off it
+/// reads the same namespace it would have sent, and the same key a signup-field rejection
+/// carries.
+fn built_in_message(id: message::MessageId, error: &ResolvedFieldError) -> Message {
+    let pointer = match error.field {
+        TargetField::Identifier => "/identifier",
+        TargetField::Password => "/password",
+        TargetField::Trait(_) => "",
+    };
+    let mut context = MessageContext::one(signup_fields::FIELD_CONTEXT_KEY, pointer);
+    if let Some(reason) = &error.reason {
+        context
+            .0
+            .insert(signup_fields::REASON_CONTEXT_KEY.to_owned(), reason.clone());
+    }
+    Message::with_context(id, context)
 }
 
 /// The flow level message a [`Decision::Refuse`] renders.
@@ -548,15 +665,38 @@ mod tests {
             },
         ]);
 
+        let identifier = identifier.expect("the identifier rejection is carried through");
         assert_eq!(
-            identifier,
-            Some(message::FLOW_TARGET_REJECTED),
+            identifier.id,
+            message::FLOW_TARGET_REJECTED,
             "no reason means the template WITHOUT the placeholder"
         );
         assert_eq!(
-            password,
-            Some(message::FLOW_TARGET_REJECTED_WITH_REASON),
+            identifier.context.0.get("reason"),
+            None,
+            "and nothing to interpolate"
+        );
+
+        let password = password.expect("the password rejection is carried through");
+        assert_eq!(
+            password.id,
+            message::FLOW_TARGET_REJECTED_WITH_REASON,
             "a reason means the template that interpolates it"
+        );
+        // THE regression this test exists for. An earlier revision returned an id alone for
+        // the two built-in fields, which forced an EMPTY context at the node, so the
+        // `{reason}` template rendered its placeholder LITERALLY to the person and the
+        // target's text was discarded. Asserting the id alone passed while that was true.
+        assert_eq!(
+            password.context.0.get("reason").map(String::as_str),
+            Some("too weak for this tenant"),
+            "the target's own text must reach the context, or the with-reason template \
+             renders the literal placeholder and the explanation is lost"
+        );
+        assert_eq!(
+            password.context.0.get("field").map(String::as_str),
+            Some("/password"),
+            "and the wire pointer rides alongside it, as it does for a signup field"
         );
 
         let email = failures

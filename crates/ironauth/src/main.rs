@@ -1352,10 +1352,20 @@ async fn build_oidc_plane(
         ..ironauth_fetch::FetchLimits::default()
     }) {
         Ok(fetcher) => state.with_flow_target_fetcher(std::sync::Arc::new(fetcher)),
-        // A trust-store failure must not take the process down: every registered target then
-        // takes the unavailable path and its own failure policy, which is the same decision
-        // the operator already made for a target that cannot be reached.
-        Err(_) => state,
+        Err(error) => {
+            // A trust-store failure must not take the process down, but it must not be
+            // silent either: with no fetcher every registered target takes the unavailable
+            // path, and `flow_targets.failure_policy` DEFAULTS to fail_closed, so a
+            // deployment with one registered target refuses every signup for the process
+            // lifetime. Without this line the only symptom is generic copy on a form.
+            tracing::warn!(
+                %error,
+                "the flow-target outbound fetcher could not be built; every registered HTTP \
+                 flow target will take its failure policy without being called, and a \
+                 fail-closed target will refuse the flow it guards"
+            );
+            state
+        }
     };
     // Everything that reaches BOTH planes (issue #414): the two config sections that
     // live outside `[oidc]` because both planes consume them (the `[organizations]`

@@ -316,6 +316,29 @@ pub async fn register_post(
         }
     }
 
+    // Registered HTTP flow targets, PRE-PERSIST (issue #112). This route creates accounts
+    // and is mounted unconditionally, so without this a fail-closed fraud check registered
+    // by an operator is walked around by posting here instead of driving the flow API: a
+    // control with a second door is not a control. Placed with the other pre-hash defences,
+    // for the same reason they are here.
+    //
+    // A rejection is UNIFORM on this route rather than field-mapped. The field mapping needs
+    // the flow API's node model, which this hosted form does not have; refusing without a
+    // per-field explanation is a worse message and the same security answer, whereas
+    // dispatching nothing at all is a different security answer.
+    match crate::flow::dispatch_registration_targets(&state, resume.scope, identifier, None).await {
+        crate::flow::TargetDecision::Allow => {}
+        crate::flow::TargetDecision::Refuse => {
+            return register_error(
+                identifier,
+                &resume.return_to,
+                crate::state::SCREENING_UNAVAILABLE_MESSAGE,
+                &resume.hints,
+                banner,
+            );
+        }
+    }
+
     // Hash through the dedicated, admission-controlled pool (issue #62), off the
     // async threads. An over-share tenant or a saturated pool is the retryable
     // 429/503; a pool fault is the generic server error page.
