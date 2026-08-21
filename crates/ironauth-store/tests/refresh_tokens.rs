@@ -18,9 +18,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
-    RefreshFamilyId, RefreshFamilyOpenOutcome, RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId,
-    RotatedRefreshToken, Scope, SessionEndCause, SessionId, StoredClientId, refresh_token_digest,
+    AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, IssuedTokenId,
+    IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, NewSession, RefreshFamilyId,
+    RefreshFamilyOpenOutcome, RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId,
+    RotatedRefreshToken, Scope, SessionEndCause, SessionId, StoredClientId, TokenKind,
+    refresh_token_digest,
 };
 use sqlx::Row;
 
@@ -961,5 +963,204 @@ async fn redeem_still_rotates_an_offline_family_after_its_session_dies() {
         outcome,
         RefreshRedeemOutcome::Rotated,
         "an offline_access token survives its session's logout and still rotates (issue #21)"
+    );
+}
+
+/// Count enqueued `token.issued` metering events for one grant.
+///
+/// Reads `outbox_messages` DIRECTLY: the point is that the PRODUCER fired. A helper that
+/// went through the metering fold would pass just as happily on seeded envelopes, which is
+/// what `metering_matches_seeded_activity_exactly` does and why that test could not have
+/// caught this.
+async fn metering_events_for(db: &TestDatabase, scope: Scope, grant: &str) -> i64 {
+    let mut tx = db.app_pool().begin().await.expect("begin");
+    sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+        .bind(scope.tenant().to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("bind tenant");
+    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("bind environment");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 \
+           AND payload->>'type' = 'token.issued' \
+           AND payload->'payload'->>'grant_id' = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(grant)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("count metering events");
+    tx.commit().await.expect("commit");
+    count
+}
+
+/// A ROTATION mints an access token, and a minted token must be a COUNTED token (#107).
+///
+/// `tokens_issued` is exported by `GET /usage` and published in `usage.reported`: it is
+/// billing input. A refresh rotation inserted its `issued_tokens` row and emitted no
+/// `token.issued`, so every token a rotation minted was invisible to that number.
+///
+/// This is the largest of the omissions by volume, because a long-lived session rotates many
+/// times per authorization code issued. The counted total was a fraction of the real one and
+/// the fraction varied with how long a tenant's sessions live, so the error was not even a
+/// constant factor anyone could correct for.
+///
+/// The under-report is SILENT, which is what makes it worth a test rather than a note: the
+/// fold sums whatever it is given, so a producer that never fires is indistinguishable from
+/// a tenant that never issued anything.
+#[tokio::test]
+async fn a_rotation_meters_the_access_token_it_mints() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let grant_id = seed_grant(&db, &env, scope, "usr_meter", None).await;
+    let grant_text = grant_id.to_string();
+    let (_family, token, _jti, _digest) = open_family(
+        &db,
+        &env,
+        scope,
+        &grant_id,
+        "usr_meter",
+        true,
+        FAR_FUTURE_MICROS,
+        FAR_FUTURE_MICROS,
+    )
+    .await;
+
+    assert_eq!(
+        metering_events_for(&db, scope, &grant_text).await,
+        0,
+        "opening a family mints no access token, so nothing is counted yet"
+    );
+
+    // A rotation that actually mints one. The shared `redeem` helper passes
+    // `access_records: &[]`, which is why every existing rotation test could pass while
+    // this producer never fired.
+    let (succ_token, succ_jti, succ_digest) = make_refresh_token(&env, scope);
+    let issued = IssuedTokenRecord {
+        id: IssuedTokenId::generate(&env, &scope),
+        kind: TokenKind::Access,
+    };
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .refresh()
+        .redeem(
+            &env,
+            RefreshRedeem {
+                presented_token: &token,
+                rotate: true,
+                successor: RotatedRefreshToken {
+                    jti: &succ_jti,
+                    token_digest: &succ_digest,
+                    generation: 1,
+                    idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                },
+                access_records: &[issued],
+                opaque: None,
+                grace: Duration::from_secs(0),
+            },
+        )
+        .await
+        .expect("redeem");
+    assert!(
+        matches!(outcome, RefreshRedeemOutcome::Rotated),
+        "the fixture must rotate, or this measures nothing: {outcome:?}"
+    );
+    let _ = succ_token;
+
+    assert_eq!(
+        metering_events_for(&db, scope, &grant_text).await,
+        1,
+        "the rotated access token must be counted for billing"
+    );
+}
+
+/// An OPAQUE rotation counts its access token too (#107).
+///
+/// The at+jwt arm above cannot see this one. Under the opaque format
+/// `refresh_access_records` returns `Vec::new()`, so `record_refresh_access` receives an
+/// EMPTY record list and the count comes entirely from `redeem.opaque.is_some()`. Forcing
+/// that argument to `false` leaves every other test in this repository green while every
+/// opaque-format rotation counts zero, which is exactly the defect class this change exists
+/// to remove.
+///
+/// That argument is the one the call site's own comment calls "the correctness of this call
+/// rather than a detail of it", and it was the last argument in the change with nothing
+/// measuring it. Review found it by mutation after three siblings had been fixed for the
+/// same reason.
+#[tokio::test]
+async fn an_opaque_rotation_meters_its_access_token() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let grant_id = seed_grant(&db, &env, scope, "usr_meter_opaque", None).await;
+    let grant_text = grant_id.to_string();
+    let (_family, token, _jti, _digest) = open_family(
+        &db,
+        &env,
+        scope,
+        &grant_id,
+        "usr_meter_opaque",
+        true,
+        FAR_FUTURE_MICROS,
+        FAR_FUTURE_MICROS,
+    )
+    .await;
+
+    // EMPTY records plus an opaque token: exactly the shape the opaque mint produces.
+    let (succ_token, succ_jti, succ_digest) = make_refresh_token(&env, scope);
+    let opaque_jti = IssuedTokenId::generate(&env, &scope);
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .refresh()
+        .redeem(
+            &env,
+            RefreshRedeem {
+                presented_token: &token,
+                rotate: true,
+                successor: RotatedRefreshToken {
+                    jti: &succ_jti,
+                    token_digest: &succ_digest,
+                    generation: 1,
+                    idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                },
+                access_records: &[],
+                opaque: Some(NewOpaqueAccessToken {
+                    token_digest: "opaque-rotation-digest",
+                    grant_id: Some(&grant_id),
+                    subject: "usr_meter_opaque",
+                    client_id: "cli_meter_opaque",
+                    audience: "https://api.example",
+                    audiences: &[],
+                    scope: Some("openid"),
+                    jti: &opaque_jti,
+                    expires_at_unix_micros: FAR_FUTURE_MICROS,
+                    dpop_jkt: None,
+                }),
+                grace: Duration::from_secs(0),
+            },
+        )
+        .await
+        .expect("redeem");
+    assert!(
+        matches!(outcome, RefreshRedeemOutcome::Rotated),
+        "the fixture must rotate, or this measures nothing: {outcome:?}"
+    );
+    let _ = succ_token;
+
+    assert_eq!(
+        metering_events_for(&db, scope, &grant_text).await,
+        1,
+        "an opaque rotation mints ONE access token and must count exactly one"
     );
 }

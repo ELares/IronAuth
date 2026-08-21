@@ -9760,13 +9760,20 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(token.kind.as_str())
                 .execute(&mut *tx)
                 .await?;
-                meter_token_issued(&mut tx, env, scope, &grant_text, token.kind.as_str()).await?;
+                // Metered below, through `meter_redeemed_tokens`, rather than here.
             }
             // An opaque access token (issue #29) records ONLY its digest and
             // metadata here, in the SAME transaction as the consume, so it can no
             // more be handed out without its stored row than an at+jwt jti can. The
             // grant is the consumed code's grant (grant_text), so grant-chain
             // revocation reaches the opaque token exactly as it reaches an at+jwt.
+            //
+            // METERED through the shared helper, AFTER this block, because an opaque access
+            // token contributes no `IssuedTokenRecord`. Counting the `tokens` loop alone
+            // emitted ONE event for an opaque issuance where an at+jwt issuance emitted two,
+            // so `tokens_issued` under-reported by exactly one access token per redemption on
+            // every deployment configured for the opaque format. Same defect, same shape, as
+            // the one the CIBA grant's helper was written for.
             if let Some(opaque) = &opaque {
                 sqlx::query(
                     "INSERT INTO opaque_access_tokens \
@@ -9790,6 +9797,8 @@ impl ActingAuthorizationRepo<'_> {
                 .execute(&mut *tx)
                 .await?;
             }
+            meter_redeemed_tokens(&mut tx, env, scope, &grant_text, tokens, opaque.is_some())
+                .await?;
             let spec = AuditedWrite {
                 store: self.store,
                 scope,
@@ -9933,32 +9942,14 @@ impl ActingAuthorizationRepo<'_> {
                     // `tokens_issued` counts: a redeem minting an access and an ID token
                     // really did issue two. In the write's transaction, so a rolled-back
                     // issuance is not billed.
-                    let event_id = format!("evt_{}", CorrelationId::generate(env));
-                    if let Some(envelope) = crate::event_catalog::envelope(
-                        &event_id,
-                        "token.issued",
-                        &scope.tenant().to_string(),
-                        &scope.environment().to_string(),
-                        epoch_micros(env.clock().now_utc()) / 1000,
-                        &serde_json::json!({
-                            "grant_id": grant_id.to_string(),
-                            "token_kind": token.kind.as_str(),
-                        }),
-                    ) {
-                        enqueue_domain_event(
-                            tx,
-                            env,
-                            scope,
-                            Some(&DomainEvent {
-                                id: &event_id,
-                                // The GRANT is the ordering key: every token minted under one
-                                // grant stays ordered behind it.
-                                subject: &grant_id.to_string(),
-                                envelope: &envelope,
-                            }),
-                        )
+                    //
+                    // Through the SHARED helper. This was a hand-written second copy of the
+                    // envelope `meter_token_issued` builds, which made five emit sites for
+                    // one event, and the whole argument for routing the other four through
+                    // one helper applies here too: two copies of an envelope drift, and the
+                    // drift is invisible because both still produce a `token.issued`.
+                    meter_token_issued(tx, env, scope, &grant_id.to_string(), token.kind.as_str())
                         .await?;
-                    }
                 }
                 Ok(())
             },
@@ -10108,6 +10099,24 @@ impl ActingAuthorizationRepo<'_> {
     ///
     /// Delegating wrapper so the existing callers -- client credentials and token exchange --
     /// are untouched and keep writing exactly the audit row they wrote before.
+    /// NOT METERED, and the reason is a covenant plus an open question (issue #107).
+    ///
+    /// `scripts/no-m2m-metering.sh` enforces that client-credentials issuance is never
+    /// metered, counted for billing, or quota-gated. This body is shared by THREE grants,
+    /// not two: `issue_client_credentials`, `issue_jwt_bearer_assertion_from`, and
+    /// `issue_token_exchange`. So a meter here would break the covenant for the first while
+    /// serving the other two, and there is no way to add one without splitting them.
+    ///
+    /// That split is an OWNER DECISION and is deliberately not made here. It matters most
+    /// for token exchange, whose principal is routinely a USER: an RFC 8693 exchange of a
+    /// user's token mints a token that looks like every other user-bound token except that
+    /// nothing counts it. jwt-bearer is the harder half, because its mapped principal may be
+    /// a user OR a workload.
+    ///
+    /// Worth knowing before that decision is taken: the covenant gate scans only the
+    /// eight-line `issue_client_credentials` delegator, so a meter added to THIS function
+    /// would not trip it. The gate would have to be widened at the same time, or the
+    /// covenant becomes a comment.
     async fn issue_machine_grant_detailed(
         &self,
         env: &Env,
@@ -14663,7 +14672,7 @@ impl ActingRefreshRepo<'_> {
         if !redeem.rotate {
             // No rotation (a confidential/bound client under the threshold): record
             // only a fresh access token against the grant, leave the token in place.
-            record_refresh_access(&mut tx, scope, grant_text, redeem).await?;
+            record_refresh_access(&mut tx, env, scope, grant_text, redeem).await?;
             let spec = AuditedWrite {
                 store: self.store,
                 scope,
@@ -14706,7 +14715,7 @@ impl ActingRefreshRepo<'_> {
                 now_micros,
             )
             .await?;
-            record_refresh_access(&mut tx, scope, grant_text, redeem).await?;
+            record_refresh_access(&mut tx, env, scope, grant_text, redeem).await?;
             let spec = AuditedWrite {
                 store: self.store,
                 scope,
@@ -14785,7 +14794,7 @@ impl ActingRefreshRepo<'_> {
             // leaf, so N concurrent within-grace refreshes converge (no fork). The
             // predecessor's successor is unchanged; `redeem.successor` is intentionally
             // left unused here (it is only consumed by the atomic-rotate winner).
-            record_refresh_access(&mut tx, scope, grant_text, redeem).await?;
+            record_refresh_access(&mut tx, env, scope, grant_text, redeem).await?;
             let spec = AuditedWrite {
                 store: self.store,
                 scope,
@@ -15009,10 +15018,38 @@ async fn insert_refresh_generation(
 /// opaque token an `opaque_access_tokens` row.
 async fn record_refresh_access(
     tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
     scope: Scope,
     grant_text: &str,
     redeem: &RefreshRedeem<'_>,
 ) -> Result<(), StoreError> {
+    // METERED, in the same transaction, so a rotated access token is a COUNTED token
+    // (issue #107). A refresh rotation mints a NEW access token and inserted its
+    // `issued_tokens` row while emitting no `token.issued`, so every token a rotation
+    // minted was invisible to `tokens_issued` -- the number `GET /usage` reports and
+    // `usage.reported` publishes.
+    //
+    // This is the largest of the three omissions by volume: a long-lived session rotates
+    // many times per issued authorization code, so the counted total was a small fraction
+    // of the tokens actually issued, and the fraction varies by how long sessions live.
+    // A billing number that is wrong by a tenant-dependent multiple is worse than one that
+    // is wrong by a constant.
+    //
+    // `env` is threaded in for this. It was not a parameter before, because nothing here
+    // needed a clock or entropy.
+    // `has_opaque` comes from `redeem.opaque`, NOT from the record list, and that is the
+    // correctness of this call rather than a detail of it. `refresh_access_records` returns
+    // `Vec::new()` in its opaque arm, so a fix that looped over records alone would count
+    // ZERO for every opaque rotation and would read as correct in review.
+    meter_redeemed_tokens(
+        tx,
+        env,
+        scope,
+        grant_text,
+        redeem.access_records,
+        redeem.opaque.is_some(),
+    )
+    .await?;
     for token in redeem.access_records {
         sqlx::query(
             "INSERT INTO issued_tokens \
@@ -39360,6 +39397,31 @@ impl ActingDeviceCodeRepo<'_> {
             .execute(&mut *tx)
             .await?;
         }
+        // METERED, in the same transaction, so a device-issued token is a COUNTED token
+        // (issue #107). This grant inserted `issued_tokens` rows and emitted no
+        // `token.issued`, so every token a device flow minted was invisible to
+        // `tokens_issued` -- the number `GET /usage` reports and `usage.reported`
+        // publishes, which is billing input.
+        //
+        // The under-report is SILENT and that is what makes it worth fixing rather than
+        // documenting: the metering fold sums whatever it is given, so a producer that
+        // never fires is indistinguishable from a tenant that never issued anything. There
+        // is no error, no gap in a sequence, and no reconciliation that would notice.
+        //
+        // The omission was named in `redeem_approved`'s CIBA sibling when that landed and
+        // deferred as out of scope for a CIBA issue. This is that follow-up.
+        //
+        // The OPAQUE token is metered separately below for the same reason it is in CIBA:
+        // it produces no `IssuedTokenRecord`, so a loop over `tokens` alone never counts it.
+        meter_redeemed_tokens(
+            &mut tx,
+            env,
+            scope,
+            &grant_id.to_string(),
+            tokens,
+            opaque.is_some(),
+        )
+        .await?;
         if let Some(op) = opaque {
             sqlx::query(
                 "INSERT INTO opaque_access_tokens \
@@ -65215,8 +65277,12 @@ async fn meter_redeemed_tokens(
     // sentence a future reader would reason from.
     //
     // Wiring the path being ADDED here is what stops this grant from shipping with that
-    // gap already in it. The device grant's identical omission predates this change and
-    // is filed separately rather than fixed under a CIBA issue.
+    // gap already in it.
+    //
+    // This sentence used to end "the device grant's identical omission predates this change
+    // and is filed separately". That is no longer true: issue #107 fixed it, in this file,
+    // and every user-bound grant now calls this helper. The remaining exception is the
+    // machine-grant body, which is exempt by covenant rather than by omission.
     for token in tokens {
         meter_token_issued(tx, env, scope, grant_text, token.kind.as_str()).await?;
     }
