@@ -154,11 +154,21 @@ pub(super) async fn dispatch_sync(
         return Decision::Allow;
     }
 
-    let started = unix_millis(state.env().clock().now_utc());
+    // MONOTONIC, not wall clock. `Env::now_utc`'s own contract says it "may jump backwards
+    // (NTP steps); never use it to measure elapsed time" -- and the consequences here are
+    // both real: a backwards step made `remaining` EXCEED the budget, restoring the
+    // unbounded N*30s this exists to bound, and a forwards step past 45s exhausted it and
+    // refused a signup no target was slow for, because the policy defaults to fail_closed.
+    let started = state.env().clock().monotonic();
     for target in due {
         // What remains of the SHARED budget, not the full per-target ceiling.
-        let remaining = MAX_DISPATCH_BUDGET_MS
-            .saturating_sub(unix_millis(state.env().clock().now_utc()).saturating_sub(started));
+        let remaining = budget_remaining_ms(
+            state
+                .env()
+                .clock()
+                .monotonic()
+                .saturating_duration_since(started),
+        );
         if remaining <= 0 {
             match apply_policy(Outcome::Unavailable, target.failure_policy) {
                 Step::Continue => continue,
@@ -247,6 +257,11 @@ enum Step {
 fn apply_policy(outcome: Outcome, policy: FailurePolicy) -> Step {
     match outcome {
         Outcome::Allow => Step::Continue,
+        // A rejection ALWAYS stops, whatever the policy says. An empty list is still a
+        // rejection: it means the target refused and its field mapping could not be
+        // resolved, so the flow refuses uniformly rather than inventing a field or, worse,
+        // treating the refusal as an unanswered call and forgiving it.
+        Outcome::Interrupt(errors) if errors.is_empty() => Step::Stop(Decision::Refuse),
         Outcome::Interrupt(errors) => Step::Stop(Decision::Interrupt(errors)),
         Outcome::Unavailable => match policy {
             FailurePolicy::FailOpen => Step::Continue,
@@ -405,25 +420,7 @@ fn classify_response(
             else {
                 return Outcome::Unavailable;
             };
-            let mut resolved = Vec::with_capacity(parsed_errors.len());
-            for error in parsed_errors {
-                // Resolved against THIS STEP's rendered fields. A pointer naming a field
-                // the step does not render has no node to carry the message, so it must
-                // discard the verdict rather than produce a failure that renders nowhere.
-                let Some(field) = signup_fields::resolve_target_pointer(
-                    &error.pointer,
-                    signup,
-                    SignupStep::Signup,
-                ) else {
-                    // One unresolvable pointer discards the WHOLE verdict.
-                    return Outcome::Unavailable;
-                };
-                resolved.push(ResolvedFieldError {
-                    field,
-                    reason: cap_reason(Some(error.message)),
-                });
-            }
-            Outcome::Interrupt(resolved)
+            Outcome::Interrupt(resolve_errors(parsed_errors, signup))
         }
         // An unknown verdict string is a contract violation, not an approval.
         _ => Outcome::Unavailable,
@@ -488,12 +485,14 @@ fn response_signature_verifies(
     .is_ok()
 }
 
-/// Milliseconds since the Unix epoch for a wall-clock instant (saturating).
-fn unix_millis(at: SystemTime) -> i64 {
-    match at.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(delta) => i64::try_from(delta.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
+/// What is left of the shared dispatch budget after `elapsed`.
+///
+/// A pure function so the arithmetic is testable without a database or a clock. It was
+/// inline, and both the cap and the exhaustion guard survived mutation because nothing could
+/// reach them.
+fn budget_remaining_ms(elapsed: Duration) -> i64 {
+    let spent = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+    MAX_DISPATCH_BUDGET_MS.saturating_sub(spent)
 }
 
 /// Seconds since the Unix epoch for a wall-clock instant (saturating), the same derivation
@@ -550,6 +549,37 @@ pub(super) fn split_for_render(
     (identifier, password, failures)
 }
 
+/// Map a target's field errors onto form fields, or return an EMPTY list if any one of them
+/// names a field this step does not render.
+///
+/// Empty is not "no rejection". It is "rejected, and nothing truthful to say about which
+/// field", which [`apply_policy`] turns into a uniform refusal under either policy. Returning
+/// `Unavailable` instead (as an earlier revision did) routed a deliberate refusal through the
+/// FAILURE POLICY, and under `FailOpen` that means allow: the target said no and was ignored.
+/// That is the exact collapse this module's header forbids, and it bit hardest on the legacy
+/// `/register` route, which passes no signup form, so every trait pointer was unresolvable.
+///
+/// All-or-nothing on the mapping, deliberately: attaching only the resolvable subset would let
+/// one typo in one pointer silently drop the field that actually mattered.
+fn resolve_errors(
+    errors: Vec<ironauth_store::flow_target::FieldError>,
+    signup: Option<&(SignupFormConfig, TraitSchema, i32)>,
+) -> Vec<ResolvedFieldError> {
+    let mut resolved = Vec::with_capacity(errors.len());
+    for error in errors {
+        let Some(field) =
+            signup_fields::resolve_target_pointer(&error.pointer, signup, SignupStep::Signup)
+        else {
+            return Vec::new();
+        };
+        resolved.push(ResolvedFieldError {
+            field,
+            reason: cap_reason(Some(error.message)),
+        });
+    }
+    resolved
+}
+
 /// Build a built-in field's rejection message, carrying the pointer and, when the target
 /// sent one, its own explanation.
 ///
@@ -579,8 +609,8 @@ pub(super) fn refusal_message() -> Message {
 #[cfg(test)]
 mod tests {
     use super::{
-        Decision, MAX_REASON_CHARS, Outcome, ResolvedFieldError, Step, apply_policy, cap_reason,
-        split_for_render,
+        Decision, Duration, MAX_DISPATCH_BUDGET_MS, MAX_REASON_CHARS, Outcome, ResolvedFieldError,
+        Step, apply_policy, budget_remaining_ms, cap_reason, resolve_errors, split_for_render,
     };
     use crate::flow::message;
     use crate::flow::signup_fields::TargetField;
@@ -716,6 +746,100 @@ mod tests {
             "each failure picks its id from ITS OWN reason, not from the first one"
         );
         assert_eq!(age.reason, None);
+    }
+
+    /// A rejection we cannot MAP is still a rejection, under either policy.
+    ///
+    /// The regression this pins: an unresolvable pointer used to become `Unavailable`, which
+    /// routed a deliberate refusal through the failure policy, and under `FailOpen` that is
+    /// "allow". A target that answered `interrupt` was silently ignored. It bit hardest on
+    /// the legacy `/register` route, which passes no signup form at all, so EVERY trait
+    /// pointer was unresolvable there.
+    #[test]
+    fn a_rejection_that_cannot_be_mapped_still_refuses_under_fail_open() {
+        assert_eq!(
+            apply_policy(Outcome::Interrupt(Vec::new()), FailurePolicy::FailOpen),
+            Step::Stop(Decision::Refuse),
+            "fail open forgives an unanswered call, never a refusal it could not render"
+        );
+        assert_eq!(
+            apply_policy(Outcome::Interrupt(Vec::new()), FailurePolicy::FailClosed),
+            Step::Stop(Decision::Refuse),
+        );
+        // And it is distinguishable from silence, which fail open DOES forgive.
+        assert_eq!(
+            apply_policy(Outcome::Unavailable, FailurePolicy::FailOpen),
+            Step::Continue,
+        );
+    }
+
+    /// An unmappable pointer yields an EMPTY error list, which is a rejection, not silence.
+    ///
+    /// This is the production half of the same defect the policy test above pins. Together
+    /// they cover it end to end: this proves an unresolvable pointer PRODUCES the empty
+    /// list, and that one proves the empty list REFUSES under fail-open. Testing only the
+    /// second left a mutant alive that turned the first back into `Unavailable`.
+    #[test]
+    fn a_pointer_this_step_cannot_render_maps_to_no_fields_rather_than_to_silence() {
+        let error = |pointer: &str| ironauth_store::flow_target::FieldError {
+            pointer: pointer.to_owned(),
+            message: "blocked".to_owned(),
+        };
+
+        // The legacy /register route passes no form at all, so EVERY trait pointer is
+        // unresolvable there. It must still be a rejection.
+        assert!(
+            resolve_errors(vec![error("/traits/email")], None).is_empty(),
+            "with no form, a trait pointer cannot be mapped, and the rejection must survive \
+             as an unmappable one rather than becoming an unanswered call"
+        );
+
+        // A built-in resolves even with no form, so that case maps normally.
+        assert_eq!(
+            resolve_errors(vec![error("/identifier")], None).len(),
+            1,
+            "the built-in fields need no signup form to resolve"
+        );
+
+        // One bad pointer discards the WHOLE mapping, not just its own entry.
+        let resolved = resolve_errors(vec![error("/identifier"), error("/traits/nope")], None);
+        assert!(
+            resolved.is_empty(),
+            "attaching only the resolvable subset would let one typo silently drop the field \
+             that actually mattered"
+        );
+    }
+
+    /// The shared budget shrinks with elapsed time and never goes below zero-ish nonsense.
+    ///
+    /// Pure arithmetic, extracted precisely because it was unreachable inline: both the cap
+    /// and the exhaustion guard survived mutation while nothing could call them.
+    #[test]
+    fn the_dispatch_budget_shrinks_and_then_runs_out() {
+        assert_eq!(
+            budget_remaining_ms(Duration::ZERO),
+            MAX_DISPATCH_BUDGET_MS,
+            "nothing spent yet"
+        );
+        assert_eq!(
+            budget_remaining_ms(Duration::from_secs(1)),
+            MAX_DISPATCH_BUDGET_MS - 1_000
+        );
+        assert_eq!(
+            budget_remaining_ms(Duration::from_millis(
+                u64::try_from(MAX_DISPATCH_BUDGET_MS).expect("the budget is positive")
+            )),
+            0,
+            "exactly spent is exhausted, and the caller's guard is `<= 0`"
+        );
+        assert!(
+            budget_remaining_ms(Duration::from_secs(3_600)) < 0,
+            "overspent stays negative rather than wrapping into a fresh budget"
+        );
+        assert!(
+            budget_remaining_ms(Duration::MAX) < 0,
+            "a saturating conversion must not hand back a full budget"
+        );
     }
 
     /// A target's free text is bounded, trimmed, and an empty explanation is no explanation.

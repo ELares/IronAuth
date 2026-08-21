@@ -735,6 +735,26 @@ mod tests {
             Some(TargetField::Trait("/phone".to_owned())),
             "and it DOES resolve at the step that renders it"
         );
+
+        // A field configured for THIS step whose pointer is no longer in the active schema
+        // renders no node either: `signup_field_nodes_with_messages` builds under BOTH
+        // conditions, so resolution has to match both. Without this case the schema half of
+        // the check was decorative, and deleting it left every test green.
+        let descheduled = (
+            config(vec![field("/removed_from_schema", 0, false, json!({}))]),
+            schema(),
+            1,
+        );
+        assert_eq!(
+            resolve_target_pointer(
+                "/traits/removed_from_schema",
+                Some(&descheduled),
+                SignupStep::Signup
+            ),
+            None,
+            "a configured field absent from the active schema renders no node, so resolving \
+             it would produce a failure that attaches to nothing"
+        );
     }
 
     /// A target's own text reaches the node it named, and only that node.

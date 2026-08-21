@@ -137,6 +137,19 @@ pub(crate) const BREACHED_PASSWORD_MESSAGE: &str = "That password has appeared i
 pub(crate) const SCREENING_UNAVAILABLE_MESSAGE: &str = "We could not check your password against the breach corpus right now. Please try \
      again in a moment.";
 
+/// The message shown when a registered HTTP flow target refuses a signup on the legacy
+/// `/register` route (issue #112).
+///
+/// Deliberately NOT the breach-corpus message. That screen runs and passes before this point,
+/// so reusing it would tell the person their password could not be checked when it was, and
+/// "try again in a moment" is wrong advice for a deterministic rejection by a target.
+///
+/// Uniform and field free: this route has no node model to attach a per-field explanation to,
+/// and naming a field would invent a rejection the target never made. It matches the flow
+/// path's own `FLOW_TARGET_UNAVAILABLE` copy so the two routes read the same.
+pub(crate) const FLOW_TARGET_REFUSED_MESSAGE: &str =
+    "We could not complete your request. Try again.";
+
 /// The decision a breached-password screen yields for the set/change/reset paths (issue
 /// #63): the password is allowed (not breached, screening disabled, or a fail-open
 /// outage that was audited), rejected as breached, or refused because the provider was

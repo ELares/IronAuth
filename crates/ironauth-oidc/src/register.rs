@@ -329,10 +329,14 @@ pub async fn register_post(
     match crate::flow::dispatch_registration_targets(&state, resume.scope, identifier, None).await {
         crate::flow::TargetDecision::Allow => {}
         crate::flow::TargetDecision::Refuse => {
+            // NOT the breach-corpus message. That screen already ran and passed a few lines
+            // above, so reusing it would tell the person their password could not be checked
+            // when it was, and "try again in a moment" is wrong advice for a deterministic
+            // rejection by a registered target.
             return register_error(
                 identifier,
                 &resume.return_to,
-                crate::state::SCREENING_UNAVAILABLE_MESSAGE,
+                crate::state::FLOW_TARGET_REFUSED_MESSAGE,
                 &resume.hints,
                 banner,
             );
