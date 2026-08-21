@@ -56,6 +56,11 @@ pub enum Timing {
     /// Before the write rather than inside its transaction: an outbound HTTP call inside one
     /// would hold a pooled Postgres connection and the write's row locks for the target's
     /// whole timeout, so a slow third party would consume the pool rather than its own budget.
+    ///
+    /// The header of migration 0146 still states the stronger claim, that a pre-persist target
+    /// runs inside the write's transaction. It is SHIPPED and checksummed, so its text cannot
+    /// be corrected without making every deployed database refuse to boot on
+    /// `ChecksumMismatch`; this doc is where that correction lives.
     PrePersist,
     /// Runs AFTER commit. The target observes committed state, which is the only way it can
     /// be shown data that is guaranteed to still be there when it looks.
