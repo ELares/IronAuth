@@ -3,8 +3,9 @@
 //! HTTP flow target configuration (issue #112).
 //!
 //! The types the dispatcher branches on, kept here rather than in the repository because the
-//! decisions they encode are the feature: a target's timing decides whether it runs inside the
-//! write's transaction, and its failure policy decides what happens when it does not answer.
+//! decisions they encode are the feature: a target's timing decides whether it runs BEFORE the
+//! write or after it commits, and its failure policy decides what happens when it does not
+//! answer.
 //!
 //! Nothing here performs IO. The registry reads rows and maps them to these; the dispatcher
 //! reads these and decides. Keeping the decision types free of the database is what lets the
@@ -48,8 +49,13 @@ pub enum Invocation {
 /// transaction at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Timing {
-    /// Runs INSIDE the write's transaction, before the row exists. A rejection therefore
-    /// leaves no row -- not a row that is later cleaned up, but no row ever.
+    /// Runs BEFORE the write is attempted, so no row exists yet. A rejection therefore leaves
+    /// no row -- not a row that is later cleaned up, but no row ever, because the write call is
+    /// never made.
+    ///
+    /// Before the write rather than inside its transaction: an outbound HTTP call inside one
+    /// would hold a pooled Postgres connection and the write's row locks for the target's
+    /// whole timeout, so a slow third party would consume the pool rather than its own budget.
     PrePersist,
     /// Runs AFTER commit. The target observes committed state, which is the only way it can
     /// be shown data that is guaranteed to still be there when it looks.
@@ -118,7 +124,7 @@ impl FlowTargetRecord {
     /// wrong, and the async case is the one where getting it wrong means blocking a flow on
     /// something nothing waits for.
     #[must_use]
-    pub fn runs_in_transaction(&self) -> bool {
+    pub fn runs_before_write(&self) -> bool {
         // An ASYNC target never does, whatever its timing says -- and the migration's CHECK
         // means an async target is always post-persist anyway, so this is belt and braces
         // rather than a second rule. Stated explicitly because the cost of the two disagreeing
@@ -364,21 +370,21 @@ mod tests {
         assert_eq!(field_pointer(&[]), "", "no tokens is the whole document");
     }
 
-    /// ONLY a sync pre-persist target runs inside the write's transaction.
+    /// ONLY a sync pre-persist target runs before the write.
     ///
     /// Asserted over all four combinations rather than the one true case, because the value of
-    /// this predicate is entirely in the cases it says NO to: an async target held inside a
-    /// transaction blocks a flow on something nothing waits for.
+    /// this predicate is entirely in the cases it says NO to: an async target treated as
+    /// blocking would block a flow on something nothing waits for.
     #[test]
-    fn only_a_sync_pre_persist_target_runs_in_the_transaction() {
-        assert!(target(Invocation::Sync, Timing::PrePersist).runs_in_transaction());
-        assert!(!target(Invocation::Sync, Timing::PostPersist).runs_in_transaction());
+    fn only_a_sync_pre_persist_target_runs_before_the_write() {
+        assert!(target(Invocation::Sync, Timing::PrePersist).runs_before_write());
+        assert!(!target(Invocation::Sync, Timing::PostPersist).runs_before_write());
         assert!(
-            !target(Invocation::Async, Timing::PostPersist).runs_in_transaction(),
+            !target(Invocation::Async, Timing::PostPersist).runs_before_write(),
             "fire-and-forget must never hold a transaction open"
         );
         assert!(
-            !target(Invocation::Async, Timing::PrePersist).runs_in_transaction(),
+            !target(Invocation::Async, Timing::PrePersist).runs_before_write(),
             "the migration refuses this combination, and the predicate must not depend on \
              that: a rule enforced in only one place is a rule that breaks when the other \
              place changes"

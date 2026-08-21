@@ -242,8 +242,7 @@ async fn caps_have_safe_defaults_and_are_configurable() {
 /// Issue #112 criterion 6 needs a per-target timeout: a sync flow target that exceeds its
 /// own bound must trigger its failure policy instead of hanging the flow it sits in. There
 /// was no way to express one. `total_timeout` is fixed on the `Fetcher` at construction, and
-/// a `Fetcher` per target would throw away the TLS trust-store setup and connection reuse on
-/// the signup path.
+/// a `Fetcher` per target would rebuild the TLS trust store per registered target.
 ///
 /// Both directions are driven, and the second is the one that matters. If the override
 /// REPLACED the configured bound rather than capping it, a target registered with a

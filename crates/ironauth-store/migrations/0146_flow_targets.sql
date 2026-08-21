@@ -37,7 +37,7 @@ CREATE TABLE flow_targets (
     CONSTRAINT flow_targets_invocation_valid
         CHECK (invocation IN ('sync', 'async')),
 
-    -- Criterion 4's selector. `pre_persist` runs inside the write's transaction so a rejection
+    -- Criterion 4's selector. `pre_persist` runs before the write is attempted so a rejection
     -- leaves no row; `post_persist` runs after commit so the target observes committed state.
     timing            text        NOT NULL,
     CONSTRAINT flow_targets_timing_valid

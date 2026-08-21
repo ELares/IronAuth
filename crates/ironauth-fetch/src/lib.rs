@@ -325,13 +325,16 @@ impl FetchRequest {
     ///
     /// The per-request override exists because a per-target deadline cannot be expressed
     /// otherwise: `total_timeout` is fixed on the `Fetcher` at construction, and a `Fetcher`
-    /// per target would throw away the TLS trust-store setup and connection reuse on the
-    /// signup path. It is CAPPED rather than replacing the configured bound, so a caller
-    /// can only ever ask for less time, and an operator's ceiling stays a ceiling.
+    /// per target would rebuild the TLS trust store per registered target. It is CAPPED
+    /// rather than replacing the configured bound, so a caller can only ever ask for less
+    /// time, and an operator's ceiling stays a ceiling.
     ///
     /// Honoured at the ONE existing deadline in `connect.rs`, deliberately, rather than by
-    /// wrapping the call in an outer `tokio::time::timeout`: two deadlines would disagree,
-    /// and the inner exchange would still be running after the caller had given up on it.
+    /// wrapping the call in an outer `tokio::time::timeout`. An outer wrapper does cancel the
+    /// inner exchange when it fires, but it yields `tokio` `Elapsed`, never
+    /// [`FetchError::Timeout`], so it never reaches the arm that records
+    /// `Outcome::Timeout`: every per-target timeout would vanish from the per-purpose metric
+    /// series, which is the signal an operator tunes the target's budget from.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);

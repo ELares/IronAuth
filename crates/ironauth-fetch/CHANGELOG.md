@@ -12,8 +12,9 @@ range per docs/RELEASING.md.
   sits in had no way to bound itself. `FetchRequest::timeout` CAPS the configured bound rather
   than replacing it, so a caller can only ever ask for less time and an operator's ceiling
   stays a ceiling. Honoured at the single existing deadline rather than by an outer
-  `tokio::time::timeout`, which would leave two deadlines disagreeing and the inner exchange
-  still running after the caller gave up.
+  `tokio::time::timeout`: an outer wrapper yields `Elapsed` rather than `FetchError::Timeout`,
+  so it never reaches the arm recording `Outcome::Timeout` and every per-target timeout would
+  vanish from the per-purpose metric series.
 - Add the `FlowTarget` `FetchPurpose` variant (issue #112, PR A): an operator-registered flow
   target, called out to at a point in a signup or login flow. Its own label rather than
   `WebhookDelivery`'s, because a webhook is a notification a tenant may drop and a SYNC flow

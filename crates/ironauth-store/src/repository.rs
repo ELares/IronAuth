@@ -40327,8 +40327,10 @@ impl ActingFlowTargetRepo<'_> {
 /// The registered HTTP flow targets for a scope (issue #112).
 ///
 /// READ ONLY. The dispatcher asks "which targets fire at this point", and the answer has to be
-/// available BEFORE a transaction is opened, because a pre-persist target runs inside that
-/// transaction. Registration is a management act and lives behind the control plane.
+/// available BEFORE a transaction is opened, because a pre-persist target runs before the write
+/// is attempted -- and must, since an outbound HTTP call inside the transaction would hold a
+/// pooled connection and the write's row locks for the target's whole timeout. Registration is
+/// a management act and lives behind the control plane.
 pub struct FlowTargetRepo<'a> {
     store: &'a Store,
     scope: Scope,
