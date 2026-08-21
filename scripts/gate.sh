@@ -312,10 +312,10 @@ run() {
 # the fix-one-thing-rerun-everything loop this rewrite exists to remove, for what is by far
 # clippy's most common failure mode.
 #
-# The scope is also narrower than it looks. Counted on this file: 66 checks, 63 of them below
-# this prerequisite. FOURTEEN of those 63 reach cargo -- two on gate.sh's own lines and
+# The scope is also narrower than it looks. Counted on this file: 67 checks, 64 of them below
+# this prerequisite. FOURTEEN of those 64 reach cargo -- two on gate.sh's own lines and
 # twelve through leaf scripts that shell out to it -- or sixteen when cargo-deny and the
-# ironbus lane are both available. The remaining 47 to 49 do not need a compiling tree at
+# ironbus lane are both available. The remaining 48 to 50 do not need a compiling tree at
 # all: mostly grep and python scans, plus six `git diff --exit-code` freshness assertions,
 # a `go build` and FOUR node-toolchain lanes (two guarded by a `node_modules` probe and
 # two not). An earlier version said "two npm lanes", which is the count of the OPTIONAL
@@ -395,6 +395,7 @@ run "invariant lints" scripts/invariant-lints.sh
 run "query audit (no scoped-table SQL outside the repository module)" scripts/query-audit.sh
 run "scoped table registration (every forced-RLS table in the migrations is in the query audit list)" scripts/scoped-table-registration.sh
 run "audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)" scripts/audit-fk-claim-scan.sh
+run "migration immutability (a landed migration's bytes never change)" scripts/migration-immutability.sh
 run "test registration (every tests/*.rs file has a [[test]] entry; autotests are off)" scripts/test-registration.sh
 
 run "independently publishable crates" scripts/publishable-crates.sh
