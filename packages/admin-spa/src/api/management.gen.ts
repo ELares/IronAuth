@@ -11763,7 +11763,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description The environment is absent or deleted */
+            /** @description No such target, or the environment is absent or deleted */
             404: {
                 headers: {
                     [name: string]: unknown;

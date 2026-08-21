@@ -6004,7 +6004,7 @@
             }
           },
           "404": {
-            "description": "The environment is absent or deleted",
+            "description": "No such target, or the environment is absent or deleted",
             "content": {
               "application/json": {
                 "schema": {

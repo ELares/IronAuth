@@ -240,11 +240,8 @@ fn validate(
                     .to_owned(),
             ));
         };
-        if timeout <= 0 {
-            return Err(ApiError::BadRequest(
-                "timeout_ms must be greater than zero".to_owned(),
-            ));
-        }
+        // Positivity is already refused above, for every invocation. Only the ceiling is
+        // sync-specific, because only a sync target sits on a live signup.
         if timeout > ironauth_oidc::flow::FLOW_TARGET_MAX_SYNC_TIMEOUT_MS {
             return Err(ApiError::BadRequest(format!(
                 "timeout_ms must not exceed {}: a sync target sits on a live signup, and a \
@@ -455,42 +452,20 @@ pub async fn create_flow_target(
         return Ok(replay);
     }
 
-    // Resolve the id BEFORE the write, by name.
+    // NO pre-read. An earlier revision resolved the id by name first, and that introduced a
+    // 500: deletes are SOFT, so a tombstone keeps its primary key, while the name uniqueness
+    // the upsert arbitrates on is a PARTIAL index excluding tombstones. A delete committing
+    // between the read and the write meant `ON CONFLICT` did not fire, the INSERT branch ran
+    // with the tombstone's id, and Postgres raised a primary-key violation. A freshly minted
+    // candidate cannot collide with anything.
     //
-    // The upsert arbitrates on NAME, and its ON CONFLICT branch keeps the EXISTING row's id
-    // without listing `id` in its SET. So a freshly minted candidate is DISCARDED whenever
-    // the name already names a row, and returning it would hand the caller an id that
-    // resolves nowhere, 404s on its own DELETE, and is stamped into the emitted event as the
-    // subject. Reading the name first makes the candidate the id the write will actually
-    // keep, so the response, the event and the audit target all name the same row.
-    //
-    // The write still takes the resolved id from `RETURNING id`, which is what makes this
-    // correct rather than merely likely: if a concurrent create wins the race between this
-    // read and the insert, the response and its stored replay are rendered from the id the
-    // database returned, not from this one.
-    let existing = state
-        .store()
-        .scoped(scope)
-        .flow_targets()
-        .list()
-        .await?
-        .into_iter()
-        .find(|listing| listing.record.name == request.name)
-        .map(|listing| listing.record.id);
-    let candidate =
-        existing.unwrap_or_else(|| ironauth_store::FlowTargetId::generate(state.env(), &scope));
-
+    // Nothing needs the id up front. The response, the audit target, the stored replay and
+    // now the event are all rendered from what `RETURNING id` gave back.
+    let candidate = ironauth_store::FlowTargetId::generate(state.env(), &scope);
     let config = request
         .config
         .clone()
         .unwrap_or_else(|| serde_json::json!({}));
-    let pending = flow_target_event(
-        &state,
-        scope,
-        &candidate.to_string(),
-        &request.name,
-        Some((class, invocation, timing)),
-    );
     let live_id = state
         .store()
         .scoped(scope)
@@ -521,19 +496,32 @@ pub async fn create_flow_target(
                 request_fingerprint: &fingerprint,
                 response_status: 201,
                 // Rendered from what the write RESOLVED, inside its own transaction, so the
-                // stored response and the row it names commit together and agree. A body
-                // built up front would be stored for every replay of this key forever after,
-                // so it has to describe what was persisted rather than what was requested.
+                // stored response and the row it names commit together. A body built up front
+                // would be stored for every replay of this key forever after, so it has to
+                // describe what was persisted rather than what was requested.
                 response_body: &|resolved: &ironauth_store::FlowTargetId| {
                     serde_json::to_string(&FlowTargetCreated {
                         id: resolved.to_string(),
                     })
                 },
             }),
-            pending
-                .as_ref()
-                .map(crate::events::PendingEvent::domain_event)
-                .as_ref(),
+            // Built from the LIVE id too. The event announces which integration is now
+            // registered, so a subject naming a row that does not exist is worse than no
+            // event: a consumer would act on it.
+            Some(&|resolved: &ironauth_store::FlowTargetId| {
+                flow_target_event(
+                    &state,
+                    scope,
+                    &resolved.to_string(),
+                    &request.name,
+                    Some((class, invocation, timing)),
+                )
+                .map(|pending| ironauth_store::OwnedDomainEvent {
+                    id: pending.id,
+                    subject: pending.subject,
+                    envelope: pending.envelope,
+                })
+            }),
         )
         .await?;
 
@@ -558,10 +546,10 @@ pub async fn create_flow_target(
     security(("bearer" = [])),
     responses(
         (status = 204, description = "Deregistered"),
-        (status = 404, description = "No such target in this environment", body = ErrorBody),
+
         (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "The environment is absent or deleted", body = ErrorBody)
+        (status = 404, description = "No such target, or the environment is absent or deleted", body = ErrorBody)
     )
 )]
 pub async fn delete_flow_target(

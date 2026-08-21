@@ -641,7 +641,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 168 operations declare a required permission and 24 have that permission proven. The other
+/// 171 operations declare a required permission and 27 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -656,7 +656,9 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// without somebody editing this assertion and noticing what they are doing.
 ///
 /// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 166 minus 22 is always 144. That is deliberate rather than an oversight. The
+/// its own: 171 minus 27 is always 144. (It read "166 minus 22" for two raises before this
+/// one, which is the hazard of writing an arithmetic identity beside the numbers it derives
+/// from rather than deriving it.) That is deliberate rather than an oversight. The
 /// ratchet's job was to catch a drift nothing else measured, and two exact pins catch it
 /// earlier and name which set moved. What the ratchet still carries is its message, which is
 /// the instruction for the person who just made one of those pins fail.

@@ -40134,7 +40134,13 @@ impl ActingFlowTargetRepo<'_> {
         created_at_micros: i64,
         params: NewFlowTarget<'_>,
         idempotency: Option<ResolvedIdempotencyWrite<'_, FlowTargetId>>,
-        event: Option<&DomainEvent<'_>>,
+        // RESOLVED, for the same reason the idempotent body is. The event's subject and its
+        // `flow_target_id` must name the row the upsert KEPT, and that is knowable only after
+        // `RETURNING id`. A pre-built event carries the caller's guess, and on an overwrite,
+        // or under a concurrent create of the same name, it announces a row that does not
+        // exist. `Sync` because the write is held across an await inside an axum handler
+        // whose future must be `Send`.
+        event: Option<ResolvedEventBuilder<'_, FlowTargetId>>,
     ) -> Result<FlowTargetId, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -40221,8 +40227,10 @@ impl ActingFlowTargetRepo<'_> {
         // id on every overwrite, and store it forever, which is the failure this type exists
         // for and which its own doc describes.
         insert_resolved_idempotency(&mut tx, idempotency, &live_id).await?;
-        // BEFORE the commit, in the upsert's own transaction.
-        enqueue_domain_event(&mut tx, env, scope, event).await?;
+        // BEFORE the commit, in the upsert's own transaction, and built from the LIVE id.
+        let resolved_event = event.and_then(|build| build(&live_id));
+        let borrowed = resolved_event.as_ref().map(OwnedDomainEvent::borrowed);
+        enqueue_domain_event(&mut tx, env, scope, borrowed.as_ref()).await?;
         tx.commit().await?;
         Ok(live_id)
     }
@@ -59658,6 +59666,42 @@ pub struct DomainEvent<'a> {
     /// specifies.
     pub envelope: &'a serde_json::Value,
 }
+
+/// A [`DomainEvent`] that OWNS its parts, for a write that can only build the event after it
+/// knows what it wrote.
+///
+/// An upsert that arbitrates on a natural key does not know the row's id until `RETURNING id`,
+/// so an event built beforehand carries the caller's guess and, on an overwrite, announces a
+/// row that does not exist. A borrowing [`DomainEvent`] cannot be returned from a builder
+/// called INSIDE the write, because there is nothing outside it for the borrow to point at.
+/// This owns its parts so the store can hold it locally and borrow from it for the enqueue.
+#[derive(Debug, Clone)]
+pub struct OwnedDomainEvent {
+    /// The event's stable id.
+    pub id: String,
+    /// The entity the event is about.
+    pub subject: String,
+    /// The envelope a receiver is sent.
+    pub envelope: serde_json::Value,
+}
+
+impl OwnedDomainEvent {
+    /// Borrow this as the carrier an emitting store write takes.
+    #[must_use]
+    pub fn borrowed(&self) -> DomainEvent<'_> {
+        DomainEvent {
+            id: &self.id,
+            subject: &self.subject,
+            envelope: &self.envelope,
+        }
+    }
+}
+
+/// Builds the event a write emits, from what that write RESOLVED.
+///
+/// A named alias because the bare type is unreadable and clippy refuses it. See
+/// [`OwnedDomainEvent`] for why the event cannot simply be passed in already built.
+pub type ResolvedEventBuilder<'a, R> = &'a (dyn Fn(&R) -> Option<OwnedDomainEvent> + Sync);
 
 /// The scheduled-offboarding half of a user state change (issue #52).
 ///
