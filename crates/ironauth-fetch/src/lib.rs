@@ -60,13 +60,13 @@
 
 mod connect;
 mod error;
-/// Throwaway TLS material for tests that must complete a handshake (issue #959).
-#[cfg(feature = "test-harness")]
-pub mod test_tls;
 pub mod observe;
 pub mod policy;
 pub(crate) mod resolve;
 pub mod target;
+/// Throwaway TLS material for tests that must complete a handshake (issue #959).
+#[cfg(feature = "test-harness")]
+pub mod test_tls;
 pub mod txt;
 
 use std::sync::Arc;

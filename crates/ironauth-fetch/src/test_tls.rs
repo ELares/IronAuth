@@ -91,9 +91,7 @@ impl TestTlsIdentity {
         Self {
             root_der,
             leaf_chain: vec![leaf.der().clone()],
-            leaf_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                leaf_key.serialize_der(),
-            )),
+            leaf_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
         }
     }
 }

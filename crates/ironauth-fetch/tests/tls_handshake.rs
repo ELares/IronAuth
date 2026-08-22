@@ -51,9 +51,12 @@ async fn the_hardened_fetcher_completes_an_https_exchange_with_an_in_process_tar
 
     let request = FetchRequest::get(
         FetchPurpose::FlowTarget,
-        &format!("https://{TARGET_HOST}/consult"),
+        format!("https://{TARGET_HOST}/consult"),
     );
-    let response = fetcher.fetch(request).await.expect("the exchange completes");
+    let response = fetcher
+        .fetch(request)
+        .await
+        .expect("the exchange completes");
 
     assert_eq!(response.status().as_u16(), 200, "the target answered");
     assert_eq!(
@@ -84,7 +87,7 @@ async fn the_trust_anchor_does_not_weaken_the_destination_policy() {
 
     let request = FetchRequest::get(
         FetchPurpose::FlowTarget,
-        &format!("https://{TARGET_HOST}/consult"),
+        format!("https://{TARGET_HOST}/consult"),
     );
     let error = fetcher
         .fetch(request)
@@ -123,7 +126,7 @@ async fn a_target_whose_certificate_is_not_under_the_trusted_root_is_refused() {
 
     let request = FetchRequest::get(
         FetchPurpose::FlowTarget,
-        &format!("https://{TARGET_HOST}/consult"),
+        format!("https://{TARGET_HOST}/consult"),
     );
     let result = fetcher.fetch(request).await;
     assert!(
