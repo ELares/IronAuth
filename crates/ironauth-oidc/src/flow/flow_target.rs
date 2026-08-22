@@ -422,15 +422,21 @@ async fn consult_target(
         },
         "tenant_id": scope.tenant().to_string(),
         "environment_id": scope.environment().to_string(),
-        // What the signup BECAME, stamped from the write's own facts rather than from the
-        // caller's `data` closure, which is what makes it trustworthy. Siblings of `data` and
-        // not inside it, matching where the async half puts them, so a receiver wired to both
-        // reads one contract.
-        //
         "data": data,
         "config": target.config,
     });
 
+    // What the signup BECAME.
+    //
+    // Stamped from the write's own facts rather than from the caller's `data` closure, which
+    // is what makes it trustworthy: every door gets it right for free and no future door can
+    // forget. Siblings of `data` and not inside it, matching where the async half puts them,
+    // so a receiver wired to both reads one contract.
+    //
+    // This paragraph lives HERE, beside the insert, and not above the literal. It headed the
+    // two inline keys until they moved down, and was briefly left behind describing
+    // `"data": data` instead, of which all three of its claims are false.
+    //
     // ABSENT at pre-persist, where there is no row yet, and absent means the KEY IS NOT THERE.
     //
     // Inserted after the fact rather than written inline, because `json!` inserts a key
