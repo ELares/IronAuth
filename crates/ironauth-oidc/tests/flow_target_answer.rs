@@ -294,6 +294,43 @@ fn forging_responder(request: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
     (status, body, headers)
 }
 
+/// Answer with a VALID signature over a stale timestamp.
+///
+/// The third way `response_signature_verifies` can reject, and the one with no coverage until
+/// now: the key is right and the bytes are right, but the stamp is far outside
+/// `RESPONSE_TOLERANCE_SECS`. This is the replay case. Without it the tolerance is only ever
+/// SATISFIED, never exercised, which is the same inertness `CLOCK_SECS` exists to remove on
+/// the request side.
+fn stale_responder(request: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+    let head = String::from_utf8_lossy(request);
+    let delivery_id = head
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("webhook-id")
+                .then(|| value.trim().to_owned())
+        })
+        .expect("IronAuth sends a webhook-id on a signed consultation");
+    let body = br#"{"verdict":"allow"}"#.to_vec();
+    // The epoch, while the clock reads CLOCK_SECS. Correctly signed FOR that timestamp, so the
+    // only thing wrong is how old it is.
+    let signature = sign_delivery(
+        std::slice::from_ref(&WebhookSecret::from_bytes(SIGNING_SECRET.to_vec())),
+        &delivery_id,
+        0,
+        &body,
+    );
+    (
+        200,
+        body,
+        vec![
+            ("webhook-timestamp".to_owned(), "0".to_owned()),
+            ("webhook-signature".to_owned(), signature),
+        ],
+    )
+}
+
 /// Pull one header value out of a recorded request head.
 fn header_value<'a>(head: &'a str, name: &str) -> &'a str {
     head.lines()
@@ -772,10 +809,21 @@ async fn a_wrongly_signed_response_is_refused() {
 /// The other half of the same criterion: an UNSIGNED response from a target configured with a
 /// secret must be refused.
 ///
-/// A different code path from the test above: `response_signature_verifies` returns early on
-/// the missing headers rather than reaching the comparison, so a mutant that only weakens the
-/// comparison would still be caught here, and one that removes the header check would be
-/// caught there.
+/// A different code path from the test above, and the mapping is worth naming explicitly
+/// because an earlier version of this comment stated it BACKWARDS, contradicting the
+/// measurement in its own commit message.
+///
+/// `response_signature_verifies` returns early on the missing headers and never reaches the
+/// comparison. So:
+///
+/// * a mutant on the header arm (`else { return true }`) is caught by THIS test, because this
+///   is the only one whose response carries no webhook headers;
+/// * a mutant on the comparison (`.is_ok() || true`) is caught only by
+///   `a_wrongly_signed_response_is_refused`, whose `forging_responder` keeps a valid
+///   `webhook-timestamp` so both headers bind and execution reaches `verify_delivery`.
+///
+/// Neither test can catch the other's mutant, which is why both exist. Deleting either one
+/// leaves a reject path executing nowhere in the workspace.
 #[tokio::test]
 async fn an_unsigned_response_from_a_signed_target_is_refused() {
     let identity = TestTlsIdentity::generate(TARGET_HOST);
@@ -819,5 +867,60 @@ async fn an_unsigned_response_from_a_signed_target_is_refused() {
         !user_exists(&harness, "unsigned@example.test").await,
         "a target configured with a secret must not be believed when it answers unsigned: \
          {body}"
+    );
+}
+
+/// The third reject path: a correctly signed response whose timestamp is too old.
+///
+/// `response_signature_verifies` can refuse in three ways, not two: missing headers, a
+/// timestamp outside `RESPONSE_TOLERANCE_SECS`, and a signature that does not match. The other
+/// two tests cover the first and third. Without this one the tolerance is only ever satisfied,
+/// so shortening it, lengthening it, or dropping the check entirely changes no test result.
+///
+/// This is the replay case: an attacker who captured a genuine approval cannot present it
+/// later against a new consultation.
+#[tokio::test]
+async fn a_correctly_signed_but_stale_response_is_refused() {
+    let identity = TestTlsIdentity::generate(TARGET_HOST);
+    let target = TestTlsTarget::start_with(&identity, stale_responder).await;
+
+    let mut harness = setup().await;
+    install_schema(&harness).await;
+    install_form(&harness).await;
+    install_signing_secret(&harness).await;
+    install_trusting_fetcher(&mut harness, &identity, &target);
+    register_target_signed(
+        &harness,
+        FailurePolicy::FailClosed,
+        Some(SIGNING_SECRET_NAME),
+    )
+    .await;
+    // CLOCK_SECS is 10_000 against a 300s tolerance, so a stamp of 0 is 33x outside it.
+    harness
+        .clock()
+        .advance(std::time::Duration::from_secs(CLOCK_SECS));
+
+    let (flow_id, token) = create_flow_api(&harness).await;
+    let (status, body) = post_json(
+        &harness,
+        &submit_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": {
+                "identifier": "stale@example.test",
+                "password": PASSWORD,
+                "nickname": "zeke"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "submit: {body}");
+
+    assert_eq!(target.received().len(), 1, "the target WAS consulted");
+    assert!(
+        !user_exists(&harness, "stale@example.test").await,
+        "a correctly signed but STALE response must be refused, or a captured approval could \
+         be replayed against a later consultation: {body}"
     );
 }
