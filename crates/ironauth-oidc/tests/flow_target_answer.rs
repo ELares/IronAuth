@@ -809,21 +809,25 @@ async fn a_wrongly_signed_response_is_refused() {
 /// The other half of the same criterion: an UNSIGNED response from a target configured with a
 /// secret must be refused.
 ///
-/// A different code path from the test above, and the mapping is worth naming explicitly
-/// because an earlier version of this comment stated it BACKWARDS, contradicting the
-/// measurement in its own commit message.
+/// A different code path from the two tests above, and the distinction is stated as WHAT EACH
+/// FIXTURE REACHES rather than as which mutant each uniquely kills.
 ///
-/// `response_signature_verifies` returns early on the missing headers and never reaches the
-/// comparison. So:
+/// That framing is deliberate. Two earlier versions of this comment made exclusivity claims
+/// and both were wrong: the first inverted the mapping, and the second said the comparison
+/// mutant was caught "only by" the wrongly-signed test when the stale test catches it too.
+/// Which mutants a test happens to kill is a fact about the current mutant set; which code
+/// path its fixture reaches is a fact about the fixture.
 ///
-/// * a mutant on the header arm (`else { return true }`) is caught by THIS test, because this
-///   is the only one whose response carries no webhook headers;
-/// * a mutant on the comparison (`.is_ok() || true`) is caught only by
-///   `a_wrongly_signed_response_is_refused`, whose `forging_responder` keeps a valid
-///   `webhook-timestamp` so both headers bind and execution reaches `verify_delivery`.
+/// * THIS test serves no webhook headers at all, so `response_signature_verifies` takes its
+///   local early return and never calls `verify_delivery`.
+/// * `a_wrongly_signed_response_is_refused` serves both headers with a current timestamp, so
+///   it is the only fixture in this crate that reaches the HMAC comparison and fails there.
+/// * `a_correctly_signed_but_stale_response_is_refused` serves both headers with an old
+///   timestamp, so it reaches `verify_delivery` and is refused by the tolerance BEFORE any
+///   HMAC is computed.
 ///
-/// Neither test can catch the other's mutant, which is why both exist. Deleting either one
-/// leaves a reject path executing nowhere in the workspace.
+/// The three are kept because they enter the function on three different paths, not because
+/// each is uniquely load-bearing against some particular mutant.
 #[tokio::test]
 async fn an_unsigned_response_from_a_signed_target_is_refused() {
     let identity = TestTlsIdentity::generate(TARGET_HOST);
@@ -870,15 +874,25 @@ async fn an_unsigned_response_from_a_signed_target_is_refused() {
     );
 }
 
-/// The third reject path: a correctly signed response whose timestamp is too old.
+/// A response whose timestamp is too old is refused, so the tolerance is not inert.
 ///
-/// `response_signature_verifies` can refuse in three ways, not two: missing headers, a
-/// timestamp outside `RESPONSE_TOLERANCE_SECS`, and a signature that does not match. The other
-/// two tests cover the first and third. Without this one the tolerance is only ever satisfied,
-/// so shortening it, lengthening it, or dropping the check entirely changes no test result.
+/// No claim here about how many ways the check can refuse. An earlier comment said two, round
+/// 3 corrected it to three, and it is at least four once a present-but-unparseable timestamp
+/// is counted. The enumeration kept being wrong because it was written from memory of the
+/// code rather than from the code, so it is simply gone: what this test does is drive the
+/// tolerance rejection, and that is all it claims.
 ///
-/// This is the replay case: an attacker who captured a genuine approval cannot present it
-/// later against a new consultation.
+/// What this is NOT is the replay defence. Replay is prevented by the per-call delivery id:
+/// the response is verified under the SAME id the request was signed with, so a captured
+/// approval carries the previous consultation's id and cannot match a later one at any
+/// timestamp. `flow_target.rs` says so at the call site. The tolerance BOUNDS how stale an
+/// answer may be within one consultation, which is worth pinning on its own, and is what this
+/// test pins.
+///
+/// One honest limit. `verify_delivery` checks the timestamp BEFORE computing any HMAC, so the
+/// signature this fixture builds is never actually verified by the system under test. The
+/// fixture signs correctly so the test means what its name says, but nothing here would notice
+/// if that signing became wrong.
 #[tokio::test]
 async fn a_correctly_signed_but_stale_response_is_refused() {
     let identity = TestTlsIdentity::generate(TARGET_HOST);
@@ -920,7 +934,8 @@ async fn a_correctly_signed_but_stale_response_is_refused() {
     assert_eq!(target.received().len(), 1, "the target WAS consulted");
     assert!(
         !user_exists(&harness, "stale@example.test").await,
-        "a correctly signed but STALE response must be refused, or a captured approval could \
-         be replayed against a later consultation: {body}"
+        "a STALE response must be refused. The tolerance is what bounds how old an answer \
+         may be; a signed answer accepted at any age is an answer an operator can no longer \
+         reason about: {body}"
     );
 }
