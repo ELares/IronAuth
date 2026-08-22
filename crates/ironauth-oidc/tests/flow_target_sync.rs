@@ -34,8 +34,9 @@
 //!
 //! Resolving a target's JSON pointer against no form, so every `/traits/...` rejection
 //! degrades to a field-free refusal. That mutation lives in `classify_response`, which runs
-//! only after a SUCCESSFUL fetch, and the empty root store described above forbids one here
-//! (issue #959). It is also unreachable on the legacy door in principle, since
+//! only after a SUCCESSFUL fetch. The hardened fetcher's trust anchors are EMPTY by design
+//! (see `target_server` below, and issue #959), so no handshake here can ever complete and
+//! nothing this file drives can reach that code. It is also unreachable on the legacy door in principle, since
 //! `dispatch_registration_targets` passes `None` for the signup form.
 //!
 //! This section exists because an earlier draft listed that mutation as killed. Claiming a
@@ -67,6 +68,23 @@ const PASSWORD: &str = "a-sync-target-consultation-passphrase";
 /// assertion below is stated as a multiple of it: the point of that assertion is that THIS
 /// number is what ended the consultation, so it must be the number the bound is derived from.
 const HANG_TIMEOUT_MS: u64 = 250;
+
+/// The elapsed guard multiplies the bound above by 20. That is only a GUARD while the result
+/// stays well under the ceiling that applies when the per-target bound is not honoured, which
+/// is the fetcher's own default total timeout. At `HANG_TIMEOUT_MS = 500` the product is
+/// exactly that default and the assertion stops discriminating: it would pass whether the
+/// consultation was bounded by the target or by the fallback, which is the entire distinction
+/// it exists to make.
+///
+/// So the relationship is checked at COMPILE time against the real constant rather than left
+/// as a property someone has to remember. Raising the bound past a quarter of the default is
+/// a build error naming this, not a guard that silently stops working. Half the default is
+/// the margin, so the two are never merely adjacent.
+const _: () = assert!(
+    (HANG_TIMEOUT_MS as u128) * 20 * 2 <= ironauth_fetch::DEFAULT_TOTAL_TIMEOUT.as_millis(),
+    "HANG_TIMEOUT_MS * 20 must stay at or under half the fetcher's default total timeout, or \
+     the elapsed assertion can no longer tell the configured bound from the fallback"
+);
 
 /// Stand up an in-process target that ACCEPTS a connection and never answers.
 ///
@@ -339,7 +357,7 @@ async fn an_elapsed_fail_open_consultation_admits_the_signup() {
         "hanging-advisory",
         Timing::PrePersist,
         FailurePolicy::FailOpen,
-        250,
+        i32::try_from(HANG_TIMEOUT_MS).expect("the configured bound fits an i32"),
     )
     .await;
 
@@ -384,7 +402,7 @@ async fn a_sync_consultation_reaches_the_network() {
         "dialled-gate",
         Timing::PrePersist,
         FailurePolicy::FailOpen,
-        250,
+        i32::try_from(HANG_TIMEOUT_MS).expect("the configured bound fits an i32"),
     )
     .await;
 
