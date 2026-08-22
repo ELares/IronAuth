@@ -526,6 +526,17 @@ pub(super) async fn advance_registration(
             schema_version: *schema_version,
         });
 
+    // ASYNC flow targets (issue #112 criterion 2), read BEFORE the write. Why outside the
+    // write's transaction, and why a failed read announces nothing rather than refusing the
+    // signup, are both on `flow_target::enabled_async_targets`.
+    let async_targets = flow_target::enabled_async_targets(state, scope).await;
+    // The envelope is composed entirely by the store, from ids it already holds. This door
+    // supplies no domain data: see the enqueue in `register_inner` for why an identifier must
+    // not be written into an outbox payload.
+    let deliveries = (!async_targets.is_empty()).then(|| ironauth_store::AsyncFlowDeliveries {
+        targets: &async_targets,
+    });
+
     let actor = ActorRef::human(HumanId::generate(state.env()));
     let scoped = state
         .store()
@@ -543,6 +554,7 @@ pub(super) async fn advance_registration(
                 &password_hash,
                 reason,
                 registered_traits,
+                deliveries,
             )
             .await
     } else if waitlisted {
@@ -554,12 +566,19 @@ pub(super) async fn advance_registration(
                 &password_hash,
                 UserState::Waitlisted,
                 registered_traits,
+                deliveries,
             )
             .await
     } else {
         scoped
             .users()
-            .register_with_traits(state.env(), identifier, &password_hash, registered_traits)
+            .register_with_traits(
+                state.env(),
+                identifier,
+                &password_hash,
+                registered_traits,
+                deliveries,
+            )
             .await
     };
 

@@ -6706,6 +6706,10 @@ export interface components {
              * Format: int32
              * @description The bound on a sync call, in milliseconds. Required for a sync target and refused
              *     above the ceiling.
+             *
+             *     Refused ENTIRELY on an async target: an async delivery is bounded by
+             *     `flow_targets.delivery_timeout_secs` and nothing reads a per-target value, so accepting
+             *     one here would store a setting that never applies.
              */
             timeout_ms?: number | null;
             /** @description `pre_persist` or `post_persist`. */

@@ -33,6 +33,7 @@ async fn seed_quarantined(harness: &Harness, scope: Scope, identifier: &str) -> 
             identifier,
             "$argon2id$dummy",
             SignupQuarantineReason::RiskOutput,
+            None,
         )
         .await
         .expect("seed a quarantined signup")

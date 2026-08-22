@@ -6,6 +6,22 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **New section `[flow_targets]`** (issue #112 criterion 2), with two settings and a new
+  public const. `flow_targets.delivery_enabled` (default `false`) gates whether THIS process
+  drains the `flow_target.delivery` queue and POSTs to registered async targets, matching the
+  covenant every other background worker here is held to: no mandatory background
+  infrastructure. `flow_targets.delivery_timeout_secs` (default `10`) is the per-delivery HTTP
+  budget, bounded at least 1 and at most `FLOW_TARGET_MAX_DELIVERY_TIMEOUT_SECS` (300, an
+  alias of the webhook ceiling so both outbound consumers answer to one bound).
+
+  Two new `ConfigError::Invalid` refusals, and the split between them is deliberate. The
+  BOUNDS are checked unconditionally, because a zero budget is meaningless even while no
+  worker reads it: `Duration::from_secs(0)` times out before it connects, so every delivery
+  would exhaust its attempts without one POST reaching a receiver. The LEASE rule
+  (`delivery_timeout_secs` must be strictly less than `outbox.visibility_timeout_secs`) is
+  gated on `delivery_enabled`, because the two numbers are inert where no worker runs and
+  refusing a boot over an inert pair would make a deployment that drains nothing unbootable.
+
 - **New setting `oidc.client_jwks_ttl_secs`** (default `300`, bounded 1 to
   `OIDC_MAX_CLIENT_JWKS_TTL_SECS` = 3600, a new public const; a new
   `ConfigError::Invalid` naming the setting). How long a CLIENT's fetched `jwks_uri` key set

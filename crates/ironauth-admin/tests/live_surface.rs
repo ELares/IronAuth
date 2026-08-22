@@ -826,6 +826,7 @@ impl Fixture {
                 "risky@example.test",
                 "$argon2id$dummy",
                 SignupQuarantineReason::RiskOutput,
+                None,
             )
             .await
             .expect("seed a quarantined signup")
@@ -844,6 +845,7 @@ impl Fixture {
                 "risky2@example.test",
                 "$argon2id$dummy",
                 SignupQuarantineReason::RiskOutput,
+                None,
             )
             .await
             .expect("seed a second quarantined signup")

@@ -82,6 +82,10 @@ pub struct SetFlowTargetRequest {
     pub endpoint: String,
     /// The bound on a sync call, in milliseconds. Required for a sync target and refused
     /// above the ceiling.
+    ///
+    /// Refused ENTIRELY on an async target: an async delivery is bounded by
+    /// `flow_targets.delivery_timeout_secs` and nothing reads a per-target value, so accepting
+    /// one here would store a setting that never applies.
     #[serde(default)]
     pub timeout_ms: Option<i32>,
     /// `fail_open` or `fail_closed`.
@@ -231,6 +235,22 @@ fn validate(
                 "timeout_ms must be greater than zero".to_owned(),
             ));
         }
+    }
+    // An ASYNC target must not carry a per-call timeout. The delivery consumer bounds every
+    // POST with `flow_targets.delivery_timeout_secs` and never reads `timeout_ms`, so a value
+    // set here would round-trip through this API, appear in the listing, and do nothing --
+    // the accepted-and-ignored shape the enqueue guard refuses one layer down, on the
+    // grounds that it is indistinguishable from working.
+    //
+    // The migration's CHECK only REQUIRES a timeout on sync; it does not forbid one on async.
+    // So this rule lives here, at the boundary, rather than being assumed from the schema.
+    if matches!(invocation, Invocation::Async) && request.timeout_ms.is_some() {
+        return Err(ApiError::BadRequest(
+            "an async target must not set timeout_ms: an async delivery is bounded by \
+             flow_targets.delivery_timeout_secs, so a per-target value would be accepted \
+             here and never applied"
+                .to_owned(),
+        ));
     }
     if matches!(invocation, Invocation::Sync) {
         let Some(timeout) = request.timeout_ms else {

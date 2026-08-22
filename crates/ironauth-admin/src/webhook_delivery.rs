@@ -55,13 +55,25 @@ const HEADER_SIGNATURE: &str = "webhook-signature";
 /// The returned future is declared `Send` so a worker built on this seam stays spawnable
 /// on a multi-threaded runtime.
 pub trait WebhookSender: Send + Sync {
-    /// POST `body` to `url` under the three Standard Webhooks headers. This is the ONLY
-    /// outbound path the consumer has.
+    /// POST `body` to `url` under the Standard Webhooks headers. This is the ONLY outbound
+    /// path the consumer has.
+    ///
+    /// THREE headers for a signed delivery, ONE for an unsigned one: see
+    /// [`DeliveryHeaders`], whose `id` is unconditional and whose signature pair is not.
     ///
     /// It returns what the RECEIVER said rather than merely whether the call worked,
     /// because the attempt history (#106) records the status code on a success as well as
     /// on a failure. A boolean outcome would have left "it returned 204" and "it returned
     /// 200" indistinguishable in the record an operator debugs from.
+    ///
+    /// `headers` is NOT optional. Every delivery carries `webhook-id`; what varies is whether
+    /// [`DeliveryHeaders::signature`] is present. Optionality lives one level down for a
+    /// reason measured here: making the whole set optional dropped the dedup handle along with
+    /// the signature, and an unsigned receiver then could not tell a redelivery from a second
+    /// event on an at-least-once queue.
+    ///
+    /// One sender rather than two, so the header-encoding refusal below stays in ONE place: a
+    /// second outbound path is a second chance to send a delivery the receiver cannot verify.
     fn deliver(
         &self,
         url: &str,
@@ -103,32 +115,106 @@ impl DeliveryOutcome {
     }
 }
 
-/// The three Standard Webhooks headers one delivery carries.
+/// The Standard Webhooks headers one delivery carries: three when it is signed, one when it
+/// is not.
 ///
-/// A struct rather than three parameters because the values are not interchangeable and
-/// two of them are strings: transposing the id and the signature at a call site would
-/// produce deliveries no consumer could verify and nothing in the type system would have
-/// objected.
+/// A struct rather than loose parameters because the values are not interchangeable. It used
+/// to hold three strings, where transposing the id and the signature at a call site would
+/// have produced deliveries no consumer could verify with nothing in the type system
+/// objecting. That particular transposition is no longer expressible -- the id is a `String`
+/// and the pair is an `Option<SignaturePair>` -- but the reason for grouping them stands, and
+/// the split is now what carries the rule that an unsigned delivery still has an id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryHeaders {
     /// `webhook-id`: stable across every retry of the same delivery.
+    ///
+    /// ALWAYS sent, signed or not. This is the delivery's IDENTITY, not part of its
+    /// signature: it is the handle a receiver deduplicates an at-least-once queue on, and a
+    /// delivery without one cannot be deduplicated at all. An earlier revision made the whole
+    /// header set optional so an unsigned flow target could be delivered, which dropped this
+    /// with the other two and left an unsigned receiver unable to tell a redelivery from a
+    /// second event.
     pub id: String,
+    /// The signature pair, or [`None`] for a deliberately UNSIGNED delivery.
+    ///
+    /// A webhook endpoint always has a secret, so this is always `Some` from that consumer;
+    /// an HTTP flow target may legitimately have none (issue #112) and the store permits it.
+    pub signature: Option<SignaturePair>,
+}
+
+/// The two headers that carry a signature, present together or not at all.
+///
+/// One type rather than two `Option`s, because a timestamp without a signature and a signature
+/// without a timestamp are both unverifiable: `verify_delivery` needs the pair to reconstruct
+/// what was signed, so a shape that can express one without the other can express a delivery
+/// no receiver can check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignaturePair {
     /// `webhook-timestamp`: Unix seconds, as a decimal string.
     pub timestamp: String,
     /// `webhook-signature`: the space-delimited `v1,<base64>` list.
     pub signature: String,
 }
 
+/// The header set one delivery carries, or [`None`] when a value will not encode.
+///
+/// Extracted from [`FetchWebhookSender::deliver`] so the RULE is reachable by a test. Every
+/// delivery suite in this crate drives a recording sender, which captures the
+/// [`DeliveryHeaders`] struct and never runs this loop, so the rule that actually reaches the
+/// wire had no cover: moving the id inside the signed branch would send an unsigned delivery
+/// with no `webhook-id`, and the whole suite would stay green. That is the exact defect this
+/// shape exists to prevent, so it is measured here rather than trusted.
+fn delivery_header_set(
+    headers: &DeliveryHeaders,
+) -> Option<Vec<(http::HeaderName, http::HeaderValue)>> {
+    // The id first and UNCONDITIONALLY; the signature pair only when the delivery is signed.
+    // The id is the delivery's IDENTITY rather than part of its signature, and an
+    // at-least-once queue without one cannot be deduplicated by any receiver.
+    let mut emit = vec![(HEADER_ID, headers.id.as_str())];
+    if let Some(signed) = headers.signature.as_ref() {
+        emit.push((HEADER_TIMESTAMP, signed.timestamp.as_str()));
+        emit.push((HEADER_SIGNATURE, signed.signature.as_str()));
+    }
+    let mut encoded = Vec::with_capacity(emit.len());
+    for (name, value) in emit {
+        // A value that will not encode means the delivery cannot be made correctly. Sending it
+        // WITHOUT the header would present either an unsigned POST or an undedupable one, so
+        // refusing the whole delivery is the only safe answer.
+        let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) else {
+            return None;
+        };
+        encoded.push((name, value));
+    }
+    Some(encoded)
+}
+
 /// The production sender: a POST through the SSRF-hardened outbound fetcher.
 pub struct FetchWebhookSender {
     fetcher: Arc<ironauth_fetch::Fetcher>,
+    /// Which outbound purpose the metric series is attributed to. A webhook delivery and a
+    /// flow-target delivery are different destinations with different operators behind them,
+    /// and one series covering both would make neither debuggable.
+    purpose: ironauth_fetch::FetchPurpose,
 }
 
 impl FetchWebhookSender {
     /// Wrap a shared hardened fetcher.
     #[must_use]
     pub fn new(fetcher: Arc<ironauth_fetch::Fetcher>) -> Self {
-        Self { fetcher }
+        Self {
+            fetcher,
+            purpose: ironauth_fetch::FetchPurpose::WebhookDelivery,
+        }
+    }
+
+    /// The same sender, attributing its calls to a different outbound purpose.
+    #[must_use]
+    pub fn for_purpose(mut self, purpose: ironauth_fetch::FetchPurpose) -> Self {
+        self.purpose = purpose;
+        self
     }
 
     /// Build a production sender whose per-delivery time budget is `total_timeout`, so a
@@ -155,34 +241,21 @@ impl WebhookSender for FetchWebhookSender {
         body: &str,
     ) -> impl Future<Output = DeliveryOutcome> + Send {
         let fetcher = Arc::clone(&self.fetcher);
+        let purpose = self.purpose;
         let url = url.to_owned();
         let body = body.to_owned();
         let headers = headers.clone();
         async move {
-            let mut request = ironauth_fetch::FetchRequest::new(
-                ironauth_fetch::FetchPurpose::WebhookDelivery,
-                http::Method::POST,
-                url,
-            )
-            .header(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/json"),
-            )
-            .body(body);
-            for (name, value) in [
-                (HEADER_ID, headers.id.as_str()),
-                (HEADER_TIMESTAMP, headers.timestamp.as_str()),
-                (HEADER_SIGNATURE, headers.signature.as_str()),
-            ] {
-                // A header value that will not encode means the delivery cannot be made
-                // correctly, and sending it WITHOUT the header would present an unsigned
-                // POST to the receiver. Refusing is the only safe answer.
-                let (Ok(name), Ok(value)) = (
-                    http::HeaderName::from_bytes(name.as_bytes()),
-                    http::HeaderValue::from_str(value),
-                ) else {
-                    return DeliveryOutcome::failed(None, SendFailure::Transport);
-                };
+            let Some(emit) = delivery_header_set(&headers) else {
+                return DeliveryOutcome::failed(None, SendFailure::Transport);
+            };
+            let mut request = ironauth_fetch::FetchRequest::new(purpose, http::Method::POST, url)
+                .header(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/json"),
+                )
+                .body(body);
+            for (name, value) in emit {
                 request = request.header(name, value);
             }
             match fetcher.fetch(request).await {
@@ -360,13 +433,16 @@ impl<S: WebhookSender> WebhookDeliveryConsumer<S> {
             // therefore IDENTICAL on every retry of this message. That is exactly what
             // `webhook-id` has to be for a receiver to deduplicate at-least-once delivery.
             id: message.idempotency_key.clone(),
-            timestamp: now_secs.to_string(),
-            signature: sign_delivery(
-                &secrets,
-                &message.idempotency_key,
-                now_secs,
-                body.as_bytes(),
-            ),
+            // Always `Some` here: a webhook endpoint always carries a secret.
+            signature: Some(SignaturePair {
+                timestamp: now_secs.to_string(),
+                signature: sign_delivery(
+                    &secrets,
+                    &message.idempotency_key,
+                    now_secs,
+                    body.as_bytes(),
+                ),
+            }),
         };
 
         // Latency is measured across the send through the CLOCK SEAM rather than a
@@ -535,5 +611,94 @@ fn unix_secs(at: std::time::SystemTime) -> i64 {
     match at.duration_since(std::time::UNIX_EPOCH) {
         Ok(delta) => i64::try_from(delta.as_secs()).unwrap_or(i64::MAX),
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(signed: bool) -> DeliveryHeaders {
+        DeliveryHeaders {
+            id: "evt_42".to_owned(),
+            signature: signed.then(|| SignaturePair {
+                timestamp: "1700000000".to_owned(),
+                signature: "v1,abc".to_owned(),
+            }),
+        }
+    }
+
+    fn names(set: &[(http::HeaderName, http::HeaderValue)]) -> Vec<String> {
+        set.iter().map(|(n, _)| n.as_str().to_owned()).collect()
+    }
+
+    /// An UNSIGNED delivery still carries `webhook-id`, and carries neither signature header.
+    #[test]
+    fn an_unsigned_delivery_still_emits_the_dedup_handle() {
+        let set = delivery_header_set(&headers(false)).expect("the header set builds");
+        assert_eq!(
+            names(&set),
+            vec![HEADER_ID.to_owned()],
+            "exactly the dedup handle, and nothing that claims a signature"
+        );
+        assert_eq!(set[0].1.as_bytes(), b"evt_42");
+    }
+
+    /// A SIGNED delivery carries all three, id first.
+    #[test]
+    fn a_signed_delivery_emits_all_three_headers() {
+        let set = delivery_header_set(&headers(true)).expect("the header set builds");
+        assert_eq!(
+            names(&set),
+            vec![
+                HEADER_ID.to_owned(),
+                HEADER_TIMESTAMP.to_owned(),
+                HEADER_SIGNATURE.to_owned(),
+            ],
+        );
+        assert_eq!(set[1].1.as_bytes(), b"1700000000");
+        assert_eq!(set[2].1.as_bytes(), b"v1,abc");
+    }
+
+    /// `for_purpose` actually changes the purpose the sender attributes its calls to.
+    ///
+    /// Its doc says a webhook delivery and a flow-target delivery are different destinations
+    /// with different operators behind them, and that one metric series covering both would
+    /// make neither debuggable. Nothing measured that: `pub fn for_purpose(self, _) -> Self
+    /// { self }` survives the entire tree and silently collapses the flow-target series into
+    /// the webhook one, which is exactly what the doc says must not happen.
+    #[test]
+    fn for_purpose_changes_the_attributed_purpose() {
+        // `Fetcher::for_tests` rather than the production constructor, which loads the OS
+        // trust store. An earlier revision of this test built a real fetcher and failed under
+        // parallel load with `NoTrustRoots`: this asserts which purpose a sender attributes
+        // its calls to, and has no business depending on the platform's certificate store.
+        let sender = FetchWebhookSender::new(Arc::new(ironauth_fetch::Fetcher::for_tests(
+            ironauth_fetch::FetchLimits::default(),
+        )));
+        assert_eq!(
+            sender.purpose,
+            ironauth_fetch::FetchPurpose::WebhookDelivery,
+            "a sender is a webhook deliverer until told otherwise"
+        );
+        assert_eq!(
+            sender
+                .for_purpose(ironauth_fetch::FetchPurpose::FlowTarget)
+                .purpose,
+            ironauth_fetch::FetchPurpose::FlowTarget,
+            "and takes the purpose it is given"
+        );
+    }
+
+    /// A value that will not encode REFUSES the whole delivery rather than dropping one
+    /// header, which would present an unsigned or undedupable POST to the receiver.
+    #[test]
+    fn a_header_value_that_will_not_encode_refuses_the_delivery() {
+        let mut bad = headers(true);
+        bad.id = "evt\u{0}bad".to_owned();
+        assert!(
+            delivery_header_set(&bad).is_none(),
+            "an unencodable header refuses the whole delivery"
+        );
     }
 }

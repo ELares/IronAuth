@@ -635,6 +635,25 @@
       },
       "type": "object"
     },
+    "FlowTargetsConfig": {
+      "additionalProperties": false,
+      "description": "Outbound ASYNC flow-target delivery settings (issue #112 criterion 2).\n\nIts own section rather than a field on `[webhooks]`, for exactly the reason the webhook\nworker has its own switch rather than riding the OIDC logout switches: gating one\nsubsystem's worker on another's setting makes a deployment that uses neither unable to run\nthe one it does use. A deployment that registers flow targets and no webhook endpoints\nshould not have to enable webhook delivery to get its targets called.\n\nOFF by default, matching `[webhooks]` and the same covenant every background worker here\nis held to: no mandatory background infrastructure. The consequence is worth stating\nplainly, because it is a real edge: an operator who registers an async target through the\nmanagement API and never opens this section gets NOTHING delivered. The queue is durable,\nso nothing is lost and enabling the worker drains the backlog, but the target is silent\nuntil then. That is the same trade `[webhooks]` already makes, and it is what lets the API\ntier register targets while a separate worker tier delivers them.",
+      "properties": {
+        "delivery_enabled": {
+          "default": false,
+          "description": "Whether THIS process drains the `flow_target.delivery` queue and POSTs to registered\nasync targets. OFF by default.",
+          "type": "boolean"
+        },
+        "delivery_timeout_secs": {
+          "default": 10,
+          "description": "The per-delivery HTTP budget, in seconds.\n\nMust be at least 1 and at most [`FLOW_TARGET_MAX_DELIVERY_TIMEOUT_SECS`], which is\nchecked whether or not `delivery_enabled` is set: a zero budget is meaningless even\nwhile no worker is reading it.\n\nAnd, once delivery IS enabled, STRICTLY LESS than `outbox.visibility_timeout_secs`,\nor a delivery still in flight when its lease expires is redelivered underneath itself\nand the receiver sees the same signup twice under one `webhook-id`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "FlowsConfig": {
       "additionalProperties": false,
       "description": "Headless flow API settings (issue #84).\n\nThe flow engine generalizes the bootstrap interaction pages into one persisted,\nmachine readable flow object (a state machine plus a typed node/message renderer)\nconsumed identically by the browser and native JSON transports. This gate mirrors\n`oidc.enabled`: a plain operator toggle, off by default, that mounts nothing new on\nthe wire until it is turned on (the flow routes answer a uniform 404 while off, so a\ndeployment that does not use the flow API discloses nothing).",
@@ -2770,6 +2789,14 @@
       "default": {},
       "description": "Feature toggles keyed by registered feature name. Enabling an\nexperimental feature additionally requires `ack` equal to the\nfeature's exact current version; see the feature reference in the\ngenerated docs/CONFIG.md.",
       "type": "object"
+    },
+    "flow_targets": {
+      "$ref": "#/$defs/FlowTargetsConfig",
+      "default": {
+        "delivery_enabled": false,
+        "delivery_timeout_secs": 10
+      },
+      "description": "Outbound async flow-target delivery (issue #112)."
     },
     "flows": {
       "$ref": "#/$defs/FlowsConfig",

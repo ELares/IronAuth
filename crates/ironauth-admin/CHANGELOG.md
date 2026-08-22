@@ -6,6 +6,34 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **BREAKING: `DeliveryHeaders` changed shape** (issue #112 criterion 2). Its `timestamp` and
+  `signature` fields are replaced by one `signature: Option<SignaturePair>`, where
+  `SignaturePair` is a new public type carrying both. `id` and `WebhookSender::deliver`'s
+  signature are unchanged.
+
+  The shape is the point. A delivery may now be deliberately UNSIGNED, which an HTTP flow
+  target may legitimately be and a webhook endpoint never is, so the two signature headers had
+  to become optional. They became optional TOGETHER, in one type, because a timestamp without
+  a signature and a signature without a timestamp are both unverifiable: a shape that can
+  express one without the other can express a delivery no receiver can check.
+
+  `id` stayed unconditional deliberately. `webhook-id` is the delivery's IDENTITY rather than
+  part of its signature -- it is what a receiver deduplicates an at-least-once queue on -- so
+  an unsigned delivery needs it exactly as much as a signed one.
+
+- **New module `flow_target_delivery`** (issue #112 criterion 2): the outbox consumer that
+  signs a queued flow-target delivery and POSTs it. Retries, backoff, the attempts cap,
+  dead-lettering, per-target head-of-group serialization and scope fencing are inherited from
+  the generic outbox unchanged; the module contributes only which record to look up, which
+  secret to sign under, and how each answer from the world is classified.
+
+- **The flow-target registration route refuses `timeout_ms` on an ASYNC target**, which it
+  previously accepted and stored. Nothing read it: an async delivery is bounded by
+  `flow_targets.delivery_timeout_secs`. This is a behaviour change on a published route, so an
+  async target registered with one can no longer be re-registered unchanged; drop the field.
+  Accepting a setting that never applies is indistinguishable from working, which is the shape
+  the enqueue guard one layer down already refuses.
+
 - **Creating and deleting an organization through the management API emit their events
   (issue #108).** Both ride the transaction of the write they announce.
 

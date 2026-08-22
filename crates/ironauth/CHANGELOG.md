@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A fifth outbox worker pool: async flow-target delivery** (issue #112 criterion 2), behind
+  `flow_targets.delivery_enabled` (OFF by default). Its own switch rather than riding the
+  webhook one, for the reason webhook delivery has its own rather than riding the OIDC logout
+  switches: a deployment that registers flow targets and no webhook endpoints must not have to
+  enable webhook delivery to get its targets called.
+
+  It refuses to start, logging and starting nothing, when there is no control-plane DSN to
+  enumerate scopes with or no master key to open a target's sealed signing secret. Refusing
+  beats starting a worker that cannot sign, which would burn every message's attempt budget
+  and turn a missing configuration value into permanently discarded deliveries. The queue is
+  durable either way, so enabling the worker later drains the backlog.
+
 - **The RustCrypto block ciphers moved to their 2024 line** in `ironauth-hash-scheme`:
   `aes` 0.8 -> 0.9 and `ctr` 0.9 -> 0.10. See that crate's own changelog for the detail;
   the server-visible part is the dependency graph, which gains `cpubits` 0.1.1 (RustCrypto,
