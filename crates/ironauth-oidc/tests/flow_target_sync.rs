@@ -38,58 +38,37 @@ use axum::http::StatusCode;
 use common::{Harness, enc, form, location_param};
 use ironauth_fetch::{FetchLimits, Fetcher, RecordingDialer, StaticResolver};
 use ironauth_store::flow_target::{FailurePolicy, Invocation, TargetClass, Timing};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 /// A >= 15-code-point passphrase, so a refusal is never the length floor.
 const PASSWORD: &str = "a-sync-target-consultation-passphrase";
 
-/// What an in-process target does when consulted.
-enum Behavior {
-    /// Answer with this body and a 200.
-    Answer(String),
-    /// Accept the connection and never reply, so the consultation ELAPSES.
-    Hang,
-}
-
-/// Stand up an in-process target and return the address plus a handle to what it received.
+/// Stand up an in-process target that ACCEPTS a connection and never answers.
 ///
-/// The received bytes are captured so a test can verify the SIGNED REQUEST rather than only
-/// the verdict: criterion 3 is about what leaves the process, and asserting on the response
-/// alone would prove nothing about the payload or its signature.
-async fn target_server(behavior: Behavior) -> (SocketAddr, Arc<tokio::sync::Mutex<Vec<String>>>) {
+/// There is deliberately no "answers with a verdict" mode, and its absence is the finding
+/// rather than an omission. The hardened fetcher cannot complete a handshake with an
+/// in-process server: `test_tls_config`'s root store is EMPTY by design, and `http://` is
+/// refused by the plaintext policy. So a target can be dialed and never spoken to.
+///
+/// An answering variant existed here briefly and clippy flagged it as never constructed, which
+/// was correct -- keeping it would have implied a capability this harness does not have.
+/// Tracked as issue #959, which blocks criteria 1 and 3-sync.
+async fn target_server() -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind a loopback listener");
     let addr = listener.local_addr().expect("local addr");
-    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let captured = Arc::clone(&seen);
     tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            let mut buf = vec![0_u8; 8192];
-            let read = socket.read(&mut buf).await.unwrap_or(0);
-            captured
-                .lock()
-                .await
-                .push(String::from_utf8_lossy(&buf[..read]).into_owned());
-            match &behavior {
-                Behavior::Answer(body) => {
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
-                         {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    let _ = socket.flush().await;
-                }
-                // Held open and never answered, so the consultation runs out its budget.
-                Behavior::Hang => {
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                }
-            }
+        // Accepted and held, so the consultation's budget genuinely ELAPSES rather than
+        // failing fast on a refused connection -- which would exercise a different arm.
+        while let Ok(socket) = listener.accept().await {
+            tokio::spawn(async move {
+                let _held = socket;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            });
         }
     });
-    (addr, seen)
+    addr
 }
 
 /// A fetcher whose SSRF policy runs for real but whose socket lands on `target`, plus the
@@ -259,7 +238,7 @@ async fn a_fail_open_pre_persist_target_admits_the_signup() {
 /// ADMITS the signup it exists to stop.
 #[tokio::test]
 async fn a_sync_target_that_exceeds_its_timeout_triggers_the_failure_policy() {
-    let (addr, _seen) = target_server(Behavior::Hang).await;
+    let addr = target_server().await;
     let mut harness = Harness::start().await;
     let (fetcher, _dialer) = fetcher_to(addr);
     harness.install_flow_target_fetcher(fetcher);
@@ -289,7 +268,7 @@ async fn a_sync_target_that_exceeds_its_timeout_triggers_the_failure_policy() {
 /// rather than to the timeout path refusing unconditionally.
 #[tokio::test]
 async fn an_elapsed_fail_open_consultation_admits_the_signup() {
-    let (addr, _seen) = target_server(Behavior::Hang).await;
+    let addr = target_server().await;
     let mut harness = Harness::start().await;
     let (fetcher, _dialer) = fetcher_to(addr);
     harness.install_flow_target_fetcher(fetcher);
@@ -334,7 +313,7 @@ async fn an_elapsed_fail_open_consultation_admits_the_signup() {
 /// standard helpers -- remains unproven end to end, and is tracked rather than papered over.
 #[tokio::test]
 async fn a_sync_consultation_reaches_the_network() {
-    let (addr, _seen) = target_server(Behavior::Hang).await;
+    let addr = target_server().await;
     let mut harness = Harness::start().await;
     let (fetcher, dialer) = fetcher_to(addr);
     harness.install_flow_target_fetcher(fetcher);
@@ -354,15 +333,15 @@ async fn a_sync_consultation_reaches_the_network() {
         "fail_open, so the signup completes whatever the target does: {body}"
     );
 
-    let dialed = dialer.requested();
+    let attempts = dialer.requested();
     assert_eq!(
-        dialed.len(),
+        attempts.len(),
         1,
-        "the consultation was attempted exactly once: {dialed:?}"
+        "the consultation was attempted exactly once: {attempts:?}"
     );
     assert_eq!(
-        dialed[0],
+        attempts[0],
         SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 443)),
-        "and it dialed the address destination validation approved, on the scheme's port --          not the loopback the dialer forwards to, which is what pins the connection to the          once-validated address: {dialed:?}"
+        "and it dialed the address destination validation approved, on the scheme's port --          not the loopback the dialer forwards to, which is what pins the connection to the          once-validated address: {attempts:?}"
     );
 }
