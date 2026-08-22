@@ -21,9 +21,10 @@ range per docs/RELEASING.md.
   yet and a default would render as an active unquarantined account, indistinguishable from a
   real one. That absence is the same asymmetry `subject` already relies on.
 
-  This is a WIRE ADDITION to a published envelope. A receiver that ignores unknown fields is
-  unaffected; one that rejects them is not, which is why it is called out here rather than
-  left to be discovered.
+  This is a WIRE ADDITION to a published envelope, and it lands on the POST-PERSIST body only.
+  A receiver that ignores unknown fields is unaffected either way; one with a strict schema
+  needs the two new keys allowed on its post-persist handler and needs nothing at all on its
+  pre-persist one, where the keys are genuinely not emitted rather than emitted as null.
 
 - **The OpenID CIBA token grant (issue #131).** `POST /token` now services
   `grant_type=urn:openid:params:grant-type:ciba`, exchanging an approved `auth_req_id` for

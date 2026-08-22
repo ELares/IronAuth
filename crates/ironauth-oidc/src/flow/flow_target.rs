@@ -427,15 +427,31 @@ async fn consult_target(
         // not inside it, matching where the async half puts them, so a receiver wired to both
         // reads one contract.
         //
-        // ABSENT at pre-persist, where there is no row yet, rather than defaulted. A default
-        // would render as an active unquarantined account, indistinguishable from a real one.
-        // That absence is the same asymmetry `subject` already relies on to make the two
-        // timings observably different.
-        "state": signup_outcome.map(|o| o.state.as_str()),
-        "quarantined": signup_outcome.map(|o| o.quarantined),
         "data": data,
         "config": target.config,
     });
+
+    // ABSENT at pre-persist, where there is no row yet, and absent means the KEY IS NOT THERE.
+    //
+    // Inserted after the fact rather than written inline, because `json!` inserts a key
+    // unconditionally: `"state": None` lowers to `to_value(&None)`, which is `Value::Null`, so
+    // the inline form emits `"state": null` and the key is present after all. An earlier
+    // revision did exactly that while five places in this change claimed the keys were absent,
+    // and the test that was supposed to prove it read `is_none_or(is_null)`, a disjunction
+    // satisfied by both encodings.
+    //
+    // The distinction is not pedantry. `subject` is genuinely missing from the pre-persist
+    // body, so a receiver keying on presence sees one convention rather than two, and a strict
+    // schema that rejects unknown keys is untouched at this timing. A defaulted value would be
+    // worse still: it would render as an active unquarantined account, indistinguishable from
+    // a real one.
+    let mut envelope = envelope;
+    if let Some(outcome) = signup_outcome {
+        if let Some(map) = envelope.as_object_mut() {
+            map.insert("state".to_owned(), outcome.state.as_str().into());
+            map.insert("quarantined".to_owned(), outcome.quarantined.into());
+        }
+    }
     let Ok(body) = serde_json::to_vec(&envelope) else {
         return Outcome::Unavailable;
     };

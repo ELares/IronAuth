@@ -1189,14 +1189,26 @@ async fn a_pre_persist_envelope_carries_neither_state_nor_quarantined() {
         .expect("the recorded request has a body");
     let envelope: Value = serde_json::from_str(sent).expect("envelope is JSON");
 
+    // `is_none()`, NOT `is_none_or(is_null)`. The weaker form is satisfied by `"state": null`
+    // as well as by a missing key, and an earlier revision emitted exactly that while claiming
+    // absence in five places. A disjunction that accepts both encodings cannot tell you which
+    // one you shipped.
     assert!(
-        envelope.get("state").is_none_or(Value::is_null),
-        "a pre-persist envelope must not name a state: there is no row yet, and a default \
-         would be indistinguishable from a real active account: {envelope}"
+        envelope.get("state").is_none(),
+        "a pre-persist envelope must not carry a state KEY at all: there is no row yet, and \
+         `subject` is absent here by the same convention, so a receiver keying on presence \
+         sees one rule rather than two: {envelope}"
     );
     assert!(
-        envelope.get("quarantined").is_none_or(Value::is_null),
-        "and must not name a quarantine flag: {envelope}"
+        envelope.get("quarantined").is_none(),
+        "and must not carry a quarantine key: {envelope}"
+    );
+    // The convention this matches, asserted rather than asserted-about: `subject` is missing
+    // from a pre-persist body too.
+    assert!(
+        envelope["data"].get("subject").is_none(),
+        "`subject` is absent at pre-persist, which is the convention the two fields above \
+         follow: {envelope}"
     );
     // The control: the envelope IS otherwise populated, so the two absences above are the
     // deliberate omission and not an empty body.
