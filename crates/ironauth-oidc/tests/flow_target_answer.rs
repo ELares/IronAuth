@@ -294,13 +294,19 @@ fn forging_responder(request: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
     (status, body, headers)
 }
 
-/// Answer with a VALID signature over a stale timestamp.
+/// Answer with a signature over a timestamp far outside `RESPONSE_TOLERANCE_SECS`.
 ///
-/// The third way `response_signature_verifies` can reject, and the one with no coverage until
-/// now: the key is right and the bytes are right, but the stamp is far outside
-/// `RESPONSE_TOLERANCE_SECS`. This is the replay case. Without it the tolerance is only ever
-/// SATISFIED, never exercised, which is the same inertness `CLOCK_SECS` exists to remove on
-/// the request side.
+/// The key is right and the bytes are right; only the stamp is old, so `verify_delivery`
+/// refuses on the tolerance before computing any HMAC. Without a fixture like this the
+/// tolerance is only ever SATISFIED, never exercised, which is the same inertness `CLOCK_SECS`
+/// exists to remove on the request side.
+///
+/// Two things this is NOT, both of which an earlier version of this comment claimed and the
+/// test below already retracts. It is not "the third way the check can reject": that count was
+/// wrong twice and is gone. And it is not the replay case. This fixture reads `webhook-id` out
+/// of the LIVE request and signs with it, so what it models is a stale answer WITHIN one
+/// consultation. A genuine replay would carry a previous consultation's id, and the id is
+/// minted per consultation and verified on the way back, which is what actually stops it.
 fn stale_responder(request: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
     let head = String::from_utf8_lossy(request);
     let delivery_id = head
