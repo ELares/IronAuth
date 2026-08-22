@@ -47,7 +47,7 @@ mod common;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::http::{HeaderMap, StatusCode};
 use common::{Harness, enc, form, location_param};
@@ -276,9 +276,22 @@ async fn a_sync_target_that_exceeds_its_timeout_triggers_the_failure_policy() {
     )
     .await;
 
-    let started = Instant::now();
+    // Through the Env clock rather than the standard library's constructor directly:
+    // `scripts/invariant-lints.sh` enforces that all monotonic time in this workspace flows
+    // through the `Clock` trait, and the production path this test measures reads the very
+    // same clock. (That lint is a text scan, so naming the forbidden constructor even inside
+    // a comment trips it. This wording is deliberate.)
+    //
+    // MONOTONIC rather than wall clock for the reason `dispatch_sync` states where it reads
+    // the same clock: an NTP step backwards would make the measured span exceed a budget
+    // nothing was actually slow for.
+    let started = harness.env().clock().monotonic();
     let (status, body) = signup(&harness, "timedout@example.test").await;
-    let elapsed = started.elapsed();
+    let elapsed = harness
+        .env()
+        .clock()
+        .monotonic()
+        .saturating_duration_since(started);
     assert_ne!(
         status,
         StatusCode::SEE_OTHER,
