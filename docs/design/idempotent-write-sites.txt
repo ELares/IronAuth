@@ -31,6 +31,7 @@ crates/ironauth-admin/src/environments.rs:create_environment:1
 crates/ironauth-admin/src/event_feed.rs:resolve_scope:0
 crates/ironauth-admin/src/export.rs:resolve_scope:0
 crates/ironauth-admin/src/flow_targets.rs:create_flow_target:1
+crates/ironauth-admin/src/flow_targets.rs:replay_flow_target_dead_letters:1
 crates/ironauth-admin/src/flow_versions.rs:create_flow_version:1
 crates/ironauth-admin/src/flow_versions.rs:pin_flow_version:1
 crates/ironauth-admin/src/flow_versions.rs:resolve_scope:0

@@ -547,6 +547,10 @@ class Client:
         """List environments under a tenant (cursor paginated). GET /v1/tenants/{tenant_id}/environments."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments", query, None)
 
+    def list_flow_target_dead_letters(self, tenant_id: str, environment_id: str, target_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List a target's dead-lettered async deliveries. GET /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/dead-letters."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/flow-targets/{urllib.parse.quote(target_id)}/dead-letters", query, None)
+
     def list_flow_targets(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List every registered HTTP flow target in the environment. GET /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/flow-targets", query, None)
@@ -766,6 +770,10 @@ class Client:
     def remove_user_identifier(self, tenant_id: str, environment_id: str, user_id: str, identifier_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Remove a login identifier from a user. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers/{identifier_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/users/{urllib.parse.quote(user_id)}/identifiers/{urllib.parse.quote(identifier_id)}", query, None)
+
+    def replay_flow_target_dead_letters(self, tenant_id: str, environment_id: str, target_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Replay a target's dead-lettered async deliveries. POST /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/replay."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/flow-targets/{urllib.parse.quote(target_id)}/replay", query, body)
 
     def replay_log_stream_dead_letters(self, tenant_id: str, environment_id: str, stream_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Request a replay of a stream's outstanding dead letters. POST /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters/replay."""

@@ -2545,3 +2545,102 @@ async fn a_replay_for_an_unknown_stream_is_refused() {
         "a refused replay must queue no command: {queued:?}"
     );
 }
+
+/// The dead-letter surface splits READING the tail from REPLAYING it (issue #112 criterion 2).
+///
+/// Both directions for both routes, which is what earns them a place in `PERMISSION_PROVEN`
+/// rather than only in `CLASSIFIED`. Classification is a declaration; this is the proof.
+///
+/// The replay half matters more than the listing half. A replay re-POSTs real signup
+/// announcements to a third party, so a credential that may only read must not be able to
+/// trigger one, and the refusal has to NAME what it wanted or an operator cannot tell a
+/// missing grant from a broken route.
+#[tokio::test]
+async fn the_flow_target_dead_letter_surface_splits_reading_from_replaying() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "ftg-dlq-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ftg-dlq-mint").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/flow-targets");
+
+    // A live target to address, registered with the write permission the create demands.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h
+        .post_as(
+            &base,
+            &secret,
+            "ftg-dlq-1",
+            &serde_json::json!({
+                "name": "dlq-probe",
+                "target_class": "event",
+                "invocation": "async",
+                "timing": "post_persist",
+                "endpoint": "https://target.example/hook",
+                "failure_policy": "fail_closed",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "register a target: {body}");
+    let target_id = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("the registered id")
+        .to_owned();
+    let dead_letters = format!("{base}/{target_id}/dead-letters");
+    let replay = format!("{base}/{target_id}/replay");
+
+    // The REPLAY under write_config is served. Asserted BEFORE the refusals, so a later 403
+    // is the permission talking rather than the route being broken or the target absent.
+    let (status, _, body) = h.post_as(&replay, &secret, "ftg-dlq-replay-1", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "write_config must be able to ask for a replay: {body}"
+    );
+
+    // The LISTING is read-classified, so write_config alone is refused and the refusal names
+    // what it wanted.
+    let (status, _, body) = h.get_as(&dead_letters, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the dead-letter tail answered a credential without management.read: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the refusal must name the permission it wanted: {body}"
+    );
+
+    // Read-granted: the listing is served.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&dead_letters, &secret).await;
+    assert_eq!(status, StatusCode::OK, "the tail under read: {body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        document["items"].is_array(),
+        "the listing answers with its items array even when empty: {body}"
+    );
+    assert_eq!(
+        document["truncated"],
+        serde_json::json!(false),
+        "and says whether the cap was reached, which a full page cannot otherwise reveal: {body}"
+    );
+
+    // And READ ALONE cannot ask for a replay.
+    let (status, _, body) = h.post_as(&replay, &secret, "ftg-dlq-replay-2", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential asked for a replay and was served: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal must name the permission it wanted: {body}"
+    );
+}

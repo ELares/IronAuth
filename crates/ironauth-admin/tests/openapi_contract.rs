@@ -209,6 +209,7 @@ fn operation_ids_are_the_stable_set() {
             "listConnectors",
             "listDcrPolicies",
             "listEnvironments",
+            "listFlowTargetDeadLetters",
             "listFlowTargets",
             "listFlowVersions",
             "listInvitations",
@@ -264,6 +265,7 @@ fn operation_ids_are_the_stable_set() {
             "removeOrgGroupMember",
             "removeStepUpPolicy",
             "removeUserIdentifier",
+            "replayFlowTargetDeadLetters",
             "replayLogStreamDeadLetters",
             "replayWebhookDeadLetters",
             "resendInvitation",
@@ -554,6 +556,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/events",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/export",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/dead-letters",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}",
@@ -638,6 +641,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/dry-run",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/replay",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness/apply",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/imports",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/imports/{run_id}",
@@ -810,7 +814,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        232,
+        234,
         "the documented route count is pinned"
     );
 

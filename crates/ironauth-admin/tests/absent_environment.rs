@@ -282,6 +282,18 @@ fn flow_target_cases(base: &str) -> Vec<Case> {
             path: format!("{base}/flow-targets/ftg_absent"),
             body: None,
         },
+        // Asking for a dead-letter replay is a WRITE and must meet the same fence. The
+        // LISTING is deliberately absent from this file: it is a read, and this surface's
+        // rule is that reads stay readable at a soft-deleted environment.
+        //
+        // The liveness fence runs BEFORE the id parse in that handler, so the synthetic id
+        // here does not shortcut the case: what answers is the environment check.
+        Case {
+            label: "flow_targets.replayFlowTargetDeadLetters",
+            method: "POST",
+            path: format!("{base}/flow-targets/ftg_absent/replay"),
+            body: Some("{}".to_owned()),
+        },
     ]
 }
 

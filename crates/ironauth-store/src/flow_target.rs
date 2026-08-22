@@ -118,10 +118,10 @@ pub struct FlowTargetRecord {
 pub enum FlowTargetDelivery {
     /// Live and enabled: deliver to it.
     Deliverable(Box<FlowTargetRecord>),
-    /// Registered but switched OFF. A delivery to it RETRIES, because a disable is a pause an
-    /// operator can undo, and retrying is what lets the backlog survive the undo. Dead-lettering
-    /// would preserve it only if something could revive a dead letter for this consumer, and
-    /// nothing can today.
+    /// Registered but switched OFF. A delivery to it DEAD-LETTERS after one attempt, and the
+    /// replay route returns it once the operator switches the target back on. Terminal rather
+    /// than retrying because a retrying head occupies its target's ordering group for the whole
+    /// backoff schedule, while a dead letter blocks nothing and is recoverable.
     Disabled,
     /// Deregistered, or never existed in this scope. Nothing to deliver to, and the secret is
     /// gone with it, so the message completes rather than retrying against a row that will

@@ -939,6 +939,13 @@ func (c *Client) ListEnvironments(tenant_id string, query url.Values) (*http.Res
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments", query, nil)
 }
 
+// ListFlowTargetDeadLetters performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/dead-letters.
+//
+// List a target's dead-lettered async deliveries.
+func (c *Client) ListFlowTargetDeadLetters(tenant_id string, environment_id string, target_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/flow-targets/" + escape(target_id) + "/dead-letters", query, nil)
+}
+
 // ListFlowTargets performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets.
 //
 // List every registered HTTP flow target in the environment.
@@ -1322,6 +1329,13 @@ func (c *Client) RemoveStepUpPolicy(tenant_id string, environment_id string, sco
 // Remove a login identifier from a user.
 func (c *Client) RemoveUserIdentifier(tenant_id string, environment_id string, user_id string, identifier_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/users/" + escape(user_id) + "/identifiers/" + escape(identifier_id), query, nil)
+}
+
+// ReplayFlowTargetDeadLetters performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/replay.
+//
+// Replay a target's dead-lettered async deliveries.
+func (c *Client) ReplayFlowTargetDeadLetters(tenant_id string, environment_id string, target_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/flow-targets/" + escape(target_id) + "/replay", query, body)
 }
 
 // ReplayLogStreamDeadLetters performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters/replay.

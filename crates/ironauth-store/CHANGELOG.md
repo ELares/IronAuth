@@ -6,6 +6,51 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A flow target's dead-lettered async deliveries can be REPLAYED** (issue #112 criterion 2).
+  New `FLOW_TARGET_REPLAY_CONSUMER` (`flow_target.replay`), a new
+  `Action::FlowTargetReplayDeadLetters` audit action, the `flow_target.replay_requested` event,
+  and `ActingFlowTargetRepo::request_dead_letter_replay_with_event`.
+
+  Nothing new was needed for the list or the revive themselves: `OutboxRepo::dead_lettered` and
+  `revive_dead_lettered` are already generic over the consumer name and an ordering key, and
+  the flow-target delivery consumer's ordering key IS the target id, so both express a
+  per-target view without the queue knowing anything about flow targets.
+
+  The request travels as a MESSAGE rather than doing the revive inline, because the plane that
+  may ask and the plane that may perform are different by grant: `ironauth_control` holds
+  SELECT and INSERT on `outbox_messages` and no UPDATE of any shape.
+
+  It CHECKS the target exists, unlike the webhook sibling, which only parses the id and so
+  answers 202 for a target that was DEREGISTERED -- the worker then revives nothing and
+  returns `Ok(0)`, indistinguishable from a successful replay of an empty backlog. (Not a
+  cross-tenant hole there: its `parse_id` is `parse_in_scope`, so a foreign id is already
+  refused.) The dead-letter LISTING makes the same check, so the two routes agree rather than
+  one showing rows the other refuses to act on. The predicate is `deleted_at IS NULL` and deliberately ignores `enabled`,
+  because disable, accumulate, fix the receiver, re-enable, replay is the sequence the route
+  exists for.
+
+  One limit is worth stating: deregistering is a SOFT delete while the registration upsert
+  arbitrates on NAME among live rows, so deleting a target and recreating it under the same
+  name mints a NEW id, and dead letters keyed on the old one are unreachable from any route.
+
+- **A DISABLED target's delivery dead-letters again, rather than retrying.** This classification
+  has now been both ways and the reason it settled here is the point. It was permanent while
+  nothing could replay a flow-target dead letter, so a disable for ten minutes of receiver
+  maintenance destroyed every signup in the window; it became retryable to make that untrue
+  without new machinery. Now that the replay route exists, retryable is the harmful one:
+  `revive_dead_lettered` resets `attempts` to zero, so replaying a target that is still off
+  would restart a fourteen-attempt schedule whose revived head blocks every newer delivery to
+  that target for roughly thirty-seven hours, because the queue leases only the
+  lowest-sequenced NON-TERMINAL message of a group. A dead letter is terminal and blocks
+  nothing.
+
+  **Operationally this is a behaviour change worth planning for.** Under the retryable rule a
+  re-enable inside the backoff window drained the backlog with no operator action. It no longer
+  does: recovery now needs an explicit replay. Nothing is lost while you decide --
+  `dead_letter_retention_secs` ships at `0`, which for that knob means keep -- and the
+  dead-letter count is observable per consumer, but a deployment that relied on
+  disable-then-re-enable draining itself has to add the replay call.
+
 - **Async flow-target deliveries ride the signup's own transaction** (issue #112 criterion 2).
   `register`, `register_in_state`, `register_quarantined` and their `_with_traits` variants
   now take `Option<AsyncFlowDeliveries>`, which names the targets and nothing else:
@@ -44,18 +89,14 @@ range per docs/RELEASING.md.
   `list` hides deleted rows. The distinction decides the message's fate and is expensive in
   both directions. A deregistered target is gone and its secret with it, so the message
   completes; retrying would burn the attempt budget against a row that will never return. A
-  disabled one is a switch an operator can flip back, so the delivery RETRIES: completing it
-  would drop a real signup notification with nothing behind it, and dead-lettering it would
-  preserve the backlog only if something could revive a dead letter for this consumer, which
-  nothing can today.
+  disabled one is a switch an operator can flip back, so the delivery DEAD-LETTERS and the
+  replay route returns it: completing it would drop a real signup notification with nothing
+  behind it, and retrying would occupy the target's ordering group for the whole backoff
+  schedule, since the queue leases only the lowest-sequenced non-terminal message of a group.
 
-  Retrying is bounded rather than free, and the bound is worth knowing before disabling a busy
-  target. At the shipped outbox defaults one message takes roughly 37 hours of backoff to
-  reach the attempts cap, and the queue leases only the lowest-sequenced non-terminal message
-  of a target's group, so while a target stays off its backlog GROWS: new signups enqueue
-  behind a head that is asleep. Re-enabling does not re-arm the head's already-scheduled
-  attempt either, so the first delivery after a re-enable waits out whatever backoff it was
-  already in (up to ten hours at the cap) before the rest follow.
+  (An intermediate revision of this unreleased entry described the delivery as RETRYING. That
+  was true of the code for exactly as long as no replay route existed; it is rewritten rather
+  than reversed on top, because nothing here has shipped yet.)
 - **Migration 0146's header overstates when a pre-persist flow target runs.**
   `0146_flow_targets.sql:40` says `pre_persist` "runs inside the write's transaction so a
   rejection leaves no row". MEASURED: nothing runs a flow target inside a write

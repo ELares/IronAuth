@@ -213,10 +213,10 @@ async fn a_signup_with_no_registered_target_queues_nothing() {
 #[tokio::test]
 async fn a_disabled_target_is_not_announced_to() {
     // Disabled means the dispatcher does not call it. The delivery consumer ALSO refuses a
-    // message whose target was switched off after enqueue (retryably, since a disable is a
-    // pause), and the two are different moments: this pins the PRODUCER, so a target switched
-    // off before the signup never produces a message at all rather than producing one that
-    // retries until the attempts cap.
+    // message whose target was switched off after enqueue -- dead-lettering it, so the replay
+    // route can return it -- and the two are different moments: this pins the PRODUCER, so a
+    // target switched off before the signup never produces a message at all rather than
+    // producing one that has to be replayed later.
     let harness = Harness::start().await;
     let id = register_async_target(&harness, "crm").await;
     let env = harness.env().clone();

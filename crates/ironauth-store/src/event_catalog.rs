@@ -1162,6 +1162,33 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // An operator asked for a target's dead-lettered async deliveries to be REPLAYED
+        // (issue #112 criterion 2). A consumer wants this because a replay re-POSTs signup
+        // announcements a receiver already had the chance to see: anything reconciling
+        // against the target's own records needs to know a redelivery burst was deliberate
+        // rather than a fault.
+        //
+        // NO NAME, unlike the two above. The replay route addresses a target by id and never
+        // reads its name, and a schema that required one would force a second read whose only
+        // purpose is to satisfy the schema -- or, worse, an empty string that the fan-out
+        // rejects permanently and silently in a release build.
+        //
+        // `since_unix_ms` travels because "replay everything" and "replay since noon" are
+        // materially different acts against a third party, and a consumer reconciling a
+        // redelivery burst needs to know which one it was. Null means everything.
+        "flow_target.replay_requested",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "flow_target_id": {"type": "string", "minLength": 1},
+                "since_unix_ms": {"type": ["integer", "null"]}
+            },
+            "required": ["flow_target_id"]
+        }"#,
+    ),
+    (
         // The METERING SNAPSHOT, so usage exports by webhook and not only by polling the API
         // (issue #107 criterion 4: "exports via API and webhook").
         //

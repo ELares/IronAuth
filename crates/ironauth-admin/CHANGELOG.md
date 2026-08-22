@@ -6,6 +6,41 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Two routes for a flow target's dead-lettered async deliveries** (issue #112 criterion 2):
+  `GET .../flow-targets/{target_id}/dead-letters` (classified `management.read`) and
+  `POST .../flow-targets/{target_id}/replay` (`management.write_config`, sudo-fenced). Both
+  permissions are PROVEN in `delegated_admin.rs` rather than only declared, so the unproven
+  count did not move.
+
+  Four deliberate differences from the webhook pair, each one a defect in the older route:
+
+  - `since` is a BODY field, never a query parameter. `idempotency::fingerprint` takes
+    `Uri::path()`, which excludes the query, so a query-bound bound would make "replay
+    everything" and "replay since noon" fingerprint identically and the second request would
+    return the first's stored 202 without ever enqueueing.
+  - the request DTO carries `deny_unknown_fields`. Without it, a caller who reads the store and
+    payload vocabulary and sends `since_unix_micros` instead of the DTO's `since_unix_ms` gets
+    a SILENT FULL REPLAY.
+  - the listing reports `truncated`. The cap is applied in SQL, so without it an exactly-full
+    page is indistinguishable from a truncated one.
+  - `since_unix_ms` has a plausibility floor. `deny_unknown_fields` catches a wrong field NAME
+    and cannot catch a wrong UNIT in the right field, and the two directions are not equally
+    safe: microseconds saturate into the future and revive nothing, while SECONDS land a bound
+    in January 1970 and replay the entire retained backlog to a third party under a 202. The
+    webhook route parses its `since_unix_ms` with no floor at all, so that fail-open is live
+    there on a shipped route.
+
+  The listing carries `last_error` because it is what an operator decides on: some dead letters
+  cannot be fixed by replaying (a malformed payload, an unparseable target id) and will fail
+  identically on every attempt, while others -- a receiver that was down, a target switched
+  off, a missing signing secret -- are exactly what replay is for.
+
+- **New `FlowTargetReplayConsumer`**, registered at boot beside the delivery consumer. It drains
+  under `flow_target.replay` and revives under `flow_target.delivery`; those are different names
+  on purpose, and passing either where the other belongs is silent -- reviving under this
+  consumer's own name matches no rows and reports `revived=0`, which reads exactly like a target
+  that had nothing outstanding.
+
 - **BREAKING: `DeliveryHeaders` changed shape** (issue #112 criterion 2). Its `timestamp` and
   `signature` fields are replaced by one `signature: Option<SignaturePair>`, where
   `SignaturePair` is a new public type carrying both. `id` and `WebhookSender::deliver`'s

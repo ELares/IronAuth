@@ -430,6 +430,8 @@ use crate::views::{
         crate::flow_targets::list_flow_targets,
         crate::flow_targets::create_flow_target,
         crate::flow_targets::delete_flow_target,
+        crate::flow_targets::list_flow_target_dead_letters,
+        crate::flow_targets::replay_flow_target_dead_letters,
         crate::log_streams::list_log_streams,
         crate::log_streams::create_log_stream,
         crate::log_streams::delete_log_stream,

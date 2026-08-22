@@ -234,6 +234,14 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("listFlowTargets", ManagementPermission::Read),
     ("createFlowTarget", ManagementPermission::WriteConfig),
     ("deleteFlowTarget", ManagementPermission::WriteConfig),
+    // The dead-letter tail is a READ of queue rows; asking for a replay is a WRITE, and
+    // write_config rather than a softer class because a replay re-POSTs real signup
+    // announcements to a third party -- the same reason registering the target is.
+    ("listFlowTargetDeadLetters", ManagementPermission::Read),
+    (
+        "replayFlowTargetDeadLetters",
+        ManagementPermission::WriteConfig,
+    ),
     // The configuration writes are `write_config`, the same class the webhook endpoint
     // registration uses: both name an outbound destination the server will send to.
     ("createLogStream", ManagementPermission::WriteConfig),
@@ -602,6 +610,12 @@ const PERMISSION_PROVEN: &[&str] = &[
     "listFlowTargets",
     "createFlowTarget",
     "deleteFlowTarget",
+    // Proven in `the_flow_target_dead_letter_surface_splits_reading_from_replaying`, which
+    // drives both in both directions: the listing served under read and refused under
+    // write_config alone, the replay refused under read alone naming
+    // `management.write_config`, then served under it.
+    "listFlowTargetDeadLetters",
+    "replayFlowTargetDeadLetters",
     // Proven in `the_log_stream_status_read_demands_read_and_never_answers_unauthenticated`,
     // which drives it in BOTH directions: served under read, refused with the required
     // permission named under a different one.
@@ -641,7 +655,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 171 operations declare a required permission and 27 have that permission proven. The other
+/// 173 operations declare a required permission and 29 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -672,12 +686,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        171,
+        173,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        27,
+        29,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

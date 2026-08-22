@@ -888,6 +888,14 @@ pub enum Action {
     /// An HTTP FLOW TARGET was deregistered through the management API (issue #112), so it
     /// stops being dispatched. The audit row names the target id and scope.
     FlowTargetDelete,
+    /// An operator asked for an HTTP FLOW TARGET's dead-lettered async deliveries to be
+    /// REPLAYED (issue #112 criterion 2). The audit row names the target id, the scope, and
+    /// the `since` bound the request carried, because "replay everything" and "replay since
+    /// noon" are materially different acts against a third party.
+    ///
+    /// The row records the REQUEST, not the outcome: the revive runs later on the data plane,
+    /// since the role that may ask holds no UPDATE on the queue.
+    FlowTargetReplayDeadLetters,
     /// A MESSAGE TEMPLATE override was deleted through the management API (issue #111),
     /// restoring whatever the next level up provides. The audit row names the template id and
     /// scope.
@@ -1525,6 +1533,7 @@ impl Action {
             Action::MessageTemplateSet => "message_template.set",
             Action::FlowTargetSet => "flow_target.set",
             Action::FlowTargetDelete => "flow_target.delete",
+            Action::FlowTargetReplayDeadLetters => "flow_target.replay_dead_letters",
             Action::MessageTemplateDelete => "message_template.delete",
             Action::SignupFormSet => "signup_form.set",
             Action::SignupFormDelete => "signup_form.delete",

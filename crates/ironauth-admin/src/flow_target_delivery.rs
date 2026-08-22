@@ -27,12 +27,15 @@
 //!
 //! ## The two decisions that are not obvious
 //!
-//! A target that is GONE completes the message; a target that is DISABLED retries. The
+//! A target that is GONE completes the message; a target that is DISABLED dead-letters it. The
 //! difference is whether an operator can undo it: a deregistered target will never come back
-//! and its secret is gone with it, so retrying achieves nothing, while a switched-off one is a
-//! flag someone can flip. Retrying is what lets the backlog survive the flip -- dead-lettering
-//! would only preserve it if something could revive a dead letter for this consumer, and
-//! nothing can.
+//! and its secret is gone with it, so there is nothing to recover and nothing to retry against,
+//! while a switched-off one is a flag someone can flip and then replay the backlog through
+//! `POST .../flow-targets/{id}/replay`.
+//!
+//! Dead-lettering rather than retrying, and the ROUTE is what makes that the safe choice: a
+//! dead letter is terminal, so it blocks nothing, while a retrying head would occupy its
+//! target's ordering group for the whole backoff schedule.
 //!
 //! A delivery enqueued as SIGNED is never sent unsigned, even if the target's secret name has
 //! since been cleared. Without that guard, clearing a name silently converts a signed
@@ -46,7 +49,10 @@ use ironauth_env::Env;
 use ironauth_jose::webhooks::WebhookSecret;
 use ironauth_store::flow_target::FlowTargetDelivery;
 use ironauth_store::outbox::{ConsumerError, OutboxConsumer};
-use ironauth_store::{FLOW_TARGET_DELIVERY_CONSUMER, FlowTargetId, OutboxMessage, Scope, Store};
+use ironauth_store::{
+    FLOW_TARGET_DELIVERY_CONSUMER, FLOW_TARGET_REPLAY_CONSUMER, FlowTargetId, OutboxMessage, Scope,
+    Store,
+};
 
 use crate::webhook_delivery::{DeliveryHeaders, SignaturePair, WebhookSender};
 
@@ -127,25 +133,26 @@ impl<S: WebhookSender> FlowTargetDeliveryConsumer<S> {
                 );
                 return Ok(());
             }
-            // Switched OFF, which an operator can switch back. RETRYABLE, because a disable
-            // is a PAUSE.
+            // Switched OFF, which an operator can switch back. PERMANENT: the delivery
+            // dead-letters after ONE attempt and the replay route returns it.
             //
-            // An earlier revision dead-lettered here and justified it as "the delivery stays
-            // replayable, so an operator can switch it back on and ask for the backlog".
-            // Nothing in this tree can ask: `revive_dead_lettered` is generic over the
-            // consumer name but has exactly one caller, and that one hardcodes the webhook
-            // consumer. So the rule that was supposed to preserve the backlog destroyed it,
-            // on the most ordinary operator action there is -- disabling a target for a few
-            // minutes of receiver maintenance, which is the move the migration itself
-            // recommends for a misbehaving integration.
+            // This classification has been both ways, and the reason it settled here is worth
+            // keeping. It was permanent first, justified as "stays replayable" while nothing
+            // could replay a flow-target dead letter -- so a disable for ten minutes of
+            // receiver maintenance destroyed every signup in the window. It became RETRYABLE
+            // to make that untrue without new machinery.
             //
-            // Retryable makes the stated intent true with no new machinery: the attempts cap
-            // is the give-up, a re-enable inside the backoff window drains the backlog, and a
-            // target left off long enough still dead-letters in the end rather than retrying
-            // forever. When an operator-invokable replay exists this can be revisited; until
-            // then the safe classification is the one that does not need it.
+            // Now that `POST .../flow-targets/{id}/replay` exists, retryable is the harmful
+            // one. `revive_dead_lettered` sets `attempts = 0`, so replaying a target that is
+            // still off restarts a fourteen-attempt schedule whose tail is ten-hour gaps, and
+            // the outbox leases only the lowest-sequenced NON-TERMINAL message of a group --
+            // so that revived head would block every newer delivery to the target for days.
+            // A dead letter is terminal and blocks nothing. Permanent costs one attempt, and
+            // the backlog is recoverable because there is now a route that recovers it.
+            //
+            // Which is exactly why the webhook sibling's paused arm is permanent too.
             FlowTargetDelivery::Disabled => {
-                return Err(ConsumerError::retryable("target_disabled"));
+                return Err(ConsumerError::permanent("target_disabled"));
             }
         };
 
@@ -260,5 +267,106 @@ fn unix_secs(at: std::time::SystemTime) -> i64 {
     match at.duration_since(std::time::UNIX_EPOCH) {
         Ok(delta) => i64::try_from(delta.as_secs()).unwrap_or(i64::MAX),
         Err(_) => 0,
+    }
+}
+
+/// The payload key naming the `since` bound a replay command carries.
+const PAYLOAD_SINCE: &str = "since_unix_micros";
+
+/// The consumer that executes an operator's dead-letter REPLAY command (issue #112
+/// criterion 2).
+///
+/// It exists because the plane that may ASK for a replay and the plane that may PERFORM one
+/// are different by GRANT. The management API holds INSERT on the queue and no UPDATE of any
+/// shape, while the drain holds the lifecycle columns, so an operator's request travels as a
+/// message and this is what picks it up on the data plane and does the revive with grants
+/// that already existed.
+///
+/// It drains under [`FLOW_TARGET_REPLAY_CONSUMER`] and revives under
+/// [`FLOW_TARGET_DELIVERY_CONSUMER`]. Those are DIFFERENT names and the asymmetry is the
+/// whole point: this consumer's own queue holds commands, and the queue it repairs holds
+/// deliveries. Passing either name where the other belongs is silent -- reviving under this
+/// consumer's name matches no rows and reports `revived=0`, which reads exactly like a
+/// target that had nothing outstanding.
+pub struct FlowTargetReplayConsumer {
+    store: Store,
+}
+
+impl FlowTargetReplayConsumer {
+    /// Build the consumer over a DATA-plane store.
+    #[must_use]
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+
+    /// Execute ONE replay command.
+    async fn replay_one(
+        &self,
+        env: &Env,
+        scope: Scope,
+        message: &OutboxMessage,
+    ) -> Result<(), ConsumerError> {
+        let Some(raw_id) = message
+            .payload
+            .get(PAYLOAD_TARGET_ID)
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Err(ConsumerError::permanent("payload_missing_target_id"));
+        };
+        // Parsed IN SCOPE, so a command carrying another tenant's target id cannot be
+        // executed while draining this one. The worker loops over every scope, so the id in
+        // a payload and the scope the drain runs under are two independent things.
+        let Ok(target_id) = FlowTargetId::parse_in_scope(raw_id, &scope) else {
+            return Err(ConsumerError::permanent("target_id_malformed"));
+        };
+        // Absent means EVERYTHING, which is a legitimate command rather than a malformed one,
+        // so only a present-but-not-an-integer value is refused.
+        let since = match message.payload.get(PAYLOAD_SINCE) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .ok_or_else(|| ConsumerError::permanent("payload_since_not_an_integer"))?,
+            ),
+        };
+
+        let revived = self
+            .store
+            .scoped(scope)
+            .outbox()
+            // The DELIVERY consumer's dead letters, narrowed to this target by the ordering
+            // key -- which IS the target id, so the generic queue read expresses a per-target
+            // replay without knowing anything about flow targets.
+            .revive_dead_lettered(
+                env,
+                FLOW_TARGET_DELIVERY_CONSUMER,
+                Some(&target_id.to_string()),
+                since,
+            )
+            .await
+            // A failed revive can succeed later, so this retries rather than dropping the
+            // operator's request; the substrate's attempt budget is what bounds it.
+            .map_err(|_| ConsumerError::retryable("replay_failed"))?;
+        tracing::info!(
+            target_id = %target_id,
+            revived,
+            "replayed dead-lettered flow-target deliveries"
+        );
+        Ok(())
+    }
+}
+
+impl OutboxConsumer for FlowTargetReplayConsumer {
+    fn name(&self) -> &str {
+        FLOW_TARGET_REPLAY_CONSUMER
+    }
+
+    fn handle<'a>(
+        &'a self,
+        env: &'a Env,
+        scope: Scope,
+        message: &'a OutboxMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ConsumerError>> + Send + 'a>> {
+        Box::pin(async move { self.replay_one(env, scope, message).await })
     }
 }

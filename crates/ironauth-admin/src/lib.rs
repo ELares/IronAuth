@@ -1092,6 +1092,18 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}",
             axum::routing::delete(flow_targets::delete_flow_target),
         )
+        // The dead-letter tail for a target's ASYNC deliveries, and the replay that returns
+        // them (issue #112 criterion 2). Without these two the queue accumulates dead letters
+        // that only a psql session can see, which is the state the delivery consumer's
+        // disabled-target rule depends on NOT being in.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/dead-letters",
+            axum::routing::get(flow_targets::list_flow_target_dead_letters),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/replay",
+            post(flow_targets::replay_flow_target_dead_letters),
+        )
         // Standard Webhooks endpoint registration (issue #105).
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams",
