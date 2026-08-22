@@ -29,7 +29,7 @@ use utoipa::ToSchema;
 use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
-use crate::input::parse_json;
+use crate::input::{parse_json, require_plausible_since_unix_ms};
 use crate::org_context::{require_live_environment, resolve_scope};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -699,11 +699,6 @@ pub struct FlowReplayAccepted {
 /// How many dead letters one listing returns at most.
 const FLOW_DEAD_LETTER_LIMIT: i64 = 200;
 
-/// The earliest `since_unix_ms` a replay will accept: 2001-09-09, the instant a Unix timestamp
-/// in SECONDS first exceeded 1e9 and so the point below which a millisecond value is almost
-/// certainly a seconds value pasted into the wrong field.
-const MIN_PLAUSIBLE_SINCE_UNIX_MS: i64 = 1_000_000_000_000;
-
 /// List a target's dead-lettered async deliveries.
 #[utoipa::path(
     get,
@@ -877,16 +872,7 @@ pub async fn replay_flow_target_dead_letters(
     // party while answering 202; refusing is how that becomes visible. Omitting the field is
     // still how a caller asks for everything -- this refuses an implausible bound, not the
     // unbounded form.
-    if let Some(since) = request.since_unix_ms {
-        if since < MIN_PLAUSIBLE_SINCE_UNIX_MS {
-            return Err(ApiError::BadRequest(format!(
-                "since_unix_ms must be MILLISECONDS since the Unix epoch and at or after \
-                 {MIN_PLAUSIBLE_SINCE_UNIX_MS}: {since} looks like seconds, which would \
-                 replay every dead letter this target has. Omit the field to ask for that \
-                 deliberately."
-            )));
-        }
-    }
+    require_plausible_since_unix_ms(request.since_unix_ms, "target")?;
 
     // The key is fingerprinted over the BODY as well as the path, so replaying "everything"
     // and replaying "since noon" are different requests under one key rather than one
