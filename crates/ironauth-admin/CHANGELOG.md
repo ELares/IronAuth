@@ -12,7 +12,7 @@ range per docs/RELEASING.md.
   permissions are PROVEN in `delegated_admin.rs` rather than only declared, so the unproven
   count did not move.
 
-  Three deliberate differences from the webhook pair, each one a defect in the older route:
+  Four deliberate differences from the webhook pair, each one a defect in the older route:
 
   - `since` is a BODY field, never a query parameter. `idempotency::fingerprint` takes
     `Uri::path()`, which excludes the query, so a query-bound bound would make "replay
@@ -23,6 +23,12 @@ range per docs/RELEASING.md.
     a SILENT FULL REPLAY.
   - the listing reports `truncated`. The cap is applied in SQL, so without it an exactly-full
     page is indistinguishable from a truncated one.
+  - `since_unix_ms` has a plausibility floor. `deny_unknown_fields` catches a wrong field NAME
+    and cannot catch a wrong UNIT in the right field, and the two directions are not equally
+    safe: microseconds saturate into the future and revive nothing, while SECONDS land a bound
+    in January 1970 and replay the entire retained backlog to a third party under a 202. The
+    webhook route parses its `since_unix_ms` with no floor at all, so that fail-open is live
+    there on a shipped route.
 
   The listing carries `last_error` because it is what an operator decides on: some dead letters
   cannot be fixed by replaying (a malformed payload, an unparseable target id) and will fail

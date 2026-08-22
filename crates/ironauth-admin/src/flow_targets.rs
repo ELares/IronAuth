@@ -839,7 +839,7 @@ fn flow_target_replay_event(
     security(("bearer" = [])),
     responses(
         (status = 202, description = "The replay was queued. The data plane executes it; watch the queue depth for `flow_target.replay` to see it drain.", body = FlowReplayAccepted),
-        (status = 400, description = "Malformed request, or an unknown field", body = ErrorBody),
+        (status = 400, description = "Malformed request, an unknown field, or a since_unix_ms earlier than 2001-09-09 (which is a seconds value in a milliseconds field)", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope, or sudo required", body = ErrorBody),
         (status = 404, description = "The environment is absent, or the target is deregistered or in another scope", body = ErrorBody),

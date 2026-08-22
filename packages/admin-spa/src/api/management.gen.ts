@@ -6326,8 +6326,16 @@ export interface components {
         ReplayFlowDeadLettersRequest: {
             /**
              * Format: int64
-             * @description Replay only deliveries enqueued at or after this instant, milliseconds since the Unix
+             * @description Replay only deliveries enqueued at or after this instant, MILLISECONDS since the Unix
              *     epoch. Omitted means every dead letter this target has.
+             *
+             *     A value earlier than 2001-09-09 is refused. `deny_unknown_fields` catches the wrong
+             *     field NAME; nothing catches the wrong unit in the right field, and the two directions
+             *     are not equally safe. Microseconds pasted here saturate far into the future and revive
+             *     NOTHING, which is loud. SECONDS pasted here -- the mistake anyone reading a Unix
+             *     timestamp off another tool will make -- land a bound in January 1970 and replay the
+             *     entire retained backlog to a third party, answered 202. The floor makes that one loud
+             *     too.
              */
             since_unix_ms?: number | null;
         };
@@ -11975,7 +11983,7 @@ export interface operations {
                     "application/json": components["schemas"]["FlowReplayAccepted"];
                 };
             };
-            /** @description Malformed request, or an unknown field */
+            /** @description Malformed request, an unknown field, or a since_unix_ms earlier than 2001-09-09 (which is a seconds value in a milliseconds field) */
             400: {
                 headers: {
                     [name: string]: unknown;
