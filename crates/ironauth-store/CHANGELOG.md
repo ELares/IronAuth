@@ -89,18 +89,14 @@ range per docs/RELEASING.md.
   `list` hides deleted rows. The distinction decides the message's fate and is expensive in
   both directions. A deregistered target is gone and its secret with it, so the message
   completes; retrying would burn the attempt budget against a row that will never return. A
-  disabled one is a switch an operator can flip back, so the delivery RETRIES: completing it
-  would drop a real signup notification with nothing behind it, and dead-lettering it would
-  preserve the backlog only if something could revive a dead letter for this consumer, which
-  nothing can today.
+  disabled one is a switch an operator can flip back, so the delivery DEAD-LETTERS and the
+  replay route returns it: completing it would drop a real signup notification with nothing
+  behind it, and retrying would occupy the target's ordering group for the whole backoff
+  schedule, since the queue leases only the lowest-sequenced non-terminal message of a group.
 
-  Retrying is bounded rather than free, and the bound is worth knowing before disabling a busy
-  target. At the shipped outbox defaults one message takes roughly 37 hours of backoff to
-  reach the attempts cap, and the queue leases only the lowest-sequenced non-terminal message
-  of a target's group, so while a target stays off its backlog GROWS: new signups enqueue
-  behind a head that is asleep. Re-enabling does not re-arm the head's already-scheduled
-  attempt either, so the first delivery after a re-enable waits out whatever backoff it was
-  already in (up to ten hours at the cap) before the rest follow.
+  (An intermediate revision of this unreleased entry described the delivery as RETRYING. That
+  was true of the code for exactly as long as no replay route existed; it is rewritten rather
+  than reversed on top, because nothing here has shipped yet.)
 - **Migration 0146's header overstates when a pre-persist flow target runs.**
   `0146_flow_targets.sql:40` says `pre_persist` "runs inside the write's transaction so a
   rejection leaves no row". MEASURED: nothing runs a flow target inside a write

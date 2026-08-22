@@ -40816,10 +40816,11 @@ impl FlowTargetRepo<'_> {
     /// getting it wrong is expensive in both directions. A DELETED target is gone and its
     /// secret with it, so the message completes and nothing is sent; treating that as a
     /// failure would retry against a row that will never return. A DISABLED target is a switch
-    /// an operator can flip back, so the delivery RETRIES and a re-enable inside the backoff
-    /// window drains the backlog; completing it would drop a real signup notification with
-    /// nothing behind it, and dead-lettering it would preserve the backlog only if something
-    /// could revive a dead letter for this consumer, which nothing can.
+    /// an operator can flip back, so the delivery DEAD-LETTERS and the replay route returns it
+    /// once they do; completing it would drop a real signup notification with nothing behind
+    /// it, and RETRYING would occupy the target's ordering group for the whole backoff
+    /// schedule, because the queue leases only the lowest-sequenced non-terminal message of a
+    /// group. A dead letter is terminal and blocks nothing.
     ///
     /// # Errors
     ///

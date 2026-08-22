@@ -1473,3 +1473,65 @@ async fn a_disabled_target_is_still_listable_and_replayable() {
         "and replaying it is the sequence the route exists for: {body}"
     );
 }
+
+/// A `since` bound that looks like SECONDS is refused, and the unbounded form still works.
+///
+/// The two unit mistakes are not equally safe, which is why only one needs a guard.
+/// Microseconds in this field saturate far into the future and revive nothing -- wrong, but
+/// loud. Seconds in this field land a bound in January 1970 and replay the entire retained
+/// backlog to a third party, answered 202. `deny_unknown_fields` catches a wrong field NAME
+/// and cannot catch a wrong unit in the right field.
+///
+/// Both halves are asserted together: a floor that also refused the unbounded form would break
+/// "replay everything", which is the documented way to ask for exactly that.
+#[tokio::test]
+async fn a_since_bound_that_looks_like_seconds_is_refused() {
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let base = targets_base(&tenant, &environment);
+    let target = register_target(&h, &tenant, &environment, "k-t1", "crm", None).await;
+
+    // 1_700_000_000 is a plausible Unix timestamp in SECONDS, and as milliseconds it is 1970.
+    let (status, _, body) = h
+        .post(
+            &format!("{base}/{target}/replay"),
+            "k-replay-seconds",
+            &serde_json::json!({ "since_unix_ms": 1_700_000_000_i64 }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a seconds-shaped bound must be refused rather than silently replaying everything: \
+         {body}"
+    );
+    assert!(
+        body.contains("MILLISECONDS"),
+        "and the refusal must name the unit it wanted: {body}"
+    );
+
+    // The same value in milliseconds is accepted.
+    let (status, _, body) = h
+        .post(
+            &format!("{base}/{target}/replay"),
+            "k-replay-millis",
+            &serde_json::json!({ "since_unix_ms": 1_700_000_000_000_i64 }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "milliseconds are fine: {body}"
+    );
+
+    // And OMITTING the field is still how a caller asks for everything. The floor must refuse
+    // an implausible bound, never the unbounded form.
+    let (status, _, body) = h
+        .post(&format!("{base}/{target}/replay"), "k-replay-all", "{}")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "the unbounded form is the documented way to replay everything: {body}"
+    );
+}
