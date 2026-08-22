@@ -1022,6 +1022,20 @@ impl Harness {
     /// are admission-controlled rather than running Argon2 inline on an I/O thread.
     /// Only the protocol router is rebuilt (the issuer/discovery routers are not
     /// needed by the hashing endpoints).
+    /// Install the outbound fetcher SYNC flow targets are consulted through (issue #112), and
+    /// rebuild the protocol router.
+    ///
+    /// Without this, `dispatch_sync` takes its no-fetcher branch and every target resolves
+    /// `Unavailable` before a request is ever built -- which is a real path, and the one the
+    /// pre-persist refusal tests drive deliberately, but it leaves the whole outbound half of
+    /// the contract unreachable. `with_flow_target_fetcher` had exactly one caller in the tree
+    /// before this: the boot path.
+    pub fn install_flow_target_fetcher(&mut self, fetcher: Arc<ironauth_fetch::Fetcher>) {
+        let state = self.state.clone().with_flow_target_fetcher(fetcher);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     pub fn install_hashing_pool(&mut self, pool: Arc<ironauth_oidc::HashingPool>) {
         let state = self.state.clone().with_hashing_pool(pool);
         self.router = oidc_router(state.clone());
