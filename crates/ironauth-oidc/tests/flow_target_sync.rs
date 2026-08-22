@@ -23,25 +23,50 @@
 //!
 //! Each was green against the whole suite before this file:
 //!
-//! * returning `Outcome::Allow` where an elapsed timeout should trigger the failure policy --
-//!   a `fail_closed` fraud gate that silently ADMITS the signup it exists to stop;
-//!   * deleting the entire pre-persist dispatch block from the registration path;
-//! * resolving a target's JSON pointer against no form, so every `/traits/...` rejection
-//!   degrades to a field-free refusal.
+//! * returning `Outcome::Allow` where an elapsed consultation should trigger the failure
+//!   policy -- a `fail_closed` fraud gate that silently ADMITS the signup it exists to stop;
+//! * widening the per-target timeout to the shared budget, so the operator's configured bound
+//!   is not what ends the consultation and a live registration hangs for the fetcher's
+//!   ceiling instead;
+//! * deleting the pre-persist dispatch block from EITHER signup door.
+//!
+//! ## What this file does NOT kill, and why
+//!
+//! Resolving a target's JSON pointer against no form, so every `/traits/...` rejection
+//! degrades to a field-free refusal. That mutation lives in `classify_response`, which runs
+//! only after a SUCCESSFUL fetch, and the empty root store described above forbids one here
+//! (issue #959). It is also unreachable on the legacy door in principle, since
+//! `dispatch_registration_targets` passes `None` for the signup form.
+//!
+//! This section exists because an earlier draft listed that mutation as killed. Claiming a
+//! kill the file cannot make is precisely the unmeasured sentence this file was written to
+//! remove, and it is worse than saying nothing: the next reader takes pointer resolution as
+//! covered and stops looking.
 
 mod common;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use common::{Harness, enc, form, location_param};
+use ironauth_config::{OidcConfig, RegulationConfig};
 use ironauth_fetch::{FetchLimits, Fetcher, RecordingDialer, StaticResolver};
+use ironauth_oidc::flow::model::{Journey, Transport};
+use ironauth_oidc::flow::{Continuation, Submission, TransportAuth, create_flow, drive};
+use ironauth_oidc::{Argon2Params, HashingPool};
 use ironauth_store::flow_target::{FailurePolicy, Invocation, TargetClass, Timing};
+use std::collections::BTreeMap;
 use tokio::net::TcpListener;
 
 /// A >= 15-code-point passphrase, so a refusal is never the length floor.
 const PASSWORD: &str = "a-sync-target-consultation-passphrase";
+
+/// The per-target bound the hanging-target tests configure. Named because the elapsed-time
+/// assertion below is stated as a multiple of it: the point of that assertion is that THIS
+/// number is what ended the consultation, so it must be the number the bound is derived from.
+const HANG_TIMEOUT_MS: u64 = 250;
 
 /// Stand up an in-process target that ACCEPTS a connection and never answers.
 ///
@@ -247,11 +272,13 @@ async fn a_sync_target_that_exceeds_its_timeout_triggers_the_failure_policy() {
         "hanging-gate",
         Timing::PrePersist,
         FailurePolicy::FailClosed,
-        250,
+        i32::try_from(HANG_TIMEOUT_MS).expect("the configured bound fits an i32"),
     )
     .await;
 
+    let started = Instant::now();
     let (status, body) = signup(&harness, "timedout@example.test").await;
+    let elapsed = started.elapsed();
     assert_ne!(
         status,
         StatusCode::SEE_OTHER,
@@ -261,6 +288,28 @@ async fn a_sync_target_that_exceeds_its_timeout_triggers_the_failure_policy() {
         !user_exists(&harness, "timedout@example.test").await,
         "and leave no row: a gate that times out and lets the signup through is the failure \
          this policy exists to prevent"
+    );
+
+    // WHICH bound ended it. Criterion 6 is not "the consultation eventually stops", it is
+    // "a target exceeding ITS timeout triggers the failure policy instead of HANGING THE
+    // FLOW", so a test that only checks the verdict leaves the operator's bound unpinned.
+    //
+    // Concretely, before this assertion existed: changing `.min(budget_remaining_ms)` to
+    // `.max(..)` in `consult_target` compiles without a warning, asks for the whole ~45s
+    // budget instead of the configured 250ms, and the never-answering server still times
+    // out -- against the fetcher's own default ceiling instead. Every assertion above stays
+    // green and the suite just runs slower. In production the boot fetcher's ceiling is
+    // 30s, so the same mutant holds a live registration for 30s against a 250ms setting.
+    //
+    // The multiple is deliberately loose. This separates "a quarter second" from "ten
+    // seconds"; it is not a latency measurement, and a snug bound here would be flaky in
+    // exchange for nothing. Stated against HANG_TIMEOUT_MS rather than against the fetcher's
+    // default so that raising that default can never silently widen this guard.
+    let ceiling = Duration::from_millis(HANG_TIMEOUT_MS * 20);
+    assert!(
+        elapsed < ceiling,
+        "the consultation must be bounded by the TARGET's {HANG_TIMEOUT_MS}ms, not by some \
+         larger ceiling that also happens to end it: took {elapsed:?}, allowed {ceiling:?}"
     );
 }
 
@@ -343,5 +392,151 @@ async fn a_sync_consultation_reaches_the_network() {
         attempts[0],
         SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 443)),
         "and it dialed the address destination validation approved, on the scheme's port --          not the loopback the dialer forwards to, which is what pins the connection to the          once-validated address: {attempts:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The OTHER door.
+//
+// There are two signup doors and each has its OWN `dispatch_sync` call site: the legacy
+// `POST /register` route goes through `dispatch_registration_targets`, and the flow API goes
+// through `flow::registration`. Everything above drives the legacy one, which left the flow
+// API's call site with zero test callers -- the same single-door gap the async sibling had
+// already learned to close, which is why it pins both.
+//
+// The two are NOT interchangeable. The legacy door passes `None` for the signup form and its
+// own doc says an interruption "collapses to Refuse: a worse message, the same security
+// answer". The flow door passes the form and is the only one that can render a field-mapped
+// `Decision::Interrupt`. So a target wired for the flow door exercises a path the legacy
+// tests cannot reach even in principle.
+// ---------------------------------------------------------------------------------------
+
+/// A flows-enabled harness with a cheap deterministic hashing pool, mirroring the setup the
+/// flow-journey suites and the async sibling use.
+async fn flows_harness() -> Harness {
+    let mut harness = Harness::start_store_backed_with(OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        regulation: RegulationConfig {
+            enabled: false,
+            registration_closed: false,
+            ..RegulationConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .await;
+    harness.enable_flows();
+    harness.install_hashing_pool(Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1),
+        1,
+        64,
+        None,
+    )));
+    harness
+}
+
+/// Drive a registration through the FLOW API and return what the flow decided.
+///
+/// Returns the continuation rather than asserting on it, because the two tests below want
+/// opposite outcomes from the same drive: a refusal renders another step, an admission
+/// completes.
+async fn flow_api_signup(harness: &Harness, identifier: &str) -> Continuation {
+    let (flow_id, token, _) = create_flow(
+        harness.state(),
+        harness.scope(),
+        Transport::Api,
+        Journey::Registration,
+        None,
+        None,
+        None,
+        &HeaderMap::new(),
+    )
+    .await
+    .expect("create the registration flow");
+
+    let mut values: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    values.insert("identifier".to_owned(), serde_json::json!(identifier));
+    values.insert("password".to_owned(), serde_json::json!(PASSWORD));
+
+    drive(
+        harness.state(),
+        harness.scope(),
+        &flow_id,
+        Transport::Api,
+        TransportAuth::Api {
+            presented_submit_token: token,
+        },
+        Submission {
+            node_values: values,
+            transient_payload: None,
+        },
+        &HeaderMap::new(),
+    )
+    .await
+    .expect("drive the registration submission")
+}
+
+/// The flow-API door consults its targets too, and a fail-closed one that cannot be reached
+/// stops the signup there as well.
+///
+/// Deleting the `dispatch_sync` block from `flow::registration` leaves every test above green,
+/// because they all post to the other door. This is the test that turns that deletion red.
+#[tokio::test]
+async fn a_fail_closed_target_at_the_flow_api_door_also_refuses() {
+    let addr = target_server().await;
+    let mut harness = flows_harness().await;
+    let (fetcher, _dialer) = fetcher_to(addr);
+    harness.install_flow_target_fetcher(fetcher);
+    register_sync_target(
+        &harness,
+        "flow-door-gate",
+        Timing::PrePersist,
+        FailurePolicy::FailClosed,
+        i32::try_from(HANG_TIMEOUT_MS).expect("the configured bound fits an i32"),
+    )
+    .await;
+
+    let continuation = flow_api_signup(&harness, "flowdoor@example.test").await;
+
+    // `Continuation` is not `Debug`, so the message names what was expected rather than
+    // rendering what arrived. A refusal comes back as a re-rendered step carrying
+    // `refusal_message()`, never as a completion.
+    assert!(
+        !matches!(continuation, Continuation::Complete { .. }),
+        "a fail-closed target that could not be consulted must stop the flow-API signup, \
+         not complete it"
+    );
+    assert!(
+        !user_exists(&harness, "flowdoor@example.test").await,
+        "and leave no row at this door either"
+    );
+}
+
+/// The same unreachable target under FAIL-OPEN completes, so the refusal above is attributable
+/// to the POLICY rather than to the flow door refusing whenever a target is registered.
+#[tokio::test]
+async fn a_fail_open_target_at_the_flow_api_door_admits_the_signup() {
+    let addr = target_server().await;
+    let mut harness = flows_harness().await;
+    let (fetcher, _dialer) = fetcher_to(addr);
+    harness.install_flow_target_fetcher(fetcher);
+    register_sync_target(
+        &harness,
+        "flow-door-advisory",
+        Timing::PrePersist,
+        FailurePolicy::FailOpen,
+        i32::try_from(HANG_TIMEOUT_MS).expect("the configured bound fits an i32"),
+    )
+    .await;
+
+    let continuation = flow_api_signup(&harness, "flowopen@example.test").await;
+
+    assert!(
+        matches!(continuation, Continuation::Complete { .. }),
+        "a fail-open target that could not be consulted must not block the flow-API signup"
+    );
+    assert!(
+        user_exists(&harness, "flowopen@example.test").await,
+        "and the account exists"
     );
 }
