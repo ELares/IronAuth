@@ -276,6 +276,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
 ] }
 rustls-native-certs = "0.8"
+# TEST-ONLY certificate generation (issue #959). Reached solely through
+# ironauth-fetch's `test-harness` feature, which is off by default, so no released
+# binary links it. `ring` and no `pem`, to match the crypto provider the rest of the
+# TLS stack already uses and to keep the graph to DER, which is what rustls consumes.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 bytes = "1"
 
 # Observability: structured logs and Prometheus metrics.

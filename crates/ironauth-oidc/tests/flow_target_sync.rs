@@ -34,9 +34,15 @@
 //!
 //! Resolving a target's JSON pointer against no form, so every `/traits/...` rejection
 //! degrades to a field-free refusal. That mutation lives in `classify_response`, which runs
-//! only after a SUCCESSFUL fetch. The hardened fetcher's trust anchors are EMPTY by design
-//! (see `target_server` below, and issue #959), so no handshake here can ever complete and
-//! nothing this file drives can reach that code. It is also unreachable on the legacy door in principle, since
+//! only after a SUCCESSFUL fetch, and every fetcher in THIS file is built with empty trust
+//! anchors (see `target_server` below), so no handshake here can complete.
+//!
+//! That is a property of this file, not of the repository any more. Issue #959 added
+//! `Fetcher::from_parts_trusting`, and `flow_target_answer.rs` uses it to drive a target that
+//! ANSWERS: it kills the pointer mutation, and closes issue #112's criterion 1. The tests
+//! here deliberately keep the empty-anchor fetcher, because what they pin is the
+//! reachability half (validated, dialed, bounded, refused) and an answering target would add
+//! a handshake to every one of them for nothing. It is also unreachable on the legacy door in principle, since
 //! `dispatch_registration_targets` passes `None` for the signup form.
 //!
 //! This section exists because an earlier draft listed that mutation as killed. Claiming a

@@ -329,6 +329,36 @@ pub(crate) fn test_tls_config() -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
+/// A TLS client configuration trusting exactly ONE caller-supplied root, for the tests that
+/// must complete a real handshake (issue #959).
+///
+/// The empty-store config above is right for the tests it was built for, which assert SSRF
+/// refusals and route shapes and never speak to anyone. It is a ceiling for everything else:
+/// with no anchors, an in-process server can be dialed and never spoken to, so the entire
+/// response half of every outbound feature (verdict parsing, signature verification, status
+/// classification) had no behavioural test anywhere in the workspace.
+///
+/// This trusts ONE root and nothing else. Not the host keychain, which is the flakiness the
+/// empty store was introduced to remove, and not a public CA. A caller mints a throwaway root
+/// with [`crate::TestTlsIdentity::generate`], serves the matching leaf from an in-process
+/// listener, and hands the root here.
+///
+/// What it deliberately does NOT relax: resolution, destination validation, the deny policy,
+/// the caps, and the pinning are all untouched, so a test still proves the policy rather than
+/// bypassing it. The only thing that changes is WHO the client is willing to believe.
+#[cfg(feature = "test-harness")]
+pub(crate) fn test_tls_config_trusting(
+    root: &tokio_rustls::rustls::pki_types::CertificateDer<'static>,
+) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(root.clone())
+        .expect("a generated test root parses as a trust anchor");
+    let config = client_config_with_roots(roots)
+        .expect("ring provider supports the default protocol versions");
+    Arc::new(config)
+}
+
 /// Why the TLS client configuration could not be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
