@@ -1015,6 +1015,20 @@ impl Harness {
         oidc_router(state)
     }
 
+    /// Install the outbound fetcher SYNC flow targets are consulted through (issue #112), and
+    /// rebuild the protocol router.
+    ///
+    /// Without this, `dispatch_sync` takes its no-fetcher branch and every target resolves
+    /// `Unavailable` before a request is ever built -- which is a real path, and the one the
+    /// pre-persist refusal tests drive deliberately, but it leaves the whole outbound half of
+    /// the contract unreachable. `with_flow_target_fetcher` had exactly one caller in the tree
+    /// before this: the boot path.
+    pub fn install_flow_target_fetcher(&mut self, fetcher: Arc<ironauth_fetch::Fetcher>) {
+        let state = self.state.clone().with_flow_target_fetcher(fetcher);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Install a dedicated Argon2id hashing pool (issue #62) on the state and
     /// rebuild the protocol router, so the public hashing surfaces (login,
     /// register, account, device-flow verify, invitation accept) route through the

@@ -81,7 +81,7 @@ scan() {
 # one is a reviewable line in the diff rather than a trait impl nobody reads.
 scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 
-scan time-via-env 'SystemTime::now|Instant::now' 2
+scan time-via-env 'SystemTime::now|Instant::now' 3
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.

@@ -393,6 +393,15 @@ name = "flow_target_async"
 path = "tests/flow_target_async.rs"
 required-features = ["testing"]
 
+# A SYNC flow target consulted on a real registration (issue #112 criteria 1, 3, 4, 6). The
+# audit that produced this found four criteria unmet for one reason: no test installed the
+# outbound fetcher, so the half of the feature that can reject a signup in band had no
+# behavioural test at all. Needs a real database.
+[[test]]
+name = "flow_target_sync"
+path = "tests/flow_target_sync.rs"
+required-features = ["testing"]
+
 # The self-service end-user account API (issue #61): a user lists and revokes their
 # OWN sessions, changes their OWN password, and enrolls/lists/removes their OWN
 # credentials, always bound to the authenticated subject (a cross-user id is the
