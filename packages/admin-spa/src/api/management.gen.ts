@@ -6319,6 +6319,10 @@ export interface components {
              * Format: int64
              * @description Replay only deliveries enqueued at or after this instant, milliseconds since the
              *     Unix epoch. Omitted means every dead letter this endpoint has.
+             *
+             *     Refused below `1_000_000_000_000` (2001-09-09), because a value that small is a SECONDS
+             *     timestamp in a milliseconds field and would replay the whole retained backlog. Omit
+             *     the field to ask for that deliberately.
              */
             since_unix_ms?: number | null;
         };
@@ -22525,7 +22529,7 @@ export interface operations {
                     "application/json": components["schemas"]["ReplayAccepted"];
                 };
             };
-            /** @description Malformed request */
+            /** @description Malformed request, or a since_unix_ms earlier than 2001-09-09 (which is a seconds value in a milliseconds field) */
             400: {
                 headers: {
                     [name: string]: unknown;
