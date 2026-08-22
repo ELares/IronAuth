@@ -64,6 +64,9 @@ pub mod observe;
 pub mod policy;
 pub(crate) mod resolve;
 pub mod target;
+/// Throwaway TLS material for tests that must complete a handshake (issue #959).
+#[cfg(feature = "test-harness")]
+pub mod test_tls;
 pub mod txt;
 
 use std::sync::Arc;
@@ -87,6 +90,10 @@ use resolve::{SystemDialer, SystemResolver};
 /// plus [`Fetcher::fetch`].
 #[cfg(feature = "test-harness")]
 pub use resolve::{Dial, RecordingDialer, Resolve, SequenceResolver, StaticResolver};
+
+/// The throwaway root and leaf a test serves when it needs a real handshake (issue #959).
+#[cfg(feature = "test-harness")]
+pub use test_tls::{TestTlsIdentity, TestTlsTarget};
 
 /// The default maximum response body size: one mebibyte. Generous for a JWKS,
 /// sector-identifier, or client-metadata document, and small enough that a
@@ -435,16 +442,22 @@ impl Fetcher {
         })
     }
 
-    /// Build a fetcher for TESTS, trusting only an embedded self-signed root (issue #674).
+    /// Build a fetcher for TESTS, trusting NOTHING (issue #674).
     ///
     /// Identical to [`Fetcher::new`] except for where the trust anchors come from, so every
     /// SSRF guard, cap, resolver and dialer behaves exactly as in production. What it does not
     /// do is read the host keychain, which is what coupled unrelated tests across three crates
     /// to a machine-level condition and made the gate fail about half the time.
     ///
-    /// Use it wherever a test needs a fetcher to EXIST rather than to reach a public host. A
-    /// test that genuinely verifies a public certificate chain must not use this, and would
-    /// have to be an integration test against a real endpoint anyway.
+    /// The trust store is EMPTY, so no handshake through this fetcher can ever complete. That
+    /// is the right shape for a test that needs a fetcher to EXIST rather than to reach
+    /// anyone, which is what every caller here wants. This doc previously described an
+    /// "embedded self-signed root"; there has never been one, and the wrong word is what made
+    /// the ceiling in issue #959 hard to see from the call sites.
+    ///
+    /// A test that must complete a handshake wants [`Fetcher::from_parts_trusting`] with a
+    /// [`TestTlsIdentity`]. A test that genuinely verifies a PUBLIC certificate chain must use
+    /// neither, and would have to run against a real endpoint anyway.
     ///
     /// Reachable only under `test-harness`, so no production build can construct one.
     #[cfg(feature = "test-harness")]
@@ -590,13 +603,19 @@ impl Fetcher {
 #[cfg(feature = "test-harness")]
 impl Fetcher {
     /// Build a fetcher from an injected resolver and dialer, with an empty TLS
-    /// trust store (tests drive the connector over plaintext `http`, so no
-    /// handshake occurs). This is how the adversarial tests control resolution
-    /// and observe the pinned dial address.
+    /// trust store, so no `https` handshake can complete. This is how the
+    /// adversarial tests control resolution and observe the pinned dial address.
+    ///
+    /// Tests that need a real response drive the connector over plaintext `http`
+    /// by opting in with [`FetchRequest::allow_plaintext_http`], which is why
+    /// `tests/behavior.rs` can assert on status, body and caps with no trust
+    /// anchor at all.
     ///
     /// Generic over the concrete seam types so a caller can hand in a
     /// `Arc<StaticResolver>` and still keep a typed handle for inspection; the
     /// concrete Arcs coerce to the internal trait objects here.
+    ///
+    /// Use [`Fetcher::from_parts_trusting`] instead when the test needs the target to ANSWER.
     #[must_use]
     pub fn from_parts<R, D>(limits: FetchLimits, resolver: Arc<R>, dialer: Arc<D>) -> Self
     where
@@ -606,6 +625,45 @@ impl Fetcher {
         Self {
             limits,
             tls: connect::test_tls_config(),
+            resolver,
+            dialer,
+        }
+    }
+
+    /// As [`Fetcher::from_parts`], but trusting one caller-supplied root so a handshake with
+    /// an in-process server can COMPLETE (issue #959).
+    ///
+    /// This is the seam that lifts the ceiling described on [`Fetcher::for_tests`], for the
+    /// callers that ceiling actually binds: those that never opt into plaintext. A test whose
+    /// request calls `allow_plaintext_http` reaches a full response through
+    /// [`Fetcher::from_parts`] today and needs none of this.
+    ///
+    /// One that cannot, such as the flow-target consultation, could previously be driven no
+    /// further than validated-and-dialed. Its response HANDLING was still testable by calling
+    /// the classifier directly with a hand-built [`FetchResponse`], and is tested that way;
+    /// what this adds is the end-to-end path in between.
+    ///
+    /// It relaxes exactly one thing: who the client believes. Resolution, destination
+    /// validation, the deny policy, the caps, and address pinning are untouched and still run
+    /// for real, which is the point. A test pointing this at a loopback or private address is
+    /// still refused, and `tests/tls_handshake.rs` pins that so the seam cannot quietly become
+    /// a way around the policy it is supposed to leave standing.
+    ///
+    /// `root` is normally [`TestTlsIdentity::root_der`], whose matching leaf the test serves.
+    #[must_use]
+    pub fn from_parts_trusting<R, D>(
+        limits: FetchLimits,
+        resolver: Arc<R>,
+        dialer: Arc<D>,
+        root: &tokio_rustls::rustls::pki_types::CertificateDer<'static>,
+    ) -> Self
+    where
+        R: resolve::Resolve + 'static,
+        D: resolve::Dial + 'static,
+    {
+        Self {
+            limits,
+            tls: connect::test_tls_config_trusting(root),
             resolver,
             dialer,
         }

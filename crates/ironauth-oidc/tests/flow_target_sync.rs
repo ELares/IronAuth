@@ -34,9 +34,15 @@
 //!
 //! Resolving a target's JSON pointer against no form, so every `/traits/...` rejection
 //! degrades to a field-free refusal. That mutation lives in `classify_response`, which runs
-//! only after a SUCCESSFUL fetch. The hardened fetcher's trust anchors are EMPTY by design
-//! (see `target_server` below, and issue #959), so no handshake here can ever complete and
-//! nothing this file drives can reach that code. It is also unreachable on the legacy door in principle, since
+//! only after a SUCCESSFUL fetch, and every fetcher in THIS file is built with empty trust
+//! anchors (see `target_server` below), so no handshake here can complete.
+//!
+//! That is a property of this file, not of the repository any more. Issue #959 added
+//! `Fetcher::from_parts_trusting`, and `flow_target_answer.rs` uses it to drive a target that
+//! ANSWERS: it kills the pointer mutation, and closes issue #112's criterion 1. The tests
+//! here deliberately keep the empty-anchor fetcher, because what they pin is the
+//! reachability half (validated, dialed, bounded, refused) and an answering target would add
+//! a handshake to every one of them for nothing. It is also unreachable on the legacy door in principle, since
 //! `dispatch_registration_targets` passes `None` for the signup form.
 //!
 //! This section exists because an earlier draft listed that mutation as killed. Claiming a
@@ -94,14 +100,15 @@ const _: () = assert!(
 
 /// Stand up an in-process target that ACCEPTS a connection and never answers.
 ///
-/// There is deliberately no "answers with a verdict" mode, and its absence is the finding
-/// rather than an omission. The hardened fetcher cannot complete a handshake with an
-/// in-process server: `test_tls_config`'s root store is EMPTY by design, and `http://` is
-/// refused by the plaintext policy. So a target can be dialed and never spoken to.
+/// There is deliberately no "answers with a verdict" mode HERE. Every fetcher in this file is
+/// built by `fetcher_to`, which uses `Fetcher::from_parts` and therefore an EMPTY root store,
+/// so a target can be dialed and never spoken to.
 ///
-/// An answering variant existed here briefly and clippy flagged it as never constructed, which
-/// was correct -- keeping it would have implied a capability this harness does not have.
-/// Tracked as issue #959, which blocks criteria 1 and 3-sync.
+/// That used to be a repository-wide limit and is not one any more. Issue #959 added
+/// `Fetcher::from_parts_trusting`, and `flow_target_answer.rs` drives a target that answers
+/// with a verdict. These tests keep the empty-anchor fetcher on purpose: what they pin is the
+/// REACHABILITY half (validated, dialed, bounded, refused), and adding a handshake to each of
+/// them would buy nothing and cost the clarity of a target that provably never replies.
 async fn target_server() -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -411,12 +418,15 @@ async fn an_elapsed_fail_open_consultation_admits_the_signup() {
 /// The consultation REACHES THE NETWORK: destination validation passes and the connector dials
 /// the validated address.
 ///
-/// This is deliberately weaker than criterion 3 asks for, and the reason is a limit of the
-/// test seams rather than of the feature. Completing an HTTPS exchange through the hardened
-/// fetcher is not possible in this repository: `Fetcher::from_parts` builds its client with
-/// `test_tls_config`, whose root store is EMPTY by design -- its own doc says "not one
-/// completes a handshake to a public host". So an in-process server can be dialed but never
-/// spoken to, and `http://` is refused by the plaintext policy, correctly.
+/// This is deliberately weaker than criterion 3 asks for, and the reason is the fetcher THIS
+/// test builds rather than a limit of the repository. `fetcher_to` uses `Fetcher::from_parts`,
+/// whose root store is EMPTY by design, so an in-process server can be dialed but never spoken
+/// to, and `http://` is refused by the plaintext policy, correctly.
+///
+/// Since issue #959 a test that needs the target to ANSWER uses
+/// `Fetcher::from_parts_trusting`, as `flow_target_answer.rs` does. Criterion 3's sync half
+/// wants the request bytes verified with the per-target secret through the standard helpers,
+/// which that seam now makes reachable; it is simply not what this test is for.
 ///
 /// What this still kills is the mutation that matters for reachability: delete the sync
 /// dispatch from the registration path, or drop the fetcher lookup, and NOTHING is dialed.

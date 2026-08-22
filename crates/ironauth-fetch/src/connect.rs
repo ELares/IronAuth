@@ -329,6 +329,53 @@ pub(crate) fn test_tls_config() -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
+/// A TLS client configuration trusting exactly ONE caller-supplied root, for the tests that
+/// must complete a real handshake (issue #959).
+///
+/// The empty-store config above is right for the tests it was built for, which assert SSRF
+/// refusals and route shapes and never speak to anyone. It is a ceiling for one specific
+/// class: a path that can only be reached over `https`.
+///
+/// A test CAN already get a full response through this fetcher, by opting the request into
+/// plaintext with `FetchRequest::allow_plaintext_http` and pointing it at a local server.
+/// `tests/behavior.rs` does exactly that and asserts on status, body bytes, the size and time
+/// caps, and the request head; federation covers status classification and signature
+/// verification the same way. So the response half is not untested in general.
+///
+/// What could not be tested is a caller that never opts in, END TO END. The flow-target
+/// consultation builds its request without `allow_plaintext_http`, correctly, since no
+/// production caller should send a signed envelope in the clear.
+///
+/// Be precise about what that did and did not leave uncovered, because two earlier drafts of
+/// this comment got it wrong in the same direction. The verdict PARSER is well covered:
+/// `flow_target.rs` has inline tests driving `classify_response` over hand-built
+/// `FetchResponse` values, and that file's own doc records an earlier claim that the response
+/// half "needs TLS" as a justification already found wrong. What no test could do is drive a
+/// real registration through the real dispatcher over a real transport and observe what the
+/// FLOW API then renders. That is an integration property, not a parser one, and issue #112's
+/// criterion 1 is stated as exactly that: the API must return the error attached to the field.
+///
+/// This trusts ONE root and nothing else. Not the host keychain, which is the flakiness the
+/// empty store was introduced to remove, and not a public CA. A caller mints a throwaway root
+/// with [`crate::TestTlsIdentity::generate`], serves the matching leaf from an in-process
+/// listener, and hands the root here.
+///
+/// What it deliberately does NOT relax: resolution, destination validation, the deny policy,
+/// the caps, and the pinning are all untouched, so a test still proves the policy rather than
+/// bypassing it. The only thing that changes is WHO the client is willing to believe.
+#[cfg(feature = "test-harness")]
+pub(crate) fn test_tls_config_trusting(
+    root: &tokio_rustls::rustls::pki_types::CertificateDer<'static>,
+) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(root.clone())
+        .expect("a generated test root parses as a trust anchor");
+    let config = client_config_with_roots(roots)
+        .expect("ring provider supports the default protocol versions");
+    Arc::new(config)
+}
+
 /// Why the TLS client configuration could not be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

@@ -276,6 +276,32 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
 ] }
 rustls-native-certs = "0.8"
+# TEST-ONLY certificate generation (issue #959). Reached solely through
+# ironauth-fetch's `test-harness` feature, which is off by default, so no released
+# binary links it. `ring` and no `pem`, to match the crypto provider the rest of the
+# TLS stack already uses and to keep the graph to DER, which is what rustls consumes.
+#
+# HELD AT 0.13 ON PURPOSE, and this is not a stale pin waiting to be bumped.
+#
+# rcgen 0.14.8 raised its declared `rust-version` to 1.88, and this workspace promises
+# 1.85. That is not a local-gate quibble: CI's `msrv (1.85)` lane runs
+# `cargo check --workspace --all-features --all-targets`, so `--all-features` turns this
+# test-only feature on and the resolver refuses. Being optional buys no exemption.
+#
+# A caret `0.14` therefore cannot be used, because it resolves forward to 0.14.9. What
+# WOULD work is an exact `=0.14.7`, which still declares 1.71 and passes the audit
+# (measured, not assumed). It is rejected for a different reason: an exact pin forfeits
+# every future patch release, including a security one, in exchange for a newer API this
+# code does not need. A caret on 0.13 takes patches freely and all of them are MSRV-safe.
+#
+# So the constraint is "0.14.8+ needs 1.88", not "0.14 needs 1.88". An earlier version of
+# this comment said the latter, which is wrong and would have misled anyone re-evaluating
+# it later.
+#
+# The lockfile also holds `time` at 0.3.41; rcgen pulls it in and 0.3.47 onward declare
+# 1.88. `scripts/msrv-audit.sh` fails the gate if either drifts forward, so this comment
+# explains a constraint the tooling already enforces rather than being its only guard.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 bytes = "1"
 
 # Observability: structured logs and Prometheus metrics.

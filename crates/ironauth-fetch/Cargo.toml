@@ -31,6 +31,8 @@ bytes.workspace = true
 # store. tokio-rustls re-exports rustls, so no separate rustls entry is needed.
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
+# Test-only, and optional: pulled in ONLY by `test-harness` (see [features]).
+rcgen = { workspace = true, optional = true }
 
 tokio = { workspace = true, features = ["net", "io-util", "time", "rt"] }
 
@@ -48,9 +50,15 @@ default = []
 # Test-support surface: exposes the injectable resolver/dialer seams and the
 # in-crate test doubles (static, sequenced, recording) so the adversarial
 # integration tests can drive rebinding, redirect, cap, and no-ambient-authority
-# scenarios deterministically. It adds no dependency and no production code path;
-# the seam types are unreachable outside the crate without it.
-test-harness = []
+# scenarios deterministically. It adds no production code path; the seam types are
+# unreachable outside the crate without it.
+#
+# It DOES now add one dependency, `rcgen`, which issue #959 needs to mint a throwaway
+# root and leaf so a test can complete a real handshake against an in-process server.
+# This comment used to say the feature added no dependency; that stopped being true
+# here rather than being quietly left to rot. `rcgen` is unreachable in a default
+# build, so a released binary still never links it.
+test-harness = ["dep:rcgen"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = [
@@ -84,6 +92,14 @@ required-features = ["test-harness"]
 [[test]]
 name = "behavior"
 path = "tests/behavior.rs"
+required-features = ["test-harness"]
+
+# A REAL HTTPS exchange through the hardened fetcher (issue #959), plus the two tests that
+# keep that from being a hole: a loopback destination is still refused, and a leaf outside
+# the trusted root still fails.
+[[test]]
+name = "tls_handshake"
+path = "tests/tls_handshake.rs"
 required-features = ["test-harness"]
 
 # Stable, in-CI adversarial table over crafted URLs, hosts, and addresses,

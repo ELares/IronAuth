@@ -10,9 +10,13 @@
 //!
 //! An audit export must not travel in cleartext, so the sinks send `https` and the fetcher
 //! refuses a plaintext target unless a request opts in, which the sinks deliberately do not.
-//! The test fetcher's TLS config trusts an EMPTY root store, so no loopback server
-//! certificate can validate. That combination means a successful HTTPS body delivery is NOT
-//! reachable from a unit test on this runner, and it is not faked here.
+//! The test fetcher THESE tests build trusts an EMPTY root store, so no loopback server
+//! certificate can validate, and a successful HTTPS body delivery is not reachable here. It
+//! is not faked either.
+//!
+//! That is a property of this file's fetcher and no longer of the runner. Issue #959 added
+//! `Fetcher::from_parts_trusting`, which completes a handshake against an in-process server,
+//! so a future test that wants a delivered body has a way to get one.
 //!
 //! What IS reachable, and what these cover: the sink's behaviour when its configured
 //! endpoint is refused by the outbound policy, and that the refusal an operator reads names
@@ -160,7 +164,9 @@ async fn an_https_endpoint_gets_past_the_policy_and_fails_at_the_transport() {
                 "an https endpoint must not be refused for its scheme: {reason}"
             );
             // The TLS handshake fails against a bare TCP listener under an empty root
-            // store, which is a TRANSPORT outcome. That is as far as this runner reaches.
+            // store, which is a TRANSPORT outcome. That is as far as THIS fetcher reaches;
+            // `Fetcher::from_parts_trusting` (issue #959) is the seam for a test that needs
+            // the handshake to succeed.
             assert!(
                 reason.contains("could not be reached") || reason.contains("timed out"),
                 "the failure must come from the transport, which is what proves the \
