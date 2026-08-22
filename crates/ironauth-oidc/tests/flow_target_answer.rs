@@ -51,6 +51,7 @@ use ironauth_config::{OidcConfig, RegulationConfig};
 use ironauth_fetch::{
     FetchLimits, Fetcher, RecordingDialer, StaticResolver, TestTlsIdentity, TestTlsTarget,
 };
+use ironauth_jose::webhooks::{WebhookSecret, verify_delivery};
 use ironauth_oidc::{Argon2Params, HashingPool};
 use ironauth_store::flow_target::{FailurePolicy, Invocation, TargetClass, Timing};
 use ironauth_store::{CorrelationId, NewSignupForm, SignupFormId};
@@ -150,6 +151,15 @@ async fn install_form(harness: &Harness) {
 
 /// Register a SYNC PRE-PERSIST target pointed at `TARGET_HOST`.
 async fn register_target(harness: &Harness, policy: FailurePolicy) {
+    register_target_signed(harness, policy, None).await;
+}
+
+/// As [`register_target`], but optionally SIGNED with the named environment secret.
+async fn register_target_signed(
+    harness: &Harness,
+    policy: FailurePolicy,
+    signing_secret_name: Option<&str>,
+) {
     let env = harness.env().clone();
     let scope = harness.scope();
     let config = json!({});
@@ -172,12 +182,47 @@ async fn register_target(harness: &Harness, policy: FailurePolicy) {
                 timeout_ms: Some(2_000),
                 failure_policy: policy,
                 config: &config,
-                signing_secret_name: None,
+                signing_secret_name,
                 enabled: true,
             },
         )
         .await
         .expect("register the answering target");
+}
+
+/// The name and bytes of the per-target signing secret used by the signature test.
+const SIGNING_SECRET_NAME: &str = "flow_target_signing";
+const SIGNING_SECRET: &[u8] = b"a-per-target-flow-signing-secret";
+
+/// Store the signing secret in the environment, which is where `open_signing_secret` reads it.
+async fn install_signing_secret(harness: &Harness) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    harness
+        .db()
+        .store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .environment_secrets()
+        .put(
+            &env,
+            &harness.db().master_key(),
+            SIGNING_SECRET_NAME,
+            SIGNING_SECRET,
+            None,
+        )
+        .await
+        .expect("store the signing secret");
+}
+
+/// Pull one header value out of a recorded request head.
+fn header_value<'a>(head: &'a str, name: &str) -> &'a str {
+    head.lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+        .unwrap_or_else(|| panic!("the recorded request carries a {name} header:\n{head}"))
 }
 
 /// Install a fetcher that trusts `identity`'s root and lands its socket on `target`.
@@ -240,6 +285,21 @@ async fn post_json(harness: &Harness, path: &str, body: &Value) -> (StatusCode, 
         serde_json::from_str(&response).unwrap_or(Value::Null)
     };
     (status, parsed)
+}
+
+/// Create an API registration flow, returning its id and submit token.
+async fn create_flow_api(harness: &Harness) -> (String, String) {
+    let (status, create) = post_json(
+        harness,
+        &create_path(harness),
+        &json!({"return_to": return_to(harness)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create: {create}");
+    (
+        create["flow"]["id"].as_str().expect("flow id").to_owned(),
+        create["submit_token"].as_str().expect("token").to_owned(),
+    )
 }
 
 /// Find a node by its input `name` in a flow object's node list.
@@ -446,5 +506,124 @@ async fn an_answering_target_that_allows_lets_the_signup_through() {
         node_named(&body["flow"], "nickname")
             .is_none_or(|node| node["messages"].as_array().is_none_or(Vec::is_empty)),
         "and nothing is attached to the field: {body}"
+    );
+}
+
+/// Criterion 3, sync half: the payload verifies with the per-target secret using the STANDARD
+/// verification helpers.
+///
+/// The criterion says "using the standard verification helpers" and that wording is the point.
+/// Recomputing an HMAC here would prove the bytes are self-consistent with themselves, which
+/// is a tautology. Calling `ironauth_jose::webhooks::verify_delivery`, the same function a
+/// receiver is documented to call, proves an integrator following the recipe can verify what
+/// we actually sent.
+///
+/// Only reachable since issue #959: the signature covers the request BODY, so verifying it
+/// needs the bytes that arrived at the target, which needs a target that can be spoken to.
+#[tokio::test]
+async fn a_signed_consultation_verifies_with_the_standard_helper() {
+    let identity = TestTlsIdentity::generate(TARGET_HOST);
+    let target = TestTlsTarget::start(&identity, 200, r#"{"verdict":"allow"}"#).await;
+
+    let mut harness = setup().await;
+    install_schema(&harness).await;
+    install_form(&harness).await;
+    install_signing_secret(&harness).await;
+    install_trusting_fetcher(&mut harness, &identity, &target);
+    register_target_signed(
+        &harness,
+        FailurePolicy::FailClosed,
+        Some(SIGNING_SECRET_NAME),
+    )
+    .await;
+
+    let (flow_id, token) = create_flow_api(&harness).await;
+    let (status, body) = post_json(
+        &harness,
+        &submit_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": {
+                "identifier": "signed@example.test",
+                "password": PASSWORD,
+                "nickname": "zeke"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "submit: {body}");
+
+    let seen = target.received();
+    assert_eq!(seen.len(), 1, "the signed consultation reached the target");
+    let request = String::from_utf8_lossy(&seen[0]);
+    let (head, sent_body) = request
+        .split_once("\r\n\r\n")
+        .expect("the recorded request has a head and a body");
+
+    let id = header_value(head, "webhook-id");
+    let timestamp = header_value(head, "webhook-timestamp");
+    let signature = header_value(head, "webhook-signature");
+
+    // The SIGNER's clock, not the wall clock. `consult_target` stamps the timestamp from
+    // `env().clock().now_utc()`, and this harness runs a deterministic clock at the epoch, so
+    // the header reads 0. Verifying against real time would fail the tolerance window by
+    // decades and look exactly like a broken signature. Read from the same clock rather than
+    // hardcoding 0, so this keeps working if the harness ever advances it.
+    let now_secs = i64::try_from(
+        harness
+            .env()
+            .clock()
+            .now_utc()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the harness clock is at or after the epoch")
+            .as_secs(),
+    )
+    .expect("the harness clock fits an i64");
+
+    verify_delivery(
+        &[WebhookSecret::from_bytes(SIGNING_SECRET.to_vec())],
+        id,
+        timestamp,
+        sent_body.as_bytes(),
+        signature,
+        300,
+        now_secs,
+    )
+    .expect("the delivery verifies with the per-target secret through the standard helper");
+
+    // The negative twin. Without it the assertion above is satisfied by a helper that accepts
+    // anything, which is the failure mode a verification test exists to rule out.
+    let wrong = verify_delivery(
+        &[WebhookSecret::from_bytes(
+            b"not-the-configured-secret".to_vec(),
+        )],
+        id,
+        timestamp,
+        sent_body.as_bytes(),
+        signature,
+        300,
+        now_secs,
+    );
+    assert!(
+        wrong.is_err(),
+        "a different secret must NOT verify, or the check above proves nothing"
+    );
+
+    // And the signature must cover the BODY, not just the headers: altering one byte of the
+    // envelope has to break it. This is what makes the signature meaningful to a receiver.
+    let tampered = format!("{sent_body} ");
+    let altered = verify_delivery(
+        &[WebhookSecret::from_bytes(SIGNING_SECRET.to_vec())],
+        id,
+        timestamp,
+        tampered.as_bytes(),
+        signature,
+        300,
+        now_secs,
+    );
+    assert!(
+        altered.is_err(),
+        "the signature must cover the envelope, so a modified body must not verify"
     );
 }
