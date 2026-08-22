@@ -133,10 +133,35 @@ impl TestTlsTarget {
     /// Serves in a loop rather than once, so a retrying caller is answered each time instead
     /// of seeing a connection refused on the second attempt and testing the wrong branch.
     ///
+    /// For a target whose answer must depend on the REQUEST, such as one signing its response
+    /// under a delivery id it has to read out of the request headers, use
+    /// [`TestTlsTarget::start_with`].
+    ///
     /// # Panics
     ///
     /// If the generated leaf cannot form a server config, or the loopback bind fails.
     pub async fn start(identity: &TestTlsIdentity, status: u16, body: impl Into<Vec<u8>>) -> Self {
+        let body = body.into();
+        Self::start_with(identity, move |_request| (status, body.clone(), Vec::new())).await
+    }
+
+    /// Start a listener whose answer is computed FROM the request.
+    ///
+    /// `respond` receives the recorded request (head and body) and returns the status, the
+    /// body, and any extra response headers.
+    ///
+    /// The callback exists so that signing stays OUT of this crate. A target that signs its
+    /// response has to read the delivery id from the request and compute an HMAC, which is
+    /// webhook domain knowledge; putting it here would mean this transport crate depending on
+    /// the JOSE crate to serve a test fixture. The caller already has both.
+    ///
+    /// # Panics
+    ///
+    /// If the generated leaf cannot form a server config, or the loopback bind fails.
+    pub async fn start_with<F>(identity: &TestTlsIdentity, respond: F) -> Self
+    where
+        F: Fn(&[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) + Send + Sync + 'static,
+    {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(identity.leaf_chain.clone(), identity.leaf_key.clone_key())
@@ -150,8 +175,7 @@ impl TestTlsTarget {
 
         let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);
-        let body = body.into();
-        let reason = if status == 200 { "OK" } else { "Error" };
+        let respond = Arc::new(respond);
 
         tokio::spawn(async move {
             loop {
@@ -160,7 +184,7 @@ impl TestTlsTarget {
                 };
                 let acceptor = acceptor.clone();
                 let sink = Arc::clone(&sink);
-                let body = body.clone();
+                let respond = Arc::clone(&respond);
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(socket).await else {
                         return;
@@ -231,14 +255,21 @@ impl TestTlsTarget {
                             }
                         }
                     }
+                    let (status, body, extra) = respond(&seen);
                     if let Ok(mut guard) = sink.lock() {
                         guard.push(seen);
                     }
-                    let head = format!(
+                    let reason = if status == 200 { "OK" } else { "Error" };
+                    let mut head = format!(
                         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
-                         content-length: {}\r\n\r\n",
+                         content-length: {}\r\n",
                         body.len()
                     );
+                    for (name, value) in extra {
+                        use std::fmt::Write as _;
+                        let _ignored = writeln!(head, "{name}: {value}\r");
+                    }
+                    head.push_str("\r\n");
                     let _ignored = tls.write_all(head.as_bytes()).await;
                     let _ignored = tls.write_all(&body).await;
                     let _ignored = tls.flush().await;

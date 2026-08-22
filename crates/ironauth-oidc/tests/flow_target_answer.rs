@@ -51,7 +51,7 @@ use ironauth_config::{OidcConfig, RegulationConfig};
 use ironauth_fetch::{
     FetchLimits, Fetcher, RecordingDialer, StaticResolver, TestTlsIdentity, TestTlsTarget,
 };
-use ironauth_jose::webhooks::{WebhookSecret, verify_delivery};
+use ironauth_jose::webhooks::{WebhookSecret, sign_delivery, verify_delivery};
 use ironauth_oidc::{Argon2Params, HashingPool};
 use ironauth_store::flow_target::{FailurePolicy, Invocation, TargetClass, Timing};
 use ironauth_store::{CorrelationId, NewSignupForm, SignupFormId};
@@ -194,6 +194,15 @@ async fn register_target_signed(
 const SIGNING_SECRET_NAME: &str = "flow_target_signing";
 const SIGNING_SECRET: &[u8] = b"a-per-target-flow-signing-secret";
 
+/// How far the signature test advances the harness clock before anything is signed.
+///
+/// Left at the epoch the timestamp dimension is inert: request stamp, response stamp and the
+/// verifier's `now` would all be 0, so a production bug that hardcoded the signing timestamp
+/// would sail through. Well past the 300s response tolerance, the header must TRACK the clock.
+/// Measured: with this advance, hardcoding `timestamp` in the dispatcher fails the test with
+/// `TimestampOutOfTolerance`; at the epoch that same mutant survives.
+const CLOCK_SECS: u64 = 10_000;
+
 /// Store the signing secret in the environment, which is where `open_signing_secret` reads it.
 async fn install_signing_secret(harness: &Harness) {
     let env = harness.env().clone();
@@ -213,6 +222,45 @@ async fn install_signing_secret(harness: &Harness) {
         )
         .await
         .expect("store the signing secret");
+}
+
+/// Answer `{"verdict":"allow"}` SIGNED under the per-target secret.
+///
+/// Signing is required rather than decoration. When a target carries a secret,
+/// `classify_response` refuses any response without a valid `webhook-timestamp` and
+/// `webhook-signature`, so an unsigned answer is `Unavailable` and a fail-closed target
+/// REFUSES the signup. An earlier version of this test served an unsigned response and stayed
+/// green, because a refusal re-renders as HTTP 200 and a status assertion cannot tell the two
+/// apart. This is also the only coverage `response_signature_verifies` has anywhere.
+///
+/// Computed per request, because the signature covers the response body under the delivery id
+/// IronAuth sent, which is only knowable once the request arrives.
+fn signing_responder(request: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+    let head = String::from_utf8_lossy(request);
+    let delivery_id = head
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("webhook-id")
+                .then(|| value.trim().to_owned())
+        })
+        .expect("IronAuth sends a webhook-id on a signed consultation");
+    let body = br#"{"verdict":"allow"}"#.to_vec();
+    let signature = sign_delivery(
+        std::slice::from_ref(&WebhookSecret::from_bytes(SIGNING_SECRET.to_vec())),
+        &delivery_id,
+        i64::try_from(CLOCK_SECS).expect("the test clock fits an i64"),
+        &body,
+    );
+    (
+        200,
+        body,
+        vec![
+            ("webhook-timestamp".to_owned(), CLOCK_SECS.to_string()),
+            ("webhook-signature".to_owned(), signature),
+        ],
+    )
 }
 
 /// Pull one header value out of a recorded request head.
@@ -344,15 +392,7 @@ async fn a_targets_pointer_rejection_lands_on_the_named_field() {
     // the only thing that can interrupt this flow is a verdict the target actually sent.
     register_target(&harness, FailurePolicy::FailOpen).await;
 
-    let (status, create) = post_json(
-        &harness,
-        &create_path(&harness),
-        &json!({"return_to": return_to(&harness)}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "create: {create}");
-    let flow_id = create["flow"]["id"].as_str().expect("flow id").to_owned();
-    let token = create["submit_token"].as_str().expect("token").to_owned();
+    let (flow_id, token) = create_flow_api(&harness).await;
 
     let (status, body) = post_json(
         &harness,
@@ -463,15 +503,7 @@ async fn an_answering_target_that_allows_lets_the_signup_through() {
     install_trusting_fetcher(&mut harness, &identity, &target);
     register_target(&harness, FailurePolicy::FailOpen).await;
 
-    let (status, create) = post_json(
-        &harness,
-        &create_path(&harness),
-        &json!({"return_to": return_to(&harness)}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "create: {create}");
-    let flow_id = create["flow"]["id"].as_str().expect("flow id").to_owned();
-    let token = create["submit_token"].as_str().expect("token").to_owned();
+    let (flow_id, token) = create_flow_api(&harness).await;
 
     let (status, body) = post_json(
         &harness,
@@ -523,7 +555,8 @@ async fn an_answering_target_that_allows_lets_the_signup_through() {
 #[tokio::test]
 async fn a_signed_consultation_verifies_with_the_standard_helper() {
     let identity = TestTlsIdentity::generate(TARGET_HOST);
-    let target = TestTlsTarget::start(&identity, 200, r#"{"verdict":"allow"}"#).await;
+
+    let target = TestTlsTarget::start_with(&identity, signing_responder).await;
 
     let mut harness = setup().await;
     install_schema(&harness).await;
@@ -536,6 +569,9 @@ async fn a_signed_consultation_verifies_with_the_standard_helper() {
         Some(SIGNING_SECRET_NAME),
     )
     .await;
+    harness
+        .clock()
+        .advance(std::time::Duration::from_secs(CLOCK_SECS));
 
     let (flow_id, token) = create_flow_api(&harness).await;
     let (status, body) = post_json(
@@ -554,6 +590,16 @@ async fn a_signed_consultation_verifies_with_the_standard_helper() {
     .await;
     assert_eq!(status, StatusCode::OK, "submit: {body}");
 
+    // The OUTCOME, not just the status. A fail-closed refusal ALSO renders as 200, so status
+    // alone cannot distinguish a consultation that succeeded from one that was refused for a
+    // bad response signature. The row is what separates them.
+    assert!(
+        user_exists(&harness, "signed@example.test").await,
+        "the signed consultation must have been ACCEPTED. No row means the target's answer \
+         was rejected, most likely because its response signature did not verify, and every \
+         assertion below would then be describing a refused exchange: {body}"
+    );
+
     let seen = target.received();
     assert_eq!(seen.len(), 1, "the signed consultation reached the target");
     let request = String::from_utf8_lossy(&seen[0]);
@@ -565,11 +611,13 @@ async fn a_signed_consultation_verifies_with_the_standard_helper() {
     let timestamp = header_value(head, "webhook-timestamp");
     let signature = header_value(head, "webhook-signature");
 
-    // The SIGNER's clock, not the wall clock. `consult_target` stamps the timestamp from
-    // `env().clock().now_utc()`, and this harness runs a deterministic clock at the epoch, so
-    // the header reads 0. Verifying against real time would fail the tolerance window by
-    // decades and look exactly like a broken signature. Read from the same clock rather than
-    // hardcoding 0, so this keeps working if the harness ever advances it.
+    // The SIGNER's clock, not the wall clock. `dispatch_sync` reads
+    // `env().clock().now_utc()` once and passes it down to `consult_target`, which takes it
+    // as a parameter and does not read a clock of its own. This harness runs a deterministic
+    // clock, advanced above, so verifying against real wall time would miss the tolerance
+    // window by decades and fail in a way that looks exactly like a broken signature.
+    //
+    // Read from the clock rather than restating the advance, so the two cannot drift.
     let now_secs = i64::try_from(
         harness
             .env()
