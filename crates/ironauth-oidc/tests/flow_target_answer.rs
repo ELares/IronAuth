@@ -19,11 +19,21 @@
 //! "A sync target rejects a registration with an error mapped by JSON pointer to the
 //! offending field, and the headless flow API returns it attached to that field."
 //!
-//! Three separate claims, and the last is the one that was never testable: not merely that
-//! the signup was refused, but that the refusal arrived ON the named field. A test that only
-//! asserted "the flow did not complete" would pass for a target that rejected with no
-//! pointer at all, which is a materially worse experience and a different code path
-//! (`Decision::Refuse`, uniform and field free).
+//! Three separate claims, and the third is the one this file adds. Be exact about what was
+//! already covered, because three earlier drafts of this PR were not and each was wrong in
+//! the same direction.
+//!
+//! The field-attachment PROPERTY is tested on main, at the unit level, and well:
+//! `signup_fields.rs`'s `a_target_reason_rides_the_context_of_the_named_field_only` drives
+//! the real renderer with two target failures and asserts each reason lands on the node it
+//! names and only there, which is deliberately two failures so a `first()` mapper cannot
+//! pass. `flow_target.rs` covers pointer resolution and the reason templates.
+//!
+//! What no test could do is reach that renderer from a REAL registration: a signup posted to
+//! the flow API, dispatched to a target that actually answers over a real transport, with the
+//! rendered JSON the API returns as the thing asserted on. Every link in that chain was
+//! exercised except the one in the middle, because an https-only caller could not be answered.
+//! That is the gap, and it is an integration gap rather than a coverage one.
 //!
 //! The flow API door is the only one that can render this. The legacy `POST /register` door
 //! passes `None` for the signup form, and its own doc says an interruption there "collapses
@@ -325,15 +335,27 @@ async fn a_targets_pointer_rejection_lands_on_the_named_field() {
     let (head, sent_body) = request
         .split_once("\r\n\r\n")
         .expect("the recorded request has a head and a body separated by a blank line");
-    assert!(
-        head.to_ascii_lowercase().contains("content-length:"),
-        "the head declares a length, which is what makes the body readable: {head}"
+
+    // Against the DECLARED length, not against a substring. `contains("data")` would be
+    // satisfied by the first few dozen bytes, so a capture that stopped after one read would
+    // pass it while losing most of the envelope; comparing to `content-length` is the only
+    // form that can tell a complete body from a truncated one.
+    let declared: usize = head
+        .to_ascii_lowercase()
+        .split("\r\n")
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse().ok())
+        .expect("the consultation declares a content-length");
+    assert_eq!(
+        sent_body.len(),
+        declared,
+        "the WHOLE envelope must be captured. A short read here means the recorder stopped \
+         early, and every assertion about what the target was asked to judge would be made \
+         against a fragment"
     );
     assert!(
-        !sent_body.is_empty() && sent_body.contains("\"data\""),
-        "the ENVELOPE reached the target, not just the head. Empty here means the body was \
-         never captured, and every claim about what the target was asked to judge would be \
-         unfounded: {sent_body}"
+        sent_body.contains("\"data\""),
+        "and it is the envelope rather than some other body: {sent_body}"
     );
 
     let flow = &body["flow"];

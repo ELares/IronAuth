@@ -191,6 +191,14 @@ impl TestTlsTarget {
                     // `content-length` only. No chunked support, deliberately: nothing in
                     // this workspace sends a chunked request body, and a half-implemented
                     // decoder would fail in a way that looks like the code under test.
+                    //
+                    // NOT EXERCISED by any current caller, and worth saying so. The
+                    // flow-target envelope is around 300 bytes, so it arrives whole in the
+                    // read that completes the head and the loop below runs zero times.
+                    // Measured: replacing `remaining` with 0 leaves every test green, while
+                    // discarding the captured body reddens them (0 against 299). So the
+                    // RECORDING is pinned and this remainder loop is defensive only. A test
+                    // that needs a body larger than one read should not assume it is covered.
                     if let Some(head_end) = head_end {
                         let head = String::from_utf8_lossy(&seen[..head_end]).to_ascii_lowercase();
                         let declared = head
