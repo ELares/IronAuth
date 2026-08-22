@@ -280,7 +280,18 @@ rustls-native-certs = "0.8"
 # ironauth-fetch's `test-harness` feature, which is off by default, so no released
 # binary links it. `ring` and no `pem`, to match the crypto provider the rest of the
 # TLS stack already uses and to keep the graph to DER, which is what rustls consumes.
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+#
+# HELD AT 0.13 ON PURPOSE, and this is not a stale pin waiting to be bumped. The whole
+# 0.14 line declares `rust-version = "1.88"`, and this workspace promises 1.85. CI's
+# `msrv (1.85)` lane runs `cargo check --workspace --all-features --all-targets`, so a
+# non-default TEST feature is still in scope there: an optional dependency does not get
+# a pass. Raising this to 0.14 means raising the published MSRV, which is a deliberate
+# decision about what this project supports and not a side effect of a dependency bump.
+#
+# The lockfile also holds `time` at 0.3.41 for the same reason; rcgen pulls it in, and
+# 0.3.47 onward declare 1.88. `scripts/msrv-audit.sh` fails the gate if either drifts
+# forward, so this comment explains a constraint the tooling already enforces.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 bytes = "1"
 
 # Observability: structured logs and Prometheus metrics.

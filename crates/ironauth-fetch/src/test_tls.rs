@@ -27,7 +27,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -74,13 +74,6 @@ impl TestTlsIdentity {
             .self_signed(&root_key)
             .expect("self-sign the test root");
         let root_der = root.der().clone();
-        // The issuer is built from the SAME params value and the SAME key that just produced
-        // the self-signed root above, so the certificate the leaf chains to is by construction
-        // the certificate the client is handed as its anchor. (`from_ca_cert_der` would state
-        // that even more directly by re-reading the DER, but it is gated behind rcgen's
-        // `x509-parser` feature and is not worth another parser in the graph for a property
-        // this code already has.)
-        let issuer = Issuer::new(root_params, root_key);
 
         let mut leaf_params = CertificateParams::new(vec![dns_name.to_owned()])
             .expect("the DNS name is a valid subject alternative name");
@@ -88,8 +81,11 @@ impl TestTlsIdentity {
         leaf_name.push(DnType::CommonName, dns_name);
         leaf_params.distinguished_name = leaf_name;
         let leaf_key = KeyPair::generate().expect("generate a leaf keypair");
+        // Signed with the SAME root certificate and key that were just self-signed above, so
+        // the certificate the leaf chains to is by construction the one the client is handed
+        // as its anchor.
         let leaf = leaf_params
-            .signed_by(&leaf_key, &issuer)
+            .signed_by(&leaf_key, &root, &root_key)
             .expect("sign the leaf under the test root");
 
         Self {
