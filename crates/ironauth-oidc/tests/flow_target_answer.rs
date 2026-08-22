@@ -47,7 +47,9 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::Harness;
-use ironauth_config::{OidcConfig, RegulationConfig};
+use ironauth_config::{
+    DisposableEmailConfig, OidcConfig, RegistrationAbuseConfig, RegulationConfig, WaitlistConfig,
+};
 use ironauth_fetch::{
     FetchLimits, Fetcher, RecordingDialer, StaticResolver, TestTlsIdentity, TestTlsTarget,
 };
@@ -943,5 +945,264 @@ async fn a_correctly_signed_but_stale_response_is_refused() {
         "a STALE response must be refused. The tolerance is what bounds how old an answer \
          may be; a signed answer accepted at any age is an answer an operator can no longer \
          reason about: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Issue #952: the POST-PERSIST sync envelope must say what the signup BECAME.
+// ---------------------------------------------------------------------------------------
+
+/// A flows harness over `abuse`, with the quarantine flag optionally on.
+///
+/// ORDER MATTERS and it is not obvious: `enable_signup_quarantine` rebuilds the state from the
+/// config, which DISCARDS an installed flow-target fetcher. It has to run before
+/// `install_flow_target_fetcher`, or the consultation silently takes the no-fetcher branch and
+/// the target records nothing.
+async fn outcome_harness(abuse: RegistrationAbuseConfig, quarantine: bool) -> Harness {
+    let config = OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        regulation: RegulationConfig {
+            enabled: false,
+            registration_closed: false,
+            ..RegulationConfig::default()
+        },
+        registration_abuse: abuse,
+        ..OidcConfig::default()
+    };
+    let mut harness = Harness::start_store_backed_with(config.clone()).await;
+    harness.enable_flows();
+    if quarantine {
+        harness.enable_signup_quarantine(&config);
+        harness.enable_flows();
+    }
+    harness.install_hashing_pool(Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1),
+        1,
+        64,
+        None,
+    )));
+    harness
+}
+
+/// Register a POST-PERSIST sync target. Fail-open, because the post-persist verdict is
+/// advisory and this test is about what was SENT, not about what the target decided.
+async fn register_post_persist_target(harness: &Harness) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let config = json!({});
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .flow_targets()
+        .set(
+            &env,
+            &ironauth_store::FlowTargetId::generate(&env, &scope),
+            1_000_000,
+            ironauth_store::NewFlowTarget {
+                name: "outcome-observer",
+                target_class: TargetClass::Request,
+                invocation: Invocation::Sync,
+                timing: Timing::PostPersist,
+                endpoint: &format!("https://{TARGET_HOST}/consult"),
+                timeout_ms: Some(2_000),
+                failure_policy: FailurePolicy::FailOpen,
+                config: &config,
+                signing_secret_name: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("register the post-persist observer");
+}
+
+/// Drive one signup through the flow API and return the envelope the target received.
+async fn envelope_from_signup(
+    abuse: RegistrationAbuseConfig,
+    quarantine: bool,
+    identifier: &str,
+) -> Value {
+    let identity = TestTlsIdentity::generate(TARGET_HOST);
+    let target = TestTlsTarget::start(&identity, 200, r#"{"verdict":"allow"}"#).await;
+
+    let mut harness = outcome_harness(abuse, quarantine).await;
+    install_schema(&harness).await;
+    install_form(&harness).await;
+    install_trusting_fetcher(&mut harness, &identity, &target);
+    register_post_persist_target(&harness).await;
+
+    let (flow_id, token) = create_flow_api(&harness).await;
+    let (status, body) = post_json(
+        &harness,
+        &submit_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": {"identifier": identifier, "password": PASSWORD, "nickname": "zeke"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "submit for {identifier}: {body}");
+
+    let seen = target.received();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the post-persist target was consulted exactly once for {identifier}"
+    );
+    let request = String::from_utf8_lossy(&seen[0]);
+    let (_head, sent) = request
+        .split_once("\r\n\r\n")
+        .expect("the recorded request has a body");
+    serde_json::from_str(sent).unwrap_or_else(|e| panic!("envelope is JSON for {identifier}: {e}"))
+}
+
+/// Issue #952: all three doors, and the values must DIFFER between them.
+///
+/// One test rather than three, because the criterion is about the DIFFERENCE. Three separate
+/// tests each asserting its own expected pair would every one of them pass against a hardcoded
+/// stamp; only comparing the three envelopes to each other can catch that.
+///
+/// The three doors produce materially different accounts: ACTIVE authenticates immediately,
+/// WAITLISTED cannot until an admin approves, and ACTIVE+QUARANTINED authenticates with
+/// limited privileges pending fraud review. Before this, their envelopes were byte-identical
+/// in these two fields, so a receiver that provisions on signup provisioned for an account
+/// nobody had approved and could not tell afterwards which it had been.
+#[tokio::test]
+async fn the_post_persist_envelope_distinguishes_all_three_signup_doors() {
+    let active = envelope_from_signup(
+        RegistrationAbuseConfig::default(),
+        false,
+        "active@example.test",
+    )
+    .await;
+
+    let waitlisted = envelope_from_signup(
+        RegistrationAbuseConfig {
+            waitlist: WaitlistConfig { enabled: true },
+            ..RegistrationAbuseConfig::default()
+        },
+        false,
+        "waitlisted@example.test",
+    )
+    .await;
+
+    let quarantined = envelope_from_signup(
+        RegistrationAbuseConfig {
+            disposable_email: DisposableEmailConfig {
+                mode: "block".to_owned(),
+                denylist: vec!["mailinator.com".to_owned()],
+                allowlist: Vec::new(),
+            },
+            ..RegistrationAbuseConfig::default()
+        },
+        true,
+        "risky@mailinator.com",
+    )
+    .await;
+
+    // BODY level, siblings of `data`, matching the async half. Inside `data` they would be
+    // caller-supplied; here they are stamped from the write's own branch.
+    assert_eq!(active["state"], json!("active"), "active door: {active}");
+    assert_eq!(active["quarantined"], json!(false), "{active}");
+
+    assert_eq!(
+        waitlisted["state"],
+        json!("waitlisted"),
+        "waitlisted door: {waitlisted}"
+    );
+    assert_eq!(waitlisted["quarantined"], json!(false), "{waitlisted}");
+
+    // Quarantined signups are created ACTIVE so they can authenticate with limited
+    // privileges; the quarantine is the orthogonal restriction. So this door differs from the
+    // first in `quarantined`, not in `state`, which is exactly why one field is not enough.
+    assert_eq!(
+        quarantined["state"],
+        json!("active"),
+        "quarantined door: {quarantined}"
+    );
+    assert_eq!(quarantined["quarantined"], json!(true), "{quarantined}");
+
+    // THE DIFFERENCE, asserted directly. A hardcoded stamp satisfies every assertion above
+    // for one door and fails here.
+    assert_ne!(
+        (&active["state"], &active["quarantined"]),
+        (&waitlisted["state"], &waitlisted["quarantined"]),
+        "active and waitlisted must be distinguishable"
+    );
+    assert_ne!(
+        (&active["state"], &active["quarantined"]),
+        (&quarantined["state"], &quarantined["quarantined"]),
+        "active and quarantined must be distinguishable"
+    );
+    assert_ne!(
+        (&waitlisted["state"], &waitlisted["quarantined"]),
+        (&quarantined["state"], &quarantined["quarantined"]),
+        "waitlisted and quarantined must be distinguishable"
+    );
+}
+
+/// The other half of the criterion: a PRE-PERSIST envelope carries NEITHER field.
+///
+/// Asserted as an absence and not merely left unchecked, because the alternative design was to
+/// default them. A default renders as an active unquarantined account, which is a real
+/// outcome, so a receiver could not tell "no row yet" from "a row that came out active". The
+/// absence is the same asymmetry `subject` already carries, and it is what makes the two
+/// timings observably different rather than merely differently labelled.
+#[tokio::test]
+async fn a_pre_persist_envelope_carries_neither_state_nor_quarantined() {
+    let identity = TestTlsIdentity::generate(TARGET_HOST);
+    let target = TestTlsTarget::start(&identity, 200, r#"{"verdict":"allow"}"#).await;
+
+    let mut harness = setup().await;
+    install_schema(&harness).await;
+    install_form(&harness).await;
+    install_trusting_fetcher(&mut harness, &identity, &target);
+    // PRE-persist, fail-open so the signup proceeds and the envelope is the only thing under
+    // test here.
+    register_target(&harness, FailurePolicy::FailOpen).await;
+
+    let (flow_id, token) = create_flow_api(&harness).await;
+    let (status, body) = post_json(
+        &harness,
+        &submit_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": {
+                "identifier": "preflight@example.test",
+                "password": PASSWORD,
+                "nickname": "zeke"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "submit: {body}");
+
+    let seen = target.received();
+    assert_eq!(seen.len(), 1, "the pre-persist target was consulted");
+    let request = String::from_utf8_lossy(&seen[0]);
+    let (_head, sent) = request
+        .split_once("\r\n\r\n")
+        .expect("the recorded request has a body");
+    let envelope: Value = serde_json::from_str(sent).expect("envelope is JSON");
+
+    assert!(
+        envelope.get("state").is_none_or(Value::is_null),
+        "a pre-persist envelope must not name a state: there is no row yet, and a default \
+         would be indistinguishable from a real active account: {envelope}"
+    );
+    assert!(
+        envelope.get("quarantined").is_none_or(Value::is_null),
+        "and must not name a quarantine flag: {envelope}"
+    );
+    // The control: the envelope IS otherwise populated, so the two absences above are the
+    // deliberate omission and not an empty body.
+    assert_eq!(
+        envelope["timing"],
+        json!("pre_persist"),
+        "the envelope is present and well formed: {envelope}"
     );
 }

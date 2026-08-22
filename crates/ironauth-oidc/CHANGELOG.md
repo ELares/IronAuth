@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The sync flow-target envelope now says what the signup became (issue #952).** A
+  POST-PERSIST envelope carries `state` and `quarantined` at BODY level, siblings of `data`,
+  which is where the async half already puts them. Three doors reach that dispatch and produce
+  materially different accounts: ACTIVE authenticates immediately, WAITLISTED cannot until an
+  admin approves it, and ACTIVE-but-QUARANTINED authenticates with limited privileges pending
+  fraud review. Their envelopes were previously byte-identical in these two fields, so a
+  receiver that provisions on signup provisioned for an account nobody had approved and could
+  not tell afterwards which it had been.
+
+  Stamped from the write's own branch rather than from the caller's `data` closure, which is
+  what makes them trustworthy: every door gets it right for free and no future door can
+  forget. A PRE-PERSIST envelope carries NEITHER field, deliberately, because there is no row
+  yet and a default would render as an active unquarantined account, indistinguishable from a
+  real one. That absence is the same asymmetry `subject` already relies on.
+
+  This is a WIRE ADDITION to a published envelope. A receiver that ignores unknown fields is
+  unaffected; one that rejects them is not, which is why it is called out here rather than
+  left to be discovered.
+
 - **The OpenID CIBA token grant (issue #131).** `POST /token` now services
   `grant_type=urn:openid:params:grant-type:ciba`, exchanging an approved `auth_req_id` for
   an ID token and an access token. Note the `openid` namespace: CIBA Core is an OpenID

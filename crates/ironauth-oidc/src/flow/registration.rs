@@ -480,6 +480,9 @@ pub(super) async fn advance_registration(
         ironauth_store::flow_target::Timing::PrePersist,
         &target_data,
         signup.as_ref(),
+        // No row yet at pre-persist, so no outcome to report. Absent rather than defaulted:
+        // see the envelope in `flow_target`.
+        None,
     )
     .await
     {
@@ -608,6 +611,22 @@ pub(super) async fn advance_registration(
             ironauth_store::flow_target::Timing::PostPersist,
             &observed,
             signup.as_ref(),
+            // Derived from the write's own branch above, not from the row. The three doors
+            // that reach here produce materially different accounts, and without these two
+            // fields their envelopes are byte-identical: a receiver that provisions on signup
+            // would provision for one nobody has approved.
+            Some(flow_target::SignupOutcome {
+                state: if quarantine_reason.is_some() {
+                    // The fraud queue takes precedence over the waitlist: quarantined signups
+                    // are created ACTIVE so they can authenticate with limited privileges.
+                    UserState::Active
+                } else if waitlisted {
+                    UserState::Waitlisted
+                } else {
+                    UserState::Active
+                },
+                quarantined: quarantine_reason.is_some(),
+            }),
         )
         .await;
     }

@@ -207,6 +207,19 @@ pub(crate) async fn enabled_async_targets(
     }
 }
 
+/// What a committed signup BECAME, for the post-persist envelope (issue #952).
+///
+/// Carried as a type rather than two loose arguments so a caller cannot transpose them, and
+/// so the pre-persist absence is `None` rather than a pair of defaults that would look like
+/// an ACTIVE, unquarantined account.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SignupOutcome {
+    /// The state the row was created in.
+    pub state: ironauth_store::UserState,
+    /// Whether it was created under the fraud quarantine.
+    pub quarantined: bool,
+}
+
 /// Dispatch every enabled SYNC target of `timing` for the request class, in name order.
 ///
 /// Returns [`Decision::Allow`] when nothing objected, INCLUDING the common case where no
@@ -217,6 +230,7 @@ pub(super) async fn dispatch_sync(
     timing: Timing,
     data: &serde_json::Value,
     signup: Option<&(SignupFormConfig, TraitSchema, i32)>,
+    signup_outcome: Option<SignupOutcome>,
 ) -> Decision {
     // A registry read that failed refuses rather than continues: a target that cannot be
     // listed cannot be consulted, and continuing would silently skip every fail-closed
@@ -309,6 +323,7 @@ pub(super) async fn dispatch_sync(
             scope,
             data,
             signup,
+            signup_outcome,
             now,
             &delivery,
             remaining,
@@ -376,6 +391,7 @@ async fn consult_target(
     scope: Scope,
     data: &serde_json::Value,
     signup: Option<&(SignupFormConfig, TraitSchema, i32)>,
+    signup_outcome: Option<SignupOutcome>,
     now: i64,
     delivery_id: &str,
     budget_remaining_ms: i64,
@@ -406,6 +422,17 @@ async fn consult_target(
         },
         "tenant_id": scope.tenant().to_string(),
         "environment_id": scope.environment().to_string(),
+        // What the signup BECAME, stamped from the write's own facts rather than from the
+        // caller's `data` closure, which is what makes it trustworthy. Siblings of `data` and
+        // not inside it, matching where the async half puts them, so a receiver wired to both
+        // reads one contract.
+        //
+        // ABSENT at pre-persist, where there is no row yet, rather than defaulted. A default
+        // would render as an active unquarantined account, indistinguishable from a real one.
+        // That absence is the same asymmetry `subject` already relies on to make the two
+        // timings observably different.
+        "state": signup_outcome.map(|o| o.state.as_str()),
+        "quarantined": signup_outcome.map(|o| o.quarantined),
         "data": data,
         "config": target.config,
     });

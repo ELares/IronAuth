@@ -96,6 +96,8 @@ pub async fn dispatch_registration_targets(
         ironauth_store::flow_target::Timing::PrePersist,
         &data,
         None,
+        // No row yet at pre-persist, so no outcome to report.
+        None,
     )
     .await
     {
