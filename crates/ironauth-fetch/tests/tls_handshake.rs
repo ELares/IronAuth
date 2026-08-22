@@ -5,8 +5,11 @@
 //! `for_tests` and `from_parts` trust NOTHING, so an in-process server can be dialed and
 //! never spoken to over `https`. `behavior.rs` gets around that by opting its requests into
 //! plaintext and does assert on real responses; this file is about the callers that cannot,
-//! because they must not send in the clear. The flow-target consultation is one, and two of
-//! issue #112's acceptance criteria were unprovable because of it.
+//! because they must not send in the clear.
+//!
+//! The flow-target consultation is one. Its verdict parser is unit-tested over hand-built
+//! responses, so what was missing was never the parsing: it was the END-TO-END path, which is
+//! how two of issue #112's acceptance criteria are worded and why they were unprovable.
 //!
 //! These tests exist to prove two things that must BOTH hold, since the second is what keeps
 //! the first from being a hole:
@@ -63,8 +66,9 @@ async fn the_hardened_fetcher_completes_an_https_exchange_with_an_in_process_tar
     assert_eq!(
         response.body(),
         br#"{"verdict":"allow"}"#,
-        "and the BODY came back over a completed TLS handshake, which is what an https-only \
-         caller could not reach before: its verdict parsing lives behind this line"
+        "and the BODY came back over a completed TLS handshake. The parsing of such a body \
+         is unit-tested elsewhere; what could not be done before is getting one here, through \
+         the real transport, for a caller that never opts into plaintext"
     );
 }
 

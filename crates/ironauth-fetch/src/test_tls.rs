@@ -21,10 +21,15 @@
 //! signature verification. The response half is not untested in general, and this module
 //! should not be read as claiming it was.
 //!
-//! The flow-target consultation is the case that could not be reached. It builds its request
-//! WITHOUT the plaintext opt-in, correctly, because no production caller should send a signed
-//! envelope in the clear. So its tests stop at "it dialed", and two of issue #112's
-//! acceptance criteria were unprovable.
+//! The flow-target consultation is the case that could not be reached END TO END. It builds
+//! its request WITHOUT the plaintext opt-in, correctly, because no production caller should
+//! send a signed envelope in the clear.
+//!
+//! Its verdict PARSER is separately well covered by inline tests over hand-built responses, so
+//! this is not first coverage of that. What was missing is the integration: a real
+//! registration, through the real dispatcher, over a real transport, ending in what the flow
+//! API renders. Two of issue #112's acceptance criteria are stated as integration properties
+//! and were unprovable for that reason.
 //!
 //! ## What this does and does not relax
 //!

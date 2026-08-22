@@ -302,11 +302,38 @@ async fn a_targets_pointer_rejection_lands_on_the_named_field() {
     // The target ANSWERED, and the answer was honoured: the flow re-renders rather than
     // completing. This is the half that needed #959; everything below it needed the pointer.
     assert_eq!(status, StatusCode::OK, "submit: {body}");
-    assert!(
-        target.received().len() == 1,
+    let seen = target.received();
+    assert_eq!(
+        seen.len(),
+        1,
         "the consultation reached the target exactly once, so what follows is its answer \
-         rather than a local refusal: {:?}",
-        target.received().len()
+         rather than a local refusal"
+    );
+
+    // What was SENT, not just that something was. The recorded request carries the head and
+    // the body, and the body is the envelope the target is asked to judge: without it a
+    // receiver has nothing to decide on, and a signature would have nothing to cover.
+    //
+    // Asserted here because nothing else does. `TestTlsTarget` learned to capture the body in
+    // this PR, and a capability with no assertion behind it regresses silently, which is the
+    // failure this whole change keeps running into.
+    let request = String::from_utf8_lossy(&seen[0]);
+    assert!(
+        request.starts_with("POST "),
+        "the consultation is a POST: {request}"
+    );
+    let (head, sent_body) = request
+        .split_once("\r\n\r\n")
+        .expect("the recorded request has a head and a body separated by a blank line");
+    assert!(
+        head.to_ascii_lowercase().contains("content-length:"),
+        "the head declares a length, which is what makes the body readable: {head}"
+    );
+    assert!(
+        !sent_body.is_empty() && sent_body.contains("\"data\""),
+        "the ENVELOPE reached the target, not just the head. Empty here means the body was \
+         never captured, and every claim about what the target was asked to judge would be \
+         unfounded: {sent_body}"
     );
 
     let flow = &body["flow"];

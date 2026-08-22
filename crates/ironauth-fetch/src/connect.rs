@@ -342,10 +342,18 @@ pub(crate) fn test_tls_config() -> Arc<ClientConfig> {
 /// caps, and the request head; federation covers status classification and signature
 /// verification the same way. So the response half is not untested in general.
 ///
-/// What could not be tested is a caller that never opts in. The flow-target consultation
-/// builds its request without `allow_plaintext_http`, correctly, since no production caller
-/// should send a signed envelope in the clear. That path was unreachable end to end, and its
-/// verdict parsing had no behavioural test.
+/// What could not be tested is a caller that never opts in, END TO END. The flow-target
+/// consultation builds its request without `allow_plaintext_http`, correctly, since no
+/// production caller should send a signed envelope in the clear.
+///
+/// Be precise about what that did and did not leave uncovered, because two earlier drafts of
+/// this comment got it wrong in the same direction. The verdict PARSER is well covered:
+/// `flow_target.rs` has inline tests driving `classify_response` over hand-built
+/// `FetchResponse` values, and that file's own doc records an earlier claim that the response
+/// half "needs TLS" as a justification already found wrong. What no test could do is drive a
+/// real registration through the real dispatcher over a real transport and observe what the
+/// FLOW API then renders. That is an integration property, not a parser one, and issue #112's
+/// criterion 1 is stated as exactly that: the API must return the error attached to the field.
 ///
 /// This trusts ONE root and nothing else. Not the host keychain, which is the flakiness the
 /// empty store was introduced to remove, and not a public CA. A caller mints a throwaway root

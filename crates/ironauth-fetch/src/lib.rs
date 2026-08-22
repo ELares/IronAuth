@@ -635,9 +635,13 @@ impl Fetcher {
     ///
     /// This is the seam that lifts the ceiling described on [`Fetcher::for_tests`], for the
     /// callers that ceiling actually binds: those that never opt into plaintext. A test whose
-    /// request calls `allow_plaintext_http` reaches a full response through [`Fetcher::from_parts`]
-    /// today and needs none of this. One that cannot, such as the flow-target consultation,
-    /// could previously prove only that a destination was validated and dialed.
+    /// request calls `allow_plaintext_http` reaches a full response through
+    /// [`Fetcher::from_parts`] today and needs none of this.
+    ///
+    /// One that cannot, such as the flow-target consultation, could previously be driven no
+    /// further than validated-and-dialed. Its response HANDLING was still testable by calling
+    /// the classifier directly with a hand-built [`FetchResponse`], and is tested that way;
+    /// what this adds is the end-to-end path in between.
     ///
     /// It relaxes exactly one thing: who the client believes. Resolution, destination
     /// validation, the deny policy, the caps, and address pinning are untouched and still run
