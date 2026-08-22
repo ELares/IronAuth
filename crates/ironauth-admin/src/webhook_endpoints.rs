@@ -28,7 +28,7 @@ use utoipa::ToSchema;
 use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
-use crate::input::{parse_json, require_non_empty};
+use crate::input::{parse_json, require_non_empty, require_plausible_since_unix_ms};
 use crate::org_context::{require_live_environment, resolve_scope};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -655,7 +655,7 @@ pub async fn list_webhook_dead_letters(
     security(("bearer" = [])),
     responses(
         (status = 202, description = "The replay was queued. A worker performs it; poll the dead-letter listing to watch it drain", body = ReplayAccepted),
-        (status = 400, description = "Malformed request", body = ErrorBody),
+        (status = 400, description = "Malformed request, or a since_unix_ms earlier than 2001-09-09 (which is a seconds value in a milliseconds field)", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "The environment is absent or deleted, or the endpoint is in another scope", body = ErrorBody),
@@ -691,6 +691,10 @@ pub async fn replay_webhook_dead_letters(
     } else {
         parse_json(&body)?
     };
+    // The same floor the flow-target replay applies (issue #958). Both routes take a
+    // milliseconds bound and both drain to a third party, so a seconds value here replays the
+    // whole retained backlog while the API answers 202.
+    require_plausible_since_unix_ms(request.since_unix_ms, "endpoint")?;
 
     // The key is fingerprinted over the BODY as well as the path, so replaying "everything"
     // and replaying "since noon" are different requests under one key rather than one

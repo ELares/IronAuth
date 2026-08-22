@@ -22525,7 +22525,7 @@ export interface operations {
                     "application/json": components["schemas"]["ReplayAccepted"];
                 };
             };
-            /** @description Malformed request */
+            /** @description Malformed request, or a since_unix_ms earlier than 2001-09-09 (which is a seconds value in a milliseconds field) */
             400: {
                 headers: {
                     [name: string]: unknown;

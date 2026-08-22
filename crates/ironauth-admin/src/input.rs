@@ -11,6 +11,41 @@ use crate::error::ApiError;
 /// # Errors
 ///
 /// [`ApiError::BadRequest`] if the body is not valid JSON for `T`.
+/// The earliest `since_unix_ms` a replay will accept: 2001-09-09, the instant a Unix timestamp
+/// in SECONDS first exceeded 1e9, and so the point below which a millisecond value is almost
+/// certainly a seconds value pasted into the wrong field.
+pub const MIN_PLAUSIBLE_SINCE_UNIX_MS: i64 = 1_000_000_000_000;
+
+/// Refuse a `since_unix_ms` that is really a SECONDS value.
+///
+/// A caller who sends seconds into a milliseconds field asks for a window starting in January
+/// 1970, which replays the entire retained backlog to a third party while the API answers 202.
+/// Refusing is how that becomes visible.
+///
+/// Omitting the field is still how a caller asks for everything: this refuses an implausible
+/// BOUND, not the unbounded form.
+///
+/// Shared rather than duplicated because two replay routes take this field and a second copy
+/// of the boundary is a second thing to drift. `scripts/` has no check that would catch two
+/// constants of the same name holding different values.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] when `since` is below [`MIN_PLAUSIBLE_SINCE_UNIX_MS`].
+pub fn require_plausible_since_unix_ms(since: Option<i64>, what: &str) -> Result<(), ApiError> {
+    if let Some(since) = since {
+        if since < MIN_PLAUSIBLE_SINCE_UNIX_MS {
+            return Err(ApiError::BadRequest(format!(
+                "since_unix_ms must be MILLISECONDS since the Unix epoch and at or after \
+                 {MIN_PLAUSIBLE_SINCE_UNIX_MS}: {since} looks like seconds, which would \
+                 replay every dead letter this {what} has. Omit the field to ask for that \
+                 deliberately."
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
     serde_json::from_slice(body)
         .map_err(|error| ApiError::BadRequest(format!("invalid JSON body: {error}")))

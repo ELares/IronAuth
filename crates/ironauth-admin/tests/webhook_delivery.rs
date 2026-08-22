@@ -1679,3 +1679,64 @@ async fn no_send_failure_is_ever_reported_as_a_successful_delivery() {
         "every failure has its own reason; collapsed labels: {labels:?}"
     );
 }
+
+/// Issue #958: a `since_unix_ms` that is really a SECONDS value is refused here too.
+///
+/// The flow-target replay already had this floor; this route did not, and both drain a
+/// backlog to a third party. A caller sending seconds asks for a window starting in January
+/// 1970, so every retained dead letter is re-sent while the API answers 202. The failure is
+/// invisible at the call site, which is what makes refusing worth the round trip.
+///
+/// The three cases are the ones that distinguish a floor from a blanket refusal: seconds are
+/// rejected, the same instant in milliseconds is accepted, and OMITTING the bound is still how
+/// a caller asks for everything.
+#[tokio::test]
+async fn a_since_bound_that_looks_like_seconds_is_refused_on_the_webhook_replay() {
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (id, _secret, base) = register(&h, &tenant, &environment).await;
+
+    // 1_700_000_000 is a plausible Unix timestamp in SECONDS; as milliseconds it is 1970.
+    let (status, _, body) = h
+        .post(
+            &format!("{base}/{id}/replay"),
+            "k-replay-seconds",
+            &serde_json::json!({ "since_unix_ms": 1_700_000_000_i64 }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a seconds-shaped bound must be refused rather than silently replaying everything: \
+         {body}"
+    );
+    assert!(
+        body.contains("MILLISECONDS"),
+        "and the refusal must name the unit it wanted: {body}"
+    );
+
+    // The same instant in milliseconds is accepted, so this is a floor and not a ban.
+    let (status, _, body) = h
+        .post(
+            &format!("{base}/{id}/replay"),
+            "k-replay-millis",
+            &serde_json::json!({ "since_unix_ms": 1_700_000_000_000_i64 }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "milliseconds are fine: {body}"
+    );
+
+    // And omitting the bound is still how a caller asks for everything. The floor refuses an
+    // implausible BOUND, never the unbounded form.
+    let (status, _, body) = h
+        .post(&format!("{base}/{id}/replay"), "k-replay-all", "{}")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "the unbounded form is the documented way to ask for everything: {body}"
+    );
+}
