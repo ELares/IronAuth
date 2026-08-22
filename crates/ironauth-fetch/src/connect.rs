@@ -333,10 +333,19 @@ pub(crate) fn test_tls_config() -> Arc<ClientConfig> {
 /// must complete a real handshake (issue #959).
 ///
 /// The empty-store config above is right for the tests it was built for, which assert SSRF
-/// refusals and route shapes and never speak to anyone. It is a ceiling for everything else:
-/// with no anchors, an in-process server can be dialed and never spoken to, so the entire
-/// response half of every outbound feature (verdict parsing, signature verification, status
-/// classification) had no behavioural test anywhere in the workspace.
+/// refusals and route shapes and never speak to anyone. It is a ceiling for one specific
+/// class: a path that can only be reached over `https`.
+///
+/// A test CAN already get a full response through this fetcher, by opting the request into
+/// plaintext with `FetchRequest::allow_plaintext_http` and pointing it at a local server.
+/// `tests/behavior.rs` does exactly that and asserts on status, body bytes, the size and time
+/// caps, and the request head; federation covers status classification and signature
+/// verification the same way. So the response half is not untested in general.
+///
+/// What could not be tested is a caller that never opts in. The flow-target consultation
+/// builds its request without `allow_plaintext_http`, correctly, since no production caller
+/// should send a signed envelope in the clear. That path was unreachable end to end, and its
+/// verdict parsing had no behavioural test.
 ///
 /// This trusts ONE root and nothing else. Not the host keychain, which is the flakiness the
 /// empty store was introduced to remove, and not a public CA. A caller mints a throwaway root

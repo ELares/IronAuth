@@ -603,8 +603,13 @@ impl Fetcher {
 #[cfg(feature = "test-harness")]
 impl Fetcher {
     /// Build a fetcher from an injected resolver and dialer, with an empty TLS
-    /// trust store, so no handshake can complete. This is how the adversarial
-    /// tests control resolution and observe the pinned dial address.
+    /// trust store, so no `https` handshake can complete. This is how the
+    /// adversarial tests control resolution and observe the pinned dial address.
+    ///
+    /// Tests that need a real response drive the connector over plaintext `http`
+    /// by opting in with [`FetchRequest::allow_plaintext_http`], which is why
+    /// `tests/behavior.rs` can assert on status, body and caps with no trust
+    /// anchor at all.
     ///
     /// Generic over the concrete seam types so a caller can hand in a
     /// `Arc<StaticResolver>` and still keep a typed handle for inspection; the
@@ -628,9 +633,11 @@ impl Fetcher {
     /// As [`Fetcher::from_parts`], but trusting one caller-supplied root so a handshake with
     /// an in-process server can COMPLETE (issue #959).
     ///
-    /// This is the seam that lifts the ceiling described on [`Fetcher::for_tests`]. Without
-    /// it a test can prove a destination was validated and dialed, and nothing about the
-    /// request bytes, the response, or a verdict.
+    /// This is the seam that lifts the ceiling described on [`Fetcher::for_tests`], for the
+    /// callers that ceiling actually binds: those that never opt into plaintext. A test whose
+    /// request calls `allow_plaintext_http` reaches a full response through [`Fetcher::from_parts`]
+    /// today and needs none of this. One that cannot, such as the flow-target consultation,
+    /// could previously prove only that a destination was validated and dialed.
     ///
     /// It relaxes exactly one thing: who the client believes. Resolution, destination
     /// validation, the deny policy, the caps, and address pinning are untouched and still run

@@ -2,10 +2,11 @@
 
 //! A real HTTPS exchange through the hardened fetcher (issue #959).
 //!
-//! Every other test in this crate stops before the handshake, because `for_tests` and
-//! `from_parts` trust NOTHING: an in-process server can be dialed and never spoken to. That
-//! ceiling left the whole response half of every outbound feature untested across the
-//! workspace, and made two of issue #112's acceptance criteria unprovable.
+//! `for_tests` and `from_parts` trust NOTHING, so an in-process server can be dialed and
+//! never spoken to over `https`. `behavior.rs` gets around that by opting its requests into
+//! plaintext and does assert on real responses; this file is about the callers that cannot,
+//! because they must not send in the clear. The flow-target consultation is one, and two of
+//! issue #112's acceptance criteria were unprovable because of it.
 //!
 //! These tests exist to prove two things that must BOTH hold, since the second is what keeps
 //! the first from being a hole:
@@ -62,9 +63,8 @@ async fn the_hardened_fetcher_completes_an_https_exchange_with_an_in_process_tar
     assert_eq!(
         response.body(),
         br#"{"verdict":"allow"}"#,
-        "and the BODY came back, which is the half no test in this workspace could reach \
-         before: verdict parsing, signature verification and status classification all live \
-         behind this line"
+        "and the BODY came back over a completed TLS handshake, which is what an https-only \
+         caller could not reach before: its verdict parsing lives behind this line"
     );
 }
 

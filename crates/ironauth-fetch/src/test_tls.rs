@@ -13,10 +13,18 @@
 //! the host keychain, which once coupled three unrelated crates to a machine-level condition
 //! and failed the gate about half the time.
 //!
-//! The cost is a ceiling. An in-process server can be DIALED and never spoken to, so nothing
-//! in the workspace could test the response half of an outbound feature: verdict parsing,
-//! signature verification, status classification. Issue #112's flow-target tests stop at "it
-//! dialed" for exactly this reason, and two of its acceptance criteria were unprovable.
+//! The cost is a ceiling on one class of caller: anything reachable only over `https`.
+//!
+//! A test that opts its request into plaintext with `allow_plaintext_http` already gets a
+//! full response through the hardened fetcher, and several do: `tests/behavior.rs` asserts
+//! status, body bytes and the caps, and federation covers status classification and JWKS
+//! signature verification. The response half is not untested in general, and this module
+//! should not be read as claiming it was.
+//!
+//! The flow-target consultation is the case that could not be reached. It builds its request
+//! WITHOUT the plaintext opt-in, correctly, because no production caller should send a signed
+//! envelope in the clear. So its tests stop at "it dialed", and two of issue #112's
+//! acceptance criteria were unprovable.
 //!
 //! ## What this does and does not relax
 //!
@@ -104,8 +112,9 @@ impl TestTlsIdentity {
 /// far side, so a difference between two suites is a difference in the code under test rather
 /// than in two hand-rolled servers.
 ///
-/// It records the request bytes it receives, which is what lets a test assert on what was
-/// SENT (headers, signature, envelope) and not only on what came back.
+/// It records each request it receives, head AND body, which is what lets a test assert on
+/// what was SENT (the headers, the signature, and the envelope the signature covers) rather
+/// than only on what came back.
 pub struct TestTlsTarget {
     /// Where the dialer should be pointed. Loopback: the resolver still answers a public
     /// address, so destination validation does real work while the socket lands here.
@@ -151,17 +160,51 @@ impl TestTlsTarget {
                     let Ok(mut tls) = acceptor.accept(socket).await else {
                         return;
                     };
-                    // Read to the end of the request head, then answer. The head is what
-                    // carries the headers a test wants to inspect.
+                    // Read the head, then the body its `content-length` declares.
+                    //
+                    // The body is not optional detail: it carries the ENVELOPE, which is what
+                    // a signature is computed over, so a test that wants to verify what was
+                    // sent needs it. An earlier revision stopped at the blank line and this
+                    // type's own doc still promised the envelope, which is a doc describing a
+                    // capability the code did not have.
                     let mut seen = Vec::new();
                     let mut buf = [0_u8; 1024];
+                    let mut head_end = None;
                     while let Ok(n) = tls.read(&mut buf).await {
                         if n == 0 {
                             break;
                         }
                         seen.extend_from_slice(&buf[..n]);
-                        if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        // Scanned over the WHOLE accumulated buffer rather than the latest
+                        // read, so a terminator split across two reads is still found.
+                        if let Some(at) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                            head_end = Some(at + 4);
                             break;
+                        }
+                    }
+
+                    // `content-length` only. No chunked support, deliberately: nothing in
+                    // this workspace sends a chunked request body, and a half-implemented
+                    // decoder would fail in a way that looks like the code under test.
+                    if let Some(head_end) = head_end {
+                        let head = String::from_utf8_lossy(&seen[..head_end]).to_ascii_lowercase();
+                        let declared = head
+                            .split("\r\n")
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        // Some of the body may already have arrived in the read that
+                        // completed the head, so only the REMAINDER is taken from the socket.
+                        let already = seen.len() - head_end;
+                        let mut remaining = declared.saturating_sub(already);
+                        while remaining > 0 {
+                            match tls.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    seen.extend_from_slice(&buf[..n]);
+                                    remaining = remaining.saturating_sub(n);
+                                }
+                            }
                         }
                     }
                     if let Ok(mut guard) = sink.lock() {
@@ -182,7 +225,10 @@ impl TestTlsTarget {
         Self { addr, received }
     }
 
-    /// The request heads received so far, oldest first.
+    /// The requests received so far, oldest first, each one head and body together.
+    ///
+    /// The body is included because the envelope is what a signature is computed over, so a
+    /// test verifying a delivery needs the exact bytes rather than the headers alone.
     #[must_use]
     pub fn received(&self) -> Vec<Vec<u8>> {
         self.received
