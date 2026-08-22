@@ -768,6 +768,30 @@
             "minLength": 1,
             "type": "string"
           },
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "flow_target_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "flow_target.replay_requested"
+    },
+    {
+      "domain": "flow_target",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "flow_target_id": {
+            "minLength": 1,
+            "type": "string"
+          },
           "invocation": {
             "minLength": 1,
             "type": "string"

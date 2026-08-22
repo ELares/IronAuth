@@ -490,7 +490,7 @@ async fn a_delivery_enqueued_as_signed_is_never_sent_unsigned() {
 }
 
 #[tokio::test]
-async fn a_disabled_target_retries_while_a_deregistered_one_completes() {
+async fn a_disabled_target_dead_letters_while_a_deregistered_one_completes() {
     // The one decision in this consumer that is not inherited from the queue, and the two
     // halves are asserted TOGETHER because the distinction is the whole content of it: what
     // separates them is whether an operator can undo the state.
@@ -501,7 +501,8 @@ async fn a_disabled_target_retries_while_a_deregistered_one_completes() {
     let sender = RecordingSender::accepting();
     let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
 
-    // DISABLED: a flag someone can flip back, so the delivery is kept, not dropped.
+    // DISABLED: a flag someone can flip back, so the delivery is KEPT as a dead letter that
+    // the replay route returns -- not dropped, and not retried.
     let disabled = register_target(&h, &tenant, &environment, "k-t1", "off", None).await;
     reconfigure(&h, &tenant, &environment, "k-off", "off", None, false).await;
     let error = consumer
@@ -514,14 +515,14 @@ async fn a_disabled_target_retries_while_a_deregistered_one_completes() {
         .expect_err("a disabled target does not deliver");
     assert_eq!(error.label(), "target_disabled");
     assert!(
-        error.is_retryable(),
-        "a disable is a PAUSE, so the delivery is kept and retried rather than dead-lettered \
-         on the spot. Dead-lettering would preserve the backlog only if something could \
-         revive a dead letter for this consumer, and nothing can: `revive_dead_lettered` is \
-         generic over the consumer name but its only caller hardcodes the webhook one. So \
-         the rule meant to preserve the backlog destroyed it, on the most ordinary operator \
-         action there is. Retrying makes the attempts cap the give-up and lets a re-enable \
-         inside the window drain the backlog with no new machinery."
+        !error.is_retryable(),
+        "a disable dead-letters after ONE attempt, and the replay route is what returns the \
+         backlog. This classification has been both ways: it was retryable while nothing \
+         could revive a flow-target dead letter, because dead-lettering then destroyed the \
+         backlog. Now that a replay exists, retryable is the harmful one -- `revive_dead_\
+         lettered` resets attempts to zero, so replaying a target that is still off would \
+         restart a fourteen-attempt schedule whose revived head blocks every newer delivery \
+         to that target for days. A dead letter is terminal and blocks nothing."
     );
 
     // DEREGISTERED: there is nothing to deliver to and the secret is gone with it, so the
@@ -935,4 +936,280 @@ async fn the_delivered_body_carries_the_targets_config_as_it_is_now() {
         "the delivery carries the config the target holds NOW, not the one it held at \
          enqueue: {delivered}"
     );
+}
+
+/// The whole replay loop, end to end (issue #112 criterion 2: "replay works").
+///
+/// This is the test the criterion turns on, and it is deliberately not three tests. Each half
+/// can pass alone while the loop does nothing: a route that answers 202 and enqueues a command
+/// nothing drains, a consumer with a full unit suite that boot never registers, or either side
+/// passing the wrong consumer constant -- reviving under the REPLAY name matches no rows and
+/// reports success. So this drives the sequence an operator actually performs and asserts the
+/// delivery becomes claimable again at the end.
+///
+/// Nothing is written into a terminal state by hand: the dead letter is produced by failing a
+/// real claimed message under a one-attempt budget.
+#[tokio::test]
+// Over the readable-length lint deliberately. Splitting this is the one change that would
+// destroy it: every seam it crosses passes in isolation while the loop does nothing, so the
+// single uninterrupted sequence IS the assertion.
+#[allow(clippy::too_many_lines)]
+async fn a_dead_lettered_delivery_is_listed_and_comes_back_after_a_replay() {
+    use ironauth_admin::flow_target_delivery::FlowTargetReplayConsumer;
+    use ironauth_store::{FailureOutcome, NewOutboxMessage, RetryPolicy};
+
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let store = h.store().clone();
+    let target = register_target(&h, &tenant, &environment, "k-t1", "crm", None).await;
+
+    // A real queued delivery, driven to a dead letter through the substrate.
+    store
+        .scoped(scope)
+        .outbox()
+        .enqueue(
+            &env,
+            &NewOutboxMessage {
+                consumer: FLOW_TARGET_DELIVERY_CONSUMER,
+                idempotency_key: "ftg_delivery_1",
+                ordering_key: &target,
+                payload: serde_json::json!({
+                    "target_id": &target,
+                    "signed": false,
+                    "body": signup_body(&target),
+                }),
+            },
+        )
+        .await
+        .expect("enqueue the delivery");
+    let claimed = store
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            FLOW_TARGET_DELIVERY_CONSUMER,
+            Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim it");
+    let message = claimed
+        .iter()
+        .find(|m| m.idempotency_key == "ftg_delivery_1")
+        .expect("the delivery is claimable");
+    let outcome = store
+        .scoped(scope)
+        .outbox()
+        .fail(
+            &env,
+            message,
+            "http_status_500",
+            RetryPolicy {
+                max_attempts: 1,
+                retry_base: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("record the failure");
+    assert!(
+        matches!(outcome, FailureOutcome::DeadLettered { .. }),
+        "a one-attempt budget dead-letters on the first failure: {outcome:?}"
+    );
+
+    // The LISTING shows it, with the failure reason an operator decides on.
+    let (status, _, body) = h
+        .get(&format!(
+            "{}/{target}/dead-letters",
+            targets_base(&tenant, &environment)
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the dead-letter tail: {body}");
+    let listed: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        listed["items"].as_array().map(Vec::len),
+        Some(1),
+        "the dead letter is listed: {body}"
+    );
+    assert_eq!(listed["items"][0]["webhook_id"], "ftg_delivery_1");
+    assert_eq!(
+        listed["items"][0]["last_error"],
+        serde_json::json!("http_status_500"),
+        "carrying WHY, which is what separates a replayable dead letter from one that will \
+         fail identically again: {body}"
+    );
+    assert_eq!(listed["truncated"], serde_json::json!(false));
+
+    // Nothing is claimable now: the delivery is terminal.
+    assert!(
+        store
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                FLOW_TARGET_DELIVERY_CONSUMER,
+                Duration::from_secs(30),
+                10
+            )
+            .await
+            .expect("claim")
+            .is_empty(),
+        "a dead letter is terminal, so it is not claimable until something revives it"
+    );
+
+    // The operator asks for a replay over HTTP.
+    let (status, _, body) = h
+        .post(
+            &format!("{}/{target}/replay", targets_base(&tenant, &environment)),
+            "k-replay",
+            "{}",
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "the replay is queued: {body}");
+
+    // The command is a real queue row on its OWN consumer, which the data plane drains. This
+    // is the link that makes the route more than a 202: without a registered consumer the
+    // request is durable and inert.
+    let commands = store
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::FLOW_TARGET_REPLAY_CONSUMER,
+            Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim the replay command");
+    assert_eq!(
+        commands.len(),
+        1,
+        "one replay asked, one command: {commands:?}"
+    );
+
+    FlowTargetReplayConsumer::new(store.clone())
+        .handle(&env, scope, &commands[0])
+        .await
+        .expect("the replay executes");
+
+    // And the delivery is claimable again, under its ORIGINAL webhook-id: revived in place
+    // rather than re-enqueued as a copy, so a receiver still deduplicates it against the
+    // attempt it already saw.
+    let revived = store
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            FLOW_TARGET_DELIVERY_CONSUMER,
+            Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim after the replay");
+    assert_eq!(revived.len(), 1, "the dead letter came back: {revived:?}");
+    assert_eq!(
+        revived[0].idempotency_key, "ftg_delivery_1",
+        "and kept its dedup handle, so a receiver sees one event rather than two"
+    );
+    assert_eq!(
+        revived[0].attempts, 0,
+        "with its attempt budget restored, so it gets a real chance rather than one attempt"
+    );
+}
+
+/// Asking for a replay over HTTP ANNOUNCES the request (issue #112 criterion 2).
+///
+/// Driven through the route rather than the store method, because the store method taking an
+/// event proves nothing about whether the handler passes one. `event_catalog::envelope`
+/// returns an `Option` and every builder here propagates it, so a handler whose event type was
+/// never added to the registry silently passes `None`, writes without an event, and still
+/// answers 202. `scripts/producer-coverage.py` does not catch that: its numerator is a regex
+/// over event CONSTRUCTION, never over registration.
+///
+/// The announcement earns its place. A replay re-POSTs signup announcements a receiver already
+/// had the chance to see, so anything reconciling against its own records needs to know a
+/// redelivery burst was asked for rather than a live spike.
+#[tokio::test]
+async fn asking_for_a_replay_announces_the_request() {
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let target = register_target(&h, &tenant, &environment, "k-t1", "crm", None).await;
+
+    // Everything the FIXTURE enqueued, drained first, so the count below measures the replay.
+    drain_events(&h, scope, &env).await;
+
+    let (status, _, body) = h
+        .post(
+            &format!("{}/{target}/replay", targets_base(&tenant, &environment)),
+            "k-replay",
+            &serde_json::json!({ "since_unix_ms": 1_700_000_000_000_i64 }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "the replay is queued: {body}");
+
+    let events = drain_events(&h, scope, &env).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "the request announces exactly once: {events:?}"
+    );
+    assert_eq!(
+        events[0]["type"],
+        serde_json::json!("flow_target.replay_requested"),
+        "and under the registered type: {:?}",
+        events[0]
+    );
+    assert_eq!(
+        events[0]["payload"]["flow_target_id"],
+        serde_json::json!(target)
+    );
+    assert_eq!(
+        events[0]["payload"]["since_unix_ms"],
+        serde_json::json!(1_700_000_000_000_i64),
+        "carrying the bound, because a consumer reconciling a redelivery burst needs to know \
+         whether it was everything or a window: {:?}",
+        events[0]
+    );
+    // The registry the FAN-OUT enforces, not just the one the builder consulted. An envelope
+    // that fails here is dropped permanently and silently in a release build.
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Drain every queued domain event in the scope and return their envelopes.
+///
+/// A LOOP, because the outbox serializes per ordering key and a single claim would return one
+/// message per key -- so a single-pass drain silently stops being a drain the moment a fixture
+/// grows a second event on one key.
+async fn drain_events(h: &Harness, scope: Scope, env: &Env) -> Vec<Value> {
+    let mut drained = Vec::new();
+    loop {
+        let claimed = h
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim the queued events");
+        if claimed.is_empty() {
+            return drained;
+        }
+        for message in &claimed {
+            drained.push(message.payload.clone());
+            h.store()
+                .scoped(scope)
+                .outbox()
+                .complete(env, message)
+                .await
+                .expect("complete it, so the next on this ordering key is claimable");
+        }
+    }
 }

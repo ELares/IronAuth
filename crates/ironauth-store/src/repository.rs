@@ -20973,6 +20973,23 @@ pub const LOG_STREAM_REPLAY_CONSUMER: &str = "log_stream.replay";
 /// matches no rows, the pool reports healthy, and the only symptom is targets that never fire.
 pub const FLOW_TARGET_DELIVERY_CONSUMER: &str = "flow_target.delivery";
 
+/// The registered consumer name a flow-target dead-letter REPLAY command drains under
+/// (issue #112 criterion 2).
+///
+/// A SEPARATE consumer from the delivery one, and not for tidiness. The plane that may ASK for
+/// a replay and the plane that may PERFORM one are different by grant: `ironauth_control` holds
+/// SELECT and INSERT on `outbox_messages` and no UPDATE of any shape, while the drain holds the
+/// lifecycle columns. So the request has to travel AS A MESSAGE, and a message needs a consumer
+/// name that is not the one whose dead letters it is about to revive.
+///
+/// It also keeps the two out of each other's way: an ordering group is per
+/// `(consumer, ordering_key)`, so a replay command for a target shares no group with that
+/// target's deliveries and cannot queue behind one.
+///
+/// Exported so producer and consumer read the SAME bytes. A consumer whose name does not equal
+/// the discriminator its producers write drains NOTHING, silently.
+pub const FLOW_TARGET_REPLAY_CONSUMER: &str = "flow_target.replay";
+
 /// The registered consumer name a CIBA PING notification drains under (issue #131
 /// criterion 2).
 ///
@@ -40509,6 +40526,131 @@ impl ActingFlowTargetRepo<'_> {
                 Ok(())
             },
             false,
+        )
+        .await
+    }
+
+    /// Ask for a target's DEAD-LETTERED async deliveries to be replayed (issue #112
+    /// criterion 2).
+    ///
+    /// # Why this enqueues a command instead of doing the revive
+    ///
+    /// The plane that may ASK and the plane that may PERFORM are different by GRANT.
+    /// `ironauth_control` holds SELECT and INSERT on `outbox_messages` and no UPDATE of any
+    /// shape (migration 0099 withheld it deliberately: "It does not drain, so it gets no
+    /// UPDATE"), while the drain holds the lifecycle columns. So the role reachable from a
+    /// management request structurally cannot clear `dead_lettered_at`, and the request
+    /// travels as a message that the data plane executes.
+    ///
+    /// # Why the target must EXIST
+    ///
+    /// Checked, unlike the webhook sibling, which only parses the id. Without it the endpoint
+    /// answers 202 for a target that was deregistered, never existed, or belongs to another
+    /// tenant, and the worker later revives nothing and returns `Ok(0)` -- indistinguishable
+    /// from a successful replay of a target with nothing outstanding, so an operator watching
+    /// for their backlog to drain waits on a command that was never going to do anything. The
+    /// log-stream replay makes the same argument and this follows it.
+    ///
+    /// The predicate is `deleted_at IS NULL` and deliberately IGNORES `enabled`. A DISABLED
+    /// target must be replayable: disable, accumulate a backlog, fix the receiver, re-enable,
+    /// replay is the sequence this whole route exists for, and refusing a disabled target
+    /// would refuse the main case. A target in another scope is a uniform not-found rather
+    /// than an existence oracle, and row-level security is what delivers that -- the
+    /// `(tenant, environment)` predicate below is defence in depth.
+    ///
+    /// # A limit worth stating
+    ///
+    /// Deregistering is a SOFT delete and the registration upsert arbitrates on NAME among
+    /// live rows, so deleting a target and creating one with the same name mints a NEW id.
+    /// Dead letters keyed on the old id are then unreachable from any route, because nothing
+    /// can name that id any more. Deregistration is the one flow-target act that is not
+    /// undoable here.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope or names no live target;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn request_dead_letter_replay_with_event(
+        &self,
+        env: &Env,
+        id: &FlowTargetId,
+        since_unix_micros: Option<i64>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let target = *id;
+        // The `since` bound is recorded on the audit row because "replay everything" and
+        // "replay since noon" are materially different acts against a third party.
+        let detail = match since_unix_micros {
+            Some(since) => format!("since_unix_micros={since}"),
+            None => "since_unix_micros=all".to_owned(),
+        };
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::FlowTargetReplayDeadLetters,
+                target: &target,
+            },
+            async move |tx| {
+                // `sqlx::query`, not `query_scalar::<_, i64>`: Postgres types a bare
+                // `SELECT 1` as int4, so decoding it as i64 is a decode error at runtime that
+                // surfaces as a 500. The sibling existence checks all take the row-presence
+                // form for the same reason.
+                let live = sqlx::query(
+                    "SELECT 1 FROM flow_targets \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                       AND deleted_at IS NULL",
+                )
+                .bind(target.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+                if live.is_none() {
+                    return Err(StoreError::NotFound);
+                }
+                // The ORDERING KEY is the target, so two replay commands for one target
+                // execute in the order they were asked for. They share no ordering group with
+                // that target's DELIVERIES, because a group is per (consumer, ordering key)
+                // and this is its own consumer -- so a replay command never queues behind the
+                // very backlog it exists to release.
+                //
+                // The IDEMPOTENCY KEY draws from the ENTROPY seam, not the clock. A second
+                // replay after the first delivered is a legitimate request, so outbox-level
+                // dedup must not collapse the two; and a clock-derived key (which the webhook
+                // sibling uses) collides under a manual test clock, where the second enqueue
+                // hits the unique index and 500s. Request-level idempotency is the endpoint's
+                // Idempotency-Key, a different mechanism at a different layer.
+                let key = format!("{target}:{}", CorrelationId::generate(env));
+                enqueue_outbox_in_tx(
+                    tx,
+                    env,
+                    scope,
+                    &NewOutboxMessage {
+                        consumer: FLOW_TARGET_REPLAY_CONSUMER,
+                        idempotency_key: &key,
+                        ordering_key: &target.to_string(),
+                        payload: serde_json::json!({
+                            "target_id": target.to_string(),
+                            "since_unix_micros": since_unix_micros,
+                        }),
+                    },
+                )
+                .await?;
+                insert_idempotency(tx, idempotency).await?;
+                // In the command's own transaction: a rolled-back request announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
         )
         .await
     }

@@ -1313,6 +1313,20 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
                                "timeout_ms": 500, "failure_policy": "fail_closed"}),
         ),
         Case::empty(
+            "flow_targets.listFlowTargetDeadLetters",
+            "GET",
+            format!("{base}/flow-targets/{flow_target}/dead-letters"),
+        ),
+        Case::json(
+            "flow_targets.replayFlowTargetDeadLetters",
+            "POST",
+            format!("{base}/flow-targets/{flow_target}/replay"),
+            &serde_json::json!({}),
+        ),
+        // The DELETE comes last of the flow-target cases deliberately: it deregisters the very
+        // target the two above address, and a soft-deleted target is a uniform not-found to
+        // the replay route.
+        Case::empty(
             "flow_targets.deleteFlowTarget",
             "DELETE",
             format!("{base}/flow-targets/{flow_target}"),

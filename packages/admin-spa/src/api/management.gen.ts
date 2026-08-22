@@ -846,6 +846,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/dead-letters": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List a target's dead-lettered async deliveries. */
+        get: operations["listFlowTargetDeadLetters"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/replay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replay a target's dead-lettered async deliveries. */
+        post: operations["replayFlowTargetDeadLetters"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness": {
         parameters: {
             query?: never;
@@ -4261,6 +4295,45 @@ export interface components {
              */
             webhook_id: string;
         };
+        /**
+         * @description One dead-lettered async delivery, with what an operator needs to decide whether replaying
+         *     it is worth anything.
+         */
+        DeadLetteredFlowDelivery: {
+            /**
+             * Format: int32
+             * @description How many attempts were made before it was given up on.
+             */
+            attempts: number;
+            /**
+             * Format: int64
+             * @description When it was given up on, milliseconds since the Unix epoch.
+             */
+            dead_lettered_at_unix_ms?: number | null;
+            /**
+             * Format: int64
+             * @description When it was enqueued, milliseconds since the Unix epoch. This is the value a
+             *     replay-since bound is compared against.
+             */
+            enqueued_at_unix_ms: number;
+            /** @description The queue message id. */
+            id: string;
+            /**
+             * @description The last failure reason, a bounded non-secret token.
+             *
+             *     Load-bearing for this listing rather than decoration. Some of these dead letters
+             *     cannot be fixed by replaying: a malformed payload or an unparseable target id will
+             *     fail the same way on every attempt. Others are exactly what replay is for: a receiver
+             *     that was down, a target that was switched off, a signing secret that was missing. This
+             *     field is what separates them before an operator acts.
+             */
+            last_error?: string | null;
+            /**
+             * @description The `webhook-id` this delivery carried, and will carry again if replayed. Stable
+             *     across every attempt and across a replay, which is what lets a receiver deduplicate.
+             */
+            webhook_id: string;
+        };
         /** @description An endpoint's delivery attempt history, newest first. */
         DeliveryAttemptList: {
             /** @description The attempts, most recent first. */
@@ -4553,6 +4626,20 @@ export interface components {
             /** @description The blind internal `usr_` subject handle, or absent before a primary factor. */
             subject?: string | null;
         };
+        /** @description A target's dead-lettered deliveries, oldest first. */
+        FlowDeadLetterList: {
+            /** @description The deliveries, in the order a replay would redeliver them. */
+            items: components["schemas"]["DeadLetteredFlowDelivery"][];
+            /**
+             * @description Whether the cap was reached, so there may be more than are shown.
+             *
+             *     The cap is applied in SQL, so without this an exactly-full page is indistinguishable
+             *     from a truncated one, and an operator reading a full page would have no way to know
+             *     their backlog is larger than their screen. The webhook listing omits this; the
+             *     log-stream listing added it, and this follows the later one.
+             */
+            truncated: boolean;
+        };
         /**
          * @description The flow dry run request (issue #91): a supplied context to replay through a journey's
          *     plan. It is evaluated with EVERY write disabled and MUST write nothing.
@@ -4655,6 +4742,21 @@ export interface components {
             traces: components["schemas"]["PolicyTraceView"][];
             /** @description The transport it was created on. */
             transport: string;
+        };
+        /**
+         * @description The acknowledgement that a replay was QUEUED.
+         *
+         *     Deliberately not a count. The management plane enqueues a command and the data plane
+         *     executes it, so no number this response could carry would still be true when a caller read
+         *     it. What the caller can rely on is durability: the request is a queue row committed in the
+         *     same transaction as its audit row.
+         */
+        FlowReplayAccepted: {
+            /**
+             * Format: int64
+             * @description The bound the replay was requested with, echoed back. `null` means every dead letter.
+             */
+            since_unix_ms?: number | null;
         };
         /** @description The identifier a registration returns. */
         FlowTargetCreated: {
@@ -6217,6 +6319,15 @@ export interface components {
              * Format: int64
              * @description Replay only deliveries enqueued at or after this instant, milliseconds since the
              *     Unix epoch. Omitted means every dead letter this endpoint has.
+             */
+            since_unix_ms?: number | null;
+        };
+        /** @description Replay a target's dead-lettered deliveries. */
+        ReplayFlowDeadLettersRequest: {
+            /**
+             * Format: int64
+             * @description Replay only deliveries enqueued at or after this instant, milliseconds since the Unix
+             *     epoch. Omitted means every dead letter this target has.
              */
             since_unix_ms?: number | null;
         };
@@ -11769,6 +11880,148 @@ export interface operations {
             };
             /** @description No such target, or the environment is absent or deleted */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listFlowTargetDeadLetters: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The target identifier (ftg_...) */
+                target_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The dead-lettered deliveries, oldest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FlowDeadLetterList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent, or the target is in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    replayFlowTargetDeadLetters: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying the same key returns the original response. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The target identifier (ftg_...) */
+                target_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReplayFlowDeadLettersRequest"];
+            };
+        };
+        responses: {
+            /** @description The replay was queued. The data plane executes it; watch the queue depth for `flow_target.replay` to see it drain. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FlowReplayAccepted"];
+                };
+            };
+            /** @description Malformed request, or an unknown field */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope, or sudo required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent, or the target is deregistered or in another scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The Idempotency-Key was reused with a different request */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing Idempotency-Key */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

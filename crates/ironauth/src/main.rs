@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use ironauth_admin::events::WebhookFanoutConsumer;
-use ironauth_admin::flow_target_delivery::FlowTargetDeliveryConsumer;
+use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTargetReplayConsumer};
 use ironauth_admin::offboarding_worker::OffboardingConsumer;
 use ironauth_admin::trait_migration_worker::TraitMigrationConsumer;
 use ironauth_admin::webhook_delivery::{
@@ -2932,6 +2932,18 @@ async fn spawn_flow_target_delivery_pools(
     )) as Arc<dyn OutboxConsumer>)
     {
         tracing::error!(%error, "flow-target delivery worker not started: duplicate consumer name");
+        return Vec::new();
+    }
+    // The REPLAY consumer rides the same pool set as the deliveries it repairs (issue #112
+    // criterion 2). Registered beside them rather than behind its own switch: an operator who
+    // runs no delivery worker has nothing to replay, and a replay command drained by nobody is
+    // a durable 202 that never executes.
+    if let Err(error) =
+        consumers
+            .register(Arc::new(FlowTargetReplayConsumer::new(data_store.clone()))
+                as Arc<dyn OutboxConsumer>)
+    {
+        tracing::error!(%error, "flow-target replay worker not started: duplicate consumer name");
         return Vec::new();
     }
 

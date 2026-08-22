@@ -6021,6 +6021,225 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/dead-letters": {
+      "get": {
+        "tags": [
+          "flow-targets"
+        ],
+        "summary": "List a target's dead-lettered async deliveries.",
+        "operationId": "listFlowTargetDeadLetters",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target_id",
+            "in": "path",
+            "description": "The target identifier (ftg_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The dead-lettered deliveries, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowDeadLetterList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent, or the target is in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/replay": {
+      "post": {
+        "tags": [
+          "flow-targets"
+        ],
+        "summary": "Replay a target's dead-lettered async deliveries.",
+        "operationId": "replayFlowTargetDeadLetters",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target_id",
+            "in": "path",
+            "description": "The target identifier (ftg_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying the same key returns the original response.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplayFlowDeadLettersRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The replay was queued. The data plane executes it; watch the queue depth for `flow_target.replay` to see it drain.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowReplayAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, or an unknown field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope, or sudo required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent, or the target is deregistered or in another scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Idempotency-Key was reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Missing Idempotency-Key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/identifier-uniqueness": {
       "get": {
         "tags": [
@@ -24803,6 +25022,51 @@
           }
         }
       },
+      "DeadLetteredFlowDelivery": {
+        "type": "object",
+        "description": "One dead-lettered async delivery, with what an operator needs to decide whether replaying\nit is worth anything.",
+        "required": [
+          "id",
+          "webhook_id",
+          "attempts",
+          "enqueued_at_unix_ms"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many attempts were made before it was given up on."
+          },
+          "dead_lettered_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When it was given up on, milliseconds since the Unix epoch."
+          },
+          "enqueued_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was enqueued, milliseconds since the Unix epoch. This is the value a\nreplay-since bound is compared against."
+          },
+          "id": {
+            "type": "string",
+            "description": "The queue message id."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last failure reason, a bounded non-secret token.\n\nLoad-bearing for this listing rather than decoration. Some of these dead letters\ncannot be fixed by replaying: a malformed payload or an unparseable target id will\nfail the same way on every attempt. Others are exactly what replay is for: a receiver\nthat was down, a target that was switched off, a signing secret that was missing. This\nfield is what separates them before an operator acts."
+          },
+          "webhook_id": {
+            "type": "string",
+            "description": "The `webhook-id` this delivery carried, and will carry again if replayed. Stable\nacross every attempt and across a replay, which is what lets a receiver deduplicate."
+          }
+        }
+      },
       "DeliveryAttemptList": {
         "type": "object",
         "description": "An endpoint's delivery attempt history, newest first.",
@@ -25223,6 +25487,27 @@
           }
         }
       },
+      "FlowDeadLetterList": {
+        "type": "object",
+        "description": "A target's dead-lettered deliveries, oldest first.",
+        "required": [
+          "items",
+          "truncated"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeadLetteredFlowDelivery"
+            },
+            "description": "The deliveries, in the order a replay would redeliver them."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether the cap was reached, so there may be more than are shown.\n\nThe cap is applied in SQL, so without this an exactly-full page is indistinguishable\nfrom a truncated one, and an operator reading a full page would have no way to know\ntheir backlog is larger than their screen. The webhook listing omits this; the\nlog-stream listing added it, and this follows the later one."
+          }
+        }
+      },
       "FlowDryRunRequest": {
         "type": "object",
         "description": "The flow dry run request (issue #91): a supplied context to replay through a journey's\nplan. It is evaluated with EVERY write disabled and MUST write nothing.",
@@ -25476,6 +25761,20 @@
           "transport": {
             "type": "string",
             "description": "The transport it was created on."
+          }
+        }
+      },
+      "FlowReplayAccepted": {
+        "type": "object",
+        "description": "The acknowledgement that a replay was QUEUED.\n\nDeliberately not a count. The management plane enqueues a command and the data plane\nexecutes it, so no number this response could carry would still be true when a caller read\nit. What the caller can rely on is durability: the request is a queue row committed in the\nsame transaction as its audit row.",
+        "properties": {
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The bound the replay was requested with, echoed back. `null` means every dead letter."
           }
         }
       },
@@ -27974,6 +28273,21 @@
             "description": "Replay only deliveries enqueued at or after this instant, milliseconds since the\nUnix epoch. Omitted means every dead letter this endpoint has."
           }
         }
+      },
+      "ReplayFlowDeadLettersRequest": {
+        "type": "object",
+        "description": "Replay a target's dead-lettered deliveries.",
+        "properties": {
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Replay only deliveries enqueued at or after this instant, milliseconds since the Unix\nepoch. Omitted means every dead letter this target has."
+          }
+        },
+        "additionalProperties": false
       },
       "ResourceServerList": {
         "type": "object",
