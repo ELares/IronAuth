@@ -207,6 +207,19 @@ pub(crate) async fn enabled_async_targets(
     }
 }
 
+/// What a committed signup BECAME, for the post-persist envelope (issue #952).
+///
+/// Carried as a type rather than two loose arguments so a caller cannot transpose them, and
+/// so the pre-persist absence is `None` rather than a pair of defaults that would look like
+/// an ACTIVE, unquarantined account.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SignupOutcome {
+    /// The state the row was created in.
+    pub state: ironauth_store::UserState,
+    /// Whether it was created under the fraud quarantine.
+    pub quarantined: bool,
+}
+
 /// Dispatch every enabled SYNC target of `timing` for the request class, in name order.
 ///
 /// Returns [`Decision::Allow`] when nothing objected, INCLUDING the common case where no
@@ -217,6 +230,7 @@ pub(super) async fn dispatch_sync(
     timing: Timing,
     data: &serde_json::Value,
     signup: Option<&(SignupFormConfig, TraitSchema, i32)>,
+    signup_outcome: Option<SignupOutcome>,
 ) -> Decision {
     // A registry read that failed refuses rather than continues: a target that cannot be
     // listed cannot be consulted, and continuing would silently skip every fail-closed
@@ -309,6 +323,7 @@ pub(super) async fn dispatch_sync(
             scope,
             data,
             signup,
+            signup_outcome,
             now,
             &delivery,
             remaining,
@@ -376,6 +391,7 @@ async fn consult_target(
     scope: Scope,
     data: &serde_json::Value,
     signup: Option<&(SignupFormConfig, TraitSchema, i32)>,
+    signup_outcome: Option<SignupOutcome>,
     now: i64,
     delivery_id: &str,
     budget_remaining_ms: i64,
@@ -409,6 +425,39 @@ async fn consult_target(
         "data": data,
         "config": target.config,
     });
+
+    // What the signup BECAME.
+    //
+    // Stamped from the write's own facts rather than from the caller's `data` closure, which
+    // is what makes it trustworthy: every door gets it right for free and no future door can
+    // forget. Siblings of `data` and not inside it, matching where the async half puts them,
+    // so a receiver wired to both reads one contract.
+    //
+    // This paragraph lives HERE, beside the insert, and not above the literal. It headed the
+    // two inline keys until they moved down, and was briefly left behind describing
+    // `"data": data` instead, of which all three of its claims are false.
+    //
+    // ABSENT at pre-persist, where there is no row yet, and absent means the KEY IS NOT THERE.
+    //
+    // Inserted after the fact rather than written inline, because `json!` inserts a key
+    // unconditionally: `"state": None` lowers to `to_value(&None)`, which is `Value::Null`, so
+    // the inline form emits `"state": null` and the key is present after all. An earlier
+    // revision did exactly that while five places in this change claimed the keys were absent,
+    // and the test that was supposed to prove it read `is_none_or(is_null)`, a disjunction
+    // satisfied by both encodings.
+    //
+    // The distinction is not pedantry. `subject` is genuinely missing from the pre-persist
+    // body, so a receiver keying on presence sees one convention rather than two, and a strict
+    // schema that rejects unknown keys is untouched at this timing. A defaulted value would be
+    // worse still: it would render as an active unquarantined account, indistinguishable from
+    // a real one.
+    let mut envelope = envelope;
+    if let Some(outcome) = signup_outcome {
+        if let Some(map) = envelope.as_object_mut() {
+            map.insert("state".to_owned(), outcome.state.as_str().into());
+            map.insert("quarantined".to_owned(), outcome.quarantined.into());
+        }
+    }
     let Ok(body) = serde_json::to_vec(&envelope) else {
         return Outcome::Unavailable;
     };
