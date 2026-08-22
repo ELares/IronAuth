@@ -40411,10 +40411,10 @@ impl ActingFlowTargetRepo<'_> {
     /// Returns the enqueued message id rather than making a caller re-derive it from the
     /// idempotency key and hope the derivation matches.
     ///
-    /// Today's caller discards it: this consumer records no per-attempt history (its module
-    /// doc says why), and no dead-letter route is mounted for it, so there is nothing yet to
-    /// correlate against. The id is returned anyway because deriving it later is the thing
-    /// that goes wrong silently.
+    /// Today's caller discards it, and this consumer records no per-attempt history (its
+    /// module doc says why) -- but the dead-letter listing now returns the queue message id,
+    /// so there IS something to correlate against. The id is returned because deriving it
+    /// later is the thing that goes wrong silently.
     ///
     /// # Errors
     ///
@@ -40440,10 +40440,10 @@ impl ActingFlowTargetRepo<'_> {
                 // The TARGET is the ordering key. What that buys UNCONDITIONALLY is that only
                 // the lowest-sequenced non-terminal message of a target's group is ever
                 // leased, so a slow or failing target cannot delay another target's
-                // deliveries, and a per-target dead-letter view would narrow on exactly this
-                // column -- WOULD, because none is mounted for this consumer yet. The generic
-                // read takes the ordering key, so the column is the right one when the route
-                // lands; today the rows are reachable only from the database.
+                // deliveries, and the per-target dead-letter view narrows on exactly this
+                // column. The generic queue read takes an ordering key, which is how
+                // `GET .../flow-targets/{id}/dead-letters` expresses a per-target view without
+                // the queue knowing anything about flow targets.
                 //
                 // It does NOT buy strict per-target ORDERING, and an earlier revision of this
                 // comment claimed it did. The substrate's contract is explicit that the
@@ -40545,11 +40545,15 @@ impl ActingFlowTargetRepo<'_> {
     /// # Why the target must EXIST
     ///
     /// Checked, unlike the webhook sibling, which only parses the id. Without it the endpoint
-    /// answers 202 for a target that was deregistered, never existed, or belongs to another
-    /// tenant, and the worker later revives nothing and returns `Ok(0)` -- indistinguishable
-    /// from a successful replay of a target with nothing outstanding, so an operator watching
-    /// for their backlog to drain waits on a command that was never going to do anything. The
-    /// log-stream replay makes the same argument and this follows it.
+    /// answers 202 for a target that was deregistered or never existed, and the worker later
+    /// revives nothing and returns `Ok(0)` -- indistinguishable from a successful replay of a
+    /// target with nothing outstanding, so an operator watching for their backlog to drain
+    /// waits on a command that was never going to do anything. The log-stream replay makes the
+    /// same argument and this follows it.
+    ///
+    /// NOT a cross-tenant hole in the sibling, which an earlier revision of this comment
+    /// claimed: its `parse_id` is `parse_in_scope` mapped to `NotFound`, so a foreign id is
+    /// already refused there. What it misses is the deregistered case.
     ///
     /// The predicate is `deleted_at IS NULL` and deliberately IGNORES `enabled`. A DISABLED
     /// target must be replayable: disable, accumulate a backlog, fix the receiver, re-enable,
@@ -40856,6 +40860,37 @@ impl FlowTargetRepo<'_> {
         Ok(crate::flow_target::FlowTargetDelivery::Deliverable(
             Box::new(decode_flow_target_row(&row, &self.scope)?),
         ))
+    }
+
+    /// Whether a LIVE target with this id exists in this scope.
+    ///
+    /// For the dead-letter listing, which must not answer an empty page for an id that names
+    /// nothing: an operator who mistyped one character would read that as a clean queue rather
+    /// than as a wrong id, and could not tell the two apart. The replay route makes the same
+    /// check, and the two routes agreeing is the point -- a listing that showed a deregistered
+    /// target's dead letters while the replay refused them would be worse than either.
+    ///
+    /// `deleted_at IS NULL` and deliberately silent about `enabled`, matching the replay: a
+    /// DISABLED target is exactly the one an operator is inspecting before they replay it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn exists(&self, id: &FlowTargetId) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(false);
+        }
+        let statement = sqlx::query(
+            "SELECT 1 FROM flow_targets \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string());
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let found = statement.fetch_optional(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(found.is_some())
     }
 
     /// Open a target's per-target signing secret, or [`None`] when it has no secret name.

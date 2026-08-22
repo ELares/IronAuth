@@ -21,9 +21,11 @@ range per docs/RELEASING.md.
   SELECT and INSERT on `outbox_messages` and no UPDATE of any shape.
 
   It CHECKS the target exists, unlike the webhook sibling, which only parses the id and so
-  answers 202 for a target that was deregistered or belongs to another tenant -- the worker
-  then revives nothing and returns `Ok(0)`, indistinguishable from a successful replay of an
-  empty backlog. The predicate is `deleted_at IS NULL` and deliberately ignores `enabled`,
+  answers 202 for a target that was DEREGISTERED -- the worker then revives nothing and
+  returns `Ok(0)`, indistinguishable from a successful replay of an empty backlog. (Not a
+  cross-tenant hole there: its `parse_id` is `parse_in_scope`, so a foreign id is already
+  refused.) The dead-letter LISTING makes the same check, so the two routes agree rather than
+  one showing rows the other refuses to act on. The predicate is `deleted_at IS NULL` and deliberately ignores `enabled`,
   because disable, accumulate, fix the receiver, re-enable, replay is the sequence the route
   exists for.
 
@@ -38,8 +40,16 @@ range per docs/RELEASING.md.
   without new machinery. Now that the replay route exists, retryable is the harmful one:
   `revive_dead_lettered` resets `attempts` to zero, so replaying a target that is still off
   would restart a fourteen-attempt schedule whose revived head blocks every newer delivery to
-  that target for days, because the queue leases only the lowest-sequenced NON-TERMINAL message
-  of a group. A dead letter is terminal and blocks nothing.
+  that target for roughly thirty-seven hours, because the queue leases only the
+  lowest-sequenced NON-TERMINAL message of a group. A dead letter is terminal and blocks
+  nothing.
+
+  **Operationally this is a behaviour change worth planning for.** Under the retryable rule a
+  re-enable inside the backoff window drained the backlog with no operator action. It no longer
+  does: recovery now needs an explicit replay. Nothing is lost while you decide --
+  `dead_letter_retention_secs` ships at `0`, which for that knob means keep -- and the
+  dead-letter count is observable per consumer, but a deployment that relied on
+  disable-then-re-enable draining itself has to add the replay call.
 
 - **Async flow-target deliveries ride the signup's own transaction** (issue #112 criterion 2).
   `register`, `register_in_state`, `register_quarantined` and their `_with_traits` variants

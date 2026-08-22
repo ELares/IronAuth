@@ -727,17 +727,36 @@ pub async fn list_flow_target_dead_letters(
     // id, so the generic queue read expresses a per-target view without the queue knowing
     // anything about flow targets. The REPLAY consumer's own queue holds commands, not
     // deliveries; reading that one here would always return an empty list.
-    let messages = state
+    // The target must EXIST, for the reason the replay route checks and the log-stream
+    // listing checks: an operator who mistypes one character of an id would otherwise read an
+    // empty backlog and conclude the queue is clean, unable to tell that from a target with
+    // nothing outstanding. An earlier revision of this handler answered 200 with an empty list
+    // for any parseable in-scope id, which also made the two routes disagree -- the replay
+    // 404s a deregistered target while the listing happily showed its dead letters.
+    if !state
+        .store()
+        .scoped(scope)
+        .flow_targets()
+        .exists(&id)
+        .await?
+    {
+        return Err(ApiError::NotFound);
+    }
+    // ONE MORE than the cap is fetched, so a full page can be told from a truncated one.
+    // Comparing `len() >= cap` against a SQL `LIMIT cap` reports truncation for a backlog of
+    // exactly cap, which is the same confusion the flag exists to remove, one off.
+    let mut messages = state
         .store()
         .scoped(scope)
         .outbox()
         .dead_lettered(
             ironauth_store::FLOW_TARGET_DELIVERY_CONSUMER,
             Some(&id.to_string()),
-            FLOW_DEAD_LETTER_LIMIT,
+            FLOW_DEAD_LETTER_LIMIT + 1,
         )
         .await?;
-    let truncated = i64::try_from(messages.len()).unwrap_or(i64::MAX) >= FLOW_DEAD_LETTER_LIMIT;
+    let truncated = i64::try_from(messages.len()).unwrap_or(i64::MAX) > FLOW_DEAD_LETTER_LIMIT;
+    messages.truncate(usize::try_from(FLOW_DEAD_LETTER_LIMIT).unwrap_or(usize::MAX));
     let view = FlowDeadLetterList {
         items: messages
             .into_iter()
