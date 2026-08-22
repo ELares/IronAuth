@@ -1742,9 +1742,14 @@ async fn a_since_bound_that_looks_like_seconds_is_refused_on_the_webhook_replay(
 
     // THE BOUNDARY ITSELF, both sides of it.
     //
-    // The three cases above sit far from the edge: 1.7e9 is a thousand times below the floor
-    // and 1.7e12 a thousand times above, so every one of them passes whether the comparison
-    // is `<` or `<=`. The error message promises "at or after 1_000_000_000_000", and until
+    // The three cases above sit far from the edge: 1_700_000_000 is 998_300_000_000 BELOW the
+    // floor and 1_700_000_000_000 is 700_000_000_000 above it, so a one-unit shift in the
+    // comparison is invisible to all of them.
+    //
+    // Distances rather than ratios, because the ratios are not the point and an earlier
+    // version of this comment got them wrong in both directions (the low case is 588x below,
+    // not 1000x; the high case is 1.7x above, not 1000x). What makes a boundary case a
+    // boundary case is ADJACENCY to the edge, which is a subtraction, not a division. The error message promises "at or after 1_000_000_000_000", and until
     // these two cases nothing held it to that word.
     let (status, _, body) = h
         .post(
