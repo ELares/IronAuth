@@ -936,13 +936,25 @@ pub async fn register_passkey_signup_verify(
     // CREATE the passkey-only account now (unusable password sentinel + passwordless), with
     // the pre-allocated id, so an abandoned ceremony left no orphan. A taken identifier is
     // the uniform conflict. No password screen/hash/policy is reachable on this path.
+    // ASYNC flow targets (issue #953), read BEFORE the write, exactly as the password door
+    // does. Outside the write's transaction, and a failed read announces nothing rather than
+    // refusing the signup: both reasons are on `flow::enabled_async_targets`.
+    //
+    // This door was silent until now. An operator with an async target registered saw password
+    // signups announced and passkey signups not, which is a gap the envelope could not express
+    // until `origin` existed to say which door a signup came from.
+    let async_targets = crate::flow::enabled_async_targets(&state, scope).await;
+    let deliveries = (!async_targets.is_empty()).then(|| ironauth_store::AsyncFlowDeliveries {
+        targets: &async_targets,
+    });
+
     let actor = interaction::user_actor(&subject);
     match state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .users()
-        .register_passwordless(state.env(), &subject, identifier)
+        .register_passwordless(state.env(), &subject, identifier, deliveries)
         .await
     {
         Ok(_) => {}

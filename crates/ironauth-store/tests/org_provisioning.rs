@@ -24,7 +24,7 @@ async fn seed_user(
             ironauth_store::CorrelationId::generate(env),
         )
         .users()
-        .register_passwordless(env, &id, handle)
+        .register_passwordless(env, &id, handle, None)
         .await
         .expect("register user");
     id

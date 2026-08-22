@@ -909,6 +909,142 @@ async fn drain_deliveries(
     }
 }
 
+/// A signup envelope must say WHICH DOOR produced it (issue #953).
+///
+/// Two doors create a real self-service account and they are not the same event: a password
+/// signup carries a password credential, a passkey-only signup carries none. A receiver that
+/// provisions differently for the two, or reports on credential mix, needs to tell them
+/// apart.
+///
+/// The passwordless door announced NOTHING before this. An operator with an async target
+/// registered saw password signups and not passkey ones, which is worse than an ambiguous
+/// envelope: it is a silent omission. Wiring it needed `origin` first, or the two would have
+/// arrived in one indistinguishable shape, which is the same defect `state` and `quarantined`
+/// were added to fix, one level up at the door rather than at the outcome.
+///
+/// One test over both doors rather than one each, for the reason its neighbour above gives:
+/// the property is the DIFFERENCE. Two tests each checking its own envelope would both still
+/// pass if the stamp were hardcoded to the value that test expected.
+#[tokio::test]
+// Over the readable-length lint deliberately, as its neighbour below is, and for the same
+// reason: the assertion IS the comparison across doors. Split into one test per door, each
+// would pass against a stamp hardcoded to the value that test expected.
+#[allow(clippy::too_many_lines)]
+async fn the_signup_envelope_names_the_door_that_produced_it() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let config = serde_json::json!({});
+
+    db.control_store()
+        .scoped(scope)
+        .acting(
+            db.test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .flow_targets()
+        .set(
+            &env,
+            &ironauth_store::FlowTargetId::generate(&env, &scope),
+            1_000_000,
+            ironauth_store::NewFlowTarget {
+                name: "door-observer",
+                target_class: ironauth_store::flow_target::TargetClass::Event,
+                invocation: ironauth_store::flow_target::Invocation::Async,
+                timing: ironauth_store::flow_target::Timing::PostPersist,
+                endpoint: "https://crm.example/signups",
+                timeout_ms: None,
+                failure_policy: ironauth_store::flow_target::FailurePolicy::FailOpen,
+                config: &config,
+                signing_secret_name: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("register the async target");
+
+    let targets = db
+        .store()
+        .scoped(scope)
+        .flow_targets()
+        .enabled_async_deliveries()
+        .await
+        .expect("read the async registry");
+    let deliveries = || ironauth_store::AsyncFlowDeliveries { targets: &targets };
+    let users = || {
+        db.store().scoped(scope).acting(
+            db.test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+    };
+
+    let password_id = users()
+        .users()
+        .register(
+            &env,
+            "password@example.test",
+            "$argon2id$dummy",
+            Some(deliveries()),
+        )
+        .await
+        .expect("a password signup");
+
+    let passkey_id = ironauth_store::UserId::generate(&env, &scope);
+    users()
+        .users()
+        .register_passwordless(
+            &env,
+            &passkey_id,
+            "passkey@example.test",
+            Some(deliveries()),
+        )
+        .await
+        .expect("a passkey signup");
+
+    let drained = drain_deliveries(&db, &env, scope).await;
+    assert_eq!(
+        drained.len(),
+        2,
+        "one delivery per signup, so the passwordless door announced at all: {drained:?}"
+    );
+
+    // Matched on the SUBJECT rather than on arrival order, so this does not silently depend
+    // on the queue draining in the order the signups happened.
+    let origin_of = |subject: &ironauth_store::UserId| -> String {
+        drained
+            .iter()
+            .find(|p| p["body"]["data"]["subject"] == serde_json::json!(subject.to_string()))
+            .map_or_else(
+                || panic!("a delivery for {subject}: {drained:?}"),
+                |p| {
+                    p["body"]["origin"]
+                        .as_str()
+                        .unwrap_or("<missing>")
+                        .to_owned()
+                },
+            )
+    };
+
+    let password_origin = origin_of(&password_id);
+    let passkey_origin = origin_of(&passkey_id);
+
+    assert_eq!(
+        password_origin, "self_service",
+        "the password door names itself: {drained:?}"
+    );
+    assert_eq!(
+        passkey_origin, "passwordless",
+        "and the passkey door names itself: {drained:?}"
+    );
+    // THE DIFFERENCE. A stamp hardcoded to either value satisfies one assertion above and
+    // fails here, which is the whole reason both doors are driven in one test.
+    assert_ne!(
+        password_origin, passkey_origin,
+        "the two doors must be distinguishable, or a receiver cannot tell a passkey signup \
+         from a password one: {drained:?}"
+    );
+}
+
 /// A signup envelope must say what the account actually BECAME (issue #112 criterion 2).
 ///
 /// Three doors reach the same enqueue, and they produce materially different accounts: an

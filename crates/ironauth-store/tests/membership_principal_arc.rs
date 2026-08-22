@@ -32,7 +32,7 @@ async fn seed_user(
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env))
         .users()
-        .register_passwordless(env, &id, handle)
+        .register_passwordless(env, &id, handle, None)
         .await
         .expect("register user");
     id
