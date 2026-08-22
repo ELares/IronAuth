@@ -192,13 +192,24 @@ impl TestTlsTarget {
                     // this workspace sends a chunked request body, and a half-implemented
                     // decoder would fail in a way that looks like the code under test.
                     //
-                    // NOT EXERCISED by any current caller, and worth saying so. The
-                    // flow-target envelope is around 300 bytes, so it arrives whole in the
-                    // read that completes the head and the loop below runs zero times.
-                    // Measured: replacing `remaining` with 0 leaves every test green, while
+                    // NOT EXERCISED by any current caller, and worth saying so precisely,
+                    // because the threshold is not the one you would guess.
+                    //
+                    // The loop runs iff the head and the body do NOT arrive together in one
+                    // read of the 1024-byte buffer above. `already` is whatever body bytes
+                    // rode along in the read that completed the head, so the head is
+                    // subtracted from the body's budget: the real allowance is
+                    // `1024 - head_len`, not 1024. Today's consult head is roughly 250 bytes
+                    // (request line, content-type, the three Standard Webhooks headers, host,
+                    // content-length), leaving about 770 for the body, and the envelope is
+                    // near 300. An 800-byte body would be "smaller than one read" and would
+                    // still enter this loop.
+                    //
+                    // Measured on this tree: forcing `remaining` to 0 leaves every test
+                    // green, because with today's sizes the loop runs zero times anyway;
                     // discarding the captured body reddens them (0 against 299). So the
-                    // RECORDING is pinned and this remainder loop is defensive only. A test
-                    // that needs a body larger than one read should not assume it is covered.
+                    // RECORDING is pinned and this remainder loop is defensive only, and a
+                    // caller near that `1024 - head_len` boundary should not assume otherwise.
                     if let Some(head_end) = head_end {
                         let head = String::from_utf8_lossy(&seen[..head_end]).to_ascii_lowercase();
                         let declared = head
