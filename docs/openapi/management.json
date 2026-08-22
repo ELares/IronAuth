@@ -28270,7 +28270,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Replay only deliveries enqueued at or after this instant, milliseconds since the\nUnix epoch. Omitted means every dead letter this endpoint has."
+            "description": "Replay only deliveries enqueued at or after this instant, milliseconds since the\nUnix epoch. Omitted means every dead letter this endpoint has.\n\nRefused below `1_000_000_000_000` (2001-09-09), because a value that small is a SECONDS\ntimestamp in a milliseconds field and would replay the whole retained backlog. Omit\nthe field to ask for that deliberately."
           }
         }
       },

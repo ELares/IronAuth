@@ -29,6 +29,10 @@ range per docs/RELEASING.md.
     in January 1970 and replay the entire retained backlog to a third party under a 202. The
     webhook route parses its `since_unix_ms` with no floor at all, so that fail-open is live
     there on a shipped route.
+  - Fixed (issue #958): the webhook replay now applies the same floor, from a single shared
+    guard both routes call rather than a second copy of the boundary. The paragraph above
+    describes the state before that fix and is left standing because it is the reason the
+    fix exists; the floor is no longer missing on either route.
 
   The listing carries `last_error` because it is what an operator decides on: some dead letters
   cannot be fixed by replaying (a malformed payload, an unparseable target id) and will fail

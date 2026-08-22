@@ -458,6 +458,10 @@ pub struct DeadLetterList {
 pub struct ReplayDeadLettersRequest {
     /// Replay only deliveries enqueued at or after this instant, milliseconds since the
     /// Unix epoch. Omitted means every dead letter this endpoint has.
+    ///
+    /// Refused below `1_000_000_000_000` (2001-09-09), because a value that small is a SECONDS
+    /// timestamp in a milliseconds field and would replay the whole retained backlog. Omit
+    /// the field to ask for that deliberately.
     #[serde(default)]
     pub since_unix_ms: Option<i64>,
 }

@@ -1739,4 +1739,36 @@ async fn a_since_bound_that_looks_like_seconds_is_refused_on_the_webhook_replay(
         StatusCode::ACCEPTED,
         "the unbounded form is the documented way to ask for everything: {body}"
     );
+
+    // THE BOUNDARY ITSELF, both sides of it.
+    //
+    // The three cases above sit far from the edge: 1.7e9 is a thousand times below the floor
+    // and 1.7e12 a thousand times above, so every one of them passes whether the comparison
+    // is `<` or `<=`. The error message promises "at or after 1_000_000_000_000", and until
+    // these two cases nothing held it to that word.
+    let (status, _, body) = h
+        .post(
+            &format!("{base}/{id}/replay"),
+            "k-replay-boundary-below",
+            &serde_json::json!({ "since_unix_ms": 999_999_999_999_i64 }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "one millisecond below the floor is refused: {body}"
+    );
+
+    let (status, _, body) = h
+        .post(
+            &format!("{base}/{id}/replay"),
+            "k-replay-boundary-at",
+            &serde_json::json!({ "since_unix_ms": 1_000_000_000_000_i64 }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "and the floor itself is ACCEPTED, which is what 'at or after' means: {body}"
+    );
 }

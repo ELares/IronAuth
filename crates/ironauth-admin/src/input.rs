@@ -6,14 +6,11 @@ use serde::de::DeserializeOwned;
 
 use crate::error::ApiError;
 
-/// Parse a JSON request body, mapping any decode failure to a 400.
-///
-/// # Errors
-///
-/// [`ApiError::BadRequest`] if the body is not valid JSON for `T`.
 /// The earliest `since_unix_ms` a replay will accept: 2001-09-09, the instant a Unix timestamp
 /// in SECONDS first exceeded 1e9, and so the point below which a millisecond value is almost
 /// certainly a seconds value pasted into the wrong field.
+///
+/// The boundary itself is ACCEPTED: the comparison is `<`, so exactly this value passes.
 pub const MIN_PLAUSIBLE_SINCE_UNIX_MS: i64 = 1_000_000_000_000;
 
 /// Refuse a `since_unix_ms` that is really a SECONDS value.
@@ -46,6 +43,11 @@ pub fn require_plausible_since_unix_ms(since: Option<i64>, what: &str) -> Result
     Ok(())
 }
 
+/// Parse a JSON request body, mapping any decode failure to a 400.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] if the body is not valid JSON for `T`.
 pub fn parse_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
     serde_json::from_slice(body)
         .map_err(|error| ApiError::BadRequest(format!("invalid JSON body: {error}")))
