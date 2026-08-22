@@ -1535,3 +1535,122 @@ async fn a_since_bound_that_looks_like_seconds_is_refused() {
         "the unbounded form is the documented way to replay everything: {body}"
     );
 }
+
+/// Criterion 5: a target's config ROUND-TRIPS as plain JSON through the management API.
+///
+/// The write half was already pinned; the READ half was not. Nothing anywhere asserted a field
+/// of `FlowTargetView`, so returning base64 from the listing -- the exact affordance this
+/// criterion exists to forbid -- was green against the whole suite.
+///
+/// The fixture deliberately carries a value that LOOKS like code, because the criterion is
+/// "no base64-embedded code blobs" and a config of `{"a":1}` cannot tell a structured object
+/// from a re-encoded one.
+#[tokio::test]
+async fn a_targets_config_round_trips_as_plain_json_through_the_listing() {
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let base = targets_base(&tenant, &environment);
+    let config = serde_json::json!({
+        "transform": "claims.role == 'admin'",
+        "nested": { "retries": 3, "labels": ["a", "b"] },
+    });
+
+    let (status, _, body) = h
+        .post(
+            &base,
+            "k-cfg",
+            &serde_json::json!({
+                "name": "round-trip",
+                "target_class": "event",
+                "invocation": "async",
+                "timing": "post_persist",
+                "endpoint": "https://target.example/hook",
+                "failure_policy": "fail_closed",
+                "config": config,
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "register: {body}");
+
+    let (status, _, body) = h.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "listing: {body}");
+    let listed: Value = serde_json::from_str(&body).expect("json");
+    let target = listed["targets"]
+        .as_array()
+        .and_then(|t| t.first())
+        .expect("the registered target is listed");
+
+    assert_eq!(
+        target["config"], config,
+        "the config comes back as the STRUCTURED object it went in as, not a string and not a \
+         re-encoding: {body}"
+    );
+    assert!(
+        target["config"].is_object(),
+        "and as an object rather than an opaque blob, which is the affordance criterion 5 \
+         forbids: {body}"
+    );
+}
+
+/// A secret-shaped key anywhere in a target's config is REFUSED at the boundary.
+///
+/// The guard is recursive and its doc says it exists so "a secret pasted in by mistake is
+/// caught at the boundary, because `config` travels further than the table". Nothing tested
+/// it: `fn secret_shaped_key(_) -> None` survived the entire suite, which would let a pasted
+/// credential reach the listing, the delivered payload, and now the outbox row.
+///
+/// The NESTED case is the one worth driving. A top-level check would pass a config whose
+/// secret sits one level down, and that is exactly where a copied snippet puts it.
+#[tokio::test]
+async fn a_secret_shaped_key_nested_in_config_is_refused() {
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let base = targets_base(&tenant, &environment);
+
+    let (status, _, body) = h
+        .post(
+            &base,
+            "k-secret-cfg",
+            &serde_json::json!({
+                "name": "leaky",
+                "target_class": "event",
+                "invocation": "async",
+                "timing": "post_persist",
+                "endpoint": "https://target.example/hook",
+                "failure_policy": "fail_closed",
+                "config": { "auth": { "client_secret": "shhh" } },
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a secret-shaped key nested in config must be refused: {body}"
+    );
+
+    // And the same config WITHOUT the secret-shaped key is accepted, so the refusal is the
+    // guard talking rather than the nesting itself being rejected.
+    let (status, _, body) = h
+        .post(
+            &base,
+            "k-clean-cfg",
+            &serde_json::json!({
+                "name": "clean",
+                "target_class": "event",
+                "invocation": "async",
+                "timing": "post_persist",
+                "endpoint": "https://target.example/hook",
+                "failure_policy": "fail_closed",
+                "config": { "auth": { "secret_name": "CRM_KEY" } },
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a NAMED secret reference is the supported shape and must be accepted: {body}"
+    );
+}
