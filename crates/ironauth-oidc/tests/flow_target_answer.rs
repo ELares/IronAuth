@@ -263,6 +263,37 @@ fn signing_responder(request: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
     )
 }
 
+/// Answer with a well-formed signature computed under the WRONG secret.
+///
+/// This is the on-path attacker `response_signature_verifies` exists to stop: the shape is
+/// perfect, the headers are present, the timestamp is current, and only the key is wrong.
+/// A target that accepted this could approve any signup by rewriting the body.
+fn forging_responder(request: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+    let (status, body, mut headers) = signing_responder(request);
+    let head = String::from_utf8_lossy(request);
+    let delivery_id = head
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("webhook-id")
+                .then(|| value.trim().to_owned())
+        })
+        .expect("IronAuth sends a webhook-id on a signed consultation");
+    let forged = sign_delivery(
+        std::slice::from_ref(&WebhookSecret::from_bytes(
+            b"not-the-target-secret".to_vec(),
+        )),
+        &delivery_id,
+        i64::try_from(CLOCK_SECS).expect("the test clock fits an i64"),
+        &body,
+    );
+    // Replace only the signature, so the ONLY thing wrong is the key.
+    headers.retain(|(name, _)| name != "webhook-signature");
+    headers.push(("webhook-signature".to_owned(), forged));
+    (status, body, headers)
+}
+
 /// Pull one header value out of a recorded request head.
 fn header_value<'a>(head: &'a str, name: &str) -> &'a str {
     head.lines()
@@ -673,5 +704,120 @@ async fn a_signed_consultation_verifies_with_the_standard_helper() {
     assert!(
         altered.is_err(),
         "the signature must cover the envelope, so a modified body must not verify"
+    );
+}
+
+/// Issue #112's verification section: "unsigned or wrongly signed target responses rejected".
+///
+/// A WRONGLY signed response must not be honoured. Everything about this answer is correct
+/// except the key it was signed with, which is exactly the on-path attacker the response
+/// signature exists to stop: rewrite the body, re-sign with anything, approve the signup.
+///
+/// This is the REJECT half of `response_signature_verifies`. Worth stating why it needs its
+/// own test rather than riding on the accept case: before the response was signed at all,
+/// this branch executed on every run and nothing asserted it, so it was invisible. Signing the
+/// fixture moved the only signed execution in the workspace onto the ACCEPT branch and left
+/// this one running nowhere. A `fn response_signature_verifies(..) -> bool { true }` mutant
+/// survived the entire workspace at that point.
+#[tokio::test]
+async fn a_wrongly_signed_response_is_refused() {
+    let identity = TestTlsIdentity::generate(TARGET_HOST);
+    let target = TestTlsTarget::start_with(&identity, forging_responder).await;
+
+    let mut harness = setup().await;
+    install_schema(&harness).await;
+    install_form(&harness).await;
+    install_signing_secret(&harness).await;
+    install_trusting_fetcher(&mut harness, &identity, &target);
+    register_target_signed(
+        &harness,
+        FailurePolicy::FailClosed,
+        Some(SIGNING_SECRET_NAME),
+    )
+    .await;
+    harness
+        .clock()
+        .advance(std::time::Duration::from_secs(CLOCK_SECS));
+
+    let (flow_id, token) = create_flow_api(&harness).await;
+    let (status, body) = post_json(
+        &harness,
+        &submit_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": {
+                "identifier": "forged@example.test",
+                "password": PASSWORD,
+                "nickname": "zeke"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "submit: {body}");
+
+    assert_eq!(
+        target.received().len(),
+        1,
+        "the target WAS consulted, so the refusal below is about its answer rather than a \
+         failure to reach it"
+    );
+    assert!(
+        !user_exists(&harness, "forged@example.test").await,
+        "a response signed under the wrong key must be refused. A row here means an on-path \
+         attacker could approve any signup by rewriting the body and re-signing it: {body}"
+    );
+}
+
+/// The other half of the same criterion: an UNSIGNED response from a target configured with a
+/// secret must be refused.
+///
+/// A different code path from the test above: `response_signature_verifies` returns early on
+/// the missing headers rather than reaching the comparison, so a mutant that only weakens the
+/// comparison would still be caught here, and one that removes the header check would be
+/// caught there.
+#[tokio::test]
+async fn an_unsigned_response_from_a_signed_target_is_refused() {
+    let identity = TestTlsIdentity::generate(TARGET_HOST);
+    // `start` serves no webhook headers at all.
+    let target = TestTlsTarget::start(&identity, 200, r#"{"verdict":"allow"}"#).await;
+
+    let mut harness = setup().await;
+    install_schema(&harness).await;
+    install_form(&harness).await;
+    install_signing_secret(&harness).await;
+    install_trusting_fetcher(&mut harness, &identity, &target);
+    register_target_signed(
+        &harness,
+        FailurePolicy::FailClosed,
+        Some(SIGNING_SECRET_NAME),
+    )
+    .await;
+    harness
+        .clock()
+        .advance(std::time::Duration::from_secs(CLOCK_SECS));
+
+    let (flow_id, token) = create_flow_api(&harness).await;
+    let (status, body) = post_json(
+        &harness,
+        &submit_path(&harness),
+        &json!({
+            "id": flow_id,
+            "submit_token": token,
+            "nodes": {
+                "identifier": "unsigned@example.test",
+                "password": PASSWORD,
+                "nickname": "zeke"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "submit: {body}");
+
+    assert_eq!(target.received().len(), 1, "the target WAS consulted");
+    assert!(
+        !user_exists(&harness, "unsigned@example.test").await,
+        "a target configured with a secret must not be believed when it answers unsigned: \
+         {body}"
     );
 }
