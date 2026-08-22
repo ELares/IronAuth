@@ -70,16 +70,22 @@ const PASSWORD: &str = "a-sync-target-consultation-passphrase";
 const HANG_TIMEOUT_MS: u64 = 250;
 
 /// The elapsed guard multiplies the bound above by 20. That is only a GUARD while the result
-/// stays well under the ceiling that applies when the per-target bound is not honoured, which
+/// stays well under the ceiling that applies when the per-target bound is NOT honoured, which
 /// is the fetcher's own default total timeout. At `HANG_TIMEOUT_MS = 500` the product is
 /// exactly that default and the assertion stops discriminating: it would pass whether the
 /// consultation was bounded by the target or by the fallback, which is the entire distinction
-/// it exists to make.
+/// it exists to draw.
 ///
 /// So the relationship is checked at COMPILE time against the real constant rather than left
-/// as a property someone has to remember. Raising the bound past a quarter of the default is
-/// a build error naming this, not a guard that silently stops working. Half the default is
-/// the margin, so the two are never merely adjacent.
+/// as a property someone has to remember.
+///
+/// Concretely, since the margin is half the default and the multiple is 20: the assertion
+/// admits `HANG_TIMEOUT_MS` up to and including 250, and the build breaks at 251. The bound
+/// and the multiple are therefore tuned TOGETHER, and raising the bound means lowering the
+/// multiple in the same edit rather than relaxing this. An earlier draft of this doc said the
+/// break came at a quarter of the default, which is 2500 and wrong by a factor of ten; the
+/// number is stated here so the next reader can check it against the expression below rather
+/// than trust the prose.
 const _: () = assert!(
     (HANG_TIMEOUT_MS as u128) * 20 * 2 <= ironauth_fetch::DEFAULT_TOTAL_TIMEOUT.as_millis(),
     "HANG_TIMEOUT_MS * 20 must stay at or under half the fetcher's default total timeout, or \
@@ -294,22 +300,29 @@ async fn a_sync_target_that_exceeds_its_timeout_triggers_the_failure_policy() {
     )
     .await;
 
-    // Through the Env clock rather than the standard library's constructor directly:
-    // `scripts/invariant-lints.sh` enforces that all monotonic time in this workspace flows
-    // through the `Clock` trait, and the production path this test measures reads the very
-    // same clock. (That lint is a text scan, so naming the forbidden constructor even inside
-    // a comment trips it. This wording is deliberate.)
+    // REAL monotonic time, with the `time-via-env` allowance the repo already grants a
+    // timing harness, because the Env seam cannot measure this.
     //
-    // MONOTONIC rather than wall clock for the reason `dispatch_sync` states where it reads
-    // the same clock: an NTP step backwards would make the measured span exceed a budget
-    // nothing was actually slow for.
-    let started = harness.env().clock().monotonic();
+    // An earlier revision of this test read `harness.env().clock()` to satisfy that lint.
+    // It type-checked, the suite stayed green, and the guard became a tautology: the harness
+    // installs `Env::deterministic`, whose `ManualClock` only moves when a test calls
+    // `advance`, and nothing here does. Both reads returned the same instant, `elapsed` was
+    // always zero, and `0 < 5s` cannot fail. That is the same vacuity this assertion was
+    // added to remove, reached from the other side, and it silently un-killed the mutant
+    // below.
+    //
+    // What is being measured is real time consumed by a real tokio timer inside the fetcher.
+    // No seam simulates it, so routing the measurement through the seam measures the seam.
+    // `outbound_timing_probe.rs` reached this conclusion first and its marker says so; this
+    // is the same case and takes the same allowance.
+    //
+    // MONOTONIC rather than wall clock because a wall clock can step under us in both
+    // directions: a FORWARDS step inflates the span and fails a test nothing was slow for,
+    // and a backwards step deflates it and hides a real overrun. `dispatch_sync` reads a
+    // monotonic source at its own call site for the same reason.
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- measuring REAL elapsed time of a real network timeout; the Clock seam is a frozen ManualClock under this harness, so reading it measures the seam and not the timeout
     let (status, body) = signup(&harness, "timedout@example.test").await;
-    let elapsed = harness
-        .env()
-        .clock()
-        .monotonic()
-        .saturating_duration_since(started);
+    let elapsed = started.elapsed();
     assert_ne!(
         status,
         StatusCode::SEE_OTHER,
@@ -341,6 +354,28 @@ async fn a_sync_target_that_exceeds_its_timeout_triggers_the_failure_policy() {
         elapsed < ceiling,
         "the consultation must be bounded by the TARGET's {HANG_TIMEOUT_MS}ms, not by some \
          larger ceiling that also happens to end it: took {elapsed:?}, allowed {ceiling:?}"
+    );
+
+    // A LOWER bound as well, and it is not symmetry for its own sake: it is what makes the
+    // upper bound above falsifiable.
+    //
+    // An upper bound alone is satisfied by zero, so any change that stops the measurement
+    // advancing turns the whole guard into `0 < 5s` while leaving it looking intact. That is
+    // not hypothetical here: it is exactly what happened when this read the harness Env
+    // clock, which is frozen unless a test advances it. The suite stayed green and the mutant
+    // came back to life, and only a reviewer reading the harness noticed.
+    //
+    // The target accepts and never answers, so a consultation that really was bounded by the
+    // configured timeout cannot come back materially faster than that timeout. Half of it is
+    // the floor, which leaves generous room for scheduling while still being far above the
+    // zero a stopped clock reports.
+    let floor = Duration::from_millis(HANG_TIMEOUT_MS / 2);
+    assert!(
+        elapsed >= floor,
+        "the consultation returned in {elapsed:?}, faster than half its {HANG_TIMEOUT_MS}ms \
+         bound against a target that never answers. Either the timeout is not being awaited, \
+         or the clock being read does not advance, which would make the ceiling assertion \
+         above vacuous"
     );
 }
 
