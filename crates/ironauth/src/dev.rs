@@ -420,15 +420,35 @@ pub fn seed_statements(scope: &SeededScope) -> Vec<String> {
         // A PUBLIC client (`none`): the emulator's reason to exist is driving flows from a
         // CLI or a sample app, and a public client with a loopback redirect is what both
         // use. A confidential one would need a secret every quickstart then has to carry.
+        //
+        // `grant_types` is stated rather than left to the column default, which migration
+        // 0021 sets to `authorization_code` alone. Omitting it made the seeded client unable
+        // to start a DEVICE grant at all: `grant_types_allow_device` refuses and the endpoint
+        // answers `unauthorized_client`, so the CLI's headless login could not be driven
+        // against the emulator even though both halves shipped. The default is right for a
+        // migration, which must not widen an existing client's grants, and wrong for a seed
+        // whose whole purpose is to exercise the flows.
+        //
+        // `first_party` for the same reason. It defaults false, which makes the seeded client
+        // THIRD-party, and the admin-consent gate then refuses a device authorization with
+        // `access_denied` until an operator pre-authorizes it. In a single-tenant emulator the
+        // dev client is the operator's own by construction, so third-party is the wrong
+        // classification rather than a safety margin: it blocks the flows the emulator exists
+        // to demonstrate while protecting nobody, since there is no second party.
         format!(
             "INSERT INTO clients /* query-audit-allow: dev-only seeding as the cluster \
              owner, against a throwaway database this process created, BEFORE any server \
              exists to route it through a scoped repository */ \
              (id, tenant_id, environment_id, display_name, token_endpoint_auth_method, \
-              redirect_uris) \
-             VALUES ('{}', '{}', '{}', 'dev client', 'none', ARRAY['{}']) \
+              redirect_uris, grant_types, first_party) \
+             VALUES ('{}', '{}', '{}', 'dev client', 'none', ARRAY['{}'], \
+                     'authorization_code {}', true) \
              ON CONFLICT (id) DO NOTHING;",
-            scope.client, scope.tenant, scope.environment, DEV_REDIRECT_URI
+            scope.client,
+            scope.tenant,
+            scope.environment,
+            DEV_REDIRECT_URI,
+            ironauth_oidc::GrantType::DEVICE_CODE_URN
         ),
     ]
 }
@@ -1138,6 +1158,29 @@ mod tests {
         let client = &statements[5];
         assert!(client.contains("'none'"), "{client}");
         assert!(client.contains(DEV_REDIRECT_URI), "{client}");
+        // The DEVICE grant, stated rather than defaulted. Without it the seeded client cannot
+        // start a device authorization at all, which is the emulator's headless-login path.
+        assert!(
+            client.contains(ironauth_oidc::GrantType::DEVICE_CODE_URN),
+            "the seed grants the device code URN: {client}"
+        );
+        assert!(
+            client.contains("authorization_code"),
+            "and keeps the browser grant beside it: {client}"
+        );
+        // FIRST-PARTY, asserted on the VALUE. `contains("first_party")` alone matches the
+        // column name in the INSERT's own column list, so it holds whatever value follows and
+        // would pass on a seed that set it false. Left false, the admin-consent gate treats
+        // the emulator's own client as a third party and refuses the device grant before it
+        // starts, which is the failure this pins.
+        assert!(
+            client.contains("first_party)"),
+            "the seed names the column: {client}"
+        );
+        assert!(
+            client.contains(", true)"),
+            "and sets it TRUE, which is the half a name match cannot see: {client}"
+        );
         // The literal, never the name: this server does not match `localhost`
         // port-agnostically, so a registration naming it could never match an ephemeral port.
         assert!(!client.contains("localhost"), "{client}");
