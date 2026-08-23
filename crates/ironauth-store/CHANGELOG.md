@@ -17,12 +17,14 @@ range per docs/RELEASING.md.
   registered saw password signups announced and passkey signups silently not. Wiring it
   needed `origin` first: without it the two arrive in one indistinguishable shape.
 
-  Two doors deliberately do NOT announce, and both now say so in their own docs rather than
-  leaving a reader unable to tell an omission from a decision. `register_with_claims` is a
-  test-only helper with no production caller. `admin_create` is an OPERATOR act with a
-  different actor in the audit trail and no signup form behind it; if operator-created
-  accounts should be announced later, they want their own event rather than a signup with a
-  different origin.
+  The doors that do NOT announce now say so in their own docs, rather than leaving a reader
+  unable to tell an omission from a decision. `register_with_claims` is a test-only helper
+  with no production caller. `admin_create` is more than one case and is documented as such:
+  a decision for its two OPERATOR callers (the management create-user route and the bulk
+  import), and an acknowledged OPEN GAP for its two end-user callers, first-federated-login
+  provisioning and lazy migration, which create the account with the user as the audit actor
+  and are not covered by the operator rationale. Announcing those wants an origin of their
+  own and a product decision about whether a first federated login reads as a signup.
 
   This is a WIRE ADDITION to a published envelope. A receiver that ignores unknown fields is
   unaffected; one with a strict schema needs `origin` allowed. Every existing door is

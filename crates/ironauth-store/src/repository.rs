@@ -17140,15 +17140,29 @@ impl ActingUserRepo<'_> {
     ///
     /// # Announcement
     ///
-    /// Does NOT announce to async flow targets, deliberately (issue #953). The async envelope
-    /// announces a SIGNUP: a self-service act by the person being created, carrying their own
-    /// consent and a signup form. An admin create is an OPERATOR act with a different actor in
-    /// the audit trail, no form behind it, and often a bulk import. A receiver that provisions
-    /// on signup would treat an operator's import as a user arriving.
+    /// Does NOT announce to async flow targets (issue #953). That is a DECISION for two of its
+    /// callers and an OPEN GAP for the other two, and the difference matters, so both are
+    /// named rather than covered by one sentence.
     ///
-    /// This is a decision, not the gap `register_passwordless` used to carry. If the product
-    /// later wants operator-created accounts announced, it wants its OWN event rather than a
-    /// signup with a different `origin`, because the audience and the actor differ.
+    /// A decision for the operator surfaces, `ironauth-admin`'s create-user route and
+    /// `ironauth-import`'s bulk engine. The async envelope announces a SIGNUP: a self-service
+    /// act by the person being created, carrying their own consent. An operator act has a
+    /// different actor in the audit trail and no signup surface behind it, and a receiver that
+    /// provisions on signup would treat an import as users arriving. If those should be
+    /// announced later they want their OWN event, not a signup with a different `origin`.
+    ///
+    /// An open gap for the two END-USER callers, which this function also serves:
+    /// `federation.rs`'s just-in-time provisioning on a FIRST federated login, and
+    /// `login.rs`'s lazy migration on a login submission. Both create the account with
+    /// `interaction::user_actor`, the person themselves, which is the same construction the
+    /// passkey door uses, and both pass self-service traits. `admin_create_emitting` says as
+    /// much itself further down: "a SELF-SERVICE create (the FIRST federated login is one)".
+    ///
+    /// So the operator rationale does NOT cover them. They stay silent for now because
+    /// announcing them wants an `origin` of their own (`federated` and `migrated` are the
+    /// obvious spellings) and a decision about whether a first federated login is a signup to
+    /// a receiver, which is a product question rather than a wiring one. Written down here so
+    /// the next reader finds an open question rather than a justification that does not fit.
     ///
     /// # Errors
     ///

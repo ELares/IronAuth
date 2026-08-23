@@ -25,6 +25,7 @@ use ciborium::value::{Integer, Value};
 use common::{Harness, ISSUER_BASE};
 use ironauth_config::OidcConfig;
 use ironauth_jose::webauthn::test_util;
+use ironauth_store::flow_target::{FailurePolicy, Invocation, TargetClass, Timing};
 use ironauth_store::{
     AbuseBanId, AbuseSubject, ActorRef, AuthPath, CorrelationId, NewBan, ServiceId,
 };
@@ -1604,5 +1605,135 @@ async fn a_passkey_sign_in_emits_no_set_login_when_fedcm_is_off() {
         set_login(&headers),
         None,
         "with FedCM off a passkey sign-in emits no Set-Login header"
+    );
+}
+
+/// Issue #953: a passkey-only signup ANNOUNCES to async flow targets, through the real
+/// ceremony.
+///
+/// The store-side test in `ironauth-store` proves `register_inner` stamps `origin` when it is
+/// handed deliveries. It cannot prove the passkey ceremony HANDS it any: it calls
+/// `register_passwordless` directly. So the one line of production wiring this change adds,
+/// the async-registry read in `webauthn.rs`, was reachable by no test at all, and reverting it
+/// to `None` left every suite green.
+///
+/// This drives `/webauthn/signup/options` then `/webauthn/signup/verify`, the same ceremony
+/// the neighbouring lifecycle test uses, and asserts a delivery was queued naming the door.
+#[tokio::test]
+// Over the readable-length lint as the lifecycle test above is, and for the same reason: the
+// ceremony is a linear sequence (register a target, options, verify, claim the delivery) and
+// splitting it would scatter the single flow being pinned.
+#[allow(clippy::too_many_lines)]
+async fn a_passkey_only_signup_announces_to_an_async_target() {
+    let harness = Harness::start().await;
+    let base = webauthn_base(&harness);
+    let scope = harness.scope();
+    let env = harness.env().clone();
+    let identifier = "announced-passkey@example.test";
+
+    // An enabled async EVENT target, registered before the signup.
+    let config = json!({});
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .flow_targets()
+        .set(
+            &env,
+            &ironauth_store::FlowTargetId::generate(&env, &scope),
+            1_000_000,
+            ironauth_store::NewFlowTarget {
+                name: "passkey-observer",
+                target_class: TargetClass::Event,
+                invocation: Invocation::Async,
+                timing: Timing::PostPersist,
+                endpoint: "https://crm.example/signups",
+                timeout_ms: None,
+                failure_policy: FailurePolicy::FailOpen,
+                config: &config,
+                signing_secret_name: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("register the async target");
+
+    let (status, opts) = post(
+        &harness,
+        &format!("{base}/signup/options"),
+        None,
+        ISSUER_BASE,
+        &json!({ "identifier": identifier }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "signup options: {opts}");
+    let challenge_id = opts["challengeId"].as_str().unwrap().to_owned();
+    let challenge_b64 = opts["publicKey"]["challenge"].as_str().unwrap().to_owned();
+
+    let attestation_object = cbor(&Value::Map(vec![
+        (Value::Text("fmt".into()), Value::Text("none".into())),
+        (Value::Text("attStmt".into()), Value::Map(vec![])),
+        (
+            Value::Text("authData".into()),
+            Value::Bytes(auth_data(0b0101_1101, 0, true)),
+        ),
+    ]));
+    let credential = json!({
+        "id": b64(CRED_ID),
+        "rawId": b64(CRED_ID),
+        "type": "public-key",
+        "response": {
+            "clientDataJSON": b64(&client_data("webauthn.create", &challenge_b64)),
+            "attestationObject": b64(&attestation_object),
+            "transports": ["internal"],
+        },
+        "clientExtensionResults": { "credProps": { "rk": true } },
+    });
+    let return_to = format!("/authorize?client_id={}", harness.client_id());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("{base}/signup/verify"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("origin", ISSUER_BASE)
+        .body(Body::from(
+            json!({
+                "challengeId": challenge_id,
+                "returnTo": return_to,
+                "identifier": identifier,
+                "credential": credential,
+            })
+            .to_string(),
+        ))
+        .expect("request builds");
+    let (status, _headers, response) = harness.send(request).await;
+    assert_eq!(status, StatusCode::OK, "signup verify: {response}");
+
+    // The delivery, claimed off the real outbox.
+    let claimed = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::FLOW_TARGET_DELIVERY_CONSUMER,
+            std::time::Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim the queued deliveries");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "the passkey ceremony must announce: an operator with an async target registered saw \
+         password signups and not these. Zero here means the registry read in `webauthn.rs` \
+         is not wired, which is exactly what no other test can observe: {claimed:?}"
+    );
+    assert_eq!(
+        claimed[0].payload["body"]["origin"],
+        json!("passwordless"),
+        "and it names the door it came from: {:?}",
+        claimed[0].payload
     );
 }

@@ -922,7 +922,7 @@ async fn drain_deliveries(
 /// arrived in one indistinguishable shape, which is the same defect `state` and `quarantined`
 /// were added to fix, one level up at the door rather than at the outcome.
 ///
-/// One test over both doors rather than one each, for the reason its neighbour above gives:
+/// One test over both doors rather than one each, for the reason its neighbour BELOW gives:
 /// the property is the DIFFERENCE. Two tests each checking its own envelope would both still
 /// pass if the stamp were hardcoded to the value that test expected.
 #[tokio::test]
@@ -1028,6 +1028,19 @@ async fn the_signup_envelope_names_the_door_that_produced_it() {
     let password_origin = origin_of(&password_id);
     let passkey_origin = origin_of(&passkey_id);
 
+    // THE DIFFERENCE FIRST, because it is the property. A stamp hardcoded to either value
+    // fails here, which is the whole reason both doors are driven in one test.
+    //
+    // Ordered before the two equalities deliberately. After them it could never be the
+    // assertion that fires: they pin both values, so any input reaching it has already
+    // satisfied it. An assertion that cannot fail is not a guard, however well it reads.
+    assert_ne!(
+        password_origin, passkey_origin,
+        "the two doors must be distinguishable, or a receiver cannot tell a passkey signup \
+         from a password one: {drained:?}"
+    );
+    // And then WHICH value each door carries, so the difference is not merely two arbitrary
+    // strings that happen to differ.
     assert_eq!(
         password_origin, "self_service",
         "the password door names itself: {drained:?}"
@@ -1035,13 +1048,6 @@ async fn the_signup_envelope_names_the_door_that_produced_it() {
     assert_eq!(
         passkey_origin, "passwordless",
         "and the passkey door names itself: {drained:?}"
-    );
-    // THE DIFFERENCE. A stamp hardcoded to either value satisfies one assertion above and
-    // fails here, which is the whole reason both doors are driven in one test.
-    assert_ne!(
-        password_origin, passkey_origin,
-        "the two doors must be distinguishable, or a receiver cannot tell a passkey signup \
-         from a password one: {drained:?}"
     );
 }
 
