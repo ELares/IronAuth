@@ -1,0 +1,30 @@
+{
+  "$comment": "The RFC 9728 section 5.1 / RFC 6750 section 3 challenge corpus (issue #127 criterion 3). Hand-maintained, and read by BOTH implementations: crates/ironauth-oidc/tests/protected_resource_metadata.rs and packages/ironauth-sdk/src/protected-resource.test.ts. Each side builds the challenge with its own builder and must produce `expected` byte for byte. Before this file the two sides asserted their own hardcoded strings, so 'the SDK matches the crate' was a claim no test could falsify.",
+  "resource": "https://api.example/v1/mcp",
+  "metadata_url": "https://api.example/.well-known/oauth-protected-resource/v1/mcp",
+  "cases": [
+    {
+      "name": "bare_401",
+      "$why": "A request with NO credential. RFC 6750 reserves the error parameters for a request that presented something, so the challenge carries only the pointer.",
+      "kind": "challenge",
+      "error": null,
+      "error_description": null,
+      "expected": "Bearer resource_metadata=\"https://api.example/.well-known/oauth-protected-resource/v1/mcp\""
+    },
+    {
+      "name": "invalid_token_401",
+      "$why": "A credential that was presented and failed. Both parameters travel, because `prm::challenge` writes `error_description` whenever it writes `error` while the SDK builder treats the description as optional. So a fixture omitting it could not be produced by both sides, and the agreeing case is the one that states it. The insufficient-scope builder below is a DIFFERENT function and pairs `error` with `scope` instead, which is why this sentence names `prm::challenge` rather than the crate.",
+      "kind": "challenge",
+      "error": "invalid_token",
+      "error_description": "the access token is not valid for this resource",
+      "expected": "Bearer resource_metadata=\"https://api.example/.well-known/oauth-protected-resource/v1/mcp\", error=\"invalid_token\", error_description=\"the access token is not valid for this resource\""
+    },
+    {
+      "name": "insufficient_scope_403",
+      "$why": "The scope hint a client needs in order to ask for the right thing rather than guess. The pointer travels here too: a client may meet a 403 before it has ever seen a 401.",
+      "kind": "insufficient_scope",
+      "scope": "mcp:tools",
+      "expected": "Bearer resource_metadata=\"https://api.example/.well-known/oauth-protected-resource/v1/mcp\", error=\"insufficient_scope\", scope=\"mcp:tools\""
+    }
+  ]
+}

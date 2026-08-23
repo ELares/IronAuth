@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
@@ -15,6 +17,9 @@ import {
   protectedResourceMetadata,
   protectedResourceMetadataUrl,
   protectedResourceMiddleware,
+  protectedResourceFromVerify,
+  type ChallengeError,
+  type DerivedResourceOverrides,
   unauthorized,
 } from './protected-resource.js';
 
@@ -138,7 +143,13 @@ test('a request with no credentials gets a bare challenge, with no error code', 
   assert.ok(challenge.includes('resource_metadata='), challenge);
 });
 
-test('parameter order matches the crate, so a shared fixture can assert identity', () => {
+// The shared fixture this comment used to anticipate now exists
+// (`vectors/prm-challenge-vectors.json`, asserted below and by the crate suite), so this test
+// is no longer the claim that the two agree. It stays as the READABLE statement of the wire
+// format: a literal a reviewer can check against RFC 6750 by eye, where the corpus case is a
+// JSON string. The corpus is what makes agreement falsifiable; this is what makes the format
+// legible.
+test('the challenge is the RFC 6750 wire format, spelled out', () => {
   assert.equal(
     unauthorized(CHECKED, { error: 'invalid_token' }).headers[
       'WWW-Authenticate'
@@ -1090,5 +1101,157 @@ test('the scheme grammar is the only thing checking the scheme', () => {
       'resource_not_absolute',
       refused.slice(0, 20),
     );
+  }
+});
+
+// --- Deriving the document from the verify configuration (issue #127 criterion 4) ---
+
+const DERIVE_FROM: VerifiedTokenConfig = {
+  issuer: 'https://auth.example/t/acme/e/prod',
+  audience: 'https://api.example/v1/mcp',
+};
+
+test('a derived document restates nothing the caller already told verify', () => {
+  const document = protectedResourceMetadata(protectedResourceFromVerify(DERIVE_FROM));
+  assert.equal(document.resource, DERIVE_FROM.audience);
+  assert.deepEqual(document.authorization_servers, [DERIVE_FROM.issuer]);
+});
+
+test('a derived mismatch is unreachable, not merely rejected', () => {
+  // The point of deriving. `defineProtectedResource` REFUSES a caller-supplied mismatch, which
+  // is right when the caller supplies both; deriving removes the opportunity. Two mechanisms,
+  // and both are needed: the override type omits the derived fields, and the call spreads
+  // overrides FIRST so a value smuggled past the types is overwritten rather than honoured.
+  // A JavaScript caller has no types, so the second is what actually holds.
+  const smuggled = {
+    scopesSupported: ['mcp:read'],
+    resource: 'https://evil.example/x',
+    authorizationServers: ['https://evil.example'],
+  } as unknown as DerivedResourceOverrides;
+  const document = protectedResourceMetadata(protectedResourceFromVerify(DERIVE_FROM, smuggled));
+  assert.equal(document.resource, DERIVE_FROM.audience);
+  assert.deepEqual(document.authorization_servers, [DERIVE_FROM.issuer]);
+  assert.deepEqual(document.scopes_supported, ['mcp:read']);
+});
+
+test('the fields verify cannot imply stay caller-supplied', () => {
+  // A token's scopes are what ONE caller was granted; `scopes_supported` is what the server
+  // offers. `verify` never learns the second, so deriving it would be an invention.
+  const bare = protectedResourceMetadata(protectedResourceFromVerify(DERIVE_FROM));
+  assert.equal('scopes_supported' in bare, false);
+  assert.equal('bearer_methods_supported' in bare, false);
+  const given = protectedResourceMetadata(
+    protectedResourceFromVerify(DERIVE_FROM, {
+      scopesSupported: ['mcp:read', 'mcp:write'],
+      bearerMethodsSupported: ['header'],
+    }),
+  );
+  assert.deepEqual(given.scopes_supported, ['mcp:read', 'mcp:write']);
+  assert.deepEqual(given.bearer_methods_supported, ['header']);
+});
+
+test('an unstable verify configuration cannot make the derived pair disagree', () => {
+  // The defect `defineProtectedResource` documents, aimed at the derivation path: a source
+  // whose reads are not stable could feed one value to the document and another to the
+  // audience comparison. Deriving reads each field ONCE into a local before either use, so
+  // the second read never reaches the document.
+  let reads = 0;
+  const shifting: VerifiedTokenConfig = {
+    get issuer() {
+      return DERIVE_FROM.issuer;
+    },
+    get audience() {
+      reads += 1;
+      return reads === 1 ? DERIVE_FROM.audience : 'https://evil.example/x';
+    },
+  };
+  const document = protectedResourceMetadata(protectedResourceFromVerify(shifting));
+  assert.equal(document.resource, DERIVE_FROM.audience);
+  assert.ok(reads >= 1, 'the getter really was read, so the fixture is not vacuous');
+});
+
+test('deriving is not a way around the identifier parse', () => {
+  // A query or fragment in the audience is the caller's bug either way, and it must surface as
+  // the same refusal rather than being waved through because the value came from `verify`.
+  assert.throws(
+    () => protectedResourceFromVerify({ ...DERIVE_FROM, audience: 'https://api.example/v1?x=1' }),
+    PrmConfigError,
+  );
+  assert.throws(
+    () => protectedResourceFromVerify({ ...DERIVE_FROM, issuer: 'not-a-url' }),
+    PrmConfigError,
+  );
+});
+
+// --- The challenge corpus shared with the crate (issue #127 criterion 3) ---
+
+interface ChallengeCase {
+  readonly name: string;
+  readonly kind: 'challenge' | 'insufficient_scope';
+  readonly error?: string | null;
+  readonly error_description?: string | null;
+  readonly scope?: string;
+  readonly expected: string;
+}
+
+interface ChallengeCorpus {
+  readonly resource: string;
+  readonly metadata_url: string;
+  readonly cases: readonly ChallengeCase[];
+}
+
+function challengeCorpus(): ChallengeCorpus {
+  // Resolved from THIS module rather than the process cwd, so the suite does not depend on
+  // where it was invoked from. `dist/` and `src/` are both one level under the package root,
+  // so the same relative path works whether this runs from source or from the build output.
+  const corpusPath = fileURLToPath(
+    new URL('../vectors/prm-challenge-vectors.json', import.meta.url),
+  );
+  return JSON.parse(readFileSync(corpusPath, 'utf8')) as ChallengeCorpus;
+}
+
+test('the SDK builds every challenge in the shared corpus, byte for byte', () => {
+  // The corpus is read by the crate test too, which is what makes "the SDK matches the crate"
+  // falsifiable. The older assertion compared this builder against a string typed into this
+  // file, so both sides could drift together and nothing would notice.
+  const corpus = challengeCorpus();
+  // The KINDS, not a count. A floor of three is satisfied by three challenge cases, which
+  // would exercise one builder path while claiming to pin both.
+  const kinds = new Set(corpus.cases.map((c) => c.kind));
+  assert.ok(
+    kinds.has('challenge') && kinds.has('insufficient_scope'),
+    'the corpus exercises both challenge shapes',
+  );
+  // Bound to the KIND. `!c.error` alone is satisfied by the insufficient-scope case, whose
+  // `error` member is absent and therefore `undefined`, so the predicate held whether or not
+  // the bare case existed. Measured: with the bare case deleted, both suites stayed green.
+  assert.ok(
+    corpus.cases.some((c) => c.kind === 'challenge' && !c.error),
+    'including the bare form, which is the answer to a request with no credential',
+  );
+  const resource = defineProtectedResource(
+    { resource: corpus.resource, authorizationServers: [ISSUER] },
+    { issuer: ISSUER, audience: corpus.resource },
+  );
+  assert.equal(
+    protectedResourceMetadataUrl(corpus.resource),
+    corpus.metadata_url,
+    'the corpus states the URL this resource composes to, so a composition change is caught here',
+  );
+
+  for (const testCase of corpus.cases) {
+    const built =
+      testCase.kind === 'insufficient_scope'
+        ? protectedResourceChallenge(resource, {
+            error: 'insufficient_scope',
+            scope: testCase.scope,
+          })
+        : protectedResourceChallenge(resource, {
+            ...(testCase.error ? { error: testCase.error as ChallengeError } : {}),
+            ...(testCase.error_description
+              ? { errorDescription: testCase.error_description }
+              : {}),
+          });
+    assert.equal(built, testCase.expected, `case ${testCase.name}`);
   }
 });

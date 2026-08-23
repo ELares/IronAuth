@@ -6,6 +6,40 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The PRM discovery chain is tested from the `401` a client actually starts at, and the
+  challenge format is pinned by a corpus both implementations read (issue #127).** Mostly gaps
+  in what was MEASURED rather than in what was served, plus one addition to the SDK surface:
+  `protectedResourceFromVerify` in `@ironauth/sdk` derives the document from the same
+  configuration `verify` already uses, so a resource identifier disagreeing with the enforced
+  audience is unreachable rather than merely rejected at startup.
+
+  The existing chain test began already holding the document, which skips the hop discovery
+  depends on: a client has never heard of this deployment, and all it has is a refusal and the
+  pointer inside it. The new test reads `resource_metadata` back OUT of a challenge string and
+  fetches with that, so a builder emitting a well-formed header naming the wrong URL fails here
+  instead of being compared against a constant.
+
+  `packages/ironauth-sdk/vectors/prm-challenge-vectors.json` is now read by both the crate suite
+  and the SDK suite, each building the challenge with its own builder. Before it, each side
+  asserted a string typed into its own file, so "the SDK matches the crate" was a claim nothing
+  could falsify and the two could drift together unnoticed. Measured: one edit to the corpus
+  fails both suites. The corpus also records an asymmetry the hardcoded pair hid, that this
+  `prm::challenge` writes `error_description` whenever it writes `error` while the SDK builder
+  treats the description as optional, so the agreeing case is the one that states it. Named for
+  the builder rather than the crate on purpose: `insufficient_scope_challenge` is a different
+  function and pairs `error` with `scope` instead, which the corpus also carries.
+
+  **A public-URL change orphans registered resources rather than reissuing their documents,**
+  and that is now pinned in both directions. `authorization_servers` is rendered per request and
+  can never go stale, but the lookup reconstructs the identifier from the CURRENT issuer base
+  while the registered audience still carries the old one, so a resource registered under a
+  previous base gets a 404 and one registered under the new base is served naming the new
+  issuer. The 404 is the safe direction, since the alternative is a document whose `resource`
+  field names an identifier nobody registered. It is a SILENT break though: every published
+  discovery chain stops resolving and the operator's signal is a 404 from an unauthenticated
+  endpoint, so the remedy (re-register under the new identifier) is worth knowing before a
+  public-URL change rather than after.
+
 - **The sync flow-target envelope now says what the signup became (issue #952).** A
   POST-PERSIST envelope carries `state` and `quarantined` at BODY level, siblings of `data`,
   which is where the async half already puts them. Three doors reach that dispatch and produce
