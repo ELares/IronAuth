@@ -346,11 +346,19 @@ async fn fetch(router: &axum::Router, path: &str) -> (StatusCode, String) {
 /// The discovery chain completes: PRM document -> the authorization server it names -> that
 /// server's metadata, with the issuer agreeing at every hop (issue #127 criterion 2).
 ///
-/// This is the half of the chain IronAuth OWNS. The criterion describes a client starting at
-/// a customer resource server's 401 and following `resource_metadata` to the PRM document;
-/// that first hop is emitted by the SDK middleware (criterion 3), which does not exist -- and
-/// `prm::challenge`, which builds exactly that header, has no caller anywhere in the
-/// workspace. Recorded on the issue; not papered over here.
+/// This is the half of the chain that starts once a client HAS the document. The hop before it,
+/// from a `401` and its `resource_metadata` pointer, is covered by
+/// `the_chain_resolves_from_a_401_challenge_through_prm_to_the_authorization_server` below,
+/// which drives `prm::challenge` and fetches what the pointer names.
+///
+/// An earlier revision of this comment said that builder "has no caller anywhere in the
+/// workspace" and that the SDK middleware did not exist. The middleware half was true when
+/// written and is not now (#939). The caller half was never true: `prm.rs`'s own
+/// `#[cfg(test)]` module has called it since before that comment was written, and a
+/// `tests/`-directory grep does not see an inline test module. What it MEANT still holds, and
+/// this PR does not change it: `prm::challenge` has no PRODUCTION caller, because the `401`
+/// criterion 2 describes is emitted by the customer's resource server through the TypeScript
+/// middleware, which no Rust caller grep can ever show.
 ///
 /// What this asserts is that once a client HAS the PRM document, every subsequent hop
 /// resolves and agrees. The failure mode it exists for is a PRM naming an authorization
@@ -435,4 +443,266 @@ async fn the_discovery_chain_resolves_from_the_prm_document_to_the_authorization
              {supported:?}"
         );
     }
+}
+
+/// The document tracks the deployment's CONFIGURED issuer, and a resource registered under a
+/// previous one stops being served rather than being served stale (issue #127 criterion 5).
+///
+/// `authorization_servers` is rendered per request from `state.issuer_for(&scope)`, so it is
+/// never a stored value that could go stale. What IS stored is the registered audience, and
+/// `resolve_hosted_resource` reconstructs the identifier it looks up from the CURRENT issuer
+/// base. Those two facts together decide what a public-URL change does, and the answer is not
+/// the obvious one:
+///
+///   registered under the CURRENT base -> served, naming the current issuer
+///   registered under a PREVIOUS base  -> 404, not a document naming the new issuer
+///
+/// The second half is the one worth pinning, and it is the safe direction. The alternative
+/// would be to match on the path suffix alone and serve a document whose `resource` field is
+/// an identifier nobody registered, which is precisely the lie this endpoint exists not to
+/// tell. But it is a SILENT break: after a public-URL change every previously published
+/// discovery chain stops resolving, and the operator's signal is a 404 rather than an error,
+/// so the remedy (re-register the resource servers under the new identifier) is worth knowing
+/// before the change rather than after.
+#[tokio::test]
+async fn a_public_url_change_orphans_the_old_registration_and_serves_a_re_registered_one() {
+    const MOVED_BASE: &str = "https://issuer-moved.test";
+
+    let harness = Harness::start().await;
+    let scope = harness.scope();
+    let resource = hosted_resource(&harness, "moved");
+    register_rs(&harness, &resource).await;
+    let path = well_known_path(&harness, "moved");
+
+    let (status, headers, body) = get(&harness, &path).await;
+    assert_eq!(status, StatusCode::OK, "served before the move: {body}");
+    let before: serde_json::Value = json(&body);
+    let etag_before = headers
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .expect("ETag")
+        .to_owned();
+    assert_eq!(
+        before["authorization_servers"],
+        serde_json::json!([format!(
+            "{}/t/{}/e/{}",
+            common::ISSUER_BASE,
+            scope.tenant(),
+            scope.environment()
+        )]),
+        "the document names the issuer this deployment is configured with: {before}"
+    );
+
+    // The SAME database, environment and rows, served by a deployment configured with a
+    // different public URL. That is what a public-URL change is: the rows do not move, the
+    // issuer the process derives from them does.
+    let moved = harness.serving_router(&ironauth_config::OidcConfig::default(), MOVED_BASE);
+
+    let (status, _, _) = send_through(
+        moved.clone(),
+        Request::builder()
+            .method("GET")
+            .uri(&path)
+            .body(Body::empty())
+            .expect("request builds"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the OLD registration is orphaned: its identifier is issuer-rooted at a base this \
+         deployment no longer serves, so there is no truthful document to publish for it"
+    );
+
+    // A resource registered under the NEW base is served, and names the new issuer. This is
+    // the half that proves the 404 above is about the stale REGISTRATION rather than the route
+    // having broken: without it, a route that 404s unconditionally would pass just as well.
+    let moved_resource = format!(
+        "{}/t/{}/e/{}/moved",
+        MOVED_BASE,
+        scope.tenant(),
+        scope.environment()
+    );
+    register_rs(&harness, &moved_resource).await;
+    let (status, headers, body) = send_through(
+        moved,
+        Request::builder()
+            .method("GET")
+            .uri(&path)
+            .body(Body::empty())
+            .expect("request builds"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "re-registered and served: {body}");
+    let after: serde_json::Value = json(&body);
+    assert_eq!(
+        after["resource"], moved_resource,
+        "the document describes the identifier that is actually registered: {after}"
+    );
+    assert_eq!(
+        after["authorization_servers"],
+        serde_json::json!([format!(
+            "{}/t/{}/e/{}",
+            MOVED_BASE,
+            scope.tenant(),
+            scope.environment()
+        )]),
+        "and names the NEW issuer, rendered per request rather than stored: {after}"
+    );
+
+    let etag_after = headers
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .expect("ETag")
+        .to_owned();
+    assert_ne!(
+        etag_before, etag_after,
+        "the ETag is content-derived, so it moves with the content: a stale one would let an \
+         intermediary revalidate to 304 and keep serving the superseded issuer"
+    );
+}
+
+/// The challenge corpus shared with the SDK, so "the SDK matches the crate" is falsifiable.
+///
+/// Both implementations build these challenges with their own builder and must produce the
+/// same bytes. Before this file the crate's forms were pinned only by inline unit tests in
+/// `prm.rs` and the SDK's by literals in its own suite, so the SDK's claim that "parameter
+/// order matches the crate" was checked by nothing that read both.
+fn challenge_corpus() -> serde_json::Value {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packages/ironauth-sdk/vectors/prm-challenge-vectors.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read the corpus at {}: {error}", path.display()));
+    serde_json::from_str(&text).expect("the corpus is JSON")
+}
+
+/// Every challenge in the shared corpus is what this crate builds (issue #127 criterion 3).
+#[test]
+fn the_crate_builds_every_challenge_in_the_shared_corpus() {
+    let corpus = challenge_corpus();
+    let metadata_url = corpus["metadata_url"].as_str().expect("metadata_url");
+    let cases = corpus["cases"].as_array().expect("cases");
+    // The KINDS, not a count. A floor of three would be satisfied by three challenge cases,
+    // and the file would then exercise one builder while claiming to pin both: losing the
+    // insufficient-scope case is exactly the edit that drops all coverage of the other one.
+    let kinds: std::collections::BTreeSet<&str> =
+        cases.iter().filter_map(|c| c["kind"].as_str()).collect();
+    assert!(
+        kinds.contains("challenge") && kinds.contains("insufficient_scope"),
+        "the corpus exercises BOTH challenge builders: {kinds:?}"
+    );
+    // Bound to the KIND. `c["error"].is_null()` alone is satisfied by the insufficient-scope
+    // case, because serde_json indexes an ABSENT key to `Value::Null` and that case carries no
+    // `error` member, so the predicate held whether or not the bare case existed. Measured:
+    // with the bare case deleted, both suites stayed green.
+    assert!(
+        cases
+            .iter()
+            .any(|c| c["kind"] == "challenge" && c["error"].is_null()),
+        "including the bare form, which is the answer to a request with no credential"
+    );
+
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let expected = case["expected"].as_str().expect("expected");
+        let built = match case["kind"].as_str().expect("kind") {
+            "challenge" => {
+                let error = case["error"].as_str().map(|code| {
+                    (
+                        code,
+                        case["error_description"]
+                            .as_str()
+                            .expect("a case with an error states its description"),
+                    )
+                });
+                ironauth_oidc::prm::challenge(metadata_url, error)
+            }
+            "insufficient_scope" => ironauth_oidc::prm::insufficient_scope_challenge(
+                metadata_url,
+                case["scope"].as_str().expect("scope"),
+            ),
+            other => panic!("unknown case kind {other} in {name}"),
+        };
+        assert_eq!(built, expected, "case {name}");
+    }
+}
+
+/// The discovery chain a client actually walks, starting where a client actually starts: at a
+/// `401` (issue #127 criterion 2).
+///
+/// The sibling chain test starts AT the document, computing its path from the harness rather
+/// than learning it from a refusal. That skips the hop discovery actually turns on: a client
+/// has never heard of this deployment, and all it has is a `401` and the pointer inside it.
+/// This test reads the metadata URL back OUT of a challenge string and fetches with that, so
+/// the pointer has to name something this deployment serves.
+#[tokio::test]
+async fn the_chain_resolves_from_a_401_challenge_through_prm_to_the_authorization_server() {
+    let harness = Harness::start().await;
+    let resource = hosted_resource(&harness, "chain");
+    register_rs(&harness, &resource).await;
+    let router = router_with_discovery(&harness);
+
+    // HOP 0: the refusal, built by the crate's own composer and its own challenge builder.
+    //
+    // `well_known_path_for` returns the ABSOLUTE URL, not a path to be joined to an origin. An
+    // earlier revision prepended the origin again, and the doubled pointer still passed every
+    // assertion here: `strip_prefix` below removes only the first copy, and axum routes on
+    // `Uri::path()`, which discards whatever precedes it. The guard after the parse is what
+    // makes that observable.
+    let metadata_url = ironauth_oidc::prm::well_known_path_for(&resource)
+        .expect("a hosted identifier composes a well-known URL");
+    let www_authenticate = ironauth_oidc::prm::challenge(
+        &metadata_url,
+        Some((
+            "invalid_token",
+            "the access token is not valid for this resource",
+        )),
+    );
+
+    // The client's parse: pull `resource_metadata` back out of the header value rather than
+    // reusing the local. Reusing it would make the test agree with itself and would not notice
+    // a builder that emitted a well-formed header naming the wrong URL.
+    let pointer = www_authenticate
+        .split("resource_metadata=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the challenge carries the pointer that makes discovery possible");
+    let request_path = pointer
+        .strip_prefix(common::ISSUER_BASE)
+        .expect("the pointer must address this deployment");
+    assert!(
+        request_path.starts_with('/'),
+        "the pointer must be exactly ONE absolute URL under this deployment. Without this the \
+         fetch below succeeds on a malformed pointer anyway, because axum routes on the URI's \
+         path and throws away anything before it: {pointer}"
+    );
+
+    // HOP 1: the document the pointer names.
+    let (status, body) = fetch(&router, request_path).await;
+    assert_eq!(status, StatusCode::OK, "PRM at {request_path}: {body}");
+    let prm = json(&body);
+    assert_eq!(
+        prm["resource"], resource,
+        "the document the CHALLENGE pointed at describes the resource that refused us: {prm}"
+    );
+
+    // HOP 2: the authorization server the document names, at the RFC 8414 composed path.
+    let issuer = prm["authorization_servers"]
+        .as_array()
+        .and_then(|servers| servers.first())
+        .and_then(serde_json::Value::as_str)
+        .expect("authorization_servers is required by RFC 9728")
+        .to_owned();
+    let as_path = issuer
+        .strip_prefix(common::ISSUER_BASE)
+        .map(|tail| format!("/.well-known/oauth-authorization-server{tail}"))
+        .expect("the AS the PRM names must live under this deployment");
+    let (status, body) = fetch(&router, &as_path).await;
+    assert_eq!(status, StatusCode::OK, "AS metadata at {as_path}: {body}");
+    let metadata = json(&body);
+    assert_eq!(
+        metadata["issuer"], issuer,
+        "the server's own issuer is the string the document sent us to, so the chain closes: \
+         {metadata}"
+    );
 }

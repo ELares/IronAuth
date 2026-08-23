@@ -506,6 +506,59 @@ export function defineProtectedResource(
   return construct(snapshot, verified, maxAge);
 }
 
+/**
+ * The fields a derived document does NOT get from `verify`, because nothing in the token
+ * verification configuration implies them.
+ *
+ * `scopesSupported` is a statement about what this resource server offers, and `verify` never
+ * learns it: a token's scopes are what one caller was granted, not the set the resource
+ * publishes. `bearerMethodsSupported` and `maxAgeSeconds` are likewise transport and caching
+ * choices. All three stay optional and caller-supplied.
+ */
+export type DerivedResourceOverrides = Omit<
+  ProtectedResourceConfig,
+  'resource' | 'authorizationServers'
+>;
+
+/**
+ * Build a protected resource from the SAME configuration `verify` already uses (issue #127).
+ *
+ * The two fields a resource server would otherwise restate are the two that must not disagree
+ * with what it enforces: `resource` IS the verified audience, and the authorization server IS
+ * the verified issuer. {@link defineProtectedResource} refuses a configuration where they
+ * diverge, which is the right answer for a caller that supplies both, but a caller that has
+ * already told the SDK what it verifies should not have to say it twice and cannot then get
+ * it wrong. Deriving makes the mismatch UNREACHABLE rather than merely rejected.
+ *
+ * That distinction is the point rather than a convenience. The failure this prevents is a
+ * document that advertises one resource identifier while the middleware beside it validates a
+ * different audience, so discovery sends a client to a server that will refuse its token, and
+ * every party involved is behaving correctly per the document it read.
+ *
+ * `algorithms` and `skewSeconds` from `VerifyOptions` have no place in a PRM document and are
+ * ignored here rather than silently mapped onto something.
+ */
+export function protectedResourceFromVerify(
+  verifies: VerifiedTokenConfig,
+  overrides: DerivedResourceOverrides = {},
+): ProtectedResource {
+  // Read ONCE into locals before either use, for the reason `defineProtectedResource`
+  // documents at length: a configuration object backed by getters or a proxy can return a
+  // different value per read, and deriving is exactly the path where one read feeds the
+  // document and another feeds the audience comparison. Deriving from an unstable source
+  // would reintroduce the divergence this function exists to make unreachable.
+  const issuer = verifies.issuer;
+  const audience = verifies.audience;
+  return defineProtectedResource(
+    {
+      ...overrides,
+      resource: audience,
+      authorizationServers: [issuer],
+    },
+    { issuer, audience },
+  );
+}
+
 function splitIssuer(issuer: string): void {
   try {
     splitResource(issuer);
