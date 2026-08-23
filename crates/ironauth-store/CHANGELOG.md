@@ -11,18 +11,25 @@ range per docs/RELEASING.md.
   direction: the schema's annotations are what say which fields to withhold, so being unable to
   read them is a reason to refuse, never a reason to disclose.
 
-  Not a hypothetical branch. A schema is compiled when it is written and again when it is
-  activated, and never afterwards, while `check_schema_wellformed` has been tightened since (it
-  now refuses an annotation anywhere but a top-level property). A row activated under the looser
-  checker stays active, since nothing demotes an active version without promoting another and
-  the table carries no `DELETE` grant, and it no longer compiles.
+  Not a hypothetical branch. A stored schema is CHECKED for well-formedness when it is written
+  and again when it is activated, and nothing re-checks it after that, while
+  `check_schema_wellformed` has been tightened since: it now refuses an annotation anywhere
+  BELOW a top-level property (the document root stays annotatable on purpose, so that a lone
+  sub-schema can be compiled on its own). A row activated under the looser checker stays active,
+  since activation is the only writer of `status` and the table carries no `DELETE` grant, and
+  it no longer compiles. Readers compile it on every use, which is how they meet it.
 
   It mattered little while every caller was in-process. `ironauth-admin`'s async flow-target
   delivery now POSTs this projection to an operator-registered third-party endpoint, which is
   what made the fallback direction load-bearing. **BEHAVIOUR CHANGE, not a signature change:**
   the call already returned a `Result` and every in-tree caller already had an error arm. The
-  flow's progressive-profiling merge base and federation's link path each turn it into a server
-  error; the delivery consumer treats it as a retryable read failure.
+  flow's progressive-profiling merge base and federation's returning-login profile reuse each
+  turn it into a server error page.
+
+  The delivery consumer classifies it PERMANENT, under the label
+  `subject_traits_schema_malformed`, so the delivery DEAD-LETTERS after one attempt rather than
+  holding its target's ordering group for the whole retry schedule. Nothing drains by itself
+  once a compiling schema is activated: recovery is the target's replay route.
 
 - **`UserRepo::traits` no longer panics on an imported identity, and its return type says
   why (issue #954).** `users.traits_schema_version` is nullable: migration 0038 adds the
@@ -824,8 +831,10 @@ range per docs/RELEASING.md.
   `visibility`, which this work makes a security boundary: MEASURED, with a nested
   `visibility: admin`, a self-service write overwrote `address.secret` and a later omission
   CLEARED it, while the root-level control in the same write was correctly preserved.
-  `check_schema_wellformed` now refuses an annotation anywhere but a top-level property,
-  with a `SchemaMalformed` naming the offending RFC 6901 pointer.
+  `check_schema_wellformed` now refuses an annotation anywhere BELOW a top-level property,
+  with a `SchemaMalformed` naming the offending RFC 6901 pointer. The document ROOT stays
+  annotatable, which is not a loophole: it is the position a lone sub-schema occupies when the
+  signup-field path compiles one on its own.
 
 - **A NON-OBJECT self-service submission can no longer clear admin-only metadata.** The
   "cannot clear" half works by carrying the existing admin-only members onto the

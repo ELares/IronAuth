@@ -1466,12 +1466,14 @@ async fn traits_imported_without_a_schema_version_read_back_rather_than_panickin
 async fn an_active_schema_that_no_longer_compiles_refuses_the_redaction_rather_than_disclosing() {
     // The user-visible projection FAILS CLOSED when the active schema will not compile.
     //
-    // This branch is reachable without anyone doing anything wrong. A schema is compiled when
-    // it is written and again when it is activated, and never afterwards, while
-    // `check_schema_wellformed` has been tightened since: it now refuses `x-ironauth` anywhere
-    // but a top-level property. A row activated under the looser checker stays active, because
-    // nothing demotes an active version without promoting another and the table carries no
-    // DELETE grant, and it stops compiling. The fixture reproduces that end state by writing
+    // This branch is reachable without anyone doing anything wrong. A stored schema is CHECKED
+    // for well-formedness when it is written and again when it is activated, and nothing
+    // re-checks it after that, while `check_schema_wellformed` has been tightened since: it now
+    // refuses `x-ironauth` anywhere BELOW a top-level property (the document root stays
+    // annotatable on purpose, so a lone sub-schema can be compiled on its own). A row activated
+    // under the looser checker stays active, because activation is the only writer of `status`
+    // and the table carries no DELETE grant, and it stops compiling. Readers compile it on
+    // every use, which is how they meet it. The fixture reproduces that end state by writing
     // the row directly, which is the only way to reach it now that the write path compiles.
     //
     // The direction matters more than the branch. Returning the document unredacted was the
