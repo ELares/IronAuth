@@ -6,6 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`UserRepo::traits_user_visible` fails closed on a schema that will not compile.** It used
+  to answer with the UNREDACTED document in that case. For a redaction that is the unsafe
+  direction: the schema's annotations are what say which fields to withhold, so being unable to
+  read them is a reason to refuse, never a reason to disclose.
+
+  Not a hypothetical branch. A schema is compiled when it is written and again when it is
+  activated, and never afterwards, while `check_schema_wellformed` has been tightened since (it
+  now refuses an annotation anywhere but a top-level property). A row activated under the looser
+  checker stays active, since nothing demotes an active version without promoting another and
+  the table carries no `DELETE` grant, and it no longer compiles.
+
+  It mattered little while every caller was in-process. `ironauth-admin`'s async flow-target
+  delivery now POSTs this projection to an operator-registered third-party endpoint, which is
+  what made the fallback direction load-bearing. **BEHAVIOUR CHANGE, not a signature change:**
+  the call already returned a `Result` and every in-tree caller already had an error arm. The
+  flow's progressive-profiling merge base and federation's link path each turn it into a server
+  error; the delivery consumer treats it as a retryable read failure.
+
 - **`UserRepo::traits` no longer panics on an imported identity, and its return type says
   why (issue #954).** `users.traits_schema_version` is nullable: migration 0038 adds the
   column with no `NOT NULL`, and `NewUserTraits::schema_version` is documented as `None`
@@ -13,9 +31,9 @@ range per docs/RELEASING.md.
   from a system with no schema registry produces. `admin_create` validates nothing and
   stores it verbatim, so such a row is reachable through a supported surface.
 
-  The read decoded that column as a bare `i32` and PANICKED on it. The one other read of the
-  same column, the export projection feeding `UserExportRecord`, already used `Option<i32>`;
-  this one was the outlier. Found by a fixture written for the delivery-time enrichment in
+  The read decoded that column as a bare `i32` and PANICKED on it. The only other place the
+  repository decodes this column, the export projection feeding `UserExportRecord`, already
+  used `Option<i32>`; this one was the outlier. Found by a fixture written for the delivery-time enrichment in
   `ironauth-admin`, which reads traits on every async flow-target delivery.
 
   The blast radius was NOT a downed worker: the outbox catches a consumer panic, records it
@@ -26,9 +44,10 @@ range per docs/RELEASING.md.
 
   **BREAKING (library API).** `UserRepo::traits` now answers
   `Option<(Option<i32>, serde_json::Value)>` rather than `Option<(i32, ...)>`. Every in-tree
-  caller was updated: of the five production callers, one consumes the version (the management
-  `GET .../users/{id}/traits`) and four destructure it away, and seven test call sites that
-  read it were changed here. Out-of-tree callers that destructure the version must handle its
+  caller was updated. One production caller consumes the version, the management
+  `GET .../users/{id}/traits`, and needed the change; the rest destructure it away and compile
+  unchanged. Every existing test site that binds the version was updated, and the regression
+  fixture below adds one more. Out-of-tree callers that destructure the version must handle its
   absence.
 
   The management route is unchanged on the wire, since `schema_version` was already nullable

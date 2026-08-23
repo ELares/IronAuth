@@ -74,8 +74,10 @@ pub struct FlowTargetDeliveryConsumer<S> {
 /// The SETTLED half of `FlowTargetDeliveryConsumer::resolve_subject`'s answer; a read that
 /// failed for some other reason is the `Err`, not a variant here. Naming both outcomes rather
 /// than returning a bool is what keeps visible the one thing [`FlowTargetDelivery`] and this
-/// genuinely share: a delivery whose subject is gone is discarded exactly as one whose target
-/// is deregistered is. The correspondence stops there, and deliberately: see that method.
+/// share: a delivery whose subject is gone is discarded exactly as one whose target is
+/// deregistered is. Do not read further correspondence into it, and in particular not between
+/// a subject read that fails for another reason and [`FlowTargetDelivery::Disabled`], which
+/// are classified opposite ways: see that method.
 #[derive(Debug)]
 enum SubjectResolution {
     /// The subject resolved and the body now carries what a receiver needs.
@@ -96,10 +98,12 @@ impl<S: WebhookSender> FlowTargetDeliveryConsumer<S> {
     /// needed no master key at all, because `open_signing_secret` answers `Ok(None)` before it
     /// consults one.
     ///
-    /// Without a master key every delivery therefore fails retryably, and because the outbox
-    /// leases only the lowest-sequenced NON-TERMINAL message of an ordering group, the
-    /// target's whole backlog waits behind it for the full backoff schedule. The head then
-    /// dead letters, which IS terminal, and the group moves on.
+    /// Without a master key every delivery THAT REACHES THE SUBJECT READ therefore fails
+    /// retryably; a deregistered, disabled or became-sync target, and a payload this consumer
+    /// cannot read, all still settle before it. Because the outbox leases only the
+    /// lowest-sequenced NON-TERMINAL message of an ordering group, the target's backlog waits
+    /// behind such a delivery for the full backoff schedule. The head then dead letters, which
+    /// IS terminal, and the group moves on.
     #[must_use]
     pub fn new(store: Store, sender: S) -> Self {
         Self { store, sender }
@@ -107,15 +111,17 @@ impl<S: WebhookSender> FlowTargetDeliveryConsumer<S> {
 
     /// Resolve the delivery's subject and write what a receiver needs into `body`.
     ///
-    /// Three outcomes: enriched, gone (discard the delivery), or a read that failed for some
-    /// other reason (retry).
+    /// Four outcomes: enriched; gone (discard the delivery); a payload shape this consumer
+    /// cannot read, which is PERMANENT and never a read at all; or a store read that failed
+    /// for some other reason, which is RETRYABLE. The `# Errors` block below names the labels
+    /// each of the last two produces.
     ///
-    /// What that shares with [`FlowTargetDelivery`] is the DISCARD arm and only that arm:
-    /// `Gone` is discarded exactly as [`FlowTargetDelivery::Absent`] is, and for the same
-    /// reason. The remaining arms do not correspond, and the difference is worth naming
-    /// because it is easy to assume otherwise: a subject read that fails for another reason is
-    /// RETRYABLE, whereas [`FlowTargetDelivery::Disabled`] is deliberately PERMANENT, with its
-    /// own comment in `deliver_one` explaining why retrying there was the harmful choice.
+    /// What that shares with [`FlowTargetDelivery`] is the DISCARD arm: `Gone` is discarded
+    /// exactly as [`FlowTargetDelivery::Absent`] is, and for the same reason. The difference
+    /// worth naming, because it is easy to assume otherwise, is that a subject read failing
+    /// for another reason is RETRYABLE, whereas [`FlowTargetDelivery::Disabled`] is
+    /// deliberately PERMANENT, with its own comment in `deliver_one` on why retrying there was
+    /// the harmful choice.
     ///
     /// The caller does the logging, so the two discard paths read alike at the one place a
     /// maintainer compares them.
@@ -137,12 +143,14 @@ impl<S: WebhookSender> FlowTargetDeliveryConsumer<S> {
         // payload (issue #954).
         //
         // The payload keeps ids only. `outbox_messages.payload` is plaintext `jsonb`, and
-        // while migration 0102 grants DELETE and a reaper exists in Rust
-        // (`OutboxRepo::reap_dead_lettered`), two facts make an identifier written there
-        // effectively permanent: `dead_letter_retention_secs`
-        // defaults to 0, which means KEEP, and the dead-letter tail is exactly where a failed
-        // delivery comes to rest; and neither reaper DELETE carries a subject predicate, so
-        // no erasure request can ever reach one person's rows. Meanwhile `users.identifier`
+        // an identifier written there is out of reach of an erasure request whatever else
+        // happens to the row: `OutboxRepo::reap_completed` and `OutboxRepo::reap_dead_lettered`
+        // both key on a time window and the scope, so neither can be pointed at one person.
+        // A delivered announcement is at least reaped eventually, on
+        // `completed_retention_secs`; a FAILED one comes to rest in the dead-letter tail,
+        // where `dead_letter_retention_secs` defaults to 0, which means KEEP.
+        //
+        // Meanwhile `users.identifier`
         // is sealed by migration 0028 under the scope's envelope DEK, one per (tenant,
         // environment) and versioned, with each row recording the version that sealed it. So
         // writing it in the clear one table over would undo that seal, and would put it beyond
@@ -166,8 +174,10 @@ impl<S: WebhookSender> FlowTargetDeliveryConsumer<S> {
         // string already proves `data` is an object -- and an unreachable arm is a label an
         // operator can never see. Holding it also keeps both refusals honest: an earlier
         // revision wrote the enrichment under an `if let`, which turned a shape this consumer
-        // cannot read into a silently unenriched delivery, indistinguishable at the receiver
-        // from a subject that genuinely has no traits.
+        // cannot read into a delivery carrying NEITHER resolved field, POSTed as a success
+        // with no failure label. That is the pre-#954 envelope, shipped silently, which is a
+        // sharper reason for the single mutable lookup than any comparison with a subject
+        // that merely has no traits: that one still carries `identifier`.
         //
         // The borrow is of `*body` and the reads below borrow `self`, so they do not conflict.
         let Some(data) = body
@@ -198,20 +208,23 @@ impl<S: WebhookSender> FlowTargetDeliveryConsumer<S> {
                 //
                 // The full document is right for a management read (`users::get_user_traits`)
                 // and for the flow evaluator (`flow::eval_ctx`), and both say so at the call
-                // site. Not every reader in the tree does: `flow::profiling`'s plan path takes
-                // the full document and states nothing, while its own submit path states the
-                // opposite choice two hundred lines below it. The evaluator's stated reason is that the value "never
-                // reaches the end user" and "the only place it is serialized is the journey
-                // REPLAY transcript, an operator and CI artifact". That is exactly the reason
-                // this call site cannot borrow: here the document is serialized into an HTTP
-                // body and POSTed off-platform to whatever endpoint a target names.
+                // site. The evaluator's stated reason is that the value "never reaches the end
+                // user" and "the only place it is serialized is the journey REPLAY transcript,
+                // an operator and CI artifact". That is exactly the reason this call site
+                // cannot borrow: here the document is serialized into an HTTP body and POSTed
+                // off-platform to whatever endpoint a target names.
                 //
                 // So the annotation is honoured. An operator marking a field admin-only has
                 // declared it is not for wider circulation, and a third-party integration is
-                // wider circulation than the management API they marked it against. It also
-                // fails in the safe direction: with no active schema there are no annotations
-                // to read, and the full document is then also the correct answer, because
-                // nothing has been declared admin-only.
+                // wider circulation than the management API they marked it against.
+                //
+                // The projection has two ways of not reading annotations and they resolve
+                // differently. NO ACTIVE SCHEMA returns the whole document, which is safe
+                // because with none nothing has been declared admin-only. An active schema
+                // that will NOT COMPILE is an error: the annotations are what say which fields
+                // to withhold, so being unable to read them is a reason to refuse. It used to
+                // return the unredacted document there, which this change fixes, because that
+                // fallback stopped being in-process the moment this call site existed.
                 //
                 // RETRYABLE on error rather than absorbed. Swallowing the read would deliver
                 // a body saying this person has no traits, which a receiver cannot tell from
@@ -219,14 +232,31 @@ impl<S: WebhookSender> FlowTargetDeliveryConsumer<S> {
                 // would land as durable wrong data on the far side. `Ok(None)` is different
                 // and is the honest answer: the subject genuinely carries no traits document,
                 // and the key is then absent rather than null.
-                let Ok(traits) = self
+                let traits = match self
                     .store
                     .scoped(scope)
                     .users()
                     .traits_user_visible(&subject_id)
                     .await
-                else {
-                    return Err(ConsumerError::retryable("subject_traits_read_failed"));
+                {
+                    Ok(found) => found,
+                    // PERMANENT, on the same reasoning the disabled-target arm gives below.
+                    // A schema that will not compile stays that way until an operator
+                    // activates a replacement, since activation is the only writer of
+                    // `trait_schemas.status` and the table has no DELETE grant. Retrying it
+                    // would hold the head of this target's ordering group for the whole
+                    // fourteen-attempt schedule, whose tail runs in ten-hour steps, and every
+                    // later delivery to the target waits behind it, including ones for
+                    // subjects that would have succeeded. A dead letter is terminal, blocks
+                    // nothing, and is replayable once a compiling schema is active.
+                    //
+                    // This is why the error is matched rather than discarded: the store
+                    // distinguishes an operator-repairable misconfiguration from a database
+                    // outage, and collapsing both into one classification throws that away.
+                    Err(ironauth_store::StoreError::SchemaMalformed(_)) => {
+                        return Err(ConsumerError::permanent("subject_traits_schema_malformed"));
+                    }
+                    Err(_) => return Err(ConsumerError::retryable("subject_traits_read_failed")),
                 };
                 data.insert(
                     "identifier".to_owned(),
@@ -247,10 +277,13 @@ impl<S: WebhookSender> FlowTargetDeliveryConsumer<S> {
             // Not retryable, because a deleted account does not come back and fourteen
             // attempts would delay every later delivery on this ordering key. Not a permanent
             // ERROR either, because nothing is broken: the operator deleted a user, which is
-            // allowed. Discarding is also the only privacy-correct answer, and it is the
-            // reason this arm matters rather than being tidiness. If the deletion was an
-            // erasure request, sending that person's identifier to a third party afterwards
-            // is precisely what erasure was supposed to prevent.
+            // allowed. What the privacy argument rules out is DELIVERING, not the other two
+            // classifications: retrying and failing both also POST nothing, because this
+            // returns before the identifier is ever inserted. It is still the reason the arm
+            // matters rather than being tidiness. If the deletion was an erasure request,
+            // sending that person's identifier to a third party afterwards is precisely what
+            // erasure was supposed to prevent, and resolving at delivery time is what makes
+            // refusing possible at all: a body built at enqueue would already hold it.
             //
             // Same shape as the [`FlowTargetDelivery::Absent`] arm in `deliver_one`, for the
             // same reason.

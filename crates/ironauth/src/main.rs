@@ -2888,14 +2888,17 @@ async fn spawn_flow_target_delivery_pools(
         );
         return Vec::new();
     };
-    // Refusing to start beats starting a worker that cannot sign. Without a master key every
-    // signed target's secret read fails at the unseal, so each message would burn its whole
-    // attempt budget and dead-letter, turning a missing configuration value into permanently
-    // discarded deliveries.
+    // Refusing to start beats starting a worker that cannot compose a delivery. Without a
+    // master key three sealed reads fail at the unseal: the target's signing secret, and since
+    // issue #954 the subject's identifier and trait document on EVERY delivery. So each
+    // message would burn its whole attempt budget and dead-letter, turning a missing
+    // configuration value into permanently discarded deliveries. An unsigned target used to be
+    // exempt and no longer is.
     let Some(master) = master else {
         tracing::error!(
-            "flow-target delivery worker not started: database.master_key is unset, so a \
-             target's sealed signing secret cannot be opened and no delivery could be signed. \
+            "flow-target delivery worker not started: database.master_key is unset, so the \
+             subject's sealed identifier cannot be opened and no delivery could be composed. \
+             This applies to UNSIGNED targets too, which also carry the subject's details. \
              The queue is durable; set database.master_key to drain it."
         );
         return Vec::new();

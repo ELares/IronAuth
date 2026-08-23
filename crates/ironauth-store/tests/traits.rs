@@ -1401,9 +1401,9 @@ async fn traits_imported_without_a_schema_version_read_back_rather_than_panickin
     // with no schema registry produces. `admin_create` validates nothing and stores it
     // verbatim, so such a row is reachable through a supported surface, not only by hand.
     //
-    // Reading it back used to decode the column as a bare `i32` and PANIC. The one other read
-    // of this column, the export projection feeding `UserExportRecord`, already decoded it as
-    // `Option<i32>`; this was the outlier.
+    // Reading it back used to decode the column as a bare `i32` and PANIC. The only other
+    // place the repository decodes this column, the export projection feeding
+    // `UserExportRecord`, already used `Option<i32>`; this was the outlier.
     //
     // A panic is worse than an error even where it is contained. The async flow-target
     // consumer reads traits on every delivery (issue #954), and the outbox catches a consumer
@@ -1459,5 +1459,90 @@ async fn traits_imported_without_a_schema_version_read_back_rather_than_panickin
     assert_eq!(
         round_tripped, doc,
         "and the document itself is intact: the missing version is the only thing missing"
+    );
+}
+
+#[tokio::test]
+async fn an_active_schema_that_no_longer_compiles_refuses_the_redaction_rather_than_disclosing() {
+    // The user-visible projection FAILS CLOSED when the active schema will not compile.
+    //
+    // This branch is reachable without anyone doing anything wrong. A schema is compiled when
+    // it is written and again when it is activated, and never afterwards, while
+    // `check_schema_wellformed` has been tightened since: it now refuses `x-ironauth` anywhere
+    // but a top-level property. A row activated under the looser checker stays active, because
+    // nothing demotes an active version without promoting another and the table carries no
+    // DELETE grant, and it stops compiling. The fixture reproduces that end state by writing
+    // the row directly, which is the only way to reach it now that the write path compiles.
+    //
+    // The direction matters more than the branch. Returning the document unredacted was the
+    // old behaviour, and for a REDACTION that is the unsafe answer: the annotations are what
+    // say which fields to withhold, so being unable to read them is a reason to refuse rather
+    // than to disclose. It became urgent when this projection gained a caller that POSTs the
+    // result to a third-party endpoint (issue #954); before that its readers were in-process.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x53);
+    let scope = db.seed_scope(&env).await;
+    let user = create_user(&db, &env, scope, "carried@example.test").await;
+
+    // Both halves have to be real: a genuine sealed traits document carrying an admin-only
+    // field, and a genuine non-compiling active schema. So seed through a schema that DOES
+    // compile, then swap the active row for one that does not.
+    let v1 = create_schema(
+        &db,
+        &env,
+        scope,
+        r#"{"type":"object","properties":{"name":{"type":"string"},"risk_score":{"type":"integer","x-ironauth":{"visibility":"admin"}}}}"#,
+    )
+    .await;
+    activate_schema(&db, &env, scope, v1)
+        .await
+        .expect("activate the compiling schema");
+    set_traits(
+        &db,
+        &env,
+        scope,
+        &user,
+        r#"{"name":"Zeke","risk_score":97}"#,
+    )
+    .await
+    .expect("seed the traits under a compiling schema");
+
+    // Sanity: while the schema compiles, the admin-only field IS stripped. Without this the
+    // assertion below could pass because the projection is broken in some other way.
+    let visible = db
+        .store()
+        .scoped(scope)
+        .users()
+        .traits_user_visible(&user)
+        .await
+        .expect("the read succeeds while the schema compiles")
+        .expect("the traits are present");
+    assert_eq!(
+        visible,
+        json!({"name": "Zeke"}),
+        "the compiling case strips the admin-only field"
+    );
+
+    // Now the carried-forward row: annotation nested below a top-level property, which the
+    // current checker refuses and an older one accepted.
+    sqlx::query("UPDATE trait_schemas SET schema_json = $1 WHERE tenant_id = $2 AND environment_id = $3 AND status = 'active'")
+        .bind(r#"{"type":"object","properties":{"name":{"type":"object","properties":{"inner":{"type":"string","x-ironauth":{"visibility":"admin"}}}}}}"#)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("carry forward a schema the current checker refuses");
+
+    let err = db
+        .store()
+        .scoped(scope)
+        .users()
+        .traits_user_visible(&user)
+        .await
+        .expect_err("a redaction that cannot read its annotations must refuse");
+    assert!(
+        matches!(err, StoreError::SchemaMalformed(_)),
+        "and it refuses AS a schema fault rather than a generic one, which is what lets a \
+         caller tell an operator-repairable misconfiguration from a database outage: {err:?}"
     );
 }

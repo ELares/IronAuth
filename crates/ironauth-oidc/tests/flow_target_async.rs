@@ -511,10 +511,12 @@ async fn the_identifier_and_traits_are_never_written_to_the_payload_column() {
     // Why the column matters more than it looks: `outbox_messages.payload` is plaintext
     // `jsonb` sitting one table over from `users.identifier`, which migration 0028 seals
     // under the scope's envelope DEK. Writing the identifier here in the clear would undo
-    // that seal for every signup. The row is also effectively permanent, for two reasons:
-    // `dead_letter_retention_secs` defaults to 0, meaning KEEP, and the dead-letter tail is
-    // where a failed delivery comes to rest; and neither reaper DELETE carries a subject
-    // predicate, so no erasure request can reach one person's rows.
+    // that seal for every signup, and it would be out of reach of an erasure request whatever
+    // else became of the row: `reap_completed` and `reap_dead_lettered` both key on a time
+    // window and the scope, so neither can be pointed at one person. A delivered announcement
+    // is at least reaped eventually; a FAILED one comes to rest in the dead-letter tail, where
+    // `dead_letter_retention_secs` defaults to 0, meaning KEEP.
+    //
     // The subject must actually CARRY traits, or the traits half of this test asserts nothing.
     // The legacy door reaches the bare `register` family, which passes `traits: None`, so a
     // fixture built on it would satisfy `!contains("traits")` with an empty document and would

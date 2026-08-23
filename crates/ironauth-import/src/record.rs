@@ -63,8 +63,11 @@ pub struct ImportRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traits: Option<serde_json::Value>,
     /// The trait-schema version the `traits` document was last validated against in
-    /// the source instance (issue #58), preserved verbatim, or [`None`] when there
-    /// are no traits.
+    /// the source instance (issue #58), preserved verbatim, or [`None`] in either of two
+    /// cases: the record carries no traits, or it carries traits whose source recorded no
+    /// version. The second is the ordinary shape for an export out of a system with no
+    /// schema registry, and it is preserved rather than invented, so a reader of the
+    /// imported identity gets `None` back for the version and a document beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traits_schema_version: Option<i32>,
     /// The password hash in a canonical algorithm-tagged string, or [`None`] for a

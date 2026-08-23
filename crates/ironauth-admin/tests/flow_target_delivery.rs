@@ -2037,9 +2037,9 @@ async fn a_subject_deleted_before_the_delivery_drained_is_discarded_not_announce
 #[tokio::test]
 async fn a_body_whose_subject_cannot_be_read_is_permanent_and_never_sent() {
     // The subject read's three PERMANENT refusals, each on its own fixture. They sit one
-    // layer in from the sibling test above: those payloads fail before the target is even
-    // looked up, while these have a registered target and a well formed envelope, and break
-    // only at the field the enrichment needs.
+    // layer in from `a_payload_this_consumer_cannot_read_is_permanent_rather_than_retried`:
+    // those payloads fail before the target is even looked up, while these have a registered
+    // target and a well formed envelope, and break only at the field the enrichment needs.
     //
     // Each fixture is named by what it REACHES, because the refusals are ordered and an
     // earlier one masks a later one:
@@ -2155,4 +2155,80 @@ async fn an_admin_only_trait_is_not_delivered_to_a_third_party() {
     // base64url characters over an alphabet that includes the digits, so searching it for a
     // two-digit literal fails by chance often enough to read as a leak when nothing leaked.
     assert!(!body.contains("9731597"), "nor its value: {body}");
+}
+
+#[tokio::test]
+async fn a_subject_whose_trait_schema_will_not_compile_dead_letters_rather_than_blocking() {
+    // The fail-closed redaction, seen from the consumer, and the classification it gets.
+    //
+    // PERMANENT rather than retryable, on the same reasoning the disabled-target arm gives: a
+    // schema that will not compile stays that way until an operator activates a replacement,
+    // so retrying holds the head of this target's ordering group for the whole
+    // fourteen-attempt schedule while every later delivery to the target waits behind it. A
+    // dead letter is terminal, blocks nothing, and is replayable.
+    //
+    // Reaching this arm needs a non-compiling ACTIVE schema, which the write path will not
+    // produce, so the row is planted directly. That is the same end state a real deployment
+    // reaches by carrying an older schema forward across a tightening of the well-formedness
+    // check, which is what makes the arm worth having rather than defensive.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    activate_trait_schema(&h, &tenant, &environment, "k-schema").await;
+    let subject = seed_subject(
+        &h,
+        &tenant,
+        &environment,
+        "stranded@example.test",
+        Some(r#"{"tier":"gold"}"#),
+    )
+    .await;
+    let target = register_target(&h, &tenant, &environment, "k-t1", "crm", None).await;
+
+    // Annotation nested below a top-level property: accepted by an older checker, refused by
+    // the current one.
+    sqlx::query(
+        "UPDATE trait_schemas SET schema_json = $1 \
+         WHERE tenant_id = $2 AND environment_id = $3 AND status = 'active'",
+    )
+    .bind(
+        r#"{"type":"object","properties":{"tier":{"type":"object","properties":{"inner":{"type":"string","x-ironauth":{"visibility":"admin"}}}}}}"#,
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .execute(h.db().owner_pool())
+    .await
+    .expect("carry forward a schema the current checker refuses");
+
+    let sender = RecordingSender::accepting();
+    let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
+    let error = consumer
+        .handle(
+            &Env::system(),
+            scope_of(&tenant, &environment),
+            &queued(
+                &target,
+                "ftg_delivery_1",
+                false,
+                &signup_body(&target, &subject),
+            ),
+        )
+        .await
+        .expect_err("a redaction that cannot read its annotations must not deliver");
+
+    assert_eq!(
+        error.label(),
+        "subject_traits_schema_malformed",
+        "the label names the schema, so an operator reading a dead letter knows to fix the \
+         schema rather than to look for a database fault"
+    );
+    assert!(
+        !error.is_retryable(),
+        "and it is PERMANENT: another attempt reads the same stored schema, so retrying only \
+         holds the ordering group"
+    );
+    assert!(
+        sender.recorded().is_empty(),
+        "nothing is POSTed: the whole point of failing closed is that the document does not \
+         leave while its annotations are unreadable"
+    );
 }
