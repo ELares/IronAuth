@@ -37744,6 +37744,26 @@ impl ActingInvitationRepo<'_> {
     /// concurrent request already stored this Idempotency-Key;
     /// [`StoreError::Encryption`] if no master key is configured;
     /// [`StoreError::Database`] on a persistence failure.
+    ///
+    /// # Announcement
+    ///
+    /// Does NOT announce to async flow targets (issue #953), and this is an OPEN GAP rather
+    /// than a decision, recorded so a reader can tell the two apart.
+    ///
+    /// This is the third account-creating door, alongside `register_inner` and
+    /// `admin_create`. It reaches `insert_admin_user_row` directly rather than through
+    /// `admin_create`, so nothing about that function's rationale covers it. The invitee's
+    /// later ACCEPT, which activates the account and sets the credential, is equally silent:
+    /// the only production call to `enqueue_async_delivery` lives in `register_inner`.
+    ///
+    /// Whether an invitation should announce is a genuine product question rather than a
+    /// wiring oversight. The create is an operator act, like the management create-user
+    /// route, but the ACCEPT is the invitee completing their own account, which is much
+    /// closer to a signup. Announcing wants an `origin` of its own and a decision about which
+    /// of the two moments a receiver should hear about.
+    ///
+    /// Note the `invitation.created` event nearby is a WEBHOOK domain event on a different
+    /// queue with a different consumer, so it does not make this path announced.
     pub async fn create_with_user(
         &self,
         env: &Env,
