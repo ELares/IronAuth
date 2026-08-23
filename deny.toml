@@ -51,7 +51,28 @@ yanked = "deny"
 # only options are ignore-with-justification or vendoring keygen; the former is
 # correct given the path is unreachable. The dep-review lens MUST re-confirm the
 # `rsa` crate is never used to decrypt or sign before this ignore is trusted.
-ignore = [{ id = "RUSTSEC-2023-0071", reason = "rsa crate used only for RS256 keygen + DER export (crates/ironauth-jose); never decrypts or signs, so the Marvin decryption-timing path is unreachable. Signing/verification is on ring." }]
+# Scoped advisory ignore (issue #959). RUSTSEC-2026-0009 is a stack-exhaustion DoS
+# in `time`'s parser, fixed in 0.3.47. This tree holds `time` at 0.3.41 and cannot
+# take the fix: 0.3.47 declares `rust-version = "1.88"` and this workspace promises
+# 1.85, so the two constraints are mutually exclusive until the MSRV moves.
+#
+# The path is UNREACHABLE in anything shipped. `cargo tree -i time --all-features`
+# shows exactly one route into the graph: rcgen -> ironauth-fetch. rcgen is an
+# OPTIONAL dependency enabled only by ironauth-fetch's non-default `test-harness`
+# feature, which exists so a test can mint a throwaway TLS identity. No default
+# build of any crate in this workspace reaches `time` at all, so no released binary
+# links the vulnerable parser, and nothing parses attacker-supplied input with it:
+# rcgen uses it to stamp certificate validity dates on material generated in-process
+# by the test itself.
+#
+# Re-confirm before trusting this ignore: `cargo tree -i time --all-features` must
+# still show rcgen as the only path, and rcgen must still be optional and
+# test-harness-gated in crates/ironauth-fetch/Cargo.toml. If either changes, or if
+# the MSRV moves to 1.88, drop this entry and take time >= 0.3.47.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa crate used only for RS256 keygen + DER export (crates/ironauth-jose); never decrypts or signs, so the Marvin decryption-timing path is unreachable. Signing/verification is on ring." },
+    { id = "RUSTSEC-2026-0009", reason = "time 0.3.41 reaches the graph ONLY through rcgen, an optional dependency behind ironauth-fetch's non-default test-harness feature; no default build links it, so the parser DoS is unreachable in any released artifact. The fix (0.3.47) requires rustc 1.88 against this workspace's 1.85 MSRV promise." },
+]
 
 [sources]
 unknown-registry = "deny"
