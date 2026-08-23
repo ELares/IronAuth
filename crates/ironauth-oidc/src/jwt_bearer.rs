@@ -102,8 +102,8 @@ use ironauth_store::{
 use serde_json::Value;
 
 use crate::client_auth::{
-    self, ASYMMETRIC_ALGS, ClientAuthError, ClientAuthInputs, parse_presented,
-    peek_assertion_header,
+    self, ASYMMETRIC_ALGS, AssertionReject, ClientAuthError, ClientAuthInputs,
+    map_assertion_reject, parse_presented, peek_assertion_header,
 };
 use crate::client_credentials::{M2mScopeRefusal, load_scope_policy, validate_m2m_scope};
 use crate::error::TokenError;
@@ -396,9 +396,7 @@ async fn validate_and_map(
         skew,
         state.env().clock(),
     )
-    .ok_or(JwtBearerError::Reject(
-        ClientAuthDiagnosticReason::AssertionInvalid,
-    ))?;
+    .map_err(|reject| JwtBearerError::Reject(map_assertion_reject(&reject)))?;
 
     // RFC 7523 3: `sub` and `exp` are REQUIRED. A missing or empty `sub` is invalid.
     //
@@ -666,8 +664,14 @@ async fn fence_mapped_principal(
 /// enforced within `skew`; the algorithm must be in `algorithms` (which excludes
 /// ES512 and never reads the token's own header). Returns the full [`VerifiedToken`]
 /// on success (so the caller can read the `sub`, `exp`, `jti`, and any claim the
-/// mapping gate pins), or `None` on any failure (uniform). Pure and synchronous: key
-/// resolution and the jti recording are the caller's async concerns.
+/// mapping gate pins), or the TERMINAL [`AssertionReject`] on failure so the caller can map
+/// it to a specific diagnostic reason (issue #126). The WIRE decision is unchanged: the caller
+/// collapses ANY `Err` into the opaque `invalid_grant`, so the sharper reject reaches the
+/// operator's out-of-band record and never a caller.
+///
+/// An audience mismatch under one candidate is not terminal, because the next acceptable
+/// audience may match; exhausting them all is, and that is what the final `Err` reports. Pure
+/// and synchronous: key resolution and the jti recording are the caller's async concerns.
 fn verify_external_assertion(
     assertion: &str,
     keys: &[TrustedKey],
@@ -676,9 +680,15 @@ fn verify_external_assertion(
     audiences: &[String],
     skew: Duration,
     clock: &dyn ironauth_env::Clock,
-) -> Option<VerifiedToken> {
+) -> Result<VerifiedToken, AssertionReject> {
+    // The REASON, not just the failure. Every refusal here used to collapse into one
+    // `None`, so an operator reading the diagnostics could not tell a stale JWKS from an
+    // audience mismatch from a bad signature -- which is issue #126's error-handling
+    // criterion, and the sibling `private_key_jwt` path has answered it since #91 with the
+    // classifier this now shares. The wire response is unchanged and stays opaque; only the
+    // out-of-band record gets sharper.
     if keys.is_empty() || algorithms.is_empty() || audiences.is_empty() {
-        return None;
+        return Err(AssertionReject::NoUsableKey);
     }
     for audience in audiences {
         // An RFC 7523 assertion from an external issuer, signed with ITS keys. RFC 7523
@@ -698,18 +708,20 @@ fn verify_external_assertion(
             audience.clone(),
             ExpectedTyp::ForeignIssuer,
         ) else {
-            return None;
+            return Err(AssertionReject::NoUsableKey);
         };
         let policy = policy.with_skew(skew);
         match verify(assertion, &policy, clock) {
-            Ok(verified) => return Some(verified),
+            Ok(verified) => return Ok(verified),
             // An audience mismatch under one acceptable audience just means try the
             // next; any other failure is a hard, uniform rejection.
             Err(error) if error.reason() == RejectReason::AudienceMismatch => {}
-            Err(_) => return None,
+            Err(error) => return Err(AssertionReject::Jose(error.reason())),
         }
     }
-    None
+    // Every acceptable audience was tried and none matched, so THIS is the terminal
+    // audience mismatch rather than one more candidate to skip.
+    Err(AssertionReject::Jose(RejectReason::AudienceMismatch))
 }
 
 /// Intersect the deployment's shared audience policy with this issuer's allowlist.
@@ -1023,19 +1035,27 @@ mod tests {
     fn verify_with_no_keys_fails_closed() {
         // A keyless issuer is rejected at registration, but if one somehow reached
         // here, verification fails CLOSED: no key means no acceptance.
+        //
+        // An UNRESOLVABLE key source, which is narrower than a stale one. A stale set is not
+        // empty (an inline `jwks` always resolves, and a failed refetch falls back to the
+        // still valid cached set), so a rotation reaches the verifier and is diagnosed as
+        // `assertion_kid_unknown`. This path is the empty set, and `map_assertion_reject`
+        // still folds it into the coarse `assertion_invalid` an operator reads. What the seam
+        // distinguishes is what a dedicated diagnostic would build on, and that would mean
+        // adding to a vocabulary published in the OpenAPI document.
         let clock = ironauth_env::ManualClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let rejected = verify_external_assertion(
+            "aGVhZGVy.cGF5.c2ln",
+            &[],
+            ASYMMETRIC_ALGS,
+            "https://issuer.test",
+            &["https://issuer.test".to_owned()],
+            Duration::from_secs(60),
+            &clock,
+        );
         assert!(
-            verify_external_assertion(
-                "aGVhZGVy.cGF5.c2ln",
-                &[],
-                ASYMMETRIC_ALGS,
-                "https://issuer.test",
-                &["https://issuer.test".to_owned()],
-                Duration::from_secs(60),
-                &clock,
-            )
-            .is_none(),
-            "an empty key set fails closed"
+            matches!(rejected, Err(AssertionReject::NoUsableKey)),
+            "an empty key set fails closed, and says why"
         );
     }
 

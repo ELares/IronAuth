@@ -752,7 +752,7 @@ enum AssertionAuthError {
 /// analogue of the JOSE [`RejectReason`] plus the two failures that arise OUTSIDE the
 /// verifier (no usable key, or a post-verify claim rule). Mapped to a
 /// [`ClientAuthDiagnosticReason`] for the record; never reaches the wire.
-enum AssertionReject {
+pub(crate) enum AssertionReject {
     /// The JOSE verifier rejected the assertion with this structural reason.
     Jose(RejectReason),
     /// No usable verification key was available (an empty JWKS, an unresolved
@@ -785,7 +785,7 @@ struct AssertionDiagnostic {
 /// structure, a claims-shape problem, an `iss` mismatch, a missing claim, no usable
 /// key, or a post-verify claim rule) fall to the coarse `AssertionInvalid`, exactly
 /// as before. The wire response is byte-identical regardless of which reason this is.
-fn map_assertion_reject(reject: &AssertionReject) -> ClientAuthDiagnosticReason {
+pub(crate) fn map_assertion_reject(reject: &AssertionReject) -> ClientAuthDiagnosticReason {
     match reject {
         AssertionReject::Jose(reason) => match reason {
             RejectReason::SignatureInvalid | RejectReason::KeyTypeMismatch => {

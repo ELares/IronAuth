@@ -11928,11 +11928,14 @@ pub enum ClientAuthDiagnosticReason {
     /// A JWT assertion's `aud` matched none of the acceptable audiences after every
     /// one was tried (issue #91): the terminal audience mismatch.
     AssertionAudienceMismatch,
-    /// A JWT assertion's header `kid` names no trusted key in the client's
-    /// registered JWKS (issue #91).
+    /// A JWT assertion's header `kid` names no trusted key in the JWKS it was verified
+    /// against: the presenting client's registered set (issue #91), or an external
+    /// issuer's resolved set on the federated grant (issue #126).
     AssertionKidUnknown,
-    /// A JWT assertion's `alg` was `none`, unsupported, or not in the client's
-    /// registered signing-algorithm allowlist (issue #91).
+    /// A JWT assertion's `alg` was `none`, unsupported, or outside the allowlist it was
+    /// judged against: the presenting client's registered set (issue #91), or an external
+    /// issuer's `signing_alg_allow` pin on the federated grant (issue #126). An operator
+    /// reading this needs to know WHICH allowlist, so the two producers are named.
     AssertionAlgorithmDisallowed,
     /// A JWT assertion's `jti` was replayed (already used).
     ReplayedJti,

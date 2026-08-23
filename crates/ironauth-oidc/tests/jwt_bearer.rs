@@ -256,7 +256,7 @@ async fn a_disabled_issuer_is_rejected() {
 #[tokio::test]
 async fn a_bad_signature_is_rejected_with_invalid_grant_and_a_diagnostic() {
     // AC2: an assertion signed with the WRONG key (the registered JWKS holds a
-    // different public key) is invalid_grant with an assertion_invalid diagnostic.
+    // different public key) is invalid_grant with an assertion_bad_signature diagnostic.
     let h = Harness::start().await;
     let client_id = seed_trust(&h).await;
     let asrt = assertion(
@@ -274,15 +274,17 @@ async fn a_bad_signature_is_rejected_with_invalid_grant_and_a_diagnostic() {
         h.client_auth_diagnostics(&client_id)
             .await
             .iter()
-            .any(|d| d.failure_reason == "assertion_invalid"),
-        "a bad signature is diagnosed"
+            .any(|d| d.failure_reason == "assertion_bad_signature"),
+        "a bad signature is diagnosed AS a bad signature. It collapsed into the coarse \
+         `assertion_invalid` until the federated path started sharing the classifier its \
+         `private_key_jwt` sibling has used since #91."
     );
 }
 
 #[tokio::test]
 async fn an_expired_assertion_is_rejected_with_invalid_grant_and_a_diagnostic() {
     // AC2: an expired assertion (exp before now-skew, at the frozen epoch clock) is
-    // invalid_grant with an assertion_invalid diagnostic.
+    // invalid_grant with an assertion_expired diagnostic.
     let h = Harness::start().await;
     let client_id = seed_trust(&h).await;
     let asrt = assertion(
@@ -300,8 +302,9 @@ async fn an_expired_assertion_is_rejected_with_invalid_grant_and_a_diagnostic() 
         h.client_auth_diagnostics(&client_id)
             .await
             .iter()
-            .any(|d| d.failure_reason == "assertion_invalid"),
-        "an expired assertion is diagnosed"
+            .any(|d| d.failure_reason == "assertion_expired"),
+        "an expired assertion is diagnosed AS expired, which is what tells an operator to \
+         look at a clock rather than at key material"
     );
 }
 
@@ -1175,8 +1178,8 @@ async fn the_exp_skew_boundary_is_accepted_and_one_second_past_is_rejected() {
         h.client_auth_diagnostics(&client_id)
             .await
             .iter()
-            .any(|d| d.failure_reason == "assertion_invalid"),
-        "the past-boundary expiry is diagnosed as an invalid assertion"
+            .any(|d| d.failure_reason == "assertion_expired"),
+        "the past-boundary expiry is diagnosed as EXPIRED rather than as the coarse bucket"
     );
 }
 
@@ -3402,4 +3405,283 @@ async fn a_kubernetes_projected_token_exchanges_under_the_mapped_identity() {
         "another service account in the same namespace must be refused: {body}"
     );
     assert_eq!(json(&body)["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn a_per_issuer_algorithm_pin_refuses_an_algorithm_the_deployment_otherwise_accepts() {
+    // Issue #126 criterion 3, the algorithm clause, driven at the LIVE endpoint.
+    //
+    // `allowed_algs` has unit tests over the record, but nothing registered an issuer with a
+    // pin and presented an assertion at `/token`. The two are different claims: the unit test
+    // says the narrowing function computes the right set, and this says the set it computes is
+    // the one `verify_external_assertion` is actually handed. A pin parsed correctly and then
+    // dropped on the floor passes the first and fails this.
+    //
+    // The assertion here is signed with EdDSA, which this deployment accepts by default and
+    // every other test in this file relies on. The pin names ES256 instead, so the refusal is
+    // specifically the ISSUER's narrowing rather than an algorithm the core cannot verify or a
+    // signature that does not check out. Both of those have their own tests, and an
+    // unsupported-algorithm fixture would be refused by the shared floor whether the pin
+    // worked or not.
+    let h = Harness::start().await;
+    let jwks = jwks_json(&issuer_key());
+    h.register_external_issuer(EXTERNAL_ISSUER, Some(&jwks), None, Some("ES256"), true)
+        .await;
+    h.create_subject_mapping(
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        None,
+        None,
+        MAPPED_PRINCIPAL,
+    )
+    .await;
+    let client_id = h.client_id().to_string();
+    let asrt = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-alg-pinned-out",
+    );
+
+    let (status, _h, body) = present(&h, &client_id, &asrt).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        json(&body)["error"],
+        "invalid_grant",
+        "the wire error is the opaque one every assertion refusal uses, so the pin is not an \
+         oracle for which algorithms an issuer allows: {body}"
+    );
+    // The PRECISE reason, not the coarse catch-all. An algorithm refused by this issuer's pin
+    // is `assertion_algorithm_disallowed`, which is what makes the diagnostic actionable: an
+    // operator seeing it knows to look at the pin rather than at the key material, the clock,
+    // or the audience. Before the federated path shared the classifier its `private_key_jwt`
+    // sibling has used since #91, every refusal here collapsed into `assertion_invalid`.
+    assert!(
+        h.client_auth_diagnostics(&client_id)
+            .await
+            .iter()
+            .any(|d| d.failure_reason == "assertion_algorithm_disallowed"),
+        "the diagnostic names the pin as the cause: {:?}",
+        h.client_auth_diagnostics(&client_id)
+            .await
+            .iter()
+            .map(|d| d.failure_reason.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn the_same_assertion_is_accepted_once_the_pin_names_its_algorithm() {
+    // The positive control for the test above, and the reason that one means anything. A
+    // refusal assertion passes for any number of reasons that have nothing to do with the pin:
+    // a broken fixture, an unseeded mapping, a mistyped issuer. This drives the same fixture
+    // against an issuer whose only difference is a pin that includes EdDSA. The `jti` differs,
+    // because it must: the grant records single use, and reusing one would refuse as a replay
+    // and prove nothing about the pin. Every claim the pin decision reads is identical.
+    let h = Harness::start().await;
+    let jwks = jwks_json(&issuer_key());
+    h.register_external_issuer(
+        EXTERNAL_ISSUER,
+        Some(&jwks),
+        None,
+        Some("EdDSA ES256"),
+        true,
+    )
+    .await;
+    h.create_subject_mapping(
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        None,
+        None,
+        MAPPED_PRINCIPAL,
+    )
+    .await;
+    let client_id = h.client_id().to_string();
+    let asrt = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-alg-pinned-in",
+    );
+
+    let (status, _h, body) = present(&h, &client_id, &asrt).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a pin that NAMES the assertion's algorithm accepts it: {body}"
+    );
+}
+
+#[tokio::test]
+async fn each_federated_refusal_is_diagnosed_distinctly_behind_one_opaque_wire_error() {
+    // Issue #126's error-handling clause: unknown issuer, audience mismatch and unmapped
+    // subject each produce a DISTINCT audited failure, while the wire says the same thing
+    // every time.
+    //
+    // Both halves matter and they pull against each other. A caller must not be able to use
+    // the error to probe which issuers are registered or what audience a deployment expects,
+    // so the wire is uniformly `invalid_grant`. An operator debugging a broken federation
+    // needs to know which of those it is, so the out-of-band diagnostic is specific. A test
+    // that checked only the wire would pass on a system that diagnosed nothing, and one that
+    // checked only the diagnostics would pass on a system that leaked the reason to callers.
+    let h = Harness::start().await;
+    let jwks = jwks_json(&issuer_key());
+    h.register_external_issuer(EXTERNAL_ISSUER, Some(&jwks), None, None, true)
+        .await;
+    h.create_subject_mapping(
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        None,
+        None,
+        MAPPED_PRINCIPAL,
+    )
+    .await;
+    let client_id = h.client_id().to_string();
+    let key = issuer_key();
+
+    // An issuer nobody registered.
+    let unknown = assertion(
+        &key,
+        "https://unregistered.example",
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-unknown-iss",
+    );
+    // A registered issuer, but addressed to somewhere this deployment does not accept.
+    let wrong_audience = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        "https://not-this-deployment.example",
+        3600,
+        "jti-wrong-aud",
+    );
+    // A registered issuer and an acceptable audience, but a subject with no mapping.
+    let unmapped = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        "spiffe://cluster.test/ns/prod/sa/nobody",
+        h.issuer(),
+        3600,
+        "jti-unmapped-distinct",
+    );
+
+    // PER ATTEMPT, with a count delta. Collecting the whole trail into a set at the end and
+    // asserting the three reasons appear cannot tell one-reason-per-attempt from
+    // all-three-per-attempt: the set is the same either way. The delta is what pins that each
+    // refusal contributes exactly its own reason and nothing else, which is what "distinct"
+    // means here. A delta rather than the newest row because `for_client` orders by
+    // `occurred_at` and two attempts can land in the same microsecond.
+    for (asrt, expected) in [
+        (&unknown, "assertion_issuer_untrusted"),
+        (&wrong_audience, "assertion_audience_mismatch"),
+        (&unmapped, "assertion_subject_unmapped"),
+    ] {
+        let before = reason_counts(&h, &client_id).await;
+        let (status, _h, body) = present(&h, &client_id, asrt).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{expected}: {body}");
+        assert_eq!(
+            json(&body)["error"],
+            "invalid_grant",
+            "every refusal is the SAME opaque wire error, so the response is not an oracle \
+             for which issuers exist or which audiences are accepted: {expected}"
+        );
+
+        let after = reason_counts(&h, &client_id).await;
+        let added: Vec<(String, usize)> = after
+            .iter()
+            .filter(|(reason, count)| before.get(*reason).copied().unwrap_or(0) < **count)
+            .map(|(reason, count)| {
+                (
+                    reason.clone(),
+                    count - before.get(reason).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        assert_eq!(
+            added,
+            vec![(expected.to_owned(), 1)],
+            "this attempt added exactly its own reason and no other: {added:?}"
+        );
+    }
+}
+
+/// Every diagnostic reason recorded for `client_id`, counted.
+///
+/// A COUNT per reason rather than a set, so a caller can take a delta across one attempt. A
+/// set answers "did this reason ever appear", which is satisfied by an earlier attempt in the
+/// same harness and cannot see a second occurrence at all.
+async fn reason_counts(h: &Harness, client_id: &str) -> std::collections::BTreeMap<String, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for diagnostic in h.client_auth_diagnostics(client_id).await {
+        *counts.entry(diagnostic.failure_reason.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+#[tokio::test]
+async fn an_issuer_that_rotated_past_the_resolved_jwks_is_diagnosed_as_an_unknown_kid() {
+    // Issue #126's stale-JWKS clause, and the reason it is CLOSED rather than remaining.
+    //
+    // The canonical symptom is a rotation the resolved key set has not caught up with: the
+    // issuer signs with a new key while this deployment still holds the old one. That set is
+    // NOT empty, so it never reaches the no-usable-key path; it reaches the verifier, whose
+    // `select_keys` refuses a header `kid` that names none of the trusted keys, and the
+    // classifier records `assertion_kid_unknown`.
+    //
+    // Worth pinning because it is easy to reason about wrongly in both directions. An earlier
+    // revision of this PR's changelog said a stale JWKS still fell to the coarse bucket, which
+    // confuses "stale" (a non-empty set that no longer holds the signing key) with
+    // "unresolvable" (an empty set, which genuinely does fall to the coarse bucket and is the
+    // narrower residue). Only the second is still indistinct.
+    let h = Harness::start().await;
+    // The deployment holds the OLD key; the issuer has moved on to the new one. Different
+    // `kid`s, which is what makes this a rotation rather than a bad signature: with the same
+    // `kid` the verifier would select the key and fail the signature instead.
+    let held = issuer_key();
+    let rotated = SigningKey::ed25519_from_seed(Some("wk-2".to_owned()), &[9_u8; 32])
+        .expect("the issuer's rotated key");
+    h.register_external_issuer(EXTERNAL_ISSUER, Some(&jwks_json(&held)), None, None, true)
+        .await;
+    h.create_subject_mapping(
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        None,
+        None,
+        MAPPED_PRINCIPAL,
+    )
+    .await;
+    let client_id = h.client_id().to_string();
+    let asrt = assertion(
+        &rotated,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-rotated",
+    );
+
+    let (status, _h, body) = present(&h, &client_id, &asrt).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    let reasons: Vec<String> = h
+        .client_auth_diagnostics(&client_id)
+        .await
+        .iter()
+        .map(|d| d.failure_reason.clone())
+        .collect();
+    assert!(
+        reasons.contains(&"assertion_kid_unknown".to_owned()),
+        "a rotated-past key set is diagnosed as an unknown kid, which tells an operator to \
+         re-resolve the issuer's JWKS rather than to suspect the assertion: {reasons:?}"
+    );
+    assert!(
+        !reasons.contains(&"assertion_invalid".to_owned()),
+        "and NOT as the coarse bucket, which is what it recorded before this change: {reasons:?}"
+    );
 }
