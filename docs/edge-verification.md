@@ -43,15 +43,35 @@ Reproduce with one command:
 cd packages/ironauth-sdk && npm run bench
 ```
 
-Representative output, Node 24 on an arm64 laptop:
+Representative output, Node 24 on an arm64 laptop, captured on an OTHERWISE IDLE machine. That
+qualifier is load-bearing: a first attempt at this refresh was taken while a full test gate was
+running and reported p99s between two and five times higher (4.6x on EdDSA, 2.3x on each of the
+others), which would have published a degraded machine's numbers as the software's. The range
+rather than the worst row, because quoting only the 4.6x would be the same kind of hand-written
+number about a measurement that this page is being corrected for.
+
+THREE rows, one per algorithm the corpus accepts. An earlier revision listed two, because the
+corpus carried two accepted algorithms when it was written and has carried three since RS256 was
+added. The command derives its rows from the corpus, so the table and the corpus can disagree
+only in the direction of the table being stale.
 
 | Algorithm | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) | ops/s |
 |---|---|---|---|---|---|
-| EdDSA | 0.067 | 0.081 | 0.088 | 0.137 | ~14,500 |
-| ES256 | 0.080 | 0.103 | 0.150 | 0.271 | ~11,700 |
+| EdDSA | 0.067 | 0.080 | 0.087 | 0.227 | ~14,600 |
+| ES256 | 0.080 | 0.099 | 0.148 | 0.287 | ~11,900 |
+| RS256 | 0.053 | 0.066 | 0.122 | 0.497 | ~17,700 |
 
-Sub-millisecond at p99 for both, with EdDSA roughly 20 percent faster than ES256, which is the
-reason it is the default.
+Sub-millisecond at p99 for all three, with EdDSA roughly 20 percent faster than ES256 on
+throughput.
+
+RS256 leads on p50, p95 and throughput, and trails on p99 and max, so "fastest" depends on which
+column you read. Either way it is not a recommendation: this table measures VERIFICATION only,
+which is the cheap half of RSA, since a public exponent of 65537 makes the modular exponentiation
+short while signing cost, key size and token size all run the other way.
+
+Nothing on this page is a reason to change an environment's signing algorithm. An earlier
+revision of this sentence said EdDSA is the default BECAUSE it is fastest; nothing in the tree
+states a performance rationale for that default, and the table above no longer supports one.
 
 **These numbers are one machine, one runtime, one moment.** They reproduce on that machine and
 are not a claim about yours. The benchmark prints the runtime and platform with every run so a
@@ -73,20 +93,25 @@ signature verification, and claim validation.
 - **A fresh key cache per algorithm**, so one subject cannot inherit another's warm state.
 - **Percentiles, not a mean.** A p50 of 0.2 ms with a p99 of 40 ms is a bad verifier wearing a
   good average, and a mean would hide exactly what an edge operator cares about.
-- **One vector per algorithm.** The conformance corpus holds four accepted vectors but only two
-  distinct algorithms; timing all four would print near-identical rows and imply the table
-  measured more than it did.
+- **One vector per algorithm.** The conformance corpus holds five accepted vectors across three
+  distinct algorithms, so two of the five are a second EdDSA case. Timing all five would print
+  near-identical rows and imply the table measured more than it did.
 
 ## Correctness comes first
 
 Latency is the easy half. A verifier that is fast and wrong is worse than no verifier, so both
 the SDK core and the copy-paste snippet are judged against the same conformance corpus at
-`packages/ironauth-sdk/vectors/verify-vectors.json`: sixteen vectors, twelve of them refusals,
-including `alg: none`, an HS256 forgery keyed with the public key, a token signed by a
+`packages/ironauth-sdk/vectors/verify-vectors.json`: nineteen vectors, fourteen of them
+refusals, including `alg: none`, an HS256 forgery keyed with the public key, a token signed by a
 published-but-wrong key, and a sibling environment's issuer.
 
-Two implementations that agree on all sixteen are two implementations that agree. Every further
+Two implementations that agree on all nineteen are two implementations that agree. Every further
 verifier added under issue #118 runs the same corpus.
+
+These counts are CHECKED rather than remembered: `scripts/verify-vectors.sh` reads them out of
+the corpus and fails if this page disagrees. They had already drifted once, saying sixteen and
+twelve after the corpus grew, which is what a hand-written number beside a generated artifact
+does given time.
 
 The corpus is generated and gate-checked (`scripts/verify-vectors.sh`), because a conformance
 corpus is exactly the artifact that gets weakened under deadline: delete the `alg: none` vector
