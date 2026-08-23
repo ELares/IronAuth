@@ -491,6 +491,16 @@ jobs:
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
           EXPECT_CODE=334158 ./scripts/dev-otp-login.sh
+      # Issue #120 criterion 1: the HEADLESS login path, driven with no browser anywhere.
+      # The device grant's whole premise is a device that cannot open one, so a test that
+      # approves through a browser proves nothing about the case the flow exists for. This
+      # asserts the POLL SEQUENCE and not just the final token: `authorization_pending`
+      # before approval and a token after, which is the contract every RFC 8628 client is
+      # written against and which an end-state check alone would not notice breaking.
+      - name: Assert a complete headless device-code login
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          ./scripts/dev-device-login.sh
       # Issue #122 criterion 2: a from-scratch reference client, written from the published
       # spec and contract and NOT from the generated SDKs, passes the published conformance
       # suite against the emulator. It runs here because this job already builds the binary

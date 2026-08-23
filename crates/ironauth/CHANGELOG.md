@@ -6,6 +6,41 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The emulator's seeded client can now complete a device-code login, and a CI job proves it
+  headlessly (issue #120).** Two seed defects made that impossible rather than merely
+  undemonstrated, and both were invisible because nothing drove the flow.
+
+  `grant_types` was omitted from the seed INSERT, so the client took migration 0021's default of
+  `authorization_code` alone and `grant_types_allow_device` refused every device authorization
+  with `unauthorized_client`. The default is correct for a migration, which must not widen an
+  existing client's grants, and wrong for a seed whose purpose is exercising the flows.
+
+  `first_party` was likewise left at its `false` default, which classified the emulator's own
+  client as a THIRD party, and the admin-consent gate then refused with `access_denied` until an
+  operator pre-authorized it. In a single-tenant emulator the dev client is the operator's own by
+  construction, so third-party is the wrong classification rather than a safety margin: it blocks
+  the flows the emulator exists to demonstrate while protecting nobody.
+
+  **What the new job does not cover, measured rather than assumed:** it exercises the SERVER
+  side, not `ironauth login`. The CLI builds its endpoints by appending `/device_authorization`
+  and `/token` to `--issuer`, while both routes are served at the deployment ROOT and an
+  IronAuth issuer is scoped, so feeding the CLI the issuer this emulator prints answers HTTP
+  404. That is a real CLI defect rather than a gap in the demo, reported on the issue; fixing
+  it means discovery-based endpoint resolution, which needs a GET helper the shared apply
+  client does not have.
+
+  `scripts/dev-device-login.sh` drives the real path with no browser anywhere, which is the point:
+  the device grant's premise is a device that cannot open one, so approving through a browser
+  proves nothing about the case it exists for. It signs in, resolves the user code on the
+  verification page, reads the per-flow handle off the confirmation and posts the decision, then
+  polls. It requests `openid`, as a real client does, and asserts the `id_token` beside the
+  access token, because the identity half is what a login stores to know who signed in. It
+  asserts the SEQUENCE,
+  `authorization_pending` before approval and a token after, since a grant that issued
+  immediately would satisfy an end-state check while breaking the contract every RFC 8628
+  client is written against. It also honours the server's advertised `interval` rather than
+  guessing one, because polling faster is answered with `slow_down`.
+
 - **A fifth outbox worker pool: async flow-target delivery** (issue #112 criterion 2), behind
   `flow_targets.delivery_enabled` (OFF by default). Its own switch rather than riding the
   webhook one, for the reason webhook delivery has its own rather than riding the OIDC logout
