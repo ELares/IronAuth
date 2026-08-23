@@ -96,10 +96,14 @@ async function measure(token, keys) {
  * One accepted vector per ALGORITHM.
  *
  * Only accepted tokens are timed, since a refusal exits early and is not the case anyone
- * deploys for. Grouping by algorithm matters: the corpus holds four accepted vectors but only
- * two distinct algorithms, and three of them are EdDSA. Timing all four would print three
+ * deploys for. Grouping by algorithm matters: the corpus holds five accepted vectors across
+ * three distinct algorithms, so two of the five share one. Timing all five would print
  * near-identical rows and imply the table measured more than it did, which is the kind of
  * padding that makes a benchmark look thorough while telling you less.
+ *
+ * The grouping is DERIVED from the corpus rather than listed here, so this comment is the only
+ * thing that can go stale when the corpus grows. It already had: it said four and two while the
+ * corpus carried five and three.
  */
 function subjects() {
   const byAlgorithm = new Map();
