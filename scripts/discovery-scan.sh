@@ -28,12 +28,22 @@ generator="crates/ironauth-oidc/src/discovery.rs"
 # moved beside the federation code it is a counterpart to so the federation suite could drive
 # the provider that actually ships -- which brought it into scope. Its own tests already treat
 # the served document as a foreign one.
+#
+# `ironauth/src/login.rs` is the CLI, which READS a served discovery document as a client
+# rather than assembling one (issue #120). It has to name the metadata keys to look them up:
+# `authorization_endpoint`, `device_authorization_endpoint` and `token_endpoint` are the
+# server's published names, and a client that did not name them would be back to appending
+# guessed paths to an issuer, which is the defect the discovery lookup exists to fix. Note the
+# comment above is now out of date on one point: the `ironauth` binary crate is NOT outside
+# this scan's reach, because the pathspec is `crates/*/src/*.rs` and `crates/ironauth/src`
+# matches it.
 federation_allow=(
   "crates/ironauth-connector/src/lib.rs"
   "crates/ironauth-connector/src/discovery.rs"
   "crates/ironauth-admin/src/views.rs"
   "crates/ironauth-fetch/src/lib.rs"
   "crates/ironauth-oidc/src/fake_idp.rs"
+  "crates/ironauth/src/login.rs"
 )
 
 fail=0

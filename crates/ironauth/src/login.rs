@@ -13,17 +13,26 @@
 //!
 //! # The transport is shared, deliberately
 //!
-//! The HTTP goes through `ironauth_apply::client::post_form`, which is the SAME connect,
-//! TLS configuration, total deadline, and response size cap the control-plane client uses.
-//! A second copy of that in this crate would be two things to keep in step, and the copy
-//! that drifts is the one nobody is looking at.
+//! The HTTP goes through `ironauth_apply::client`: `get_json` for discovery and
+//! `post_form_url` for the two protocol POSTs, both the SAME connect, TLS configuration, total
+//! deadline, and response size cap the control-plane client uses. A second copy of that in this
+//! crate would be two things to keep in step, and the copy that drifts is the one nobody is
+//! looking at.
+//!
+//! NOT `post_form`, which takes a base and appends a path. A discovered endpoint is already
+//! complete, and that function composes the PARSED prefix, whose trailing slash is trimmed: a
+//! root endpoint would become an empty request target and `/token/` would be sent as `/token`
+//! (issue #120).
 //!
 //! # What is testable here, and what is not
 //!
 //! Everything except the network. [`run_device_flow`] takes the two endpoints as closures,
 //! so the tests below drive the whole loop, including the RFC 8628 section 3.5 `slow_down`
-//! rule, against scripted responses. What that leaves unproved is the HTTP call itself,
-//! which is why it is one shared function call rather than logic of its own.
+//! rule, against scripted responses. What that leaves unproved is the HTTP calls themselves,
+//! which is why each is a shared function call rather than logic of its own. The one piece of
+//! URL construction that is NOT deferred to the transport, the authorization URL's query
+//! separator, has its own unit tests, because getting it wrong corrupts a published query
+//! rather than failing loudly.
 
 use std::time::Duration;
 
@@ -167,17 +176,32 @@ where
 /// forge parameters into an authorization request.
 #[must_use]
 pub fn authorize_url(
-    issuer: &str,
+    authorization_endpoint: &str,
     client_id: &str,
     redirect_uri: &str,
     code_challenge: &str,
     state: &str,
     scope: &str,
 ) -> String {
+    // The separator the endpoint's own shape calls for. RFC 6749 section 3.1 permits the
+    // authorization endpoint to carry a query and requires it be RETAINED when parameters are
+    // added, so a discovered `https://as.example/authorize?tenant=acme` must continue with `&`.
+    // Appending `?` unconditionally made the server read `tenant` as `acme?response_type=code`.
+    // Unreachable while the base was always `{issuer}/authorize` built locally; reachable the
+    // moment the endpoint comes from discovery.
+    //
+    // The trailing slash is NOT trimmed, for the reason `absolute_request_target` gives: the
+    // endpoint is published as an exact URL, and `/authorize/` is a different resource from
+    // `/authorize`.
+    let separator = if authorization_endpoint.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     format!(
-        "{}/authorize?response_type=code&client_id={}&redirect_uri={}\
+        "{}{separator}response_type=code&client_id={}&redirect_uri={}\
          &code_challenge={}&code_challenge_method=S256&state={}&scope={}",
-        issuer.trim_end_matches('/'),
+        authorization_endpoint,
         encode(client_id),
         encode(redirect_uri),
         encode(code_challenge),
@@ -188,7 +212,7 @@ pub fn authorize_url(
 
 /// Exchange an authorization code for tokens (the loopback flow's final leg).
 pub async fn exchange_code(
-    issuer: &str,
+    token_endpoint: &str,
     client_id: &str,
     code: &str,
     redirect_uri: &str,
@@ -201,7 +225,7 @@ pub async fn exchange_code(
         encode(client_id),
         encode(code_verifier)
     );
-    match ironauth_apply::client::post_form(issuer, "/token", body).await {
+    match ironauth_apply::client::post_form_url(token_endpoint, body).await {
         Ok(response) => {
             if let Some(access_token) = response.body["access_token"].as_str() {
                 return TokenAnswer::Issued {
@@ -297,17 +321,76 @@ fn encode(value: &str) -> String {
     out
 }
 
+/// The protocol endpoints an issuer publishes, resolved by DISCOVERY rather than guessed.
+///
+/// Every field is an ABSOLUTE URL as the authorization server named it, which is the whole
+/// point: an issuer is an identifier, not a base URL to append paths to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoints {
+    /// RFC 6749 `authorization_endpoint`, for the loopback flow's browser leg.
+    pub authorization: String,
+    /// RFC 8628 `device_authorization_endpoint`.
+    pub device_authorization: String,
+    /// RFC 6749 `token_endpoint`, shared by both flows' final leg.
+    pub token: String,
+}
+
+/// Fetch `{issuer}/.well-known/openid-configuration` and read the endpoints this login needs.
+///
+/// An earlier CLI built both endpoints by appending `/device_authorization` and `/token` to
+/// `--issuer`. That cannot work against this server and is wrong in general. IronAuth issuers
+/// are SCOPED (`.../t/{tenant}/e/{environment}`) while both routes are served at the deployment
+/// ROOT, so appending produced a 404 for every user who passed the issuer they were given, which
+/// is the only issuer they have: it is the `iss` in their tokens. BOTH flows were affected, not
+/// just the device one: `/token` is deployment-root only as well, so the loopback flow reached
+/// its browser leg (there IS a scoped `/authorize`) and then 404ed on the exchange. More
+/// broadly, RFC 8414 lets an authorization server place its endpoints anywhere, so a client that
+/// derives them by string concatenation is guessing even where the guess happens to land.
+///
+/// # Errors
+///
+/// A message naming the transport failure, a non-200 status, or a document missing an endpoint
+/// this login needs. A missing endpoint is an error rather than a fallback to the guessed path,
+/// because falling back would restore the bug quietly on exactly the servers that trigger it.
+pub async fn discover_endpoints(issuer: &str) -> Result<Endpoints, String> {
+    let url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    );
+    let response = ironauth_apply::client::get_json(&url)
+        .await
+        .map_err(|error| format!("could not read {url}: {error}"))?;
+    if response.status != 200 {
+        return Err(format!("{url} answered HTTP {}", response.status));
+    }
+    let field = |name: &str| -> Result<String, String> {
+        response.body[name]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{url} publishes no '{name}'"))
+    };
+    Ok(Endpoints {
+        authorization: field("authorization_endpoint")?,
+        device_authorization: field("device_authorization_endpoint")?,
+        token: field("token_endpoint")?,
+    })
+}
+
 /// POST the RFC 8628 device-authorization request.
 ///
 /// # Errors
 ///
 /// A message naming the transport or protocol failure.
 pub async fn request_device_authorization(
-    issuer: &str,
+    endpoint: &str,
     client_id: &str,
 ) -> Result<DeviceAuthorization, String> {
     let body = format!("client_id={}", encode(client_id));
-    let response = ironauth_apply::client::post_form(issuer, "/device_authorization", body)
+    // The DISCOVERED endpoint, sent verbatim. `post_form_url` exists for exactly this: it
+    // takes the URL's own path as the request target rather than appending to a base, so a
+    // root endpoint and a trailing slash both reach the server as published.
+    let response = ironauth_apply::client::post_form_url(endpoint, body)
         .await
         .map_err(|error| error.to_string())?;
     if response.status != 200 {
@@ -346,14 +429,18 @@ pub async fn request_device_authorization(
 /// [`TokenAnswer`] match covers it. It maps to `Next::Stop` rather than a retry, which is
 /// the conservative reading: a client that cannot tell a transient fault from a permanent
 /// one and keeps polling is the fleet-polling-forever failure section 3.5 warns about.
-pub async fn request_token(issuer: &str, client_id: &str, device_code: String) -> TokenAnswer {
+pub async fn request_token(
+    token_endpoint: &str,
+    client_id: &str,
+    device_code: String,
+) -> TokenAnswer {
     let body = format!(
         "grant_type={}&device_code={}&client_id={}",
         encode("urn:ietf:params:oauth:grant-type:device_code"),
         encode(&device_code),
         encode(client_id)
     );
-    match ironauth_apply::client::post_form(issuer, "/token", body).await {
+    match ironauth_apply::client::post_form_url(token_endpoint, body).await {
         Ok(response) => {
             if let Some(access_token) = response.body["access_token"].as_str() {
                 return TokenAnswer::Issued {
@@ -441,8 +528,11 @@ mod tests {
     /// or redirect cannot forge additional parameters into the request.
     #[test]
     fn the_authorize_url_encodes_every_value() {
+        // The DISCOVERED endpoint, not an issuer with `/authorize` appended. The endpoint is
+        // deliberately at a path the issuer does not prefix, which is the case appending got
+        // wrong: a server may publish its authorization endpoint anywhere.
         let url = super::authorize_url(
-            "https://issuer.example.test/",
+            "https://issuer.example.test/oauth2/v1/authorize",
             "cli&evil=1",
             "http://127.0.0.1:1234/cb",
             "chal",
@@ -450,7 +540,7 @@ mod tests {
             "openid profile",
         );
         assert!(
-            url.starts_with("https://issuer.example.test/authorize?"),
+            url.starts_with("https://issuer.example.test/oauth2/v1/authorize?"),
             "{url}"
         );
         assert!(url.contains("client_id=cli%26evil%3D1"), "{url}");
@@ -460,8 +550,43 @@ mod tests {
         );
         assert!(url.contains("scope=openid%20profile"), "{url}");
         assert!(url.contains("code_challenge_method=S256"), "{url}");
-        // The trailing slash on the issuer must not produce a double slash.
-        assert!(!url.contains("test//authorize"), "{url}");
+    }
+
+    #[test]
+    fn the_authorize_url_keeps_the_endpoint_the_server_published() {
+        // A trailing slash is SIGNIFICANT per RFC 3986: `/authorize/` and `/authorize` are
+        // different resources, so a discovered endpoint carrying one keeps it. An earlier
+        // revision trimmed it, which was right when the base was an issuer with `/authorize`
+        // appended and wrong once the endpoint comes from the server.
+        let slashed = super::authorize_url(
+            "https://as.example/authorize/",
+            "cli",
+            "http://127.0.0.1:1/cb",
+            "chal",
+            "st",
+            "openid",
+        );
+        assert!(
+            slashed.starts_with("https://as.example/authorize/?response_type=code"),
+            "{slashed}"
+        );
+
+        // A QUERY the server published must be RETAINED, which RFC 6749 section 3.1 requires
+        // explicitly. Appending `?` unconditionally made the server read `tenant` as
+        // `acme?response_type=code`.
+        let queried = super::authorize_url(
+            "https://as.example/authorize?tenant=acme",
+            "cli",
+            "http://127.0.0.1:1/cb",
+            "chal",
+            "st",
+            "openid",
+        );
+        assert!(
+            queried.starts_with("https://as.example/authorize?tenant=acme&response_type=code"),
+            "{queried}"
+        );
+        assert!(!queried.contains("acme?response_type"), "{queried}");
     }
 
     /// The clock seam is what the login reads, so a manual clock decides the stored expiry.
