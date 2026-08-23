@@ -6,6 +6,48 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A federated assertion refusal is diagnosed by its actual cause, not the coarse catch-all
+  (issue #126).** The `private_key_jwt` path has classified JOSE rejects into specific buckets
+  since #91: bad signature, expired, clock skew, audience mismatch, unknown `kid`, algorithm
+  disallowed. The RFC 7523 federated path called the verifier through a wrapper that returned
+  `Option`, so every one of those collapsed into `assertion_invalid`: the structural rejects at
+  a single `Err(_)` arm, and a terminal audience mismatch by falling out of the try-each-audience
+  loop with nothing recorded at all.
+
+  The machinery was already there and one caller was throwing it away. `verify_external_assertion`
+  now answers `Result<VerifiedToken, AssertionReject>` and the call site maps it through the SAME
+  classifier its sibling uses, so no new diagnostic variants were needed. Exhausting every
+  acceptable audience is now reported as the terminal audience mismatch it is, rather than as an
+  unexplained refusal.
+
+  **All four of issue #126's named failures now record their own reason.** Unknown issuer,
+  audience mismatch and unmapped subject each did before this change or gain it here; the stale
+  JWKS is the one worth spelling out, because it is easy to reason about wrongly. Its canonical
+  symptom is a ROTATION the resolved set has not caught up with, and that set is not empty: an
+  inline `jwks` always resolves, and a failed or rate-limited refetch falls back to the still
+  valid cached set. So it reaches the verifier rather than the no-usable-key path, and the
+  verifier refuses a header `kid` naming none of the trusted keys, which records
+  `assertion_kid_unknown`. Before this change that collapsed into the coarse bucket like
+  everything else.
+
+  The residue is narrower than "stale" and is stated rather than claimed closed: an
+  UNRESOLVABLE key source, meaning an empty resolved set or a `jwks_uri` that never produced
+  one, is `NoUsableKey` at the seam and still folds into `assertion_invalid`. Giving that its
+  own reason means adding to a diagnostic vocabulary published in the OpenAPI document and the
+  generated SDKs, which is a contract change rather than a test gap.
+
+  **The wire is unchanged and deliberately so:** every refusal is still `invalid_grant`, because
+  the response must not become an oracle for which issuers are registered or which audiences a
+  deployment accepts. Only the operator's out-of-band diagnostic sharpens. Three existing tests
+  that asserted the coarse bucket for a bad signature and an expired assertion now assert the
+  precise reason.
+
+  Also drives the per-issuer algorithm pin at the LIVE endpoint for the first time. `allowed_algs`
+  had unit tests over the record, but nothing registered an issuer with a pin and presented an
+  assertion, which are different claims: one says the narrowing computes the right set, the other
+  says that set is what the verifier is handed. Both the refusal and its positive control are
+  pinned, with the pin as the single varied dimension.
+
 - **The PRM discovery chain is tested from the `401` a client actually starts at, and the
   challenge format is pinned by a corpus both implementations read (issue #127).** Mostly gaps
   in what was MEASURED rather than in what was served, plus one addition to the SDK surface:
