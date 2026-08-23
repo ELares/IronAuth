@@ -248,10 +248,11 @@ impl ManagementClient {
                 let tls_stream = tls_connect(&config, host, stream).await?;
                 send(
                     TokioIo::new(tls_stream),
+                    Method::POST,
                     &full_path,
                     &host_header,
                     Some(&auth),
-                    JSON_CONTENT_TYPE,
+                    Some(JSON_CONTENT_TYPE),
                     body,
                 )
                 .await
@@ -259,10 +260,11 @@ impl ManagementClient {
             Scheme::Http => {
                 send(
                     TokioIo::new(stream),
+                    Method::POST,
                     &full_path,
                     &host_header,
                     Some(&auth),
-                    JSON_CONTENT_TYPE,
+                    Some(JSON_CONTENT_TYPE),
                     body,
                 )
                 .await
@@ -305,14 +307,22 @@ async fn tls_connect(
         .map_err(|error| ClientError::Transport(error.to_string()))
 }
 
-/// Handshake HTTP/1.1 over `io`, send one POST with a JSON body and the bearer
-/// credential, and read the response under the size cap. No redirect is followed.
+/// Handshake HTTP/1.1 over `io`, send one request, and read the response under the size cap.
+/// No redirect is followed.
+///
+/// The METHOD, the `Content-Type` and the credential are all the caller's. The method became
+/// one when discovery needed a GET (issue #120); the other two were already caller-supplied,
+/// and `post_form` has always passed no credential. The callers now differ in all three: the
+/// management client sends an authenticated JSON POST, `post_form` and `post_form_url` an
+/// unauthenticated form POST, and `get_json` a GET with no body and therefore no
+/// `Content-Type` to describe one.
 async fn send<I>(
     io: I,
+    method: Method,
     path: &str,
     host_header: &str,
     authorization: Option<&str>,
-    content_type: &str,
+    content_type: Option<&str>,
     body: Vec<u8>,
 ) -> Result<ServerResponse, ClientError>
 where
@@ -327,11 +337,16 @@ where
     });
 
     let mut builder = Request::builder()
-        .method(Method::POST)
+        .method(method)
         .uri(path)
         .header(http::header::HOST, host_header)
-        .header(http::header::CONTENT_TYPE, content_type)
         .header(http::header::ACCEPT, "application/json");
+    // OPTIONAL, because a GET has no body to describe. Sending `Content-Type` on a bodyless
+    // request is not fatal but it is a lie about a body that is not there, and some
+    // intermediaries treat it as one.
+    if let Some(content_type) = content_type {
+        builder = builder.header(http::header::CONTENT_TYPE, content_type);
+    }
     // OPTIONAL, because an OAuth token request authenticates in the body (or not at all,
     // for a public client) rather than with a bearer credential. Sending an empty
     // Authorization header instead would be a malformed request rather than an absent one.
@@ -407,10 +422,11 @@ pub async fn post_form(
                 let tls_stream = tls_connect(&config, host, stream).await?;
                 send(
                     TokioIo::new(tls_stream),
+                    Method::POST,
                     &full_path,
                     &host_header,
                     None,
-                    FORM_CONTENT_TYPE,
+                    Some(FORM_CONTENT_TYPE),
                     body,
                 )
                 .await
@@ -418,11 +434,172 @@ pub async fn post_form(
             Scheme::Http => {
                 send(
                     TokioIo::new(stream),
+                    Method::POST,
                     &full_path,
                     &host_header,
                     None,
-                    FORM_CONTENT_TYPE,
+                    Some(FORM_CONTENT_TYPE),
                     body,
+                )
+                .await
+            }
+        }
+    };
+    match tokio::time::timeout(TOTAL_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ClientError::Timeout),
+    }
+}
+
+/// The request target for an ABSOLUTE endpoint URL: its path, verbatim.
+///
+/// `parse_base_url` trims a trailing slash, which is right for a BASE that paths get appended
+/// to and wrong for an endpoint published as an exact URL. Two cases it gets wrong on its own:
+/// a root endpoint (`https://as.example`) leaves an EMPTY prefix, and `Request::builder().uri("")`
+/// is a hard error rather than a request for `/`; and `https://as.example/token/` and
+/// `https://as.example/token` are different targets per RFC 3986, so silently dropping the
+/// slash sends a request the server did not publish.
+fn absolute_request_target(url: &str) -> String {
+    // The raw path, taken from the URL rather than the trimmed prefix.
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    // No path at all means `/`. That is what a client asks for, and it is what the trimmed
+    // prefix cannot express: an empty request target is a hard error in the URI builder.
+    after_scheme
+        .find('/')
+        .map_or_else(|| "/".to_owned(), |index| after_scheme[index..].to_owned())
+}
+
+/// POST a form to an ABSOLUTE endpoint URL, as published by discovery.
+///
+/// Distinct from [`post_form`], which takes a base and appends a path. A discovered endpoint is
+/// already complete, and appending to it or trimming it would send a request the authorization
+/// server did not advertise.
+///
+/// # Errors
+///
+/// As [`post_form`].
+pub async fn post_form_url(url: &str, form_body: String) -> Result<ServerResponse, ClientError> {
+    let base = parse_base_url(url)?;
+    let target = absolute_request_target(url);
+    let tls = match base.scheme {
+        Scheme::Https => Some(build_tls_config()?),
+        Scheme::Http => None,
+    };
+    let exchange = async {
+        let host = base.host.as_str();
+        let mut addrs = tokio::net::lookup_host((host, base.port))
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| ClientError::Unresolved(host.to_owned()))?;
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let host_header = if base.host.contains(':') {
+            format!("[{}]:{}", base.host, base.port)
+        } else {
+            format!("{}:{}", base.host, base.port)
+        };
+        let body = form_body.into_bytes();
+        match base.scheme {
+            Scheme::Https => {
+                let config = tls.clone().ok_or(ClientError::TlsProvider)?;
+                let tls_stream = tls_connect(&config, host, stream).await?;
+                send(
+                    TokioIo::new(tls_stream),
+                    Method::POST,
+                    &target,
+                    &host_header,
+                    None,
+                    Some(FORM_CONTENT_TYPE),
+                    body,
+                )
+                .await
+            }
+            Scheme::Http => {
+                send(
+                    TokioIo::new(stream),
+                    Method::POST,
+                    &target,
+                    &host_header,
+                    None,
+                    Some(FORM_CONTENT_TYPE),
+                    body,
+                )
+                .await
+            }
+        }
+    };
+    match tokio::time::timeout(TOTAL_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ClientError::Timeout),
+    }
+}
+
+/// GET a JSON document, through the same transport, timeout and size caps as [`post_form`].
+///
+/// Added for OAuth DISCOVERY (issue #120). A client must not build protocol endpoints by
+/// appending paths to an issuer: an issuer is an identifier, not a base URL, and IronAuth's own
+/// are scoped (`.../t/{tenant}/e/{environment}`) while the protocol routes are served at the
+/// deployment root. Appending therefore 404s against this server, which is exactly the defect
+/// this exists to fix, and it is wrong in general because RFC 8414 lets an AS place its
+/// endpoints anywhere it likes.
+///
+/// # Errors
+///
+/// As [`post_form`]: an unparseable URL, a name that does not resolve, a transport or TLS
+/// failure, a body over the cap, or the total timeout.
+pub async fn get_json(url: &str) -> Result<ServerResponse, ClientError> {
+    let base = parse_base_url(url)?;
+    let tls = match base.scheme {
+        Scheme::Https => Some(build_tls_config()?),
+        Scheme::Http => None,
+    };
+    let exchange = async {
+        let full_path = absolute_request_target(url);
+        let host = base.host.as_str();
+        let mut addrs = tokio::net::lookup_host((host, base.port))
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| ClientError::Unresolved(host.to_owned()))?;
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let host_header = if base.host.contains(':') {
+            format!("[{}]:{}", base.host, base.port)
+        } else {
+            format!("{}:{}", base.host, base.port)
+        };
+        match base.scheme {
+            Scheme::Https => {
+                let config = tls.clone().ok_or(ClientError::TlsProvider)?;
+                let tls_stream = tls_connect(&config, host, stream).await?;
+                send(
+                    TokioIo::new(tls_stream),
+                    Method::GET,
+                    &full_path,
+                    &host_header,
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await
+            }
+            Scheme::Http => {
+                send(
+                    TokioIo::new(stream),
+                    Method::GET,
+                    &full_path,
+                    &host_header,
+                    None,
+                    None,
+                    Vec::new(),
                 )
                 .await
             }
@@ -481,7 +658,41 @@ fn build_tls_config() -> Result<Arc<ClientConfig>, ClientError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Scheme, parse_base_url};
+    use super::{Scheme, absolute_request_target, parse_base_url};
+
+    /// The request target for a discovered endpoint is its path VERBATIM.
+    ///
+    /// Both cases here were wrong when the CLI passed a whole endpoint URL to `post_form` with
+    /// an empty path (issue #120): that composes `prefix + ""`, and `prefix` is the parsed path
+    /// with its trailing slash trimmed.
+    #[test]
+    fn an_absolute_endpoint_keeps_its_path_exactly() {
+        assert_eq!(
+            absolute_request_target("https://as.example/oauth2/v1/token"),
+            "/oauth2/v1/token"
+        );
+        // A ROOT endpoint. The trimmed prefix is empty, and an empty request target is a hard
+        // error in the URI builder rather than a request for `/`.
+        assert_eq!(absolute_request_target("https://as.example"), "/");
+        assert_eq!(absolute_request_target("https://as.example/"), "/");
+        // A TRAILING SLASH is significant per RFC 3986, so dropping it sends a request the
+        // server did not publish.
+        assert_eq!(
+            absolute_request_target("https://as.example/token/"),
+            "/token/"
+        );
+        // A query the server chose to publish travels too.
+        assert_eq!(
+            absolute_request_target("https://as.example/token?v=2"),
+            "/token?v=2"
+        );
+        // A port must not be mistaken for the start of a path.
+        assert_eq!(
+            absolute_request_target("http://127.0.0.1:8080/token"),
+            "/token"
+        );
+        assert_eq!(absolute_request_target("http://127.0.0.1:8080"), "/");
+    }
 
     #[test]
     fn parses_http_with_port_and_no_prefix() {

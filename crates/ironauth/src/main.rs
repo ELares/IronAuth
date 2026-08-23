@@ -5180,6 +5180,10 @@ fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // caught this exact line taking the shortcut.
         let now = login::epoch_secs(&ironauth_env::SystemClock);
 
+        let Some(endpoints) = resolve_login_endpoints(&issuer).await else {
+            return ExitCode::FAILURE;
+        };
+
         // The loopback attempt, when it was chosen AND a redirect was registered. A bind
         // failure falls back to the device flow, which is what the criterion asks for: the
         // host heuristic cannot know whether a listener will actually bind, so the decision
@@ -5204,7 +5208,10 @@ fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
                         .expect("routed to loopback, so a redirect was registered")
                         .expect("routed to loopback, so preparing succeeded");
                     result = Some(
-                        run_loopback(&issuer, &client_id, &account, &store, now, prepared).await,
+                        run_loopback(
+                            &issuer, &endpoints, &client_id, &account, &store, now, prepared,
+                        )
+                        .await,
                     );
                 }
                 login_flow::LoginRoute::DeviceFallback(reason) => {
@@ -5233,8 +5240,13 @@ fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
                     &account,
                     &store,
                     now,
-                    || login::request_device_authorization(&issuer, &client_id),
-                    |device_code| login::request_token(&issuer, &client_id, device_code),
+                    || {
+                        login::request_device_authorization(
+                            &endpoints.device_authorization,
+                            &client_id,
+                        )
+                    },
+                    |device_code| login::request_token(&endpoints.token, &client_id, device_code),
                     |duration| async move { tokio::time::sleep(duration).await },
                 )
                 .await
@@ -5254,9 +5266,30 @@ fn login(args: &mut impl Iterator<Item = String>) -> ExitCode {
     })
 }
 
+/// Resolve the protocol endpoints for `issuer`, reporting the failure if it cannot.
+///
+/// DISCOVERY, for both flows, and before either is attempted. The endpoints are what the issuer
+/// publishes rather than paths appended to it: an IronAuth issuer is scoped while `/token` and
+/// `/device_authorization` are served at the deployment root, so appending 404ed for every user
+/// who passed the issuer their own tokens name (issue #120).
+///
+/// Running it up front is also the better error. Deferring it would surface a bare 404 from
+/// whichever leg happened to run first, which is what made the original defect read as a
+/// browser problem on the loopback path and a server problem on the device path.
+async fn resolve_login_endpoints(issuer: &str) -> Option<login::Endpoints> {
+    match login::discover_endpoints(issuer).await {
+        Ok(endpoints) => Some(endpoints),
+        Err(error) => {
+            eprintln!("ironauth login: {error}");
+            None
+        }
+    }
+}
+
 /// Run the loopback leg: open the browser, wait for the redirect, exchange the code.
 async fn run_loopback(
     issuer: &str,
+    endpoints: &login::Endpoints,
     client_id: &str,
     account: &str,
     store: &impl credentials::CredentialStore,
@@ -5264,7 +5297,7 @@ async fn run_loopback(
     prepared: loopback_flow::Prepared,
 ) -> Result<(), login::LoginError> {
     let url = login::authorize_url(
-        issuer,
+        &endpoints.authorization,
         client_id,
         &prepared.redirect_uri,
         &prepared.code_challenge,
@@ -5303,7 +5336,7 @@ async fn run_loopback(
     }
 
     let answer = login::exchange_code(
-        issuer,
+        &endpoints.token,
         client_id,
         &code,
         &prepared.redirect_uri,

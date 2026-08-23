@@ -6,6 +6,45 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`ironauth login` could not complete against an IronAuth issuer, in either flow (issue
+  #120).** The CLI built its protocol endpoints by appending to `--issuer`:
+  `/device_authorization` and `/token`. Both are served at the deployment ROOT while an
+  IronAuth issuer is SCOPED (`.../t/{tenant}/e/{environment}`), so appending answered HTTP 404
+  for every user who passed the issuer their own tokens name, which is the only issuer they
+  have.
+
+  Both flows were affected, not just the device one. The loopback flow reached its browser leg,
+  because there IS a scoped `/authorize`, and then 404ed on the token exchange, which made the
+  failure look like a browser problem rather than a URL-construction one.
+
+  Fixed by DISCOVERY. `login` now fetches `{issuer}/.well-known/openid-configuration` and uses
+  the `authorization_endpoint`, `device_authorization_endpoint` and `token_endpoint` the server
+  publishes. That is also correct in general rather than only here: RFC 8414 lets an
+  authorization server place its endpoints anywhere, so a client deriving them by string
+  concatenation is guessing even where the guess happens to land. A document missing an endpoint
+  is an error rather than a fall back to the appended path, because falling back would restore
+  the bug quietly on exactly the servers that trigger it.
+
+  Discovery runs BEFORE either flow is attempted, so an unreachable issuer says so instead of
+  surfacing a bare 404 from whichever leg ran first.
+
+  `ironauth-apply`'s client gained `get_json` and `post_form_url`, both sharing the transport,
+  timeout and body caps `post_form` already had; `send` is now method-parameterized rather than
+  POST-only, with an optional `Content-Type` because a GET has no body to describe.
+
+  `post_form_url` exists because `post_form` takes a BASE and appends a path, and a discovered
+  endpoint is already complete. Reusing it with an empty path looked equivalent and is not: it
+  composes the parsed prefix, which has its trailing slash trimmed, so a root endpoint produced
+  an EMPTY request target (a hard error in the URI builder, not a request for `/`) and
+  `/token/` was silently sent as `/token`, which RFC 3986 makes a different resource.
+
+  Verified by driving the fixed binary end to end against the emulator on a machine with a
+  keychain. `scripts/dev-device-login.sh` still exercises the SERVER side in CI rather than the
+  CLI: the CLI stores its credential in the platform keychain unconditionally and treats a
+  backend error as a failure, and the ubuntu runner that job uses has no Secret Service, which
+  this repository has already measured. Driving the CLI in CI needs a headless credential
+  store, which is its own change.
+
 - **The emulator's seeded client can now complete a device-code login, and a CI job proves it
   headlessly (issue #120).** Two seed defects made that impossible rather than merely
   undemonstrated, and both were invisible because nothing drove the flow.

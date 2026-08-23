@@ -3,15 +3,21 @@
 #
 # Drive a COMPLETE RFC 8628 device authorization against the emulator, offline (issue #120).
 #
-# WHAT THIS DOES AND DOES NOT COVER. It exercises the SERVER side of the headless login: the
-# grant starts, the code is approved from a second device, and a token is issued. It does NOT
-# run `ironauth login`, which criterion 1 names, and that is not an omission I can close here:
-# the CLI builds its endpoints by appending `/device_authorization` and `/token` to `--issuer`
-# (crates/ironauth/src/login.rs:310 and :356), while both routes are served at the DEPLOYMENT
-# ROOT and an IronAuth issuer is scoped (`.../t/{tenant}/e/{environment}`). Feeding the CLI
-# the issuer this very emulator prints therefore answers HTTP 404. Measured, and reported on
-# the issue. The fix is discovery-based endpoint resolution in the CLI, which needs a GET
-# helper the shared apply client does not have, so it is its own change.
+# WHAT THIS COVERS, and what it deliberately does not. It exercises the SERVER side of the
+# headless login: the grant starts, the code is approved from a second device, and a token is
+# issued. It does NOT run `ironauth login`, and that is a CI constraint rather than an oversight.
+#
+# The CLI stores its credential in the platform keychain, unconditionally, and it treats a
+# backend error as a failure rather than as "not signed in" (correctly: reporting success on a
+# machine with nothing stored would send the user somewhere worse). The ubuntu runner this job
+# uses has no Secret Service, which this repository has already measured and recorded beside its
+# keychain test, so driving the CLI here would fail on the keychain rather than on anything the
+# device flow does. Making that possible needs a headless credential store, which is its own
+# change.
+#
+# The CLI's own defect on this path -- it appended `/device_authorization` and `/token` to
+# `--issuer` while both are served at the deployment root -- IS fixed in this change, and the
+# fixed binary was driven end to end against this emulator on a machine that has a keychain.
 #
 # The device grant is the one flow whose whole premise is that the device cannot open a
 # browser, so a test that drives it through a browser proves nothing about the case it exists
