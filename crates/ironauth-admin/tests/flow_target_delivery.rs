@@ -40,7 +40,8 @@ use ironauth_jose::webhooks::{WebhookSecret, verify_delivery};
 use ironauth_oidc::SendFailure;
 use ironauth_store::outbox::OutboxConsumer;
 use ironauth_store::{
-    EnvironmentId, FLOW_TARGET_DELIVERY_CONSUMER, OutboxMessage, Scope, TenantId,
+    ActorRef, CorrelationId, EnvironmentId, FLOW_TARGET_DELIVERY_CONSUMER, HumanId, NewAdminUser,
+    NewUserTraits, OutboxMessage, Scope, TenantId, TraitWriteVisibility, UserState,
 };
 use serde_json::Value;
 
@@ -156,14 +157,75 @@ fn queued(target_id: &str, idempotency_key: &str, signed: bool, body: &Value) ->
     }
 }
 
+/// A subject that is not a user id at all.
+///
+/// Safe wherever the consumer's subject read is never reached, which is two situations rather
+/// than one:
+///
+///   - `deliver_one` returns before it: an absent, disabled, cross-tenant, or became-sync
+///     target, or a payload it cannot parse.
+///   - the consumer is never invoked on the message at all: the dead-letter and replay
+///     fixtures, which drive the queue directly through `outbox().fail(..)`.
+///
+/// Reaching the enrichment with this value is a permanent `payload_subject_not_a_user_id`,
+/// which is the wrong failure for any test not about that. Every fixture that expects a POST
+/// seeds a real user with `seed_subject` and passes the id it returns.
+const UNRESOLVABLE_SUBJECT: &str = "usr_test";
+
 /// The signup envelope a producer composes, near enough for a delivery to carry.
-fn signup_body(target_id: &str) -> Value {
+///
+/// The subject is the ONLY user-identifying field, and deliberately so: what the receiver
+/// reads as `identifier` and `traits` is resolved from the store when the delivery is made
+/// rather than written here (issue #954). A fixture that wants those in the delivered body
+/// creates the user; it cannot put them in the payload, because nothing does.
+fn signup_body(target_id: &str, subject: &str) -> Value {
     serde_json::json!({
         "target_id": target_id,
         "class": "event",
         "timing": "post_persist",
-        "data": { "subject": "usr_test" },
+        "data": { "subject": subject },
     })
+}
+
+/// Create a user the consumer's subject read will resolve, and answer with its id.
+async fn seed_subject(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    identifier: &str,
+    traits_json: Option<&str>,
+) -> String {
+    let env = Env::system();
+    h.store()
+        .scoped(scope_of(tenant, environment))
+        .acting(
+            ActorRef::human(HumanId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .users()
+        .admin_create(
+            &env,
+            NewAdminUser {
+                id: None,
+                identifier,
+                password_hash: None,
+                claims_json: None,
+                external_id: None,
+                state: UserState::Active,
+                foreign_password_hash: None,
+                foreign_password_algo: None,
+                traits: traits_json.map(|traits_json| NewUserTraits {
+                    traits_json,
+                    schema_version: None,
+                    visibility: TraitWriteVisibility::Admin,
+                }),
+            },
+            1_000_000,
+            None,
+        )
+        .await
+        .expect("seed the delivery's subject")
+        .to_string()
 }
 
 /// The `.../flow-targets` base path.
@@ -260,6 +322,7 @@ async fn a_delivery_is_signed_under_the_environment_secret_the_target_names() {
     // secret route's seal, the target registration, and the signing contract.
     let h = Harness::start_with_signing_registry(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let subject = seed_subject(&h, &tenant, &environment, "subject@example.test", None).await;
     write_secret(&h, &tenant, &environment, "k-secret", SECRET_VALUE).await;
     let target = register_target(
         &h,
@@ -274,7 +337,12 @@ async fn a_delivery_is_signed_under_the_environment_secret_the_target_names() {
     let sender = RecordingSender::accepting();
     let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
     let env = Env::system();
-    let message = queued(&target, "ftg_delivery_1", true, &signup_body(&target));
+    let message = queued(
+        &target,
+        "ftg_delivery_1",
+        true,
+        &signup_body(&target, &subject),
+    );
 
     consumer
         .handle(&env, scope_of(&tenant, &environment), &message)
@@ -358,6 +426,7 @@ async fn the_secret_is_resolved_at_delivery_time_so_rotation_needs_no_target_wri
     // sent the pre-rotation value and the receiver would have rejected it.
     let h = Harness::start_with_signing_registry(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let subject = seed_subject(&h, &tenant, &environment, "subject@example.test", None).await;
     write_secret(&h, &tenant, &environment, "k-secret", SECRET_VALUE).await;
     let target = register_target(
         &h,
@@ -371,7 +440,12 @@ async fn the_secret_is_resolved_at_delivery_time_so_rotation_needs_no_target_wri
 
     let env = Env::system();
     let scope = scope_of(&tenant, &environment);
-    let message = queued(&target, "ftg_delivery_1", true, &signup_body(&target));
+    let message = queued(
+        &target,
+        "ftg_delivery_1",
+        true,
+        &signup_body(&target, &subject),
+    );
 
     // Rotated AFTER the message exists, so the delivery below is one that was queued under
     // the old value.
@@ -423,11 +497,17 @@ async fn an_unsigned_target_still_carries_the_dedup_handle() {
     // after the POST, before the completion write) could not tell it from a second signup.
     let h = Harness::start_with_signing_registry(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let subject = seed_subject(&h, &tenant, &environment, "subject@example.test", None).await;
     let target = register_target(&h, &tenant, &environment, "k-t1", "unsigned", None).await;
 
     let sender = RecordingSender::accepting();
     let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
-    let message = queued(&target, "ftg_delivery_1", false, &signup_body(&target));
+    let message = queued(
+        &target,
+        "ftg_delivery_1",
+        false,
+        &signup_body(&target, &subject),
+    );
 
     consumer
         .handle(&Env::system(), scope_of(&tenant, &environment), &message)
@@ -456,6 +536,7 @@ async fn a_delivery_enqueued_as_signed_is_never_sent_unsigned() {
     // would start rejecting deliveries it should trust, with nothing saying why.
     let h = Harness::start_with_signing_registry(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let subject = seed_subject(&h, &tenant, &environment, "subject@example.test", None).await;
     write_secret(&h, &tenant, &environment, "k-secret", SECRET_VALUE).await;
     let target = register_target(
         &h,
@@ -467,7 +548,12 @@ async fn a_delivery_enqueued_as_signed_is_never_sent_unsigned() {
     )
     .await;
 
-    let message = queued(&target, "ftg_delivery_1", true, &signup_body(&target));
+    let message = queued(
+        &target,
+        "ftg_delivery_1",
+        true,
+        &signup_body(&target, &subject),
+    );
     // The name cleared after the message was queued as SIGNED.
     reconfigure(&h, &tenant, &environment, "k-clear", "signed", None, true).await;
 
@@ -509,7 +595,12 @@ async fn a_disabled_target_dead_letters_while_a_deregistered_one_completes() {
         .handle(
             &env,
             scope,
-            &queued(&disabled, "ftg_delivery_1", false, &signup_body(&disabled)),
+            &queued(
+                &disabled,
+                "ftg_delivery_1",
+                false,
+                &signup_body(&disabled, UNRESOLVABLE_SUBJECT),
+            ),
         )
         .await
         .expect_err("a disabled target does not deliver");
@@ -537,7 +628,12 @@ async fn a_disabled_target_dead_letters_while_a_deregistered_one_completes() {
         .handle(
             &env,
             scope,
-            &queued(&gone, "ftg_delivery_2", false, &signup_body(&gone)),
+            &queued(
+                &gone,
+                "ftg_delivery_2",
+                false,
+                &signup_body(&gone, UNRESOLVABLE_SUBJECT),
+            ),
         )
         .await
         .expect("a deregistered target completes its queued deliveries rather than retrying");
@@ -572,7 +668,12 @@ async fn a_delivery_naming_another_tenants_target_is_never_made() {
             &Env::system(),
             // Draining tenant A, with tenant B's target id in the payload.
             scope_of(&tenant_a, &environment_a),
-            &queued(&victim, "ftg_delivery_1", false, &signup_body(&victim)),
+            &queued(
+                &victim,
+                "ftg_delivery_1",
+                false,
+                &signup_body(&victim, UNRESOLVABLE_SUBJECT),
+            ),
         )
         .await
         .expect_err("a target id from another scope is not deliverable here");
@@ -600,11 +701,26 @@ async fn a_payload_this_consumer_cannot_read_is_permanent_rather_than_retried() 
     let sender = RecordingSender::accepting();
     let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
 
-    let mut no_target = queued("ftg_x", "k1", false, &signup_body("ftg_x"));
+    let mut no_target = queued(
+        "ftg_x",
+        "k1",
+        false,
+        &signup_body("ftg_x", UNRESOLVABLE_SUBJECT),
+    );
     no_target.payload = serde_json::json!({ "body": { "a": 1 } });
-    let mut no_body = queued("ftg_x", "k2", false, &signup_body("ftg_x"));
+    let mut no_body = queued(
+        "ftg_x",
+        "k2",
+        false,
+        &signup_body("ftg_x", UNRESOLVABLE_SUBJECT),
+    );
     no_body.payload = serde_json::json!({ "target_id": "ftg_x" });
-    let malformed = queued("not-an-id", "k3", false, &signup_body("not-an-id"));
+    let malformed = queued(
+        "not-an-id",
+        "k3",
+        false,
+        &signup_body("not-an-id", UNRESOLVABLE_SUBJECT),
+    );
 
     for (message, label) in [
         (no_target, "payload_missing_target_id"),
@@ -635,6 +751,7 @@ async fn every_answer_from_the_world_is_retryable_so_the_attempts_cap_decides() 
     // from the one operators already know.
     let h = Harness::start_with_signing_registry(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let subject = seed_subject(&h, &tenant, &environment, "subject@example.test", None).await;
     let scope = scope_of(&tenant, &environment);
     let env = Env::system();
     let target = register_target(&h, &tenant, &environment, "k-t1", "unsigned", None).await;
@@ -652,7 +769,12 @@ async fn every_answer_from_the_world_is_retryable_so_the_attempts_cap_decides() 
             .handle(
                 &env,
                 scope,
-                &queued(&target, "ftg_delivery_1", false, &signup_body(&target)),
+                &queued(
+                    &target,
+                    "ftg_delivery_1",
+                    false,
+                    &signup_body(&target, &subject),
+                ),
             )
             .await
             .expect_err("a refused delivery fails");
@@ -675,6 +797,7 @@ async fn an_exhausted_delivery_dead_letters_through_the_real_queue() {
     // queue produced.
     let h = Harness::start_with_signing_registry(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let subject = seed_subject(&h, &tenant, &environment, "subject@example.test", None).await;
     let scope = scope_of(&tenant, &environment);
     let env = Env::system();
     let target = register_target(&h, &tenant, &environment, "k-t1", "unsigned", None).await;
@@ -692,7 +815,7 @@ async fn an_exhausted_delivery_dead_letters_through_the_real_queue() {
                 payload: serde_json::json!({
                     "target_id": &target,
                     "signed": false,
-                    "body": signup_body(&target),
+                    "body": signup_body(&target, &subject),
                 }),
             },
         )
@@ -824,7 +947,12 @@ async fn a_target_that_became_sync_does_not_deliver_its_queued_async_messages() 
     let h = Harness::start_with_signing_registry(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
     let target = register_target(&h, &tenant, &environment, "k-t1", "gate", None).await;
-    let message = queued(&target, "ftg_delivery_1", false, &signup_body(&target));
+    let message = queued(
+        &target,
+        "ftg_delivery_1",
+        false,
+        &signup_body(&target, UNRESOLVABLE_SUBJECT),
+    );
 
     // Hardened into a gate AFTER the delivery was queued. A sync target requires a timeout,
     // which is what makes this a realistic re-registration rather than a contrived one.
@@ -877,6 +1005,7 @@ async fn the_delivered_body_carries_the_targets_config_as_it_is_now() {
     // consumer puts it back.
     let h = Harness::start_with_signing_registry(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let subject = seed_subject(&h, &tenant, &environment, "subject@example.test", None).await;
 
     let (status, _, body) = h
         .post(
@@ -899,7 +1028,12 @@ async fn the_delivered_body_carries_the_targets_config_as_it_is_now() {
         .as_str()
         .expect("id")
         .to_owned();
-    let message = queued(&target, "ftg_delivery_1", false, &signup_body(&target));
+    let message = queued(
+        &target,
+        "ftg_delivery_1",
+        false,
+        &signup_body(&target, &subject),
+    );
 
     // Edited AFTER the delivery was queued.
     let (status, _, body) = h
@@ -978,7 +1112,7 @@ async fn a_dead_lettered_delivery_is_listed_and_comes_back_after_a_replay() {
                 payload: serde_json::json!({
                     "target_id": &target,
                     "signed": false,
-                    "body": signup_body(&target),
+                    "body": signup_body(&target, UNRESOLVABLE_SUBJECT),
                 }),
             },
         )
@@ -1284,7 +1418,7 @@ async fn a_bounded_replay_returns_only_deliveries_after_the_bound() {
                     payload: serde_json::json!({
                         "target_id": &target,
                         "signed": false,
-                        "body": signup_body(&target),
+                        "body": signup_body(&target, UNRESOLVABLE_SUBJECT),
                     }),
                 },
             )
@@ -1652,5 +1786,449 @@ async fn a_secret_shaped_key_nested_in_config_is_refused() {
         status,
         StatusCode::CREATED,
         "a NAMED secret reference is the supported shape and must be accepted: {body}"
+    );
+}
+
+/// Register and activate a trait schema, so `set_traits` has a write-time contract.
+///
+/// Two callers, for two reasons. The mutability test needs it because `set_traits` refuses
+/// outright when no schema is active, which the create-time path does not: `admin_create`
+/// accepts a caller-stamped `schema_version` and validates nothing. The admin-only test needs
+/// it because the visibility annotations live ON the active schema, so with none active there
+/// is nothing marked admin-only and the projection has nothing to strip.
+async fn activate_trait_schema(h: &Harness, tenant: &str, environment: &str, key: &str) {
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/trait-schemas");
+    let body = serde_json::json!({
+        "schema": {
+            "type": "object",
+            "properties": {
+                "tier": { "type": "string" },
+                // Annotated admin-only, so a fixture can ask whether the delivery honours
+                // the annotation. `risk_score` is the canonical example the trait-schema
+                // suite uses for this.
+                "risk_score": { "type": "integer", "x-ironauth": { "visibility": "admin" } },
+            },
+            "additionalProperties": false,
+        }
+    })
+    .to_string();
+    let (status, _, created) = h.post(&path, &format!("{key}-create"), &body).await;
+    assert_eq!(status, StatusCode::OK, "create schema: {created}");
+    let version = serde_json::from_str::<Value>(&created).expect("json")["version"]
+        .as_i64()
+        .expect("version");
+    let (status, _, activated) = h
+        .post(
+            &format!("{path}/{version}/activate"),
+            &format!("{key}-activate"),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "activate schema: {activated}");
+}
+
+#[tokio::test]
+async fn the_delivered_body_carries_the_subjects_identifier_and_traits() {
+    // Issue #954 criterion 1. The payload holds an OPAQUE subject id and nothing else about
+    // the person; a receiver that needs to know WHO signed up gets it because the consumer
+    // resolves it here. Without that resolution a receiver would have to call back, which is
+    // the whole reason the identifier used to be written into the queue.
+    //
+    // Signed, and verified through `verify_delivery`, so the assertion is that the signature
+    // is computed over the body a receiver actually gets, ENRICHMENT INCLUDED. What it does
+    // not pin is the ordering of enrichment against serialization: `deliver_one` renders one
+    // `String` and both signs and sends that same value, so a moved enrichment would produce
+    // a body that is unenriched and still verifies. The `data.identifier` assertion below is
+    // what catches that.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    write_secret(&h, &tenant, &environment, "k-secret", SECRET_VALUE).await;
+    // The NULL `traits_schema_version` comes from `seed_subject` passing `schema_version:
+    // None` to `admin_create`, which validates nothing and stores it verbatim. Not from the
+    // absent schema: the next test activates one and its subject is still seeded this way.
+    //
+    // Keep the `None`. It is the shape an IMPORT produces, and reading such a row back used
+    // to panic rather than return, which this fixture is what found.
+    // `crates/ironauth-store/tests/traits.rs` pins the store half directly. What this one
+    // adds is the path: the consumer reads traits on every delivery, so the panic landed
+    // inside the outbox, which catches it as `consumer_panic` and retries to the cap. The
+    // delivery dead-lettered on a fault the read could have reported as an error.
+    let subject = seed_subject(
+        &h,
+        &tenant,
+        &environment,
+        "resolved@example.test",
+        Some(r#"{"tier":"gold"}"#),
+    )
+    .await;
+    let target = register_target(
+        &h,
+        &tenant,
+        &environment,
+        "k-t1",
+        "signed",
+        Some(SECRET_NAME),
+    )
+    .await;
+
+    let sender = RecordingSender::accepting();
+    let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
+    let message = queued(
+        &target,
+        "ftg_delivery_1",
+        true,
+        &signup_body(&target, &subject),
+    );
+    consumer
+        .handle(&Env::system(), scope_of(&tenant, &environment), &message)
+        .await
+        .expect("the delivery is made");
+
+    let sent = sender.recorded();
+    assert_eq!(sent.len(), 1, "one message, one POST");
+    let delivery = &sent[0];
+    let delivered: Value = serde_json::from_str(&delivery.body).expect("the body is json");
+    assert_eq!(
+        delivered["data"]["identifier"], "resolved@example.test",
+        "the receiver reads the identifier inline: {delivered}"
+    );
+    assert_eq!(
+        delivered["data"]["traits"],
+        serde_json::json!({ "tier": "gold" }),
+        "and the traits document, decrypted and inline: {delivered}"
+    );
+    assert_eq!(
+        delivered["data"]["subject"], subject,
+        "the subject the payload carried is still there, so the receiver can correlate"
+    );
+
+    // The signature covers the ENRICHED bytes.
+    let held = WebhookSecret::from_bytes(SECRET_VALUE.as_bytes().to_vec());
+    let now: i64 = delivery.signed().timestamp.parse().expect("unix seconds");
+    verify_delivery(
+        &[held],
+        &delivery.headers.id,
+        &delivery.signed().timestamp,
+        delivery.body.as_bytes(),
+        &delivery.signed().signature,
+        300,
+        now,
+    )
+    .expect("the signature verifies over the body as SENT, enrichment included");
+}
+
+#[tokio::test]
+async fn traits_edited_after_the_signup_are_delivered_as_they_are_now() {
+    // The half of criterion 1 that says WHEN the values are resolved, and the reason it is not
+    // enough to see them in the body: a body built at enqueue would look identical here until
+    // the record changes underneath it.
+    //
+    // Only `traits` can demonstrate this. `identifier` is sealed under a scope envelope DEK with no
+    // update path on this repository, so there is no edit to observe; the delivered value can
+    // differ from the enqueued one only by the account being deleted, which is the next test.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    activate_trait_schema(&h, &tenant, &environment, "k-schema").await;
+    let subject = seed_subject(
+        &h,
+        &tenant,
+        &environment,
+        "edited@example.test",
+        Some(r#"{"tier":"bronze"}"#),
+    )
+    .await;
+    let target = register_target(&h, &tenant, &environment, "k-t1", "crm", None).await;
+    let message = queued(
+        &target,
+        "ftg_delivery_1",
+        false,
+        &signup_body(&target, &subject),
+    );
+
+    // Edited AFTER the delivery was queued, and before it drained.
+    let env = Env::system();
+    let subject_id = h
+        .store()
+        .scoped(scope_of(&tenant, &environment))
+        .users()
+        .parse_id(&subject)
+        .expect("subject id");
+    h.store()
+        .scoped(scope_of(&tenant, &environment))
+        .acting(
+            ActorRef::human(HumanId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .users()
+        .set_traits(&env, &subject_id, r#"{"tier":"platinum"}"#)
+        .await
+        .expect("upgrade the tier");
+
+    let sender = RecordingSender::accepting();
+    let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
+    consumer
+        .handle(&env, scope_of(&tenant, &environment), &message)
+        .await
+        .expect("the delivery is made");
+
+    let delivered: Value =
+        serde_json::from_str(&sender.recorded()[0].body).expect("the body is json");
+    assert_eq!(
+        delivered["data"]["traits"],
+        serde_json::json!({ "tier": "platinum" }),
+        "the delivery carries the traits the subject holds NOW, not the ones current at \
+         enqueue: {delivered}"
+    );
+}
+
+#[tokio::test]
+async fn a_subject_deleted_before_the_delivery_drained_is_discarded_not_announced() {
+    // Issue #954 criterion 3: the deleted-subject case has a STATED outcome, and this is it.
+    // Discarded, exactly like a deregistered target: not retried, because a deleted account
+    // does not come back and fourteen attempts would stall every later delivery on this
+    // ordering key; and not an error, because deleting a user is allowed.
+    //
+    // The privacy reading is the load-bearing one. If the deletion was an erasure request,
+    // POSTing that person's identifier to a third party afterwards is the exact thing erasure
+    // was meant to stop -- and resolving at delivery time is what makes refusing possible at
+    // all. A body built at enqueue would already hold the identifier and would go out.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let subject = seed_subject(&h, &tenant, &environment, "erased@example.test", None).await;
+    let target = register_target(&h, &tenant, &environment, "k-t1", "crm", None).await;
+    let message = queued(
+        &target,
+        "ftg_delivery_1",
+        false,
+        &signup_body(&target, &subject),
+    );
+
+    let env = Env::system();
+    let subject_id = h
+        .store()
+        .scoped(scope_of(&tenant, &environment))
+        .users()
+        .parse_id(&subject)
+        .expect("subject id");
+    h.store()
+        .scoped(scope_of(&tenant, &environment))
+        .acting(
+            ActorRef::human(HumanId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .users()
+        .delete(&env, &subject_id, false, None, None)
+        .await
+        .expect("delete the subject");
+
+    let sender = RecordingSender::accepting();
+    let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
+    consumer
+        .handle(&env, scope_of(&tenant, &environment), &message)
+        .await
+        .expect("the message is COMPLETED, not failed: nothing here is broken");
+
+    assert!(
+        sender.recorded().is_empty(),
+        "no POST at all: a deleted person's identifier does not leave the process"
+    );
+}
+
+#[tokio::test]
+async fn a_body_whose_subject_cannot_be_read_is_permanent_and_never_sent() {
+    // The subject read's three PERMANENT refusals, each on its own fixture. They sit one
+    // layer in from `a_payload_this_consumer_cannot_read_is_permanent_rather_than_retried`:
+    // those payloads fail before the target is even looked up, while these have a registered
+    // target and a well formed envelope, and break only at the field the enrichment needs.
+    //
+    // Each fixture is named by what it REACHES, because the refusals are ordered and an
+    // earlier one masks a later one:
+    //
+    //   `data` is an array          -> refused as not-an-object, before `subject` is read
+    //   `data` is an object, no key -> reaches the subject read and finds nothing
+    //   `subject` is not an id      -> reaches `parse_id` and is refused there
+    //
+    // The first two are separate labels precisely because the check is a single mutable
+    // lookup. Reading `data.subject` through a chain would collapse them into one, and the
+    // operator staring at a stuck queue would not learn which of the two shapes they have.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let target = register_target(&h, &tenant, &environment, "k-t1", "crm", None).await;
+    let sender = RecordingSender::accepting();
+    let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
+
+    let cases = [
+        (
+            serde_json::json!({ "target_id": target, "data": ["not", "an", "object"] }),
+            "payload_body_data_not_an_object",
+        ),
+        (
+            serde_json::json!({ "target_id": target, "data": { "class": "event" } }),
+            "payload_body_missing_subject",
+        ),
+        (
+            serde_json::json!({ "target_id": target, "data": { "subject": "not-a-user-id" } }),
+            "payload_subject_not_a_user_id",
+        ),
+    ];
+
+    for (index, (body, label)) in cases.into_iter().enumerate() {
+        let message = queued(&target, &format!("ftg_bad_{index}"), false, &body);
+        let error = consumer
+            .handle(&env, scope, &message)
+            .await
+            .expect_err("a body whose subject cannot be read fails");
+        assert_eq!(error.label(), label, "case {index}");
+        assert!(
+            !error.is_retryable(),
+            "{label} is not something another attempt could fix: the payload is immutable \
+             once enqueued, so every retry reads the same bytes"
+        );
+    }
+
+    assert!(
+        sender.recorded().is_empty(),
+        "and none of them reached the socket: a delivery this consumer cannot enrich is not \
+         sent unenriched"
+    );
+}
+
+#[tokio::test]
+async fn an_admin_only_trait_is_not_delivered_to_a_third_party() {
+    // The delivery sends the USER-VISIBLE projection, not the full trait document.
+    //
+    // The management read takes the full document and says so; the flow evaluator takes the
+    // full document too, and rests that on the value never reaching the end user, its only
+    // serialization being the journey replay transcript, an operator and CI artifact.
+    //
+    // A delivery cannot borrow that reasoning. It serializes the document into an HTTP body
+    // and POSTs it to whatever endpoint a target names, which is the widest circulation any
+    // reader of these fields has. An operator annotating a field
+    // `x-ironauth: {"visibility": "admin"}` has declared it is not for that, and the
+    // annotation is honoured rather than being quietly reversed by an integration.
+    //
+    // Both halves are asserted. A test that only checked the admin-only field's absence
+    // would pass just as well if the delivery carried no traits at all, or none of this
+    // subject's.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    activate_trait_schema(&h, &tenant, &environment, "k-schema").await;
+    let subject = seed_subject(
+        &h,
+        &tenant,
+        &environment,
+        "annotated@example.test",
+        Some(r#"{"tier":"gold","risk_score":9731597}"#),
+    )
+    .await;
+    let target = register_target(&h, &tenant, &environment, "k-t1", "crm", None).await;
+    let message = queued(
+        &target,
+        "ftg_delivery_1",
+        false,
+        &signup_body(&target, &subject),
+    );
+
+    let sender = RecordingSender::accepting();
+    let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
+    consumer
+        .handle(&Env::system(), scope_of(&tenant, &environment), &message)
+        .await
+        .expect("the delivery is made");
+
+    let body = &sender.recorded()[0].body;
+    let delivered: Value = serde_json::from_str(body).expect("the body is json");
+    assert_eq!(
+        delivered["data"]["traits"],
+        serde_json::json!({ "tier": "gold" }),
+        "the visible trait is delivered and the admin-only one is stripped: {delivered}"
+    );
+    // Searched over the whole body as text, not only at the key the projection would use. A
+    // field stripped from `data.traits` but echoed anywhere else is the same disclosure.
+    assert!(
+        !body.contains("risk_score"),
+        "no admin-only field name anywhere in the delivered body: {body}"
+    );
+    // A DISTINCTIVE value, not a short one. The body carries two `ScopedId`s, each 64
+    // base64url characters over an alphabet that includes the digits, so searching it for a
+    // two-digit literal fails by chance often enough to read as a leak when nothing leaked.
+    assert!(!body.contains("9731597"), "nor its value: {body}");
+}
+
+#[tokio::test]
+async fn a_subject_whose_trait_schema_will_not_compile_dead_letters_rather_than_blocking() {
+    // The fail-closed redaction, seen from the consumer, and the classification it gets.
+    //
+    // PERMANENT rather than retryable, on the same reasoning the disabled-target arm gives: a
+    // schema that will not compile stays that way until an operator activates a replacement,
+    // so retrying holds the head of this target's ordering group for the whole
+    // fourteen-attempt schedule while every later delivery to the target waits behind it. A
+    // dead letter is terminal, blocks nothing, and is replayable.
+    //
+    // Reaching this arm needs a non-compiling ACTIVE schema, which the write path will not
+    // produce, so the row is planted directly. That is the same end state a real deployment
+    // reaches by carrying an older schema forward across a tightening of the well-formedness
+    // check, which is what makes the arm worth having rather than defensive.
+    let h = Harness::start_with_signing_registry(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    activate_trait_schema(&h, &tenant, &environment, "k-schema").await;
+    let subject = seed_subject(
+        &h,
+        &tenant,
+        &environment,
+        "stranded@example.test",
+        Some(r#"{"tier":"gold"}"#),
+    )
+    .await;
+    let target = register_target(&h, &tenant, &environment, "k-t1", "crm", None).await;
+
+    // Annotation nested below a top-level property: accepted by an older checker, refused by
+    // the current one.
+    sqlx::query(
+        "UPDATE trait_schemas SET schema_json = $1 \
+         WHERE tenant_id = $2 AND environment_id = $3 AND status = 'active'",
+    )
+    .bind(
+        r#"{"type":"object","properties":{"tier":{"type":"object","properties":{"inner":{"type":"string","x-ironauth":{"visibility":"admin"}}}}}}"#,
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .execute(h.db().owner_pool())
+    .await
+    .expect("carry forward a schema the current checker refuses");
+
+    let sender = RecordingSender::accepting();
+    let consumer = FlowTargetDeliveryConsumer::new(h.store().clone(), sender.clone());
+    let error = consumer
+        .handle(
+            &Env::system(),
+            scope_of(&tenant, &environment),
+            &queued(
+                &target,
+                "ftg_delivery_1",
+                false,
+                &signup_body(&target, &subject),
+            ),
+        )
+        .await
+        .expect_err("a redaction that cannot read its annotations must not deliver");
+
+    assert_eq!(
+        error.label(),
+        "subject_traits_schema_malformed",
+        "the label names the schema, so an operator reading a dead letter knows to fix the \
+         schema rather than to look for a database fault"
+    );
+    assert!(
+        !error.is_retryable(),
+        "and it is PERMANENT: another attempt reads the same stored schema, so retrying only \
+         holds the ordering group"
+    );
+    assert!(
+        sender.recorded().is_empty(),
+        "nothing is POSTed: the whole point of failing closed is that the document does not \
+         leave while its annotations are unreadable"
     );
 }

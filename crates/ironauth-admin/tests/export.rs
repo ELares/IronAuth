@@ -225,7 +225,11 @@ async fn full_export_reimports_into_a_fresh_instance_with_logins_working() {
         .await
         .expect("traits read")
         .expect("bob has traits");
-    assert_eq!(schema_version, 3, "the source schema version is preserved");
+    assert_eq!(
+        schema_version,
+        Some(3),
+        "the source schema version is preserved"
+    );
     assert_eq!(
         traits,
         serde_json::json!({

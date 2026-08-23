@@ -6,6 +6,62 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`UserRepo::traits_user_visible` fails closed on a schema that will not compile.** It used
+  to answer with the UNREDACTED document in that case. For a redaction that is the unsafe
+  direction: the schema's annotations are what say which fields to withhold, so being unable to
+  read them is a reason to refuse, never a reason to disclose.
+
+  Not a hypothetical branch. A stored schema is CHECKED for well-formedness when it is written
+  and again when it is activated, and nothing re-checks it after that, while
+  `check_schema_wellformed` has been tightened since: it now refuses an annotation anywhere
+  BELOW a top-level property (the document root stays annotatable on purpose, so that a lone
+  sub-schema can be compiled on its own). A row activated under the looser checker stays active,
+  since activation is the only writer of `status` and the table carries no `DELETE` grant, and
+  it no longer compiles. Readers compile it on every use, which is how they meet it.
+
+  It mattered little while every caller was in-process. `ironauth-admin`'s async flow-target
+  delivery now POSTs this projection to an operator-registered third-party endpoint, which is
+  what made the fallback direction load-bearing. **BEHAVIOUR CHANGE, not a signature change:**
+  the call already returned a `Result` and every in-tree caller already had an error arm. The
+  flow's progressive-profiling merge base and federation's returning-login profile reuse each
+  turn it into a server error page.
+
+  The delivery consumer classifies it PERMANENT, under the label
+  `subject_traits_schema_malformed`, so the delivery DEAD-LETTERS after one attempt rather than
+  holding its target's ordering group for the whole retry schedule. Nothing drains by itself
+  once a compiling schema is activated: recovery is the target's replay route.
+
+- **`UserRepo::traits` no longer panics on an imported identity, and its return type says
+  why (issue #954).** `users.traits_schema_version` is nullable: migration 0038 adds the
+  column with no `NOT NULL`, and `NewUserTraits::schema_version` is documented as `None`
+  when the source recorded none, which is exactly what importing a user who carries traits
+  from a system with no schema registry produces. `admin_create` validates nothing and
+  stores it verbatim, so such a row is reachable through a supported surface.
+
+  The read decoded that column as a bare `i32` and PANICKED on it. The only other place the
+  repository decodes this column, the export projection feeding `UserExportRecord`, already
+  used `Option<i32>`; this one was the outlier. Found by a fixture written for the delivery-time enrichment in
+  `ironauth-admin`, which reads traits on every async flow-target delivery.
+
+  The blast radius was NOT a downed worker: the outbox catches a consumer panic, records it
+  as the retryable `consumer_panic`, counts it as an attempt, and survives. The cost was that
+  such an identity's delivery retried to the attempts cap and dead-lettered on a fault the
+  read could simply have reported, and that a panic per attempt is a poor way to learn that a
+  column is nullable.
+
+  **BREAKING (library API).** `UserRepo::traits` now answers
+  `Option<(Option<i32>, serde_json::Value)>` rather than `Option<(i32, ...)>`. Every in-tree
+  caller was updated. One production caller consumes the version, the management
+  `GET .../users/{id}/traits`, and needed the change; the rest destructure it away and compile
+  unchanged. Every existing test site that binds the version was updated, and the regression
+  fixture below adds one more. Out-of-tree callers that destructure the version must handle its
+  absence.
+
+  The management route is unchanged on the wire, since `schema_version` was already nullable
+  there, but its MEANING widened: it is now null in a second case, an identity whose traits
+  carry no recorded version, and the published description says so. The `traits` field beside
+  it separates the two, being null for "no traits at all" and a document otherwise.
+
 - **The signup envelope names the door that produced it (issue #953).** The async
   flow-target body carries `origin`, beside `state` and `quarantined`: `self_service` for a
   password signup, `passwordless` for a passkey-only one. Derived inside `register_inner`
@@ -775,8 +831,10 @@ range per docs/RELEASING.md.
   `visibility`, which this work makes a security boundary: MEASURED, with a nested
   `visibility: admin`, a self-service write overwrote `address.secret` and a later omission
   CLEARED it, while the root-level control in the same write was correctly preserved.
-  `check_schema_wellformed` now refuses an annotation anywhere but a top-level property,
-  with a `SchemaMalformed` naming the offending RFC 6901 pointer.
+  `check_schema_wellformed` now refuses an annotation anywhere BELOW a top-level property,
+  with a `SchemaMalformed` naming the offending RFC 6901 pointer. The document ROOT stays
+  annotatable, which is not a loophole: it is the position a lone sub-schema occupies when the
+  signup-field path compiles one on its own.
 
 - **A NON-OBJECT self-service submission can no longer clear admin-only metadata.** The
   "cannot clear" half works by carrying the existing admin-only members onto the

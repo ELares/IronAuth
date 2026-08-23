@@ -1101,8 +1101,10 @@ pub struct UserTraitsView {
     /// The identity-traits document, or null when the identity has none set.
     #[schema(value_type = Object)]
     pub traits: Option<serde_json::Value>,
-    /// The trait-schema version the document was last validated against, or null when
-    /// the identity has no traits.
+    /// The trait-schema version the document was last validated against, or null in either
+    /// of two cases: the identity has no traits at all, or it carries traits whose source
+    /// recorded no version (an import). The field beside this one separates them, being null
+    /// in the first case and a document in the second.
     pub schema_version: Option<i32>,
 }
 

@@ -7633,8 +7633,10 @@ export interface components {
             id: string;
             /**
              * Format: int32
-             * @description The trait-schema version the document was last validated against, or null when
-             *     the identity has no traits.
+             * @description The trait-schema version the document was last validated against, or null in either
+             *     of two cases: the identity has no traits at all, or it carries traits whose source
+             *     recorded no version (an import). The field beside this one separates them, being null
+             *     in the first case and a document in the second.
              */
             schema_version?: number | null;
             /** @description The identity-traits document, or null when the identity has none set. */

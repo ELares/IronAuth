@@ -15388,8 +15388,10 @@ pub struct UserExportRecord {
     /// The user's identity-traits document as JSON text, opened from its sealed
     /// column, or [`None`] when the user has no traits set.
     pub traits_json: Option<String>,
-    /// The trait-schema version the traits were last validated against, or [`None`]
-    /// when there are no traits.
+    /// The trait-schema version the traits were last validated against, or [`None`] in
+    /// either of two cases: the identity has no traits at all, or it carries traits whose
+    /// source recorded no version (an import). `traits_json` beside this one separates
+    /// them, being [`None`] in the first case and a document in the second.
     pub traits_schema_version: Option<i32>,
     /// The native Argon2id PHC verifier string, or [`None`] when it is the unusable
     /// sentinel (a credential-less or foreign-only account). One-way; never the
@@ -61491,9 +61493,14 @@ impl<'a> ActingStore<'a> {
 }
 
 impl UserRepo<'_> {
-    /// Read one identity's trait document, decrypted, along with the schema version it
-    /// was validated against. Returns [`None`] when the identity has no traits set (or
-    /// is absent / soft-deleted / out of scope).
+    /// Read one identity's trait document, decrypted, along with the schema version it was
+    /// validated against. Returns [`None`] when the identity has no traits set (or is
+    /// absent / soft-deleted / out of scope).
+    ///
+    /// The VERSION is itself optional, and the two [`None`]s mean different things: the outer
+    /// one is "no traits", the inner one is "traits whose source recorded no version", which
+    /// is what an import produces. The column is nullable and this returns that faithfully
+    /// rather than inventing a number.
     ///
     /// # Errors
     ///
@@ -61502,7 +61509,7 @@ impl UserRepo<'_> {
     pub async fn traits(
         &self,
         id: &UserId,
-    ) -> Result<Option<(i32, serde_json::Value)>, StoreError> {
+    ) -> Result<Option<(Option<i32>, serde_json::Value)>, StoreError> {
         if id.scope() != self.scope {
             return Ok(None);
         }
@@ -61522,7 +61529,22 @@ impl UserRepo<'_> {
             tx.commit().await?;
             return Ok(None);
         };
-        let version: i32 = row.get("traits_schema_version");
+        // NULLABLE, and decoded as such. Migration 0038 adds the column with no NOT NULL,
+        // and the write path allows it: `NewUserTraits::schema_version` is documented as
+        // `None` when the source recorded none, which is what an IMPORT of a user who
+        // carries traits but no known schema version produces. Decoding it as a bare `i32`
+        // made THIS read, and `traits_user_visible` through it, PANIC rather than fail.
+        //
+        // Not a downed process: the outbox catches a consumer panic, records it as the
+        // retryable `consumer_panic`, and counts it as an attempt, so the worker survives.
+        // The cost is that the delivery for such an identity retried to the attempts cap and
+        // dead-lettered on a fault the read could simply have reported, and a panic per
+        // attempt is a poor way to learn that a column is nullable.
+        //
+        // The only other place this repository DECODES this column, the export projection
+        // feeding `UserExportRecord`, already uses `Option<i32>`; this was the outlier. (A
+        // raw-SQL read in the signup-fields test suite decodes it nullably too.)
+        let version: Option<i32> = row.get("traits_schema_version");
         let traits = open_user_traits(&mut tx, self.scope, master, &row).await?;
         tx.commit().await?;
         Ok(Some((version, traits)))
@@ -61530,12 +61552,16 @@ impl UserRepo<'_> {
 
     /// Read one identity's trait document as a self-service (user-facing) surface sees
     /// it: with every admin-only field stripped per the active schema's annotations
-    /// (issue #53). Returns [`None`] when the identity has no traits. Falls back to the
-    /// full document only if there is no active schema to read annotations from.
+    /// (issue #53). Returns [`None`] when the identity has no traits. Falls back to the full
+    /// document when there is no active schema, because with none nothing is declared
+    /// admin-only. A schema that is active but will NOT compile is an error rather than a
+    /// second fallback: the annotations are what say which fields to withhold, so being unable
+    /// to read them is a reason to refuse rather than to disclose.
     ///
     /// # Errors
     ///
-    /// As [`UserRepo::traits`].
+    /// As [`UserRepo::traits`]; additionally [`StoreError::SchemaMalformed`] when the scope's
+    /// ACTIVE schema does not compile.
     pub async fn traits_user_visible(
         &self,
         id: &UserId,
@@ -61548,9 +61574,31 @@ impl UserRepo<'_> {
             scope: self.scope,
         };
         let redacted = match schemas.active().await? {
-            Some(active) => TraitSchema::compile(&active.schema_json)
-                .map(|schema| schema.annotations().redact_for_user(&traits))
-                .unwrap_or(traits),
+            // FAIL CLOSED on a schema that will not compile. This used to `unwrap_or(traits)`,
+            // which answered with the UNREDACTED document, and for a redaction that is the
+            // unsafe direction: the annotations are what say which fields to withhold, so
+            // being unable to read them is a reason to refuse, never a reason to disclose.
+            //
+            // Not a hypothetical branch. A stored schema is CHECKED for well-formedness when
+            // it is written and again when it is activated, and nothing re-checks it after
+            // that, while `check_schema_wellformed` has been tightened since: it now refuses
+            // an annotation anywhere BELOW a top-level property. (The document root stays
+            // annotatable on purpose, so that a lone sub-schema can be compiled on its own.)
+            // A row activated under the looser checker stays active, since activation is the
+            // only writer of `status` and the table has no DELETE grant, and it no longer
+            // compiles. Readers compile it on every use, which is how they meet it.
+            //
+            // Every caller already had an error arm and each degrades safely into it: the
+            // flow's progressive-profiling merge base and federation's returning-login profile
+            // reuse both turn it into a server error, and the async flow-target delivery
+            // refuses the delivery PERMANENTLY rather than POSTing the document to a third
+            // party.
+            Some(active) => TraitSchema::compile(&active.schema_json)?
+                .annotations()
+                .redact_for_user(&traits),
+            // No active schema is different, and genuinely safe: with none, nothing has been
+            // declared admin-only, so there is nothing being withheld by returning the whole
+            // document.
             None => traits,
         };
         Ok(Some(redacted))

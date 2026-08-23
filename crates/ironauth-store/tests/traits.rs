@@ -258,7 +258,7 @@ async fn traits_validate_against_the_active_version_and_persist_the_version_used
         .await
         .expect("read traits")
         .expect("traits present");
-    assert_eq!(recorded_version, v1);
+    assert_eq!(recorded_version, Some(v1));
     assert_eq!(round_tripped, doc, "arrays and nested objects round-trip");
 
     // The traits are sealed at rest: a database dump carries no plaintext.
@@ -439,7 +439,7 @@ async fn versioning_is_immutable_and_a_dry_run_reports_and_blocks_the_cutover() 
         .await
         .expect("read")
         .expect("present");
-    assert_eq!(still_v1, v1);
+    assert_eq!(still_v1, Some(v1));
 
     // The cutover is blocked while invalid identities remain.
     let err = activate_schema(&db, &env, scope, v2)
@@ -561,7 +561,7 @@ async fn a_migration_job_transforms_deterministically_idempotently_and_unblocks_
         .await
         .expect("read")
         .expect("present");
-    assert_eq!(alice_v, v2);
+    assert_eq!(alice_v, Some(v2));
     assert_eq!(
         alice_traits,
         json!({"full_name": "Alice"}),
@@ -713,7 +713,7 @@ async fn a_migration_job_is_scoped_and_never_touches_another_tenant() {
         .await
         .expect("read b")
         .expect("present");
-    assert_eq!(b_version, 1, "tenant B stays on v1");
+    assert_eq!(b_version, Some(1), "tenant B stays on v1");
     assert_eq!(b_traits, json!({"name": "Bruno"}), "tenant B is untouched");
 
     // A job id from tenant A is a uniform not-found in tenant B.
@@ -1391,4 +1391,160 @@ async fn registering_and_activating_a_schema_version_emit_distinct_types() {
     );
     ironauth_store::event_catalog::validate_event(&second)
         .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+#[tokio::test]
+async fn traits_imported_without_a_schema_version_read_back_rather_than_panicking() {
+    // `traits_schema_version` is NULLABLE (migration 0038 adds it with no NOT NULL) and the
+    // write path allows it: `NewUserTraits::schema_version` is documented as `None` when the
+    // source recorded none, which is what importing a user who carries traits from a system
+    // with no schema registry produces. `admin_create` validates nothing and stores it
+    // verbatim, so such a row is reachable through a supported surface, not only by hand.
+    //
+    // Reading it back used to decode the column as a bare `i32` and PANIC. The only other
+    // place the repository decodes this column, the export projection feeding
+    // `UserExportRecord`, already used `Option<i32>`; this was the outlier.
+    //
+    // A panic is worse than an error even where it is contained. The async flow-target
+    // consumer reads traits on every delivery (issue #954), and the outbox catches a consumer
+    // panic, records the retryable `consumer_panic`, and survives, so the worker does not
+    // die. What it costs is that such an identity's delivery retries to the attempts cap and
+    // dead-letters on a fault the read could have reported outright.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x53);
+    let scope = db.seed_scope(&env).await;
+    let doc = json!({"imported": true, "source": "legacy"});
+
+    let user = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .admin_create(
+            &env,
+            NewAdminUser {
+                id: None,
+                identifier: "imported@example.test",
+                password_hash: Some(PASSWORD_HASH),
+                claims_json: None,
+                external_id: None,
+                state: UserState::Active,
+                foreign_password_hash: None,
+                foreign_password_algo: None,
+                traits: Some(NewUserTraits {
+                    traits_json: &doc.to_string(),
+                    // The whole point of the fixture.
+                    schema_version: None,
+                    visibility: TraitWriteVisibility::Admin,
+                }),
+            },
+            NOW_MICROS,
+            None,
+        )
+        .await
+        .expect("import a user carrying traits but no schema version");
+
+    let (version, round_tripped) = db
+        .store()
+        .scoped(scope)
+        .users()
+        .traits(&user)
+        .await
+        .expect("the read succeeds instead of panicking")
+        .expect("the traits are present");
+    assert_eq!(
+        version, None,
+        "no version is recorded, and that is reported rather than invented"
+    );
+    assert_eq!(
+        round_tripped, doc,
+        "and the document itself is intact: the missing version is the only thing missing"
+    );
+}
+
+#[tokio::test]
+async fn an_active_schema_that_no_longer_compiles_refuses_the_redaction_rather_than_disclosing() {
+    // The user-visible projection FAILS CLOSED when the active schema will not compile.
+    //
+    // This branch is reachable without anyone doing anything wrong. A stored schema is CHECKED
+    // for well-formedness when it is written and again when it is activated, and nothing
+    // re-checks it after that, while `check_schema_wellformed` has been tightened since: it now
+    // refuses `x-ironauth` anywhere BELOW a top-level property (the document root stays
+    // annotatable on purpose, so a lone sub-schema can be compiled on its own). A row activated
+    // under the looser checker stays active, because activation is the only writer of `status`
+    // and the table carries no DELETE grant, and it stops compiling. Readers compile it on
+    // every use, which is how they meet it. The fixture reproduces that end state by writing
+    // the row directly, which is the only way to reach it now that the write path compiles.
+    //
+    // The direction matters more than the branch. Returning the document unredacted was the
+    // old behaviour, and for a REDACTION that is the unsafe answer: the annotations are what
+    // say which fields to withhold, so being unable to read them is a reason to refuse rather
+    // than to disclose. It became urgent when this projection gained a caller that POSTs the
+    // result to a third-party endpoint (issue #954); before that its readers were in-process.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x53);
+    let scope = db.seed_scope(&env).await;
+    let user = create_user(&db, &env, scope, "carried@example.test").await;
+
+    // Both halves have to be real: a genuine sealed traits document carrying an admin-only
+    // field, and a genuine non-compiling active schema. So seed through a schema that DOES
+    // compile, then swap the active row for one that does not.
+    let v1 = create_schema(
+        &db,
+        &env,
+        scope,
+        r#"{"type":"object","properties":{"name":{"type":"string"},"risk_score":{"type":"integer","x-ironauth":{"visibility":"admin"}}}}"#,
+    )
+    .await;
+    activate_schema(&db, &env, scope, v1)
+        .await
+        .expect("activate the compiling schema");
+    set_traits(
+        &db,
+        &env,
+        scope,
+        &user,
+        r#"{"name":"Zeke","risk_score":97}"#,
+    )
+    .await
+    .expect("seed the traits under a compiling schema");
+
+    // Sanity: while the schema compiles, the admin-only field IS stripped. Without this the
+    // assertion below could pass because the projection is broken in some other way.
+    let visible = db
+        .store()
+        .scoped(scope)
+        .users()
+        .traits_user_visible(&user)
+        .await
+        .expect("the read succeeds while the schema compiles")
+        .expect("the traits are present");
+    assert_eq!(
+        visible,
+        json!({"name": "Zeke"}),
+        "the compiling case strips the admin-only field"
+    );
+
+    // Now the carried-forward row: annotation nested below a top-level property, which the
+    // current checker refuses and an older one accepted.
+    sqlx::query("UPDATE trait_schemas SET schema_json = $1 WHERE tenant_id = $2 AND environment_id = $3 AND status = 'active'")
+        .bind(r#"{"type":"object","properties":{"name":{"type":"object","properties":{"inner":{"type":"string","x-ironauth":{"visibility":"admin"}}}}}}"#)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("carry forward a schema the current checker refuses");
+
+    let err = db
+        .store()
+        .scoped(scope)
+        .users()
+        .traits_user_visible(&user)
+        .await
+        .expect_err("a redaction that cannot read its annotations must refuse");
+    assert!(
+        matches!(err, StoreError::SchemaMalformed(_)),
+        "and it refuses AS a schema fault rather than a generic one, which is what lets a \
+         caller tell an operator-repairable misconfiguration from a database outage: {err:?}"
+    );
 }

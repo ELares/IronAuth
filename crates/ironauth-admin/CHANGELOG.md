@@ -6,6 +6,77 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **An async flow-target delivery carries the subject's identifier and traits, resolved at
+  DELIVERY time (issue #954).** A receiver previously got an opaque subject id, plus the
+  `state`, `quarantined` and `origin` the envelope already carried, and had to call the
+  management API back for anything IDENTIFYING: who the person is and what traits they hold. The consumer now opens the
+  live user record and its traits document while composing the outgoing body, beside
+  `config`, which is already resolved the same way though for a different reason: `config` is
+  late so that an operator's edit reaches a delivery already queued, while the identifier is
+  late so that it never rests in the plaintext queue at all.
+
+  The queue itself is unchanged and deliberately so: `outbox_messages.payload` still holds
+  ids only. It is plaintext `jsonb` sitting one table over from `users.identifier`, which
+  migration 0028 seals under the scope's envelope DEK, one per (tenant, environment) and
+  versioned, with each row recording the version that sealed it. An identifier written to the
+  queue would be out of reach of an erasure request whatever else became of the row:
+  `OutboxRepo::reap_completed` and `OutboxRepo::reap_dead_lettered` both key on a time window
+  and the scope, so neither can be pointed at one person. A delivered announcement is at least
+  reaped eventually, on `completed_retention_secs`; a FAILED one comes to rest in the
+  dead-letter tail, where `dead_letter_retention_secs` defaults to 0, meaning KEEP.
+
+  **Which snapshot.** NOW, not signup time, for the one field where the two can differ.
+  `traits` is mutable, so an edit between the signup and the drain is what the receiver sees,
+  which is `config`'s behaviour exactly. `identifier` has no update path on this repository
+  at all, so for it the two differ only when the account was deleted. This is a real trade:
+  the event's subject is "this signup happened", so the signup-time traits are arguably the
+  correct ones, and they are exactly what is no longer available. Rendering now is chosen
+  because the alternative is holding them at rest forever.
+
+  **A deleted subject** is DISCARDED exactly as a deregistered target is, and that discard arm
+  is the only one the two share: a subject read that fails for any other reason is RETRYABLE,
+  whereas a DISABLED target is deliberately PERMANENT. The delivery is not retried and not
+  failed: a deleted account does not come back,
+  so fourteen attempts would only delay every later delivery on the same ordering key, and
+  nothing is broken, since deleting a user is allowed. What the privacy argument rules out is
+  DELIVERING rather than the other two classifications, both of which also POST nothing: if the
+  deletion was an erasure request, sending that person's identifier to a third party afterwards
+  is precisely what erasure was meant to stop, and resolving at delivery time is what makes
+  refusing possible at all, since a body built at enqueue would already hold it. A read that fails for any other reason is
+  RETRYABLE, including the traits read on its own, because absorbing it would deliver a body
+  saying this person has no traits, which a receiver cannot distinguish from the truth.
+
+  **The USER-VISIBLE trait projection, not the full document.** Fields an operator annotated
+  `x-ironauth: {"visibility": "admin"}` are stripped. The full document is right for a
+  management read and for the flow evaluator, and both say so, the evaluator resting its case
+  on the value never reaching an end user and being serialized only into an operator and CI
+  artifact. A delivery cannot borrow that: it POSTs the document to whatever endpoint a target
+  names, which is the widest circulation any reader of these fields has. With no active schema
+  there is nothing annotated admin-only, so the full document is then also the correct answer.
+
+  **The redaction now FAILS CLOSED.** `UserRepo::traits_user_visible` used to answer with the
+  UNREDACTED document when the active schema would not compile, and for a redaction that is the
+  unsafe direction: the annotations are what say which fields to withhold, so being unable to
+  read them is a reason to refuse rather than to disclose. It is now an error. The branch is
+  reachable without anyone doing anything wrong, because a schema is compiled when written and
+  when activated and never again, while the well-formedness check has been tightened since. It
+  mattered little while the projection had only in-process readers; this change is what routes
+  it to a third party. Its other callers already had an error arm and each degrades safely
+  into it.
+
+  The delivery classifies that error PERMANENT rather than retryable, on the same reasoning the
+  disabled-target arm gives: the schema stays broken until an operator activates a replacement,
+  so retrying would hold the head of the target's ordering group for the whole attempt schedule
+  while every later delivery to that target waits behind it. A dead letter is terminal, blocks
+  nothing, and is replayable. Its label names the schema, so an operator reading the dead letter
+  is not sent looking for a database fault.
+
+  **WIRE ADDITION** to a published envelope, under `data`: `identifier` always, and `traits`
+  only when the subject has a document, so its absence is an absent key rather than an
+  explicit null. Enrichment happens before the single serialization the signature covers, so
+  the signed bytes and the sent bytes remain the same bytes. A receiver that ignores unknown
+  fields is unaffected.
+
 - **Two routes for a flow target's dead-lettered async deliveries** (issue #112 criterion 2):
   `GET .../flow-targets/{target_id}/dead-letters` (classified `management.read`) and
   `POST .../flow-targets/{target_id}/replay` (`management.write_config`, sudo-fenced). Both
