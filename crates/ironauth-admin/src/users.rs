@@ -584,7 +584,10 @@ pub async fn get_user_traits(
     let view = UserTraitsView {
         id: id.to_string(),
         traits: traits.as_ref().map(|(_, value)| value.clone()),
-        schema_version: traits.as_ref().map(|(version, _)| *version),
+        // `None` for BOTH "no traits at all" and "traits whose source recorded no schema
+        // version" (an import). They serialize alike, and the field beside it separates
+        // them: `traits` is null in the first case and a document in the second.
+        schema_version: traits.as_ref().and_then(|(version, _)| *version),
     };
     let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))

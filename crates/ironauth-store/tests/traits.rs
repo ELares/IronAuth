@@ -258,7 +258,7 @@ async fn traits_validate_against_the_active_version_and_persist_the_version_used
         .await
         .expect("read traits")
         .expect("traits present");
-    assert_eq!(recorded_version, v1);
+    assert_eq!(recorded_version, Some(v1));
     assert_eq!(round_tripped, doc, "arrays and nested objects round-trip");
 
     // The traits are sealed at rest: a database dump carries no plaintext.
@@ -439,7 +439,7 @@ async fn versioning_is_immutable_and_a_dry_run_reports_and_blocks_the_cutover() 
         .await
         .expect("read")
         .expect("present");
-    assert_eq!(still_v1, v1);
+    assert_eq!(still_v1, Some(v1));
 
     // The cutover is blocked while invalid identities remain.
     let err = activate_schema(&db, &env, scope, v2)
@@ -561,7 +561,7 @@ async fn a_migration_job_transforms_deterministically_idempotently_and_unblocks_
         .await
         .expect("read")
         .expect("present");
-    assert_eq!(alice_v, v2);
+    assert_eq!(alice_v, Some(v2));
     assert_eq!(
         alice_traits,
         json!({"full_name": "Alice"}),
@@ -713,7 +713,7 @@ async fn a_migration_job_is_scoped_and_never_touches_another_tenant() {
         .await
         .expect("read b")
         .expect("present");
-    assert_eq!(b_version, 1, "tenant B stays on v1");
+    assert_eq!(b_version, Some(1), "tenant B stays on v1");
     assert_eq!(b_traits, json!({"name": "Bruno"}), "tenant B is untouched");
 
     // A job id from tenant A is a uniform not-found in tenant B.
@@ -1391,4 +1391,73 @@ async fn registering_and_activating_a_schema_version_emit_distinct_types() {
     );
     ironauth_store::event_catalog::validate_event(&second)
         .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+#[tokio::test]
+async fn traits_imported_without_a_schema_version_read_back_rather_than_panicking() {
+    // `traits_schema_version` is NULLABLE (migration 0038 adds it with no NOT NULL) and the
+    // write path allows it: `NewUserTraits::schema_version` is documented as `None` when the
+    // source recorded none, which is what importing a user who carries traits from a system
+    // with no schema registry produces. `admin_create` validates nothing and stores it
+    // verbatim, so such a row is reachable through a supported surface, not only by hand.
+    //
+    // Reading it back used to decode the column as a bare `i32` and PANIC. The one other read
+    // of this column, the export projection feeding `UserExportRecord`, already decoded it as
+    // `Option<i32>`; this was the outlier.
+    //
+    // A panic is worse than an error even where it is contained. The async flow-target
+    // consumer reads traits on every delivery (issue #954), and the outbox catches a consumer
+    // panic, records the retryable `consumer_panic`, and survives, so the worker does not
+    // die. What it costs is that such an identity's delivery retries to the attempts cap and
+    // dead-letters on a fault the read could have reported outright.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x53);
+    let scope = db.seed_scope(&env).await;
+    let doc = json!({"imported": true, "source": "legacy"});
+
+    let user = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .admin_create(
+            &env,
+            NewAdminUser {
+                id: None,
+                identifier: "imported@example.test",
+                password_hash: Some(PASSWORD_HASH),
+                claims_json: None,
+                external_id: None,
+                state: UserState::Active,
+                foreign_password_hash: None,
+                foreign_password_algo: None,
+                traits: Some(NewUserTraits {
+                    traits_json: &doc.to_string(),
+                    // The whole point of the fixture.
+                    schema_version: None,
+                    visibility: TraitWriteVisibility::Admin,
+                }),
+            },
+            NOW_MICROS,
+            None,
+        )
+        .await
+        .expect("import a user carrying traits but no schema version");
+
+    let (version, round_tripped) = db
+        .store()
+        .scoped(scope)
+        .users()
+        .traits(&user)
+        .await
+        .expect("the read succeeds instead of panicking")
+        .expect("the traits are present");
+    assert_eq!(
+        version, None,
+        "no version is recorded, and that is reported rather than invented"
+    );
+    assert_eq!(
+        round_tripped, doc,
+        "and the document itself is intact: the missing version is the only thing missing"
+    );
 }

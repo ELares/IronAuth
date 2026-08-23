@@ -328,6 +328,133 @@ async fn flow_api_signup(harness: &Harness, identifier: &str) {
     );
 }
 
+/// Install and activate a trait schema carrying a collectable `nickname`.
+///
+/// Needed only by the payload-column fixture: without a schema and a form, a signup collects
+/// no traits, and an assertion that traits are absent from the queue measures nothing.
+async fn install_trait_schema(harness: &Harness) {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "nickname": {"type": "string", "minLength": 3, "maxLength": 20}
+        }
+    })
+    .to_string();
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let (_, version) = harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(
+            harness.db().test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .trait_schemas()
+        .create_version(&env, &schema, 1_000_000)
+        .await
+        .expect("create schema version");
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(
+            harness.db().test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .trait_schemas()
+        .activate_version(&env, version)
+        .await
+        .expect("activate schema version");
+}
+
+/// A signup form for the harness client with one required `nickname` field.
+async fn install_signup_form(harness: &Harness) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let client = harness.client_id().to_string();
+    let fields = serde_json::json!([
+        {"trait_pointer": "/nickname", "required": true, "order": 0, "step": "signup",
+         "rules": {}, "label_message_id": 1_070_001}
+    ])
+    .to_string();
+    let id = ironauth_store::SignupFormId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(
+            harness.db().test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .signup_forms()
+        .set(
+            &env,
+            &id,
+            1_000_000,
+            ironauth_store::NewSignupForm {
+                client_id: &client,
+                fields_json: &fields,
+            },
+        )
+        .await
+        .expect("set signup form");
+}
+
+/// Drive the flow-API registration door, collecting `nickname` as a trait.
+async fn flow_api_signup_with_nickname(harness: &Harness, identifier: &str, nickname: &str) {
+    // The RESUME TARGET is what makes the registration path load a signup form, and it is the
+    // fifth argument. An earlier revision passed the client id as the seventh instead, which
+    // is `connector`; `start_state`'s Registration arm never reads that, so the argument was a
+    // silent no-op, no form was loaded, no trait was collected, and the fixture this helper
+    // exists to de-vacuate stayed vacuous. `load_active_signup_form` takes the client from
+    // `parse_resume(return_to)`, so a `None` there short-circuits to no form.
+    let client_id = harness.client_id().to_string();
+    let return_to = format!(
+        "/authorize?response_type=code&client_id={client_id}&redirect_uri=https://rp.example/cb\
+         &scope=openid"
+    );
+    let (flow_id, token, _) = create_flow(
+        harness.state(),
+        harness.scope(),
+        Transport::Api,
+        Journey::Registration,
+        Some(return_to.as_str()),
+        None,
+        None,
+        &HeaderMap::new(),
+    )
+    .await
+    .expect("create the registration flow");
+
+    let mut values: BTreeMap<String, Value> = BTreeMap::new();
+    values.insert("identifier".to_owned(), serde_json::json!(identifier));
+    values.insert("password".to_owned(), serde_json::json!(PASSWORD));
+    values.insert("nickname".to_owned(), serde_json::json!(nickname));
+
+    let continuation = drive(
+        harness.state(),
+        harness.scope(),
+        &flow_id,
+        Transport::Api,
+        TransportAuth::Api {
+            presented_submit_token: token,
+        },
+        Submission {
+            node_values: values,
+            transient_payload: None,
+        },
+        &HeaderMap::new(),
+    )
+    .await
+    .expect("drive the registration submission");
+
+    assert!(
+        matches!(continuation, Continuation::Complete { .. }),
+        "the trait-collecting signup must complete rather than render another step"
+    );
+}
+
 #[tokio::test]
 async fn a_signup_at_the_flow_api_door_also_queues_a_delivery() {
     // The OTHER door. Everything above drives the legacy `/register` route, and the commit for
@@ -358,5 +485,118 @@ async fn a_signup_at_the_flow_api_door_also_queues_a_delivery() {
             .as_str()
             .is_some_and(|s| s.starts_with("usr_")),
         "and names the account it created: {queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_identifier_and_traits_are_never_written_to_the_payload_column() {
+    // Issue #954 criterion 2, asserted where the criterion asks for it: on the PAYLOAD
+    // COLUMN, read back over the owner pool as `payload::text`, rather than on anything the
+    // consumer hands out.
+    //
+    // Named for exactly what it checks. The payload is not free of facts about the subject:
+    // it carries `state`, `quarantined` and `origin` beside the id, deliberately (issues #953
+    // and #112). What it must never carry is the two IDENTIFYING fields, which are the ones
+    // sealed in `users` and the ones an erasure request is about.
+    //
+    // The payload column and the delivered body are two different artifacts, and the whole
+    // point of this change is that they differ, so a test that reads only the delivered body
+    // cannot see this property at all.
+    //
+    // Read as `payload::text` and searched as a SUBSTRING rather than by key. A per-key
+    // assertion only refuses the spelling it names, so `data.identifier` moving to
+    // `data.user.email` or `subject_identifier` would pass it while writing exactly the same
+    // plaintext to exactly the same column. The substring search does not care where it went.
+    //
+    // Why the column matters more than it looks: `outbox_messages.payload` is plaintext
+    // `jsonb` sitting one table over from `users.identifier`, which migration 0028 seals
+    // under the scope's envelope DEK. Writing the identifier here in the clear would undo
+    // that seal for every signup. The row is also effectively permanent, for two reasons:
+    // `dead_letter_retention_secs` defaults to 0, meaning KEEP, and the dead-letter tail is
+    // where a failed delivery comes to rest; and neither reaper DELETE carries a subject
+    // predicate, so no erasure request can reach one person's rows.
+    // The subject must actually CARRY traits, or the traits half of this test asserts nothing.
+    // The legacy door reaches the bare `register` family, which passes `traits: None`, so a
+    // fixture built on it would satisfy `!contains("traits")` with an empty document and would
+    // still pass against a leak written in the same conditional shape the consumer itself uses.
+    // So this drives the FLOW API door with a schema and a signup form installed, collecting a
+    // nickname, and asserts the collected VALUE is absent from the column as well as the key.
+    let harness = flows_harness().await;
+    install_trait_schema(&harness).await;
+    install_signup_form(&harness).await;
+    let target = register_async_target(&harness, "crm").await;
+    let identifier = "not-in-the-queue@example.test";
+    let nickname = "queuenick";
+
+    flow_api_signup_with_nickname(&harness, identifier, nickname).await;
+
+    // POSITIVE GUARD, and the reason this test is not the vacuous one it replaces. Every
+    // assertion below is an ABSENCE, and absence is exactly what a subject with no traits
+    // produces, so without this the fixture passes hardest when it is measuring least. Read
+    // from the users table rather than inferred from the flow completing: the flow completes
+    // just as happily when the signup form was never loaded.
+    let has_traits: bool = sqlx::query_scalar(
+        "SELECT traits_sealed IS NOT NULL FROM users \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(harness.scope().tenant().to_string())
+    .bind(harness.scope().environment().to_string())
+    .fetch_one(harness.db().owner_pool())
+    .await
+    .expect("read the created subject");
+    assert!(
+        has_traits,
+        "the fixture must actually collect a trait, or every absence assertion below is \
+         satisfied by there being nothing to find"
+    );
+
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload::text FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3",
+    )
+    .bind(harness.scope().tenant().to_string())
+    .bind(harness.scope().environment().to_string())
+    .bind(ironauth_store::FLOW_TARGET_DELIVERY_CONSUMER)
+    .fetch_all(harness.db().owner_pool())
+    .await
+    .expect("read the payload column");
+
+    // Non-empty first. An empty result satisfies every `!contains` below vacuously, and the
+    // failure mode that produces it (the signup queued nothing) is one this file's other
+    // tests exist to catch -- which is exactly why it must not be silently tolerated here.
+    assert_eq!(
+        payloads.len(),
+        1,
+        "one target, one signup, one queued delivery"
+    );
+    let payload = &payloads[0];
+    assert!(
+        !payload.contains(identifier),
+        "the identifier must not be written to the queue in any field: {payload}"
+    );
+    assert!(
+        !payload.contains("identifier"),
+        "nor a key by that name, however it is spelled: {payload}"
+    );
+    assert!(!payload.contains("traits"), "nor a traits key: {payload}");
+    // The VALUE, not only the key. A key check alone is blind to the leak shape that actually
+    // threatens here: a conditional insert in the same shape the consumer itself uses writes
+    // nothing for a trait-less subject, so on the old fixture it passed by writing nothing
+    // rather than by being correct. The positive guard above is what closes that.
+    assert!(
+        !payload.contains(nickname),
+        "nor the collected trait value: {payload}"
+    );
+
+    // The positive half, so the assertions above are about ABSENCE of the person rather than
+    // about having read an empty or unrelated row. The subject id is present, and it is the
+    // only handle the payload carries.
+    assert!(
+        payload.contains(&target),
+        "the payload is the one for this target: {payload}"
+    );
+    assert!(
+        payload.contains("\"subject\""),
+        "and it carries the opaque subject id the consumer resolves from: {payload}"
     );
 }

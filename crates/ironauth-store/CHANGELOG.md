@@ -6,6 +6,36 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`UserRepo::traits` no longer panics on an imported identity, and its return type says
+  why (issue #954).** `users.traits_schema_version` is nullable: migration 0038 adds the
+  column with no `NOT NULL`, and `NewUserTraits::schema_version` is documented as `None`
+  when the source recorded none, which is exactly what importing a user who carries traits
+  from a system with no schema registry produces. `admin_create` validates nothing and
+  stores it verbatim, so such a row is reachable through a supported surface.
+
+  The read decoded that column as a bare `i32` and PANICKED on it. The one other read of the
+  same column, the export projection feeding `UserExportRecord`, already used `Option<i32>`;
+  this one was the outlier. Found by a fixture written for the delivery-time enrichment in
+  `ironauth-admin`, which reads traits on every async flow-target delivery.
+
+  The blast radius was NOT a downed worker: the outbox catches a consumer panic, records it
+  as the retryable `consumer_panic`, counts it as an attempt, and survives. The cost was that
+  such an identity's delivery retried to the attempts cap and dead-lettered on a fault the
+  read could simply have reported, and that a panic per attempt is a poor way to learn that a
+  column is nullable.
+
+  **BREAKING (library API).** `UserRepo::traits` now answers
+  `Option<(Option<i32>, serde_json::Value)>` rather than `Option<(i32, ...)>`. Every in-tree
+  caller was updated: of the five production callers, one consumes the version (the management
+  `GET .../users/{id}/traits`) and four destructure it away, and seven test call sites that
+  read it were changed here. Out-of-tree callers that destructure the version must handle its
+  absence.
+
+  The management route is unchanged on the wire, since `schema_version` was already nullable
+  there, but its MEANING widened: it is now null in a second case, an identity whose traits
+  carry no recorded version, and the published description says so. The `traits` field beside
+  it separates the two, being null for "no traits at all" and a document otherwise.
+
 - **The signup envelope names the door that produced it (issue #953).** The async
   flow-target body carries `origin`, beside `state` and `quarantined`: `self_service` for a
   password signup, `passwordless` for a passkey-only one. Derived inside `register_inner`

@@ -485,7 +485,11 @@ async fn a_data_only_connector_provisions_mapped_traits_end_to_end_with_zero_cod
         .await
         .expect("traits read")
         .expect("the provisioned user carries mapped traits");
-    assert_eq!(version, 1, "the traits record the active schema version");
+    assert_eq!(
+        version,
+        Some(1),
+        "the traits record the active schema version"
+    );
     assert_eq!(
         traits.get("email"),
         Some(&serde_json::json!("user@upstream.example"))

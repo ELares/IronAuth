@@ -69,15 +69,195 @@ pub struct FlowTargetDeliveryConsumer<S> {
     sender: S,
 }
 
+/// What resolving a delivery's subject settled.
+///
+/// The SETTLED half of `FlowTargetDeliveryConsumer::resolve_subject`'s answer; a read that
+/// failed for some other reason is the `Err`, not a variant here. Naming both outcomes rather
+/// than returning a bool is what keeps visible the one thing [`FlowTargetDelivery`] and this
+/// genuinely share: a delivery whose subject is gone is discarded exactly as one whose target
+/// is deregistered is. The correspondence stops there, and deliberately: see that method.
+#[derive(Debug)]
+enum SubjectResolution {
+    /// The subject resolved and the body now carries what a receiver needs.
+    Enriched,
+    /// The account was deleted before the delivery drained. Discard it.
+    Gone,
+}
+
 impl<S: WebhookSender> FlowTargetDeliveryConsumer<S> {
     /// Build the consumer over a DATA-plane store and an outbound sender.
     ///
-    /// The store must carry a master key: opening a target's sealed signing secret is what
-    /// the read is for, and without one every signed delivery fails RETRYABLY rather than
-    /// silently going out unsigned.
+    /// The store must carry a master key, and since issue #954 that is true of EVERY delivery
+    /// rather than only signed ones. THREE reads need it: opening a target's sealed signing
+    /// secret, which is why a signed delivery fails RETRYABLY rather than silently going out
+    /// unsigned; opening the subject's sealed identifier; and opening the subject's sealed
+    /// trait document, a separate read in its own transaction. The last two are what
+    /// [`Self::resolve_subject`] added on every delivery. Before that, an UNSIGNED target
+    /// needed no master key at all, because `open_signing_secret` answers `Ok(None)` before it
+    /// consults one.
+    ///
+    /// Without a master key every delivery therefore fails retryably, and because the outbox
+    /// leases only the lowest-sequenced NON-TERMINAL message of an ordering group, the
+    /// target's whole backlog waits behind it for the full backoff schedule. The head then
+    /// dead letters, which IS terminal, and the group moves on.
     #[must_use]
     pub fn new(store: Store, sender: S) -> Self {
         Self { store, sender }
+    }
+
+    /// Resolve the delivery's subject and write what a receiver needs into `body`.
+    ///
+    /// Three outcomes: enriched, gone (discard the delivery), or a read that failed for some
+    /// other reason (retry).
+    ///
+    /// What that shares with [`FlowTargetDelivery`] is the DISCARD arm and only that arm:
+    /// `Gone` is discarded exactly as [`FlowTargetDelivery::Absent`] is, and for the same
+    /// reason. The remaining arms do not correspond, and the difference is worth naming
+    /// because it is easy to assume otherwise: a subject read that fails for another reason is
+    /// RETRYABLE, whereas [`FlowTargetDelivery::Disabled`] is deliberately PERMANENT, with its
+    /// own comment in `deliver_one` explaining why retrying there was the harmful choice.
+    ///
+    /// The caller does the logging, so the two discard paths read alike at the one place a
+    /// maintainer compares them.
+    ///
+    /// # Errors
+    ///
+    /// Permanent when the payload's body is a shape this consumer cannot read:
+    /// `payload_body_data_not_an_object`, `payload_body_missing_subject`, or
+    /// `payload_subject_not_a_user_id` (which also covers a subject id belonging to another
+    /// scope). Retryable when a store read fails for any reason other than the subject being
+    /// absent: `subject_read_failed`, or `subject_traits_read_failed` for the traits read on
+    /// its own.
+    async fn resolve_subject(
+        &self,
+        scope: Scope,
+        body: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<SubjectResolution, ConsumerError> {
+        // The subject's identifier and traits, resolved HERE rather than carried in the
+        // payload (issue #954).
+        //
+        // The payload keeps ids only. `outbox_messages.payload` is plaintext `jsonb`, and
+        // while migration 0102 grants DELETE and a reaper exists in Rust
+        // (`OutboxRepo::reap_dead_lettered`), two facts make an identifier written there
+        // effectively permanent: `dead_letter_retention_secs`
+        // defaults to 0, which means KEEP, and the dead-letter tail is exactly where a failed
+        // delivery comes to rest; and neither reaper DELETE carries a subject predicate, so
+        // no erasure request can ever reach one person's rows. Meanwhile `users.identifier`
+        // is sealed by migration 0028 under the scope's envelope DEK, one per (tenant,
+        // environment) and versioned, with each row recording the version that sealed it. So
+        // writing it in the clear one table over would undo that seal, and would put it beyond
+        // the reach of the KEK shred that is the scope-level answer to an erasure.
+        //
+        // Delivery-time rather than enqueue-time, as [`Self::deliver_one`] already resolves
+        // `config` and the signing secret, though those and these reach it from different
+        // directions. `traits` is mutable, so it inherits config's
+        // property exactly: an edit between the signup and the drain is what the receiver
+        // sees. `identifier` has no update path at all (it is sealed, and this repository
+        // exposes no rename), so for it "now" and "then" differ only when the
+        // account was DELETED in the window, which the arm below handles rather than delivers.
+        //
+        // A real trade rather than a free win, for the mutable half. The event's subject is
+        // "this signup happened", so the signup-time traits are arguably the correct ones,
+        // and they are exactly what is no longer available. Rendering now is chosen because
+        // the alternative is holding them at rest forever.
+
+        // Taken MUTABLY once and held, rather than read now and re-opened to write. Two
+        // lookups would make the second refusal unreachable -- proving `data.subject` is a
+        // string already proves `data` is an object -- and an unreachable arm is a label an
+        // operator can never see. Holding it also keeps both refusals honest: an earlier
+        // revision wrote the enrichment under an `if let`, which turned a shape this consumer
+        // cannot read into a silently unenriched delivery, indistinguishable at the receiver
+        // from a subject that genuinely has no traits.
+        //
+        // The borrow is of `*body` and the reads below borrow `self`, so they do not conflict.
+        let Some(data) = body
+            .get_mut("data")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return Err(ConsumerError::permanent("payload_body_data_not_an_object"));
+        };
+        let Some(subject) = data
+            .get("subject")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Err(ConsumerError::permanent("payload_body_missing_subject"));
+        };
+        // Also the answer for an id belonging to ANOTHER scope: `parse_id` refuses it exactly
+        // as it refuses a malformed one, so a payload naming a foreign subject is a permanent
+        // read failure rather than a cross-tenant lookup.
+        let Ok(subject_id) = self.store.scoped(scope).users().parse_id(&subject) else {
+            return Err(ConsumerError::permanent("payload_subject_not_a_user_id"));
+        };
+
+        match self.store.scoped(scope).users().get(&subject_id).await {
+            Ok(user) => {
+                // The USER-VISIBLE projection, not the full document. The two differ by the
+                // fields an operator annotated `x-ironauth: {"visibility": "admin"}`, the
+                // canonical one being `risk_score`.
+                //
+                // The full document is right for a management read (`users::get_user_traits`)
+                // and for the flow evaluator (`flow::eval_ctx`), and both say so at the call
+                // site. Not every reader in the tree does: `flow::profiling`'s plan path takes
+                // the full document and states nothing, while its own submit path states the
+                // opposite choice two hundred lines below it. The evaluator's stated reason is that the value "never
+                // reaches the end user" and "the only place it is serialized is the journey
+                // REPLAY transcript, an operator and CI artifact". That is exactly the reason
+                // this call site cannot borrow: here the document is serialized into an HTTP
+                // body and POSTed off-platform to whatever endpoint a target names.
+                //
+                // So the annotation is honoured. An operator marking a field admin-only has
+                // declared it is not for wider circulation, and a third-party integration is
+                // wider circulation than the management API they marked it against. It also
+                // fails in the safe direction: with no active schema there are no annotations
+                // to read, and the full document is then also the correct answer, because
+                // nothing has been declared admin-only.
+                //
+                // RETRYABLE on error rather than absorbed. Swallowing the read would deliver
+                // a body saying this person has no traits, which a receiver cannot tell from
+                // the truthful version of the same body -- so a transient database fault
+                // would land as durable wrong data on the far side. `Ok(None)` is different
+                // and is the honest answer: the subject genuinely carries no traits document,
+                // and the key is then absent rather than null.
+                let Ok(traits) = self
+                    .store
+                    .scoped(scope)
+                    .users()
+                    .traits_user_visible(&subject_id)
+                    .await
+                else {
+                    return Err(ConsumerError::retryable("subject_traits_read_failed"));
+                };
+                data.insert(
+                    "identifier".to_owned(),
+                    serde_json::Value::String(user.identifier),
+                );
+                // Inserted only when there IS one, so a subject with no traits document
+                // yields an ABSENT key rather than an explicit null. `json!` would have made
+                // the opposite choice: `"traits": None` lowers to `Value::Null` and the key
+                // is present, which tells a receiver "we looked and there are none" using the
+                // same bytes a bug that dropped the read would produce.
+                if let Some(traits) = traits {
+                    data.insert("traits".to_owned(), traits);
+                }
+            }
+            // The account is GONE before the delivery drained. Discard rather than deliver,
+            // and rather than retry.
+            //
+            // Not retryable, because a deleted account does not come back and fourteen
+            // attempts would delay every later delivery on this ordering key. Not a permanent
+            // ERROR either, because nothing is broken: the operator deleted a user, which is
+            // allowed. Discarding is also the only privacy-correct answer, and it is the
+            // reason this arm matters rather than being tidiness. If the deletion was an
+            // erasure request, sending that person's identifier to a third party afterwards
+            // is precisely what erasure was supposed to prevent.
+            //
+            // Same shape as the [`FlowTargetDelivery::Absent`] arm in `deliver_one`, for the
+            // same reason.
+            Err(ironauth_store::StoreError::NotFound) => return Ok(SubjectResolution::Gone),
+            Err(_) => return Err(ConsumerError::retryable("subject_read_failed")),
+        }
+        Ok(SubjectResolution::Enriched)
     }
 
     async fn deliver_one(
@@ -184,6 +364,22 @@ impl<S: WebhookSender> FlowTargetDeliveryConsumer<S> {
         };
         let mut body = body.clone();
         body.insert("config".to_owned(), target.config.clone());
+
+        // The subject's identifier and traits, resolved HERE rather than carried in the
+        // payload (issue #954). `Gone` is discarded exactly as the target lookup's `Absent`
+        // arm is; the other outcomes do not correspond, and `resolve_subject` says why.
+        match self.resolve_subject(scope, &mut body).await? {
+            SubjectResolution::Enriched => {}
+            SubjectResolution::Gone => {
+                tracing::warn!(
+                    target_id = %target_id,
+                    delivery = %message.idempotency_key,
+                    "signup subject is gone; discarding its queued delivery rather than \
+                     announcing a deleted account"
+                );
+                return Ok(());
+            }
+        }
         // Serialized ONCE, and these exact bytes are both signed and sent. Signing one
         // rendering and sending another is the classic way to ship deliveries that verify
         // nowhere, and JSON object order is not guaranteed to survive a round trip.

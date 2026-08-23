@@ -15388,8 +15388,10 @@ pub struct UserExportRecord {
     /// The user's identity-traits document as JSON text, opened from its sealed
     /// column, or [`None`] when the user has no traits set.
     pub traits_json: Option<String>,
-    /// The trait-schema version the traits were last validated against, or [`None`]
-    /// when there are no traits.
+    /// The trait-schema version the traits were last validated against, or [`None`] in
+    /// either of two cases: the identity has no traits at all, or it carries traits whose
+    /// source recorded no version (an import). `traits_json` beside this one separates
+    /// them, being [`None`] in the first case and a document in the second.
     pub traits_schema_version: Option<i32>,
     /// The native Argon2id PHC verifier string, or [`None`] when it is the unusable
     /// sentinel (a credential-less or foreign-only account). One-way; never the
@@ -61491,9 +61493,14 @@ impl<'a> ActingStore<'a> {
 }
 
 impl UserRepo<'_> {
-    /// Read one identity's trait document, decrypted, along with the schema version it
-    /// was validated against. Returns [`None`] when the identity has no traits set (or
-    /// is absent / soft-deleted / out of scope).
+    /// Read one identity's trait document, decrypted, along with the schema version it was
+    /// validated against. Returns [`None`] when the identity has no traits set (or is
+    /// absent / soft-deleted / out of scope).
+    ///
+    /// The VERSION is itself optional, and the two [`None`]s mean different things: the outer
+    /// one is "no traits", the inner one is "traits whose source recorded no version", which
+    /// is what an import produces. The column is nullable and this returns that faithfully
+    /// rather than inventing a number.
     ///
     /// # Errors
     ///
@@ -61502,7 +61509,7 @@ impl UserRepo<'_> {
     pub async fn traits(
         &self,
         id: &UserId,
-    ) -> Result<Option<(i32, serde_json::Value)>, StoreError> {
+    ) -> Result<Option<(Option<i32>, serde_json::Value)>, StoreError> {
         if id.scope() != self.scope {
             return Ok(None);
         }
@@ -61522,7 +61529,21 @@ impl UserRepo<'_> {
             tx.commit().await?;
             return Ok(None);
         };
-        let version: i32 = row.get("traits_schema_version");
+        // NULLABLE, and decoded as such. Migration 0038 adds the column with no NOT NULL,
+        // and the write path allows it: `NewUserTraits::schema_version` is documented as
+        // `None` when the source recorded none, which is what an IMPORT of a user who
+        // carries traits but no known schema version produces. Decoding it as a bare `i32`
+        // made every later read of that identity's traits PANIC rather than fail.
+        //
+        // Not a downed process: the outbox catches a consumer panic, records it as the
+        // retryable `consumer_panic`, and counts it as an attempt, so the worker survives.
+        // The cost is that the delivery for such an identity retried to the attempts cap and
+        // dead-lettered on a fault the read could simply have reported, and a panic per
+        // attempt is a poor way to learn that a column is nullable.
+        //
+        // The one other read of this column, the export projection feeding
+        // `UserExportRecord`, already decodes it as `Option<i32>`; this was the outlier.
+        let version: Option<i32> = row.get("traits_schema_version");
         let traits = open_user_traits(&mut tx, self.scope, master, &row).await?;
         tx.commit().await?;
         Ok(Some((version, traits)))
