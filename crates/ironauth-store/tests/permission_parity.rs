@@ -79,7 +79,7 @@ impl Principal {
                     .scoped(scope)
                     .acting(db.test_actor(env), CorrelationId::generate(env))
                     .users()
-                    .register_passwordless(env, &id, "parity@example.test")
+                    .register_passwordless(env, &id, "parity@example.test", None)
                     .await
                     .expect("register the user");
                 Self::User(id)

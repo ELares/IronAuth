@@ -6,6 +6,41 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The signup envelope names the door that produced it (issue #953).** The async
+  flow-target body carries `origin`, beside `state` and `quarantined`: `self_service` for a
+  password signup, `passwordless` for a passkey-only one. Derived inside `register_inner`
+  from the `passwordless` flag it already receives, so no caller supplies it and no future
+  door can forget it, which is the same reason `state` and `quarantined` are stamped there.
+
+  **`register_passwordless` now announces.** It passed `None` for deliveries and carried a
+  comment calling that a gap rather than a decision. An operator with an async target
+  registered saw password signups announced and passkey signups silently not. Wiring it
+  needed `origin` first: without it the two arrive in one indistinguishable shape.
+
+  All THREE account-creating doors that do not announce now say so in their own docs, rather
+  than leaving a reader unable to tell an omission from a decision. Three is the measured
+  count, not an estimate: there are exactly two production `INSERT INTO users` sites, and the
+  second is reached by two paths that do not share a rationale.
+
+  - `register_with_claims`: a test-only helper with no production caller.
+  - `admin_create`: more than one case, and documented as such. A decision for its two
+    OPERATOR callers (the management create-user route and the bulk import), and an
+    acknowledged OPEN GAP for its two end-user callers, first-federated-login provisioning
+    and lazy migration, which create the account with the user as the audit actor and are not
+    covered by the operator rationale.
+  - the joined invitation create: also an OPEN GAP. It reaches the shared insert directly
+    rather than through `admin_create`, so that rationale does not cover it, and the
+    invitee's later ACCEPT is silent too, since the only production enqueue lives in
+    `register_inner`.
+
+  Announcing any of those wants an origin of its own and a product decision: whether a first
+  federated login reads as a signup to a receiver, and which of an invitation's two moments
+  (the operator's create, or the invitee's accept) is the one to announce.
+
+  This is a WIRE ADDITION to a published envelope. A receiver that ignores unknown fields is
+  unaffected; one with a strict schema needs `origin` allowed. Every existing door is
+  backfilled, so no envelope goes out without it.
+
 - **A flow target's dead-lettered async deliveries can be REPLAYED** (issue #112 criterion 2).
   New `FLOW_TARGET_REPLAY_CONSUMER` (`flow_target.replay`), a new
   `Action::FlowTargetReplayDeadLetters` audit action, the `flow_target.replay_requested` event,

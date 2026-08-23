@@ -16605,6 +16605,10 @@ impl ActingUserRepo<'_> {
         env: &Env,
         id: &UserId,
         identifier: &str,
+        // The ASYNC flow-target deliveries this signup should announce (issue #953). Wired
+        // now that the envelope names its door: before `origin` existed, a passkey signup
+        // announced here would have been indistinguishable from a password one.
+        deliveries: Option<AsyncFlowDeliveries<'_>>,
     ) -> Result<UserId, StoreError> {
         self.register_inner(
             env,
@@ -16616,18 +16620,12 @@ impl ActingUserRepo<'_> {
             UserState::Active,
             None,
             None,
-            // NO async flow-target deliveries, and this is a GAP rather than a decision.
-            //
-            // The one production caller is the passkey-only signup ceremony, which creates a
-            // real self-service account, so an operator with an async event target registered
-            // sees password signups announced and passkey signups silently not. Wiring it
-            // wants the envelope to say WHICH door produced a signup first, or a receiver gets
-            // several materially different events in one indistinguishable shape -- the same
-            // defect `state` and `quarantined` were added to fix. Tracked as issue #953.
-            //
-            // Written down because the dev seed's `None` carries a justification and this one
-            // did not, so a reader could not tell an omission from a decision.
-            None,
+            // Announced, since issue #953. The gap that used to be documented here was
+            // waiting on exactly one thing: an envelope that says which door produced the
+            // signup. `origin` now does, derived from the `passwordless` flag above, so a
+            // receiver can tell a passkey signup from a password one instead of getting two
+            // materially different events in one shape.
+            deliveries,
         )
         .await
     }
@@ -16647,6 +16645,18 @@ impl ActingUserRepo<'_> {
     ///
     /// [`StoreError::Conflict`] if the login handle is already registered in this
     /// scope; [`StoreError::Database`] on a persistence failure.
+    ///
+    /// # Announcement
+    ///
+    /// Does NOT announce to async flow targets, and that is a decision rather than the gap
+    /// `register_passwordless` used to carry (issue #953). This helper has no production
+    /// caller: every use is a test fixture seeding a user with claims. Announcing would emit
+    /// signup events for accounts no signup surface created.
+    ///
+    /// Stated here because issue #953 asks every account-creating door to announce or to say
+    /// why it does not, and silence reads the same either way. A production caller arriving
+    /// later changes the answer: wire `deliveries` through as the passwordless door does, and
+    /// give it its own `origin`.
     pub async fn register_with_claims(
         &self,
         env: &Env,
@@ -17081,6 +17091,24 @@ impl ActingUserRepo<'_> {
                                 // gets it right for free, and no future door can forget.
                                 "state": state.as_str(),
                                 "quarantined": quarantined,
+                                // WHICH DOOR produced this signup (issue #953).
+                                //
+                                // Derived from `passwordless`, a fact this function already
+                                // has, rather than taken as a new parameter. That is the same
+                                // reason `state` and `quarantined` are stamped here: a caller
+                                // cannot supply the wrong value because no caller supplies it.
+                                //
+                                // A passkey-only signup carries no password credential, so a
+                                // receiver that provisions differently for the two, or that
+                                // reports on credential mix, needs to tell them apart. Without
+                                // this they arrive in one indistinguishable shape, which is
+                                // exactly the defect `state` and `quarantined` were added to
+                                // fix, one level up at the door rather than at the outcome.
+                                "origin": if passwordless {
+                                    "passwordless"
+                                } else {
+                                    "self_service"
+                                },
                                 "data": { "subject": id.to_string() },
                             },
                         });
@@ -17109,6 +17137,32 @@ impl ActingUserRepo<'_> {
     /// present) the external id under the scope's active DEK, and writes a
     /// `user.create` audit row in the same transaction. Returns the id (the supplied
     /// one, or a freshly minted one).
+    ///
+    /// # Announcement
+    ///
+    /// Does NOT announce to async flow targets (issue #953). That is a DECISION for two of its
+    /// callers and an OPEN GAP for the other two, and the difference matters, so both are
+    /// named rather than covered by one sentence.
+    ///
+    /// A decision for the operator surfaces, `ironauth-admin`'s create-user route and
+    /// `ironauth-import`'s bulk engine. The async envelope announces a SIGNUP: a self-service
+    /// act by the person being created, carrying their own consent. An operator act has a
+    /// different actor in the audit trail and no signup surface behind it, and a receiver that
+    /// provisions on signup would treat an import as users arriving. If those should be
+    /// announced later they want their OWN event, not a signup with a different `origin`.
+    ///
+    /// An open gap for the two END-USER callers, which this function also serves:
+    /// `federation.rs`'s just-in-time provisioning on a FIRST federated login, and
+    /// `login.rs`'s lazy migration on a login submission. Both create the account with
+    /// `interaction::user_actor`, the person themselves, which is the same construction the
+    /// passkey door uses, and both pass self-service traits. `admin_create_emitting` says as
+    /// much itself further down: "a SELF-SERVICE create (the FIRST federated login is one)".
+    ///
+    /// So the operator rationale does NOT cover them. They stay silent for now because
+    /// announcing them wants an `origin` of their own (`federated` and `migrated` are the
+    /// obvious spellings) and a decision about whether a first federated login is a signup to
+    /// a receiver, which is a product question rather than a wiring one. Written down here so
+    /// the next reader finds an open question rather than a justification that does not fit.
     ///
     /// # Errors
     ///
@@ -37690,6 +37744,26 @@ impl ActingInvitationRepo<'_> {
     /// concurrent request already stored this Idempotency-Key;
     /// [`StoreError::Encryption`] if no master key is configured;
     /// [`StoreError::Database`] on a persistence failure.
+    ///
+    /// # Announcement
+    ///
+    /// Does NOT announce to async flow targets (issue #953), and this is an OPEN GAP rather
+    /// than a decision, recorded so a reader can tell the two apart.
+    ///
+    /// This is the third account-creating door, alongside `register_inner` and
+    /// `admin_create`. It reaches `insert_admin_user_row` directly rather than through
+    /// `admin_create`, so nothing about that function's rationale covers it. The invitee's
+    /// later ACCEPT, which activates the account and sets the credential, is equally silent:
+    /// the only production call to `enqueue_async_delivery` lives in `register_inner`.
+    ///
+    /// Whether an invitation should announce is a genuine product question rather than a
+    /// wiring oversight. The create is an operator act, like the management create-user
+    /// route, but the ACCEPT is the invitee completing their own account, which is much
+    /// closer to a signup. Announcing wants an `origin` of its own and a decision about which
+    /// of the two moments a receiver should hear about.
+    ///
+    /// Note the `invitation.created` event nearby is a WEBHOOK domain event on a different
+    /// queue with a different consumer, so it does not make this path announced.
     pub async fn create_with_user(
         &self,
         env: &Env,

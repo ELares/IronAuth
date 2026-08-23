@@ -51,7 +51,7 @@ async fn register_passwordless(db: &TestDatabase, env: &Env, scope: Scope, handl
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env))
         .users()
-        .register_passwordless(env, &id, handle)
+        .register_passwordless(env, &id, handle, None)
         .await
         .expect("register passwordless user")
 }
