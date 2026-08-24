@@ -3488,7 +3488,7 @@ async fn lag_measures_the_oldest_due_message_and_ignores_one_waiting_out_its_bac
 /// Not a mock of IronBus. It is a second REAL implementation of the seam, present so the
 /// trait ships with more than one and so the POOL's use of it is exercised rather than
 /// merely declared. A seam with a single implementation reads as finished and is not.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct SignallingBackbone {
     notify: tokio::sync::Notify,
 }
@@ -3556,6 +3556,231 @@ impl OutboxConsumer for CountingConsumer {
             Ok(())
         })
     }
+}
+
+/// An AUDITED WRITE's enqueue wakes the drain (issue #944).
+///
+/// The sibling test below covers the DIRECT path, `OutboxRepo::enqueue`, which owns its
+/// transaction and signals for itself. This one covers the deferred path, which is the
+/// majority of the mechanism and the half that carries production traffic: an enqueue riding
+/// a caller's transaction cannot signal for itself, because the row it wrote is invisible to
+/// every other connection until commit, so a drain woken by it would find nothing and spend
+/// its one wake. `record_wake` therefore only RECORDS, and `write_audited` sends after its
+/// commit.
+///
+/// Two review rounds went by with this untested, and the mutations that survived were the
+/// whole collector: deleting `record_wake`, unwrapping `signalling_after_commit`, or
+/// signalling on rollback instead of on commit. The direct-path test could not see any of
+/// them, because it never enters the collector at all.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn an_audited_writes_enqueue_wakes_the_drain_after_its_commit() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0xB0_60);
+    let scope = db.seed_scope(&env).await;
+
+    let consumer = CountingConsumer::new("webhook.event");
+    let backbone: Arc<dyn OutboxBackbone> = Arc::new(SignallingBackbone::default());
+    // The CONTROL-plane handle: `organizations` is a management table the data-plane role
+    // cannot write, and the audited producer used below lives there. The drain still reads
+    // through the data-plane store, which is the real arrangement (both roles are granted the
+    // outbox) and makes the wake cross the plane boundary exactly as it does in a deployment.
+    let producing = db
+        .control_store()
+        .clone()
+        .with_outbox_backbone(Arc::clone(&backbone));
+
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        env.clone(),
+        Arc::clone(&consumer) as Arc<dyn OutboxConsumer>,
+        WorkerSettings {
+            concurrency: 1,
+            visibility_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(3_600),
+            batch: 64,
+            retry: RetryPolicy::default(),
+        },
+    );
+
+    // One message so the pool drains once and then parks in `backbone.wait`. It carries a
+    // real envelope because the webhook-event consumer validates at EMIT time, and a seed
+    // that failed validation would panic before this test reached what it is about.
+    let seed = serde_json::json!({
+        "id": "evt-audited-0",
+        "type": "organization.created",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 0,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        "payload": { "organization_id": "org_seed", "display_name": "seed" },
+    });
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .enqueue(
+            &env,
+            &NewOutboxMessage {
+                consumer: "webhook.event",
+                idempotency_key: "audited-0",
+                ordering_key: "agg-a",
+                payload: seed,
+            },
+        )
+        .await
+        .expect("seed the feed");
+    let scopes: Arc<dyn ScopeSource> = Arc::new(StaticScopes::new(vec![scope]));
+    let pool = OutboxWorkerPool::spawn_with_backbone(&worker, &scopes, &silent(), &backbone);
+
+    let mut first = false;
+    for _ in 0..200 {
+        if consumer.handled().len() == 1 {
+            first = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(first, "the first pass drains without needing a signal");
+
+    // An AUDITED write that emits an event. Nothing in this test signals; the wake can only
+    // come from the collector draining after `write_audited`'s commit.
+    let actor = ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env));
+    let organization = ironauth_store::OrganizationId::generate(&env, &scope);
+    let envelope = serde_json::json!({
+        "id": "evt-audited-1",
+        "type": "organization.created",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 0,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        "payload": {
+            "organization_id": organization.to_string(),
+            "display_name": "wake-me",
+        },
+    });
+    producing
+        .management()
+        .acting(actor, CorrelationId::generate(&env))
+        .organizations(scope)
+        .create_with_event(
+            &env,
+            &organization,
+            0,
+            "wake-me",
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt-audited-1",
+                subject: &organization.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("the audited write commits");
+
+    let mut second = false;
+    for _ in 0..200 {
+        if consumer.handled().len() == 2 {
+            second = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    pool.shutdown().await;
+    assert!(
+        second,
+        "an audited write that enqueues must wake the drain after its commit; with the \
+         deferred collector removed this waits out the hour and handles only {:?}",
+        consumer.handled()
+    );
+}
+
+/// A REAL enqueue wakes the drain, with nothing in the test signalling (issue #944).
+///
+/// The sibling test below proves the pool AWAITS a backbone. It cannot prove anything about
+/// production, because the test itself calls `notify`. That was the whole defect: `notify`
+/// had zero callers outside tests, so a deployment configuring `ironbus_addr` paid for the
+/// broker connections and behaved exactly as `PollOnly`, since every drain still waited out
+/// its full interval. The feature was a wake-up backbone that was never woken, and the
+/// existing test passed throughout.
+///
+/// So this arm removes the test's own signal. The only thing that can wake the pool is the
+/// producer path itself, which means the store the enqueue goes through has to be the one
+/// carrying the backbone. `poll_interval` is an hour, so a pool that does not get a wake
+/// cannot drain the second message at all within any patience this test has.
+#[tokio::test]
+async fn a_real_enqueue_wakes_the_drain_with_no_signal_from_the_test() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0xB0_5F);
+    let scope = db.seed_scope(&env).await;
+
+    let consumer = CountingConsumer::new(CONSUMER);
+    let backbone: Arc<dyn OutboxBackbone> = Arc::new(SignallingBackbone::default());
+    // The PRODUCER's handle. `db.store()` has no backbone, which is the Postgres-only
+    // default; a producer signals only when one is wired, exactly as boot wires it.
+    let producing = db
+        .store()
+        .clone()
+        .with_outbox_backbone(Arc::clone(&backbone));
+
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        env.clone(),
+        Arc::clone(&consumer) as Arc<dyn OutboxConsumer>,
+        WorkerSettings {
+            concurrency: 1,
+            visibility_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(3_600),
+            batch: 64,
+            retry: RetryPolicy::default(),
+        },
+    );
+
+    enqueue(&db, &env, scope, "real-1", "agg-a").await;
+    let scopes: Arc<dyn ScopeSource> = Arc::new(StaticScopes::new(vec![scope]));
+    let pool = OutboxWorkerPool::spawn_with_backbone(&worker, &scopes, &silent(), &backbone);
+
+    let mut first = false;
+    for _ in 0..200 {
+        if consumer.handled().len() == 1 {
+            first = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(first, "the first pass drains without needing a signal");
+
+    // The pool is inside `backbone.wait` with an hour on the clock. This enqueue is the ONLY
+    // thing that happens next: no `backbone.notify` anywhere in this test.
+    producing
+        .scoped(scope)
+        .outbox()
+        .enqueue(
+            &env,
+            &NewOutboxMessage {
+                consumer: CONSUMER,
+                idempotency_key: "real-2",
+                ordering_key: "agg-a",
+                payload: serde_json::json!({ "key": "real-2" }),
+            },
+        )
+        .await
+        .expect("enqueue through the producing store");
+
+    let mut second = false;
+    for _ in 0..200 {
+        if consumer.handled().len() == 2 {
+            second = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    pool.shutdown().await;
+    assert!(
+        second,
+        "an enqueue on a store carrying the backbone must wake the drain by itself; with no \
+         producer-side signal this waits out the hour and handles only {:?}",
+        consumer.handled()
+    );
 }
 
 /// The backbone seam is swappable, and a signal short-circuits the poll wait.

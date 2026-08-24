@@ -62,6 +62,7 @@
 //! features, which the crate already pulled in through sqlx.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -740,9 +741,20 @@ pub trait OutboxObserver: Send + Sync {
 /// allowed to return early, spuriously, or only when the deadline elapses. An
 /// implementation that simply slept for `max_wait` on every call would be correct, just
 /// slow, which is exactly what [`PollOnly`] is.
-pub trait OutboxBackbone: Send + Sync {
+pub trait OutboxBackbone: fmt::Debug + Send + Sync {
     /// Signal that `consumer` has work in `scope`. Advisory and infallible by contract.
     fn notify(&self, consumer: &str, scope: Scope);
+
+    /// Whether `notify` does anything at all.
+    ///
+    /// `PollOnly` answers false, which lets a boot path decline to start a producer-side wake
+    /// dispatcher for a backbone that would drop every wake on the floor. Defaults to true so
+    /// a new implementation is signalling until it says otherwise, which is the safe default:
+    /// the cost of a needless dispatcher is a thread, and the cost of a missing one is the
+    /// feature silently not working, which is the defect issue #944 was filed for.
+    fn signals(&self) -> bool {
+        true
+    }
 
     /// Wait until there may be work for `consumer`, or until `max_wait` elapses.
     ///
@@ -753,6 +765,55 @@ pub trait OutboxBackbone: Send + Sync {
         consumer: &'a str,
         max_wait: Duration,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// A bounded, non-blocking way to hand wakes to a backbone from a request path.
+///
+/// One thread, one bounded queue, and a DROP when the queue is full. Every part of that is
+/// deliberate: `notify` may block (the IronBus implementation writes to a socket under a
+/// mutex), request paths must never block on it, and a wake is advisory with the drain's poll
+/// deadline underneath it, so shedding one costs latency and never correctness.
+///
+/// Constructed per backbone rather than globally, so a process that runs several backbones
+/// does not funnel their wakes through one queue.
+#[derive(Debug)]
+pub struct WakeDispatcher {
+    sender: std::sync::mpsc::SyncSender<Vec<(String, Scope)>>,
+}
+
+/// How many pending wake batches the dispatcher holds before shedding.
+///
+/// Small on purpose. A backlog here means the backbone is slower than the write rate, and the
+/// useful response to that is to drop wakes (the poll deadline covers them) rather than to
+/// accumulate a queue of stale ones that wake drains for work already drained.
+const WAKE_QUEUE_DEPTH: usize = 64;
+
+impl WakeDispatcher {
+    /// Start the dispatcher thread for `backbone`.
+    #[must_use]
+    pub fn spawn(backbone: Arc<dyn OutboxBackbone>) -> Self {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<Vec<(String, Scope)>>(WAKE_QUEUE_DEPTH);
+        std::thread::Builder::new()
+            .name("outbox-wake".to_owned())
+            .spawn(move || {
+                // Ends when every sender is dropped, which is process shutdown.
+                for batch in receiver {
+                    for (consumer, scope) in batch {
+                        backbone.notify(&consumer, scope);
+                    }
+                }
+            })
+            .ok();
+        Self { sender }
+    }
+
+    /// Hand `wakes` to the dispatcher, dropping them if it is saturated.
+    pub fn send(&self, wakes: Vec<(String, Scope)>) {
+        // `try_send` never blocks. A full queue or a dead thread both mean "no wake", which
+        // degrades to the poll interval.
+        let _ = self.sender.try_send(wakes);
+    }
 }
 
 /// The default backbone: no signalling, wait out the full `poll_interval` (issue #104).
@@ -766,6 +827,10 @@ pub struct PollOnly;
 
 impl OutboxBackbone for PollOnly {
     fn notify(&self, _consumer: &str, _scope: Scope) {}
+
+    fn signals(&self) -> bool {
+        false
+    }
 
     fn wait<'a>(
         &'a self,

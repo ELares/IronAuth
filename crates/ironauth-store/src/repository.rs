@@ -45,8 +45,10 @@
 //! audit. This is enforcement by construction at the module boundary, not
 //! handler discipline spread across the codebase.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
@@ -21895,6 +21897,97 @@ pub(crate) async fn enqueue_outbox_in_tx_at_unvalidated(
     enqueue_outbox_in_tx_at_inner(tx, env, scope, message, None, false).await
 }
 
+tokio::task_local! {
+    /// Wake-ups owed to the backbone once the CURRENT transaction commits (issue #944).
+    ///
+    /// An in-transaction enqueue cannot signal for itself. The row it wrote is invisible to
+    /// every other connection until commit, so a drain woken by it would find nothing and
+    /// the wake would be spent for no work; and if the transaction then rolls back, the wake
+    /// announced work that never existed. So the enqueue RECORDS what it would signal and
+    /// the code that owns the commit sends it afterwards.
+    ///
+    /// A task-local rather than a thread-local because these paths are async: a task may
+    /// resume on a different worker thread after any await, which would leave a thread-local
+    /// collector holding another task's wakes, or lose its own.
+    ///
+    /// Absent scope is not an error. `try_with` fails for an enqueue that runs outside a
+    /// wrapped commit, and that enqueue simply does not signal: the drain falls back to its
+    /// poll interval, which is the Postgres-only behaviour and is always correct.
+    static PENDING_WAKES: RefCell<Vec<(String, Scope)>>;
+}
+
+/// Run `body`, then signal the backbone for whatever it enqueued (issue #944).
+///
+/// Wraps a COMMIT. Everything the body enqueued through [`enqueue_outbox_in_tx`] is signalled
+/// after `body` resolves, and only if it resolved Ok: an `Err` means the transaction rolled
+/// back, and announcing work that was rolled back is worse than not announcing it, because a
+/// drain spends a wake and its next poll is no earlier than it would have been anyway.
+async fn signalling_after_commit<F, R>(store: &Store, body: F) -> Result<R, StoreError>
+where
+    F: Future<Output = Result<R, StoreError>>,
+{
+    let outcome = PENDING_WAKES
+        .scope(RefCell::new(Vec::new()), async move {
+            let result = body.await;
+            let wakes = PENDING_WAKES.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+            (result, wakes)
+        })
+        .await;
+    let (result, wakes) = outcome;
+    if result.is_ok() {
+        signal_wakes(store, wakes);
+    }
+    result
+}
+
+/// Hand the recorded wake-ups to the backbone, off the async runtime.
+///
+/// # Why a dedicated thread and not `spawn_blocking`
+///
+/// `OutboxBackbone::notify` is advisory and infallible BY CONTRACT, and the IronBus
+/// implementation is a blocking `client.produce` holding a `std::sync::Mutex` across the
+/// socket write. An earlier draft dispatched each wake with `tokio::task::spawn_blocking`,
+/// which is wrong for a reason worth stating exactly, because the first version of this
+/// comment stated it WRONGLY.
+///
+/// A broker that accepts a connection and then black-holes it leaves the first notify parked
+/// inside `produce` holding the mutex; every later commit queues another blocking task behind
+/// that mutex, unbounded, at the write rate. Tokio's blocking pool tops out and then queues,
+/// so an unbounded fan-in of tasks that each block indefinitely is a resource leak with no
+/// ceiling and no backpressure, in a subsystem whose own rule is that "a backbone that is
+/// down must never turn a successful write into a failure".
+///
+/// What that draft ALSO claimed was that this would starve Argon2id password hashing, which
+/// shares the blocking pool. That is false for the binary this repo ships: `main` installs a
+/// `HashingPool` unconditionally, and it runs Argon2 on its own dedicated threads rather than
+/// on `spawn_blocking`. The `spawn_blocking` fallback exists for embedders and tests, and the
+/// shipped boot path never takes it. The design conclusion holds on its own terms; the
+/// dramatic consequence did not, and is removed rather than softened.
+///
+/// So wakes go to ONE dedicated thread over a BOUNDED channel, and a full channel DROPS the
+/// wake rather than blocking the caller. Dropping is safe by construction: a wake is a
+/// latency optimisation and the poll deadline is underneath it, so the worst case of a
+/// dropped wake is the Postgres-only behaviour this backbone exists to improve on. Blocking
+/// a request path to deliver one would be trading correctness for that optimisation.
+fn signal_wakes(store: &Store, wakes: Vec<(String, Scope)>) {
+    if wakes.is_empty() {
+        return;
+    }
+    let Some(dispatcher) = store.wakes() else {
+        return;
+    };
+    // A linear dedup rather than a hash set: this list holds one entry per message the
+    // transaction enqueued, which is one or two in almost every case and a handful in the
+    // worst (a fan-out writing one per endpoint), so the allocation a set costs is not repaid.
+    let mut seen: Vec<(String, Scope)> = Vec::with_capacity(wakes.len());
+    for wake in wakes {
+        if !seen.contains(&wake) {
+            seen.push(wake);
+        }
+    }
+    dispatcher.send(seen);
+}
+
 async fn enqueue_outbox_in_tx_at_inner(
     tx: &mut Transaction<'_, Postgres>,
     env: &Env,
@@ -21967,7 +22060,21 @@ async fn enqueue_outbox_in_tx_at_inner(
     .bind(now_micros)
     .execute(&mut **tx)
     .await?;
+    // Recorded, not sent. The row is invisible until this transaction commits, so the wake
+    // belongs to whoever owns the commit (issue #944).
+    record_wake(message.consumer, scope);
     Ok(id)
+}
+
+/// Note that `consumer` has work in `scope` once the current transaction commits.
+///
+/// Silently does nothing outside a [`signalling_after_commit`] scope, which is the correct
+/// degradation: no signal means the drain waits out its poll interval, which is exactly the
+/// Postgres-only mode and is never wrong, only slower.
+fn record_wake(consumer: &str, scope: Scope) {
+    let _ = PENDING_WAKES.try_with(|pending| {
+        pending.borrow_mut().push((consumer.to_owned(), scope));
+    });
 }
 
 /// Insert ONE message on the caller's transaction, TOLERATING a duplicate
@@ -22492,6 +22599,11 @@ impl OutboxRepo<'_> {
             .await?;
         let id = enqueue_outbox_in_tx(&mut tx, env, scope, message).await?;
         tx.commit().await?;
+        // Signalled AFTER the commit, so the drain that wakes can actually see the row
+        // (issue #944). These three methods own their transaction, so they know their own
+        // wake directly and do not need the deferred collector the in-transaction enqueue
+        // relies on.
+        signal_wakes(self.store, vec![(message.consumer.to_owned(), scope)]);
         Ok(id.to_string())
     }
 
@@ -22517,6 +22629,11 @@ impl OutboxRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         let id = enqueue_outbox_in_tx(&mut tx, env, scope, message).await?;
         tx.commit().await?;
+        // Signalled AFTER the commit, so the drain that wakes can actually see the row
+        // (issue #944). These three methods own their transaction, so they know their own
+        // wake directly and do not need the deferred collector the in-transaction enqueue
+        // relies on.
+        signal_wakes(self.store, vec![(message.consumer.to_owned(), scope)]);
         Ok(id.to_string())
     }
 
@@ -22601,6 +22718,20 @@ impl OutboxRepo<'_> {
             }
         }
         tx.commit().await?;
+        // Gated on whether ANYTHING landed. A batch whose rows were all duplicates inserted
+        // nothing, and waking a drain for it would spend a wake on an empty pass. Note this
+        // is a gate rather than a filter: a mixed-consumer batch where only one consumer's
+        // rows were new still wakes both, which is harmless (a wake is advisory and the
+        // extra one finds nothing) and is not worth tracking per row.
+        if inserted > 0 {
+            signal_wakes(
+                self.store,
+                messages
+                    .iter()
+                    .map(|message| (message.consumer.to_owned(), scope))
+                    .collect(),
+            );
+        }
         Ok(inserted)
     }
 
@@ -40236,20 +40367,39 @@ where
     T: AuditTarget,
     M: AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<R, StoreError>,
 {
-    let mut tx = begin_scoped(spec.store, spec.scope).await?;
-    // The data change and the audit row share this one transaction.
-    let reported = mutate(&mut tx).await?;
-    insert_audit_row(&mut tx, &spec, detail).await?;
-    if poison_after_audit {
-        // Testing seam only (production callers pass false): force a guaranteed
-        // error after both inserts are staged, so their joint rollback proves
-        // the data change and the audit row are in the same transaction.
-        sqlx::query("SELECT 1 / 0").execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
-    // Reached only on a COMMITTED transaction: a mutation that reports what it wrote
-    // never reports it for a write that rolled back.
-    Ok(reported)
+    // Wrapped so that anything this write enqueues is signalled to the outbox backbone AFTER
+    // the commit below, and not at all if it rolls back (issue #944).
+    //
+    // NOT every producer, and the difference matters. An earlier draft of this comment called
+    // this "the choke point every domain event passes through", which is false: roughly twenty
+    // repository methods open their own `begin_scoped` transaction, enqueue, and commit
+    // WITHOUT going through an audited write. `ActingAuthorizationRepo::redeem`,
+    // `ActingRefreshRepo::redeem_live_leaf`, `ActingSessionRepo::bulk_revoke_with_events`,
+    // `ActingApiKeyRepo::revoke_with_event` and `BackchannelAuthRepo::redeem_approved` are
+    // among them, which is to say token issuance and refresh rotation are among them.
+    //
+    // Their enqueues call `record_wake`, whose `try_with` finds no scope and silently does
+    // nothing, so those drains still wait out the poll interval. That is the Postgres-only
+    // behaviour rather than a regression, and it is tracked as the remainder of #944 rather
+    // than described here as done.
+    let store = spec.store;
+    signalling_after_commit(store, async move {
+        let mut tx = begin_scoped(spec.store, spec.scope).await?;
+        // The data change and the audit row share this one transaction.
+        let reported = mutate(&mut tx).await?;
+        insert_audit_row(&mut tx, &spec, detail).await?;
+        if poison_after_audit {
+            // Testing seam only (production callers pass false): force a guaranteed
+            // error after both inserts are staged, so their joint rollback proves
+            // the data change and the audit row are in the same transaction.
+            sqlx::query("SELECT 1 / 0").execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        // Reached only on a COMMITTED transaction: a mutation that reports what it wrote
+        // never reports it for a write that rolled back.
+        Ok(reported)
+    })
+    .await
 }
 
 /// Insert the session row (issues #32 and #101).

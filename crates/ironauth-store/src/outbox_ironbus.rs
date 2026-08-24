@@ -67,6 +67,12 @@ static WAKE_GROUP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 const WAKE_POLL: Duration = Duration::from_millis(100);
 
 /// An IronBus-backed wake-up backbone (issue #104).
+///
+/// The `Debug` form shows the reader thread's liveness and NO connection handles: it is
+/// printed at boot beside the rest of the resolved configuration, and a broker address is
+/// operator-supplied infrastructure rather than something to widen the log surface with. It
+/// also never touches the producer mutex, because a `Debug` impl that can block on a lock is
+/// a trap for whoever adds a `tracing` call later.
 pub struct IronBusBackbone {
     /// Signalled whenever the reader thread observes a wake on the bus.
     woken: Arc<tokio::sync::Notify>,
@@ -76,6 +82,15 @@ pub struct IronBusBackbone {
     /// Set once the reader thread has given up, so `wait` stops pretending a signal may
     /// arrive and simply sleeps the deadline out.
     reader_dead: Arc<AtomicBool>,
+    /// The broker address, kept so a dropped producer connection can be REMADE.
+    ///
+    /// Without it `notify`'s recovery path was a comment rather than a behaviour: a single
+    /// failed produce set `producer` to `None` and nothing could ever refill it, so one
+    /// broker blip permanently reverted the deployment to poll-only for the rest of the
+    /// process lifetime, silently, while `reader_dead` still reported healthy because the
+    /// READER half was fine. That was invisible for as long as `notify` had no production
+    /// callers; issue #944 gave it callers.
+    addr: String,
 }
 
 impl IronBusBackbone {
@@ -89,6 +104,7 @@ impl IronBusBackbone {
     /// point of an OPTIONAL backbone is that its absence is a supported mode.
     pub fn connect(addr: &str) -> Result<Self, ironbus_client::ClientError> {
         let producer = Client::connect(addr)?;
+        let addr_owned = addr.to_owned();
         let woken = Arc::new(tokio::sync::Notify::new());
         let reader_dead = Arc::new(AtomicBool::new(false));
 
@@ -170,6 +186,7 @@ impl IronBusBackbone {
             woken,
             producer: std::sync::Mutex::new(Some(producer)),
             reader_dead,
+            addr: addr_owned,
         })
     }
 
@@ -217,6 +234,27 @@ fn wake_body(consumer: &str) -> PubBody<'_> {
     }
 }
 
+impl std::fmt::Debug for IronBusBackbone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The CONSUMER half's liveness, and nothing else. Deliberately does not reach for
+        // `producer`: that is a client handle behind a mutex, printing it would need the
+        // lock, and a Debug impl that can block is a trap for whoever adds a tracing call
+        // later. It also does not carry the address, which is operator infrastructure rather
+        // than something to widen the log surface with.
+        //
+        // So this reports HALF the health of the type, and says so rather than implying
+        // otherwise: `reader_dead` covers the wait path. The produce path's health is not a
+        // field at all now that it reconnects on demand, since a dropped connection is a
+        // transient state the next wake repairs rather than a mode to report.
+        f.debug_struct("IronBusBackbone")
+            .field(
+                "reader_dead",
+                &self.reader_dead.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl OutboxBackbone for IronBusBackbone {
     fn notify(&self, consumer: &str, _scope: Scope) {
         // Infallible by contract. A produce that fails is dropped on the floor ON PURPOSE:
@@ -225,13 +263,23 @@ impl OutboxBackbone for IronBusBackbone {
         let Ok(mut guard) = self.producer.lock() else {
             return;
         };
+        // RECONNECT when the previous produce dropped the connection. A broker restart is
+        // ordinary, and without this one blip left the process poll-only forever: the guard
+        // stayed `None` and every later wake returned here. A failed reconnect leaves it
+        // `None` and the next notify tries again, so recovery is retried at the write rate
+        // rather than never.
+        if guard.is_none() {
+            match Client::connect(&self.addr) {
+                Ok(client) => *guard = Some(client),
+                Err(_) => return,
+            }
+        }
         let Some(client) = guard.as_mut() else {
             return;
         };
         let body = wake_body(consumer);
         if client.produce(&body).is_err() {
-            // Drop the connection rather than keep a broken one: a later notify makes a
-            // fresh one, and until then the poll covers us.
+            // Drop the broken connection. The branch above remakes it on the next wake.
             *guard = None;
         }
     }
