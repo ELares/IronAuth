@@ -625,6 +625,8 @@ jobs:
         run: scripts/test-registration.sh
       - name: idempotent write audit (no admin handler splits two store writes behind one Idempotency-Key)
         run: scripts/idempotent-write-audit.sh
+      - name: event feed ordering registry (every producer's ordering class is a decision)
+        run: scripts/event-ordering-audit.sh
       - name: classification lint (every resource type is classified; all three classes used)
         run: scripts/classification-lint.sh
       - name: diagnostics redaction corpus (a sentinel in any free-form diagnostic field would be seen)

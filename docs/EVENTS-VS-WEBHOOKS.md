@@ -13,9 +13,41 @@ dead-lettered, and the gap is discovered by whatever downstream system was relyi
 data. Under retries the order is not the order things happened in.
 
 The events API inverts every one of those. You poll at your own pace, from a cursor you
-control, in a strictly ordered feed, and a read from any past cursor returns the same
-events in the same order. Nothing is lost while you are down, because nothing was being
-pushed.
+control, and a read from any past cursor returns the same events in the same order. Nothing
+is lost while you are down, because nothing was being pushed.
+
+### What "ordered" means here, precisely
+
+Two guarantees hold for EVERY event on the feed, and they are the two a synchronising
+consumer needs:
+
+- **Completeness.** A cursor never advances past an event that had not committed when you
+  read, so a concurrent writer cannot slip an event in behind your cursor. That is delivered
+  by a visibility watermark on every read rather than by locking writers, so it holds for
+  every producer without exception. The one gap is retention rather than concurrency: a
+  cursor that has never advanced past the beginning is not told when older events were
+  pruned, so poll to the end of the feed and keep your cursor rather than holding a beginning
+  cursor across an outage longer than the retention window.
+- **Replay stability.** The same cursor returns the same events in the same order, on every
+  read and across restarts. The order is the feed's sequence, and a sequence is never
+  reassigned.
+
+One guarantee does NOT hold for most producers, and it is worth being exact about because it
+is easy to assume from the word "ordered":
+
+- **Commit-order equality.** A sequence is allocated when a row is written, not when its
+  transaction commits, so two transactions that overlap can land on the feed in the opposite
+  order to the order they committed in. Closing that gap costs a per-scope lock held to
+  commit, which on the authentication path would serialise sign-in per environment, so it is
+  not applied there. Treat the feed as unordered BETWEEN concurrent writers. Which producers
+  take the lock is recorded in `docs/design/event-ordering-sites.txt` and enforced by
+  `scripts/event-ordering-audit.sh`, so a producer cannot change class without someone
+  deciding.
+
+If you are reconciling state, completeness and replay stability are what you rely on: read to
+the end of the feed and your copy converges regardless of the order two concurrent writes
+landed in. If you are inferring causality BETWEEN two events from their feed order, compare
+their payloads rather than their positions.
 
 ## The decision table
 
