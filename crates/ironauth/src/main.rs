@@ -49,7 +49,8 @@ use ironauth_store::{
     outbox::{
         ConsumerRegistry, ControlPlaneScopes, DrainStats, OutboxBackbone, OutboxConsumer,
         OutboxObserver, OutboxReaper, OutboxWorker, OutboxWorkerPool, PollOnly, RetentionObserver,
-        RetentionSettings, RetentionStats, RetentionSweeper, ScopeSource, WorkerSettings,
+        RetentionSettings, RetentionStats, RetentionSweeper, ScopeSource, WakeDispatcher,
+        WorkerSettings,
     },
 };
 
@@ -708,6 +709,13 @@ async fn build_admin_state(
         Some(master) => store.with_master_key(Arc::clone(master)),
         None => store,
     };
+    // The producer-side wake dispatcher (issue #944), so a write on this surface wakes the
+    // drain instead of leaving it to time out its poll interval. `None` when no broker is
+    // configured, which is the default and signals nothing.
+    let store = match producer_wake_dispatcher(&config.outbox) {
+        Some(wakes) => store.with_wake_dispatcher(wakes),
+        None => store,
+    };
     match AdminState::new(store, env.clone(), &config.admin) {
         Ok(state) => {
             // The ONE data-plane issuer registry this plane reads signing keys through
@@ -811,6 +819,13 @@ async fn connect_data_plane_registry(
     };
     let store = match shared.master_key() {
         Some(master) => store.with_master_key(Arc::clone(master)),
+        None => store,
+    };
+    // The producer-side wake dispatcher (issue #944), so a write on this surface wakes the
+    // drain instead of leaving it to time out its poll interval. `None` when no broker is
+    // configured, which is the default and signals nothing.
+    let store = match producer_wake_dispatcher(&config.outbox) {
+        Some(wakes) => store.with_wake_dispatcher(wakes),
         None => store,
     };
     Some(Arc::new(IssuerRegistry::store_backed(
@@ -1095,6 +1110,13 @@ async fn build_oidc_plane(
     // already logged when it is unset or unreadable.
     let store = match shared.master_key() {
         Some(master) => store.with_master_key(Arc::clone(master)),
+        None => store,
+    };
+    // The producer-side wake dispatcher (issue #944), so a write on this surface wakes the
+    // drain instead of leaving it to time out its poll interval. `None` when no broker is
+    // configured, which is the default and signals nothing.
+    let store = match producer_wake_dispatcher(&config.outbox) {
+        Some(wakes) => store.with_wake_dispatcher(wakes),
         None => store,
     };
 
@@ -2331,6 +2353,46 @@ fn spawn_consumer_pools(
         .collect()
 }
 
+/// The process's ONE producer-side wake dispatcher (issue #944).
+///
+/// A `OnceLock` rather than an entry in `shared_plane_inputs!`, and the reason is worth
+/// recording. Everything in that macro's `derived_objects` arm is a shared OBJECT, and the
+/// boot-wiring census requires each to carry an identity probe comparing the handle both
+/// planes received. This value is `None` for any configuration without a broker, which is
+/// every test configuration and most deployments, so it has no handle to compare and the
+/// probe it would need could not discriminate a wired plane from an unwired one. Declaring it
+/// there anyway would have meant a probe asserting `installed: false`, which the census
+/// correctly refuses.
+///
+/// One per process is still the property that matters, and this gives it: each dispatcher
+/// owns a thread and a bounded queue, so resolving per store would start one per store.
+static PRODUCER_WAKES: std::sync::OnceLock<Option<Arc<WakeDispatcher>>> =
+    std::sync::OnceLock::new();
+
+/// The dispatcher every store on this process shares, started on first use.
+fn producer_wake_dispatcher(outbox: &OutboxConfig) -> Option<Arc<WakeDispatcher>> {
+    PRODUCER_WAKES
+        .get_or_init(|| resolve_producer_wake_dispatcher(outbox))
+        .clone()
+}
+
+fn resolve_producer_wake_dispatcher(outbox: &OutboxConfig) -> Option<Arc<WakeDispatcher>> {
+    // No broker, no dispatcher. `resolve_outbox_backbone` would hand back `PollOnly`, whose
+    // `notify` is a no-op, so starting a thread and a queue to reach it would cost every
+    // enqueue-bearing commit something for nothing.
+    outbox
+        .ironbus_addr
+        .as_deref()
+        .filter(|addr| !addr.is_empty())?;
+    let backbone = resolve_outbox_backbone(outbox);
+    // A broker that was CONFIGURED but is unreachable resolves to `PollOnly` as well, and the
+    // same reasoning applies: nothing to signal, so nothing to start.
+    if !backbone.signals() {
+        return None;
+    }
+    Some(Arc::new(WakeDispatcher::spawn(backbone)))
+}
+
 /// Resolve the configured outbox wake-up backbone (issue #104), falling back to
 /// [`PollOnly`] whenever a broker is not configured, not compiled in, or not reachable.
 ///
@@ -2801,6 +2863,15 @@ async fn spawn_backchannel_logout_pools(
             return Vec::new();
         }
     };
+
+    // The producer-side wake dispatcher (issue #944). This worker is ITSELF a producer: it
+    // runs inside a consumer and enqueues the next hop, so without this the second stage of
+    // every fan-out (and, for the trait migration, every batch boundary) waits out a full
+    // poll interval even though the first stage was woken the moment its write committed.
+    let data_store = match producer_wake_dispatcher(&outbox) {
+        Some(wakes) => data_store.with_wake_dispatcher(wakes),
+        None => data_store,
+    };
     let control_store = match Store::connect(&control_dsn).await {
         Ok(store) => store,
         Err(error) => {
@@ -3015,6 +3086,15 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
             return Vec::new();
         }
     };
+
+    // The producer-side wake dispatcher (issue #944). This worker is ITSELF a producer: it
+    // runs inside a consumer and enqueues the next hop, so without this the second stage of
+    // every fan-out (and, for the trait migration, every batch boundary) waits out a full
+    // poll interval even though the first stage was woken the moment its write committed.
+    let data_store = match producer_wake_dispatcher(&outbox) {
+        Some(wakes) => data_store.with_wake_dispatcher(wakes),
+        None => data_store,
+    };
     let control_store = match Store::connect(&control_dsn).await {
         Ok(store) => store,
         Err(error) => {
@@ -3113,6 +3193,15 @@ async fn spawn_trait_migration_pools(inputs: TraitMigrationInputs) -> Vec<Outbox
             tracing::error!(%error, "trait migration worker not started: data-plane connect failed");
             return Vec::new();
         }
+    };
+
+    // The producer-side wake dispatcher (issue #944). This worker is ITSELF a producer: it
+    // runs inside a consumer and enqueues the next hop, so without this the second stage of
+    // every fan-out (and, for the trait migration, every batch boundary) waits out a full
+    // poll interval even though the first stage was woken the moment its write committed.
+    let data_store = match producer_wake_dispatcher(&outbox) {
+        Some(wakes) => data_store.with_wake_dispatcher(wakes),
+        None => data_store,
     };
     let control_store = match Store::connect(&control_dsn).await {
         Ok(store) => store,

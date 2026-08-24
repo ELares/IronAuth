@@ -17,6 +17,7 @@ use sqlx::postgres::PgPoolOptions;
 
 use crate::error::StoreError;
 use crate::migrate::MigrationRunner;
+use crate::outbox::{OutboxBackbone, WakeDispatcher};
 use crate::repository::{ManagementStore, ScopedStore};
 use crate::scope::Scope;
 
@@ -34,6 +35,19 @@ pub struct Store {
     // wired); the PII read/write paths then FAIL CLOSED rather than fall back to
     // plaintext. Never logged, displayed, or serialized (the key redacts itself).
     master: Option<Arc<MasterKey>>,
+    // The outbox wake-up dispatcher (issues #104, #944), on the PRODUCER side.
+    //
+    // The consumer half has always had a backbone: `OutboxWorkerPool` waits on one instead of
+    // sleeping out the poll interval. Nothing ever signalled it. A deployment configuring
+    // `ironbus_addr` paid for the broker connections and behaved exactly as `PollOnly`,
+    // because every drain still waited its full interval, so the mode was a wake-up backbone
+    // that was never woken.
+    //
+    // `None` means this handle signals nothing, and it is the state every deployment WITHOUT
+    // a configured broker is in: the boot path installs a dispatcher only when a real backbone
+    // was resolved, so Postgres-only mode costs nothing at all here rather than paying a
+    // dedup and a channel send to reach a no-op notify.
+    wakes: Option<Arc<WakeDispatcher>>,
 }
 
 impl Store {
@@ -52,7 +66,11 @@ impl Store {
             .max_connections(16)
             .connect(url)
             .await?;
-        Ok(Self { pool, master: None })
+        Ok(Self {
+            pool,
+            master: None,
+            wakes: None,
+        })
     }
 
     /// Build a store from a pool the caller already configured (for example a
@@ -61,7 +79,11 @@ impl Store {
     /// not widen access to scoped tables.
     #[must_use]
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool, master: None }
+        Self {
+            pool,
+            master: None,
+            wakes: None,
+        }
     }
 
     /// Attach the platform envelope master key (issue #48), enabling the encrypted
@@ -74,6 +96,43 @@ impl Store {
     pub fn with_master_key(mut self, master: Arc<MasterKey>) -> Self {
         self.master = Some(master);
         self
+    }
+
+    /// Attach the outbox wake-up backbone this handle SIGNALS on (issue #944).
+    ///
+    /// Wire this on every store that serves a surface which enqueues outbox work, which is
+    /// every request-path store: the signal has to come from the producer, and the producer
+    /// is whichever handler just committed a domain write. A store without one is
+    /// Postgres-only and enqueues silently, which is the documented default rather than a
+    /// degraded state.
+    ///
+    /// Wire this ONLY when a real broker is configured. Installing a `PollOnly` backbone here
+    /// would be indistinguishable in behaviour and would still cost every enqueue-bearing
+    /// commit a dedup and a channel send to reach a `notify` that does nothing, which is a
+    /// price paid by deployments that opted into no broker at all.
+    ///
+    /// Starts one dispatcher thread per call, so pass one handle per process rather than
+    /// building a store per request.
+    #[must_use]
+    pub fn with_outbox_backbone(mut self, backbone: Arc<dyn OutboxBackbone>) -> Self {
+        self.wakes = Some(Arc::new(WakeDispatcher::spawn(backbone)));
+        self
+    }
+
+    /// Share an ALREADY RUNNING dispatcher with another handle of the same process.
+    ///
+    /// `Store` is cloned freely, and every clone shares the dispatcher its parent carried.
+    /// This exists for the boot path, which opens several stores against the same database
+    /// and must not start a wake thread for each.
+    #[must_use]
+    pub fn with_wake_dispatcher(mut self, wakes: Arc<WakeDispatcher>) -> Self {
+        self.wakes = Some(wakes);
+        self
+    }
+
+    /// The wake dispatcher, for the repository layer's post-commit signal only.
+    pub(crate) fn wakes(&self) -> Option<&Arc<WakeDispatcher>> {
+        self.wakes.as_ref()
     }
 
     /// The pool, for the repository layer only. Crate-private so no other crate
