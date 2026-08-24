@@ -5754,6 +5754,379 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers": {
+      "get": {
+        "tags": [
+          "external-issuers"
+        ],
+        "summary": "List the external issuers registered in this environment.",
+        "operationId": "listExternalIssuers",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The registered issuers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalIssuerList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "external-issuers"
+        ],
+        "summary": "Register an external assertion issuer as a trust anchor.",
+        "operationId": "registerExternalIssuer",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterExternalIssuerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The registered issuer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExternalIssuerCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, an empty issuer, or neither or both of jwks and jwks_uri",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "An issuer with this `iss` is already registered here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers/{issuer_id}": {
+      "delete": {
+        "tags": [
+          "external-issuers"
+        ],
+        "summary": "Remove a registered external issuer.",
+        "operationId": "deleteExternalIssuer",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "issuer_id",
+            "in": "path",
+            "description": "The `xai_` identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The registration was removed"
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment or issuer is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "external-issuers"
+        ],
+        "summary": "Enable or disable a registered external issuer.",
+        "operationId": "setExternalIssuerEnabled",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "issuer_id",
+            "in": "path",
+            "description": "The `xai_` identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The issuer's state was set"
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment or issuer is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets": {
       "get": {
         "tags": [
@@ -18326,6 +18699,379 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings": {
+      "get": {
+        "tags": [
+          "external-issuers"
+        ],
+        "summary": "List the subject mappings registered in this environment.",
+        "operationId": "listSubjectMappings",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The registered mappings, including disabled ones",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectMappingList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "external-issuers"
+        ],
+        "summary": "Author a subject mapping from an external subject to an IronAuth principal.",
+        "operationId": "createSubjectMapping",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSubjectMappingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The authored mapping",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectMappingCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, one half of the claim gate without the other, an unregistered issuer, or a principal that is not a registered machine identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A mapping for this issuer and subject already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings/{mapping_id}": {
+      "delete": {
+        "tags": [
+          "external-issuers"
+        ],
+        "summary": "Remove a subject mapping.",
+        "operationId": "deleteSubjectMapping",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "mapping_id",
+            "in": "path",
+            "description": "The `asm_` identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The mapping was removed"
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment or mapping is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "external-issuers"
+        ],
+        "summary": "Enable or disable a subject mapping.",
+        "operationId": "setSubjectMappingEnabled",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "mapping_id",
+            "in": "path",
+            "description": "The `asm_` identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The mapping's state was set"
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment or mapping is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas": {
       "get": {
         "tags": [
@@ -24740,6 +25486,43 @@
           }
         }
       },
+      "CreateSubjectMappingRequest": {
+        "type": "object",
+        "description": "The body to author a subject mapping.",
+        "required": [
+          "issuer",
+          "external_subject",
+          "principal"
+        ],
+        "properties": {
+          "external_subject": {
+            "type": "string",
+            "description": "The external `sub` to map from."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The external issuer to map from. Must name a registered issuer."
+          },
+          "match_claim": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional additional claim gate. Both `match_claim` and `match_value` must be\npresent together or both absent; a database CHECK enforces it and this rejects the\nhalf-set form at the edge so the caller gets a message rather than a constraint."
+          },
+          "match_value": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The value the optional `match_claim` must equal."
+          },
+          "principal": {
+            "type": "string",
+            "description": "The registered machine identity a matched assertion is issued as: an `sva_` service\naccount that already exists in this environment. It becomes the issued token's `sub`,\nso a principal naming nothing would mint tokens no reader can attribute. Refused at\nauthoring time rather than at the first assertion."
+          }
+        }
+      },
       "CreateTenantRequest": {
         "type": "object",
         "description": "The body to create a tenant. The first environment is created with it.",
@@ -25393,6 +26176,86 @@
             "description": "How many seconds from now to extend the review window by. Must be at least 1.",
             "example": 604800,
             "minimum": 0
+          }
+        }
+      },
+      "ExternalIssuerCreated": {
+        "type": "object",
+        "description": "The identifier a registration minted.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The `xai_` identifier."
+          }
+        }
+      },
+      "ExternalIssuerList": {
+        "type": "object",
+        "description": "A page of registered issuers.",
+        "required": [
+          "issuers"
+        ],
+        "properties": {
+          "issuers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExternalIssuerView"
+            },
+            "description": "The issuers registered in this environment, oldest first."
+          }
+        }
+      },
+      "ExternalIssuerView": {
+        "type": "object",
+        "description": "One registered external issuer, as an operator reads it.",
+        "required": [
+          "id",
+          "issuer",
+          "enabled"
+        ],
+        "properties": {
+          "audience_allow": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A space-separated per-issuer audience allowlist, intersected with the deployment's\nacceptable audiences, or null to accept them unchanged. It can only NARROW."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the grant will judge assertions against this anchor. A disabled issuer is\nrefused exactly as an unregistered one is."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `xai_` identifier."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The `iss` an assertion must carry to be judged against this anchor."
+          },
+          "jwks": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pinned JWKS document, verbatim, or null when the issuer is resolved by URI.\nPUBLIC key material: an external issuer authenticates by signing, so nothing secret\nis held for it."
+          },
+          "jwks_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The JWKS URL, fetched and cached through the SSRF-hardened fetcher, or null when the\ndocument is pinned inline."
+          },
+          "signing_alg_allow": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A space-separated per-issuer algorithm allowlist, intersected with the deployment's\nown set, or null to accept the deployment set unchanged. It can only NARROW."
           }
         }
       },
@@ -28246,6 +29109,47 @@
           }
         }
       },
+      "RegisterExternalIssuerRequest": {
+        "type": "object",
+        "description": "The body to register an external issuer.",
+        "required": [
+          "issuer"
+        ],
+        "properties": {
+          "audience_allow": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional space-separated audience allowlist. Narrowing only."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The `iss` an assertion must carry. Compared exactly, never by prefix."
+          },
+          "jwks": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A pinned JWKS document. Exactly one of `jwks` and `jwks_uri` must be present: an\nissuer with neither has no key to verify against and would refuse every assertion,\nand an issuer with both leaves which one wins unstated."
+          },
+          "jwks_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A JWKS URL to resolve and cache."
+          },
+          "signing_alg_allow": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional space-separated algorithm allowlist. Narrowing only."
+          }
+        }
+      },
       "ReplayAccepted": {
         "type": "object",
         "description": "The acknowledgement that a replay was QUEUED.\n\nDeliberately not a count. The management plane enqueues a command and the delivery\nworker executes it, so no number this response could carry would be true by the time a\ncaller read it. What the caller can rely on is that the request is durable: it is a\nqueue row committed in the same transaction as its audit row.",
@@ -29003,6 +29907,19 @@
           }
         }
       },
+      "SetEnabledRequest": {
+        "type": "object",
+        "description": "The body to enable or disable a registered resource.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the resource should be live."
+          }
+        }
+      },
       "SetEventTypesRequest": {
         "type": "object",
         "description": "Set or clear an endpoint's event-type subscription.",
@@ -29631,6 +30548,82 @@
           "scope_token": {
             "type": "string",
             "description": "The OAuth scope token this policy governs."
+          }
+        }
+      },
+      "SubjectMappingCreated": {
+        "type": "object",
+        "description": "The identifier a mapping creation minted.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The `asm_` identifier."
+          }
+        }
+      },
+      "SubjectMappingList": {
+        "type": "object",
+        "description": "A page of subject mappings.",
+        "required": [
+          "mappings"
+        ],
+        "properties": {
+          "mappings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubjectMappingView"
+            },
+            "description": "The mappings registered in this environment, oldest first, INCLUDING disabled ones."
+          }
+        }
+      },
+      "SubjectMappingView": {
+        "type": "object",
+        "description": "One subject mapping, as an operator reads it.",
+        "required": [
+          "id",
+          "issuer",
+          "external_subject",
+          "principal",
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the rule is live. A disabled rule is listed and does not fire."
+          },
+          "external_subject": {
+            "type": "string",
+            "description": "The external `sub` this rule maps from."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `asm_` identifier."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The external issuer this rule maps from."
+          },
+          "match_claim": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional additional claim NAME the assertion must carry with `match_value`, or\nnull when the (issuer, subject) pair alone is the rule."
+          },
+          "match_value": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The value `match_claim` must equal, or null when `match_claim` is null."
+          },
+          "principal": {
+            "type": "string",
+            "description": "The registered machine identity a matched assertion is issued as (the token's `sub`)."
           }
         }
       },

@@ -40,7 +40,19 @@ PROVIDER_DIR="terraform-provider-ironauth/internal/provider"
 # grew rather than coverage slipping. A Terraform resource for registering a flow target
 # belongs with the provider work, and bolting one on inside the API's own change would mean
 # shipping a provider resource with no acceptance test beside it.
-UNCOVERED_CEILING=22
+# RAISED 22 -> 24 for `registerExternalIssuer` and `createSubjectMapping` (issue #126), on the
+# same terms again: workload-federation trust anchors and subject mappings are new surface, so
+# the denominator grew by two rather than coverage slipping.
+#
+# Worth naming what actually moved, because it was not the POST. Both operations existed one
+# commit earlier and neither counted, because "promotable" here means a collection POST with a
+# SIBLING ITEM DELETE and the surface shipped only create plus a disable toggle. Review found
+# that was a defect rather than a design: both tables carry a UNIQUE constraint on their
+# natural key with no `enabled` predicate, so a parked row keeps its key and an issuer that
+# rotated its signing keys could never be repointed. Adding the DELETE fixed that and, as a
+# side effect, made both resources promotable. So this raise records real new provider debt
+# that the earlier shape was hiding, not new debt this change created.
+UNCOVERED_CEILING=24
 
 python3 - "$SPEC" "$PROVIDER_DIR" "$UNCOVERED_CEILING" <<'PY'
 import collections, json, pathlib, re, sys

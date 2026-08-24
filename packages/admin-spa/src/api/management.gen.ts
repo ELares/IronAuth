@@ -811,6 +811,42 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the external issuers registered in this environment. */
+        get: operations["listExternalIssuers"];
+        put?: never;
+        /** Register an external assertion issuer as a trust anchor. */
+        post: operations["registerExternalIssuer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers/{issuer_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove a registered external issuer. */
+        delete: operations["deleteExternalIssuer"];
+        options?: never;
+        head?: never;
+        /** Enable or disable a registered external issuer. */
+        patch: operations["setExternalIssuerEnabled"];
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets": {
         parameters: {
             query?: never;
@@ -2411,6 +2447,42 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the subject mappings registered in this environment. */
+        get: operations["listSubjectMappings"];
+        put?: never;
+        /** Author a subject mapping from an external subject to an IronAuth principal. */
+        post: operations["createSubjectMapping"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings/{mapping_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove a subject mapping. */
+        delete: operations["deleteSubjectMapping"];
+        options?: never;
+        head?: never;
+        /** Enable or disable a subject mapping. */
+        patch: operations["setSubjectMappingEnabled"];
         trace?: never;
     };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas": {
@@ -4132,6 +4204,28 @@ export interface components {
              */
             value: string;
         };
+        /** @description The body to author a subject mapping. */
+        CreateSubjectMappingRequest: {
+            /** @description The external `sub` to map from. */
+            external_subject: string;
+            /** @description The external issuer to map from. Must name a registered issuer. */
+            issuer: string;
+            /**
+             * @description An optional additional claim gate. Both `match_claim` and `match_value` must be
+             *     present together or both absent; a database CHECK enforces it and this rejects the
+             *     half-set form at the edge so the caller gets a message rather than a constraint.
+             */
+            match_claim?: string | null;
+            /** @description The value the optional `match_claim` must equal. */
+            match_value?: string | null;
+            /**
+             * @description The registered machine identity a matched assertion is issued as: an `sva_` service
+             *     account that already exists in this environment. It becomes the issued token's `sub`,
+             *     so a principal naming nothing would mint tokens no reader can attribute. Refused at
+             *     authoring time rather than at the first assertion.
+             */
+            principal: string;
+        };
         /** @description The body to create a tenant. The first environment is created with it. */
         CreateTenantRequest: {
             /**
@@ -4582,6 +4676,49 @@ export interface components {
              * @example 604800
              */
             extend_secs: number;
+        };
+        /** @description The identifier a registration minted. */
+        ExternalIssuerCreated: {
+            /** @description The `xai_` identifier. */
+            id: string;
+        };
+        /** @description A page of registered issuers. */
+        ExternalIssuerList: {
+            /** @description The issuers registered in this environment, oldest first. */
+            issuers: components["schemas"]["ExternalIssuerView"][];
+        };
+        /** @description One registered external issuer, as an operator reads it. */
+        ExternalIssuerView: {
+            /**
+             * @description A space-separated per-issuer audience allowlist, intersected with the deployment's
+             *     acceptable audiences, or null to accept them unchanged. It can only NARROW.
+             */
+            audience_allow?: string | null;
+            /**
+             * @description Whether the grant will judge assertions against this anchor. A disabled issuer is
+             *     refused exactly as an unregistered one is.
+             */
+            enabled: boolean;
+            /** @description The `xai_` identifier. */
+            id: string;
+            /** @description The `iss` an assertion must carry to be judged against this anchor. */
+            issuer: string;
+            /**
+             * @description The pinned JWKS document, verbatim, or null when the issuer is resolved by URI.
+             *     PUBLIC key material: an external issuer authenticates by signing, so nothing secret
+             *     is held for it.
+             */
+            jwks?: string | null;
+            /**
+             * @description The JWKS URL, fetched and cached through the SSRF-hardened fetcher, or null when the
+             *     document is pinned inline.
+             */
+            jwks_uri?: string | null;
+            /**
+             * @description A space-separated per-issuer algorithm allowlist, intersected with the deployment's
+             *     own set, or null to accept the deployment set unchanged. It can only NARROW.
+             */
+            signing_alg_allow?: string | null;
         };
         /** @description One event on the feed. */
         FeedEvent: {
@@ -6297,6 +6434,23 @@ export interface components {
             /** @description The authenticated end-user subject the family's tokens are minted for. */
             subject: string;
         };
+        /** @description The body to register an external issuer. */
+        RegisterExternalIssuerRequest: {
+            /** @description An optional space-separated audience allowlist. Narrowing only. */
+            audience_allow?: string | null;
+            /** @description The `iss` an assertion must carry. Compared exactly, never by prefix. */
+            issuer: string;
+            /**
+             * @description A pinned JWKS document. Exactly one of `jwks` and `jwks_uri` must be present: an
+             *     issuer with neither has no key to verify against and would refuse every assertion,
+             *     and an issuer with both leaves which one wins unstated.
+             */
+            jwks?: string | null;
+            /** @description A JWKS URL to resolve and cache. */
+            jwks_uri?: string | null;
+            /** @description An optional space-separated algorithm allowlist. Narrowing only. */
+            signing_alg_allow?: string | null;
+        };
         /**
          * @description The acknowledgement that a replay was QUEUED.
          *
@@ -6796,6 +6950,11 @@ export interface components {
              */
             algorithm: string;
         };
+        /** @description The body to enable or disable a registered resource. */
+        SetEnabledRequest: {
+            /** @description Whether the resource should be live. */
+            enabled: boolean;
+        };
         /** @description Set or clear an endpoint's event-type subscription. */
         SetEventTypesRequest: {
             /**
@@ -7147,6 +7306,36 @@ export interface components {
             min_acr?: string | null;
             /** @description The OAuth scope token this policy governs. */
             scope_token: string;
+        };
+        /** @description The identifier a mapping creation minted. */
+        SubjectMappingCreated: {
+            /** @description The `asm_` identifier. */
+            id: string;
+        };
+        /** @description A page of subject mappings. */
+        SubjectMappingList: {
+            /** @description The mappings registered in this environment, oldest first, INCLUDING disabled ones. */
+            mappings: components["schemas"]["SubjectMappingView"][];
+        };
+        /** @description One subject mapping, as an operator reads it. */
+        SubjectMappingView: {
+            /** @description Whether the rule is live. A disabled rule is listed and does not fire. */
+            enabled: boolean;
+            /** @description The external `sub` this rule maps from. */
+            external_subject: string;
+            /** @description The `asm_` identifier. */
+            id: string;
+            /** @description The external issuer this rule maps from. */
+            issuer: string;
+            /**
+             * @description An optional additional claim NAME the assertion must carry with `match_value`, or
+             *     null when the (issuer, subject) pair alone is the rule.
+             */
+            match_claim?: string | null;
+            /** @description The value `match_claim` must equal, or null when `match_claim` is null. */
+            match_value?: string | null;
+            /** @description The registered machine identity a matched assertion is issued as (the token's `sub`). */
+            principal: string;
         };
         /** @description The result of a successful admin sudo elevation (issue #73). */
         SudoElevationView: {
@@ -11712,6 +11901,261 @@ export interface operations {
                 };
             };
             /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listExternalIssuers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The registered issuers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExternalIssuerList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    registerExternalIssuer: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterExternalIssuerRequest"];
+            };
+        };
+        responses: {
+            /** @description The registered issuer */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExternalIssuerCreated"];
+                };
+            };
+            /** @description Malformed request, an empty issuer, or neither or both of jwks and jwks_uri */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description An issuer with this `iss` is already registered here */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteExternalIssuer: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The `xai_` identifier */
+                issuer_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The registration was removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment or issuer is absent */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setExternalIssuerEnabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The `xai_` identifier */
+                issuer_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetEnabledRequest"];
+            };
+        };
+        responses: {
+            /** @description The issuer's state was set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment or issuer is absent */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -19878,6 +20322,261 @@ export interface operations {
                 };
             };
             /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listSubjectMappings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The registered mappings, including disabled ones */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SubjectMappingList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createSubjectMapping: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateSubjectMappingRequest"];
+            };
+        };
+        responses: {
+            /** @description The authored mapping */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SubjectMappingCreated"];
+                };
+            };
+            /** @description Malformed request, one half of the claim gate without the other, an unregistered issuer, or a principal that is not a registered machine identity */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A mapping for this issuer and subject already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteSubjectMapping: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The `asm_` identifier */
+                mapping_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The mapping was removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment or mapping is absent */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setSubjectMappingEnabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The `asm_` identifier */
+                mapping_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetEnabledRequest"];
+            };
+        };
+        responses: {
+            /** @description The mapping's state was set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment or mapping is absent */
             404: {
                 headers: {
                     [name: string]: unknown;

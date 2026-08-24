@@ -195,6 +195,10 @@ class Client:
         """createServiceAccountApiKey. POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/service-accounts/{urllib.parse.quote(service_account_id)}/api-keys", query, body)
 
+    def create_subject_mapping(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Author a subject mapping from an external subject to an IronAuth principal. POST /v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/subject-mappings", query, body)
+
     def create_tenant(self, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Create a tenant and its first environment. POST /v1/tenants."""
         return self._do("POST", f"/v1/tenants", query, body)
@@ -243,6 +247,10 @@ class Client:
         """Deactivate an environment (soft delete; idempotent). DELETE /v1/tenants/{tenant_id}/environments/{environment_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}", query, None)
 
+    def delete_external_issuer(self, tenant_id: str, environment_id: str, issuer_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Remove a registered external issuer. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers/{issuer_id}."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/external-issuers/{urllib.parse.quote(issuer_id)}", query, None)
+
     def delete_flow_target(self, tenant_id: str, environment_id: str, target_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Deregister an HTTP flow target. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/flow-targets/{urllib.parse.quote(target_id)}", query, None)
@@ -290,6 +298,10 @@ class Client:
     def delete_signup_form(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Delete a per-environment, per-client signup form. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/signup-form", query, None)
+
+    def delete_subject_mapping(self, tenant_id: str, environment_id: str, mapping_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Remove a subject mapping. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings/{mapping_id}."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/subject-mappings/{urllib.parse.quote(mapping_id)}", query, None)
 
     def delete_tenant(self, tenant_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Deactivate a tenant (soft delete; idempotent). DELETE /v1/tenants/{tenant_id}."""
@@ -547,6 +559,10 @@ class Client:
         """List environments under a tenant (cursor paginated). GET /v1/tenants/{tenant_id}/environments."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments", query, None)
 
+    def list_external_issuers(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List the external issuers registered in this environment. GET /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/external-issuers", query, None)
+
     def list_flow_target_dead_letters(self, tenant_id: str, environment_id: str, target_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List a target's dead-lettered async deliveries. GET /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/dead-letters."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/flow-targets/{urllib.parse.quote(target_id)}/dead-letters", query, None)
@@ -679,6 +695,10 @@ class Client:
         """List every per-scope step-up policy in the environment. GET /v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/step-up-policies", query, None)
 
+    def list_subject_mappings(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List the subject mappings registered in this environment. GET /v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/subject-mappings", query, None)
+
     def list_tenants(self, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List tenants (cursor paginated). GET /v1/tenants."""
         return self._do("GET", f"/v1/tenants", query, None)
@@ -750,6 +770,10 @@ class Client:
     def read_event_feed(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Read the ordered event feed (issue #107). GET /v1/tenants/{tenant_id}/environments/{environment_id}/events."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/events", query, None)
+
+    def register_external_issuer(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Register an external assertion issuer as a trust anchor. POST /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/external-issuers", query, body)
 
     def reject_recovery_approval(self, tenant_id: str, environment_id: str, flow_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """REJECT an admin-approved recovery: the recovery can never complete via this method. POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/reject."""
@@ -879,6 +903,10 @@ class Client:
         """Pin the ID-token signing algorithm for one client (issue #93). PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/clients/{urllib.parse.quote(client_id)}/signing-algorithm", query, body)
 
+    def set_external_issuer_enabled(self, tenant_id: str, environment_id: str, issuer_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Enable or disable a registered external issuer. PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers/{issuer_id}."""
+        return self._do("PATCH", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/external-issuers/{urllib.parse.quote(issuer_id)}", query, body)
+
     def set_locale(self, tenant_id: str, environment_id: str, locale: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Set (create or overwrite) a per-environment locale bundle. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/locales/{urllib.parse.quote(locale)}", query, body)
@@ -910,6 +938,10 @@ class Client:
     def set_step_up_policy(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Set the step-up policy for one OAuth scope token. POST /v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/step-up-policies", query, body)
+
+    def set_subject_mapping_enabled(self, tenant_id: str, environment_id: str, mapping_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Enable or disable a subject mapping. PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings/{mapping_id}."""
+        return self._do("PATCH", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/subject-mappings/{urllib.parse.quote(mapping_id)}", query, body)
 
     def set_user_state(self, tenant_id: str, environment_id: str, user_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Transition a user's lifecycle state. POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state."""

@@ -208,8 +208,9 @@ pub use backchannel::{
 };
 pub use client_auth::{
     AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod, ClientAuthParseError,
-    JWT_BEARER_ASSERTION_TYPE, PresentedClientAuth, authenticate_client,
-    authenticate_client_self_scoped, generate_secret, hash_secret, parse_presented,
+    JWT_BEARER_ASSERTION_TYPE, PresentedClientAuth, assertion_signing_alg_values,
+    authenticate_client, authenticate_client_self_scoped, generate_secret, hash_secret,
+    parse_presented,
 };
 pub use client_keys::ClientKeyResolver;
 pub use dcr_policy::{

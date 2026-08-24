@@ -1718,6 +1718,7 @@ dependencies = [
  "ciborium",
  "http",
  "http-body-util",
+ "ironauth-admin",
  "ironauth-config",
  "ironauth-connector",
  "ironauth-env",

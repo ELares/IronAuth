@@ -79,6 +79,7 @@ pub mod log_shipper;
 pub mod log_stream_signature;
 
 pub mod ciba_ping;
+mod external_issuers;
 pub mod flow_target_delivery;
 mod flow_targets;
 mod log_streams;
@@ -1079,6 +1080,42 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/queues",
             axum::routing::get(queues::list_queue_depths),
+        )
+        // Workload identity federation's granting path (issue #126). The enforcement half
+        // shipped long before this: assertion verification, JWKS resolution, the audience and
+        // algorithm narrowing, subject mapping and deny-by-default were all built and covered,
+        // while the two tables behind them were writable only from the store repository. Every
+        // registration in the tree came from a test harness, so the issue's first two criteria
+        // were unreachable rather than undemonstrated. The #112 flow-target surface below hit
+        // the same shape; its own note now sits with its routes rather than up here.
+        //
+        // DELETE alongside the enable toggle, and the pair is not redundant: disable is
+        // revocation and keeps the row, delete frees the natural key. Both unique constraints
+        // ignore `enabled`, so without the delete an anchor whose keys rotated could never be
+        // repointed. See migration 0153.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers",
+            axum::routing::get(external_issuers::list_external_issuers)
+                .post(external_issuers::register_external_issuer),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers/{issuer_id}",
+            axum::routing::patch(external_issuers::set_external_issuer_enabled)
+                .delete(external_issuers::delete_external_issuer),
+        )
+        // Mappings are a SIBLING of issuers rather than nested under one, because a mapping's
+        // `issuer` is the issuer STRING an assertion carries, not the `xai_` row id. Nesting
+        // would imply a foreign key the schema does not have and would make the path disagree
+        // with the body.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings",
+            axum::routing::get(external_issuers::list_subject_mappings)
+                .post(external_issuers::create_subject_mapping),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings/{mapping_id}",
+            axum::routing::patch(external_issuers::set_subject_mapping_enabled)
+                .delete(external_issuers::delete_subject_mapping),
         )
         // HTTP flow target registration (issue #112). Until this existed the table granted
         // INSERT to `ironauth_control` only and nothing mounted a route, so the dispatcher

@@ -71,7 +71,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      CIBA backchannel authentication requests, \
      client backchannel delivery, \
      external issuer audience allow, scope fk naming, \
-     backchannel approved requires grant, backchannel approved grant validated.";
+     backchannel approved requires grant, backchannel approved grant validated, \
+     external issuer control grants.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -191,6 +192,30 @@ async fn role_has_column_privilege(
         .await
         .expect("column privilege lookup")
         .get("present")
+}
+
+/// Every live column of `table` on which `role` holds UPDATE, in catalog order.
+///
+/// The positive form of `role_has_any_column_privilege`: rather than asking whether some
+/// column is writable, it names WHICH are, so a test can assert the exact set. A hand-written
+/// list of columns NOT to be writable silently stops covering a column the table gains later,
+/// and worse, is easy to write so that it omits the columns that matter.
+async fn writable_columns(pool: &sqlx::PgPool, role: &str, table: &str) -> Vec<String> {
+    sqlx::query(
+        "SELECT a.attname::text AS column_name \
+         FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
+         WHERE c.relname::text = $2 AND a.attnum > 0 AND NOT a.attisdropped \
+           AND has_column_privilege($1, c.oid, a.attnum, 'UPDATE') \
+         ORDER BY a.attnum",
+    )
+    .bind(role)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .expect("writable column sweep")
+    .into_iter()
+    .map(|row| row.get::<String, _>("column_name"))
+    .collect()
 }
 
 /// Whether `role` holds `privilege` on ANY live column of `table`, swept over the
@@ -678,7 +703,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        152,
+        153,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -717,7 +742,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108,
             109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
             126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
-            143, 144, 145, 146, 147, 148, 149, 150, 151, 152
+            143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153
         ]
     );
     let phase_of = |version: i64| async move {
@@ -8252,5 +8277,96 @@ async fn the_four_reaperless_tables_refuse_a_data_plane_delete() {
             .execute(&mut *tx)
             .await;
         assert_permission_denied(result, table);
+    }
+}
+
+/// 0153 grants the control plane exactly what the workload-federation surface needs.
+///
+/// The migration makes two security claims in prose and, before this test, nothing measured
+/// either: that UPDATE is narrowed to `enabled` so an operator cannot silently repoint an
+/// anchor at a different JWKS while every listing still shows the issuer they expect, and that
+/// the DATA plane gains nothing. A later `GRANT UPDATE ON external_assertion_issuers TO
+/// ironauth_control` would satisfy every other test in the tree, including the whole-surface
+/// live sweep, while handing the control path exactly the edit the narrowing exists to prevent.
+///
+/// DELETE is asserted PRESENT, which is the half a reader is most likely to think is a mistake.
+/// It is what makes a mis-registration correctable: both unique constraints ignore `enabled`,
+/// so a parked row keeps its natural key and an issuer that rotated the keys behind a pinned
+/// inline `jwks` could otherwise never be repointed.
+#[tokio::test]
+async fn the_control_plane_holds_exactly_the_federation_grants_0153_adds() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    for table in [
+        "external_assertion_issuers",
+        "external_assertion_subject_mappings",
+    ] {
+        // What the eight management routes issue. SELECT covers the two listings plus the
+        // by-id reads the PATCH and DELETE handlers make internally (there is no by-id READ
+        // route); INSERT the two creates; DELETE the two deletes that free the natural key.
+        for privilege in ["SELECT", "INSERT", "DELETE"] {
+            assert!(
+                role_has_table_privilege(pool, "ironauth_control", table, privilege).await,
+                "the control plane needs {privilege} on {table}; without it the issue #126 \
+                 management surface answers an opaque server error on every deployment that \
+                 sets admin.control_database_url"
+            );
+        }
+
+        // The narrowing. Table-wide UPDATE would auto-extend to every column this table ever
+        // gains, which is how the issue #31 lesson was learned the first time.
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_control", table, "UPDATE").await,
+            "0153 must not grant the control plane table-wide UPDATE on {table}"
+        );
+        assert!(
+            role_has_column_privilege(pool, "ironauth_control", table, "enabled", "UPDATE").await,
+            "the control plane needs UPDATE on {table}.enabled: revoking trust in a \
+             compromised issuer is the operation an operator needs fastest"
+        );
+
+        // And NO OTHER COLUMN is writable, swept over the catalog rather than a hand-written
+        // list. The first version of this test probed four columns chosen because they are
+        // common to both tables, which happened to exclude every column the migration's
+        // security claim is actually about: `jwks`, `jwks_uri`, `signing_alg_allow`,
+        // `audience_allow`, `principal`, `external_subject`, `match_claim`, `match_value`. A
+        // later `GRANT UPDATE (jwks, jwks_uri) ... TO ironauth_control` would have passed it
+        // while handing the control plane exactly the in-place repoint 0153 exists to prevent,
+        // and the column-scoped form is the LIKELIER regression, since it is the form 0153 and
+        // 0020 both use. So this enumerates the live columns and names the ones that are
+        // writable, which cannot go stale as the table grows.
+        let writable = writable_columns(pool, "ironauth_control", table).await;
+        assert_eq!(
+            writable,
+            vec!["enabled".to_owned()],
+            "the control plane must hold UPDATE on {table}.enabled and on nothing else; an \
+             anchor or mapping repointed in place changes who can mint tokens, or as whom, \
+             while every listing still shows what an operator expects"
+        );
+
+        // The DATA plane is untouched by 0153. 0020 gave it SELECT, INSERT and UPDATE(enabled)
+        // and deliberately no DELETE, because a request path must be able to park a compromised
+        // anchor and never to erase one.
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_app", table, "DELETE").await,
+            "0153 must not extend DELETE on {table} to the data plane; 0020's \
+             'disabled, not deleted' rule is scoped to that plane and stays true"
+        );
+
+        // Positive controls, one per HELPER the withholdings above rely on, so neither a
+        // table lookup nor a column sweep answering emptily could satisfy them. The first
+        // version of this test controlled only the table helper while its sharpest assertions
+        // used the column one.
+        assert!(
+            role_has_table_privilege(pool, "ironauth_app", table, "SELECT").await,
+            "the data plane holds the {table} SELECT the JWT bearer grant reads"
+        );
+        assert_eq!(
+            writable_columns(pool, "ironauth_app", table).await,
+            vec!["enabled".to_owned()],
+            "the column sweep reports a real answer for the data plane too, so an empty \
+             result cannot be what satisfied the control-plane assertion above"
+        );
     }
 }

@@ -1208,6 +1208,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0152_backchannel_approved_grant_validated.sql"),
         },
+        Migration {
+            version: 153,
+            name: "external_issuer_control_grants",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0153_external_issuer_control_grants.sql"),
+        },
     ]
 }
 

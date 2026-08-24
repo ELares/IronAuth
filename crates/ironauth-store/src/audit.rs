@@ -750,14 +750,24 @@ pub enum Action {
     /// An external assertion issuer's enable switch was toggled (issue #26): a
     /// compromised or decommissioned trust anchor was DISABLED (or re-enabled)
     /// through the column-scoped data-plane grant, so its assertions are rejected
-    /// exactly as an unregistered issuer's are. The data-plane revocation capability
-    /// (the HTTP management surface for it is M13).
+    /// exactly as an unregistered issuer's are. The data-plane revocation capability;
+    /// the HTTP management surface for it shipped with issue #126.
     ExternalAssertionIssuerSetEnabled,
     /// A subject-mapping rule's enable switch was toggled (issue #26): a mis-authored
     /// or decommissioned mapping was DISABLED (or re-enabled) through the
     /// column-scoped data-plane grant, so it resolves to no rule and the grant
     /// rejects the subject exactly as an unmapped one.
     ExternalAssertionSubjectMappingSetEnabled,
+    /// An external assertion issuer registration was REMOVED (issue #126). Distinct
+    /// from disabling one: disable is revocation and keeps the row, delete frees the
+    /// `(tenant, environment, issuer)` unique key so the same issuer can be registered
+    /// again with a different key source. That is the only way to repoint an anchor
+    /// whose keys rotated, since the key columns are immutable to both planes.
+    ExternalAssertionIssuerDelete,
+    /// A subject-mapping rule was REMOVED (issue #126). Frees the
+    /// `(tenant, environment, issuer, external_subject)` unique key, which is what lets
+    /// a rule authored against the wrong principal be replaced rather than only parked.
+    ExternalAssertionSubjectMappingDelete,
     /// A short-lived access token was issued under the JWT bearer assertion grant
     /// (issue #26): a validated external assertion was exchanged for a token under
     /// the mapped identity. No refresh token accompanies it (RFC 7521 4.1).
@@ -1502,6 +1512,10 @@ impl Action {
                 "external_assertion_subject_mapping.create"
             }
             Action::ExternalAssertionIssuerSetEnabled => "external_assertion_issuer.set_enabled",
+            Action::ExternalAssertionIssuerDelete => "external_assertion_issuer.delete",
+            Action::ExternalAssertionSubjectMappingDelete => {
+                "external_assertion_subject_mapping.delete"
+            }
             Action::ExternalAssertionSubjectMappingSetEnabled => {
                 "external_assertion_subject_mapping.set_enabled"
             }
