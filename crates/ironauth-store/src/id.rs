@@ -821,6 +821,20 @@ impl ScopedKind for MessageTemplateKind {
     const PREFIX: &'static str = "mtp";
 }
 
+/// Marker for one outbound message (`msg_`), the delivery record issue #111 writes when a
+/// send is enqueued.
+///
+/// Distinct from [`OutboxMessageKind`] (`obx_`), which identifies the QUEUE row that carries
+/// the delivery job. One send has both: the `msg_` row is the durable record an operator
+/// lists and a consumer resolves, the `obx_` row is the work item that gets claimed, retried
+/// and eventually dead-lettered. Collapsing them would tie the record's lifetime to the
+/// queue's retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MessageKind;
+impl ScopedKind for MessageKind {
+    const PREFIX: &'static str = "msg";
+}
+
 /// Marker for a registered HTTP flow target (`ftg_`), one configured extension endpoint per
 /// environment (issue #112).
 ///
@@ -1878,6 +1892,9 @@ pub type LogStreamId = ScopedId<LogStreamKind>;
 
 /// A stored message template override (issue #111).
 pub type MessageTemplateId = ScopedId<MessageTemplateKind>;
+
+/// One outbound message's identifier (`msg_...`), the delivery record a send writes.
+pub type MessageId = ScopedId<MessageKind>;
 
 /// A registered HTTP flow target (issue #112).
 pub type FlowTargetId = ScopedId<FlowTargetKind>;
