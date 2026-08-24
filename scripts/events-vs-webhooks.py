@@ -90,10 +90,23 @@ consumer needs:
 - **Completeness.** A cursor never advances past an event that had not committed when you
   read, so a concurrent writer cannot slip an event in behind your cursor. That is delivered
   by a visibility watermark on every read rather than by locking writers, so it holds for
-  every producer without exception. The one gap is retention rather than concurrency: a
-  cursor that has never advanced past the beginning is not told when older events were
-  pruned, so poll to the end of the feed and keep your cursor rather than holding a beginning
-  cursor across an outage longer than the retention window.
+  every producer without exception.
+
+  There is one standing assumption behind that, and it is worth stating rather than leaving
+  a reader to infer it from the word "never": the watermark compares a row's transaction id
+  against the oldest transaction still running, and those two are read in different widths.
+  On any cluster that has not yet run through 2^32 transactions they agree; past that point
+  the comparison stops discriminating and the guarantee weakens to replay stability alone.
+  No deployment has been near it, and closing it is tracked separately.
+
+  Beyond that, RETENTION is where the exceptions are, and there are two of them, in
+  opposite directions. A cursor that has never advanced past the beginning is never told that
+  older events were pruned, so it can be handed a silently short feed. And a cursor that HAS
+  advanced can be told the feed moved past it when nothing of yours was lost, because the
+  sequence is shared across every scope in the database and a gap in it may be somebody
+  else's rows rather than your pruned ones. So: poll to the end of the feed and keep the
+  cursor you get, rather than holding a beginning cursor across an outage longer than the
+  retention window; and treat a `Gone` as "resync", not as "your events were deleted".
 - **Replay stability.** The same cursor returns the same events in the same order, on every
   read and across restarts. The order is the feed's sequence, and a sequence is never
   reassigned.
@@ -105,10 +118,15 @@ is easy to assume from the word "ordered":
   transaction commits, so two transactions that overlap can land on the feed in the opposite
   order to the order they committed in. Closing that gap costs a per-scope lock held to
   commit, which on the authentication path would serialise sign-in per environment, so it is
-  not applied there. Treat the feed as unordered BETWEEN concurrent writers. Which producers
-  take the lock is recorded in `docs/design/event-ordering-sites.txt` and enforced by
-  `scripts/event-ordering-audit.sh`, so a producer cannot change class without someone
-  deciding.
+  not applied there, and in fact no production producer takes that lock through the
+  commit-ordered appender at all. Treat the feed as unordered BETWEEN concurrent writers.
+
+  WHERE the feed is written is inventoried in `docs/design/event-ordering-sites.txt` and kept
+  current by `scripts/event-ordering-audit.sh`, so a new producer cannot join the feed
+  without showing up in a diff. That inventory deliberately records no per-producer ordering
+  class: deciding one needs to know what a producer's CALLERS hold, and an inventory built by
+  reading source text does not know that. The guarantees above are the ones to rely on, and
+  they are the same for every producer.
 
 If you are reconciling state, completeness and replay stability are what you rely on: read to
 the end of the feed and your copy converges regardless of the order two concurrent writes
@@ -149,8 +167,36 @@ would. If you need a bound on that, the bound is the length of your longest tran
 """
 
 
+# A repo-relative path in backticks, as this document cites its sources.
+CITED_PATH = re.compile(r"`((?:docs|scripts|crates)/[A-Za-z0-9_./-]+)`")
+
+
+def check_citations(rendered: str) -> list[str]:
+    """Every file this document names must exist.
+
+    A published document that points a reader at `scripts/event-ordering-audit.sh` and
+    `docs/design/event-ordering-sites.txt` is making a claim about the repository, and until
+    now nothing tied the two together: either file could be deleted or renamed and every gate
+    stayed green while the doc went on citing it. That is the same shape as a comment
+    describing code that has since moved, except it ships to readers outside the repository.
+    """
+    return sorted(
+        {path for path in CITED_PATH.findall(rendered) if not (ROOT / path).exists()}
+    )
+
+
 def main(argv: list[str]) -> int:
     rendered = render()
+    dangling = check_citations(rendered)
+    if dangling:
+        print(
+            "events-vs-webhooks: this document cites files that do not exist: "
+            + ", ".join(dangling)
+            + ". A published citation to a path nobody kept is worse than no citation, "
+            "because a reader will go looking for it.",
+            file=sys.stderr,
+        )
+        return 1
     if len(argv) == 2 and argv[1] == "--check":
         if not OUT.exists() or OUT.read_text() != rendered:
             print(
