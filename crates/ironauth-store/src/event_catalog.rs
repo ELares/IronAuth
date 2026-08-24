@@ -2348,6 +2348,135 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // Workload identity federation (issue #126). A trust anchor decides WHOSE SIGNATURE
+        // can mint a token in this environment, which makes the six that follow the
+        // highest-value configuration events on the surface: a receiver reconciling "who can authenticate
+        // here" against its own expectations reads them and nothing else.
+        //
+        // The issuer STRING is carried alongside the row id because it, not the id, is what
+        // an assertion presents and what an operator recognises. `enabled` is carried so a
+        // receiver READS the resulting state rather than inferring it from the event name,
+        // which is the same reason the toggle event carries it. Today the registration route
+        // always creates a live anchor, so this is always true; it is a field rather than an
+        // implication so that a later staged registration cannot silently change what an
+        // existing receiver believes.
+        //
+        // The key material is deliberately NOT carried. A pinned `jwks` is a public key set,
+        // but it is unbounded in size and a receiver that wants it can read the anchor back;
+        // putting it on every delivery would make the highest-frequency field the one nobody
+        // reads.
+        "external_issuer.registered",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "issuer_id": {"type": "string", "minLength": 1},
+                "issuer": {"type": "string", "minLength": 1},
+                "enabled": {"type": "boolean"}
+            },
+            "required": ["issuer_id", "issuer", "enabled"]
+        }"#,
+    ),
+    (
+        // The revocation direction, and the one a receiver most needs: a disabled anchor
+        // stops authenticating workloads at that instant. `enabled` carries the RESULTING
+        // state rather than naming a direction, matching `webhook_endpoint.active_changed`,
+        // so a receiver that missed an earlier event still converges on the truth.
+        //
+        // The issuer string is carried as well as the row id, because it is this event's
+        // ordering key and the thing a receiver reconciles trust by. Without it the toggle
+        // would be the one event on this resource whose key could not be recovered from its
+        // own payload, so a receiver that had not seen the registration could not tell which
+        // issuer had just stopped being honoured.
+        "external_issuer.enabled_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "issuer_id": {"type": "string", "minLength": 1},
+                "issuer": {"type": "string", "minLength": 1},
+                "enabled": {"type": "boolean"}
+            },
+            "required": ["issuer_id", "issuer", "enabled"]
+        }"#,
+    ),
+    (
+        // A mapping decides which principal a foreign subject BECOMES, so all three of the
+        // issuer, the external subject and the mapped principal are carried: any two of them
+        // without the third leaves a receiver unable to say who gained the ability to act as
+        // whom. The optional claim gate is not carried, because a receiver reconciling trust
+        // reads the rule back for its conditions; what the event has to deliver is that the
+        // rule now exists and what it grants.
+        "subject_mapping.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "mapping_id": {"type": "string", "minLength": 1},
+                "issuer": {"type": "string", "minLength": 1},
+                "external_subject": {"type": "string", "minLength": 1},
+                "principal": {"type": "string", "minLength": 1}
+            },
+            "required": ["mapping_id", "issuer", "external_subject", "principal"]
+        }"#,
+    ),
+    (
+        // The deletion is a DISTINCT type from the disable, because they mean different
+        // things to a receiver reconciling trust: a disabled anchor still exists and can be
+        // switched back, a deleted one is gone and its issuer string is free to be registered
+        // again with a different key source. Collapsing them would make a repoint (delete then
+        // re-register) indistinguishable from a revocation.
+        "external_issuer.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "issuer_id": {"type": "string", "minLength": 1},
+                "issuer": {"type": "string", "minLength": 1}
+            },
+            "required": ["issuer_id", "issuer"]
+        }"#,
+    ),
+    (
+        // The issuer and external subject are carried for the same reason the creation carries
+        // them: they are the natural key a receiver tracks trust by, and after the row is gone
+        // the id resolves to nothing, so an event carrying only the id could not be reconciled
+        // against anything.
+        "subject_mapping.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "mapping_id": {"type": "string", "minLength": 1},
+                "issuer": {"type": "string", "minLength": 1},
+                "external_subject": {"type": "string", "minLength": 1}
+            },
+            "required": ["mapping_id", "issuer", "external_subject"]
+        }"#,
+    ),
+    (
+        // The mapping's revocation direction, resulting state for the same reason the
+        // anchor's is.
+        "subject_mapping.enabled_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "mapping_id": {"type": "string", "minLength": 1},
+                "issuer": {"type": "string", "minLength": 1},
+                "external_subject": {"type": "string", "minLength": 1},
+                "enabled": {"type": "boolean"}
+            },
+            "required": ["mapping_id", "issuer", "external_subject", "enabled"]
+        }"#,
+    ),
+    (
         // The display name is carried because it is the whole of what a create decided that a
         // receiver cannot derive from the id. Everything else about a new organization is
         // either the id itself or scope, both already on the envelope.

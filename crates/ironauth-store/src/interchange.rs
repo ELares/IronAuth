@@ -892,9 +892,10 @@ impl ImportEnvironment {
 /// principal under RFC 7523. Registering a journey exporter there would silently confer that power
 /// too. Two different trust decisions sharing one registry is how a registry becomes a
 /// vulnerability, so the honest answer is that cross-organization EXPORTER trust has no home yet
-/// and needs an operator-facing one of its own. That table also has no management API at all
-/// (deferred to M13 by its own migration comment), so there is nothing to extend even if the
-/// conflation were acceptable.
+/// and needs an operator-facing one of its own. The external-issuer table gained a management API in
+/// issue #126, so the second half of that argument is gone; the first half is the whole of it
+/// and stands on its own. Exporter trust and assertion-issuer trust are different decisions,
+/// and putting them in one registry would be wrong however reachable that registry is.
 ///
 /// ## Why there is no fetch here
 ///

@@ -59,6 +59,20 @@ pub const ORGANIZATION_CREATED: &str = "organization.created";
 pub const ORGANIZATION_DELETED: &str = "organization.deleted";
 /// The wire type deleting a client emits.
 pub const CLIENT_DELETED: &str = "client.deleted";
+/// The wire type registering an external assertion trust anchor emits (issue #126).
+pub const EXTERNAL_ISSUER_REGISTERED: &str = "external_issuer.registered";
+/// The wire type an anchor's enable toggle emits: the REVOCATION direction matters most.
+pub const EXTERNAL_ISSUER_ENABLED_CHANGED: &str = "external_issuer.enabled_changed";
+/// The wire type authoring a subject mapping emits (issue #126).
+pub const SUBJECT_MAPPING_CREATED: &str = "subject_mapping.created";
+/// The wire type a mapping's enable toggle emits.
+pub const SUBJECT_MAPPING_ENABLED_CHANGED: &str = "subject_mapping.enabled_changed";
+/// The wire type removing a trust anchor emits: DISTINCT from disabling one, because a
+/// repoint is a delete followed by a fresh registration and a receiver must not read it as a
+/// revocation.
+pub const EXTERNAL_ISSUER_DELETED: &str = "external_issuer.deleted";
+/// The wire type removing a subject mapping emits.
+pub const SUBJECT_MAPPING_DELETED: &str = "subject_mapping.deleted";
 
 /// The payload schema version every event in this envelope carries.
 ///

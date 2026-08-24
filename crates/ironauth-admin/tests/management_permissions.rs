@@ -6,8 +6,8 @@
 //!
 //! Delegated administration restricts what a management credential may do. The dangerous
 //! failure is not a wrong permission on a route, it is a route with NO permission: it defaults
-//! to allowed, nothing goes red, and the gap is invisible until somebody audits 198 operations
-//! by hand. That is the same shape as every dormant-layer defect in this tree, and adding
+//! to allowed, nothing goes red, and the gap is invisible until somebody audits the WHOLE
+//! documented surface by hand. That is the same shape as every dormant-layer defect in this tree, and adding
 //! routes is continuous.
 //!
 //! So the classification lands FIRST, as a total function over the operation set, and the
@@ -16,7 +16,7 @@
 //!
 //! # The UNCLASSIFIED list is deliberate, explicit, and meant to shrink
 //!
-//! Classifying 198 operations correctly is not a mechanical exercise: several of them are
+//! Classifying every documented operation correctly is not a mechanical exercise: several are
 //! read-and-write pairs on the same resource, and a few (the migration credential surface) sit
 //! on the boundary between configuration and credential authority. Guessing in bulk would
 //! produce a table that looks complete and is wrong in ways nobody can see.
@@ -411,6 +411,31 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("linkUserExternalId", ManagementPermission::WriteUsers),
     ("unlinkUserExternalId", ManagementPermission::WriteUsers),
     ("getUserTraits", ManagementPermission::Read),
+    // Workload identity federation (issue #126). The two listings are reads; the four writes
+    // are `write_config` rather than a federation-specific permission, because they configure
+    // the environment's trust the same way the client and connector writes beside them do.
+    //
+    // Both halves carry the SAME fence deliberately. An anchor decides whose signature is
+    // honoured and a mapping decides which principal a foreign subject becomes, so a caller
+    // who can author a mapping against an issuer it already controls needs nothing else.
+    ("listExternalIssuers", ManagementPermission::Read),
+    ("registerExternalIssuer", ManagementPermission::WriteConfig),
+    (
+        "setExternalIssuerEnabled",
+        ManagementPermission::WriteConfig,
+    ),
+    ("listSubjectMappings", ManagementPermission::Read),
+    ("createSubjectMapping", ManagementPermission::WriteConfig),
+    (
+        "setSubjectMappingEnabled",
+        ManagementPermission::WriteConfig,
+    ),
+    // The deletes carry the same authority as the creates, and deliberately not a higher one:
+    // deleting a trust anchor REMOVES an authentication path rather than opening one, so it is
+    // strictly less dangerous than registering it, and gating it above write_config would mean
+    // a caller who can add an anchor cannot remove the one they mis-added.
+    ("deleteExternalIssuer", ManagementPermission::WriteConfig),
+    ("deleteSubjectMapping", ManagementPermission::WriteConfig),
 ];
 
 /// Operations not yet classified. This list is DEBT and is meant to shrink to nothing.
@@ -610,6 +635,20 @@ const PERMISSION_PROVEN: &[&str] = &[
     "listFlowTargets",
     "createFlowTarget",
     "deleteFlowTarget",
+    // Proven across `the_external_issuer_surface_splits_reading_from_registering`,
+    // `registering_and_disabling_a_trust_anchor_demand_write_config` and
+    // `the_subject_mapping_surface_splits_reading_from_authoring`, which drive all eight in
+    // both directions: each listing served under read and refused (naming `management.read`)
+    // under a different permission, and each write refused under read alone with the refusal
+    // asserted to name `management.write_config`, then served under it.
+    "listExternalIssuers",
+    "registerExternalIssuer",
+    "setExternalIssuerEnabled",
+    "listSubjectMappings",
+    "createSubjectMapping",
+    "setSubjectMappingEnabled",
+    "deleteExternalIssuer",
+    "deleteSubjectMapping",
     // Proven in `the_flow_target_dead_letter_surface_splits_reading_from_replaying`, which
     // drives both in both directions: the listing served under read and refused under
     // write_config alone, the replay refused under read alone naming
@@ -655,7 +694,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 173 operations declare a required permission and 29 have that permission proven. The other
+/// 181 operations declare a required permission and 37 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -670,9 +709,11 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// without somebody editing this assertion and noticing what they are doing.
 ///
 /// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 171 minus 27 is always 144. (It read "166 minus 22" for two raises before this
-/// one, which is the hazard of writing an arithmetic identity beside the numbers it derives
-/// from rather than deriving it.) That is deliberate rather than an oversight. The
+/// its own: 181 minus 37 is always 144. (It read "166 minus 22", then "171 minus 27", while
+/// the pins above it moved twice without it, which is the hazard of writing an arithmetic
+/// identity beside the numbers it derives from rather than deriving it. Both operands are
+/// pinned by the two `assert_eq!`s in the test below; if you change either, change this
+/// sentence too.) That is deliberate rather than an oversight. The
 /// ratchet's job was to catch a drift nothing else measured, and two exact pins catch it
 /// earlier and name which set moved. What the ratchet still carries is its message, which is
 /// the instruction for the person who just made one of those pins fail.
@@ -686,12 +727,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        173,
+        181,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        29,
+        37,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

@@ -125,6 +125,14 @@ ironauth-jose = { workspace = true, features = ["test-util"] }
 ciborium.workspace = true
 # Database-free unit tests build an Env and a deterministic entropy source.
 ironauth-env = { workspace = true }
+# The workload-federation end-to-end test (issue #126) registers a trust anchor and a
+# subject mapping through the MANAGEMENT router and then authenticates against them at
+# this crate's `/token` endpoint. Registering through the store repository instead would
+# prove the grant works while leaving the operator-facing path that turns it on unmeasured,
+# which is exactly the gap that test exists to close. A dev-dependency only: the published
+# library does not depend on the management plane, and the cycle is one cargo permits
+# precisely because it never reaches the normal dependency graph.
+ironauth-admin = { workspace = true, features = ["testing"] }
 # Base64 for building client_secret_basic Authorization headers in the tests.
 base64.workspace = true
 # SHA-256 lets the session-management test replicate the check_session_iframe's own
@@ -705,6 +713,18 @@ required-features = ["testing"]
 [[test]]
 name = "jwt_bearer"
 path = "tests/jwt_bearer.rs"
+required-features = ["testing"]
+
+# Workload identity federation through the OPERATOR-FACING path (issue #126). The sibling
+# jwt_bearer suite registers every trust anchor by calling the store repository, which no
+# operator can do, so it proves the grant enforces its configuration while saying nothing
+# about whether the feature can be turned on. This one registers the anchor and the subject
+# mapping through the MANAGEMENT router over the same database, then authenticates a
+# workload at /token against them, and proves the disable toggle revokes live
+# authentication.
+[[test]]
+name = "workload_federation"
+path = "tests/workload_federation.rs"
 required-features = ["testing"]
 
 # Dynamic Client Registration and configuration management (issue #30): omitted

@@ -297,6 +297,79 @@ fn flow_target_cases(base: &str) -> Vec<Case> {
     ]
 }
 
+/// The workload-federation trust anchor and subject-mapping writes (issue #126).
+///
+/// The liveness fence runs before the id parse in all four by-id handlers, so at a live
+/// environment these synthetic ids reach the fence first. Be honest about what that buys: with
+/// the fence REMOVED, a `xai_absent` id fails `parse_in_scope` and yields the same
+/// `ApiError::NotFound`, so the four by-id cases here cannot DISCRIMINATE a missing fence. They
+/// are an inventory obligation (every documented environment-scoped write is driven) rather
+/// than a measurement, exactly like the pre-existing `ftg_absent` case above.
+///
+/// Nor are the two POSTs, and an earlier draft of this comment claimed they were. Every
+/// handler in this module opens with `resolve_scope`, which calls `exists_in_any_state` and
+/// answers `ApiError::NotFound` for an environment that was never created. This sweep's
+/// environment is generated and never created, so `resolve_scope` refuses first and
+/// `require_live_environment` is never reached by ANY case here. All six are inventory.
+///
+/// The two LISTINGS are deliberately absent, following this file's rule: they are reads, and
+/// a soft-deleted environment stays readable so it stays auditable. They are driven at the
+/// soft-deleted environment by the live-surface sweep instead, which asserts they keep
+/// answering the LIVE status and carrying their rows.
+fn external_issuer_cases(base: &str) -> Vec<Case> {
+    vec![
+        Case {
+            label: "external_issuers.registerExternalIssuer",
+            method: "POST",
+            path: format!("{base}/external-issuers"),
+            body: Some(
+                serde_json::json!({
+                    "issuer": "https://absent-environment.example/oidc",
+                    "jwks_uri": "https://absent-environment.example/keys",
+                })
+                .to_string(),
+            ),
+        },
+        Case {
+            label: "external_issuers.setExternalIssuerEnabled",
+            method: "PATCH",
+            path: format!("{base}/external-issuers/xai_absent"),
+            body: Some(serde_json::json!({ "enabled": false }).to_string()),
+        },
+        Case {
+            label: "external_issuers.createSubjectMapping",
+            method: "POST",
+            path: format!("{base}/subject-mappings"),
+            body: Some(
+                serde_json::json!({
+                    "issuer": "https://absent-environment.example/oidc",
+                    "external_subject": "absent-environment-probe",
+                    "principal": "sva_absent",
+                })
+                .to_string(),
+            ),
+        },
+        Case {
+            label: "external_issuers.setSubjectMappingEnabled",
+            method: "PATCH",
+            path: format!("{base}/subject-mappings/asm_absent"),
+            body: Some(serde_json::json!({ "enabled": false }).to_string()),
+        },
+        Case {
+            label: "external_issuers.deleteExternalIssuer",
+            method: "DELETE",
+            path: format!("{base}/external-issuers/xai_absent"),
+            body: None,
+        },
+        Case {
+            label: "external_issuers.deleteSubjectMapping",
+            method: "DELETE",
+            path: format!("{base}/subject-mappings/asm_absent"),
+            body: None,
+        },
+    ]
+}
+
 /// The SIEM log stream configuration writes (issue #110).
 fn log_stream_cases(base: &str) -> Vec<Case> {
     vec![
@@ -1318,6 +1391,7 @@ fn all_cases(tenant: &str, environment: &str) -> Vec<Case> {
     let ids = Ids::mint(tenant, environment);
     let mut cases = abuse_and_sudo_cases(&base);
     cases.extend(flow_target_cases(&base));
+    cases.extend(external_issuer_cases(&base));
     cases.extend(log_stream_cases(&base));
     cases.extend(client_cases(&base, &ids));
     cases.extend(secret_cases(&base));

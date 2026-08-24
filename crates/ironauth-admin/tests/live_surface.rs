@@ -327,6 +327,13 @@ struct Fixture {
     /// environment too, and driving it at a soft-deleted one would measure nothing.
     flow_target: String,
     webhook_endpoint: String,
+    /// A live external assertion issuer, so the enable toggle addresses a REAL trust anchor
+    /// (issue #126). A fabricated `xai_absent` does not decode as a scoped id, so the handler
+    /// answers the uniform not-found at a LIVE environment too, and this sweep refuses a write
+    /// case that cannot succeed: it would measure nothing about the soft-deleted fence.
+    external_issuer: String,
+    /// A live subject mapping, for the same reason its issuer is live.
+    subject_mapping: String,
     family: String,
     recovery_flow: String,
     group: String,
@@ -788,6 +795,40 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "create sa api key: {body}");
         let sa_api_key = field(&body, "/id", "seed sa api key");
+
+        // A live trust anchor and a live mapping off it (issue #126). The mapping names the
+        // issuer STRING rather than the row id, which is why the two resources are siblings on
+        // the surface rather than nested. Seeded AFTER the service account, because a mapping
+        // is refused unless its principal names a machine identity that exists.
+        let seed_issuer = "https://token.actions.githubusercontent.com";
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/external-issuers"),
+                "seed-external-issuer",
+                &serde_json::json!({
+                    "issuer": seed_issuer,
+                    "jwks_uri": "https://token.actions.githubusercontent.com/.well-known/jwks",
+                })
+                .to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed external issuer: {body}");
+        let external_issuer = field(&body, "/id", "seed external issuer");
+
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/subject-mappings"),
+                "seed-subject-mapping",
+                &serde_json::json!({
+                    "issuer": seed_issuer,
+                    "external_subject": "repo:acme/live-surface:ref:refs/heads/main",
+                    "principal": &service_account,
+                })
+                .to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed subject mapping: {body}");
+        let subject_mapping = field(&body, "/id", "seed subject mapping");
         let pat_base = format!("{base}/users/{user}/personal-access-tokens");
         let (status, _, body) = h
             .post(
@@ -1150,6 +1191,8 @@ impl Fixture {
             log_stream,
             flow_target,
             webhook_endpoint,
+            external_issuer,
+            subject_mapping,
             family,
             recovery_flow,
             recovery_flow_to_reject,
@@ -1204,6 +1247,8 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         log_stream,
         flow_target,
         webhook_endpoint,
+        external_issuer,
+        subject_mapping,
         family,
         recovery_flow,
         group,
@@ -1330,6 +1375,73 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "flow_targets.deleteFlowTarget",
             "DELETE",
             format!("{base}/flow-targets/{flow_target}"),
+        ),
+
+        // ---- External assertion trust anchors and subject mappings (issue #126) ----
+        //
+        // Both enable toggles run after the reads and the creates, and disable rather than
+        // enable: they address rows the two listings above have already been driven at, and a
+        // disable is the direction an operator reaches for under compromise. The two DELETES
+        // are last of all, because they consume the rows every case here addresses.
+        Case::empty(
+            "external_issuers.listExternalIssuers",
+            "GET",
+            format!("{base}/external-issuers"),
+        ),
+        Case::json(
+            "external_issuers.registerExternalIssuer",
+            "POST",
+            format!("{base}/external-issuers"),
+            // A DIFFERENT issuer than the seeded one: `(tenant, environment, issuer)` is
+            // unique, so re-registering the seeded string would answer a conflict at a LIVE
+            // environment and this sweep would be measuring the constraint, not the fence.
+            &serde_json::json!({
+                "issuer": "https://live-surface.example/oidc",
+                "jwks_uri": "https://live-surface.example/oauth/discovery/keys",
+            }),
+        ),
+        Case::empty(
+            "external_issuers.listSubjectMappings",
+            "GET",
+            format!("{base}/subject-mappings"),
+        ),
+        Case::json(
+            "external_issuers.createSubjectMapping",
+            "POST",
+            format!("{base}/subject-mappings"),
+            // Unique on `(issuer, external_subject)`, so this differs from the seeded rule in
+            // its subject for the same reason the registration above differs in its issuer.
+            &serde_json::json!({
+                "issuer": "https://token.actions.githubusercontent.com",
+                "external_subject": "repo:acme/live-surface:ref:refs/heads/release",
+                "principal": service_account,
+            }),
+        ),
+        Case::json(
+            "external_issuers.setExternalIssuerEnabled",
+            "PATCH",
+            format!("{base}/external-issuers/{external_issuer}"),
+            &serde_json::json!({ "enabled": false }),
+        ),
+        Case::json(
+            "external_issuers.setSubjectMappingEnabled",
+            "PATCH",
+            format!("{base}/subject-mappings/{subject_mapping}"),
+            &serde_json::json!({ "enabled": false }),
+        ),
+        // The two deletes run LAST of this family, because they CONSUME the rows every case
+        // above addresses. They are what makes a mis-registration correctable: both unique
+        // constraints ignore `enabled`, so a parked row keeps its natural key and re-registering
+        // the same issuer would answer 409 forever (issue #126, migration 0153).
+        Case::empty(
+            "external_issuers.deleteSubjectMapping",
+            "DELETE",
+            format!("{base}/subject-mappings/{subject_mapping}"),
+        ),
+        Case::empty(
+            "external_issuers.deleteExternalIssuer",
+            "DELETE",
+            format!("{base}/external-issuers/{external_issuer}"),
         ),
         // ---- SIEM log streams (issue #110) ----
         Case::empty(
@@ -2610,6 +2722,8 @@ fn every_documented_operation_is_driven_by_a_case() {
         log_stream: "lgs_0".to_owned(),
         flow_target: "ftg_0".to_owned(),
         webhook_endpoint: "whe_0".to_owned(),
+        external_issuer: "xai_0".to_owned(),
+        subject_mapping: "asm_0".to_owned(),
         family: "rfm_0".to_owned(),
         recovery_flow: "rcf_0".to_owned(),
         group: "grp_0".to_owned(),
@@ -3624,6 +3738,18 @@ fn documented_body_contents(f: &Fixture) -> BTreeMap<&'static str, Vec<String>> 
         ("users.getUser", vec![f.user.clone()]),
         // The connected app, by client id: the one field the list exists to name.
         ("consents.listUserConsents", vec![f.client.clone()]),
+        // The seeded trust anchor and its mapping, by row id. A decommissioned environment
+        // has to stay auditable through exactly these two: an operator answering "whose
+        // signature could mint a token here" after the fact reads them, and a 200 carrying an
+        // emptied array would answer that question wrongly rather than not at all.
+        (
+            "external_issuers.listExternalIssuers",
+            vec![f.external_issuer.clone()],
+        ),
+        (
+            "external_issuers.listSubjectMappings",
+            vec![f.subject_mapping.clone()],
+        ),
         // The POSITIVE verdict, the subject it carries, and the PII inside the profile.
         (
             "migration.verifyMigrationCredential",

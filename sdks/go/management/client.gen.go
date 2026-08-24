@@ -323,6 +323,13 @@ func (c *Client) CreateServiceAccountApiKey(tenant_id string, environment_id str
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/service-accounts/" + escape(service_account_id) + "/api-keys", query, body)
 }
 
+// CreateSubjectMapping performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings.
+//
+// Author a subject mapping from an external subject to an IronAuth principal.
+func (c *Client) CreateSubjectMapping(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/subject-mappings", query, body)
+}
+
 // CreateTenant performs POST /v1/tenants.
 //
 // Create a tenant and its first environment.
@@ -407,6 +414,13 @@ func (c *Client) DeleteEnvironment(tenant_id string, environment_id string, quer
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id), query, nil)
 }
 
+// DeleteExternalIssuer performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers/{issuer_id}.
+//
+// Remove a registered external issuer.
+func (c *Client) DeleteExternalIssuer(tenant_id string, environment_id string, issuer_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/external-issuers/" + escape(issuer_id), query, nil)
+}
+
 // DeleteFlowTarget performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}.
 //
 // Deregister an HTTP flow target.
@@ -489,6 +503,13 @@ func (c *Client) DeleteSecret(tenant_id string, environment_id string, name stri
 // Delete a per-environment, per-client signup form.
 func (c *Client) DeleteSignupForm(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/signup-form", query, nil)
+}
+
+// DeleteSubjectMapping performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings/{mapping_id}.
+//
+// Remove a subject mapping.
+func (c *Client) DeleteSubjectMapping(tenant_id string, environment_id string, mapping_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/subject-mappings/" + escape(mapping_id), query, nil)
 }
 
 // DeleteTenant performs DELETE /v1/tenants/{tenant_id}.
@@ -939,6 +960,13 @@ func (c *Client) ListEnvironments(tenant_id string, query url.Values) (*http.Res
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments", query, nil)
 }
 
+// ListExternalIssuers performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers.
+//
+// List the external issuers registered in this environment.
+func (c *Client) ListExternalIssuers(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/external-issuers", query, nil)
+}
+
 // ListFlowTargetDeadLetters performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/dead-letters.
 //
 // List a target's dead-lettered async deliveries.
@@ -1170,6 +1198,13 @@ func (c *Client) ListStepUpPolicies(tenant_id string, environment_id string, que
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/step-up-policies", query, nil)
 }
 
+// ListSubjectMappings performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings.
+//
+// List the subject mappings registered in this environment.
+func (c *Client) ListSubjectMappings(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/subject-mappings", query, nil)
+}
+
 // ListTenants performs GET /v1/tenants.
 //
 // List tenants (cursor paginated).
@@ -1294,6 +1329,13 @@ func (c *Client) PurgeTenant(tenant_id string, query url.Values) (*http.Response
 // Read the ordered event feed (issue #107).
 func (c *Client) ReadEventFeed(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/events", query, nil)
+}
+
+// RegisterExternalIssuer performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers.
+//
+// Register an external assertion issuer as a trust anchor.
+func (c *Client) RegisterExternalIssuer(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/external-issuers", query, body)
 }
 
 // RejectRecoveryApproval performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/reject.
@@ -1520,6 +1562,13 @@ func (c *Client) SetClientSigningAlgorithm(tenant_id string, environment_id stri
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/clients/" + escape(client_id) + "/signing-algorithm", query, body)
 }
 
+// SetExternalIssuerEnabled performs PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers/{issuer_id}.
+//
+// Enable or disable a registered external issuer.
+func (c *Client) SetExternalIssuerEnabled(tenant_id string, environment_id string, issuer_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PATCH", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/external-issuers/" + escape(issuer_id), query, body)
+}
+
 // SetLocale performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}.
 //
 // Set (create or overwrite) a per-environment locale bundle.
@@ -1574,6 +1623,13 @@ func (c *Client) SetSmsOtpConfig(tenant_id string, environment_id string, query 
 // Set the step-up policy for one OAuth scope token.
 func (c *Client) SetStepUpPolicy(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/step-up-policies", query, body)
+}
+
+// SetSubjectMappingEnabled performs PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings/{mapping_id}.
+//
+// Enable or disable a subject mapping.
+func (c *Client) SetSubjectMappingEnabled(tenant_id string, environment_id string, mapping_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PATCH", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/subject-mappings/" + escape(mapping_id), query, body)
 }
 
 // SetUserState performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state.

@@ -737,6 +737,83 @@
       "type": "environment_variable.set"
     },
     {
+      "domain": "external_issuer",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "issuer": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "issuer_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer_id",
+          "issuer"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "external_issuer.deleted"
+    },
+    {
+      "domain": "external_issuer",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "issuer": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "issuer_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer_id",
+          "issuer",
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "external_issuer.enabled_changed"
+    },
+    {
+      "domain": "external_issuer",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "issuer": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "issuer_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer_id",
+          "issuer",
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "external_issuer.registered"
+    },
+    {
       "domain": "flow_target",
       "payload_schema": {
         "additionalProperties": false,
@@ -2272,6 +2349,99 @@
       },
       "payload_schema_version": 1,
       "type": "step_up_policy.set"
+    },
+    {
+      "domain": "subject_mapping",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "external_subject": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "issuer": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "mapping_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "principal": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "mapping_id",
+          "issuer",
+          "external_subject",
+          "principal"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "subject_mapping.created"
+    },
+    {
+      "domain": "subject_mapping",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "external_subject": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "issuer": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "mapping_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "mapping_id",
+          "issuer",
+          "external_subject"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "subject_mapping.deleted"
+    },
+    {
+      "domain": "subject_mapping",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "external_subject": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "issuer": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "mapping_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "mapping_id",
+          "issuer",
+          "external_subject",
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "subject_mapping.enabled_changed"
     },
     {
       "domain": "sudo",

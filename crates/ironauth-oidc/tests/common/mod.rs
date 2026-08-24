@@ -1721,7 +1721,7 @@ impl Harness {
     }
 
     /// A throwaway acting context for direct store seeding.
-    fn seeding_actor(&self) -> (ironauth_store::ActorRef, CorrelationId) {
+    pub fn seeding_actor(&self) -> (ironauth_store::ActorRef, CorrelationId) {
         (
             self.db.test_actor(&self.env),
             CorrelationId::generate(&self.env),

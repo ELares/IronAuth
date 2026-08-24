@@ -1,0 +1,72 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The control plane's grants on the workload-federation tables (issue #126).
+--
+-- Migration 0020 granted `external_assertion_issuers` and
+-- `external_assertion_subject_mappings` to `ironauth_app` and to nobody else, which was right
+-- at the time: the JWT bearer grant reads them on the data plane, and there was no management
+-- surface to write them from.
+--
+-- That is also the reason there could not BE one. The management API connects as
+-- `ironauth_control`, so a route registering a trust anchor would have failed on a permission
+-- error rather than a missing handler, and issue #126's first two criteria stayed unreachable:
+-- every registration in the tree came from a test harness holding the owner connection.
+--
+-- # Why UPDATE is narrowed to `enabled`
+--
+-- Revoking trust in a compromised issuer is the operation an operator needs fastest, so
+-- disabling has to be reachable from the management API. The column list is deliberately
+-- narrow: an operator may park an anchor, and may not silently repoint one at a different
+-- JWKS, because a rewritten `jwks_uri` on an existing row changes who can mint tokens while
+-- every listing still shows the issuer an operator expects.
+--
+-- The same argument gives the mappings table the same shape: a mapping's `principal` decides
+-- WHICH identity a foreign subject becomes, so editing one in place would silently redirect a
+-- federation under an unchanged name.
+--
+-- # Why DELETE, when disable already exists
+--
+-- Because they answer different questions, and the first draft of this migration shipped only
+-- one of them while its own prose prescribed the other. Disable is REVOCATION: the row stays,
+-- the listing still shows what was once trusted, and the switch flips back. Delete is
+-- CORRECTION: it frees the unique key.
+--
+-- Without DELETE a registration is write-once, and not merely awkward to fix. Both tables
+-- carry a UNIQUE constraint on their natural key with no `enabled` predicate
+-- (`(tenant, environment, issuer)` and `(tenant, environment, issuer, external_subject)`), so
+-- a disabled row keeps occupying it and re-registering the same issuer answers 409 forever.
+-- The configuration columns are immutable to both planes by the narrowing above, and the `iss`
+-- string is dictated by the external platform, so there is no second key to register under.
+--
+-- The case that forces it is routine rather than exceptional: an issuer ROTATES the keys
+-- behind a pinned inline `jwks`. Every workload behind that anchor stops authenticating, and
+-- with disable alone the anchor could never be repointed and the federation would be
+-- permanently dead. Correcting a mis-typed `jwks_uri` or a mapping authored against the wrong
+-- principal has the same shape.
+--
+-- Deleting loses nothing an incident responder needs. `audit_log` holds no foreign key to
+-- either table, so the registration, every enable toggle, and the deletion itself all survive
+-- in the place built to keep them; the live row was never the record of what was once trusted.
+--
+-- DELETE goes to the CONTROL plane only. 0020's "a registration is disabled, not deleted" is
+-- scoped in its own words to the data plane, and that stays true: the grant below does not
+-- touch `ironauth_app`, so the request path can still only park a compromised anchor, never
+-- erase one.
+--
+-- # Safety
+--
+-- Additive GRANTs only. This migration creates no object, adds no column, and changes no data,
+-- so it cannot fail on existing rows, needs no backfill, and is safe under N/N+1 rollout.
+--
+-- No new row-level-security policy is needed and none is added: 0020's tenant-isolation
+-- policies on both tables carry no `TO` clause, so they bind PUBLIC and confine
+-- `ironauth_control` exactly as they already confine `ironauth_app`. A DELETE is filtered by
+-- the policy's USING clause like any other statement, so a cross-scope delete removes nothing.
+-- No new table, so there is no entry to add to scripts/query-audit.sh or the scoped-table
+-- registration list.
+
+GRANT SELECT, INSERT, DELETE ON external_assertion_issuers TO ironauth_control;
+GRANT UPDATE (enabled) ON external_assertion_issuers TO ironauth_control;
+
+GRANT SELECT, INSERT, DELETE ON external_assertion_subject_mappings TO ironauth_control;
+GRANT UPDATE (enabled) ON external_assertion_subject_mappings TO ironauth_control;

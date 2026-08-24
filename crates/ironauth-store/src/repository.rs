@@ -13247,6 +13247,101 @@ impl ExternalAssertionIssuerRepo<'_> {
             }
         }
     }
+
+    /// One registered external assertion issuer by its `xai_` identifier.
+    ///
+    /// `by_issuer` answers the GRANT's question ("is this `iss` a trust anchor here"), keyed
+    /// on the issuer STRING. A management route addressing a row by id needs the other
+    /// direction, and the delete needs it specifically: the removal event carries the issuer
+    /// string, and once the row is gone there is nothing left to read it from.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure or an undecodable stored row.
+    pub async fn by_issuer_id(
+        &self,
+        id: &ExternalIssuerId,
+    ) -> Result<Option<ExternalAssertionIssuerRecord>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, issuer, jwks, jwks_uri, signing_alg_allow, audience_allow, enabled \
+             FROM external_assertion_issuers \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let id_text: String = row.get("id");
+                Ok(Some(ExternalAssertionIssuerRecord {
+                    id: ExternalIssuerId::parse_in_scope(&id_text, &self.scope)?,
+                    issuer: row.get("issuer"),
+                    jwks: row.get("jwks"),
+                    jwks_uri: row.get("jwks_uri"),
+                    signing_alg_allow: row.get("signing_alg_allow"),
+                    audience_allow: row.get("audience_allow"),
+                    enabled: row.get("enabled"),
+                }))
+            }
+        }
+    }
+
+    /// Every external assertion issuer registered in this scope, oldest first.
+    ///
+    /// The management surface's read (issue #126). `by_issuer` answers the GRANT's question,
+    /// "is this `iss` a trust anchor here", and an operator's question is the other one: what
+    /// have I registered. Without this an operator can only discover a registration by naming
+    /// the issuer they are looking for, which is not a listing.
+    ///
+    /// Ordered by `created_at` then `id`, matching every sibling listing in this file. NOT by
+    /// `id` alone: a scoped identifier's unique component is 16 RANDOM bytes from the entropy
+    /// seam, and the tenant and environment prefixes are constant within a scope, so ordering
+    /// by `id` would sort on randomness. That is stable and it is not chronological, which is
+    /// the question an incident responder asks of this listing. `created_at` is immutable to
+    /// both planes here, so the earlier worry about ordering on a column an update can move
+    /// does not apply.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored row fails to decode
+    /// (an out-of-scope identifier).
+    pub async fn list(&self) -> Result<Vec<ExternalAssertionIssuerRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, issuer, jwks, jwks_uri, signing_alg_allow, audience_allow, enabled \
+             FROM external_assertion_issuers \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id_text: String = row.get("id");
+            out.push(ExternalAssertionIssuerRecord {
+                id: ExternalIssuerId::parse_in_scope(&id_text, &self.scope)?,
+                issuer: row.get("issuer"),
+                jwks: row.get("jwks"),
+                jwks_uri: row.get("jwks_uri"),
+                signing_alg_allow: row.get("signing_alg_allow"),
+                audience_allow: row.get("audience_allow"),
+                enabled: row.get("enabled"),
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// The mutating external assertion issuer repository (issue #26). Reachable only
@@ -13273,6 +13368,29 @@ impl ActingExternalAssertionIssuerRepo<'_> {
         env: &Env,
         issuer: NewExternalAssertionIssuer<'_>,
     ) -> Result<(), StoreError> {
+        self.register_with_event(env, issuer, None, None).await
+    }
+
+    /// As [`Self::register`], carrying an idempotency record and announcing
+    /// `external_issuer.registered` in the SAME transaction as the row.
+    ///
+    /// Registering a trust anchor decides whose signature can mint a token in this
+    /// environment, so a receiver watching the event stream for changes to who is trusted
+    /// has to see it. Emitted transactionally for the reason every producer here is: an
+    /// event sent after the commit is lost when the process dies between the two, and one
+    /// sent before announces a registration that may roll back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::register`], plus [`StoreError::IdempotencyConflict`] if the key was used
+    /// with a different request.
+    pub async fn register_with_event(
+        &self,
+        env: &Env,
+        issuer: NewExternalAssertionIssuer<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if issuer.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -13287,6 +13405,10 @@ impl ActingExternalAssertionIssuerRepo<'_> {
                 target: issuer.id,
             },
             async move |tx| {
+                // INSIDE the audited transaction, so the replay record, the issuer row and
+                // the audit row commit together or not at all. Storing the response after the
+                // fact would leave a window where a retry re-registers.
+                insert_idempotency(tx, idempotency).await?;
                 let result = sqlx::query(
                     "INSERT INTO external_assertion_issuers \
                      (id, tenant_id, environment_id, issuer, jwks, jwks_uri, \
@@ -13305,16 +13427,18 @@ impl ActingExternalAssertionIssuerRepo<'_> {
                 .execute(&mut **tx)
                 .await;
                 match result {
-                    Ok(_) => Ok(()),
+                    Ok(_) => {}
                     // A duplicate issuer OR a CHECK violation (not exactly one key
                     // source) is a caller-facing conflict, not a persistence fault:
                     // erroring here rolls the audited write back, so a rejected
                     // registration leaves neither an issuer row nor an audit row.
                     Err(error) if is_unique_violation(&error) || is_check_violation(&error) => {
-                        Err(StoreError::Conflict)
+                        return Err(StoreError::Conflict);
                     }
-                    Err(error) => Err(error.into()),
+                    Err(error) => return Err(error.into()),
                 }
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )
@@ -13340,6 +13464,26 @@ impl ActingExternalAssertionIssuerRepo<'_> {
         env: &Env,
         id: &ExternalIssuerId,
         enabled: bool,
+    ) -> Result<(), StoreError> {
+        self.set_enabled_with_event(env, id, enabled, None).await
+    }
+
+    /// As [`Self::set_enabled`], announcing `external_issuer.enabled_changed` in the SAME transaction
+    /// as the row it flips.
+    ///
+    /// This is the revocation direction, so it is the event a receiver most needs: a
+    /// consumer tracking what this environment trusts learns that an anchor stopped being
+    /// honoured at the instant it stopped, rather than by noticing workloads fail.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_enabled`].
+    pub async fn set_enabled_with_event(
+        &self,
+        env: &Env,
+        id: &ExternalIssuerId,
+        enabled: bool,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -13368,6 +13512,79 @@ impl ActingExternalAssertionIssuerRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Remove a registered external assertion issuer, auditing
+    /// `external_assertion_issuer.delete` in the same transaction.
+    ///
+    /// Distinct from disabling one, and both are needed. Disable is REVOCATION: it keeps the
+    /// row, so the listing still shows what was once trusted and the switch can be flipped
+    /// back. Delete is CORRECTION: it frees the unique key.
+    ///
+    /// Without it a registration is write-once. The configuration columns are immutable to
+    /// both planes by design (the column-scoped grant permits only `enabled`), and the unique
+    /// index carries no `enabled` predicate, so a disabled row keeps occupying its key.
+    ///
+    /// The audit row outlives the deletion: `audit_log` holds no foreign key to this table, so
+    /// the record of what was once trusted survives in the place built to keep it.
+    ///
+    /// The acute case is not a typo. An issuer that ROTATES the keys behind a pinned inline
+    /// `jwks` is a routine lifecycle event, and without a delete its anchor could never be
+    /// repointed: the `iss` string is dictated by the external platform, so there is no second
+    /// key to register under, and every workload behind it would stay unable to authenticate.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or names no issuer
+    /// visible here; [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &ExternalIssuerId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// As [`Self::delete`], announcing `external_issuer.deleted` in the SAME transaction.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &ExternalIssuerId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ExternalAssertionIssuerDelete,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "DELETE FROM external_assertion_issuers \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -13396,6 +13613,15 @@ pub struct AssertionSubjectMappingRecord {
     pub match_value: Option<String>,
     /// The IronAuth principal the mapped token is issued under (the token's `sub`).
     pub principal: String,
+    /// Whether this mapping is live.
+    ///
+    /// Always `true` from [`AssertionSubjectMappingRepo::resolve`], whose query filters on it:
+    /// the grant asks "which mapping applies", and a disabled one does not. The field exists
+    /// for [`AssertionSubjectMappingRepo::list`], the OPERATOR's read, where a disabled mapping
+    /// must be visible and distinguishable rather than absent (issue #126). An operator who
+    /// cannot see what they disabled cannot re-enable it, and cannot tell a disabled mapping
+    /// from one that was never created.
+    pub enabled: bool,
 }
 
 /// A subject-mapping rule to author (issue #26). The `id` is minted under the
@@ -13470,9 +13696,110 @@ impl AssertionSubjectMappingRepo<'_> {
                     match_claim: row.get("match_claim"),
                     match_value: row.get("match_value"),
                     principal: row.get("principal"),
+                    // Not read from the row. The query's own `enabled = true` predicate is what
+                    // selected it, so reading the column would re-ask a question the existence
+                    // of the row already answers.
+                    enabled: true,
                 }))
             }
         }
+    }
+
+    /// One subject-mapping rule by its `asm_` identifier.
+    ///
+    /// `resolve` answers the GRANT's question and filters on `enabled`; this answers a
+    /// management route's, and does not, because an operator addressing a row by id means that
+    /// row whatever its switch says. The delete needs it: the removal event carries the
+    /// natural key, which cannot be recovered once the row is gone.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure or an undecodable stored row.
+    pub async fn by_id(
+        &self,
+        id: &AssertionMappingId,
+    ) -> Result<Option<AssertionSubjectMappingRecord>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, issuer, external_subject, match_claim, match_value, principal, enabled \
+             FROM external_assertion_subject_mappings \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let id_text: String = row.get("id");
+                Ok(Some(AssertionSubjectMappingRecord {
+                    id: AssertionMappingId::parse_in_scope(&id_text, &self.scope)?,
+                    issuer: row.get("issuer"),
+                    external_subject: row.get("external_subject"),
+                    match_claim: row.get("match_claim"),
+                    match_value: row.get("match_value"),
+                    principal: row.get("principal"),
+                    enabled: row.get("enabled"),
+                }))
+            }
+        }
+    }
+
+    /// Every subject mapping registered in this scope, oldest first.
+    ///
+    /// The management surface's read (issue #126), and DELIBERATELY not filtered by `enabled`,
+    /// which is the one way it differs from [`Self::resolve`]. The grant asks which mapping
+    /// APPLIES and a disabled one does not; an operator asks what EXISTS, and a disabled
+    /// mapping they cannot see is one they cannot re-enable and cannot tell apart from one
+    /// that was never created.
+    ///
+    /// Ordered by `created_at` then `id`, matching every sibling listing in this file. NOT by
+    /// `id` alone: a scoped identifier's unique component is 16 RANDOM bytes from the entropy
+    /// seam, and the tenant and environment prefixes are constant within a scope, so ordering
+    /// by `id` would sort on randomness. That is stable and it is not chronological, which is
+    /// the question an incident responder asks of this listing. `created_at` is immutable to
+    /// both planes here, so the earlier worry about ordering on a column an update can move
+    /// does not apply.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored row fails to decode
+    /// (an out-of-scope identifier).
+    pub async fn list(&self) -> Result<Vec<AssertionSubjectMappingRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, issuer, external_subject, match_claim, match_value, principal, \
+                    enabled \
+             FROM external_assertion_subject_mappings \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id_text: String = row.get("id");
+            out.push(AssertionSubjectMappingRecord {
+                id: AssertionMappingId::parse_in_scope(&id_text, &self.scope)?,
+                issuer: row.get("issuer"),
+                external_subject: row.get("external_subject"),
+                match_claim: row.get("match_claim"),
+                match_value: row.get("match_value"),
+                principal: row.get("principal"),
+                enabled: row.get("enabled"),
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -13500,6 +13827,26 @@ impl ActingAssertionSubjectMappingRepo<'_> {
         env: &Env,
         mapping: NewAssertionSubjectMapping<'_>,
     ) -> Result<(), StoreError> {
+        self.create_with_event(env, mapping, None, None).await
+    }
+
+    /// As [`Self::create`], carrying an idempotency record and announcing
+    /// `subject_mapping.created` in the SAME transaction as the row.
+    ///
+    /// A mapping decides which principal a foreign subject becomes, so it changes who can
+    /// act as whom just as directly as the anchor decides who is trusted at all.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`], plus [`StoreError::IdempotencyConflict`] if the key was used
+    /// with a different request.
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        mapping: NewAssertionSubjectMapping<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if mapping.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -13514,6 +13861,8 @@ impl ActingAssertionSubjectMappingRepo<'_> {
                 target: mapping.id,
             },
             async move |tx| {
+                // INSIDE the audited transaction, for the reason `register` gives above.
+                insert_idempotency(tx, idempotency).await?;
                 let result = sqlx::query(
                     "INSERT INTO external_assertion_subject_mappings \
                      (id, tenant_id, environment_id, issuer, external_subject, \
@@ -13531,12 +13880,14 @@ impl ActingAssertionSubjectMappingRepo<'_> {
                 .execute(&mut **tx)
                 .await;
                 match result {
-                    Ok(_) => Ok(()),
+                    Ok(_) => {}
                     Err(error) if is_unique_violation(&error) || is_check_violation(&error) => {
-                        Err(StoreError::Conflict)
+                        return Err(StoreError::Conflict);
                     }
-                    Err(error) => Err(error.into()),
+                    Err(error) => return Err(error.into()),
                 }
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )
@@ -13562,6 +13913,26 @@ impl ActingAssertionSubjectMappingRepo<'_> {
         env: &Env,
         id: &AssertionMappingId,
         enabled: bool,
+    ) -> Result<(), StoreError> {
+        self.set_enabled_with_event(env, id, enabled, None).await
+    }
+
+    /// As [`Self::set_enabled`], announcing `subject_mapping.enabled_changed` in the SAME transaction
+    /// as the row it flips.
+    ///
+    /// This is the revocation direction, so it is the event a receiver most needs: a
+    /// consumer tracking what this environment trusts learns that a mapping stopped being
+    /// honoured at the instant it stopped, rather than by noticing workloads fail.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_enabled`].
+    pub async fn set_enabled_with_event(
+        &self,
+        env: &Env,
+        id: &AssertionMappingId,
+        enabled: bool,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -13590,6 +13961,78 @@ impl ActingAssertionSubjectMappingRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Remove a subject-mapping rule, auditing
+    /// `external_assertion_subject_mapping.delete` in the same transaction.
+    ///
+    /// Distinct from disabling one, and both are needed. Disable is REVOCATION: it keeps the
+    /// row, so the listing still shows what was once trusted and the switch can be flipped
+    /// back. Delete is CORRECTION: it frees the unique key.
+    ///
+    /// Without it a registration is write-once. The configuration columns are immutable to
+    /// both planes by design (the column-scoped grant permits only `enabled`), and the unique
+    /// index carries no `enabled` predicate, so a disabled row keeps occupying its key.
+    ///
+    /// The audit row outlives the deletion: `audit_log` holds no foreign key to this table, so
+    /// the record of what was once trusted survives in the place built to keep it.
+    ///
+    /// For a mapping the freed key is `(tenant, environment, issuer, external_subject)`, which
+    /// is what lets a rule authored against the wrong principal be REPLACED rather than only
+    /// parked. Parking it alone would leave that external subject permanently unmappable.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or names no mapping
+    /// visible here; [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &AssertionMappingId) -> Result<(), StoreError> {
+        self.delete_with_event(env, id, None).await
+    }
+
+    /// As [`Self::delete`], announcing `subject_mapping.deleted` in the SAME transaction.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        id: &AssertionMappingId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ExternalAssertionSubjectMappingDelete,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "DELETE FROM external_assertion_subject_mappings \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

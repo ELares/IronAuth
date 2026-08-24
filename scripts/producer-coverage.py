@@ -96,10 +96,13 @@ ROUTE = re.compile(r"\b(post|put|patch|delete)\(\s*([a-z0-9_]+)::([a-z0-9_]+)\s*
 # statement: that handler both mutates and announces.
 #
 # Deliberately not tightened to `event_catalog::envelope`, and NOT because every call site
-# is that qualified form: 76 are, and four are `crate::events::envelope(` (`users.rs` three
-# times, `organizations.rs` once). An earlier version of this comment asserted the stronger
+# is that qualified form: 80 are, and four are `crate::events::envelope(` (`users.rs` three
+# times, `organizations.rs` once). The "76" here was stale for several changes before anyone
+# counted; both numbers are hand written beside a thing that moves, so re-measure them rather
+# than trusting them. An earlier version of this comment asserted the stronger
 # thing, which was false and would have made the tightening look free. Measured, tightening
-# still passes 127/127, because those four producers are detected through the `*_event(`
+# still passes (137/137 at the time of writing), because those four producers are detected
+# through the `*_event(`
 # shape instead. The reason to keep the loose pattern is the tradeoff below: the looser
 # pattern's only risk is a false PASS on some future unrelated `envelope(`. That is the
 # wrong direction to guard against

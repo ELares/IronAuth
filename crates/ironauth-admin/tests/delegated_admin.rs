@@ -32,6 +32,38 @@ async fn mint_key(h: &Harness, tenant: &str, environment: &str, idem: &str) -> (
     )
 }
 
+/// Mint a registered machine identity, which a subject mapping's principal must name.
+///
+/// A service account has no create route of its own: it is minted for a CLIENT, the way the
+/// client-credentials grant does at first issuance, so this reaches the store exactly as
+/// production does.
+async fn seed_machine_identity(h: &Harness, tenant: &str, environment: &str) -> String {
+    let env = ironauth_env::Env::system();
+    let scope = ironauth_store::Scope::new(
+        ironauth_store::TenantId::parse(tenant).expect("tenant id"),
+        ironauth_store::EnvironmentId::parse(environment).expect("environment id"),
+    );
+    let actor = ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env));
+    let client = h
+        .db()
+        .store()
+        .scoped(scope)
+        .acting(actor, ironauth_store::CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "a federated workload")
+        .await
+        .expect("create the client");
+    h.db()
+        .store()
+        .scoped(scope)
+        .acting(actor, ironauth_store::CorrelationId::generate(&env))
+        .service_accounts()
+        .ensure(&env, &client)
+        .await
+        .expect("mint the machine identity")
+        .to_string()
+}
+
 /// Confine `key_id` to one organization.
 async fn confine(h: &Harness, tenant: &str, environment: &str, key_id: &str, org: &str) {
     sqlx::query(
@@ -2642,5 +2674,434 @@ async fn the_flow_target_dead_letter_surface_splits_reading_from_replaying() {
     assert!(
         body.contains("management.write_config"),
         "the refusal must name the permission it wanted: {body}"
+    );
+}
+
+/// The trust-anchor surface splits reading from registering (issue #126).
+///
+/// Registering an external issuer decides WHOSE SIGNATURE can mint a token in this
+/// environment, which is the most consequential write on the management API: a caller who can
+/// add an anchor they control can mint tokens as any principal a mapping names. A read-only
+/// credential must not be able to do it, and the refusal must name what it wanted, because
+/// substituting one write permission for another would otherwise pass unnoticed.
+///
+/// The listing is read at a SEEDED anchor rather than an empty environment. An empty
+/// environment cannot tell a working listing apart from a handler that answers a constant
+/// empty array, so the read half asserts the seeded issuer comes back through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_external_issuer_surface_splits_reading_from_registering() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "exi-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "exi-mint").await;
+    let issuers = format!("/v1/tenants/{tenant}/environments/{environment}/external-issuers");
+
+    // Seeded through the BOOTSTRAP operator credential, so what the delegated key can read is
+    // measured against a row whose existence does not depend on the grant under test.
+    let seeded_issuer = "https://token.actions.githubusercontent.com";
+    let (status, _, body) = h
+        .post(
+            &issuers,
+            "exi-seed",
+            &serde_json::json!({
+                "issuer": seeded_issuer,
+                "jwks_uri": "https://token.actions.githubusercontent.com/.well-known/jwks",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed a trust anchor: {body}");
+    let seeded_id = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("the registration mints an id")
+        .to_owned();
+
+    // Read-granted: served, and the seeded anchor is IN the answer.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&issuers, &secret).await;
+    assert_eq!(status, StatusCode::OK, "issuers under read: {body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    let listed = document["issuers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the listing answers with an issuers array: {body}"));
+    assert!(
+        listed.iter().any(|entry| {
+            entry["id"] == serde_json::json!(seeded_id)
+                && entry["issuer"] == serde_json::json!(seeded_issuer)
+        }),
+        "the listing carries the seeded anchor, so it reads the table rather than answering a \
+         constant: {body}"
+    );
+
+    // A credential holding a WRITE but not read is refused, and the refusal names what it
+    // wanted.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&issuers, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "issuers answered a credential without management.read: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the refusal names the permission it wanted: {body}"
+    );
+
+    // And with no credential at all.
+    let (status, _, body) = h.get_as(&issuers, "").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "issuers answered an unauthenticated caller: {body}"
+    );
+}
+
+/// Registering a trust anchor demands `write_config`, and so does disabling one.
+///
+/// BOTH directions are checked. A surface that gates adding an anchor but not removing one
+/// would let a read-scoped credential revoke a federation an operator depends on, which is a
+/// denial of service against every workload authenticating through it.
+///
+/// Each refusal is paired with the SAME request under `write_config`, which is what makes the
+/// 403 attributable to the permission. A 403 on its own is also what a route answers when it
+/// is misrouted, fenced, or addressing a row that does not exist, so an unpaired refusal
+/// would keep passing if the surface stopped working entirely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn registering_and_disabling_a_trust_anchor_demand_write_config() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "exi-write-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "exi-write-mint").await;
+    let issuers = format!("/v1/tenants/{tenant}/environments/{environment}/external-issuers");
+
+    // A LIVE anchor to aim the disable at, seeded through the bootstrap credential. Addressed
+    // at a fabricated id the PATCH would answer the uniform not-found for a reason that has
+    // nothing to do with the grant, and the ordering of the permission check against the path
+    // parse would decide what the test measured.
+    let (status, _, body) = h
+        .post(
+            &issuers,
+            "exi-write-seed",
+            &serde_json::json!({
+                "issuer": "https://token.actions.githubusercontent.com",
+                "jwks_uri": "https://token.actions.githubusercontent.com/.well-known/jwks",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed a trust anchor: {body}");
+    let anchor_id = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("the registration mints an id")
+        .to_owned();
+    assert!(
+        anchor_id.starts_with("xai_"),
+        "a registered anchor is addressed by its scoped `xai_` identifier: {anchor_id}"
+    );
+    let anchor = format!("{issuers}/{anchor_id}");
+
+    // A SECOND issuer string for the register attempt: the seeded one is taken, and a unique
+    // violation would answer 409 for a read-only credential too.
+    let register_body = serde_json::json!({
+        "issuer": "https://gitlab.example/oidc",
+        "jwks_uri": "https://gitlab.example/oauth/discovery/keys",
+    })
+    .to_string();
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h
+        .post_as(&issuers, &secret, "exi-denied", &register_body)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential registered a trust anchor: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal names the permission it wanted: {body}"
+    );
+
+    // The same credential must not be able to DISABLE one either.
+    let (status, _, body) = h
+        .patch_as(
+            &anchor,
+            &secret,
+            &serde_json::json!({"enabled": false}).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential disabled a trust anchor: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the disable refusal names the permission it wanted: {body}"
+    );
+
+    // Both requests, unchanged, under `write_config`. Without this half the two refusals above
+    // are satisfied by a surface that refuses everyone.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h
+        .post_as(&issuers, &secret, "exi-allowed", &register_body)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "write_config registered a trust anchor: {body}"
+    );
+    let (status, _, body) = h
+        .patch_as(
+            &anchor,
+            &secret,
+            &serde_json::json!({"enabled": false}).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "write_config disabled a trust anchor: {body}"
+    );
+
+    // The DELETE carries the same fence, in both directions. It is the correction path (a
+    // parked row keeps its unique key, so an anchor whose issuer rotated can only be repointed
+    // by removing it), which makes it as consequential as the registration: a read-scoped
+    // credential able to delete could tear down a federation an operator depends on.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.delete_as(&anchor, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential deleted a trust anchor: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the delete refusal names the permission it wanted: {body}"
+    );
+    // And the allowed direction, so the refusal above is attributable to the permission
+    // rather than to a route that refuses everyone. Aimed at the SECOND anchor this test
+    // registered (`https://gitlab.example/oidc`), because the assertion below re-reads the
+    // first one to prove the disable landed.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&issuers, &secret).await;
+    assert_eq!(status, StatusCode::OK, "list the anchors: {body}");
+    let second = serde_json::from_str::<Value>(&body).expect("json")["issuers"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry["issuer"] == serde_json::json!("https://gitlab.example/oidc"))
+        .expect("the second anchor this test registered")["id"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+    let (status, _, body) = h.delete_as(&format!("{issuers}/{second}"), &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "write_config deleted a trust anchor: {body}"
+    );
+
+    // And the disable LANDED, rather than answering 204 over an untouched row.
+    let (status, _, body) = h.get_as(&issuers, &secret).await;
+    assert_eq!(status, StatusCode::OK, "read the anchors back: {body}");
+    let document: Value = serde_json::from_str(&body).expect("json");
+    let disabled = document["issuers"]
+        .as_array()
+        .expect("an issuers array")
+        .iter()
+        .find(|entry| entry["id"] == serde_json::json!(anchor_id))
+        .unwrap_or_else(|| panic!("the disabled anchor is still listed: {body}"));
+    assert_eq!(
+        disabled["enabled"],
+        serde_json::json!(false),
+        "the anchor reads back disabled, so the PATCH wrote the row: {body}"
+    );
+}
+
+/// The subject-mapping surface splits reading from authoring, in both directions.
+///
+/// A mapping decides which principal a foreign subject BECOMES, so a caller who can author
+/// one can mint tokens as any machine identity it names. That is the same authority the
+/// anchor carries, and the reason this surface is fenced identically rather than treated as
+/// the anchor's lesser half: an attacker who can add a mapping to an issuer they already
+/// control needs nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn the_subject_mapping_surface_splits_reading_from_authoring() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "asm-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "asm-mint").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let issuers = format!("{base}/external-issuers");
+    let mappings = format!("{base}/subject-mappings");
+
+    // A registered anchor and a real machine identity, both through the bootstrap operator,
+    // so a refusal below is the delegated grant rather than a mapping that could not resolve
+    // its ends whoever asked.
+    let seeded_issuer = "https://token.actions.githubusercontent.com";
+    let (status, _, body) = h
+        .post(
+            &issuers,
+            "asm-seed-anchor",
+            &serde_json::json!({
+                "issuer": seeded_issuer,
+                "jwks_uri": "https://token.actions.githubusercontent.com/.well-known/jwks",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed a trust anchor: {body}");
+    let identity = seed_machine_identity(&h, &tenant, &environment).await;
+
+    let authored = serde_json::json!({
+        "issuer": seeded_issuer,
+        "external_subject": "repo:acme/widgets:ref:refs/heads/main",
+        "principal": identity,
+    })
+    .to_string();
+
+    // Read-granted: the listing is served.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&mappings, &secret).await;
+    assert_eq!(status, StatusCode::OK, "mappings under read: {body}");
+
+    // But READ ALONE cannot author one, and the refusal names what it wanted.
+    let (status, _, body) = h.post_as(&mappings, &secret, "asm-denied", &authored).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential authored a subject mapping: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal names the permission it wanted: {body}"
+    );
+
+    // A credential holding a WRITE but not read cannot read the listing.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&mappings, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "mappings answered a credential without management.read: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the refusal names the permission it wanted: {body}"
+    );
+
+    // Under write_config both the author and the disable are served, which is what makes the
+    // two refusals above attributable to the permission rather than to a broken route.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h
+        .post_as(&mappings, &secret, "asm-allowed", &authored)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "write_config authored a subject mapping: {body}"
+    );
+    let mapping_id = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("the authoring mints an id")
+        .to_owned();
+
+    // The disable, refused under read alone and served under write_config.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let disable = serde_json::json!({ "enabled": false }).to_string();
+    let (status, _, body) = h
+        .patch_as(&format!("{mappings}/{mapping_id}"), &secret, &disable)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential disabled a subject mapping: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the disable refusal names the permission it wanted: {body}"
+    );
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h
+        .patch_as(&format!("{mappings}/{mapping_id}"), &secret, &disable)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "write_config disabled a subject mapping: {body}"
+    );
+
+    // The DELETE, both directions. Removing a mapping frees its natural key, which is what
+    // lets a rule authored against the wrong principal be replaced rather than only parked.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h
+        .delete_as(&format!("{mappings}/{mapping_id}"), &secret)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential deleted a subject mapping: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the delete refusal names the permission it wanted: {body}"
+    );
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h
+        .delete_as(&format!("{mappings}/{mapping_id}"), &secret)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "write_config deleted a subject mapping: {body}"
     );
 }
