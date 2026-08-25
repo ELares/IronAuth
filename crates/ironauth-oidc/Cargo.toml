@@ -167,6 +167,15 @@ tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
 # histogram appear in the rendered exposition text.
 metrics-exporter-prometheus = { workspace = true }
 
+# Metering stays OFF the issuance path (issue #107 acceptance criterion 5): a token
+# exchange under a tracing capture executes no query that READS the event feed.
+# ALONE in its binary by necessity, not by preference: it installs a global tracing
+# subscriber, and `tracing` caches callsite interest process-wide, so a sibling test
+# reaching sqlx's callsite first would silence the capture for the whole process.
+[[test]]
+name = "metering_inline_queries"
+path = "tests/metering_inline_queries.rs"
+
 # Structural exclusion of forbidden flows: the grant-type, response-type, and
 # PKCE-method registries cannot express ROPC, authorization-endpoint access
 # tokens, or plain PKCE. Database-free, so it runs on every lane (incl. MSRV).
