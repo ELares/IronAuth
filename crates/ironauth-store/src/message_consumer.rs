@@ -52,7 +52,9 @@ use crate::message_delivery::{MessageProvider, deliver};
 use crate::message_failover::GiveUpReason;
 use crate::message_prepare::PreparedMessage;
 use crate::outbox::{ConsumerError, OutboxConsumer};
-use crate::repository::{MESSAGE_DELIVERY_CONSUMER, OutboxMessage, Resolution};
+use crate::repository::{
+    MESSAGE_DELIVERY_CONSUMER, MessageTemplateRecord, OutboxMessage, Resolution,
+};
 use crate::scope::Scope;
 use crate::store::Store;
 
@@ -69,6 +71,13 @@ pub trait MessageComposer: Send + Sync + std::fmt::Debug {
     /// `recipient` has been opened from the row's sealed copy. It is the live address and must
     /// not be logged or persisted by an implementation.
     ///
+    /// `configured` is every LIVE template this scope defines for this kind, strongest level
+    /// first. Loaded by the CONSUMER rather than by the composer, because loading is IO and a
+    /// composer that reached for a database would be untestable without one. An empty slice is
+    /// the ordinary case, not a failure: it means the deployment has configured nothing, and
+    /// the built-in applies, which is the LAST level of the resolution order issue #111
+    /// specifies rather than a fallback bolted on beside it.
+    ///
     /// # Errors
     ///
     /// A short, non-secret classification. It becomes the row's `failure_reason`, which an
@@ -79,6 +88,7 @@ pub trait MessageComposer: Send + Sync + std::fmt::Debug {
         kind: &str,
         recipient: &str,
         payload: &serde_json::Value,
+        configured: &[MessageTemplateRecord],
     ) -> Result<PreparedMessage, String>;
 }
 
@@ -182,21 +192,33 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                 return Ok(());
             };
 
-            let prepared =
-                match self
-                    .composer
-                    .compose(scope, &record.kind, &recipient, &message.payload)
-                {
-                    Ok(prepared) => prepared,
-                    Err(reason) => {
-                        // Policy refused, or the template is broken. Neither improves on a retry.
-                        messages
-                            .resolve(&id, Resolution::Failed { reason: &reason })
-                            .await
-                            .map_err(|_| ConsumerError::retryable("resolve_failed"))?;
-                        return Ok(());
-                    }
-                };
+            // The scope's own templates, strongest level first. A read failure is TRANSIENT
+            // rather than a broken message, so it retries instead of resolving the row failed:
+            // composing from the built-in when a configured template merely could not be READ
+            // would silently send the wrong wording and record it as a success.
+            let configured = repo
+                .message_templates()
+                .candidates_for(&record.kind)
+                .await
+                .map_err(|_| ConsumerError::retryable("template_read_failed"))?;
+
+            let prepared = match self.composer.compose(
+                scope,
+                &record.kind,
+                &recipient,
+                &message.payload,
+                &configured,
+            ) {
+                Ok(prepared) => prepared,
+                Err(reason) => {
+                    // Policy refused, or the template is broken. Neither improves on a retry.
+                    messages
+                        .resolve(&id, Resolution::Failed { reason: &reason })
+                        .await
+                        .map_err(|_| ConsumerError::retryable("resolve_failed"))?;
+                    return Ok(());
+                }
+            };
 
             let report = deliver(&self.providers, &prepared).await;
             if report.delivered_by.is_some() {

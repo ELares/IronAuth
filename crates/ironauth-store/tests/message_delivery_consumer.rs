@@ -98,6 +98,7 @@ impl MessageComposer for RecordingComposer {
         kind: &str,
         recipient: &str,
         _payload: &serde_json::Value,
+        _configured: &[ironauth_store::MessageTemplateRecord],
     ) -> Result<PreparedMessage, String> {
         self.seen.lock().expect("lock").push(recipient.to_owned());
         if let Some(reason) = &self.refuse {

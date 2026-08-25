@@ -24,6 +24,7 @@
 
 use std::collections::BTreeSet;
 
+use ironauth_store::MessageTemplateRecord;
 use ironauth_store::Scope;
 use ironauth_store::message_consumer::MessageComposer;
 use ironauth_store::message_prepare::{
@@ -41,6 +42,10 @@ pub struct DefaultComposer {
 }
 
 impl DefaultComposer {
+    /// The body handle the built-in template is registered under. A configured template's
+    /// handle is its row id, so this cannot collide with one.
+    const BUILT_IN_REF: &'static str = "built-in";
+
     /// Build the composer for `sender_domain`, which is the right-hand side of the
     /// `Message-ID` this deployment stamps on every message it sends.
     ///
@@ -82,6 +87,7 @@ impl MessageComposer for DefaultComposer {
         kind: &str,
         recipient: &str,
         payload: &serde_json::Value,
+        configured: &[MessageTemplateRecord],
     ) -> Result<PreparedMessage, String> {
         // The payload's flat string fields become the template values. A non-string field is
         // SKIPPED rather than stringified: `{{ x }}` rendering as `{"a":1}` is a broken message
@@ -106,15 +112,46 @@ impl MessageComposer for DefaultComposer {
             return Err("no_message_id".to_owned());
         };
 
-        let bodies = Self::built_in();
-        // The built-in must be a CANDIDATE, not merely a body the loader can return. Template
-        // resolution walks the levels and fails with no template when the list is empty, so an
-        // empty list plus a loader that always answers is a composer that never composes.
-        let candidates = vec![TemplateCandidate {
+        // The CONFIGURED templates first, then the built-in, which is the last level of the
+        // resolution order (organization, environment, tenant, built-in default). The built-in
+        // is always present, which is what makes resolution total: it is why
+        // `resolve_template` can be documented as unable to fail.
+        let built_in = Self::built_in();
+        let mut candidates: Vec<TemplateCandidate> = configured
+            .iter()
+            .map(|record| TemplateCandidate {
+                level: record.level,
+                locale: Locale::new(&record.locale),
+                body_ref: record.id.to_string(),
+            })
+            .collect();
+        candidates.push(TemplateCandidate {
             level: TemplateLevel::Default,
             locale: self.default_locale.clone(),
-            body_ref: format!("built-in:{kind}"),
-        }];
+            body_ref: Self::BUILT_IN_REF.to_owned(),
+        });
+
+        // The body loader answers from the same records the candidates came from, so a
+        // resolution can only ever name a body this call actually holds.
+        let bodies = |body_ref: &str| -> Option<MessageBodies> {
+            if body_ref == Self::BUILT_IN_REF {
+                return Some(built_in.clone());
+            }
+            configured
+                .iter()
+                .find(|record| record.id.to_string() == body_ref)
+                .map(|record| MessageBodies {
+                    subject: record.subject.clone(),
+                    text: record.body_text.clone(),
+                    // A template with no HTML part still has to produce a multipart body, so
+                    // the text stands in. An empty HTML part would ship a message whose
+                    // alternative half is blank, which some clients render as an empty mail.
+                    html: record
+                        .body_html
+                        .clone()
+                        .unwrap_or_else(|| record.body_text.clone()),
+                })
+        };
 
         // A missing or non-string `body` is a REFUSAL, not an empty message. Filling it with
         // a default silently sends a blank mail to a real person, and `RenderError` already
@@ -130,7 +167,7 @@ impl MessageComposer for DefaultComposer {
             candidates: &candidates,
             requested_locale: &self.default_locale,
             default_locale: &self.default_locale,
-            bodies: &|_| Some(bodies.clone()),
+            bodies: &bodies,
             values: &values,
             // Suppression and the per-recipient rate limit are enforced by the CALLER that
             // enqueues, not here: this runs after the message is already queued, and refusing
@@ -206,6 +243,51 @@ mod tests {
             kind,
             "ada@example.test",
             payload,
+            &[],
+        )
+    }
+
+    /// A configured template at one level, for the resolution-order tests.
+    ///
+    /// Each record gets a DISTINCT id. An earlier version seeded the generator identically for
+    /// every call, so all of them shared one id and the body lookup returned whichever came
+    /// first -- the environment template lost to the tenant one, and the test caught it.
+    fn configured(
+        level: TemplateLevel,
+        locale: &str,
+        subject: &str,
+        text: &str,
+    ) -> MessageTemplateRecord {
+        let seed = match level {
+            TemplateLevel::Default => 41,
+            TemplateLevel::Tenant => 42,
+            TemplateLevel::Environment => 43,
+            TemplateLevel::Organization => 44,
+        };
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, seed);
+        MessageTemplateRecord {
+            id: ironauth_store::MessageTemplateId::generate(&env, &scope()),
+            level,
+            organization_id: None,
+            kind: "login_code".to_owned(),
+            locale: locale.to_owned(),
+            subject: subject.to_owned(),
+            body_text: text.to_owned(),
+            body_html: None,
+            locked: false,
+        }
+    }
+
+    fn compose_with(
+        records: &[MessageTemplateRecord],
+        payload: &serde_json::Value,
+    ) -> Result<PreparedMessage, String> {
+        DefaultComposer::new("mail.example.test").compose(
+            scope(),
+            "login_code",
+            "ada@example.test",
+            payload,
+            records,
         )
     }
 
@@ -250,10 +332,10 @@ mod tests {
     fn the_message_id_carries_the_configured_sending_domain() {
         let payload = ok("hello", "msg_same");
         let a = DefaultComposer::new("a.example.test")
-            .compose(scope(), "login_code", "ada@example.test", &payload)
+            .compose(scope(), "login_code", "ada@example.test", &payload, &[])
             .expect("a");
         let b = DefaultComposer::new("b.example.test")
-            .compose(scope(), "login_code", "ada@example.test", &payload)
+            .compose(scope(), "login_code", "ada@example.test", &payload, &[])
             .expect("b");
         assert!(a.message_id.contains("a.example.test"), "{}", a.message_id);
         assert!(b.message_id.contains("b.example.test"), "{}", b.message_id);
@@ -419,5 +501,96 @@ mod tests {
         let prepared = compose(&ok("hello", "msg_lvl")).expect("composes");
         assert_eq!(prepared.template_level, TemplateLevel::Default);
         assert!(!prepared.locale_fallback_applied);
+    }
+
+    /// CRITERION 3, the resolution order: organization overrides environment overrides tenant
+    /// overrides the built-in default.
+    ///
+    /// Each level is added on top of the last and the subject must change every time. Asserting
+    /// only that the strongest wins would pass against an implementation that always picked the
+    /// first record it was handed.
+    #[test]
+    fn a_stronger_level_overrides_a_weaker_one_all_the_way_down() {
+        let payload = ok("hello", "msg_res");
+
+        let built_in = compose_with(&[], &payload).expect("built-in");
+        assert!(
+            built_in.subject.contains("login_code"),
+            "{}",
+            built_in.subject
+        );
+        assert_eq!(built_in.template_level, TemplateLevel::Default);
+
+        let tenant = configured(TemplateLevel::Tenant, "en", "TENANT SUBJECT", "t");
+        let at_tenant = compose_with(std::slice::from_ref(&tenant), &payload).expect("tenant");
+        assert_eq!(at_tenant.subject, "TENANT SUBJECT");
+        assert_eq!(at_tenant.template_level, TemplateLevel::Tenant);
+
+        let environment = configured(TemplateLevel::Environment, "en", "ENVIRONMENT SUBJECT", "e");
+        let at_env =
+            compose_with(&[tenant.clone(), environment.clone()], &payload).expect("environment");
+        assert_eq!(
+            at_env.subject, "ENVIRONMENT SUBJECT",
+            "an environment template must beat the tenant one"
+        );
+        assert_eq!(at_env.template_level, TemplateLevel::Environment);
+
+        let organization = configured(TemplateLevel::Organization, "en", "ORG SUBJECT", "o");
+        let at_org =
+            compose_with(&[tenant, environment, organization], &payload).expect("organization");
+        assert_eq!(
+            at_org.subject, "ORG SUBJECT",
+            "an organization override must beat both"
+        );
+        assert_eq!(at_org.template_level, TemplateLevel::Organization);
+    }
+
+    /// A configured template's VALUES still render, so an override is a template rather than a
+    /// literal string.
+    #[test]
+    fn a_configured_template_still_interpolates_its_values() {
+        let record = configured(
+            TemplateLevel::Tenant,
+            "en",
+            "Code for {{ tenant }}",
+            "Your code: {{ body }}",
+        );
+        let prepared = compose_with(&[record], &ok("998877", "msg_int")).expect("composes");
+        assert!(prepared.body.contains("998877"), "{}", prepared.body);
+        assert!(
+            prepared.subject.contains(&scope().tenant().to_string()),
+            "{}",
+            prepared.subject
+        );
+    }
+
+    /// A template with no HTML part still produces BOTH multipart parts. An empty HTML
+    /// alternative ships a message whose richer half is blank, which some clients render as an
+    /// empty mail.
+    #[test]
+    fn a_template_without_html_still_produces_both_parts() {
+        let record = configured(TemplateLevel::Tenant, "en", "S", "TEXT-ONLY-BODY");
+        let prepared = compose_with(&[record], &ok("x", "msg_html")).expect("composes");
+        assert!(prepared.body.contains("text/plain"), "{}", prepared.body);
+        assert!(prepared.body.contains("text/html"), "{}", prepared.body);
+        assert_eq!(
+            prepared.body.matches("TEXT-ONLY-BODY").count(),
+            2,
+            "the text stands in for the missing HTML part, so it appears in both: {}",
+            prepared.body
+        );
+    }
+
+    /// A template for a DIFFERENT locale falls back to the default one rather than failing, and
+    /// says it fell back.
+    #[test]
+    fn an_unavailable_locale_falls_back_and_reports_it() {
+        let other = configured(TemplateLevel::Tenant, "fr", "SUJET", "corps");
+        let prepared = compose_with(&[other], &ok("x", "msg_loc")).expect("composes");
+        assert_eq!(prepared.subject, "SUJET", "the only template is used");
+        assert!(
+            prepared.locale_fallback_applied,
+            "and the caller is told the requested locale was unavailable"
+        );
     }
 }
