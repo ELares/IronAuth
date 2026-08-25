@@ -133,6 +133,17 @@ pub enum FetchPurpose {
     ClientMetadata,
     /// Delivering a webhook to a tenant-configured target.
     WebhookDelivery,
+    /// Handing one outbound MESSAGE to a generic HTTP email or SMS provider (issue #111).
+    ///
+    /// Distinct from [`FetchPurpose::WebhookDelivery`] for the same reason the others are:
+    /// the two answer to different operators and carry different payloads. A webhook is a
+    /// notification a tenant may drop; a message is a person's login code or password reset,
+    /// so a rate limit or a failure budget that is unremarkable for one is a locked-out user
+    /// for the other. Collapsing them into one metric series would hide exactly that.
+    ///
+    /// It also carries RECIPIENT PII in its body where a webhook carries an event, which is a
+    /// reason to be able to police them separately.
+    MessageDelivery,
     /// Shipping a batch of audit events to an operator-configured SIEM sink
     /// (issue #110). Distinct from [`FetchPurpose::WebhookDelivery`] because the
     /// two answer to different operators and carry different payloads: a webhook
@@ -225,6 +236,7 @@ impl FetchPurpose {
             FetchPurpose::SectorIdentifier => "sector_identifier",
             FetchPurpose::ClientMetadata => "client_metadata",
             FetchPurpose::WebhookDelivery => "webhook_delivery",
+            FetchPurpose::MessageDelivery => "message_delivery",
             FetchPurpose::LogStreamDelivery => "log_stream_delivery",
             FetchPurpose::FlowTarget => "flow_target",
             FetchPurpose::Logo => "logo",
