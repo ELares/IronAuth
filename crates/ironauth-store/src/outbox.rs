@@ -867,7 +867,12 @@ pub struct OutboxWorkerPool {
     live: Arc<AtomicUsize>,
     /// Wakes workers parked in `backbone.wait` so `shutdown` does not have to outlast a
     /// poll interval, which a backbone deployment may legitimately set to minutes.
-    shutdown_signal: Arc<tokio::sync::Notify>,
+    /// LEVEL-triggered, deliberately. `Notify::notify_waiters` wakes only the tasks already
+    /// parked at the moment it is called, and stores nothing for the ones that are not: a
+    /// worker still inside its drain pass when `shutdown` fires misses the wake entirely and
+    /// then parks for a whole poll interval. A `watch` value is a STATE rather than an edge,
+    /// so a worker that reads it late still sees it.
+    shutdown_signal: tokio::sync::watch::Sender<bool>,
 }
 
 /// Decrements the pool's LIVE worker count when its task ends, however it ends.
@@ -926,7 +931,7 @@ impl OutboxWorkerPool {
         let stop = Arc::new(AtomicBool::new(false));
         // Wakes workers parked in `backbone.wait` so shutdown does not have to outlast a
         // poll interval that a backbone deployment may set to minutes.
-        let shutdown_signal = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_signal, shutdown_rx) = tokio::sync::watch::channel(false);
         let workers = usize::try_from(worker.settings.concurrency.max(1)).unwrap_or(1);
         let poll = worker.settings.poll_interval;
         let live = Arc::new(AtomicUsize::new(0));
@@ -937,7 +942,7 @@ impl OutboxWorkerPool {
             let observer = Arc::clone(observer);
             let stop = Arc::clone(&stop);
             let backbone = Arc::clone(backbone);
-            let shutdown = Arc::clone(&shutdown_signal);
+            let mut shutdown = shutdown_rx.clone();
             let consumer_name = worker.consumer_name().to_owned();
             // Counted UP here rather than inside the task, so `size` is the configured
             // count the instant `spawn` returns and only ever falls from a real death.
@@ -995,7 +1000,11 @@ impl OutboxWorkerPool {
                     // hanging on exactly this.
                     tokio::select! {
                         () = backbone.wait(&consumer_name, poll) => {}
-                        () = shutdown.notified() => {}
+                        // `wait_for` returns IMMEDIATELY when the value already satisfies the
+                        // predicate, which is the whole reason this is a watch rather than a
+                        // Notify: a shutdown that landed while this task was draining is not
+                        // lost, it is simply already true when the task gets here.
+                        _ = shutdown.wait_for(|stopping| *stopping) => {}
                     }
                 }
             }));
@@ -1065,8 +1074,10 @@ impl OutboxWorkerPool {
     pub async fn shutdown(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         // Wake anyone parked in `backbone.wait` BEFORE awaiting the handles, or this
-        // await lasts as long as the poll interval.
-        self.shutdown_signal.notify_waiters();
+        // await lasts as long as the poll interval. Sending a VALUE rather than notifying
+        // waiters is what makes this reliable: a worker that has not reached the select yet
+        // still observes it when it does.
+        let _ = self.shutdown_signal.send(true);
         // Taken rather than consumed: this type has a `Drop` that re-signals the flag, so
         // its fields cannot be moved out. Draining the vector in place leaves the drop
         // with nothing left to do and keeps the belt-and-braces signal for the path where
@@ -1085,7 +1096,7 @@ impl Drop for OutboxWorkerPool {
         self.stop.store(true, Ordering::Relaxed);
         // And wake anyone parked in `backbone.wait`, or "the next check" is a poll
         // interval away rather than immediate.
-        self.shutdown_signal.notify_waiters();
+        let _ = self.shutdown_signal.send(true);
     }
 }
 
