@@ -22491,10 +22491,13 @@ pub struct MessageRecord {
     /// The recipient BLIND INDEX. Never the address: see the migration for why a ledger is
     /// the worst table to keep a plaintext one in.
     pub recipient_bidx: Vec<u8>,
-    /// Delivery state: `pending`, `sent`, or `failed`.
+    /// Delivery state: `pending`, `sending`, `sent`, or `failed`.
     pub state: String,
     /// Why a failed delivery failed, as a classification rather than a provider response.
     pub failure_reason: Option<String>,
+    /// How many times an operator has re-queued this message. Zero for a message that was
+    /// only ever sent once, which is the answer to "why did this person get four copies".
+    pub resend_count: i32,
 }
 
 /// What enqueuing one outbound message needs (issue #111).
@@ -22546,6 +22549,82 @@ pub enum Enqueued {
         /// The epoch second at which this recipient's oldest counted send leaves the window.
         retry_after_epoch_seconds: u64,
     },
+}
+
+/// The outbox idempotency key for one delivery attempt of a message (issue #111).
+///
+/// Attempt 0 is the ORIGINAL send and keeps the bare message id, so this is not a format
+/// change: every job already queued keeps the key it was filed under. Each resend appends its
+/// count, because the outbox is UNIQUE on `(tenant, environment, consumer, idempotency_key)`
+/// and `enqueue_outbox_in_tx` is the RAISING enqueue: re-filing the original key raises a
+/// unique violation that aborts the whole resend transaction, so the row never moves and the
+/// operator gets a database error instead of a resend.
+///
+/// (An earlier version of this comment, and of migration 0158, said re-filing would "silently
+/// do nothing" and leave the operator a false success. That is the behaviour of
+/// `enqueue_outbox_in_tx_ignoring_conflict`, which this path does not use. The conclusion --
+/// each attempt needs a key of its own -- is unchanged; the mechanism was asserted rather than
+/// measured, and was wrong.)
+fn delivery_idempotency_key(id: &MessageId, attempt: i32) -> String {
+    if attempt == 0 {
+        id.to_string()
+    } else {
+        format!("{id}#{attempt}")
+    }
+}
+
+/// The message-id half of a delivery job's idempotency key: the inverse of
+/// [`delivery_idempotency_key`].
+///
+/// It lives HERE, beside its inverse, because the two drifting apart is not hypothetical. The
+/// consumer parsed the whole key as a `MessageId`, which was true while the key WAS the id;
+/// the moment resend appended `#N`, every resend job failed to parse and was dead-lettered
+/// without any provider being reached, leaving the row `pending` and unrecoverable. A reader
+/// that does not know the key's grammar is the defect, so the grammar has exactly one writer
+/// and one reader and they sit together.
+///
+/// A `MessageId` renders as base64url, which has no `#`, so the split is unambiguous.
+#[must_use]
+pub fn delivery_key_message_id(key: &str) -> &str {
+    key.split_once('#').map_or(key, |(id, _attempt)| id)
+}
+
+/// What [`MessageRepo::resend`] did with a re-queue request (issue #111 criterion 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resent {
+    /// The message moved back to `pending` and a fresh delivery job was queued.
+    Requeued {
+        /// Which re-queue this was for this message, starting at 1.
+        attempt: i32,
+    },
+    /// The recipient is SUPPRESSED, so nothing was re-queued (issue #111 criterion 6).
+    ///
+    /// A resend is an operator action and this refuses it anyway. Suppression records a hard
+    /// bounce or a spam complaint, and those are obligations to the RECIPIENT, not delivery
+    /// advice to the sender: an operator re-queueing mail to an address that complained is the
+    /// exact event the list exists to prevent, and being authenticated does not change what
+    /// the recipient asked for.
+    Suppressed {
+        /// Why, as the classification the suppression was recorded under.
+        reason: String,
+    },
+    /// The message is not in a state a resend can act on, carrying the state it is in.
+    ///
+    /// `pending` is already queued and will be delivered; `sent` was delivered, and mailing it
+    /// again is a NEW send with a new dedup window rather than a resend of this one.
+    NotResendable {
+        /// The state the row is actually in.
+        state: String,
+    },
+    /// The original delivery payload is no longer retained, so nothing could be re-queued.
+    ///
+    /// The ledger deliberately holds no rendered body (migration 0154: "a rendered message
+    /// contains the very secrets the send exists to carry"), so the variables live only on the
+    /// outbox job, which the diagnostics retention sweep eventually reaps. Refusing is the only
+    /// honest answer: re-queueing without them would deliver a template with empty
+    /// placeholders, which is a message that SENDS and is useless, and the recipient is the one
+    /// who discovers it.
+    PayloadExpired,
 }
 
 /// Suppression and the per-recipient budget, evaluated inside a caller's transaction.
@@ -22848,7 +22927,7 @@ impl MessageRepo<'_> {
             scope,
             &NewOutboxMessage {
                 consumer: MESSAGE_DELIVERY_CONSUMER,
-                idempotency_key: &message.id.to_string(),
+                idempotency_key: &delivery_idempotency_key(message.id, 0),
                 ordering_key: &ordering_key,
                 payload: payload.clone(),
             },
@@ -22856,6 +22935,152 @@ impl MessageRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(Enqueued::Accepted)
+    }
+
+    /// Re-queue a terminal message for delivery (issue #111 criterion 1).
+    ///
+    /// # What a resend is, and is not
+    ///
+    /// It re-queues the ORIGINAL delivery job. It does not re-render, because the ledger holds
+    /// no body to re-render from: 0154 keeps the rendered message out of the table on purpose,
+    /// so the template variables exist only on the outbox payload. That makes retention the
+    /// bound on how long a message can be resent, and [`Resent::PayloadExpired`] the honest
+    /// answer once it lapses.
+    ///
+    /// # Why the transition is the guard
+    ///
+    /// The move out of a terminal state is a compare-and-swap in one statement, so two
+    /// operators clicking at once serialise on the row lock and exactly one wins; the other is
+    /// told the state it lost to. A SELECT-then-UPDATE would mail the same person twice, which
+    /// is the failure `messages` exists to prevent.
+    ///
+    /// # The rate limit is NOT consulted, and nothing else bounds this
+    ///
+    /// Say it plainly, because an earlier version of this comment did not. It claimed the CAS
+    /// bounded the loop -- "a message cannot be resent twice without failing again in between"
+    /// -- and that is FALSE: a caller can resolve and resend in a tight loop, and review
+    /// measured it doing so. There is no per-message cap, and no resend touches the
+    /// per-recipient budget, so the only thing standing between an authenticated operator and
+    /// unbounded mail to one address is their authorization to call this at all.
+    ///
+    /// That is a deliberate choice rather than an oversight. The budget counts sends in a
+    /// window to stop automated pumping through the PUBLIC doors; charging an operator's
+    /// recovery against it would refuse a resend precisely for the recipients whose mail has
+    /// been failing, which is everyone who needs one. `resend_count` is the durable record of
+    /// how often it was used, which is what the question "why did this person get four copies"
+    /// reduces to.
+    ///
+    /// It is worth being exact about what stands in for a bound, because an earlier draft named
+    /// a control that does not exist: there is NO caller yet. Whatever permission gates the
+    /// management endpoint is issue #111 criterion 1's remaining work, and whether it is
+    /// sufficient is a question for that endpoint rather than a property this function has.
+    ///
+    /// Suppression IS consulted, and the difference is in [`Resent::Suppressed`]: a hard bounce
+    /// or a complaint is an obligation to the recipient, not delivery advice to the sender.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope or names no row; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn resend(&self, env: &Env, id: &MessageId) -> Result<Resent, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+
+        let row = sqlx::query(
+            "SELECT state, recipient_bidx, resend_count FROM messages \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        let state: String = row.get("state");
+        let bidx: Vec<u8> = row.get("recipient_bidx");
+        let previous_attempt: i32 = row.get("resend_count");
+
+        // SUPPRESSION FIRST, before the state check, so an operator resending to a complained
+        // address is told THAT rather than "this message is already sent". The two refusals
+        // are not interchangeable: one is about this row and the other is about the person.
+        let suppressed: Option<String> = sqlx::query_scalar(
+            "SELECT reason FROM message_suppressions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND recipient_bidx = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(&bidx)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(reason) = suppressed {
+            return Ok(Resent::Suppressed { reason });
+        }
+
+        // The payload of the most recent attempt, read BEFORE the row is moved: a resend that
+        // moved the row and then discovered the payload was gone would leave a `pending`
+        // message no job will ever deliver, which reads to an operator exactly like mail that
+        // is merely slow.
+        let payload: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM outbox_messages \
+             WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
+               AND idempotency_key = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(MESSAGE_DELIVERY_CONSUMER)
+        .bind(delivery_idempotency_key(id, previous_attempt))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(payload) = payload else {
+            return Ok(Resent::PayloadExpired);
+        };
+
+        // THE COMPARE-AND-SWAP. `sending` is resendable because 0156 left recovering a stuck
+        // row to a person: a worker that died mid-delivery leaves one no other worker will
+        // take, and refusing here would strand it for good. It can double-deliver, and that is
+        // the operator's call to make with knowledge the database does not have.
+        let attempt: Option<i32> = sqlx::query_scalar(
+            "UPDATE messages \
+             SET state = 'pending', failure_reason = NULL, \
+                 resend_count = resend_count + 1, updated_at = now() \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+               AND state IN ('failed', 'sending') \
+             RETURNING resend_count",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(attempt) = attempt else {
+            // Lost the race, or never resendable. The state read at the top is what the caller
+            // is told; under a concurrent resend that is the state it was in when we looked,
+            // which is the honest answer to "why did mine not take effect".
+            return Ok(Resent::NotResendable { state });
+        };
+
+        // A job of its OWN. Re-filing under the original key would collide with the completed
+        // original on the outbox UNIQUE, and `enqueue_outbox_in_tx` is the RAISING enqueue, so
+        // that collision aborts this transaction: the row never moves and the operator gets a
+        // database error rather than a resend.
+        enqueue_outbox_in_tx(
+            &mut tx,
+            env,
+            self.scope,
+            &NewOutboxMessage {
+                consumer: MESSAGE_DELIVERY_CONSUMER,
+                idempotency_key: &delivery_idempotency_key(id, attempt),
+                // The same per-recipient key as the original, so a resend stays ordered behind
+                // this person's other mail rather than overtaking it.
+                ordering_key: &hex_of(&bidx),
+                payload,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Resent::Requeued { attempt })
     }
 
     /// Record that this recipient is suppressed (issue #111 criterion 6).
@@ -22899,9 +23124,11 @@ impl MessageRepo<'_> {
 
     /// Claim this message for delivery, moving it `pending` -> `sending`.
     ///
-    /// Returns `true` if THIS caller won it. The transition is the mutual exclusion: a
-    /// conditional UPDATE on `state = 'pending'` is serialised by the row lock, so of two
-    /// workers racing, exactly one sees a row affected and the other sees none.
+    /// Returns [`None`] if this caller LOST it, and `Some(generation)` if it won -- where the
+    /// generation is the `resend_count` the claim was granted under, and every subsequent write
+    /// for this delivery must carry it. The transition is the mutual exclusion: a conditional
+    /// UPDATE on `state = 'pending'` is serialised by the row lock, so of two workers racing,
+    /// exactly one sees a row affected and the other sees none.
     ///
     /// The read-then-act it replaces was not safe. The outbox leases a job, but a lease can
     /// LAPSE: a worker that stalls past its visibility timeout has its job re-claimed while it
@@ -22913,23 +23140,29 @@ impl MessageRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
     /// on a persistence failure.
-    pub async fn claim_for_delivery(&self, id: &MessageId) -> Result<bool, StoreError> {
+    pub async fn claim_for_delivery(&self, id: &MessageId) -> Result<Option<i32>, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        let claimed = sqlx::query(
+        // RETURNING the generation this claim was granted under. A resend moves the row back to
+        // `pending` and increments `resend_count`, so a worker that was mid-delivery when an
+        // operator resent is holding a claim on a message that has since moved on. Without a
+        // token it cannot tell: it would resolve the row and silently void the resend, or void
+        // the claim of whichever worker took the new job. The generation is what lets its
+        // resolve affect zero rows and stop.
+        let generation: Option<i32> = sqlx::query_scalar(
             "UPDATE messages SET state = 'sending', updated_at = now() \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'pending'",
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'pending' \
+             RETURNING resend_count",
         )
         .bind(id.to_string())
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        .fetch_optional(&mut *tx)
+        .await?;
         tx.commit().await?;
-        Ok(claimed == 1)
+        Ok(generation)
     }
 
     /// Release a claim, moving `sending` back to `pending` so a retry can take it.
@@ -22942,22 +23175,36 @@ impl MessageRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
     /// on a persistence failure.
-    pub async fn release_claim(&self, id: &MessageId) -> Result<(), StoreError> {
+    /// `generation` is the value [`Self::claim_for_delivery`] returned. Returns whether the
+    /// claim was actually RELEASED: `false` means this worker no longer owns the row, which is
+    /// the correct outcome for a stale worker and not an error.
+    ///
+    /// Reporting it matters. Returning `Ok(())` either way made a wrong generation here
+    /// completely silent -- no send, no failure record, no dead letter, retry budget unspent,
+    /// which is exactly the harm `release_then`'s own doc names -- and it is what let a
+    /// hardcoded `0` at four call sites survive the whole suite.
+    pub async fn release_claim(&self, id: &MessageId, generation: i32) -> Result<bool, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        sqlx::query(
+        // Fenced on the generation for the same reason `resolve` is: a worker that lost its
+        // message to a resend must not drag the row back to `pending` underneath whichever
+        // worker now holds it, which would arm a THIRD delivery of the same mail.
+        let released = sqlx::query(
             "UPDATE messages SET state = 'pending', updated_at = now() \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'sending'",
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'sending' \
+               AND resend_count = $4",
         )
         .bind(id.to_string())
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .bind(generation)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
         tx.commit().await?;
-        Ok(())
+        Ok(released == 1)
     }
 
     /// Open this message's sealed recipient, or [`None`] if it carries none.
@@ -23021,7 +23268,16 @@ impl MessageRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the identifier is out of this scope or names no row;
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn resolve(&self, id: &MessageId, outcome: Resolution<'_>) -> Result<(), StoreError> {
+    /// `generation` is the value [`Self::claim_for_delivery`] returned. A resolve carrying a
+    /// STALE one -- the row was resent out from under this worker -- affects no rows and is
+    /// refused with [`StoreError::NotFound`], which is how a worker learns it no longer owns
+    /// the message it just mailed.
+    pub async fn resolve(
+        &self,
+        id: &MessageId,
+        generation: i32,
+        outcome: Resolution<'_>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -23033,13 +23289,14 @@ impl MessageRepo<'_> {
         let updated = sqlx::query(
             "UPDATE messages SET state = $1, failure_reason = $2, updated_at = now() \
              WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
-             AND state IN ('pending', 'sending')",
+               AND state IN ('pending', 'sending') AND resend_count = $6",
         )
         .bind(state)
         .bind(reason)
         .bind(id.to_string())
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .bind(generation)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -23064,7 +23321,8 @@ impl MessageRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, kind, recipient_bidx, state, failure_reason FROM messages \
+            "SELECT id, kind, recipient_bidx, state, failure_reason, resend_count \
+             FROM messages \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -23083,6 +23341,7 @@ impl MessageRepo<'_> {
                     recipient_bidx: row.get("recipient_bidx"),
                     state: row.get("state"),
                     failure_reason: row.get("failure_reason"),
+                    resend_count: row.get("resend_count"),
                 }))
             }
         }

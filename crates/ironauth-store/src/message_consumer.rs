@@ -48,6 +48,7 @@ use std::sync::Arc;
 
 use ironauth_env::Env;
 
+use crate::error::StoreError;
 use crate::message_delivery::{MessageProvider, deliver};
 use crate::message_failover::GiveUpReason;
 use crate::message_prepare::PreparedMessage;
@@ -105,9 +106,12 @@ pub trait MessageComposer: Send + Sync + std::fmt::Debug {
 async fn release_then(
     messages: &crate::repository::MessageRepo<'_>,
     id: &crate::id::MessageId,
+    generation: i32,
     label: &'static str,
 ) -> ConsumerError {
-    if messages.release_claim(id).await.is_err() {
+    if messages.release_claim(id, generation).await.is_err() {
+        // A stale generation returns Ok(false), not Err, so this arm is a real persistence
+        // fault rather than "somebody else owns the row".
         // The release itself failed. Retry anyway: the row stays `sending` and this attempt is
         // not recorded as a completion, which is the safe direction.
         return ConsumerError::retryable("release_failed");
@@ -162,13 +166,22 @@ impl OutboxConsumer for MessageDeliveryConsumer {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ConsumerError>> + Send + 'a>>
     {
         Box::pin(async move {
-            // The job's idempotency key IS the message id: `MessageRepo::enqueue` writes it
-            // that way inside the same transaction as the row, so a job can always name its
-            // row and a row can always be found from its job.
+            // The job's idempotency key NAMES the message: `MessageRepo::enqueue` files the
+            // original under the bare id and a resend files attempt N under `<id>#N`, so a job
+            // can always name its row and a row can always be found from its job.
+            //
+            // Read through `delivery_key_message_id`, which is the inverse of the function that
+            // WRITES the key. Parsing the whole key here was correct while the key was the id
+            // and became silently wrong the moment resend appended a suffix: `#` is not
+            // base64url, so every resend job was dead-lettered as unparseable without reaching
+            // a provider, and left its row `pending` where nothing could resend it again.
             let repo = self.store.scoped(scope);
             let messages = repo.messages();
-            let id = crate::id::MessageId::parse_in_scope(&message.idempotency_key, &scope)
-                .map_err(|_| ConsumerError::permanent("message_id_unparseable"))?;
+            let id = crate::id::MessageId::parse_in_scope(
+                crate::repository::delivery_key_message_id(&message.idempotency_key),
+                &scope,
+            )
+            .map_err(|_| ConsumerError::permanent("message_id_unparseable"))?;
             let Some(record) = messages
                 .by_id(&id)
                 .await
@@ -185,20 +198,25 @@ impl OutboxConsumer for MessageDeliveryConsumer {
             // it is still running would observe `pending` alongside the new owner and both
             // would mail. The conditional UPDATE is serialised on the row, so exactly one
             // worker wins and the loser stops here.
-            if !messages
+            // The claim hands back the GENERATION it was granted under, and every write that
+            // follows carries it. A resend moves the row back to `pending` and bumps that
+            // counter, so a worker still mid-delivery when an operator resends is holding a
+            // claim on a message that has moved on; its resolve then affects zero rows instead
+            // of voiding the resend or overwriting whichever worker took the new job.
+            let Some(generation) = messages
                 .claim_for_delivery(&id)
                 .await
                 .map_err(|_| ConsumerError::retryable("claim_failed"))?
-            {
+            else {
                 // Somebody else has it, or it is already resolved. Either way this attempt
                 // sends nothing: at-least-once delivery of the JOB must not become
                 // at-least-once delivery of the MAIL.
                 return Ok(());
-            }
+            };
 
             // Pre-delivery: release, as above. Nothing has reached a provider.
             let Ok(recipient) = messages.open_recipient(&id).await else {
-                return Err(release_then(&messages, &id, "recipient_unopenable").await);
+                return Err(release_then(&messages, &id, generation, "recipient_unopenable").await);
             };
             let Some(recipient) = recipient else {
                 // A row from before migration 0155 carries no sealed recipient and never can:
@@ -207,6 +225,7 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                 let _ = messages
                     .resolve(
                         &id,
+                        generation,
                         Resolution::Failed {
                             reason: "no_sealed_recipient",
                         },
@@ -220,7 +239,7 @@ impl OutboxConsumer for MessageDeliveryConsumer {
             // composing from the built-in when a configured template merely could not be READ
             // would silently send the wrong wording and record it as a success.
             let Ok(configured) = repo.message_templates().candidates_for(&record.kind).await else {
-                return Err(release_then(&messages, &id, "template_read_failed").await);
+                return Err(release_then(&messages, &id, generation, "template_read_failed").await);
             };
 
             let prepared = match self.composer.compose(
@@ -234,7 +253,7 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                 Err(reason) => {
                     // Policy refused, or the template is broken. Neither improves on a retry.
                     messages
-                        .resolve(&id, Resolution::Failed { reason: &reason })
+                        .resolve(&id, generation, Resolution::Failed { reason: &reason })
                         .await
                         .map_err(|_| ConsumerError::retryable("resolve_failed"))?;
                     return Ok(());
@@ -243,26 +262,35 @@ impl OutboxConsumer for MessageDeliveryConsumer {
 
             let report = deliver(&self.providers, &prepared).await;
             if report.delivered_by.is_some() {
-                messages
-                    .resolve(&id, Resolution::Sent)
-                    .await
-                    .map_err(|_| ConsumerError::retryable("resolve_failed"))?;
-                return Ok(());
+                // SUPERSEDED IS NOT A FAILURE. The mail is out. If an operator resent this row
+                // while the provider was accepting it, the resolve carries a stale generation
+                // and affects nothing -- and retrying THIS job would hand the same recipient
+                // the same message again, which is what the claim exists to prevent. The
+                // generation that owns the row now is the one that will resolve it.
+                match messages.resolve(&id, generation, Resolution::Sent).await {
+                    Ok(()) | Err(StoreError::NotFound) => return Ok(()),
+                    Err(_) => return Err(ConsumerError::retryable("resolve_failed")),
+                }
             }
 
             match report.gave_up {
                 // The message is undeliverable as written. Finished, not deferred.
                 Some(GiveUpReason::MessageRejected) => {
-                    messages
+                    // Superseded is not a failure here either: a provider has already refused
+                    // this message, so re-offering it on a retry cannot change the outcome.
+                    match messages
                         .resolve(
                             &id,
+                            generation,
                             Resolution::Failed {
                                 reason: "message_rejected",
                             },
                         )
                         .await
-                        .map_err(|_| ConsumerError::retryable("resolve_failed"))?;
-                    Ok(())
+                    {
+                        Ok(()) | Err(StoreError::NotFound) => Ok(()),
+                        Err(_) => Err(ConsumerError::retryable("resolve_failed")),
+                    }
                 }
                 // The infrastructure is down, not the message. Leave the row PENDING and let
                 // the outbox retry: resolving it `failed` here would tell an operator the send
@@ -271,8 +299,10 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                     // Nothing was delivered and the substrate will try again, so the claim is
                     // RELEASED rather than left held: a row stuck in `sending` with a retry
                     // queued behind it would be claimed by nobody and finished by nobody.
+                    // `false` means the row was resent out from under this worker, which is
+                    // the correct outcome and not a fault: the new generation owns it now.
                     messages
-                        .release_claim(&id)
+                        .release_claim(&id, generation)
                         .await
                         .map_err(|_| ConsumerError::retryable("release_failed"))?;
                     Err(ConsumerError::retryable("all_providers_unavailable"))
@@ -285,7 +315,7 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                     // `sending`: released, so that configuring a provider and replaying the
                     // dead letter finds a message it can still send.
                     messages
-                        .release_claim(&id)
+                        .release_claim(&id, generation)
                         .await
                         .map_err(|_| ConsumerError::retryable("release_failed"))?;
                     Err(ConsumerError::permanent("no_providers_configured"))

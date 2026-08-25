@@ -19,7 +19,8 @@ use ironauth_store::message_hygiene::{dedup_key, normalize_recipient, window_ind
 use ironauth_store::message_rate::RateBudget;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, Enqueued, MESSAGE_DELIVERY_CONSUMER, MessageId, NewMessage, Resolution, Scope,
+    CorrelationId, Enqueued, MESSAGE_DELIVERY_CONSUMER, MessageId, NewMessage, Resent, Resolution,
+    Scope,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -53,6 +54,44 @@ async fn provision_keys(db: &TestDatabase, env: &Env, scope: Scope) {
         .provision_dek(env, &db.master_key())
         .await
         .expect("provision dek");
+}
+
+/// As `send_with_id`, with a payload the caller chooses.
+///
+/// A resend re-queues the ORIGINAL job's variables. Asserting that with the shared
+/// `payload(kind)` fixture proves little: a resend that RE-DERIVED the payload from the kind
+/// would produce a byte-identical object and pass. A marker unique to this send is what makes
+/// the comparison discriminate.
+async fn send_with_payload(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    recipient: &str,
+    at_secs: u64,
+    payload: &serde_json::Value,
+) -> MessageId {
+    let normalized = normalize_recipient(recipient).expect("a deliverable address");
+    let key =
+        dedup_key("email_otp", recipient, window_index(at_secs, WINDOW_SECS)).expect("a dedup key");
+    let id = MessageId::generate(env, &scope);
+    db.store()
+        .scoped(scope)
+        .messages()
+        .enqueue(
+            env,
+            NewMessage {
+                id: &id,
+                kind: "email_otp",
+                recipient: &normalized,
+                dedup_key: &key,
+            },
+            payload,
+            RateBudget::new(1_000, 3_600),
+            at_secs,
+        )
+        .await
+        .expect("enqueue");
+    id
 }
 
 /// Enqueue one send, returning what the store did with it AND the id it minted.
@@ -822,7 +861,7 @@ async fn resolve_records_the_outcome_once_and_refuses_a_second() {
     let messages = repo.scoped(scope);
     messages
         .messages()
-        .resolve(&id, Resolution::Sent)
+        .resolve(&id, generation_of(&db, scope, &id).await, Resolution::Sent)
         .await
         .expect("first resolve");
     let record = messages
@@ -836,7 +875,11 @@ async fn resolve_records_the_outcome_once_and_refuses_a_second() {
 
     let again = messages
         .messages()
-        .resolve(&id, Resolution::Failed { reason: "bounced" })
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed { reason: "bounced" },
+        )
         .await;
     assert!(
         again.is_err(),
@@ -866,6 +909,7 @@ async fn a_failed_delivery_records_its_reason() {
         .messages()
         .resolve(
             &id,
+            generation_of(&db, scope, &id).await,
             Resolution::Failed {
                 reason: "all_providers_unavailable",
             },
@@ -1751,4 +1795,625 @@ async fn webhook_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Valu
     .fetch_all(db.owner_pool())
     .await
     .expect("read the queued events")
+}
+
+// =========================================================================================
+// Resend (issue #111 criterion 1: "per-message status and resend are available via API").
+// =========================================================================================
+
+/// The generation a resolve must carry: the row's current `resend_count`.
+///
+/// Production reads it from `claim_for_delivery`, which hands back the generation it granted.
+/// These fixtures resolve without claiming, so they read the counter directly rather than
+/// hardcoding 0 -- a literal would silently stop matching the moment a fixture resends first,
+/// and the resolve would quietly affect no rows.
+async fn generation_of(db: &TestDatabase, scope: Scope, id: &MessageId) -> i32 {
+    sqlx::query_scalar("SELECT resend_count FROM messages WHERE id = $1 AND tenant_id = $2")
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("read the generation")
+}
+
+/// Every delivery job queued for a message, by the idempotency key it was filed under.
+async fn delivery_keys(db: &TestDatabase, scope: Scope) -> Vec<String> {
+    delivery_jobs(db, scope)
+        .await
+        .into_iter()
+        .map(|(key, _, _)| key)
+        .collect()
+}
+
+/// Every delivery job as `(idempotency_key, ordering_key, payload)`, oldest first.
+///
+/// The key alone was all any assertion read, which left the resend free to queue a job with a
+/// constant ordering key or somebody else's payload.
+async fn delivery_jobs(
+    db: &TestDatabase,
+    scope: Scope,
+) -> Vec<(String, String, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT idempotency_key, ordering_key, payload FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 ORDER BY sequence",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(MESSAGE_DELIVERY_CONSUMER)
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the queued delivery jobs")
+}
+
+/// A failed message re-queues, under a delivery key of its OWN.
+///
+/// The key is the whole test. `enqueue` files the original under the bare message id and the
+/// outbox is UNIQUE on it, so a resend that re-filed the same key would collapse into the
+/// completed original and queue NOTHING: the operator sees success, the ledger says pending,
+/// and no mail is ever sent. Asserting only "the state moved" would pass against exactly that.
+#[tokio::test]
+// One narrative: the key, the payload, the ordering key, the state, the count and the
+// timestamp all belong to the SAME resend. Splitting it would put the act in one function and
+// what it changed in another.
+#[allow(clippy::too_many_lines)]
+async fn a_failed_message_resends_under_a_delivery_key_of_its_own() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x160);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let id = send_with_payload(
+        &db,
+        &env,
+        scope,
+        "ada@example.test",
+        1_000,
+        &serde_json::json!({ "kind": "email_otp", "code": "hunter2" }),
+    )
+    .await;
+    db.store()
+        .scoped(scope)
+        .messages()
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed {
+                reason: "all_providers_unavailable",
+            },
+        )
+        .await
+        .expect("resolve failed");
+
+    // As epoch micros, because this crate carries no time type sqlx can decode a timestamptz
+    // into. The comparison stays in SQL either way.
+    let before_resend: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint FROM messages WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read updated_at before the resend");
+
+    let resent = db
+        .store()
+        .scoped(scope)
+        .messages()
+        .resend(&env, &id)
+        .await
+        .expect("resend");
+    assert_eq!(resent, Resent::Requeued { attempt: 1 });
+
+    let jobs = delivery_jobs(&db, scope).await;
+    assert_eq!(
+        jobs.iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<Vec<_>>(),
+        vec![id.to_string(), format!("{id}#1")],
+        "the resend must be a SECOND job: re-filing the original key raises on the outbox \
+         UNIQUE and aborts the whole resend"
+    );
+    let (_, original_order, original_payload) = &jobs[0];
+    let (_, resend_order, resend_payload) = &jobs[1];
+    assert_eq!(
+        resend_payload, original_payload,
+        "the resend re-queues the ORIGINAL variables: the ledger holds no body to re-render \
+         from, so anything else delivers a message the caller never composed"
+    );
+    assert!(
+        resend_payload["code"].as_str() == Some("hunter2"),
+        "and the fixture's payload must be distinguishable, or two empty objects compare \
+         equal and the assertion above is vacuous: {resend_payload}"
+    );
+    assert_eq!(
+        resend_order, original_order,
+        "the resend stays in this recipient's ordering group rather than overtaking their \
+         other mail"
+    );
+
+    let record = db
+        .store()
+        .scoped(scope)
+        .messages()
+        .by_id(&id)
+        .await
+        .expect("read back")
+        .expect("row");
+    assert_eq!(record.state, "pending", "the row is deliverable again");
+    let (_, never_resent) =
+        send_with_id(&db, &env, scope, "email_otp", "grace@example.test", 1_000).await;
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .messages()
+            .by_id(&never_resent)
+            .await
+            .expect("read")
+            .expect("row")
+            .resend_count,
+        0,
+        "a message that was never resent reports zero, so the field cannot be a constant"
+    );
+    assert_eq!(
+        record.failure_reason, None,
+        "the old reason is cleared: a pending message with a failure reason reads as though \
+         the resend already failed"
+    );
+    assert_eq!(record.resend_count, 1);
+    // Compared against the instant captured BEFORE the resend, not against `created_at`. The
+    // `resolve` above already moved `updated_at` past `created_at`, so the original form held
+    // for any test that had touched the row at all and said nothing about the resend.
+    let moved: bool = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint > $2 \
+         FROM messages WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .bind(before_resend)
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("compare the timestamps");
+    assert!(
+        moved,
+        "the resend transition must stamp updated_at, which is what a status surface reports \
+         as 'last changed'"
+    );
+}
+
+/// A message can be resent AGAIN after failing again, and each attempt gets its own key.
+#[tokio::test]
+async fn a_second_resend_gets_a_second_key() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x161);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+    let messages = db.store().scoped(scope).messages();
+    for attempt in 1..=2 {
+        messages
+            .resolve(
+                &id,
+                generation_of(&db, scope, &id).await,
+                Resolution::Failed { reason: "bounced" },
+            )
+            .await
+            .expect("resolve failed");
+        assert_eq!(
+            messages.resend(&env, &id).await.expect("resend"),
+            Resent::Requeued { attempt }
+        );
+    }
+    assert_eq!(
+        delivery_keys(&db, scope).await,
+        vec![id.to_string(), format!("{id}#1"), format!("{id}#2")],
+        "each attempt is its own job"
+    );
+    assert_eq!(
+        messages
+            .by_id(&id)
+            .await
+            .expect("read")
+            .expect("row")
+            .resend_count,
+        2,
+        "the ledger records HOW MANY times an operator re-queued this, which is what the \
+         question \"why did this person get four copies\" reduces to. Asserted at 2 as well as \
+         at 0 elsewhere, so no single hardcoded constant satisfies the suite"
+    );
+}
+
+/// A resend is refused for every state a resend cannot act on, and the answer names the state.
+///
+/// `pending` and `sent` are the two that matter and they are refused for opposite reasons: one
+/// is already queued and will be delivered, and the other was delivered, so mailing it again is
+/// a NEW send with its own dedup window rather than a resend of this one.
+#[tokio::test]
+async fn resending_a_pending_or_sent_message_is_refused_with_its_state() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x162);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (_, pending) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+    let messages = db.store().scoped(scope).messages();
+    assert_eq!(
+        messages.resend(&env, &pending).await.expect("resend"),
+        Resent::NotResendable {
+            state: "pending".to_owned()
+        }
+    );
+
+    let (_, sent) = send_with_id(&db, &env, scope, "email_otp", "grace@example.test", 1_000).await;
+    messages
+        .resolve(
+            &sent,
+            generation_of(&db, scope, &sent).await,
+            Resolution::Sent,
+        )
+        .await
+        .expect("resolve sent");
+    assert_eq!(
+        messages.resend(&env, &sent).await.expect("resend"),
+        Resent::NotResendable {
+            state: "sent".to_owned()
+        }
+    );
+
+    assert_eq!(
+        delivery_keys(&db, scope).await,
+        vec![pending.to_string(), sent.to_string()],
+        "a refused resend queues nothing"
+    );
+}
+
+/// A STUCK `sending` row is resendable, because refusing strands it for good.
+///
+/// Migration 0156 left this to a person: a worker that dies mid-delivery leaves a row no other
+/// worker will ever claim, and the database cannot know whether the provider accepted. Refusing
+/// here would make that row permanently undeliverable with no recovery path at all.
+#[tokio::test]
+async fn a_stuck_sending_message_can_be_recovered_by_an_operator() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x163);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .messages()
+        .claim_for_delivery(&id)
+        .await
+        .expect("claim");
+    assert_eq!(
+        claimed,
+        Some(0),
+        "the claim moved it to sending, at generation 0"
+    );
+
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .messages()
+            .resend(&env, &id)
+            .await
+            .expect("resend"),
+        Resent::Requeued { attempt: 1 },
+        "a stuck sending row is the operator's to recover"
+    );
+}
+
+/// A resend to a SUPPRESSED recipient is refused, and the refusal names the reason.
+///
+/// Being an operator does not override a hard bounce or a spam complaint: those are
+/// obligations to the recipient, and criterion 6 does not carve out an authenticated caller.
+#[tokio::test]
+async fn a_resend_to_a_suppressed_recipient_is_blocked() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x164);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+    let messages = db.store().scoped(scope).messages();
+    messages
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed { reason: "bounced" },
+        )
+        .await
+        .expect("resolve failed");
+
+    let record = messages.by_id(&id).await.expect("read").expect("row");
+    suppress(
+        &db,
+        scope,
+        &record.recipient_bidx,
+        SuppressionReason::HardBounce.token(),
+    )
+    .await;
+
+    assert_eq!(
+        messages.resend(&env, &id).await.expect("resend"),
+        Resent::Suppressed {
+            reason: SuppressionReason::HardBounce.token().to_owned()
+        }
+    );
+    assert_eq!(
+        delivery_keys(&db, scope).await,
+        vec![id.to_string()],
+        "a suppressed resend queues nothing"
+    );
+    assert_eq!(
+        messages.by_id(&id).await.expect("read").expect("row").state,
+        "failed",
+        "and it does not move the row: a suppressed message is not pending delivery"
+    );
+
+    // THE NEGATIVE, varying one dimension. Another recipient in the SAME scope, suppressed
+    // nowhere, must still resend: without this the lookup can ignore `recipient_bidx` entirely
+    // and refuse every resend in a scope that has any suppression at all.
+    let (_, other) = send_with_id(&db, &env, scope, "email_otp", "grace@example.test", 1_000).await;
+    messages
+        .resolve(
+            &other,
+            generation_of(&db, scope, &other).await,
+            Resolution::Failed { reason: "bounced" },
+        )
+        .await
+        .expect("resolve failed");
+    assert_eq!(
+        messages.resend(&env, &other).await.expect("resend"),
+        Resent::Requeued { attempt: 1 },
+        "one recipient's suppression must not block another's resend"
+    );
+}
+
+/// Once the delivery payload has been reaped, a resend REFUSES rather than mailing a blank.
+///
+/// The ledger deliberately holds no rendered body (0154), so the template variables live only
+/// on the outbox job. Re-queueing without them would deliver a message with empty placeholders,
+/// which SENDS and is useless, and the recipient is the one who finds out.
+#[tokio::test]
+async fn a_resend_refuses_once_the_delivery_payload_is_gone() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x165);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+    let messages = db.store().scoped(scope).messages();
+    messages
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed { reason: "bounced" },
+        )
+        .await
+        .expect("resolve failed");
+
+    // What the retention sweep eventually does to a completed job.
+    sqlx::query(
+        "DELETE FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(MESSAGE_DELIVERY_CONSUMER)
+    .execute(db.owner_pool())
+    .await
+    .expect("reap the job");
+
+    assert_eq!(
+        messages.resend(&env, &id).await.expect("resend"),
+        Resent::PayloadExpired
+    );
+    assert!(
+        delivery_keys(&db, scope).await.is_empty(),
+        "nothing is queued for a message whose variables are gone"
+    );
+    assert_eq!(
+        messages.by_id(&id).await.expect("read").expect("row").state,
+        "failed",
+        "and the row is NOT left pending with no job to deliver it, which would read to an \
+         operator exactly like mail that is merely slow"
+    );
+}
+
+/// Reaping only the ORIGINAL job does not make a resent message unresendable.
+///
+/// The payload lookup reads the LAST attempt's job, and this is what pins that. Deleting every
+/// delivery job (as the test above does) is satisfied by a lookup that ignores the attempt
+/// discriminator entirely, or the message identity: with attempt 1's job still present, a
+/// lookup keyed on the bare id finds nothing and refuses a resend that should succeed.
+#[tokio::test]
+async fn reaping_the_original_job_does_not_strand_a_message_that_was_already_resent() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x167);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+    let messages = db.store().scoped(scope);
+    let messages = messages.messages();
+    for attempt in 1..=2 {
+        messages
+            .resolve(
+                &id,
+                generation_of(&db, scope, &id).await,
+                Resolution::Failed { reason: "bounced" },
+            )
+            .await
+            .expect("resolve failed");
+        if attempt == 2 {
+            // Retention reaps the ORIGINAL only. Attempt 1's job is still there, and it is the
+            // one the next resend must read.
+            sqlx::query(
+                "DELETE FROM outbox_messages \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
+                   AND idempotency_key = $4",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(MESSAGE_DELIVERY_CONSUMER)
+            .bind(id.to_string())
+            .execute(db.owner_pool())
+            .await
+            .expect("reap the original job only");
+        }
+        assert_eq!(
+            messages.resend(&env, &id).await.expect("resend"),
+            Resent::Requeued { attempt },
+            "attempt {attempt} must find the previous attempt's payload"
+        );
+    }
+}
+
+/// A message id from another scope is not resendable, and queues nothing.
+///
+/// The third member of the family the two existing cross-scope tests belong to, varying one
+/// dimension: a sibling ENVIRONMENT of the same tenant.
+#[tokio::test]
+async fn a_message_id_from_another_scope_cannot_be_resent() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x168);
+    let scope = db.seed_scope(&env).await;
+    // A sibling ENVIRONMENT of the SAME tenant, so exactly one dimension varies. `seed_scope`
+    // mints a fresh tenant too, and a fixture that differs on both cannot say which one the
+    // guard is reading -- a scope check that compared only tenants would pass it.
+    let other = Scope::new(
+        scope.tenant(),
+        db.seed_environment(&env, scope.tenant()).await,
+    );
+    provision_keys(&db, &env, scope).await;
+
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+    db.store()
+        .scoped(scope)
+        .messages()
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed { reason: "bounced" },
+        )
+        .await
+        .expect("resolve failed");
+
+    assert!(
+        db.store()
+            .scoped(other)
+            .messages()
+            .resend(&env, &id)
+            .await
+            .is_err(),
+        "a scope may not resend another scope's message"
+    );
+    assert_eq!(
+        delivery_keys(&db, scope).await,
+        vec![id.to_string()],
+        "and nothing is queued"
+    );
+}
+
+/// `resend_count` cannot go negative: the CHECK the migration adds is real.
+#[tokio::test]
+async fn the_resend_count_cannot_be_driven_negative() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x169);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+
+    let refused = sqlx::query("UPDATE messages SET resend_count = -1 WHERE id = $1")
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await;
+    assert!(
+        refused.is_err(),
+        "the CHECK must refuse a negative count even to the owner"
+    );
+}
+
+/// Two concurrent resends of one message queue ONE job, not two.
+///
+/// The move out of a terminal state is the guard: predicate and write are ONE statement, so two
+/// callers serialise on the row lock and the loser affects zero rows. A SELECT-then-UPDATE
+/// would let both observe `failed` and both queue, mailing the same person twice through the
+/// recovery path.
+///
+/// # Why this holds a lock instead of just spawning tasks
+///
+/// Spawning four tasks does not produce the race. Each `resend` awaits its own round trips and
+/// they interleave in whatever order the runtime picks, so in practice the first finishes
+/// before the second reads: review measured a SELECT-then-UPDATE passing that shape 25 times
+/// out of 25. A test for a race that never occurs is a test of nothing.
+///
+/// So the interleaving is FORCED. An outside transaction takes `SELECT ... FOR UPDATE` on the
+/// row. Both callers' opening reads are plain MVCC reads and pass straight through it, so BOTH
+/// observe `failed`; both then block on the lock at their UPDATE. Releasing it lets exactly one
+/// through, and the other re-evaluates its predicate under READ COMMITTED against the row the
+/// winner left. That is precisely the interleaving a SELECT-then-UPDATE loses to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_resends_of_one_message_queue_one_job() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x166);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+    db.store()
+        .scoped(scope)
+        .messages()
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed { reason: "bounced" },
+        )
+        .await
+        .expect("resolve failed");
+
+    // The barrier: hold the row until both callers have read it.
+    let mut gate = db.owner_pool().begin().await.expect("begin the gate");
+    sqlx::query("SELECT id FROM messages WHERE id = $1 FOR UPDATE")
+        .bind(id.to_string())
+        .fetch_one(&mut *gate)
+        .await
+        .expect("lock the row");
+
+    let db = Arc::new(db);
+    let env = Arc::new(env);
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let db = Arc::clone(&db);
+        let env = Arc::clone(&env);
+        handles.push(tokio::spawn(async move {
+            db.store()
+                .scoped(scope)
+                .messages()
+                .resend(&env, &id)
+                .await
+                .expect("resend")
+        }));
+    }
+
+    // Both callers are now past their read and parked on the lock. Release it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    gate.commit().await.expect("release the gate");
+
+    let mut requeued = 0_usize;
+    for handle in handles {
+        if matches!(handle.await.expect("task"), Resent::Requeued { .. }) {
+            requeued += 1;
+        }
+    }
+    assert_eq!(
+        requeued, 1,
+        "exactly one caller may re-queue a message, however they interleave"
+    );
+    assert_eq!(
+        delivery_keys(&db, scope).await,
+        vec![id.to_string(), format!("{id}#1")],
+        "and exactly one extra job exists"
+    );
 }

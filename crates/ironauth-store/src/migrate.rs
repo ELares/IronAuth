@@ -1238,6 +1238,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0157_message_suppressions.sql"),
         },
+        Migration {
+            version: 158,
+            name: "messages_resend_count",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0158_messages_resend_count.sql"),
+        },
     ]
 }
 

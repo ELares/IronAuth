@@ -21,7 +21,7 @@ use ironauth_store::message_rate::RateBudget;
 use ironauth_store::message_template::{Locale, TemplateLevel};
 use ironauth_store::outbox::OutboxConsumer;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{CorrelationId, MessageId, NewMessage, OutboxMessage, Scope};
+use ironauth_store::{CorrelationId, MessageId, NewMessage, OutboxMessage, Resent, Scope};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
@@ -652,5 +652,476 @@ async fn a_template_read_failure_releases_the_claim_rather_than_stranding_the_ro
         ("pending".to_owned(), None),
         "the row must be claimable again; left in `sending` it is sent by nobody and \
          finished by nobody"
+    );
+}
+
+/// A RESEND job delivers, and is the test that was missing (issue #111 criterion 1).
+///
+/// Every test above hands the consumer a job whose idempotency key IS the message id, because
+/// that was the only key shape the store produced. A resend files attempt N under `<id>#N`, and
+/// the consumer parsed the whole key as a `MessageId`; `#` is not base64url, so every resend
+/// job was dead-lettered as unparseable without any provider being reached, and left its row
+/// `pending` where the resend compare-and-swap can no longer reach it -- strictly worse than
+/// the `failed` it started from.
+///
+/// The whole suite stayed green through that, because nothing here had ever run a resend job.
+/// This drives one end to end: a provider must be reached and the row must resolve.
+#[tokio::test]
+async fn a_resend_job_reaches_a_provider_and_resolves_the_row() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x140);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    // Deliver the original and have it REJECTED, so the row reaches `failed` and is resendable.
+    let (id, job) = enqueue_send(&db, &env, scope, "ada@example.test").await;
+    let (rejecting, _) = provider("rejecting", Outcome::MessageRejected);
+    let composer = Arc::new(RecordingComposer::default());
+    MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![rejecting],
+        Arc::clone(&composer) as Arc<dyn MessageComposer>,
+    )
+    .handle(&env, scope, &job)
+    .await
+    .expect("first pass handled");
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("failed".to_owned(), Some("message_rejected".to_owned()))
+    );
+
+    // Complete the original job, as the outbox does, so only the resend job remains claimable.
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .complete(&env, &job)
+        .await
+        .expect("complete the original job");
+
+    let resent = db
+        .store()
+        .scoped(scope)
+        .messages()
+        .resend(&env, &id)
+        .await
+        .expect("resend");
+    assert_eq!(resent, Resent::Requeued { attempt: 1 });
+
+    let resend_job = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            "message.delivery",
+            std::time::Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .next()
+        .expect("the resend job is queued");
+    assert!(
+        resend_job.idempotency_key.ends_with("#1"),
+        "the fixture must really be driving a RESEND job, or this test proves nothing: {}",
+        resend_job.idempotency_key
+    );
+
+    let (delivering, delivering_tries) = provider("delivering", Outcome::Delivered);
+    MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![delivering],
+        Arc::clone(&composer) as Arc<dyn MessageComposer>,
+    )
+    .handle(&env, scope, &resend_job)
+    .await
+    .expect("the resend job must be handled, not dead-lettered as unparseable");
+
+    assert_eq!(
+        delivering_tries.load(Ordering::Relaxed),
+        1,
+        "a provider must actually be reached: the defect this test exists for reached none"
+    );
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("sent".to_owned(), None),
+        "and the row resolves, rather than being stranded `pending` with no job behind it"
+    );
+}
+
+/// A worker that loses its message to a resend cannot resolve it, and cannot release it.
+///
+/// A resend moves a `sending` row back to `pending` and bumps `resend_count`, so a worker still
+/// mid-delivery is holding a claim on a message that has moved on. Without a generation token
+/// its `resolve` would mark the row `sent` and silently void the resend, or its `release_claim`
+/// would drag the row back underneath whichever worker took the new job and arm a third
+/// delivery of the same mail.
+#[tokio::test]
+async fn a_stale_worker_cannot_resolve_a_message_that_was_resent_under_it() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x141);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, _job) = enqueue_send(&db, &env, scope, "ada@example.test").await;
+    let messages = db.store().scoped(scope);
+    let messages = messages.messages();
+
+    // A worker claims it and is granted generation 0.
+    let generation = messages
+        .claim_for_delivery(&id)
+        .await
+        .expect("claim")
+        .expect("claimed");
+    assert_eq!(generation, 0);
+
+    // An operator resends the STUCK `sending` row, which 0156 leaves to a person.
+    assert_eq!(
+        messages.resend(&env, &id).await.expect("resend"),
+        Resent::Requeued { attempt: 1 }
+    );
+
+    // The stale worker finishes and tries to record its outcome.
+    assert!(
+        messages
+            .resolve(&id, generation, ironauth_store::Resolution::Sent)
+            .await
+            .is_err(),
+        "a worker holding generation 0 must not resolve a message now at generation 1: doing \
+         so marks it sent and the queued resend never delivers"
+    );
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("pending".to_owned(), None),
+        "the row stays deliverable for the resend job"
+    );
+
+    // And it cannot drag the row back under a worker that took the new job either.
+    let next = messages
+        .claim_for_delivery(&id)
+        .await
+        .expect("claim")
+        .expect("the resend job's worker claims it");
+    assert_eq!(next, 1, "the new claim carries the new generation");
+    messages
+        .release_claim(&id, generation)
+        .await
+        .expect("the call succeeds");
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("sending".to_owned(), None),
+        "a stale release must not move a row the current worker holds"
+    );
+}
+
+/// Drive a message to `failed`, resend it, and hand back the RESEND job.
+///
+/// Every other fixture here uses a fresh message, where the generation is 0 -- and a hardcoded
+/// `0` is indistinguishable from the granted value at every call site. Only a job at generation
+/// >= 1 can tell them apart, which is why the release arms below all start here.
+async fn resend_job(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    recipient: &str,
+) -> (MessageId, OutboxMessage) {
+    let (id, job) = enqueue_send(db, env, scope, recipient).await;
+    let (rejecting, _) = provider("rejecting", Outcome::MessageRejected);
+    MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![rejecting],
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    )
+    .handle(env, scope, &job)
+    .await
+    .expect("first pass");
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .complete(env, &job)
+        .await
+        .expect("complete the original job");
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .messages()
+            .resend(env, &id)
+            .await
+            .expect("resend"),
+        Resent::Requeued { attempt: 1 }
+    );
+    let job = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            "message.delivery",
+            std::time::Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim")
+        .into_iter()
+        .next()
+        .expect("the resend job");
+    assert!(
+        job.idempotency_key.ends_with("#1"),
+        "the fixture must be at generation 1, or a hardcoded 0 passes: {}",
+        job.idempotency_key
+    );
+    (id, job)
+}
+
+/// A resend job RELEASES its claim when every provider is down.
+///
+/// The release arms are where a wrong generation is silent: `release_claim` reports whether it
+/// released, but the consumer cannot invent the value, and every other test runs at generation
+/// 0 where a hardcoded `0` is correct by accident. Under a `0` here the row stays `sending`
+/// with a retry queued behind it -- claimed by nobody, finished by nobody, retry budget never
+/// spent, which is the exact harm `release_then`'s own doc names.
+#[tokio::test]
+async fn a_resend_job_releases_its_claim_when_every_provider_is_down() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x142);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = resend_job(&db, &env, scope, "ada@example.test").await;
+    let (down, _) = provider("down", Outcome::ProviderUnavailable);
+    let outcome = MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![down],
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    )
+    .handle(&env, scope, &job)
+    .await;
+
+    assert!(outcome.is_err(), "an outage is retryable");
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("pending".to_owned(), None),
+        "the resend job must RELEASE its claim on an outage, or the row is stuck `sending` with \
+         a retry queued behind it that nobody will ever claim"
+    );
+}
+
+/// A resend job with no providers configured dead-letters and leaves the row sendable.
+///
+/// The second release arm, driven at generation 1 for the same reason.
+#[tokio::test]
+async fn a_resend_job_with_no_providers_leaves_the_row_sendable() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x143);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = resend_job(&db, &env, scope, "ada@example.test").await;
+    let outcome = MessageDeliveryConsumer::new(
+        db.store().clone(),
+        Vec::new(),
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    )
+    .handle(&env, scope, &job)
+    .await;
+
+    assert!(outcome.is_err(), "a deployment error dead-letters");
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("pending".to_owned(), None),
+        "the row stays sendable once a provider is configured, rather than stuck `sending`"
+    );
+}
+
+/// A resend job whose recipient cannot be opened releases its claim.
+///
+/// The third release arm: `release_then`, pre-delivery. Driven at generation 1.
+#[tokio::test]
+async fn a_resend_job_releases_its_claim_when_the_recipient_cannot_be_opened() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x144);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = resend_job(&db, &env, scope, "ada@example.test").await;
+    // CORRUPT the seal rather than clearing it. An ABSENT seal is a different path -- it is
+    // recorded and finished (`a_row_without_a_sealed_recipient_is_recorded_not_retried`) --
+    // and it was the first thing I reached for. `release_then("recipient_unopenable")` fires
+    // when the seal is present and will not OPEN, which is the arm under test here.
+    sqlx::query("UPDATE messages SET recipient_sealed = $2 WHERE id = $1")
+        .bind(id.to_string())
+        .bind(vec![0_u8; 64])
+        .execute(db.owner_pool())
+        .await
+        .expect("corrupt the seal");
+
+    let (never, never_tries) = provider("never", Outcome::Delivered);
+    let outcome = MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![never],
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    )
+    .handle(&env, scope, &job)
+    .await;
+
+    assert!(outcome.is_err(), "an unopenable recipient is not a send");
+    assert_eq!(never_tries.load(Ordering::Relaxed), 0, "nothing was mailed");
+    assert_ne!(
+        state_of(&db, scope, &id).await.0,
+        "sending",
+        "a pre-delivery failure must not strand the row in `sending`"
+    );
+}
+
+/// A resend job that is REJECTED resolves the row failed, at its own generation.
+///
+/// The `Resolution::Failed` arms are the other half of the fence. Every fixture that reached
+/// them ran at generation 0, so a hardcoded `0` was correct by accident: under it the resolve
+/// silently affects no rows, the ledger keeps saying `pending`, and an operator watching the
+/// status surface sees a send that never finishes and never fails.
+#[tokio::test]
+async fn a_rejected_resend_job_records_its_failure_at_its_own_generation() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x145);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = resend_job(&db, &env, scope, "ada@example.test").await;
+    let (rejecting, tries) = provider("rejecting-again", Outcome::MessageRejected);
+    MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![rejecting],
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    )
+    .handle(&env, scope, &job)
+    .await
+    .expect("a rejection is finished, not deferred");
+
+    assert_eq!(tries.load(Ordering::Relaxed), 1, "the provider saw it");
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("failed".to_owned(), Some("message_rejected".to_owned())),
+        "the resend's failure must be RECORDED: a resolve at the wrong generation affects no \
+         rows and leaves the ledger claiming the send is still pending"
+    );
+}
+
+/// A resend job whose composition is refused records its reason, at its own generation.
+///
+/// The pre-delivery `Resolution::Failed` arm, driven at generation 1 for the same reason.
+#[tokio::test]
+async fn a_refused_resend_composition_records_its_reason_at_its_own_generation() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x146);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = resend_job(&db, &env, scope, "ada@example.test").await;
+    let (never, never_tries) = provider("never", Outcome::Delivered);
+    let composer = Arc::new(RecordingComposer {
+        seen: std::sync::Mutex::new(Vec::new()),
+        templates_seen: std::sync::Mutex::new(Vec::new()),
+        refuse: Some("suppressed".to_owned()),
+    });
+    MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![never],
+        composer as Arc<dyn MessageComposer>,
+    )
+    .handle(&env, scope, &job)
+    .await
+    .expect("a refusal is finished, not deferred");
+
+    assert_eq!(never_tries.load(Ordering::Relaxed), 0, "nothing was mailed");
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("failed".to_owned(), Some("suppressed".to_owned())),
+        "the refusal must be recorded against the resend's own generation"
+    );
+}
+
+/// A resend job for a row with NO sealed recipient is recorded, at its own generation.
+///
+/// The pre-0155 row: nothing can ever seal it, so retrying cannot help and it is recorded and
+/// finished. The `let _ =` on that resolve makes a wrong generation doubly silent -- the result
+/// is discarded, so even the refusal is thrown away -- and every fixture that reached this arm
+/// ran at generation 0, where a hardcoded `0` is right by accident.
+#[tokio::test]
+async fn a_resend_job_without_a_sealed_recipient_is_recorded_at_its_own_generation() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x147);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = resend_job(&db, &env, scope, "ada@example.test").await;
+    sqlx::query(
+        "UPDATE messages SET recipient_sealed = NULL, pii_dek_version = NULL WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("clear the seal");
+
+    let (never, never_tries) = provider("never", Outcome::Delivered);
+    MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![never],
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    )
+    .handle(&env, scope, &job)
+    .await
+    .expect("recorded, not retried");
+
+    assert_eq!(never_tries.load(Ordering::Relaxed), 0, "nothing was mailed");
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("failed".to_owned(), Some("no_sealed_recipient".to_owned())),
+        "the record must land against the resend's own generation, or the row stays `pending` \
+         for ever with nothing able to deliver it"
+    );
+}
+
+/// A resend job releases its claim when the scope's templates cannot be READ.
+///
+/// A template read failure is transient, so the row must go back to `pending` rather than be
+/// resolved failed -- composing from the built-in would silently send the wrong wording. The
+/// read is made to fail by revoking the app plane's SELECT on `message_templates` for the
+/// duration, which is the closest thing to the real fault (a permission or connectivity
+/// problem) that a test can arrange deterministically.
+#[tokio::test]
+async fn a_resend_job_releases_its_claim_when_templates_cannot_be_read() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x148);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = resend_job(&db, &env, scope, "ada@example.test").await;
+    sqlx::query("REVOKE SELECT ON message_templates FROM ironauth_app")
+        .execute(db.owner_pool())
+        .await
+        .expect("revoke the read");
+
+    let (never, never_tries) = provider("never", Outcome::Delivered);
+    let outcome = MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![never],
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    )
+    .handle(&env, scope, &job)
+    .await;
+
+    sqlx::query("GRANT SELECT ON message_templates TO ironauth_app")
+        .execute(db.owner_pool())
+        .await
+        .expect("restore the read");
+
+    assert!(outcome.is_err(), "a template read failure is retryable");
+    assert_eq!(never_tries.load(Ordering::Relaxed), 0, "nothing was mailed");
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("pending".to_owned(), None),
+        "the claim must be RELEASED so the retry can take it, rather than stranding the row in \
+         `sending` where nobody will claim it and nobody will finish it"
     );
 }
