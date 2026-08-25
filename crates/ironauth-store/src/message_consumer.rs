@@ -92,6 +92,29 @@ pub trait MessageComposer: Send + Sync + std::fmt::Debug {
     ) -> Result<PreparedMessage, String>;
 }
 
+/// Release the claim, then report `label` as retryable.
+///
+/// For PRE-DELIVERY failures only, and the restriction is the whole point. The claim moved the
+/// row to `sending`; a retryable error that leaves it there strands it, because the next
+/// attempt loses the claim, returns `Ok`, and the outbox marks the JOB complete. No send, no
+/// failure, no dead letter, and the retry budget never spent.
+///
+/// Releasing AFTER a provider has seen the message would re-offer it and mail the recipient
+/// twice, which is the exact harm the claim exists to prevent. So the post-delivery arms
+/// resolve or retry without releasing, deliberately.
+async fn release_then(
+    messages: &crate::repository::MessageRepo<'_>,
+    id: &crate::id::MessageId,
+    label: &'static str,
+) -> ConsumerError {
+    if messages.release_claim(id).await.is_err() {
+        // The release itself failed. Retry anyway: the row stays `sending` and this attempt is
+        // not recorded as a completion, which is the safe direction.
+        return ConsumerError::retryable("release_failed");
+    }
+    ConsumerError::retryable(label)
+}
+
 /// Drains `message.delivery` and resolves each row (issue #111 criterion 1).
 pub struct MessageDeliveryConsumer {
     store: Store,
@@ -173,10 +196,10 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                 return Ok(());
             }
 
-            let recipient = messages
-                .open_recipient(&id)
-                .await
-                .map_err(|_| ConsumerError::retryable("recipient_unopenable"))?;
+            // Pre-delivery: release, as above. Nothing has reached a provider.
+            let Ok(recipient) = messages.open_recipient(&id).await else {
+                return Err(release_then(&messages, &id, "recipient_unopenable").await);
+            };
             let Some(recipient) = recipient else {
                 // A row from before migration 0155 carries no sealed recipient and never can:
                 // there is no plaintext anywhere to seal it from. Retrying cannot fix that, so
@@ -196,11 +219,9 @@ impl OutboxConsumer for MessageDeliveryConsumer {
             // rather than a broken message, so it retries instead of resolving the row failed:
             // composing from the built-in when a configured template merely could not be READ
             // would silently send the wrong wording and record it as a success.
-            let configured = repo
-                .message_templates()
-                .candidates_for(&record.kind)
-                .await
-                .map_err(|_| ConsumerError::retryable("template_read_failed"))?;
+            let Ok(configured) = repo.message_templates().candidates_for(&record.kind).await else {
+                return Err(release_then(&messages, &id, "template_read_failed").await);
+            };
 
             let prepared = match self.composer.compose(
                 scope,
