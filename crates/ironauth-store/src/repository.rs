@@ -22523,6 +22523,20 @@ pub enum Enqueued {
     Collapsed,
 }
 
+/// How a delivery attempt ended (issue #111 criterion 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution<'r> {
+    /// A provider accepted it.
+    Sent,
+    /// Nobody accepted it. Carries a CLASSIFICATION, never a provider's raw response: those
+    /// carry recipient data and provider-side identifiers, and this column is read by an
+    /// operator answering "why did this not arrive".
+    Failed {
+        /// Why, as a short stable reason.
+        reason: &'r str,
+    },
+}
+
 /// The outbound message repository (issue #111).
 pub struct MessageRepo<'a> {
     store: &'a Store,
@@ -22579,10 +22593,21 @@ impl MessageRepo<'_> {
             let _ = write!(ordering_key, "{byte:02x}");
         }
         let mut tx = begin_scoped(self.store, scope).await?;
+        // The address, sealed under the scope's active DEK. The consumer cannot mail a blind
+        // index, so a queued send has to be able to recover what it is sending to; sealing it
+        // here is what keeps that out of the outbox payload, which every consumer worker reads
+        // in the clear. See migration 0155.
+        let (dek_version, dek) = fetch_active_dek(&mut tx, scope, master).await?;
+        let sealed = dek.seal(
+            env.entropy(),
+            &message_recipient_seal_aad(scope, dek_version),
+            message.recipient.as_bytes(),
+        );
         let inserted = sqlx::query(
             "INSERT INTO messages \
-             (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+             (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key, \
+              recipient_sealed, pii_dek_version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (tenant_id, environment_id, dedup_key) DO NOTHING",
         )
         .bind(message.id.to_string())
@@ -22591,6 +22616,8 @@ impl MessageRepo<'_> {
         .bind(message.kind)
         .bind(bidx.as_bytes())
         .bind(message.dedup_key)
+        .bind(sealed.into_bytes())
+        .bind(dek_version)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -22620,6 +22647,47 @@ impl MessageRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(Enqueued::Accepted)
+    }
+
+    /// Record how a delivery attempt ended.
+    ///
+    /// The consumer calls this exactly once per message, and the column-scoped UPDATE grant in
+    /// migration 0154 is what stops it from touching anything else: it may write the state, the
+    /// reason and the timestamp, and not the recipient index or the dedup key. A plane that
+    /// could rewrite a dedup key could replay a send the collapse already refused.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or names no row;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve(&self, id: &MessageId, outcome: Resolution<'_>) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let (state, reason) = match outcome {
+            Resolution::Sent => ("sent", None),
+            Resolution::Failed { reason } => ("failed", Some(reason)),
+        };
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let updated = sqlx::query(
+            "UPDATE messages SET state = $1, failure_reason = $2, updated_at = now() \
+             WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 AND state = 'pending'",
+        )
+        .bind(state)
+        .bind(reason)
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        if updated == 0 {
+            // Either no such row in this scope, or it is already resolved. Both are the same
+            // answer to the caller: this message is not yours to finish.
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
     }
 
     /// Read one message back by id.
@@ -55787,6 +55855,8 @@ const EMAIL_FACTOR_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.email-factor-
 const EMAIL_FACTOR_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.email-factor-recipient.v1";
 /// The blind-index label for a `messages` recipient (issue #111).
 const MESSAGE_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.message-recipient.v1";
+/// The envelope label for a sealed `messages` recipient (issue #111).
+const MESSAGE_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.message-recipient.v1";
 /// The AAD label domain-separating a sealed recipient phone number on an
 /// `sms_otp_codes` row (issue #70) from every other envelope context, so a phone
 /// ciphertext never authenticates under another column's context.
@@ -56449,6 +56519,21 @@ fn message_recipient_bidx_aad(scope: Scope, recipient: &str) -> Aad {
         .text(&scope.tenant().to_string())
         .text(&scope.environment().to_string())
         .field(recipient.as_bytes())
+        .build()
+}
+
+/// The associated data binding a sealed `messages` recipient to its scope and the DEK version
+/// that sealed it (issue #111).
+///
+/// Its own label, distinct from the email-factor seal. A seal is only openable in the context
+/// it was made in, so sharing a label would let a `messages` row's recipient be opened as
+/// though it were an `email_otp_codes` row's and the other way round.
+fn message_recipient_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(MESSAGE_RECIPIENT_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
         .build()
 }
 
