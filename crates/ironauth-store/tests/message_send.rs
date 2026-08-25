@@ -475,7 +475,7 @@ async fn enqueue_refuses_an_identifier_from_another_scope_and_writes_nothing() {
 /// CI's ironbus lane for thirty minutes: `ALTER TABLE` takes an ACCESS EXCLUSIVE lock, and in
 /// that lane a live consumer is polling the same table, so the ALTER queued behind it and
 /// every later reader queued behind the ALTER. Occupying the outbox's unique
-/// (tenant, environment, consumer, idempotency_key) with the id this enqueue is about to use
+/// (tenant, environment, consumer, `idempotency_key`) with the id this enqueue is about to use
 /// needs only a row lock, and fails the insert for exactly the reason the test is about.
 #[tokio::test]
 async fn a_failed_delivery_job_takes_the_message_row_with_it() {
