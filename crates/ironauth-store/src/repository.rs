@@ -21561,6 +21561,9 @@ pub const WEBHOOK_EVENT_CONSUMER: &str = "webhook.event";
 /// three.
 pub const MESSAGE_DELIVERY_CONSUMER: &str = "message.delivery";
 
+/// The event type a rate-limited send emits (issue #111 criterion 5).
+pub const MESSAGE_RATE_LIMITED_EVENT: &str = "message.rate_limited";
+
 /// The largest exponential-backoff delay, in seconds, a retry schedule may reach
 /// (issue #104). The doubling is capped here rather than left to overflow, so a
 /// long-lived poison message's next attempt stays a number an operator can reason about
@@ -22552,7 +22555,9 @@ pub enum Enqueued {
 /// sends all pass a budget of one. Returns the refusal, or [`None`] to proceed.
 async fn hygiene_refusal(
     tx: &mut sqlx::Transaction<'_, Postgres>,
+    env: &Env,
     scope: Scope,
+    kind: &str,
     bidx: &BlindIndex,
     budget: RateBudget,
     now_epoch_seconds: u64,
@@ -22615,8 +22620,49 @@ async fn hygiene_refusal(
         // The oldest counted send leaves the window one window after it was made, which
         // is the earliest instant a retry could succeed.
         let oldest = u64::try_from(counted.1.unwrap_or(0)).unwrap_or(0);
+        let retry_after_epoch_seconds = oldest.saturating_add(budget.window_seconds);
+
+        // CRITERION 5 asks that exceeding the limit both block the send AND emit this, and the
+        // conjunction is the point: a block nobody can observe is indistinguishable to an
+        // operator from mail that silently never arrived, which is the complaint the criterion
+        // exists to answer.
+        //
+        // In the SAME transaction as the decision. An event emitted outside it could announce
+        // a refusal that then did not happen, or be lost for one that did.
+        //
+        // The payload carries the blind index, never the address: a rate-limit feed is by
+        // construction a list of the mailboxes under most pressure, and the event stream is
+        // the artifact a tenant hands to third-party sync targets.
+        let event_id = OutboxMessageId::generate(env, &scope).to_string();
+        let payload = serde_json::json!({
+            "recipient_bidx": hex_of(bidx.as_bytes()),
+            "kind": kind,
+            "retry_after_unix_seconds": retry_after_epoch_seconds,
+        });
+        if let Some(envelope) = crate::event_catalog::envelope(
+            &event_id,
+            MESSAGE_RATE_LIMITED_EVENT,
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            epoch_micros(env.clock().now_utc()) / 1_000,
+            &payload,
+        ) {
+            enqueue_domain_event(
+                tx,
+                env,
+                scope,
+                Some(&DomainEvent {
+                    id: &event_id,
+                    // Ordered per RECIPIENT, so one person's refusals arrive in order and
+                    // different people's never wait on each other.
+                    subject: &hex_of(bidx.as_bytes()),
+                    envelope: &envelope,
+                }),
+            )
+            .await?;
+        }
         return Ok(Some(Enqueued::RateLimited {
-            retry_after_epoch_seconds: oldest.saturating_add(budget.window_seconds),
+            retry_after_epoch_seconds,
         }));
     }
     Ok(None)
@@ -22735,8 +22781,16 @@ impl MessageRepo<'_> {
             .await?;
 
         // Suppression and the per-recipient budget, inside the transaction the lock guards.
-        if let Some(refusal) =
-            hygiene_refusal(&mut tx, scope, &bidx, budget, now_epoch_seconds).await?
+        if let Some(refusal) = hygiene_refusal(
+            &mut tx,
+            env,
+            scope,
+            message.kind,
+            &bidx,
+            budget,
+            now_epoch_seconds,
+        )
+        .await?
         {
             tx.commit().await?;
             return Ok(refusal);

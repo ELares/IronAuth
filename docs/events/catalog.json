@@ -1220,6 +1220,33 @@
       "type": "management_key.revoked"
     },
     {
+      "domain": "message",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "recipient_bidx": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "retry_after_unix_seconds": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "recipient_bidx",
+          "kind",
+          "retry_after_unix_seconds"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "message.rate_limited"
+    },
+    {
       "domain": "message_template",
       "payload_schema": {
         "additionalProperties": false,
