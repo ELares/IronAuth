@@ -3907,6 +3907,14 @@ impl OutboxConsumer for GatedConsumer {
 ///
 /// This is the same lesson `SignallingBackbone` above already records for the PRODUCER signal
 /// ("`notify_one`, NOT `notify_waiters`"). It was applied there and missed here.
+///
+/// THREE workers, not one, and that is what makes this test discriminating rather than merely
+/// passing. `notify_one` is the obvious repair for a lost wake and it is the WRONG one here:
+/// it stores a permit for exactly one waiter, so with a pool it wakes one worker and leaves
+/// the rest parked for the interval. With one worker a `notify_one` version of the fix passes
+/// this test, which would have made it a guard that cannot fail in the direction that matters.
+/// Only one message is enqueued, so exactly one worker is mid-pass and the other two are
+/// parked: a correct signal has to reach all three.
 #[tokio::test]
 async fn a_shutdown_that_lands_mid_pass_is_not_lost() {
     let db = TestDatabase::start().await;
@@ -3927,7 +3935,7 @@ async fn a_shutdown_that_lands_mid_pass_is_not_lost() {
         env.clone(),
         Arc::clone(&consumer) as Arc<dyn OutboxConsumer>,
         WorkerSettings {
-            concurrency: 1,
+            concurrency: 3,
             visibility_timeout: Duration::from_secs(30),
             // An hour, so a lost shutdown is unmistakable: the difference between a stop that
             // works and one that does not is not a slow test, it is a hung one.
@@ -3959,4 +3967,94 @@ async fn a_shutdown_that_lands_mid_pass_is_not_lost() {
              was mid-pass has to still be visible when that worker reaches its wait",
         )
         .expect("the shutdown task did not panic");
+}
+
+/// Counts drain passes, so a test can assert a worker STOPPED making them.
+#[derive(Debug, Default)]
+struct PassCounter {
+    passes: std::sync::atomic::AtomicUsize,
+}
+
+impl PassCounter {
+    fn count(&self) -> usize {
+        self.passes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl OutboxObserver for PassCounter {
+    fn pass_finished(&self, _consumer: &str, _scope: Scope, _stats: &DrainStats) {
+        self.passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn pass_failed(&self, _consumer: &str, _scope: Scope, _error: &StoreError) {}
+
+    fn scopes_unavailable(&self, _consumer: &str, _error: &StoreError) {}
+}
+
+/// An idle worker WAITS. Nothing pinned that, and it is one token away at all times.
+///
+/// The pool's whole contract when there is no work is to park until the poll interval or a
+/// backbone signal. Two separate one-token edits break it and, before this test, both survived
+/// the entire 43-test suite: flipping the shutdown watch's initial value from `false` to
+/// `true` makes every `wait_for` return instantly, and setting `poll_interval` to zero makes
+/// the deadline inert. Either turns an idle pool into a continuous Postgres claim loop, which
+/// is the kind of defect that is invisible in a test suite and extremely visible in a
+/// production database.
+///
+/// The assertion is shaped to fail for one reason only. It first WAITS for the first pass
+/// rather than assuming it has landed, because asserting a count after a fixed sleep fails on
+/// a loaded machine for a reason that has nothing to do with the property. Then it requires
+/// the count to be unchanged across a window many times longer than a pass takes: a worker
+/// that is parked makes no further passes, and a worker that is spinning makes hundreds.
+#[tokio::test]
+async fn an_idle_worker_parks_instead_of_spinning() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0xB0_61);
+    let scope = db.seed_scope(&env).await;
+
+    let consumer = CountingConsumer::new(CONSUMER);
+    // ONE counter, handed to the pool as an observer and read back here.
+    let counter = Arc::new(PassCounter::default());
+    let observed: Arc<dyn OutboxObserver> = Arc::clone(&counter) as Arc<dyn OutboxObserver>;
+
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        env.clone(),
+        Arc::clone(&consumer) as Arc<dyn OutboxConsumer>,
+        WorkerSettings {
+            concurrency: 1,
+            visibility_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(3_600),
+            batch: 64,
+            retry: RetryPolicy::default(),
+        },
+    );
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(StaticScopes::new(vec![scope]));
+    let pool = OutboxWorkerPool::spawn(&worker, &scopes, &observed);
+
+    // Wait FOR the first pass rather than assuming it has happened.
+    let mut saw_first = false;
+    for _ in 0..200 {
+        if counter.count() >= 1 {
+            saw_first = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(saw_first, "the pool should make its first pass immediately");
+    let after_first = counter.count();
+
+    // A window many times longer than a pass. A parked worker adds nothing to the count.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let later = counter.count();
+    pool.shutdown().await;
+
+    assert_eq!(
+        later, after_first,
+        "an idle worker must park for its poll interval, not re-claim in a loop: {after_first} \
+         passes then {later}. A pool that keeps passing here is hammering Postgres for as long \
+         as it runs, and nothing else in this suite notices."
+    );
 }

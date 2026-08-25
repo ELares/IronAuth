@@ -174,6 +174,16 @@ impl IronBusBackbone {
                             if backlog_drained {
                                 // `notify_waiters`, not `notify_one`: every worker should
                                 // re-drain; a stored permit would wake exactly one.
+                                //
+                                // KNOWN GAP (issue #982): this is edge-triggered, so a wake
+                                // that lands while every worker is inside its drain pass is
+                                // dropped and they park until `poll_interval`. Reproduced
+                                // deterministically. It costs LATENCY and never an event,
+                                // because the deadline below is never removed, and it is why
+                                // that deadline stays. Fixing it properly needs a per-worker
+                                // cursor on the `wait` seam rather than a different notify
+                                // primitive: `notify_one` would wake exactly one worker,
+                                // which is the thing this comment already refuses.
                                 woken_thread.notify_waiters();
                             }
                         }
