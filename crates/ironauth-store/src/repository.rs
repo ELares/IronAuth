@@ -22649,6 +22649,56 @@ impl MessageRepo<'_> {
         Ok(Enqueued::Accepted)
     }
 
+    /// Open this message's sealed recipient, or [`None`] if it carries none.
+    ///
+    /// The ONLY way an address leaves this table. Returns the live address, so a caller mails
+    /// it and drops it; writing it anywhere is the plaintext column migration 0154 refused.
+    ///
+    /// [`None`] means a row written before migration 0155, which has no sealed recipient and
+    /// never can: there was no plaintext to seal it from. That is a permanent condition, not a
+    /// transient one, and a caller should record it rather than retry it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or names no row;
+    /// [`StoreError::Encryption`] if no master key is configured or the seal will not open;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn open_recipient(&self, id: &MessageId) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT recipient_sealed, pii_dek_version FROM messages \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Err(StoreError::NotFound);
+        };
+        let sealed: Option<Vec<u8>> = row.get("recipient_sealed");
+        let version: Option<i32> = row.get("pii_dek_version");
+        let (Some(sealed), Some(version)) = (sealed, version) else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, version).await?;
+        tx.commit().await?;
+        let plaintext = dek.open(
+            &message_recipient_seal_aad(self.scope, version),
+            &Sealed::from_bytes(sealed)?,
+        )?;
+        String::from_utf8(plaintext)
+            .map(Some)
+            .map_err(|_| StoreError::Encryption)
+    }
+
     /// Record how a delivery attempt ended.
     ///
     /// The consumer calls this exactly once per message, and the column-scoped UPDATE grant in

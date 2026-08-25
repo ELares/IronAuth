@@ -74,6 +74,7 @@ pub mod impersonation;
 pub mod interchange;
 pub mod locale_bundle;
 pub mod log_stream;
+pub mod message_consumer;
 pub mod message_delivery;
 pub mod message_failover;
 pub mod message_feedback;
