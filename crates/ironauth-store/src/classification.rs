@@ -206,8 +206,12 @@ pub enum ResourceType {
     /// per-environment config a snapshot carries and a promotion replays: Promotable.
     ///
     /// The TENANT and ORGANIZATION levels of the same table are NOT this type. A tenant-level
-    /// template is not per-environment, and a per-organization override is runtime data that
-    /// rides org export, never a snapshot, exactly as issue #111 requires.
+    /// template is not per-environment, and a per-organization override is runtime data.
+    ///
+    /// What is SHIPPED is the exclusion: neither level can enter a snapshot or be written by a
+    /// promotion. Issue #111 also asks that per-organization overrides "export with org data",
+    /// and no organization export carries them today. That half is unbuilt, and saying so here
+    /// rather than describing it as done is the difference between a comment and a claim.
     MessageTemplate,
     /// A per-organization named role (issue #97): one entry in an organization's role
     /// set. A role in M10 is a NAME only (what it grants is issue #98). It is scoped to

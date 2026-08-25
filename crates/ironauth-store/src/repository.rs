@@ -60193,6 +60193,18 @@ async fn read_promoted_message_templates(
         locked: row.get("locked"),
     })
     .collect();
+    // Sorted in RUST, and this is defence rather than a measured requirement. Say which:
+    // deleting this sort leaves every test green, because `message_templates_unique_scope` is
+    // `(tenant_id, environment_id, level, kind, locale)` and can serve this predicate in key
+    // order, so the rows already arrive sorted. Measured, by deleting it and running the
+    // suite.
+    //
+    // It stays because nothing in the SCHEMA promises that. This vector's order reaches the
+    // canonical form, whose hash is the revision the drift gate and the no-op branch compare;
+    // a plan change that stopped using that index would make the target's revision depend on
+    // physical row order, and a settled promotion would stop reporting NoOp. That failure
+    // would appear in production under a planner decision no test controls, which is the worst
+    // way to find it.
     message_template.sort_by(|a, b| {
         (a.kind.as_str(), a.locale.as_str()).cmp(&(b.kind.as_str(), b.locale.as_str()))
     });
@@ -61234,6 +61246,11 @@ async fn apply_brand_assets(
 /// promotion can neither overwrite a tenant default nor touch an organization's override, both
 /// of which can share a `(kind, locale)` with the row being promoted; the partial unique index
 /// keeps those in separate slots and this keeps the writer in the same one.
+///
+/// The `organization_id IS NULL` beside it is DEFENCE IN DEPTH and nothing more: 0145's CHECK
+/// already makes `level <> 'organization'` imply a NULL organization, so the level pin alone
+/// decides the row set. It is stated because a reader who took it for the load-bearing half
+/// would be looking at the wrong clause if the level pin were ever dropped.
 async fn apply_message_template_change(
     tx: &mut Transaction<'_, Postgres>,
     scope: Scope,
