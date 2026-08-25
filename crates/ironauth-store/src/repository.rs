@@ -88,18 +88,18 @@ use crate::id::{
     ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, FlowTargetId, FlowVersionId,
     FlowVersionPinId, GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId,
     IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
-    MessageTemplateId, MigrationRunId, MigrationRunRecordId, OperatorId, OrgAuthPolicyId,
-    OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId,
-    OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId, OutboxMessageId,
-    PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId, PushedRequestId,
-    RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId, RecoveryFlowId,
-    RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId,
-    ScopeStepUpPolicyId, ServiceAccountId, SessionId, SigningKeyId, SignupFormId,
-    SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId,
-    TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId,
-    UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
-    WebhookDeliveryAttemptId, WebhookEndpointId,
+    MessageId, MessageTemplateId, MigrationRunId, MigrationRunRecordId, OperatorId,
+    OrgAuthPolicyId, OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
+    OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
+    OutboxMessageId, PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId,
+    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
+    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
+    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
+    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId, SigningKeyId,
+    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
+    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
+    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -535,6 +535,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn outbox(&self) -> OutboxRepo<'a> {
         OutboxRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The outbound message records (issue #111).
+    #[must_use]
+    pub fn messages(&self) -> MessageRepo<'a> {
+        MessageRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -21541,6 +21550,15 @@ pub const OFFBOARDING_CONSUMER: &str = "users.offboarding";
 /// happens to have registered.
 pub const WEBHOOK_EVENT_CONSUMER: &str = "webhook.event";
 
+/// The consumer that delivers an outbound message (issue #111).
+///
+/// A message's delivery is queued rather than performed inline for the reason every outbound
+/// hop in this system is: a send that blocks the request holds a login behind a provider's
+/// latency, and a provider that is down would turn a sign-in into a failure. The queue also
+/// gives retries, a dead-letter tail, and replay for free, because the outbox already has all
+/// three.
+pub const MESSAGE_DELIVERY_CONSUMER: &str = "message.delivery";
+
 /// The largest exponential-backoff delay, in seconds, a retry schedule may reach
 /// (issue #104). The doubling is capped here rather than left to overflow, so a
 /// long-lived poison message's next attempt stays a number an operator can reason about
@@ -22457,6 +22475,208 @@ fn append_lock_key(scope: Scope) -> i64 {
     // than casting says that explicitly: every bit pattern is a valid key, so this is a
     // reinterpretation and not a narrowing that could lose one.
     i64::from_ne_bytes(hasher.finish().to_ne_bytes())
+}
+/// One enqueued outbound message, as an operator reads it back (issue #111).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRecord {
+    /// The `msg_` identifier.
+    pub id: MessageId,
+    /// The message kind, which selects the template.
+    pub kind: String,
+    /// The recipient BLIND INDEX. Never the address: see the migration for why a ledger is
+    /// the worst table to keep a plaintext one in.
+    pub recipient_bidx: Vec<u8>,
+    /// Delivery state: `pending`, `sent`, or `failed`.
+    pub state: String,
+    /// Why a failed delivery failed, as a classification rather than a provider response.
+    pub failure_reason: Option<String>,
+}
+
+/// What enqueuing one outbound message needs (issue #111).
+#[derive(Debug, Clone, Copy)]
+pub struct NewMessage<'a> {
+    /// The `msg_` identifier, minted under this scope.
+    pub id: &'a MessageId,
+    /// The message kind (`email_otp`, `magic_link`, ...).
+    pub kind: &'a str,
+    /// The recipient, which the CALLER must already have normalized with
+    /// `message_hygiene::normalize_recipient`. It is blind-indexed on the way in and never
+    /// stored as written.
+    ///
+    /// The store cannot check that precondition and does not pretend to: normalization is
+    /// not idempotent-detectable from the result, and the same address written two ways
+    /// produces two different blind indexes and two different dedup keys, so an unnormalized
+    /// caller silently loses its own collapse. The doors call `normalize_recipient` once and
+    /// pass the result to both this and `dedup_key`, which is what keeps the two agreeing
+    /// about who the recipient is.
+    pub recipient: &'a str,
+    /// The collapse key from `message_hygiene::dedup_key`.
+    pub dedup_key: &'a str,
+}
+
+/// Whether an enqueue wrote a new message or collapsed onto one already in the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enqueued {
+    /// A new message was written and a delivery job queued.
+    Accepted,
+    /// An identical send is already in this window, so nothing was written or queued.
+    Collapsed,
+}
+
+/// The outbound message repository (issue #111).
+pub struct MessageRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl MessageRepo<'_> {
+    /// Enqueue one outbound message, collapsing a duplicate inside its window.
+    ///
+    /// The message row and its delivery job are written in ONE transaction, which is the
+    /// whole reason the outbox exists: a message recorded without a job never sends, and a
+    /// job queued without a record delivers something no operator can account for. Measured
+    /// by `message_send.rs::a_failed_delivery_job_takes_the_message_row_with_it`, which makes
+    /// the second write fail and requires the first to be gone; asserting only that both are
+    /// present after a success would be satisfied by two sequential commits.
+    ///
+    /// # Why the collapse is a constraint rather than a check
+    ///
+    /// `ON CONFLICT DO NOTHING` on `(tenant, environment, dedup_key)` is race-free.
+    /// A SELECT-then-INSERT is not, and the doors this serves are exactly where the race
+    /// happens: a user double-clicking "email me a code" issues two concurrent requests that
+    /// both read "no row yet" and both insert. The window is already inside the key, so a
+    /// send in a later window hashes differently and inserts cleanly.
+    ///
+    /// Returns [`Enqueued::Collapsed`] when nothing was written, so a caller can tell a
+    /// deduplicated send from a fresh one without a second query. That distinction matters at
+    /// the door: a collapsed send must still answer the user as though it succeeded, because
+    /// telling them "already sent" leaks that the address is registered.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn enqueue(
+        &self,
+        env: &Env,
+        message: NewMessage<'_>,
+        payload: &serde_json::Value,
+    ) -> Result<Enqueued, StoreError> {
+        if message.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidx = message_recipient_blind_index(master, scope, message.recipient);
+        // The outbox ordering key. Per RECIPIENT, so two messages to one person are delivered
+        // in the order they were enqueued and messages to different people never wait on each
+        // other -- but keyed on the INDEX, not the address. `outbox_messages.ordering_key` is
+        // a plaintext column read by every consumer worker, and putting an end-user email in
+        // it would leak exactly what the blind index above exists to avoid storing.
+        let mut ordering_key = String::with_capacity(bidx.as_bytes().len() * 2);
+        for byte in bidx.as_bytes() {
+            use std::fmt::Write as _;
+            let _ = write!(ordering_key, "{byte:02x}");
+        }
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let inserted = sqlx::query(
+            "INSERT INTO messages \
+             (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (tenant_id, environment_id, dedup_key) DO NOTHING",
+        )
+        .bind(message.id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(message.kind)
+        .bind(bidx.as_bytes())
+        .bind(message.dedup_key)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            // Nothing written, so nothing to deliver. Rolling back rather than committing an
+            // empty transaction keeps the "one row, one job" invariant visible.
+            tx.rollback().await?;
+            return Ok(Enqueued::Collapsed);
+        }
+        // The delivery job, in the SAME transaction. Keyed on the message id, which is
+        // unique per row, so this consumer's idempotency key cannot collide with another
+        // send's. Note what that does and does not buy: a retry of a COLLAPSED enqueue never
+        // reaches here at all (the insert above wrote nothing and returned), so the
+        // idempotency key is a second line of defence behind the UNIQUE rather than the
+        // thing doing the deduplication.
+        enqueue_outbox_in_tx(
+            &mut tx,
+            env,
+            scope,
+            &NewOutboxMessage {
+                consumer: MESSAGE_DELIVERY_CONSUMER,
+                idempotency_key: &message.id.to_string(),
+                ordering_key: &ordering_key,
+                payload: payload.clone(),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Enqueued::Accepted)
+    }
+
+    /// Read one message back by id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure or an undecodable stored row.
+    pub async fn by_id(&self, id: &MessageId) -> Result<Option<MessageRecord>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, kind, recipient_bidx, state, failure_reason FROM messages \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let id_text: String = row.get("id");
+                Ok(Some(MessageRecord {
+                    id: MessageId::parse_in_scope(&id_text, &self.scope)?,
+                    kind: row.get("kind"),
+                    recipient_bidx: row.get("recipient_bidx"),
+                    state: row.get("state"),
+                    failure_reason: row.get("failure_reason"),
+                }))
+            }
+        }
+    }
+
+    /// How many messages this scope holds, for the operator listing and for tests that need
+    /// to assert a collapse wrote nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn count(&self) -> Result<i64, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS total FROM messages \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.get("total"))
+    }
 }
 
 /// The generic transactional outbox and lease based job queue (issue #104), keyed to one
@@ -55565,6 +55785,8 @@ const EMAIL_FACTOR_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.email-factor-
 /// `email_otp_codes` / `magic_link_tokens` row (issue #68) from every other keyed
 /// derivation, so a recipient-email index tag never collides across columns or tenants.
 const EMAIL_FACTOR_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.email-factor-recipient.v1";
+/// The blind-index label for a `messages` recipient (issue #111).
+const MESSAGE_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.message-recipient.v1";
 /// The AAD label domain-separating a sealed recipient phone number on an
 /// `sms_otp_codes` row (issue #70) from every other envelope context, so a phone
 /// ciphertext never authenticates under another column's context.
@@ -56211,6 +56433,29 @@ fn email_factor_recipient_seal_aad(scope: Scope, dek_version: i32) -> Aad {
         .text(&scope.environment().to_string())
         .version(i64::from(dek_version))
         .build()
+}
+
+/// The blind-index context for a recipient on a `messages` row (issue #111): the label, the
+/// scope, and the NORMALIZED address, length-prefixed. The per-tenant HMAC key keeps the same
+/// address in two tenants from colliding.
+///
+/// A distinct label from the email-factor index, deliberately. Sharing one would make a
+/// `messages` row and an `email_otp_codes` row for the same address carry the SAME bytes, so
+/// anyone holding one table could join it to the other; separate labels mean each index is
+/// only useful within the table that computed it.
+fn message_recipient_bidx_aad(scope: Scope, recipient: &str) -> Aad {
+    Aad::builder()
+        .text(MESSAGE_RECIPIENT_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(recipient.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a `messages` recipient in `scope` under `master`
+/// (issue #111).
+fn message_recipient_blind_index(master: &MasterKey, scope: Scope, recipient: &str) -> BlindIndex {
+    master.blind_index(&message_recipient_bidx_aad(scope, recipient))
 }
 
 /// The blind-index context for a recipient email on an email-factor row (issue #68): the

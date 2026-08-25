@@ -70,7 +70,7 @@ MINIMUM_CRATES = 8
 # this check would still have printed clean -- which is precisely the silent shrink it exists
 # to make impossible, sitting in the guard itself. A floor is only a floor when it is snug
 # against the number it guards.
-MINIMUM_ENTRIES = 291
+MINIMUM_ENTRIES = 293
 
 
 def autotests_off_narrow(text):

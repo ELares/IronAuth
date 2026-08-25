@@ -1214,6 +1214,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0153_external_issuer_control_grants.sql"),
         },
+        Migration {
+            version: 154,
+            name: "messages",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0154_messages.sql"),
+        },
     ]
 }
 
