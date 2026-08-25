@@ -88,6 +88,8 @@ fn provider(name: &str, outcome: Outcome) -> (Box<dyn MessageProvider>, Arc<Atom
 #[derive(Debug, Default)]
 struct RecordingComposer {
     seen: std::sync::Mutex<Vec<String>>,
+    /// How many CONFIGURED templates the consumer handed over on the last call.
+    templates_seen: std::sync::Mutex<Vec<usize>>,
     refuse: Option<String>,
 }
 
@@ -98,8 +100,13 @@ impl MessageComposer for RecordingComposer {
         kind: &str,
         recipient: &str,
         _payload: &serde_json::Value,
+        configured: &[ironauth_store::MessageTemplateRecord],
     ) -> Result<PreparedMessage, String> {
         self.seen.lock().expect("lock").push(recipient.to_owned());
+        self.templates_seen
+            .lock()
+            .expect("lock")
+            .push(configured.len());
         if let Some(reason) = &self.refuse {
             return Err(reason.clone());
         }
@@ -327,6 +334,7 @@ async fn a_refused_composition_is_recorded_and_finished() {
     let (primary, primary_tries) = provider("primary", Outcome::Delivered);
     let composer = Arc::new(RecordingComposer {
         seen: std::sync::Mutex::new(Vec::new()),
+        templates_seen: std::sync::Mutex::new(Vec::new()),
         refuse: Some("suppressed".to_owned()),
     });
     let consumer = MessageDeliveryConsumer::new(
@@ -547,5 +555,99 @@ async fn no_providers_configured_dead_letters_and_leaves_the_row_sendable() {
         state_of(&db, scope, &id).await,
         ("pending".to_owned(), None),
         "the row must be sendable again once somebody configures a provider"
+    );
+}
+
+/// The consumer LOADS the scope's templates and hands them to the composer.
+///
+/// Deleting the whole `candidates_for` call left every consumer test green, because nothing
+/// looked at what the composer received. A composer handed an empty slice always composes from
+/// the built-in, so every configured template in the deployment would be silently ignored and
+/// the mail would still go out and still be recorded as sent.
+#[tokio::test]
+async fn the_consumer_hands_the_scopes_configured_templates_to_the_composer() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x140);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    // Two live templates for this kind, at different levels.
+    for (level, locale, subject) in [("tenant", "en", "TENANT"), ("environment", "en", "ENV")] {
+        sqlx::query(
+            "INSERT INTO message_templates \
+             (id, tenant_id, environment_id, level, kind, locale, subject, body_text, \
+              created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, 'email_otp', $5, $6, 'body', now(), now())",
+        )
+        .bind(ironauth_store::MessageTemplateId::generate(&env, &scope).to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(level)
+        .bind(locale)
+        .bind(subject)
+        .execute(db.owner_pool())
+        .await
+        .expect("seed a template");
+    }
+
+    let (_, job) = enqueue_send(&db, &env, scope, "ada@example.test").await;
+    let (primary, _) = provider("primary", Outcome::Delivered);
+    let composer = Arc::new(RecordingComposer::default());
+    let consumer = MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![primary],
+        Arc::clone(&composer) as Arc<dyn MessageComposer>,
+    );
+    consumer.handle(&env, scope, &job).await.expect("handled");
+
+    assert_eq!(
+        composer.templates_seen.lock().expect("lock").as_slice(),
+        [2],
+        "both configured templates must reach the composer; an empty slice silently composes \
+         every message from the built-in while still reporting success"
+    );
+}
+
+/// A transient template read RELEASES the claim instead of stranding the row.
+///
+/// The claim moves the row to `sending`. A retryable error that leaves it there strands it: the
+/// next attempt loses the claim, returns Ok, and the outbox marks the JOB complete. No send, no
+/// failure, no dead letter, and the retry budget never spent.
+#[tokio::test]
+async fn a_template_read_failure_releases_the_claim_rather_than_stranding_the_row() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x141);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = enqueue_send(&db, &env, scope, "ada@example.test").await;
+
+    // Make the template read fail for this scope only, and only while the probe runs.
+    sqlx::query("ALTER TABLE message_templates RENAME TO message_templates_probe_hidden")
+        .execute(db.owner_pool())
+        .await
+        .expect("hide the table");
+
+    let (primary, tries) = provider("primary", Outcome::Delivered);
+    let consumer = MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![primary],
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    );
+    let outcome = consumer.handle(&env, scope, &job).await;
+
+    sqlx::query("ALTER TABLE message_templates_probe_hidden RENAME TO message_templates")
+        .execute(db.owner_pool())
+        .await
+        .expect("restore the table");
+
+    let error = outcome.expect_err("a template read failure is not a completion");
+    assert!(error.is_retryable());
+    assert_eq!(tries.load(Ordering::Relaxed), 0, "nothing was sent");
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("pending".to_owned(), None),
+        "the row must be claimable again; left in `sending` it is sent by nobody and \
+         finished by nobody"
     );
 }

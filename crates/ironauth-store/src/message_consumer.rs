@@ -52,7 +52,9 @@ use crate::message_delivery::{MessageProvider, deliver};
 use crate::message_failover::GiveUpReason;
 use crate::message_prepare::PreparedMessage;
 use crate::outbox::{ConsumerError, OutboxConsumer};
-use crate::repository::{MESSAGE_DELIVERY_CONSUMER, OutboxMessage, Resolution};
+use crate::repository::{
+    MESSAGE_DELIVERY_CONSUMER, MessageTemplateRecord, OutboxMessage, Resolution,
+};
 use crate::scope::Scope;
 use crate::store::Store;
 
@@ -69,6 +71,13 @@ pub trait MessageComposer: Send + Sync + std::fmt::Debug {
     /// `recipient` has been opened from the row's sealed copy. It is the live address and must
     /// not be logged or persisted by an implementation.
     ///
+    /// `configured` is every LIVE template this scope defines for this kind, strongest level
+    /// first. Loaded by the CONSUMER rather than by the composer, because loading is IO and a
+    /// composer that reached for a database would be untestable without one. An empty slice is
+    /// the ordinary case, not a failure: it means the deployment has configured nothing, and
+    /// the built-in applies, which is the LAST level of the resolution order issue #111
+    /// specifies rather than a fallback bolted on beside it.
+    ///
     /// # Errors
     ///
     /// A short, non-secret classification. It becomes the row's `failure_reason`, which an
@@ -79,7 +88,31 @@ pub trait MessageComposer: Send + Sync + std::fmt::Debug {
         kind: &str,
         recipient: &str,
         payload: &serde_json::Value,
+        configured: &[MessageTemplateRecord],
     ) -> Result<PreparedMessage, String>;
+}
+
+/// Release the claim, then report `label` as retryable.
+///
+/// For PRE-DELIVERY failures only, and the restriction is the whole point. The claim moved the
+/// row to `sending`; a retryable error that leaves it there strands it, because the next
+/// attempt loses the claim, returns `Ok`, and the outbox marks the JOB complete. No send, no
+/// failure, no dead letter, and the retry budget never spent.
+///
+/// Releasing AFTER a provider has seen the message would re-offer it and mail the recipient
+/// twice, which is the exact harm the claim exists to prevent. So the post-delivery arms
+/// resolve or retry without releasing, deliberately.
+async fn release_then(
+    messages: &crate::repository::MessageRepo<'_>,
+    id: &crate::id::MessageId,
+    label: &'static str,
+) -> ConsumerError {
+    if messages.release_claim(id).await.is_err() {
+        // The release itself failed. Retry anyway: the row stays `sending` and this attempt is
+        // not recorded as a completion, which is the safe direction.
+        return ConsumerError::retryable("release_failed");
+    }
+    ConsumerError::retryable(label)
 }
 
 /// Drains `message.delivery` and resolves each row (issue #111 criterion 1).
@@ -163,10 +196,10 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                 return Ok(());
             }
 
-            let recipient = messages
-                .open_recipient(&id)
-                .await
-                .map_err(|_| ConsumerError::retryable("recipient_unopenable"))?;
+            // Pre-delivery: release, as above. Nothing has reached a provider.
+            let Ok(recipient) = messages.open_recipient(&id).await else {
+                return Err(release_then(&messages, &id, "recipient_unopenable").await);
+            };
             let Some(recipient) = recipient else {
                 // A row from before migration 0155 carries no sealed recipient and never can:
                 // there is no plaintext anywhere to seal it from. Retrying cannot fix that, so
@@ -182,21 +215,31 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                 return Ok(());
             };
 
-            let prepared =
-                match self
-                    .composer
-                    .compose(scope, &record.kind, &recipient, &message.payload)
-                {
-                    Ok(prepared) => prepared,
-                    Err(reason) => {
-                        // Policy refused, or the template is broken. Neither improves on a retry.
-                        messages
-                            .resolve(&id, Resolution::Failed { reason: &reason })
-                            .await
-                            .map_err(|_| ConsumerError::retryable("resolve_failed"))?;
-                        return Ok(());
-                    }
-                };
+            // The scope's own templates, strongest level first. A read failure is TRANSIENT
+            // rather than a broken message, so it retries instead of resolving the row failed:
+            // composing from the built-in when a configured template merely could not be READ
+            // would silently send the wrong wording and record it as a success.
+            let Ok(configured) = repo.message_templates().candidates_for(&record.kind).await else {
+                return Err(release_then(&messages, &id, "template_read_failed").await);
+            };
+
+            let prepared = match self.composer.compose(
+                scope,
+                &record.kind,
+                &recipient,
+                &message.payload,
+                &configured,
+            ) {
+                Ok(prepared) => prepared,
+                Err(reason) => {
+                    // Policy refused, or the template is broken. Neither improves on a retry.
+                    messages
+                        .resolve(&id, Resolution::Failed { reason: &reason })
+                        .await
+                        .map_err(|_| ConsumerError::retryable("resolve_failed"))?;
+                    return Ok(());
+                }
+            };
 
             let report = deliver(&self.providers, &prepared).await;
             if report.delivered_by.is_some() {
