@@ -5,24 +5,42 @@
 --
 -- `enqueue` files the delivery job under `idempotency_key = <message id>` (repository.rs), and
 -- the outbox is UNIQUE on (tenant, environment, consumer, idempotency_key). That is exactly
--- right for the original send and it is fatal for a resend: re-filing the same key collapses
--- into the completed original and DOES NOTHING, with no error anywhere. The operator sees a
--- 200, the ledger says pending, and no mail is ever sent. A resend therefore needs a key the
--- original cannot collide with, and it needs one per ATTEMPT, because a resend that fails can
--- be resent again.
+-- right for the original send and it is fatal for a resend: `enqueue_outbox_in_tx` is the
+-- RAISING enqueue, so re-filing the same key raises a unique violation that aborts the whole
+-- resend transaction. The row never moves and the operator gets a database error rather than a
+-- resend. A resend therefore needs a key the original cannot collide with, and it needs one per
+-- ATTEMPT, because a resend that fails can be resent again.
+--
+-- The silent-collapse reading belongs to `enqueue_outbox_in_tx_ignoring_conflict`, which is a
+-- DIFFERENT function that this path does not call. An earlier draft of this migration asserted
+-- that mechanism, and review measured it wrong. The conclusion is unchanged and the reason is
+-- not, which is worth recording here because this text ships frozen and is what a future reader
+-- will reason from.
 --
 -- The count is that key's discriminator: attempt N files under `<message id>#N`. It is also
 -- the only durable record of how many times an operator re-queued a message, which is the
 -- question "why did this person get four copies" reduces to.
 --
+-- THE KEY NOW HAS A GRAMMAR, AND IT HAS A READER. `MessageDeliveryConsumer` recovers the
+-- message id from the job's key, and it parsed the WHOLE key as an id, which was true only
+-- while the key was the id. `#` is not base64url, so the first version of this change made
+-- every resend job fail to parse and be dead-lettered without any provider being reached,
+-- leaving the row `pending` where the compare-and-swap below can no longer reach it: strictly
+-- worse than the `failed` it started from. `delivery_idempotency_key` and
+-- `delivery_key_message_id` are now inverses sitting beside each other for that reason.
+--
 -- # Why the transition is a compare-and-swap and needs no lock
 --
 -- Resend moves a terminal row back to `pending` with `WHERE state IN ('failed', 'sending')`.
--- Two operators clicking at once serialise on the row lock; the first moves it and the second
+-- Two operators clicking at once serialise on the row lock: the first moves it, and the second
 -- affects zero rows and is told the message is not in a resendable state. There is no window
 -- where both observe `failed`, because the predicate and the write are one statement. A
 -- SELECT-then-UPDATE here would send the same mail twice, which is the failure this whole
 -- table exists to avoid.
+--
+-- What this does NOT do is bound how often a message may be resent. Resolve-then-resend in a
+-- loop is unbounded, and the counter below records it rather than limiting it. The control is
+-- the management permission required to call resend at all.
 --
 -- # Why `sending` is resendable at all
 --

@@ -22555,14 +22555,38 @@ pub enum Enqueued {
 ///
 /// Attempt 0 is the ORIGINAL send and keeps the bare message id, so this is not a format
 /// change: every job already queued keeps the key it was filed under. Each resend appends its
-/// count, because the outbox is UNIQUE on that key and re-filing the original would collapse
-/// into the completed job and queue nothing.
+/// count, because the outbox is UNIQUE on `(tenant, environment, consumer, idempotency_key)`
+/// and `enqueue_outbox_in_tx` is the RAISING enqueue: re-filing the original key raises a
+/// unique violation that aborts the whole resend transaction, so the row never moves and the
+/// operator gets a database error instead of a resend.
+///
+/// (An earlier version of this comment, and of migration 0158, said re-filing would "silently
+/// do nothing" and leave the operator a false success. That is the behaviour of
+/// `enqueue_outbox_in_tx_ignoring_conflict`, which this path does not use. The conclusion --
+/// each attempt needs a key of its own -- is unchanged; the mechanism was asserted rather than
+/// measured, and was wrong.)
 fn delivery_idempotency_key(id: &MessageId, attempt: i32) -> String {
     if attempt == 0 {
         id.to_string()
     } else {
         format!("{id}#{attempt}")
     }
+}
+
+/// The message-id half of a delivery job's idempotency key: the inverse of
+/// [`delivery_idempotency_key`].
+///
+/// It lives HERE, beside its inverse, because the two drifting apart is not hypothetical. The
+/// consumer parsed the whole key as a `MessageId`, which was true while the key WAS the id;
+/// the moment resend appended `#N`, every resend job failed to parse and was dead-lettered
+/// without any provider being reached, leaving the row `pending` and unrecoverable. A reader
+/// that does not know the key's grammar is the defect, so the grammar has exactly one writer
+/// and one reader and they sit together.
+///
+/// A `MessageId` renders as base64url, which has no `#`, so the split is unambiguous.
+#[must_use]
+pub fn delivery_key_message_id(key: &str) -> &str {
+    key.split_once('#').map_or(key, |(id, _attempt)| id)
 }
 
 /// What [`MessageRepo::resend`] did with a re-queue request (issue #111 criterion 1).
@@ -22930,13 +22954,24 @@ impl MessageRepo<'_> {
     /// told the state it lost to. A SELECT-then-UPDATE would mail the same person twice, which
     /// is the failure `messages` exists to prevent.
     ///
-    /// That same CAS is why this needs no rate limit of its own. A message cannot be resent
-    /// twice without FAILING again in between, so the state machine already bounds the loop,
-    /// and the per-recipient budget is deliberately not consulted: it counts sends in a window
-    /// to stop automated pumping through the public doors, and charging an authenticated
-    /// operator's recovery against it would refuse a resend precisely for the recipients whose
-    /// mail has been failing, which is everyone who needs one. Suppression is consulted, and
-    /// the difference is in [`Resent::Suppressed`].
+    /// # The rate limit is NOT consulted, and nothing else bounds this
+    ///
+    /// Say it plainly, because an earlier version of this comment did not. It claimed the CAS
+    /// bounded the loop -- "a message cannot be resent twice without failing again in between"
+    /// -- and that is FALSE: a caller can resolve and resend in a tight loop, and review
+    /// measured it doing so. There is no per-message cap, and no resend touches the
+    /// per-recipient budget, so the only thing standing between an authenticated operator and
+    /// unbounded mail to one address is their authorization to call this at all.
+    ///
+    /// That is a deliberate choice rather than an oversight. The budget counts sends in a
+    /// window to stop automated pumping through the PUBLIC doors; charging an operator's
+    /// recovery against it would refuse a resend precisely for the recipients whose mail has
+    /// been failing, which is everyone who needs one. The control is the management
+    /// permission, and `resend_count` is the durable record of how often it was used, which is
+    /// what the question "why did this person get four copies" reduces to.
+    ///
+    /// Suppression IS consulted, and the difference is in [`Resent::Suppressed`]: a hard bounce
+    /// or a complaint is an obligation to the recipient, not delivery advice to the sender.
     ///
     /// # Errors
     ///
@@ -23097,23 +23132,29 @@ impl MessageRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
     /// on a persistence failure.
-    pub async fn claim_for_delivery(&self, id: &MessageId) -> Result<bool, StoreError> {
+    pub async fn claim_for_delivery(&self, id: &MessageId) -> Result<Option<i32>, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        let claimed = sqlx::query(
+        // RETURNING the generation this claim was granted under. A resend moves the row back to
+        // `pending` and increments `resend_count`, so a worker that was mid-delivery when an
+        // operator resent is holding a claim on a message that has since moved on. Without a
+        // token it cannot tell: it would resolve the row and silently void the resend, or void
+        // the claim of whichever worker took the new job. The generation is what lets its
+        // resolve affect zero rows and stop.
+        let generation: Option<i32> = sqlx::query_scalar(
             "UPDATE messages SET state = 'sending', updated_at = now() \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'pending'",
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'pending' \
+             RETURNING resend_count",
         )
         .bind(id.to_string())
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        .fetch_optional(&mut *tx)
+        .await?;
         tx.commit().await?;
-        Ok(claimed == 1)
+        Ok(generation)
     }
 
     /// Release a claim, moving `sending` back to `pending` so a retry can take it.
@@ -23126,18 +23167,23 @@ impl MessageRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
     /// on a persistence failure.
-    pub async fn release_claim(&self, id: &MessageId) -> Result<(), StoreError> {
+    pub async fn release_claim(&self, id: &MessageId, generation: i32) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Fenced on the generation for the same reason `resolve` is: a worker that lost its
+        // message to a resend must not drag the row back to `pending` underneath whichever
+        // worker now holds it, which would arm a THIRD delivery of the same mail.
         sqlx::query(
             "UPDATE messages SET state = 'pending', updated_at = now() \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'sending'",
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'sending' \
+               AND resend_count = $4",
         )
         .bind(id.to_string())
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .bind(generation)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -23205,7 +23251,12 @@ impl MessageRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the identifier is out of this scope or names no row;
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn resolve(&self, id: &MessageId, outcome: Resolution<'_>) -> Result<(), StoreError> {
+    pub async fn resolve(
+        &self,
+        id: &MessageId,
+        generation: i32,
+        outcome: Resolution<'_>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -23217,13 +23268,14 @@ impl MessageRepo<'_> {
         let updated = sqlx::query(
             "UPDATE messages SET state = $1, failure_reason = $2, updated_at = now() \
              WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
-             AND state IN ('pending', 'sending')",
+               AND state IN ('pending', 'sending') AND resend_count = $6",
         )
         .bind(state)
         .bind(reason)
         .bind(id.to_string())
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .bind(generation)
         .execute(&mut *tx)
         .await?
         .rows_affected();
