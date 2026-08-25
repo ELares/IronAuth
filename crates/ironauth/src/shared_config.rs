@@ -593,6 +593,14 @@ mod tests {
     /// must state rather than one they can omit.
     const PLANE_LOCAL_KEYS: &[(&str, Reach, &str)] = &[
         (
+            "messaging",
+            Reach::OnePlaneOrNoState,
+            "consumed once at boot to build the message delivery consumer (issue #111), a \
+             background task that answers no request. Neither plane's state holds it: the \
+             providers become a worker's failover list and nothing serves a response from \
+             them.",
+        ),
+        (
             "log_streams",
             Reach::OnePlaneOrNoState,
             "consumed once at boot to build the SIEM log stream shipper (issue #110), a \

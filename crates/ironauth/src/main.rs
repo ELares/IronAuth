@@ -2940,17 +2940,6 @@ async fn spawn_backchannel_logout_pools(
     pools
 }
 
-/// Start the ASYNC flow-target delivery worker (issue #112 criterion 2) on the generic
-/// outbox worker pool.
-///
-/// A separate function from [`spawn_webhook_delivery_pools`] for the same reason that one is
-/// separate from the logout pools: the switches are independent, and a deployment that
-/// registers flow targets and no webhook endpoints should not have to run webhook delivery to
-/// get its targets called. Everything generic is shared: [`spawn_consumer_pools`],
-/// [`ControlPlaneScopes`] and the observer. Only the consumer and its sender are specific.
-///
-/// Every early return is logged and starts NOTHING; the rest of the server runs unaffected
-/// and the queue is durable, so the work waits rather than being lost.
 /// What the message delivery worker needs from config (issue #111).
 struct MessageDeliveryInputs {
     messaging: ironauth_config::MessagingConfig,
@@ -2984,20 +2973,26 @@ fn message_delivery_inputs(config: &Config, env: &Env) -> Option<MessageDelivery
             .server
             .public_url
             .as_deref()
-            .and_then(|url| url.split("://").nth(1).map(str::to_owned))
-            .map(|rest| {
-                rest.split('/')
-                    .next()
-                    .unwrap_or_default()
-                    .split(':')
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned()
-            })
+            .and_then(|url| url.parse::<http::Uri>().ok())
+            .and_then(|uri| uri.host().map(str::to_owned))
             .filter(|host| !host.is_empty())
             .unwrap_or_else(|| "ironauth.invalid".to_owned()),
         env: env.clone(),
     })
+}
+
+/// The configured providers as (name, endpoint), IN CONFIGURED ORDER.
+///
+/// Split out so the ORDER can be asserted. The order is the failover order and it is the
+/// operator's: the primary is first, and reversing it silently demotes the provider they chose
+/// to last resort. Built inline, that decision was untestable without a database and a
+/// fetcher, and a review confirmed a `.rev()` inserted here survived the entire suite.
+fn provider_specs(messaging: &ironauth_config::MessagingConfig) -> Vec<(String, String)> {
+    messaging
+        .providers
+        .iter()
+        .map(|configured| (configured.name.clone(), configured.endpoint.clone()))
+        .collect()
 }
 
 /// Start the message delivery worker (issue #111) on the generic outbox worker pool.
@@ -3063,21 +3058,17 @@ async fn spawn_message_delivery_pools(inputs: MessageDeliveryInputs) -> Vec<Outb
     // In CONFIGURED order, which is the failover order: the primary is first and each
     // subsequent provider is tried only when the previous was unavailable. Config validation
     // has already refused an enabled worker with an empty list, so this cannot be empty here.
-    let providers: Vec<Box<dyn ironauth_store::message_delivery::MessageProvider>> = messaging
-        .providers
+    let specs = provider_specs(&messaging);
+    let provider_names: Vec<String> = specs.iter().map(|(name, _)| name.clone()).collect();
+    let providers: Vec<Box<dyn ironauth_store::message_delivery::MessageProvider>> = specs
         .iter()
-        .map(|configured| {
+        .map(|(name, endpoint)| {
             Box::new(HttpMessageProvider::new(
-                configured.name.clone(),
-                configured.endpoint.clone(),
+                name.clone(),
+                endpoint.clone(),
                 Arc::clone(&fetcher),
             )) as Box<dyn ironauth_store::message_delivery::MessageProvider>
         })
-        .collect();
-    let provider_names: Vec<String> = messaging
-        .providers
-        .iter()
-        .map(|configured| configured.name.clone())
         .collect();
 
     let composer = Arc::new(DefaultComposer::new(sender_domain))
@@ -3106,6 +3097,17 @@ async fn spawn_message_delivery_pools(inputs: MessageDeliveryInputs) -> Vec<Outb
     pools
 }
 
+/// Start the ASYNC flow-target delivery worker (issue #112 criterion 2) on the generic
+/// outbox worker pool.
+///
+/// A separate function from [`spawn_webhook_delivery_pools`] for the same reason that one is
+/// separate from the logout pools: the switches are independent, and a deployment that
+/// registers flow targets and no webhook endpoints should not have to run webhook delivery to
+/// get its targets called. Everything generic is shared: [`spawn_consumer_pools`],
+/// [`ControlPlaneScopes`] and the observer. Only the consumer and its sender are specific.
+///
+/// Every early return is logged and starts NOTHING; the rest of the server runs unaffected
+/// and the queue is durable, so the work waits rather than being lost.
 async fn spawn_flow_target_delivery_pools(
     inputs: FlowTargetDeliveryInputs,
 ) -> Vec<OutboxWorkerPool> {
@@ -6104,5 +6106,99 @@ mod tests {
                  scope's pass are different sizes of outage and must not share a series"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod message_delivery_wiring_tests {
+    use super::{message_delivery_inputs, provider_specs};
+    use ironauth_config::{Config, MessageProviderConfig, MessagingConfig};
+    use ironauth_env::Env;
+
+    fn messaging(enabled: bool, names: &[&str]) -> MessagingConfig {
+        MessagingConfig {
+            delivery_enabled: enabled,
+            providers: names
+                .iter()
+                .map(|name| MessageProviderConfig {
+                    name: (*name).to_owned(),
+                    endpoint: format!("https://{name}.example.test/send"),
+                })
+                .collect(),
+        }
+    }
+
+    fn config_with(messaging: MessagingConfig) -> Config {
+        Config {
+            messaging,
+            ..Config::default()
+        }
+    }
+
+    /// The enable gate points the right way.
+    ///
+    /// A review inverted it -- so the worker started only when an operator turned delivery OFF
+    /// -- and the whole suite stayed bit-identical, clippy included. A feature that can be
+    /// wired backwards with nothing going red is a feature nothing measures.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn the_worker_starts_when_delivery_is_enabled_and_not_when_it_is_off() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 31);
+
+        let off = config_with(messaging(false, &["primary"]));
+        assert!(
+            message_delivery_inputs(&off, &env).is_none(),
+            "delivery off must not start a worker"
+        );
+
+        let on = config_with(messaging(true, &["primary"]));
+        assert!(
+            message_delivery_inputs(&on, &env).is_some(),
+            "delivery on must start one; inverted, the worker runs exactly when the operator \
+             asked for silence"
+        );
+    }
+
+    /// CONFIGURED order is FAILOVER order.
+    ///
+    /// The primary is first and each subsequent provider is tried only when the one before it
+    /// was unavailable, so reversing the list silently demotes the operator's primary to last
+    /// resort. Measured: a `.rev()` here survived the entire suite before this test.
+    #[test]
+    fn the_provider_list_preserves_the_configured_order() {
+        let specs = provider_specs(&messaging(true, &["primary", "secondary", "tertiary"]));
+        let names: Vec<&str> = specs.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["primary", "secondary", "tertiary"],
+            "the operator's order is the failover order"
+        );
+        assert_eq!(specs[0].1, "https://primary.example.test/send");
+    }
+
+    /// The delivery pool is awaited by the graceful shutdown rather than dropped.
+    ///
+    /// A dropped pool stops its workers at the next flag check, which is the opposite of a
+    /// graceful stop: a message mid-delivery has its lease lapse instead of finishing. This is
+    /// a text pin, the same shape `outbox_observer_pin.rs` uses for the observer seams, because
+    /// the alternative is booting a server to observe a shutdown ordering.
+    #[test]
+    fn the_delivery_pool_is_chained_into_the_shutdown() {
+        // Search only the code ABOVE this test module. `include_str!` reads the whole file,
+        // and the needle appears in this test's own source, so an unscoped `contains` finds
+        // itself and passes however the shutdown is written. Measured: it did exactly that --
+        // deleting the real chain call left this test green.
+        let source = include_str!("main.rs");
+        let marker = concat!("mod ", "message_delivery_wiring_tests");
+        let code = source
+            .split(marker)
+            .next()
+            .expect("the file has a first part");
+        let needle = concat!(".chain(", "message_delivery_pools)");
+        assert!(
+            code.contains(needle),
+            "the message delivery pool must be chained into the shutdown loop; dropping it \
+             instead stops workers at the next flag check rather than awaiting them"
+        );
     }
 }

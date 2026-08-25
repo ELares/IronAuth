@@ -30,10 +30,10 @@ const MAIN_RS: &str = include_str!("../src/main.rs");
 /// binds it under a different name and is invisible here, which is the ceiling this file's
 /// header states.
 ///
-/// MOVED 4 -> 5 for async flow-target delivery (issue #112 criterion 2), which is a new seam
-/// rather than a relaxation: the count moves WITH a seam being added, which is exactly what
-/// the assertion below says to do.
-const POOL_SEAMS: usize = 5;
+/// MOVED 4 -> 5 for async flow-target delivery (issue #112 criterion 2), and 5 -> 6 for
+/// message delivery (issue #111). Both are new seams rather than relaxations: the count moves
+/// WITH a seam being added, which is exactly what the assertion below says to do.
+const POOL_SEAMS: usize = 6;
 
 #[test]
 fn every_pool_seam_reports_through_the_shared_observer() {

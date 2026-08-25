@@ -7253,12 +7253,19 @@ fn validate_messaging(messaging: &MessagingConfig) -> Result<(), ConfigError> {
                 ),
             });
         }
-        if !provider.endpoint.starts_with("https://") {
+        // PARSED, not prefix-matched. This file already retired `starts_with("https://")`
+        // once, for the reason stated on `is_well_formed_https_endpoint`: it admits
+        // `https://` with no host, an embedded space, an unterminated IPv6 literal, and
+        // userinfo smuggling a credential into the URL. Every one of those would load
+        // cleanly here and then fail at the first send, which is a silent per-message
+        // outage rather than a startup error.
+        if !is_well_formed_https_endpoint(&provider.endpoint) {
             return Err(ConfigError::Invalid {
                 message: format!(
-                    "messaging.providers entry `{}` must use https: a message body carries a \
-                     login code and the recipient's address, and the outbound fetch layer \
-                     refuses plaintext anyway, so this would fail at the first send",
+                    "messaging.providers entry `{}` needs a well-formed absolute https URL \
+                     with a host and no userinfo: a message body carries a login code and \
+                     the recipient's address, and the outbound fetch layer refuses anything \
+                     else at the first send",
                     provider.name
                 ),
             });
@@ -10933,6 +10940,35 @@ enabled = true
         validate_messaging(&messaging).expect("one provider is enough");
     }
 
+    /// `Config::validate` actually CALLS `validate_messaging`.
+    ///
+    /// A review deleted the call and all 111 config tests still passed: every messaging test
+    /// invoked the helper directly, so nothing tied the helper to the boot path it is supposed
+    /// to guard. Going through the top-level entry point is what makes the refusal real.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn config_validate_refuses_messaging_that_cannot_work() {
+        let mut config = Config::default();
+        config.messaging = MessagingConfig {
+            delivery_enabled: true,
+            providers: Vec::new(),
+        };
+        assert!(
+            matches!(config.validate(), Err(ConfigError::Invalid { .. })),
+            "delivery on with no providers must not pass the top-level validate"
+        );
+
+        config.messaging.providers.push(MessageProviderConfig {
+            name: "primary".to_owned(),
+            endpoint: "https://relay.example.test/send".to_owned(),
+        });
+        // The rest of a default Config is already valid, so reaching Ok here means the
+        // messaging refusal above was the ONLY thing standing in the way.
+        config
+            .validate()
+            .expect("a well-formed messaging section validates");
+    }
+
     /// Provider entries are checked whether or not delivery is enabled, and each refusal has a
     /// consequence rather than a preference behind it.
     #[test]
@@ -10957,10 +10993,40 @@ enabled = true
         ));
         // Plaintext carries a login code and the recipient's address in the clear, and the
         // outbound fetch layer refuses it anyway, so this would fail at the first send.
-        assert!(matches!(
-            validate_messaging(&base("postmark", "http://relay.example.test/send")),
-            Err(ConfigError::Invalid { .. })
-        ));
+        for bad in [
+            "http://relay.example.test/send",
+            // The shapes a prefix match admits and a parser does not. Each would load
+            // cleanly and then fail at every send.
+            "https://",
+            "https:///send",
+            "https://exa mple.test/send",
+            "https://[not-an-ip/send",
+            // Userinfo smuggles a credential into a URL that gets logged and diffed.
+            "https://user:secret@relay.example.test/send",
+            " https://relay.example.test/send",
+        ] {
+            assert!(
+                matches!(
+                    validate_messaging(&base("postmark", bad)),
+                    Err(ConfigError::Invalid { .. })
+                ),
+                "endpoint {bad:?} must be refused at load, not at the first send"
+            );
+        }
+
+        // ACCEPTED, and deliberately so: RFC 3986 makes the scheme case-insensitive, and the
+        // URI parser normalizes it. Refusing this would reject a valid URL. Listed here rather
+        // than left out, because "the parser is strict" is only useful alongside what it
+        // admits -- a refusal list on its own cannot distinguish a strict check from a broken
+        // one that refuses everything.
+        for good in [
+            "HTTPS://relay.example.test/send",
+            "https://relay.example.test:8443/send",
+            "https://relay.example.test/send?key=abc",
+        ] {
+            validate_messaging(&base("postmark", good))
+                .unwrap_or_else(|error| panic!("endpoint {good:?} should load: {error:?}"));
+        }
 
         // Two providers under one name: a delivery record could not say which accepted it.
         let duplicated = MessagingConfig {

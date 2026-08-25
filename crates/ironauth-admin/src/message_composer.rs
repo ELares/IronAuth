@@ -61,9 +61,14 @@ impl DefaultComposer {
     /// product: a deployment that wants its own wording configures one, and this is what
     /// arrives until it does. Making it elaborate would only make the difference between
     /// configured and unconfigured harder to notice.
-    fn built_in(kind: &str) -> MessageBodies {
+    fn built_in() -> MessageBodies {
+        // The KIND is deliberately NOT spliced in here. An earlier version built the subject
+        // with `format!("Your {kind} from {{{{ tenant }}}}")`, which put caller-controlled text
+        // into the TEMPLATE and then rendered it: a kind containing `{{ body }}` would pull a
+        // payload value into the Subject header. Template text is a constant; everything
+        // variable arrives as a VALUE, which the renderer escapes.
         MessageBodies {
-            subject: format!("Your {kind} from {{{{ tenant }}}}"),
+            subject: "Your {{ kind }} from {{ tenant }}".to_owned(),
             text: "{{ body }}\n".to_owned(),
             html: "<p>{{ body }}</p>".to_owned(),
         }
@@ -89,12 +94,19 @@ impl MessageComposer for DefaultComposer {
                 }
             }
         }
-        values
-            .entry("tenant".to_owned())
-            .or_insert_with(|| scope.tenant().to_string());
-        values.entry("body".to_owned()).or_default();
+        // The kind and the tenant are VALUES, so the renderer escapes them and neither can
+        // introduce markup or a placeholder. A caller cannot override them: `insert` rather
+        // than `entry().or_insert()`, because a payload carrying its own "tenant" would
+        // otherwise decide what the recipient is told this message is from.
+        values.insert("kind".to_owned(), kind.to_owned());
+        values.insert("tenant".to_owned(), scope.tenant().to_string());
 
-        let bodies = Self::built_in(kind);
+        // No usable id means no stable Message-ID, and a shared one is worse than refusing.
+        let Some(local) = message_id_local(payload) else {
+            return Err("no_message_id".to_owned());
+        };
+
+        let bodies = Self::built_in();
         // The built-in must be a CANDIDATE, not merely a body the loader can return. Template
         // resolution walks the levels and fails with no template when the list is empty, so an
         // empty list plus a loader that always answers is a composer that never composes.
@@ -103,6 +115,14 @@ impl MessageComposer for DefaultComposer {
             locale: self.default_locale.clone(),
             body_ref: format!("built-in:{kind}"),
         }];
+
+        // A missing or non-string `body` is a REFUSAL, not an empty message. Filling it with
+        // a default silently sends a blank mail to a real person, and `RenderError` already
+        // exists to say so: composing something empty is worse than composing nothing, because
+        // the empty one is delivered and counts as a success.
+        if !values.contains_key("body") {
+            return Err("missing_body".to_owned());
+        }
 
         let request = PrepareRequest {
             kind,
@@ -127,9 +147,9 @@ impl MessageComposer for DefaultComposer {
             // random source: the id is already unique per message and is stable across a
             // retry, so a redelivered message keeps ONE Message-ID instead of looking like two
             // messages to a receiver that deduplicates on it.
-            message_id_local: &message_id_local(payload),
+            message_id_local: &local,
             message_id_domain: &self.sender_domain,
-            boundary: &boundary_for(payload),
+            boundary: &boundary_for(&local),
         };
 
         prepare_message(&request).map_err(|error| match error {
@@ -142,30 +162,31 @@ impl MessageComposer for DefaultComposer {
     }
 }
 
-/// The local part of the `Message-ID`, from the payload's message id when it carries one.
-fn message_id_local(payload: &serde_json::Value) -> String {
-    payload
-        .get("message_id")
-        .and_then(serde_json::Value::as_str)
-        .map_or_else(|| "message".to_owned(), sanitize_local)
+/// The local part of the `Message-ID`, from the payload's message id.
+///
+/// Returns [`None`] rather than a fallback, and that is the whole point. An earlier version
+/// answered `"message"` for every payload that carried no id, so EVERY such message shipped
+/// the identical `Message-ID` and a receiver deduplicating on it would drop all but the first.
+/// A message with no stable identity has no business being stamped with a shared one.
+///
+/// Sanitising also REJECTS rather than filters. Filtering collapses distinct ids onto one
+/// local part -- `msg/1` and `msg1` both became `msg1` -- which is the same collision by a
+/// different route.
+fn message_id_local(payload: &serde_json::Value) -> Option<String> {
+    let raw = payload.get("message_id")?.as_str()?;
+    if raw.is_empty()
+        || !raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(raw.to_owned())
 }
 
 /// A MIME boundary that cannot appear in the body it delimits.
-fn boundary_for(payload: &serde_json::Value) -> String {
-    format!("ironauth-{}", message_id_local(payload))
-}
-
-/// Keep only characters RFC 5322 permits unquoted in a `Message-ID` local part.
-fn sanitize_local(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    if cleaned.is_empty() {
-        "message".to_owned()
-    } else {
-        cleaned
-    }
+fn boundary_for(local: &str) -> String {
+    format!("ironauth-{local}")
 }
 
 #[cfg(test)]
@@ -179,101 +200,224 @@ mod tests {
         Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env))
     }
 
-    fn compose(payload: &serde_json::Value) -> Result<PreparedMessage, String> {
+    fn compose_kind(kind: &str, payload: &serde_json::Value) -> Result<PreparedMessage, String> {
         DefaultComposer::new("mail.example.test").compose(
             scope(),
-            "login_code",
+            kind,
             "ada@example.test",
             payload,
         )
     }
 
-    /// The composed message carries the payload's values and a well-formed `Message-ID`.
+    fn compose(payload: &serde_json::Value) -> Result<PreparedMessage, String> {
+        compose_kind("login_code", payload)
+    }
+
+    fn ok(body: &str, id: &str) -> serde_json::Value {
+        serde_json::json!({ "body": body, "message_id": id })
+    }
+
+    /// The payload's values reach the body, and the Message-ID is well formed.
     ///
-    /// RFC 5322 section 3.6.4 requires one, and shipping without it costs deliverability: it is
-    /// the mistake Kratos made and had to fix. So the presence AND the shape are pinned.
+    /// RFC 5322 section 3.6.4 requires one, and shipping without it costs deliverability: it
+    /// is the mistake Kratos made and had to fix.
     #[test]
     fn a_composed_message_renders_the_payload_and_stamps_a_message_id() {
-        let prepared = compose(&serde_json::json!({
-            "body": "your code is 123456",
-            "message_id": "msg_abc123",
-        }))
-        .expect("composes");
-
+        let prepared = compose(&ok("your code is 123456", "msg_abc123")).expect("composes");
         assert_eq!(prepared.recipient, "ada@example.test");
         assert!(
             prepared.body.contains("your code is 123456"),
-            "the payload's values must reach the body: {}",
+            "{}",
             prepared.body
         );
         assert!(
             prepared.message_id.starts_with('<') && prepared.message_id.ends_with('>'),
-            "a Message-ID is angle-bracketed: {}",
+            "{}",
             prepared.message_id
         );
         assert!(
-            prepared.message_id.contains("mail.example.test"),
-            "and carries the sending domain, which is what makes it unique rather than \
-             merely random: {}",
-            prepared.message_id
-        );
-        assert!(
-            prepared.message_id.contains("msg_abc123") || prepared.message_id.contains("msgabc123"),
-            "and is derived from the message id, so a redelivery keeps ONE Message-ID \
-             instead of looking like two messages: {}",
+            prepared.message_id.contains("msg_abc123"),
+            "{}",
             prepared.message_id
         );
     }
 
-    /// The SAME payload composes to the same `Message-ID`, which is what makes a retry one
-    /// message rather than two to a receiver that deduplicates on it.
+    /// The DOMAIN half is what makes a Message-ID globally unique rather than merely random,
+    /// so it must come from the composer's configuration and not from a constant. Two
+    /// different domains must produce two different Message-IDs: pinning only the fixture's
+    /// own literal would pass against a hardcoded domain.
     #[test]
-    fn a_redelivery_keeps_one_message_id() {
-        let payload = serde_json::json!({ "body": "hello", "message_id": "msg_stable" });
-        let first = compose(&payload).expect("composes");
-        let second = compose(&payload).expect("composes");
-        assert_eq!(
-            first.message_id, second.message_id,
-            "a redelivered message must not look like a second message"
-        );
-    }
-
-    /// Two DIFFERENT messages must not share a `Message-ID`, or a receiver that deduplicates
-    /// on it drops the second one.
-    #[test]
-    fn two_messages_do_not_share_a_message_id() {
-        let a = compose(&serde_json::json!({ "body": "a", "message_id": "msg_aaa" })).expect("a");
-        let b = compose(&serde_json::json!({ "body": "b", "message_id": "msg_bbb" })).expect("b");
+    fn the_message_id_carries_the_configured_sending_domain() {
+        let payload = ok("hello", "msg_same");
+        let a = DefaultComposer::new("a.example.test")
+            .compose(scope(), "login_code", "ada@example.test", &payload)
+            .expect("a");
+        let b = DefaultComposer::new("b.example.test")
+            .compose(scope(), "login_code", "ada@example.test", &payload)
+            .expect("b");
+        assert!(a.message_id.contains("a.example.test"), "{}", a.message_id);
+        assert!(b.message_id.contains("b.example.test"), "{}", b.message_id);
         assert_ne!(a.message_id, b.message_id);
     }
 
-    /// A non-string payload field is SKIPPED, not stringified. `{{ code }}` rendering as
-    /// `{"a":1}` is a broken message that looks like a working one, and the sender finds out
-    /// from the recipient.
+    /// The SAME payload composes to the same Message-ID, so a redelivery is one message.
     #[test]
-    fn a_non_string_payload_field_does_not_reach_the_body() {
-        let prepared = compose(&serde_json::json!({
-            "body": "ok",
-            "structured": { "nested": 1 },
-        }))
-        .expect("composes");
-        assert!(
-            !prepared.body.contains("nested"),
-            "a structured field must not be stringified into a message: {}",
-            prepared.body
+    fn a_redelivery_keeps_one_message_id() {
+        let payload = ok("hello", "msg_stable");
+        assert_eq!(
+            compose(&payload).expect("first").message_id,
+            compose(&payload).expect("second").message_id
         );
     }
 
-    /// The body is multipart with both a text and an HTML part, which is what issue #111 means
-    /// by "correct text plus HTML multipart output".
+    /// Two DIFFERENT messages must not share a Message-ID, or a receiver deduplicating on it
+    /// drops the second. Includes the pair that COLLIDED under the previous implementation,
+    /// which filtered disallowed characters instead of refusing them.
     #[test]
-    fn the_body_is_multipart_with_both_parts() {
-        let prepared = compose(&serde_json::json!({ "body": "hello" })).expect("composes");
+    fn two_messages_do_not_share_a_message_id() {
+        let a = compose(&ok("a", "msg_aaa")).expect("a");
+        let b = compose(&ok("b", "msg_bbb")).expect("b");
+        assert_ne!(a.message_id, b.message_id);
+
+        // `msg/1` and `msg1` both sanitised to `msg1` before. Now the first is refused
+        // outright rather than silently becoming the second.
+        assert!(
+            compose(&ok("x", "msg/1")).is_err(),
+            "a malformed id is refused"
+        );
+    }
+
+    /// A payload with NO message id is refused. Previously every such message was stamped
+    /// `<message@domain>`, so they ALL shared one Message-ID and a receiver deduplicating on it
+    /// would drop every one after the first.
+    #[test]
+    fn a_payload_without_a_message_id_is_refused_rather_than_sharing_one() {
+        let refused = compose(&serde_json::json!({ "body": "hello" }));
+        assert_eq!(refused.err().as_deref(), Some("no_message_id"));
+    }
+
+    /// A missing or non-string `body` is REFUSED, not composed to an empty message. Sending a
+    /// blank mail to a real person and recording it as delivered is worse than sending nothing.
+    #[test]
+    fn a_missing_or_structured_body_is_refused_rather_than_sent_empty() {
+        assert_eq!(
+            compose(&serde_json::json!({ "message_id": "msg_x" }))
+                .err()
+                .as_deref(),
+            Some("missing_body"),
+            "a message with no body must not be sent"
+        );
+        assert_eq!(
+            compose(&serde_json::json!({ "message_id": "msg_x", "body": { "n": 1 } }))
+                .err()
+                .as_deref(),
+            Some("missing_body"),
+            "a structured body is not a body: stringifying it sends {{\"n\":1}} to a person"
+        );
+    }
+
+    /// The KIND is a VALUE, never template text. Splicing it into the template let a kind
+    /// containing a placeholder pull a payload value into the Subject header.
+    #[test]
+    fn a_kind_containing_a_placeholder_cannot_pull_a_payload_value_into_the_subject() {
+        let prepared =
+            compose_kind("{{ body }}", &ok("SECRET-CODE-42", "msg_inject")).expect("composes");
+        assert!(
+            !prepared.subject.contains("SECRET-CODE-42"),
+            "a kind that is template text would render the payload into the Subject: {}",
+            prepared.subject
+        );
+        assert!(
+            prepared.subject.contains("{{ body }}"),
+            "and the kind itself is shown literally: {}",
+            prepared.subject
+        );
+    }
+
+    /// The subject renders both of its values, which nothing asserted before.
+    #[test]
+    fn the_subject_renders_the_kind_and_the_tenant() {
+        let prepared = compose(&ok("hello", "msg_subj")).expect("composes");
+        assert!(
+            prepared.subject.contains("login_code"),
+            "{}",
+            prepared.subject
+        );
+        assert!(
+            prepared.subject.contains(&scope().tenant().to_string()),
+            "{}",
+            prepared.subject
+        );
+    }
+
+    /// A payload cannot override the kind or the tenant, which decide what the recipient is
+    /// told this message IS and who it is from.
+    #[test]
+    fn a_payload_cannot_override_the_kind_or_the_tenant() {
+        let prepared = compose(&serde_json::json!({
+            "body": "hello",
+            "message_id": "msg_ovr",
+            "kind": "password_reset",
+            "tenant": "some-other-tenant",
+        }))
+        .expect("composes");
+        assert!(
+            prepared.subject.contains("login_code"),
+            "{}",
+            prepared.subject
+        );
+        assert!(
+            !prepared.subject.contains("password_reset"),
+            "{}",
+            prepared.subject
+        );
+        assert!(
+            !prepared.subject.contains("some-other-tenant"),
+            "{}",
+            prepared.subject
+        );
+    }
+
+    /// A non-string payload field is SKIPPED, not stringified. The fixture key is a real
+    /// placeholder in the template, so this fails if the value ever reaches it -- the previous
+    /// version used a key the template never mentions, so it could not fail either way.
+    #[test]
+    fn a_non_string_payload_field_does_not_reach_the_body() {
+        let refused = compose(&serde_json::json!({
+            "message_id": "msg_ns",
+            "body": { "nested": 1 },
+        }));
+        assert_eq!(
+            refused.err().as_deref(),
+            Some("missing_body"),
+            "a structured value must not be stringified into the one placeholder it names"
+        );
+    }
+
+    /// Multipart with BOTH parts populated. Asserting only the content-type headers passes with
+    /// an empty HTML part, and asserting the boundary appears in the body is a tautology --
+    /// `multipart_alternative` writes the delimiters from that same boundary.
+    #[test]
+    fn the_body_is_multipart_with_both_parts_populated() {
+        let prepared = compose(&ok("hello-there", "msg_mp")).expect("composes");
         assert!(prepared.body.contains("text/plain"), "{}", prepared.body);
         assert!(prepared.body.contains("text/html"), "{}", prepared.body);
         assert!(
-            prepared.body.contains(&prepared.boundary),
-            "the outer Content-Type boundary must appear in the body"
+            prepared.body.contains("<p>hello-there</p>"),
+            "the HTML part must carry the rendered body, not just its header: {}",
+            prepared.body
         );
+        let plain_at = prepared.body.find("text/plain").expect("a text part");
+        let html_at = prepared.body.find("text/html").expect("an html part");
+        assert!(plain_at < html_at, "RFC 2046: least-rich part first");
+    }
+
+    /// The built-in is the DEFAULT level, which is what the three configurable levels fall
+    /// back to. Unpinned, a change to the level would be invisible.
+    #[test]
+    fn the_built_in_resolves_at_the_default_level() {
+        let prepared = compose(&ok("hello", "msg_lvl")).expect("composes");
+        assert_eq!(prepared.template_level, TemplateLevel::Default);
+        assert!(!prepared.locale_fallback_applied);
     }
 }
