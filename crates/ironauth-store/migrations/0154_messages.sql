@@ -4,11 +4,17 @@
 --
 -- # What this table is for, and what it is NOT
 --
--- `message_prepare::prepare_message` already runs the whole decision pipeline as a PURE
--- function: suppression, rate limit, template resolution, rendering, MIME. It has 129 inline
--- tests across its eleven modules and, until now, zero production callers. Nothing was
--- missing from the decisions. What was missing was a place to WRITE one down and a consumer
--- to deliver it, so this table is the smallest thing that turns that island into a product.
+-- `message_prepare::prepare_message` already runs the whole decision pipeline as a pure,
+-- sans-IO function: suppression, rate limit, template resolution, rendering, MIME. The
+-- eleven `message_*` modules carry 129 inline tests between them (counted, not estimated)
+-- and, until now, zero production callers. Not all eleven are pure: `message_delivery`
+-- holds the provider seam and an async `deliver` driver, which is IO by construction; the
+-- five that `prepare_message` composes are.
+--
+-- Nothing was missing from the decisions. What was missing was a place to WRITE one down and
+-- a consumer to deliver it, so this table is the smallest thing that starts turning that
+-- island into a product. It is a start and not the finish: this migration ships the record,
+-- and the consumer that resolves it is still to come.
 --
 -- It is a DELIVERY record, not a message archive. It holds what delivery needs and what an
 -- operator needs to answer "did this send, and if not why", and deliberately not the rendered
@@ -26,9 +32,9 @@
 -- # `dedup_key` and why the UNIQUE is the whole point
 --
 -- `message_hygiene::dedup_key(kind, address, window)` hashes the message kind, the normalized
--- recipient, and a window index. Its own doc says the module cannot answer whether the key has
--- been seen, "because whether this key has been seen inside the window is a store question,
--- and this module cannot answer it". This is the store answering it.
+-- recipient, and a window index. `message_prepare` is explicit that it stops there: "whether
+-- this key has been seen inside the window is a store question, and this module cannot answer
+-- it" (crates/ironauth-store/src/message_prepare.rs). This is the store answering it.
 --
 -- Criterion 2 asks that a duplicate send inside the window collapse to ONE delivery. A UNIQUE
 -- constraint plus `ON CONFLICT DO NOTHING` is that, and it is race-free in a way an
@@ -37,8 +43,12 @@
 -- doors are precisely where a user double-clicking produces that race.
 --
 -- The window is already IN the key, so the constraint carries no time predicate: a send in a
--- later window hashes differently and inserts cleanly. Old rows are pruned by retention
--- rather than by the constraint.
+-- later window hashes differently and inserts cleanly.
+--
+-- Nothing prunes old rows yet, and that is a gap rather than a design: no reaper exists, and
+-- no application role is granted DELETE, so this table only grows. A retention sweep belongs
+-- with the delivery consumer that resolves these rows, since both need the same DELETE grant
+-- and the same view of what a finished message is.
 
 CREATE TABLE messages (
     -- The `msg_` scoped identifier; embeds its (tenant, environment).
@@ -48,10 +58,22 @@ CREATE TABLE messages (
     -- The message kind (`email_otp`, `magic_link`, ...). Part of the dedup key, and what
     -- selects the template.
     kind            text        NOT NULL,
-    -- The NORMALIZED recipient, as `message_hygiene::normalize_recipient` produced it. Stored
-    -- normalized so a listing groups by what the send actually addressed rather than by the
-    -- casing a caller happened to pass.
-    recipient       text        NOT NULL,
+    -- The recipient blind index: a deterministic per-tenant keyed HMAC of the NORMALIZED
+    -- address (issue #48), never the plaintext.
+    --
+    -- `email_otp_codes` and `magic_link_tokens` -- the two tables that mail the same people
+    -- this one records -- store `recipient_email_bidx` + `recipient_email_sealed`, and
+    -- migration 0048 states the rule outright: the recipient email is PII, so it is NEVER a
+    -- plaintext column. A delivery LEDGER is the worst place to break that, because unlike a
+    -- code row it is not consumed and deleted minutes later: it accumulates, so a plaintext
+    -- column here would in time hold every address the deployment has ever mailed.
+    --
+    -- Blind index and no sealed copy, deliberately. The index is what this table needs: it
+    -- groups a recipient's sends and answers equality, which is all the dedup and any
+    -- listing require. A sealed copy would let an authorized view render the address back,
+    -- and nothing here does that yet; adding it later is a column and an open path, whereas
+    -- un-shipping a plaintext column is a migration and a disclosure.
+    recipient_bidx  bytea       NOT NULL,
     -- The collapse key: kind + normalized recipient + window index, hashed. See above.
     dedup_key       text        NOT NULL,
     -- Delivery state: `pending` until a consumer resolves it, then `sent` or `failed`.
@@ -65,7 +87,7 @@ CREATE TABLE messages (
     CONSTRAINT messages_scope_nonempty
         CHECK (tenant_id <> '' AND environment_id <> ''),
     CONSTRAINT messages_kind_nonempty CHECK (kind <> ''),
-    CONSTRAINT messages_recipient_nonempty CHECK (recipient <> ''),
+    CONSTRAINT messages_recipient_nonempty CHECK (octet_length(recipient_bidx) > 0),
     CONSTRAINT messages_dedup_key_nonempty CHECK (dedup_key <> ''),
     CONSTRAINT messages_state_known
         CHECK (state IN ('pending', 'sent', 'failed')),
@@ -79,7 +101,9 @@ CREATE TABLE messages (
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id)
 );
 
--- The operator listing: a scope's messages, newest first.
+-- A scope's messages, newest first. The listing this shape is for does not ship in this
+-- migration; the index does, because adding it later means a rewrite on a table that by then
+-- holds every send the deployment has made.
 CREATE INDEX messages_scope_idx
     ON messages (tenant_id, environment_id, created_at DESC, id);
 
@@ -96,13 +120,15 @@ CREATE POLICY messages_tenant_isolation ON messages
     );
 
 -- The DATA plane enqueues a send (INSERT), the delivery consumer resolves it (SELECT, and
--- UPDATE of exactly the two columns a resolution writes). Column-scoped UPDATE for the issue
+-- UPDATE of exactly the three columns a resolution writes: the state, the reason it failed,
+-- and the timestamp recording when that was decided). Column-scoped UPDATE for the issue
 -- #31 reason every table here follows: a table-wide grant auto-extends to every column added
--- later, including the recipient and the dedup key, and a plane that can rewrite a dedup key
--- can replay a suppressed send.
+-- later, including the recipient index and the dedup key, and a plane that can rewrite a
+-- dedup key can replay a suppressed send.
 GRANT SELECT, INSERT ON messages TO ironauth_app;
 GRANT UPDATE (state, failure_reason, updated_at) ON messages TO ironauth_app;
 
--- The CONTROL plane reads for the operator listing and nothing else: a management surface
--- that could enqueue a send could use the product as a mailer.
+-- The CONTROL plane reads and nothing else: a management surface that could enqueue a send
+-- could use the product as a mailer. No control-plane reader ships yet either; the grant is
+-- here so that when one does, it arrives without a migration that widens privileges.
 GRANT SELECT ON messages TO ironauth_control;

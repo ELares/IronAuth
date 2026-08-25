@@ -22483,8 +22483,9 @@ pub struct MessageRecord {
     pub id: MessageId,
     /// The message kind, which selects the template.
     pub kind: String,
-    /// The NORMALIZED recipient.
-    pub recipient: String,
+    /// The recipient BLIND INDEX. Never the address: see the migration for why a ledger is
+    /// the worst table to keep a plaintext one in.
+    pub recipient_bidx: Vec<u8>,
     /// Delivery state: `pending`, `sent`, or `failed`.
     pub state: String,
     /// Why a failed delivery failed, as a classification rather than a provider response.
@@ -22498,7 +22499,16 @@ pub struct NewMessage<'a> {
     pub id: &'a MessageId,
     /// The message kind (`email_otp`, `magic_link`, ...).
     pub kind: &'a str,
-    /// The recipient, ALREADY normalized by `message_hygiene::normalize_recipient`.
+    /// The recipient, which the CALLER must already have normalized with
+    /// `message_hygiene::normalize_recipient`. It is blind-indexed on the way in and never
+    /// stored as written.
+    ///
+    /// The store cannot check that precondition and does not pretend to: normalization is
+    /// not idempotent-detectable from the result, and the same address written two ways
+    /// produces two different blind indexes and two different dedup keys, so an unnormalized
+    /// caller silently loses its own collapse. The doors call `normalize_recipient` once and
+    /// pass the result to both this and `dedup_key`, which is what keeps the two agreeing
+    /// about who the recipient is.
     pub recipient: &'a str,
     /// The collapse key from `message_hygiene::dedup_key`.
     pub dedup_key: &'a str,
@@ -22524,7 +22534,10 @@ impl MessageRepo<'_> {
     ///
     /// The message row and its delivery job are written in ONE transaction, which is the
     /// whole reason the outbox exists: a message recorded without a job never sends, and a
-    /// job queued without a record delivers something no operator can account for.
+    /// job queued without a record delivers something no operator can account for. Measured
+    /// by `message_send.rs::a_failed_delivery_job_takes_the_message_row_with_it`, which makes
+    /// the second write fail and requires the first to be gone; asserting only that both are
+    /// present after a success would be satisfied by two sequential commits.
     ///
     /// # Why the collapse is a constraint rather than a check
     ///
@@ -22553,10 +22566,22 @@ impl MessageRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidx = message_recipient_blind_index(master, scope, message.recipient);
+        // The outbox ordering key. Per RECIPIENT, so two messages to one person are delivered
+        // in the order they were enqueued and messages to different people never wait on each
+        // other -- but keyed on the INDEX, not the address. `outbox_messages.ordering_key` is
+        // a plaintext column read by every consumer worker, and putting an end-user email in
+        // it would leak exactly what the blind index above exists to avoid storing.
+        let mut ordering_key = String::with_capacity(bidx.as_bytes().len() * 2);
+        for byte in bidx.as_bytes() {
+            use std::fmt::Write as _;
+            let _ = write!(ordering_key, "{byte:02x}");
+        }
         let mut tx = begin_scoped(self.store, scope).await?;
         let inserted = sqlx::query(
             "INSERT INTO messages \
-             (id, tenant_id, environment_id, kind, recipient, dedup_key) \
+             (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key) \
              VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (tenant_id, environment_id, dedup_key) DO NOTHING",
         )
@@ -22564,7 +22589,7 @@ impl MessageRepo<'_> {
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(message.kind)
-        .bind(message.recipient)
+        .bind(bidx.as_bytes())
         .bind(message.dedup_key)
         .execute(&mut *tx)
         .await?
@@ -22575,8 +22600,12 @@ impl MessageRepo<'_> {
             tx.rollback().await?;
             return Ok(Enqueued::Collapsed);
         }
-        // The delivery job, in the SAME transaction. Keyed on the message id so a retry of
-        // this enqueue cannot queue the job twice.
+        // The delivery job, in the SAME transaction. Keyed on the message id, which is
+        // unique per row, so this consumer's idempotency key cannot collide with another
+        // send's. Note what that does and does not buy: a retry of a COLLAPSED enqueue never
+        // reaches here at all (the insert above wrote nothing and returned), so the
+        // idempotency key is a second line of defence behind the UNIQUE rather than the
+        // thing doing the deduplication.
         enqueue_outbox_in_tx(
             &mut tx,
             env,
@@ -22584,9 +22613,7 @@ impl MessageRepo<'_> {
             &NewOutboxMessage {
                 consumer: MESSAGE_DELIVERY_CONSUMER,
                 idempotency_key: &message.id.to_string(),
-                // Ordered per RECIPIENT: two messages to one person arrive in the order they
-                // were enqueued, and messages to different people never wait on each other.
-                ordering_key: message.recipient,
+                ordering_key: &ordering_key,
                 payload: payload.clone(),
             },
         )
@@ -22607,7 +22634,7 @@ impl MessageRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, kind, recipient, state, failure_reason FROM messages \
+            "SELECT id, kind, recipient_bidx, state, failure_reason FROM messages \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -22623,7 +22650,7 @@ impl MessageRepo<'_> {
                 Ok(Some(MessageRecord {
                     id: MessageId::parse_in_scope(&id_text, &self.scope)?,
                     kind: row.get("kind"),
-                    recipient: row.get("recipient"),
+                    recipient_bidx: row.get("recipient_bidx"),
                     state: row.get("state"),
                     failure_reason: row.get("failure_reason"),
                 }))
@@ -55740,6 +55767,8 @@ const EMAIL_FACTOR_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.email-factor-
 /// `email_otp_codes` / `magic_link_tokens` row (issue #68) from every other keyed
 /// derivation, so a recipient-email index tag never collides across columns or tenants.
 const EMAIL_FACTOR_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.email-factor-recipient.v1";
+/// The blind-index label for a `messages` recipient (issue #111).
+const MESSAGE_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.message-recipient.v1";
 /// The AAD label domain-separating a sealed recipient phone number on an
 /// `sms_otp_codes` row (issue #70) from every other envelope context, so a phone
 /// ciphertext never authenticates under another column's context.
@@ -56386,6 +56415,29 @@ fn email_factor_recipient_seal_aad(scope: Scope, dek_version: i32) -> Aad {
         .text(&scope.environment().to_string())
         .version(i64::from(dek_version))
         .build()
+}
+
+/// The blind-index context for a recipient on a `messages` row (issue #111): the label, the
+/// scope, and the NORMALIZED address, length-prefixed. The per-tenant HMAC key keeps the same
+/// address in two tenants from colliding.
+///
+/// A distinct label from the email-factor index, deliberately. Sharing one would make a
+/// `messages` row and an `email_otp_codes` row for the same address carry the SAME bytes, so
+/// anyone holding one table could join it to the other; separate labels mean each index is
+/// only useful within the table that computed it.
+fn message_recipient_bidx_aad(scope: Scope, recipient: &str) -> Aad {
+    Aad::builder()
+        .text(MESSAGE_RECIPIENT_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(recipient.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a `messages` recipient in `scope` under `master`
+/// (issue #111).
+fn message_recipient_blind_index(master: &MasterKey, scope: Scope, recipient: &str) -> BlindIndex {
+    master.blind_index(&message_recipient_bidx_aad(scope, recipient))
 }
 
 /// The blind-index context for a recipient email on an email-factor row (issue #68): the
