@@ -74,6 +74,7 @@ pub mod impersonation;
 pub mod interchange;
 pub mod locale_bundle;
 pub mod log_stream;
+pub mod message_consumer;
 pub mod message_delivery;
 pub mod message_failover;
 pub mod message_feedback;
@@ -339,10 +340,10 @@ pub use repository::{
     ActingWebhookEndpointRepo, AsyncFlowDeliveries, DeliveryAttemptRecord, DeliveryTargetLookup,
     DomainEvent, Enqueued, LOG_STREAM_REPLAY_CONSUMER, MESSAGE_DELIVERY_CONSUMER, MessageRecord,
     MessageRepo, NewDeliveryAttempt, NewMessage, NewWebhookEndpoint, OFFBOARDING_CONSUMER,
-    OUTBOX_MAX_BACKOFF_SECS, OffboardingSchedule, OwnedDomainEvent, TRAIT_MIGRATION_CONSUMER,
-    TraitMigrationStart, WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_EVENT_CONSUMER,
-    WEBHOOK_REPLAY_CONSUMER, WebhookDeliveryAttemptRepo, WebhookDeliveryTarget,
-    WebhookEndpointRecord, WebhookEndpointRepo,
+    OUTBOX_MAX_BACKOFF_SECS, OffboardingSchedule, OwnedDomainEvent, Resolution,
+    TRAIT_MIGRATION_CONSUMER, TraitMigrationStart, WEBHOOK_DELIVERY_CONSUMER,
+    WEBHOOK_EVENT_CONSUMER, WEBHOOK_REPLAY_CONSUMER, WebhookDeliveryAttemptRepo,
+    WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,
 };
 pub use repository::{
     AuditChainRepo, ChainEntry, ChainFault, ChainVerified, ChainedAuditRow, CursorOrigin,

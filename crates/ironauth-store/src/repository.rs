@@ -22503,12 +22503,13 @@ pub struct NewMessage<'a> {
     /// `message_hygiene::normalize_recipient`. It is blind-indexed on the way in and never
     /// stored as written.
     ///
-    /// The store cannot check that precondition and does not pretend to: normalization is
-    /// not idempotent-detectable from the result, and the same address written two ways
-    /// produces two different blind indexes and two different dedup keys, so an unnormalized
-    /// caller silently loses its own collapse. The doors call `normalize_recipient` once and
-    /// pass the result to both this and `dedup_key`, which is what keeps the two agreeing
-    /// about who the recipient is.
+    /// The store cannot check that precondition and does not pretend to. What an unnormalized
+    /// caller actually loses is narrower than it looks: `dedup_key` normalizes internally, so
+    /// the COLLAPSE still works. What diverges is the blind index, which is computed from
+    /// exactly what is passed here, so the same mailbox written two ways lands two rows whose
+    /// indexes disagree, and a listing or a suppression check keyed on the index sees two
+    /// recipients where there is one. The doors call `normalize_recipient` once and pass the
+    /// result to both, which is what keeps the two agreeing about who the recipient is.
     pub recipient: &'a str,
     /// The collapse key from `message_hygiene::dedup_key`.
     pub dedup_key: &'a str,
@@ -22521,6 +22522,20 @@ pub enum Enqueued {
     Accepted,
     /// An identical send is already in this window, so nothing was written or queued.
     Collapsed,
+}
+
+/// How a delivery attempt ended (issue #111 criterion 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution<'r> {
+    /// A provider accepted it.
+    Sent,
+    /// Nobody accepted it. Carries a CLASSIFICATION, never a provider's raw response: those
+    /// carry recipient data and provider-side identifiers, and this column is read by an
+    /// operator answering "why did this not arrive".
+    Failed {
+        /// Why, as a short stable reason.
+        reason: &'r str,
+    },
 }
 
 /// The outbound message repository (issue #111).
@@ -22579,10 +22594,21 @@ impl MessageRepo<'_> {
             let _ = write!(ordering_key, "{byte:02x}");
         }
         let mut tx = begin_scoped(self.store, scope).await?;
+        // The address, sealed under the scope's active DEK. The consumer cannot mail a blind
+        // index, so a queued send has to be able to recover what it is sending to; sealing it
+        // here is what keeps that out of the outbox payload, which every consumer worker reads
+        // in the clear. See migration 0155.
+        let (dek_version, dek) = fetch_active_dek(&mut tx, scope, master).await?;
+        let sealed = dek.seal(
+            env.entropy(),
+            &message_recipient_seal_aad(scope, dek_version),
+            message.recipient.as_bytes(),
+        );
         let inserted = sqlx::query(
             "INSERT INTO messages \
-             (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+             (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key, \
+              recipient_sealed, pii_dek_version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (tenant_id, environment_id, dedup_key) DO NOTHING",
         )
         .bind(message.id.to_string())
@@ -22591,6 +22617,8 @@ impl MessageRepo<'_> {
         .bind(message.kind)
         .bind(bidx.as_bytes())
         .bind(message.dedup_key)
+        .bind(sealed.into_bytes())
+        .bind(dek_version)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -22620,6 +22648,161 @@ impl MessageRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(Enqueued::Accepted)
+    }
+
+    /// Claim this message for delivery, moving it `pending` -> `sending`.
+    ///
+    /// Returns `true` if THIS caller won it. The transition is the mutual exclusion: a
+    /// conditional UPDATE on `state = 'pending'` is serialised by the row lock, so of two
+    /// workers racing, exactly one sees a row affected and the other sees none.
+    ///
+    /// The read-then-act it replaces was not safe. The outbox leases a job, but a lease can
+    /// LAPSE: a worker that stalls past its visibility timeout has its job re-claimed while it
+    /// is still running, and then both observe `pending` and both hand the message to a
+    /// provider. At-least-once delivery of the JOB is the substrate's contract and is right;
+    /// at-least-once delivery of the MAIL is somebody receiving the same code twice.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn claim_for_delivery(&self, id: &MessageId) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let claimed = sqlx::query(
+            "UPDATE messages SET state = 'sending', updated_at = now() \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'pending'",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(claimed == 1)
+    }
+
+    /// Release a claim, moving `sending` back to `pending` so a retry can take it.
+    ///
+    /// For the outage case ONLY: every provider was unavailable, nothing was delivered, and
+    /// the substrate is going to try again. A message that reached a provider is resolved, not
+    /// released.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn release_claim(&self, id: &MessageId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "UPDATE messages SET state = 'pending', updated_at = now() \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'sending'",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Open this message's sealed recipient, or [`None`] if it carries none.
+    ///
+    /// The ONLY way an address leaves this table. Returns the live address, so a caller mails
+    /// it and drops it; writing it anywhere is the plaintext column migration 0154 refused.
+    ///
+    /// [`None`] means a row written before migration 0155, which has no sealed recipient and
+    /// never can: there was no plaintext to seal it from. That is a permanent condition, not a
+    /// transient one, and a caller should record it rather than retry it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or names no row;
+    /// [`StoreError::Encryption`] if no master key is configured or the seal will not open;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn open_recipient(&self, id: &MessageId) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT recipient_sealed, pii_dek_version FROM messages \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Err(StoreError::NotFound);
+        };
+        let sealed: Option<Vec<u8>> = row.get("recipient_sealed");
+        let version: Option<i32> = row.get("pii_dek_version");
+        let (Some(sealed), Some(version)) = (sealed, version) else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, version).await?;
+        tx.commit().await?;
+        let plaintext = dek.open(
+            &message_recipient_seal_aad(self.scope, version),
+            &Sealed::from_bytes(sealed)?,
+        )?;
+        String::from_utf8(plaintext)
+            .map(Some)
+            .map_err(|_| StoreError::Encryption)
+    }
+
+    /// Record how a delivery attempt ended.
+    ///
+    /// The consumer calls this exactly once per message, and the column-scoped UPDATE grant in
+    /// migration 0154 is what stops it from touching anything else: it may write the state, the
+    /// reason and the timestamp, and not the recipient index or the dedup key. A plane that
+    /// could rewrite a dedup key could replay a send the collapse already refused.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or names no row;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve(&self, id: &MessageId, outcome: Resolution<'_>) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let (state, reason) = match outcome {
+            Resolution::Sent => ("sent", None),
+            Resolution::Failed { reason } => ("failed", Some(reason)),
+        };
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let updated = sqlx::query(
+            "UPDATE messages SET state = $1, failure_reason = $2, updated_at = now() \
+             WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
+             AND state IN ('pending', 'sending')",
+        )
+        .bind(state)
+        .bind(reason)
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        if updated == 0 {
+            // Either no such row in this scope, or it is already resolved. Both are the same
+            // answer to the caller: this message is not yours to finish.
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
     }
 
     /// Read one message back by id.
@@ -55787,6 +55970,8 @@ const EMAIL_FACTOR_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.email-factor-
 const EMAIL_FACTOR_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.email-factor-recipient.v1";
 /// The blind-index label for a `messages` recipient (issue #111).
 const MESSAGE_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.message-recipient.v1";
+/// The envelope label for a sealed `messages` recipient (issue #111).
+const MESSAGE_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.message-recipient.v1";
 /// The AAD label domain-separating a sealed recipient phone number on an
 /// `sms_otp_codes` row (issue #70) from every other envelope context, so a phone
 /// ciphertext never authenticates under another column's context.
@@ -56449,6 +56634,21 @@ fn message_recipient_bidx_aad(scope: Scope, recipient: &str) -> Aad {
         .text(&scope.tenant().to_string())
         .text(&scope.environment().to_string())
         .field(recipient.as_bytes())
+        .build()
+}
+
+/// The associated data binding a sealed `messages` recipient to its scope and the DEK version
+/// that sealed it (issue #111).
+///
+/// Its own label, distinct from the email-factor seal. A seal is only openable in the context
+/// it was made in, so sharing a label would let a `messages` row's recipient be opened as
+/// though it were an `email_otp_codes` row's and the other way round.
+fn message_recipient_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(MESSAGE_RECIPIENT_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
         .build()
 }
 
@@ -67280,4 +67480,84 @@ async fn meter_token_issued(
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod message_recipient_seal_tests {
+    use ironauth_env::Env;
+    use ironauth_jose::{Dek, MasterKey, Sealed};
+
+    use super::{
+        email_factor_recipient_bidx_aad, email_factor_recipient_seal_aad,
+        message_recipient_bidx_aad, message_recipient_seal_aad,
+    };
+    use crate::id::{EnvironmentId, TenantId};
+    use crate::scope::Scope;
+
+    /// Migration 0155 says the sealed recipient is bound "under its own AAD label so a seal
+    /// from one table cannot be opened in the context of another", and until this test that
+    /// sentence rested entirely on two string constants differing. A one-character edit to
+    /// either made the two contexts identical and every behavioural test still passed, because
+    /// both the seal and the open use the SAME helper and are self-consistent under any label.
+    ///
+    /// A property that holds cross-function has to be asserted cross-function. Modelled on
+    /// `upstream_token_seal_tests` above, which does the same job for the upstream token seal.
+    #[test]
+    fn a_messages_seal_cannot_be_opened_as_an_email_factor_seal() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 11);
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let dek = Dek::generate(env.entropy());
+        let address = b"ada@example.test";
+        let version = 1;
+
+        let sealed = dek
+            .seal(
+                env.entropy(),
+                &message_recipient_seal_aad(scope, version),
+                address,
+            )
+            .into_bytes();
+
+        // Its own context opens it.
+        let opened = dek
+            .open(
+                &message_recipient_seal_aad(scope, version),
+                &Sealed::from_bytes(sealed.clone()).expect("decodes"),
+            )
+            .expect("the seal opens in the context it was made in");
+        assert_eq!(opened, address);
+
+        // The email-factor context does NOT, which is the whole claim. A shared label would
+        // make the two interchangeable and let a `messages` row's recipient be opened as
+        // though it were an `email_otp_codes` row's, and the other way round.
+        assert!(
+            dek.open(
+                &email_factor_recipient_seal_aad(scope, version),
+                &Sealed::from_bytes(sealed).expect("decodes"),
+            )
+            .is_err(),
+            "a messages seal must not open as an email-factor seal; if this fails, the two \
+             labels have been made equal and the tables share a key space"
+        );
+    }
+
+    /// The same separation for the BLIND INDEX, which is the half that would silently produce
+    /// a working cross-table join key rather than an error: equal labels mean the same address
+    /// hashes identically in both tables, and anyone holding one could join it to the other.
+    #[test]
+    fn a_messages_blind_index_is_not_an_email_factor_blind_index() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 12);
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let master = MasterKey::generate("sep-test", env.entropy());
+        let address = "ada@example.test";
+
+        let ours = master.blind_index(&message_recipient_bidx_aad(scope, address));
+        let theirs = master.blind_index(&email_factor_recipient_bidx_aad(scope, address));
+        assert_ne!(
+            ours.as_bytes(),
+            theirs.as_bytes(),
+            "the same address must not hash to the same index in two tables; equal indexes \
+             are a join key across them for anyone holding either"
+        );
+    }
 }

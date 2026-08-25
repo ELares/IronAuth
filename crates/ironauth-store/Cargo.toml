@@ -935,6 +935,10 @@ required-features = ["testing"]
 # eleven `message_*` decision modules are pure and carry 129 inline tests; this is the store
 # half they had no caller for.
 [[test]]
+name = "message_delivery_consumer"
+required-features = ["testing"]
+
+[[test]]
 name = "message_send"
 path = "tests/message_send.rs"
 required-features = ["testing"]

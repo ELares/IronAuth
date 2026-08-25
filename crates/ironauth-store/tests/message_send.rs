@@ -16,7 +16,9 @@
 use ironauth_env::Env;
 use ironauth_store::message_hygiene::{dedup_key, normalize_recipient, window_index};
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{Enqueued, MESSAGE_DELIVERY_CONSUMER, MessageId, NewMessage, Scope};
+use ironauth_store::{
+    CorrelationId, Enqueued, MESSAGE_DELIVERY_CONSUMER, MessageId, NewMessage, Resolution, Scope,
+};
 use std::time::SystemTime;
 
 /// The window every test below sends in, so a collapse is about the KEY rather than about
@@ -25,6 +27,61 @@ const WINDOW_SECS: u64 = 300;
 
 fn payload(kind: &str) -> serde_json::Value {
     serde_json::json!({ "kind": kind })
+}
+
+/// Provision the scope's envelope keys.
+///
+/// `enqueue` seals the recipient under the scope's active DEK, so a scope with no DEK cannot
+/// accept a send. In production every path that reaches a send has already sealed PII for this
+/// scope, so the keys exist; a bare `seed_scope` has not, so tests do it explicitly rather than
+/// having `enqueue` provision keys as a side effect of sending a message.
+async fn provision_keys(db: &TestDatabase, env: &Env, scope: Scope) {
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env));
+    acting
+        .envelope()
+        .provision_kek(env, &db.master_key())
+        .await
+        .expect("provision kek");
+    acting
+        .envelope()
+        .provision_dek(env, &db.master_key())
+        .await
+        .expect("provision dek");
+}
+
+/// Enqueue one send, returning what the store did with it AND the id it minted.
+async fn send_with_id(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    kind: &str,
+    recipient: &str,
+    at_secs: u64,
+) -> (Enqueued, MessageId) {
+    let normalized = normalize_recipient(recipient).expect("a deliverable address");
+    let window = window_index(at_secs, WINDOW_SECS);
+    let key = dedup_key(kind, recipient, window).expect("a dedup key");
+    let id = MessageId::generate(env, &scope);
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .messages()
+        .enqueue(
+            env,
+            NewMessage {
+                id: &id,
+                kind,
+                recipient: &normalized,
+                dedup_key: &key,
+            },
+            &payload(kind),
+        )
+        .await
+        .expect("enqueue");
+    (outcome, id)
 }
 
 /// Enqueue one send, returning what the store did with it.
@@ -77,6 +134,7 @@ async fn a_second_identical_send_within_the_window_collapses_to_one_delivery() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x111);
     let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
 
     let first = send(&db, &env, scope, "email_otp", "user@example.test", 1_000).await;
     assert_eq!(first, Enqueued::Accepted, "the first send is written");
@@ -112,6 +170,7 @@ async fn the_same_recipient_in_a_later_window_is_a_new_send() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x112);
     let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
 
     assert_eq!(
         send(&db, &env, scope, "email_otp", "user@example.test", 1_000).await,
@@ -134,6 +193,7 @@ async fn two_different_kinds_to_one_recipient_do_not_collapse_into_each_other() 
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x113);
     let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
 
     assert_eq!(
         send(&db, &env, scope, "email_otp", "user@example.test", 1_000).await,
@@ -153,6 +213,7 @@ async fn a_differently_cased_address_is_the_same_recipient() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x114);
     let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
 
     assert_eq!(
         send(&db, &env, scope, "email_otp", "User@Example.Test", 1_000).await,
@@ -172,6 +233,7 @@ async fn a_send_in_one_environment_does_not_collapse_a_send_in_another() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x115);
     let first = db.seed_scope(&env).await;
+    provision_keys(&db, &env, first).await;
     // The SAME tenant, a second environment. Two `seed_scope` calls would differ on tenant
     // AND environment, and then dropping `environment_id` from the UNIQUE would still pass:
     // the fixture could not attribute the outcome to the half it is named for. `environments`
@@ -181,6 +243,7 @@ async fn a_send_in_one_environment_does_not_collapse_a_send_in_another() {
         first.tenant(),
         db.seed_environment(&env, first.tenant()).await,
     );
+    provision_keys(&db, &env, second).await;
 
     assert_eq!(
         send(&db, &env, first, "email_otp", "user@example.test", 1_000).await,
@@ -203,6 +266,7 @@ async fn a_collapsed_send_queues_no_delivery_job() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x116);
     let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
 
     send(&db, &env, scope, "email_otp", "user@example.test", 1_000).await;
     let after_first = queued(&db, scope).await;
@@ -245,6 +309,7 @@ async fn the_row_holds_a_blind_index_and_never_the_address() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x117);
     let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
 
     let address = "ada@example.test";
     let key = dedup_key("email_otp", address, window_index(1_000, WINDOW_SECS)).expect("a key");
@@ -284,17 +349,22 @@ async fn the_row_holds_a_blind_index_and_never_the_address() {
     assert_eq!(record.state, "pending");
     assert_eq!(record.failure_reason, None);
 
-    // The plaintext address must appear NOWHERE the row can be read from, including the
-    // delivery job the same transaction queued. Read through the owner pool so this is a
-    // statement about what is ON DISK rather than about what one role can see.
+    // The plaintext address must appear NOWHERE the row can be read from. Read through the
+    // owner pool so this is a statement about what is ON DISK rather than what one role sees.
+    //
+    // `position(bytea in bytea)`, NOT a cast to text. Postgres renders bytea as `\x` plus hex
+    // under the default `bytea_output`, and `@` and `.` are not hex digits, so
+    // `recipient_bidx::text LIKE '%ada@example.test%'` is UNSATISFIABLE: it reports zero leaks
+    // for ANY column content, the plaintext address included. Measured: with the address bound
+    // straight into the column, all sixteen tests stayed green under that predicate.
     let leaked: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM messages \
          WHERE tenant_id = $1 AND environment_id = $2 \
-         AND recipient_bidx::text LIKE $3",
+         AND position($3::bytea in recipient_bidx) > 0",
     )
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
-    .bind(format!("%{address}%"))
+    .bind(address.as_bytes())
     .fetch_one(db.owner_pool())
     .await
     .expect("scan the stored index");
@@ -353,6 +423,7 @@ async fn the_ordering_key_groups_by_recipient_and_separates_recipients() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x11a);
     let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
 
     send(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
     // A later window, so this is a second SEND to the same person rather than a collapse.
@@ -386,12 +457,14 @@ async fn a_message_id_from_another_scope_is_not_found() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x118);
     let here = db.seed_scope(&env).await;
+    provision_keys(&db, &env, here).await;
     // One dimension again: same tenant, other environment. With two independent scopes the
     // guard could be narrowed to compare tenants only and this test would not notice.
     let elsewhere = Scope::new(
         here.tenant(),
         db.seed_environment(&env, here.tenant()).await,
     );
+    provision_keys(&db, &env, elsewhere).await;
 
     let foreign = MessageId::generate(&env, &elsewhere);
     let outcome = db.store().scoped(here).messages().by_id(&foreign).await;
@@ -414,10 +487,12 @@ async fn enqueue_refuses_an_identifier_from_another_scope_and_writes_nothing() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x11b);
     let here = db.seed_scope(&env).await;
+    provision_keys(&db, &env, here).await;
     let elsewhere = Scope::new(
         here.tenant(),
         db.seed_environment(&env, here.tenant()).await,
     );
+    provision_keys(&db, &env, elsewhere).await;
 
     let foreign = MessageId::generate(&env, &elsewhere);
     let key = dedup_key(
@@ -482,6 +557,7 @@ async fn a_failed_delivery_job_takes_the_message_row_with_it() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x11c);
     let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
 
     // The id this send will use, minted first so its delivery job's idempotency key can be
     // taken before the send is made.
@@ -561,10 +637,12 @@ async fn the_row_level_security_policy_hides_another_scopes_rows() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x11d);
     let here = db.seed_scope(&env).await;
+    provision_keys(&db, &env, here).await;
     let elsewhere = Scope::new(
         here.tenant(),
         db.seed_environment(&env, here.tenant()).await,
     );
+    provision_keys(&db, &env, elsewhere).await;
 
     send(&db, &env, here, "email_otp", "ada@example.test", 1_000).await;
     send(
@@ -619,6 +697,7 @@ async fn the_control_plane_cannot_enqueue_and_the_data_plane_cannot_rewrite_a_se
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x11e);
     let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
     send(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
 
     // The control plane's privilege, asked of the catalogue rather than inferred from a
@@ -657,4 +736,137 @@ async fn the_control_plane_cannot_enqueue_and_the_data_plane_cannot_rewrite_a_se
              able to rewrite `{column}` lets it replay a send the collapse refused"
         );
     }
+}
+
+/// The sealed recipient round-trips, and the seal is bound to its table.
+///
+/// A consumer cannot mail a blind index, so the address has to survive the enqueue; migration
+/// 0155 seals it rather than putting it on the outbox payload every worker reads. Two things
+/// are worth pinning: that what comes back out is what went in, and that the ciphertext is not
+/// the address sitting in a bytea column with extra steps.
+#[tokio::test]
+async fn the_sealed_recipient_round_trips_and_is_not_the_address_in_disguise() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x120);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let address = "ada@example.test";
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", address, 1_000).await;
+
+    let row: (Vec<u8>, i32) = sqlx::query_as(
+        "SELECT recipient_sealed, pii_dek_version FROM messages \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the sealed recipient");
+    assert!(!row.0.is_empty(), "a queued send must carry its recipient");
+    assert!(row.1 >= 1, "and the DEK version that sealed it");
+    let as_text = String::from_utf8_lossy(&row.0);
+    assert!(
+        !as_text.contains(address) && !as_text.contains("ada"),
+        "the stored bytes must be ciphertext, not the address with extra steps"
+    );
+
+    // And it ROUND TRIPS, which is the half the title claimed and the body did not measure:
+    // this test read the column and looked at it, and never once opened it. `open_recipient`
+    // could have returned a constant and nothing here would have noticed.
+    let opened = db
+        .store()
+        .scoped(scope)
+        .messages()
+        .open_recipient(&id)
+        .await
+        .expect("open the sealed recipient")
+        .expect("a queued send carries one");
+    assert_eq!(
+        opened, "ada@example.test",
+        "what the consumer mails must be what the door addressed"
+    );
+}
+
+/// `resolve` writes the outcome once, and a second attempt is refused.
+///
+/// The second half matters as much as the first: a consumer that could resolve an
+/// already-resolved message could overwrite a `failed` with a `sent`, and an operator reading
+/// the ledger would be told a message arrived that never did.
+#[tokio::test]
+async fn resolve_records_the_outcome_once_and_refuses_a_second() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x121);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+    let repo = db.store();
+    let messages = repo.scoped(scope);
+    messages
+        .messages()
+        .resolve(&id, Resolution::Sent)
+        .await
+        .expect("first resolve");
+    let record = messages
+        .messages()
+        .by_id(&id)
+        .await
+        .expect("read back")
+        .expect("row");
+    assert_eq!(record.state, "sent");
+    assert_eq!(record.failure_reason, None);
+
+    let again = messages
+        .messages()
+        .resolve(&id, Resolution::Failed { reason: "bounced" })
+        .await;
+    assert!(
+        again.is_err(),
+        "a resolved message is finished; letting a second attempt through would let a failure \
+         overwrite a success, or the reverse"
+    );
+    let after = messages
+        .messages()
+        .by_id(&id)
+        .await
+        .expect("read back")
+        .expect("row");
+    assert_eq!(after.state, "sent", "and the first outcome stands");
+}
+
+/// A failure records WHY, and the reason is a classification an operator can group by.
+#[tokio::test]
+async fn a_failed_delivery_records_its_reason() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x122);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;
+    db.store()
+        .scoped(scope)
+        .messages()
+        .resolve(
+            &id,
+            Resolution::Failed {
+                reason: "all_providers_unavailable",
+            },
+        )
+        .await
+        .expect("resolve");
+
+    let record = db
+        .store()
+        .scoped(scope)
+        .messages()
+        .by_id(&id)
+        .await
+        .expect("read back")
+        .expect("row");
+    assert_eq!(record.state, "failed");
+    assert_eq!(
+        record.failure_reason.as_deref(),
+        Some("all_providers_unavailable")
+    );
 }
