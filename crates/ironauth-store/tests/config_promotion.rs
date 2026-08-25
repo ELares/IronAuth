@@ -2704,3 +2704,594 @@ async fn an_applied_promotion_announces_its_revision_and_a_no_op_announces_nothi
          invalidates a cache for no reason: {quiet:?}"
     );
 }
+
+// =========================================================================================
+// Message templates (issue #111, criterion 7): environment-level templates export and
+// promote through config snapshots; per-organization overrides stay out.
+// =========================================================================================
+
+/// Insert a message-template row at an explicit level.
+///
+/// Direct SQL for the same reason `tests/message_templates.rs` uses it: there is no authoring
+/// surface yet (the admin half of criterion 3), and this is about what the SNAPSHOT does with
+/// rows that exist, not about how they got there. In a transaction carrying the scope
+/// settings, because `message_templates` is FORCE RLS with a WITH CHECK.
+#[allow(clippy::too_many_arguments)]
+async fn set_template(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    level: &str,
+    organization: Option<&ironauth_store::OrganizationId>,
+    kind: &str,
+    locale: &str,
+    subject: &str,
+    locked: bool,
+) {
+    let id = ironauth_store::MessageTemplateId::generate(env, &scope).to_string();
+    let statement = sqlx::query(
+        "INSERT INTO message_templates \
+         (id, tenant_id, environment_id, level, organization_id, kind, locale, subject, \
+          body_text, body_html, locked, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())",
+    )
+    .bind(&id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(level)
+    .bind(organization.map(ToString::to_string))
+    .bind(kind)
+    .bind(locale)
+    .bind(subject)
+    .bind(format!("text of {subject}"))
+    .bind(format!("<p>{subject}</p>"))
+    .bind(locked);
+
+    let mut tx = db.control_pool().begin().await.expect("begin");
+    for (key, value) in [
+        ("ironauth.tenant_id", scope.tenant().to_string()),
+        ("ironauth.environment_id", scope.environment().to_string()),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .expect("scope setting");
+    }
+    statement.execute(&mut *tx).await.expect("insert template");
+    tx.commit().await.expect("commit");
+}
+
+/// One live template row, as every field a promotion is supposed to carry.
+///
+/// All of them, because a projection that reads only the key and the subject cannot see a
+/// capture that blanks `body_text`, drops `body_html`, or loses `locked`: each of those was a
+/// surviving mutant against the narrower tuple.
+type TemplateRow = (String, String, String, String, String, Option<String>, bool);
+
+/// Every LIVE template row in a scope, ordered.
+async fn templates_of(db: &TestDatabase, scope: Scope) -> Vec<TemplateRow> {
+    let mut rows: Vec<TemplateRow> = sqlx::query_as(
+        "SELECT level, kind, locale, subject, body_text, body_html, locked \
+         FROM message_templates \
+         WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read templates");
+    rows.sort();
+    rows
+}
+
+/// One exported template, as the assertions compare it: the key, the three bodies, the lock.
+type ExportedTemplate<'a> = (&'a str, &'a str, &'a str, &'a str, Option<&'a str>, bool);
+
+/// The row `set_template` writes for these arguments, as `templates_of` reports it.
+fn expected(level: &str, kind: &str, locale: &str, subject: &str, locked: bool) -> TemplateRow {
+    (
+        level.to_owned(),
+        kind.to_owned(),
+        locale.to_owned(),
+        subject.to_owned(),
+        format!("text of {subject}"),
+        Some(format!("<p>{subject}</p>")),
+        locked,
+    )
+}
+
+/// An ENVIRONMENT template promotes end to end, and the tenant and organization levels do not.
+///
+/// The decoys are the point. Both share the promoted row's `(kind, locale)`, so a capture that
+/// forgot its level filter would export three rows for one key, and a writer that forgot its
+/// level filter would overwrite the target's tenant default with the source's environment
+/// body. Issue #111 requires per-organization overrides to ride org export and never a
+/// snapshot, and a shared key is exactly the case where "never" is load-bearing.
+#[tokio::test]
+// One fixture carries the whole claim: splitting it would put the decoy rows in one
+// function and the assertion that they stayed behind in another.
+#[allow(clippy::too_many_lines)]
+async fn an_environment_template_promotes_and_the_other_levels_stay_behind() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    let org = {
+        let id = ironauth_store::OrganizationId::generate(&env, &source);
+        db.control_store()
+            .management()
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .organizations(source)
+            .create(&env, &id, 1_000_000, "promotion org", None)
+            .await
+            .expect("create organization");
+        id
+    };
+
+    // Seeded OUT of (kind, locale) order, and `locked` set on one of them. A fixture already
+    // in byte order makes the export's sort a no-op, so "ordered by (kind, locale)" would pass
+    // against a capture that never sorted at all.
+    set_template(
+        &db,
+        &env,
+        source,
+        "environment",
+        None,
+        "invitation",
+        "fr",
+        "ENV invite",
+        true,
+    )
+    .await;
+    set_template(
+        &db,
+        &env,
+        source,
+        "environment",
+        None,
+        "email_otp",
+        "en",
+        "ENV subject",
+        false,
+    )
+    .await;
+    // Same (kind, locale) as the second, at the two levels a snapshot must not carry.
+    set_template(
+        &db,
+        &env,
+        source,
+        "tenant",
+        None,
+        "email_otp",
+        "en",
+        "TENANT subject",
+        false,
+    )
+    .await;
+    set_template(
+        &db,
+        &env,
+        source,
+        "organization",
+        Some(&org),
+        "email_otp",
+        "en",
+        "ORG subject",
+        false,
+    )
+    .await;
+
+    let source_snapshot = export(&db, source).await;
+
+    // EXPORT carries the two environment rows and neither decoy.
+    let exported: Vec<ExportedTemplate<'_>> = source_snapshot
+        .resources
+        .message_template
+        .iter()
+        .map(|t| {
+            (
+                t.kind.as_str(),
+                t.locale.as_str(),
+                t.subject.as_str(),
+                t.body_text.as_str(),
+                t.body_html.as_deref(),
+                t.locked,
+            )
+        })
+        .collect();
+    assert_eq!(
+        exported,
+        vec![
+            (
+                "email_otp",
+                "en",
+                "ENV subject",
+                "text of ENV subject",
+                Some("<p>ENV subject</p>"),
+                false
+            ),
+            (
+                "invitation",
+                "fr",
+                "ENV invite",
+                "text of ENV invite",
+                Some("<p>ENV invite</p>"),
+                true
+            ),
+        ],
+        "only the ENVIRONMENT level exports, EVERY field of it, sorted by (kind, locale) \
+         rather than left in the order the rows were written"
+    );
+
+    // The export must satisfy the validator the IMPORT side applies. The two are separate
+    // code paths over the same grammar, and a capture that emitted a document its own
+    // validator refuses would make an environment unpromotable with the fault only visible at
+    // the far end of a promotion.
+    let rendered = serde_json::to_vec(&source_snapshot).expect("serialize the export");
+    validate_document(&rendered).expect("the exported document must pass the import validator");
+
+    let plan = plan_promotion(&control(&db).scoped(target), &source_snapshot)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    assert_eq!(
+        plan.diff().len(),
+        2,
+        "one create per environment template: {:?}",
+        plan.diff().changes()
+    );
+
+    let (actor, corr) = acting(&db, &env);
+    let outcome = control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &source_snapshot, plan.base_revision(), false)
+        .await
+        .expect("apply");
+    assert!(matches!(outcome, PromotionOutcome::Applied(_)));
+
+    assert_eq!(
+        templates_of(&db, target).await,
+        vec![
+            expected("environment", "email_otp", "en", "ENV subject", false),
+            expected("environment", "invitation", "fr", "ENV invite", true),
+        ],
+        "the target holds the two promoted rows WHOLE -- both bodies and the pin flag -- at \
+         environment level, and nothing else"
+    );
+
+    // Re-applying changes nothing.
+    let replan = plan_promotion(&control(&db).scoped(target), &source_snapshot)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    assert_eq!(replan.diff().len(), 0, "a settled promotion re-plans empty");
+}
+
+/// An UPDATE and a DELETE reach the environment row and leave a same-key tenant default alone.
+///
+/// The delete half is where a level-blind `WHERE kind = $1 AND locale = $2` does real damage: it
+/// would soft-delete the target's own tenant default, which no promotion ever owned, and the
+/// only evidence would be mail silently falling back to the built-in template.
+#[tokio::test]
+// One fixture carries the whole claim: splitting it would put the decoy rows in one
+// function and the assertion that they stayed behind in another.
+#[allow(clippy::too_many_lines)]
+async fn promoting_an_update_and_a_delete_never_touches_the_tenant_default() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    set_template(
+        &db,
+        &env,
+        source,
+        "environment",
+        None,
+        "email_otp",
+        "en",
+        "first",
+        false,
+    )
+    .await;
+    let first = export(&db, source).await;
+    let plan = plan_promotion(&control(&db).scoped(target), &first)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    let (actor, corr) = acting(&db, &env);
+    control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &first, plan.base_revision(), false)
+        .await
+        .expect("apply");
+
+    // The target has its OWN tenant default on the same key, which the promotion never owned.
+    set_template(
+        &db,
+        &env,
+        target,
+        "tenant",
+        None,
+        "email_otp",
+        "en",
+        "target tenant",
+        false,
+    )
+    .await;
+
+    // UPDATE: rewrite the source's environment row.
+    sqlx::query(
+        "UPDATE message_templates SET subject = 'second', updated_at = now() \
+         WHERE tenant_id = $1 AND environment_id = $2 AND level = 'environment'",
+    )
+    .bind(source.tenant().to_string())
+    .bind(source.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("rewrite source");
+
+    let second = export(&db, source).await;
+    let plan = plan_promotion(&control(&db).scoped(target), &second)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    assert_eq!(plan.diff().len(), 1, "the rewrite is one update");
+    let (actor, corr) = acting(&db, &env);
+    control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &second, plan.base_revision(), false)
+        .await
+        .expect("apply");
+    assert_eq!(
+        templates_of(&db, target).await,
+        vec![
+            // The rewrite touched only `subject`, so the bodies are still the ones the FIRST
+            // promotion carried.
+            (
+                "environment".to_owned(),
+                "email_otp".to_owned(),
+                "en".to_owned(),
+                "second".to_owned(),
+                "text of first".to_owned(),
+                Some("<p>first</p>".to_owned()),
+                false,
+            ),
+            expected("tenant", "email_otp", "en", "target tenant", false),
+        ],
+        "the update reached the environment row and left the tenant default alone"
+    );
+
+    // DELETE: drop the source's environment row entirely.
+    sqlx::query(
+        "UPDATE message_templates SET deleted_at = now() \
+         WHERE tenant_id = $1 AND environment_id = $2 AND level = 'environment'",
+    )
+    .bind(source.tenant().to_string())
+    .bind(source.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("delete source");
+
+    let third = export(&db, source).await;
+    assert!(
+        third.resources.message_template.is_empty(),
+        "a soft-deleted template does not export"
+    );
+    let plan = plan_promotion(&control(&db).scoped(target), &third)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    assert_eq!(plan.diff().len(), 1, "the removal is one delete");
+    let (actor, corr) = acting(&db, &env);
+    control(&db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(&env, &third, plan.base_revision(), false)
+        .await
+        .expect("apply");
+    assert_eq!(
+        templates_of(&db, target).await,
+        vec![expected(
+            "tenant",
+            "email_otp",
+            "en",
+            "target tenant",
+            false
+        )],
+        "the delete took the promoted environment row and ONLY it"
+    );
+}
+
+/// Promoting twice into a non-empty target is a no-op the second time.
+///
+/// The plan reads the target one way and the apply reads it another, and the two must agree
+/// BYTE for byte or a settled promotion never reports `NoOp`. This drives the whole apply rather
+/// than the diff, because the diff is keyed by a `BTreeMap` and an empty second diff is
+/// consistent with any ordering at all.
+///
+/// What it does NOT cover: deleting the Rust sort in `read_promoted_message_templates` leaves
+/// this green, because the partial unique index already returns the rows in `(kind, locale)`
+/// order. That sort is defence against a query-plan change and is not measurable from here;
+/// the reasoning is recorded beside it rather than asserted here.
+#[tokio::test]
+async fn a_second_promotion_into_a_populated_target_is_a_no_op() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    // Two rows whose insert order is the REVERSE of their key order, so a target read that
+    // returns them unsorted disagrees with the export's sorted capture.
+    set_template(
+        &db,
+        &env,
+        source,
+        "environment",
+        None,
+        "invitation",
+        "fr",
+        "invite",
+        false,
+    )
+    .await;
+    set_template(
+        &db,
+        &env,
+        source,
+        "environment",
+        None,
+        "email_otp",
+        "en",
+        "otp",
+        false,
+    )
+    .await;
+
+    let snapshot = export(&db, source).await;
+    let mut outcomes = Vec::new();
+    for _ in 0..2 {
+        let plan = plan_promotion(&control(&db).scoped(target), &snapshot)
+            .await
+            .expect("plan db")
+            .expect("plan builds");
+        let (actor, corr) = acting(&db, &env);
+        outcomes.push(
+            control(&db)
+                .scoped(target)
+                .acting(actor, corr)
+                .apply_promotion(&env, &snapshot, plan.base_revision(), false)
+                .await
+                .expect("apply"),
+        );
+    }
+
+    assert!(matches!(outcomes[0], PromotionOutcome::Applied(_)));
+    // The APPLY OUTCOME is the assertion, not the diff length. The diff is keyed by a
+    // `BTreeMap`, so element order cannot reach it and an empty second diff proves nothing
+    // about ordering. The no-op branch instead compares the target's REVISION against the
+    // source's, and a revision is a hash of the canonical form, in which arrays keep their
+    // order. So a target read that returns these two rows in physical order rather than
+    // `(kind, locale)` order hashes differently from the sorted export, the revisions never
+    // match, and a settled promotion re-applies for ever instead of reporting NoOp.
+    //
+    // The fixture is what gives that teeth: the rows are inserted in the REVERSE of their key
+    // order, so sorted and unsorted reads genuinely differ.
+    assert!(
+        matches!(outcomes[1], PromotionOutcome::NoOp),
+        "a settled promotion must report NoOp, not re-apply: {:?}",
+        outcomes[1]
+    );
+}
+
+/// Export `source`, plan against `target`, apply, and report how many changes the plan held.
+async fn promote_current(db: &TestDatabase, env: &Env, source: Scope, target: Scope) -> usize {
+    let snapshot = export(db, source).await;
+    let plan = plan_promotion(&control(db).scoped(target), &snapshot)
+        .await
+        .expect("plan db")
+        .expect("plan builds");
+    let changes = plan.diff().len();
+    let (actor, corr) = acting(db, env);
+    control(db)
+        .scoped(target)
+        .acting(actor, corr)
+        .apply_promotion(env, &snapshot, plan.base_revision(), false)
+        .await
+        .expect("apply");
+    changes
+}
+
+/// A template deleted by one promotion can be RE-CREATED by the next.
+///
+/// The delete is soft, and the partial unique index is `WHERE deleted_at IS NULL`, so the
+/// tombstone frees the slot. If either the target read or the re-create forgot
+/// `deleted_at IS NULL`, this fails: the read would report a deleted row as present (so the
+/// re-create would be planned as an update that matches nothing), or the insert would collide
+/// with the tombstone.
+#[tokio::test]
+async fn a_promoted_delete_can_be_followed_by_a_promoted_re_create() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+
+    set_template(
+        &db,
+        &env,
+        source,
+        "environment",
+        None,
+        "email_otp",
+        "en",
+        "before",
+        false,
+    )
+    .await;
+    assert_eq!(
+        promote_current(&db, &env, source, target).await,
+        1,
+        "the create"
+    );
+
+    sqlx::query(
+        "UPDATE message_templates SET deleted_at = now() \
+         WHERE tenant_id = $1 AND environment_id = $2 AND level = 'environment'",
+    )
+    .bind(source.tenant().to_string())
+    .bind(source.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("soft delete in the source");
+    assert_eq!(
+        promote_current(&db, &env, source, target).await,
+        1,
+        "the delete"
+    );
+    assert!(
+        templates_of(&db, target).await.is_empty(),
+        "the target's row is gone"
+    );
+
+    // The same key again, with different content.
+    set_template(
+        &db,
+        &env,
+        source,
+        "environment",
+        None,
+        "email_otp",
+        "en",
+        "after",
+        true,
+    )
+    .await;
+    assert_eq!(
+        promote_current(&db, &env, source, target).await,
+        1,
+        "the re-create"
+    );
+    assert_eq!(
+        templates_of(&db, target).await,
+        vec![expected("environment", "email_otp", "en", "after", true)],
+        "a soft-deleted row frees its slot, so the same (kind, locale) can come back"
+    );
+}

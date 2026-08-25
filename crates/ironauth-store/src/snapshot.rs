@@ -82,7 +82,7 @@ pub const CONNECTOR_CLIENT_SECRET_REFERENCE: &str = "connector_client_secret";
 /// (and by the export), and an environment-identity or runtime type can never be
 /// added without failing it. This is the live binding between the snapshot and the
 /// single source of truth, not a hand-maintained parallel list.
-pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 12] = [
+pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 13] = [
     ResourceType::Client,
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
@@ -95,6 +95,7 @@ pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 12] = [
     ResourceType::LocaleBundle,
     ResourceType::SignupForm,
     ResourceType::FlowVersion,
+    ResourceType::MessageTemplate,
 ];
 
 /// A named reference to a secret in the environment-scoped secret store (issue
@@ -448,6 +449,37 @@ pub struct FlowVersionSnapshot {
     pub pinned: bool,
 }
 
+/// The secret-free projection of one per-environment message template (issue #111). A template
+/// is NON-secret promotable config: the message kind, the BCP47 locale, and the subject / text /
+/// HTML bodies. The bodies are safe-templating source, which interpolates data and executes
+/// nothing, and the table is credential-free by construction (migration 0145 refuses to store an
+/// SMTP credential precisely so a snapshot cannot carry one).
+///
+/// ENVIRONMENT level only. A tenant-level template is not per-environment config, and a
+/// per-organization override is runtime data that exports with the organization and never enters
+/// a snapshot, which is what issue #111 asks for in as many words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageTemplateSnapshot {
+    /// Which message this templates (for example `email_otp`), half of the natural key.
+    pub kind: String,
+    /// The BCP47 tag the bodies are written in, the other half of the natural key.
+    pub locale: String,
+    /// The rendered subject line.
+    pub subject: String,
+    /// The plain-text body.
+    pub body_text: String,
+    /// The HTML body, when one was authored.
+    pub body_html: Option<String>,
+    /// Whether this level PINS, so no narrower level may replace it (issue #619).
+    ///
+    /// Defaulted, so a document written before this field existed imports as UNLOCKED rather
+    /// than failing deserialization with an error that names no path. The validator treats it
+    /// as optional too, and the two have to agree: a field one half requires and the other
+    /// tolerates is refused before any violation can be reported against it.
+    #[serde(default)]
+    pub locked: bool,
+}
+
 /// The promotable resources a snapshot carries, keyed by resource-type wire name
 /// (issue #41 classification). Each array is ordered by its type's stable natural
 /// key, so the collection order is deterministic and documented.
@@ -505,6 +537,12 @@ pub struct SnapshotResources {
     /// secret and no PII travels (issue #92, PR 5).
     #[serde(default)]
     pub flow_version: Vec<FlowVersionSnapshot>,
+    /// The environment's per-environment message templates (`message_template`). Each is
+    /// secret-free config (a kind, a locale, and the subject and bodies); the table cannot hold
+    /// an SMTP credential, and tenant-level and per-organization templates are excluded (issue
+    /// #111).
+    #[serde(default)]
+    pub message_template: Vec<MessageTemplateSnapshot>,
 }
 
 /// A canonical, deterministic, secret-free snapshot of one environment's
@@ -938,6 +976,30 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
         (a.journey_id.as_str(), a.version).cmp(&(b.journey_id.as_str(), b.version))
     });
 
+    // Message templates (issue #111): non-secret promotable config, ENVIRONMENT level only.
+    // The repository filters the level, so a tenant default and a per-organization override
+    // cannot reach the snapshot even if one exists for the same (kind, locale). No secret
+    // travels because the table has no column that could hold one. Ordered by the stable
+    // (kind, locale) natural key, both scope-independent strings, which is what makes these
+    // promotable where a signup form (keyed by a scope-embedded client id) is not.
+    let mut message_template: Vec<MessageTemplateSnapshot> = scoped
+        .message_templates()
+        .list_environment_level()
+        .await?
+        .into_iter()
+        .map(|record| MessageTemplateSnapshot {
+            kind: record.kind,
+            locale: record.locale,
+            subject: record.subject,
+            body_text: record.body_text,
+            body_html: record.body_html,
+            locked: record.locked,
+        })
+        .collect();
+    message_template.sort_by(|a, b| {
+        (a.kind.as_str(), a.locale.as_str()).cmp(&(b.kind.as_str(), b.locale.as_str()))
+    });
+
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
         resources: SnapshotResources {
@@ -953,6 +1015,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             locale_bundle,
             signup_form,
             flow_version,
+            message_template,
         },
     })
 }
@@ -1064,8 +1127,8 @@ const CLIENT_AUTH_METHODS: [&str; 5] = [
 /// The recognized `token_format` values a snapshot resource server may carry.
 const RESOURCE_SERVER_FORMATS: [&str; 2] = ["at_jwt", "opaque"];
 
-/// Every key a snapshot `client` element may carry (the published schema pins
-/// `additionalProperties: false`, so any other key is rejected).
+/// Every key a snapshot `client` element may carry. THIS list is the contract:
+/// `reject_unknown_keys` refuses anything else, so any other key is rejected.
 const CLIENT_KEYS: [&str; 16] = [
     "client_id",
     "display_name",
@@ -1109,7 +1172,7 @@ const DCR_POLICY_KEYS: [&str; 2] = ["name", "primitives"];
 const VARIABLE_KEYS: [&str; 2] = ["name", "value"];
 
 /// Every key a snapshot `brand` element may carry (issue #86). No secret slot: a brand
-/// holds no secret material. The published schema pins `additionalProperties: false`. PR 3
+/// holds no secret material. `reject_unknown_keys` refuses anything else. PR 3
 /// adds the per-brand selection keys (`host_pattern`, `client_id`) and the by-reference asset
 /// metadata list (`assets`).
 const BRAND_KEYS: [&str; 11] = [
@@ -1135,22 +1198,33 @@ const BRAND_ASSET_KEYS: [&str; 4] = ["kind", "content_type", "sha256", "size_byt
 const BRAND_ASSET_KINDS: [&str; 2] = ["logo", "favicon"];
 
 /// Every key a snapshot `locale_bundle` element may carry (issue #86, PR 2). No secret slot: a
-/// locale bundle holds no secret material. The published schema pins `additionalProperties:
-/// false`.
+/// locale bundle holds no secret material. `reject_unknown_keys` refuses anything else.
 const LOCALE_BUNDLE_KEYS: [&str; 3] = ["locale", "is_env_default", "entries"];
 
 /// Every key a snapshot `signup_form` element may carry (issue #87). No secret slot: a signup
 /// form holds no secret material and no PII (only trait pointers, bounded rules, and numeric
-/// ids). The published schema pins `additionalProperties: false`.
+/// ids). `reject_unknown_keys` refuses anything else.
 const SIGNUP_FORM_KEYS: [&str; 2] = ["client_id", "fields"];
 
 /// Every key a snapshot `flow_version` element may carry (issue #92, PR 5). No secret slot: a
 /// journey artifact holds no secret and no PII (a predicate references trait pointers and group /
-/// scope names, never values). The published schema pins `additionalProperties: false`.
+/// scope names, never values). `reject_unknown_keys` refuses anything else.
 const FLOW_VERSION_KEYS: [&str; 4] = ["journey_id", "version", "artifact", "pinned"];
 
+/// Every key a snapshot `message_template` element may carry (issue #111). No secret slot: the
+/// table is credential-free by construction and a body is safe-templating source that
+/// interpolates data and executes nothing. `reject_unknown_keys` refuses anything else.
+const MESSAGE_TEMPLATE_KEYS: [&str; 6] = [
+    "kind",
+    "locale",
+    "subject",
+    "body_text",
+    "body_html",
+    "locked",
+];
+
 /// Every key a snapshot `connector` element may carry, besides the secret REFERENCE
-/// slot (issue #75). The published schema pins `additionalProperties: false`.
+/// slot (issue #75). `reject_unknown_keys` refuses anything else.
 const CONNECTOR_KEYS: [&str; 3] = ["connector_slug", "definition", "enabled"];
 
 /// Every key a snapshot `org_connection` element may carry (issue #77). No secret
@@ -1596,6 +1670,52 @@ fn validate_resource(
                 )),
             }
         }
+        ResourceType::MessageTemplate => {
+            // A message template is secret-free config (issue #111): a kind, a locale, the
+            // subject and bodies, and the lock flag. The forbidden-secret-key scan above
+            // already blocks secret-shaped material, and the TABLE has no column that could
+            // hold an SMTP credential, which is what migration 0145 refused to add.
+            reject_unknown_keys(object, &MESSAGE_TEMPLATE_KEYS, None, path, violations);
+            require_nonempty_string(object, "kind", path, violations);
+            require_nonempty_string(object, "locale", path, violations);
+            require_nonempty_string(object, "subject", path, violations);
+            require_nonempty_string(object, "body_text", path, violations);
+            if let Some(value) = object.get("locked") {
+                if !value.is_boolean() {
+                    violations.push(SnapshotViolation::new(
+                        format!("{path}/locked"),
+                        "must be a boolean",
+                    ));
+                }
+            }
+            // Every body must be SAFE-TEMPLATING VALID, the same gate the flow-version arm
+            // applies to a journey artifact and for the same reason: a promotion that accepted
+            // an unterminated `{{` would store a template that fails at SEND time, and the
+            // recipient is the one who discovers it. `body_html` is optional but is checked
+            // when present; a JSON null is the absent case, not a body.
+            //
+            // THIS IS THE ONLY GATE TODAY, and it is worth being exact about what that means.
+            // The store's write path does not check syntax, so a template inserted directly
+            // can be exported and then refused here, which makes its environment unpromotable
+            // until it is fixed. The violation names the offending field's path, so an
+            // operator is told WHICH body rather than merely that one is bad; what they do not
+            // yet have is an authoring surface that would have refused it on the way in. That
+            // belongs with criterion 3's management endpoints, and when they land the check
+            // belongs there too. `config_promotion.rs` asserts an export satisfies this
+            // validator, so the two sides cannot drift apart silently in the meantime.
+            for field in ["subject", "body_text", "body_html"] {
+                // `body_html` may be absent or null; the required-string check above already
+                // reported a missing or non-string subject or text body.
+                if let Some(serde_json::Value::String(text)) = object.get(field) {
+                    if let Err(error) = crate::message_render::validate_syntax(text) {
+                        violations.push(SnapshotViolation::new(
+                            format!("{path}/{field}"),
+                            error.as_str(),
+                        ));
+                    }
+                }
+            }
+        }
         // Only the promotable set is ever passed here (the caller iterates
         // SNAPSHOT_RESOURCE_TYPES); a non-promotable type is a programmer error, not
         // a document fault, so it is reported at the element path.
@@ -1606,10 +1726,14 @@ fn validate_resource(
     }
 }
 
-/// Reject any key on `object` not in `allowed` (plus the optional `extra` key):
-/// the published schema pins `additionalProperties: false` on every resource, so
+/// Reject any key on `object` not in `allowed` (plus the optional `extra` key), so
 /// an unexpected field is caught rather than silently dropped, which also blocks
 /// smuggling secret-shaped material under a novel key name.
+///
+/// THIS function is where `additionalProperties: false` is enforced, and the per-resource
+/// key lists above are the contract. `docs/snapshot/snapshot.schema.json` describes only
+/// four of the thirteen resource types, so the comments here used to credit a published
+/// document that does not mention the resource they sat above; the guard is the code.
 fn reject_unknown_keys(
     object: &serde_json::Map<String, serde_json::Value>,
     allowed: &[&str],
@@ -1920,7 +2044,7 @@ mod tests {
         assert_eq!(
             text,
             "{\"resources\":{\"brand\":[],\"client\":[],\"connector\":[],\"dcr_policy\":[],\
-             \"flow_version\":[],\"locale_bundle\":[],\"org_connection\":[],\
+             \"flow_version\":[],\"locale_bundle\":[],\"message_template\":[],\"org_connection\":[],\
              \"resource_server\":[],\"routing_rule\":[],\"signup_form\":[],\
              \"upstream_token_grant\":[],\"variable\":[]},\
              \"schema_version\":\"ironauth.config-snapshot/v1\"}"
@@ -2233,6 +2357,112 @@ mod tests {
                 .iter()
                 .any(|v| v.path == "/resources/connector/0/secret"),
             "a raw connector secret must be rejected with its path: {violations:?}"
+        );
+    }
+
+    /// A well-formed message template validates and re-serializes byte-identically.
+    ///
+    /// Without this the whole `ResourceType::MessageTemplate` arm was UNREACHABLE from any
+    /// test: replacing its body with a tripwire that rejected every template document left
+    /// the store and admin suites green, because nothing ever fed one to `validate_document`.
+    #[test]
+    fn a_message_template_validates_and_round_trips() {
+        let doc = format!(
+            r#"{{"schema_version":"{SNAPSHOT_SCHEMA_VERSION}","resources":{{"message_template":[{{"kind":"email_otp","locale":"en","subject":"Your {{{{ kind }}}} code","body_text":"Code: {{{{ code }}}}","body_html":"<p>Code: {{{{ code }}}}</p>","locked":true}}]}}}}"#
+        );
+        let snapshot = validate_document(doc.as_bytes()).expect("a template document is valid");
+        let template = &snapshot.resources.message_template[0];
+        assert_eq!(template.kind, "email_otp");
+        assert_eq!(template.locale, "en");
+        assert!(template.locked, "the pin flag survives the round trip");
+        assert_eq!(
+            template.body_html.as_deref(),
+            Some("<p>Code: {{ code }}</p>")
+        );
+
+        // An ABSENT body_html is the None case, and an omitted `locked` is unlocked rather
+        // than a deserialization failure with no path to report.
+        let minimal = format!(
+            r#"{{"schema_version":"{SNAPSHOT_SCHEMA_VERSION}","resources":{{"message_template":[{{"kind":"invitation","locale":"fr","subject":"Bienvenue","body_text":"Bonjour"}}]}}}}"#
+        );
+        let snapshot = validate_document(minimal.as_bytes()).expect("html and lock are optional");
+        assert_eq!(snapshot.resources.message_template[0].body_html, None);
+        assert!(!snapshot.resources.message_template[0].locked);
+    }
+
+    /// Every way a message template can be malformed is refused, AT ITS PATH.
+    ///
+    /// The paths matter because the arm computes three of them from one loop: a violation
+    /// reported against the element rather than the field tells an operator a template is bad
+    /// without saying which of its three bodies.
+    #[test]
+    fn a_malformed_message_template_is_rejected_at_the_offending_field() {
+        let case = |fields: &str| {
+            format!(
+                r#"{{"schema_version":"{SNAPSHOT_SCHEMA_VERSION}","resources":{{"message_template":[{fields}]}}}}"#
+            )
+        };
+        let paths = |doc: String| -> Vec<String> {
+            validate_document(doc.as_bytes())
+                .expect_err("must be rejected")
+                .iter()
+                .map(|violation| violation.path.clone())
+                .collect()
+        };
+
+        // An unterminated placeholder, in each of the three body fields in turn.
+        for (field, fields) in [
+            (
+                "subject",
+                r#"{"kind":"k","locale":"en","subject":"Hi {{","body_text":"b"}"#,
+            ),
+            (
+                "body_text",
+                r#"{"kind":"k","locale":"en","subject":"s","body_text":"Hi {{"}"#,
+            ),
+            (
+                "body_html",
+                r#"{"kind":"k","locale":"en","subject":"s","body_text":"b","body_html":"Hi {{"}"#,
+            ),
+        ] {
+            assert!(
+                paths(case(fields)).contains(&format!("/resources/message_template/0/{field}")),
+                "an unterminated placeholder in {field} must be reported against {field}"
+            );
+        }
+
+        // A malformed NAME, which the renderer refuses because a permissive name would let a
+        // template look like it carries an expression.
+        assert!(
+            paths(case(
+                r#"{"kind":"k","locale":"en","subject":"s","body_text":"{{ firstName }}"}"#
+            ))
+            .contains(&"/resources/message_template/0/body_text".to_owned()),
+            "an upper-case placeholder name is malformed, not merely unknown"
+        );
+
+        // An empty required string, an unknown key, and a non-boolean lock flag.
+        assert!(
+            paths(case(
+                r#"{"kind":"","locale":"en","subject":"s","body_text":"b"}"#
+            ))
+            .contains(&"/resources/message_template/0/kind".to_owned()),
+            "an empty kind is not a key"
+        );
+        assert!(
+            !paths(case(
+                r#"{"kind":"k","locale":"en","subject":"s","body_text":"b","smtp_password":"hunter2"}"#
+            ))
+            .is_empty(),
+            "an unknown key is refused, which is what stops secret-shaped material riding in \
+             under a novel name"
+        );
+        assert!(
+            paths(case(
+                r#"{"kind":"k","locale":"en","subject":"s","body_text":"b","locked":"yes"}"#
+            ))
+            .contains(&"/resources/message_template/0/locked".to_owned()),
+            "a non-boolean lock flag is reported at the field"
         );
     }
 

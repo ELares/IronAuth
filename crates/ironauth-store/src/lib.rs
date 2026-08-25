@@ -367,10 +367,10 @@ pub use signup_form::{
 pub use sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 pub use snapshot::{
     BrandAssetMetaSnapshot, BrandSnapshot, CLIENT_SECRET_REFERENCE, ClientSnapshot,
-    DcrPolicySnapshot, FlowVersionSnapshot, LocaleBundleSnapshot, OrgConnectionSnapshot,
-    ResourceServerSnapshot, RoutingRuleSnapshot, SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION,
-    SecretRef, SignupFormSnapshot, Snapshot, SnapshotResources, SnapshotViolation,
-    UpstreamTokenGrantSnapshot, VariableSnapshot, classification_coverage_gaps,
+    DcrPolicySnapshot, FlowVersionSnapshot, LocaleBundleSnapshot, MessageTemplateSnapshot,
+    OrgConnectionSnapshot, ResourceServerSnapshot, RoutingRuleSnapshot, SNAPSHOT_RESOURCE_TYPES,
+    SNAPSHOT_SCHEMA_VERSION, SecretRef, SignupFormSnapshot, Snapshot, SnapshotResources,
+    SnapshotViolation, UpstreamTokenGrantSnapshot, VariableSnapshot, classification_coverage_gaps,
     export as export_snapshot, validate_document,
 };
 pub use store::Store;

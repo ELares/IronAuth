@@ -132,10 +132,46 @@ pub fn render(
     context: &RenderContext,
     mode: RenderMode,
 ) -> Result<String, RenderError> {
-    let mut out = String::with_capacity(template.len());
+    walk(template, context, mode, Missing::Reject).map(Option::unwrap_or_default)
+}
+
+/// What [`walk`] does when the context has no value for a placeholder it reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Missing {
+    /// Stop and report it. This is rendering: a template whose placeholder has no value is a
+    /// message that would go out with a hole in it.
+    Reject,
+    /// Treat it as empty and keep walking. This is validation, which is asking about the
+    /// template's SHAPE and has no context to check names against.
+    Skip,
+}
+
+/// The one walk over a template. [`render`] and [`validate_syntax`] both go through it.
+///
+/// Returns [`None`] when the caller asked only whether the template is well formed, so the
+/// output string is never built for a validation pass.
+///
+/// One function rather than two because the thing that decides what a placeholder IS must be
+/// the thing that decides whether a template is VALID. Two walks would be two grammars, and
+/// they would drift: the validator would accept a spelling the renderer then refuses, at send
+/// time, in front of the recipient.
+fn walk(
+    template: &str,
+    context: &RenderContext,
+    mode: RenderMode,
+    missing: Missing,
+) -> Result<Option<String>, RenderError> {
+    let building = missing == Missing::Reject;
+    let mut out = if building {
+        String::with_capacity(template.len())
+    } else {
+        String::new()
+    };
     let mut rest = template;
     while let Some(open) = rest.find("{{") {
-        out.push_str(&rest[..open]);
+        if building {
+            out.push_str(&rest[..open]);
+        }
         let after_open = &rest[open + 2..];
         let Some(close) = after_open.find("}}") else {
             return Err(RenderError::UnterminatedPlaceholder);
@@ -144,19 +180,64 @@ pub fn render(
         if !name_is_well_formed(name) {
             return Err(RenderError::MalformedPlaceholderName(name.to_owned()));
         }
-        let Some(value) = context.get(name) else {
-            return Err(RenderError::UnknownPlaceholder(name.to_owned()));
-        };
-        // The ONLY place a value enters the output. Pushing the escaped value straight onto
-        // `out`, rather than back onto the scan buffer, is what makes the pass single.
-        match mode {
-            RenderMode::Text => out.push_str(value),
-            RenderMode::Html => out.push_str(&escape_html(value)),
+        match context.get(name) {
+            Some(value) => {
+                // The ONLY place a value enters the output. Pushing the escaped value straight
+                // onto `out`, rather than back onto the scan buffer, is what makes the pass
+                // single.
+                match mode {
+                    RenderMode::Text => out.push_str(value),
+                    RenderMode::Html => out.push_str(&escape_html(value)),
+                }
+            }
+            None if missing == Missing::Reject => {
+                return Err(RenderError::UnknownPlaceholder(name.to_owned()));
+            }
+            // Validating: an unsupplied name is not a fault, and the walk continues to the
+            // REST of the template rather than stopping at the first placeholder.
+            None => {}
         }
         rest = &after_open[close + 2..];
     }
+    if !building {
+        return Ok(None);
+    }
     out.push_str(rest);
-    Ok(out)
+    Ok(Some(out))
+}
+
+/// Check that a template is STRUCTURALLY well-formed, without rendering it.
+///
+/// A snapshot may carry a hand-authored template, and a promotion that accepted an unterminated
+/// `{{` would store a body that fails at SEND time, when the recipient is the one who discovers
+/// it. This is the template equivalent of the load-validity gate a journey artifact passes.
+///
+/// It answers syntax only: whether every placeholder closes and every name is well formed. It
+/// deliberately does NOT answer whether the names are ones the sender will supply, because the
+/// context depends on the message kind and a template for one kind is not wrong for naming a
+/// placeholder another kind supplies.
+///
+/// Shares [`render`]'s walk, so there is ONE grammar rather than two that can drift, and it is
+/// a SINGLE pass: `Missing::Skip` lets the walk continue past a placeholder it has no value
+/// for instead of stopping there.
+///
+/// It was first written as a loop that re-rendered, supplying one more name each round. That is
+/// linear in the template per round and linear in distinct placeholders in rounds, so it is
+/// QUADRATIC in the body: measured at 10.1 minutes of CPU for a 966 KB body, and this runs
+/// inline in a request handler on the runtime that also serves the public plane. The cost bound
+/// is the reason this shape exists, and it is why the round count belongs nowhere in it.
+///
+/// # Errors
+///
+/// [`RenderError::UnterminatedPlaceholder`] or [`RenderError::MalformedPlaceholderName`].
+pub fn validate_syntax(template: &str) -> Result<(), RenderError> {
+    walk(
+        template,
+        &RenderContext::new(),
+        RenderMode::Text,
+        Missing::Skip,
+    )
+    .map(|_| ())
 }
 
 /// Render a value destined for an email HEADER (a subject, a sender name).
@@ -185,6 +266,98 @@ pub fn render_header(template: &str, context: &RenderContext) -> Result<String, 
 
 #[cfg(test)]
 mod tests {
+    /// Validation is a SINGLE pass, so its cost is linear in the body and not in the square
+    /// of it.
+    ///
+    /// The first version drove `render` in a loop, supplying one more placeholder each round:
+    /// linear per round, linear in rounds, quadratic overall. Measured at 10.1 minutes of CPU
+    /// for a 966 KB body, reachable inline from a promotion request on the runtime that also
+    /// serves the public plane.
+    ///
+    /// The assertion is a RATIO, not a wall-clock budget: a threshold in milliseconds is a
+    /// flake on a loaded machine and says nothing on a fast one. Doubling the distinct
+    /// placeholder count doubles the work of a linear scan and quadruples it for a quadratic
+    /// one, so a ratio near 2 passes and a ratio near 4 fails, whatever the hardware.
+    #[test]
+    fn validating_a_body_of_placeholders_is_linear_and_not_quadratic() {
+        fn body(distinct: usize) -> String {
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            for n in 0..distinct {
+                let _ = write!(out, "{{{{ p{n} }}}} filler text between placeholders ");
+            }
+            out
+        }
+        fn micros(template: &str) -> u128 {
+            // Best of three: a scheduler hiccup inflates a single sample, and the minimum is
+            // the least noisy estimator of work done.
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    assert!(super::validate_syntax(template).is_ok());
+                    start.elapsed().as_micros()
+                })
+                .min()
+                .unwrap_or(u128::MAX)
+        }
+
+        let small = body(2_000);
+        let large = body(4_000);
+        // Warm up, so the first sample does not pay for a cold allocator.
+        micros(&small);
+
+        let small_us = micros(&small).max(1);
+        let large_us = micros(&large);
+        // Both are microsecond counts of a sub-minute run, far inside f64's exact range.
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = large_us as f64 / small_us as f64;
+        assert!(
+            ratio < 3.0,
+            "doubling the distinct placeholders must roughly double the work, not quadruple \
+             it: {small_us}us -> {large_us}us is {ratio:.2}x. The quadratic version measured \
+             ~4x here and minutes of CPU on a request-sized body."
+        );
+    }
+
+    /// The walk reaches the END of the template, not just the first placeholder.
+    ///
+    /// This is what the loop bought and what the single pass has to keep: a fault AFTER a
+    /// placeholder the context has no value for must still be found. A validator that stopped
+    /// at the first unsupplied name would accept every template whose first placeholder is
+    /// unknown, which is every template.
+    #[test]
+    fn validation_finds_a_fault_after_an_unsupplied_placeholder() {
+        assert_eq!(
+            super::validate_syntax("{{ code }} and then {{ unterminated"),
+            Err(super::RenderError::UnterminatedPlaceholder)
+        );
+        assert_eq!(
+            super::validate_syntax("{{ code }} and then {{ Bad Name }}"),
+            Err(super::RenderError::MalformedPlaceholderName(
+                "Bad Name".to_owned()
+            ))
+        );
+        // A well-formed template with names nobody has supplied is VALID: validation asks
+        // about shape, and the context depends on the message kind.
+        assert!(super::validate_syntax("{{ code }} {{ link }} {{ tenant }}").is_ok());
+    }
+
+    /// Rendering still refuses an unsupplied placeholder. The two callers of the shared walk
+    /// disagree about exactly one thing, and this pins that they still do.
+    #[test]
+    fn rendering_still_rejects_what_validation_tolerates() {
+        let template = "{{ code }}";
+        assert!(super::validate_syntax(template).is_ok());
+        assert_eq!(
+            super::render(
+                template,
+                &super::RenderContext::new(),
+                super::RenderMode::Text
+            ),
+            Err(super::RenderError::UnknownPlaceholder("code".to_owned()))
+        );
+    }
+
     use super::{RenderContext, RenderError, RenderMode, render, render_header};
 
     fn context(pairs: &[(&str, &str)]) -> RenderContext {

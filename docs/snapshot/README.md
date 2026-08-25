@@ -57,8 +57,10 @@ private JWK parameter (`d`, `p`, `q`, `dp`, `dq`, `qi`, `k`).
 ## What a snapshot contains
 
 The set of resource types is not a hand-maintained list: it is exactly the types
-the resource-model classification (issue #41) marks **promotable**. Today that is
-twelve types:
+the resource-model classification (issue #41) marks **promotable**, and a store
+test fails until the snapshot covers a newly promotable one. The table below is
+the full set; it carries no count, because a number in prose goes stale the moment
+a type is added and nothing fails when it does:
 
 | Resource type          | Key                                | Natural order              |
 | ---------------------- | ---------------------------------- | -------------------------- |
@@ -74,6 +76,7 @@ twelve types:
 | `locale_bundle`        | `resources.locale_bundle`          | `locale`                   |
 | `signup_form`          | `resources.signup_form`            | `client_id`                |
 | `flow_version`         | `resources.flow_version`           | `(journey_id, version)`    |
+| `message_template`     | `resources.message_template`       | `(kind, locale)`           |
 
 Environment-identity types (the environment itself, its signing keys, its
 management credentials, its issuer) and runtime types (users, sessions, grants,
@@ -82,11 +85,22 @@ document that references one is rejected. When a new promotable type is added to
 the classification, a store test fails until the snapshot covers it, so coverage
 cannot silently drift.
 
+`message_template` is the one type whose table holds rows a snapshot must NOT
+carry. Templates are stored at three levels in one table, and only the
+**environment** level is per-environment config: a tenant default is wider than
+the environment, and a per-organization override is runtime data that travels
+with its organization's export. Both the export and the promotion writer pin
+`level = 'environment'` in SQL rather than filtering afterwards, because all
+three levels can share a `(kind, locale)`: a level-blind writer would overwrite a
+target's own tenant default with a promoted environment body, and the only
+symptom would be mail quietly falling back to the built-in template.
+
 ### Exported is not the same as promoted
 
 Every type above is EXPORTED. A strict subset of them is also applied by the
 transactional promotion engine (issue #44): `resource_server`, `dcr_policy`,
-`variable`, `brand`, `locale_bundle` and `flow_version`. The other six are
+`variable`, `brand`, `locale_bundle`, `flow_version` and `message_template`.
+The other six are
 carried for export, diff and review but are left untouched in a target:
 
 - `client` and `signup_form` are keyed by an authorize `client_id`, which is a

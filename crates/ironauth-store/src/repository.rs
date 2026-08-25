@@ -41521,6 +41521,61 @@ impl MessageTemplateRepo<'_> {
             .collect()
     }
 
+    /// Every LIVE ENVIRONMENT-level template in this scope, ordered by `(kind, locale)`.
+    ///
+    /// The level filter is the point, and it is applied in SQL rather than by the caller. A
+    /// config snapshot carries per-ENVIRONMENT config: a tenant-level default is not
+    /// per-environment, and a per-organization override is runtime data that exports with its
+    /// organization and must never enter a snapshot (issue #111 says so in as many words). A
+    /// caller that filtered afterwards would be one `if` away from promoting an organization's
+    /// private copy into another environment, where its `organization_id` names an
+    /// organization that need not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_environment_level(&self) -> Result<Vec<MessageTemplateRecord>, StoreError> {
+        let statement = sqlx::query(
+            "SELECT id, level, organization_id, kind, locale, subject, body_text, body_html, \
+                    locked \
+             FROM message_templates \
+             WHERE tenant_id = $1 AND environment_id = $2 AND level = 'environment' \
+               AND deleted_at IS NULL \
+             ORDER BY kind, locale",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string());
+
+        // Scoped, for the reason `candidates_for` gives: `message_templates` is FORCE RLS, so
+        // an unscoped read returns an empty page rather than an error, and an empty page here
+        // exports as "this environment has no templates" and promotes as DELETE THEM ALL.
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = statement.fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                let organization: Option<String> = row.get("organization_id");
+                Ok(MessageTemplateRecord {
+                    id: MessageTemplateId::parse_in_scope(&id_text, &self.scope)?,
+                    // The SQL pinned the level, so decoding it cannot disagree; a row that
+                    // did would mean the filter and the decode read different columns.
+                    level: crate::message_template::TemplateLevel::Environment,
+                    organization_id: organization
+                        .map(|id| OrganizationId::parse_in_scope(&id, &self.scope))
+                        .transpose()?,
+                    kind: row.get("kind"),
+                    locale: row.get("locale"),
+                    subject: row.get("subject"),
+                    body_text: row.get("body_text"),
+                    body_html: row.get("body_html"),
+                    locked: row.get("locked"),
+                })
+            })
+            .collect()
+    }
+
     /// Resolve the template for one `kind` and requested locale, or [`None`] when no override
     /// exists at any level.
     ///
@@ -60073,6 +60128,7 @@ async fn read_promoted_snapshot(
         brand: Vec::new(),
         locale_bundle: Vec::new(),
         flow_version: Vec::new(),
+        message_template: Vec::new(),
     };
 
     for promoted in PromotedResourceType::ALL {
@@ -60095,6 +60151,9 @@ async fn read_promoted_snapshot(
             PromotedResourceType::FlowVersion => {
                 resources.flow_version = read_promoted_flow_versions(tx, scope).await?;
             }
+            PromotedResourceType::MessageTemplate => {
+                resources.message_template = read_promoted_message_templates(tx, scope).await?;
+            }
         }
     }
 
@@ -60102,6 +60161,54 @@ async fn read_promoted_snapshot(
         schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION.to_owned(),
         resources,
     })
+}
+
+/// Read the target's promoted MESSAGE TEMPLATES inside the caller's transaction, ordered by
+/// the `(kind, locale)` natural key.
+///
+/// ENVIRONMENT level only, matching the capture. Reading every level here would report a
+/// tenant default or an organization override as a target row the source lacks, and the diff
+/// would emit a DELETE for a template the promotion never owned.
+async fn read_promoted_message_templates(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<Vec<crate::snapshot::MessageTemplateSnapshot>, StoreError> {
+    let mut message_template: Vec<crate::snapshot::MessageTemplateSnapshot> = sqlx::query(
+        "SELECT kind, locale, subject, body_text, body_html, locked \
+         FROM message_templates \
+         WHERE tenant_id = $1 AND environment_id = $2 AND level = 'environment' \
+           AND deleted_at IS NULL",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(&mut **tx)
+    .await?
+    .iter()
+    .map(|row| crate::snapshot::MessageTemplateSnapshot {
+        kind: row.get("kind"),
+        locale: row.get("locale"),
+        subject: row.get("subject"),
+        body_text: row.get("body_text"),
+        body_html: row.get("body_html"),
+        locked: row.get("locked"),
+    })
+    .collect();
+    // Sorted in RUST, and this is defence rather than a measured requirement. Say which:
+    // deleting this sort leaves every test green, because `message_templates_unique_scope` is
+    // `(tenant_id, environment_id, level, kind, locale)` and can serve this predicate in key
+    // order, so the rows already arrive sorted. Measured, by deleting it and running the
+    // suite.
+    //
+    // It stays because nothing in the SCHEMA promises that. This vector's order reaches the
+    // canonical form, whose hash is the revision the drift gate and the no-op branch compare;
+    // a plan change that stopped using that index would make the target's revision depend on
+    // physical row order, and a settled promotion would stop reporting NoOp. That failure
+    // would appear in production under a planner decision no test controls, which is the worst
+    // way to find it.
+    message_template.sort_by(|a, b| {
+        (a.kind.as_str(), a.locale.as_str()).cmp(&(b.kind.as_str(), b.locale.as_str()))
+    });
+    Ok(message_template)
 }
 
 /// Read the target's promoted RESOURCE SERVERS inside the caller's transaction, ordered
@@ -60422,6 +60529,11 @@ async fn apply_change(
         }
         PromotedResourceType::LocaleBundle => {
             apply_locale_bundle_change(tx, scope, env, source, change, now_micros)
+                .await
+                .map_err(PromotionApplyError::from)
+        }
+        PromotedResourceType::MessageTemplate => {
+            apply_message_template_change(tx, scope, env, source, change, now_micros)
                 .await
                 .map_err(PromotionApplyError::from)
         }
@@ -61125,6 +61237,106 @@ async fn apply_brand_assets(
     .bind(&kinds)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+/// Apply a message-template create/update/delete, matched by the `(kind, locale)` natural key.
+///
+/// ENVIRONMENT level only, on both sides. The WHERE clauses pin `level = 'environment'` so a
+/// promotion can neither overwrite a tenant default nor touch an organization's override, both
+/// of which can share a `(kind, locale)` with the row being promoted; the partial unique index
+/// keeps those in separate slots and this keeps the writer in the same one.
+///
+/// The `organization_id IS NULL` beside it is DEFENCE IN DEPTH and nothing more: 0145's CHECK
+/// already makes `level <> 'organization'` imply a NULL organization, so the level pin alone
+/// decides the row set. It is stated because a reader who took it for the load-bearing half
+/// would be looking at the wrong clause if the level pin were ever dropped.
+async fn apply_message_template_change(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    env: &Env,
+    source: &crate::snapshot::Snapshot,
+    change: &crate::promotion::ResourceChange,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    use crate::promotion::ChangeKind;
+    let (kind, locale) =
+        crate::promotion::split_message_template_key(&change.key).ok_or(StoreError::NotFound)?;
+    if change.kind == ChangeKind::Delete {
+        // SOFT delete, matching every other path that removes a template: the partial unique
+        // index is `WHERE deleted_at IS NULL`, so a soft delete frees the slot, and a later
+        // promotion that re-creates the same (kind, locale) inserts cleanly rather than
+        // colliding with a tombstone.
+        sqlx::query(
+            "UPDATE message_templates \
+             SET deleted_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND level = 'environment' \
+               AND organization_id IS NULL AND kind = $3 AND locale = $5 \
+               AND deleted_at IS NULL",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(kind)
+        .bind(now_micros)
+        .bind(locale)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(());
+    }
+    let template = source
+        .resources
+        .message_template
+        .iter()
+        .find(|template| template.kind == kind && template.locale == locale)
+        .ok_or(StoreError::NotFound)?;
+    match change.kind {
+        ChangeKind::Create => {
+            let id = MessageTemplateId::generate(env, &scope);
+            sqlx::query(
+                "INSERT INTO message_templates \
+                 (id, tenant_id, environment_id, level, organization_id, kind, locale, \
+                  subject, body_text, body_html, locked, created_at, updated_at) \
+                 VALUES ($1, $2, $3, 'environment', NULL, $4, $5, $6, $7, $8, $9, \
+                         TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, \
+                         TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&template.kind)
+            .bind(&template.locale)
+            .bind(&template.subject)
+            .bind(&template.body_text)
+            .bind(&template.body_html)
+            .bind(template.locked)
+            .bind(now_micros)
+            .execute(&mut **tx)
+            .await?;
+        }
+        ChangeKind::Update => {
+            sqlx::query(
+                "UPDATE message_templates \
+                 SET subject = $1, body_text = $2, body_html = $3, locked = $4, \
+                     updated_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                 WHERE tenant_id = $6 AND environment_id = $7 AND level = 'environment' \
+                   AND organization_id IS NULL AND kind = $8 AND locale = $9 \
+                   AND deleted_at IS NULL",
+            )
+            .bind(&template.subject)
+            .bind(&template.body_text)
+            .bind(&template.body_html)
+            .bind(template.locked)
+            .bind(now_micros)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&template.kind)
+            .bind(&template.locale)
+            .execute(&mut **tx)
+            .await?;
+        }
+        ChangeKind::Delete => unreachable!("handled above"),
+    }
     Ok(())
 }
 
