@@ -484,6 +484,7 @@ else
     skipped "admin SPA bindings freshness" "cd packages/admin-spa && npm install"
 fi
 run "idempotent write audit (no admin handler splits two store writes behind one Idempotency-Key)" scripts/idempotent-write-audit.sh
+run "event feed producer census (joining the feed is a decision, not an accident)" scripts/event-ordering-audit.sh
 
 run "classification lint (every resource type is classified; all three classes used)" scripts/classification-lint.sh
 run "pii encryption (every classified PII/secret column is envelope-encrypted)" scripts/pii-encryption-scan.sh

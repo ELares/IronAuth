@@ -22974,6 +22974,24 @@ impl OutboxRepo<'_> {
     ) -> Result<Vec<OutboxMessage>, StoreError> {
         let scope = self.scope;
         let sql = format!(
+            // THE WIDTHS ON THE TWO SIDES OF THIS COMPARISON DIFFER, and that is a standing
+            // assumption rather than an oversight nobody noticed.
+            //
+            // `xmin` is a 32-bit `xid`, so it is always below 2^32. `pg_snapshot_xmin` of a
+            // `pg_snapshot` is an `xid8`: the same counter with the wraparound EPOCH in the
+            // high bits. While the cluster is in epoch 0 the two agree and this predicate is
+            // exactly right, which is why the suite passes and why every deployment to date
+            // is correct. Once a cluster crosses roughly 4.29 billion transactions and the
+            // oldest running transaction sits in epoch 1, the right side is permanently
+            // above every possible left side, the predicate is unconditionally true, and the
+            // feed silently loses the completeness half of its contract while keeping replay
+            // stability. Nothing in normal operation resets the epoch: pg_upgrade and
+            // physical replication both preserve it.
+            //
+            // Fixing it means comparing in ONE domain, and doing that correctly across a
+            // wraparound boundary is not a one-line change, so it is tracked on its own
+            // (issue #980) rather than smuggled into an unrelated diff. Anything that edits
+            // this predicate must keep `events_cursor_ordering.rs`'s duplicate in step.
             "SELECT {OUTBOX_COLUMNS} FROM outbox_messages \
              WHERE tenant_id = $1 AND environment_id = $2 AND sequence > $3 \
              AND xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint \
