@@ -22,7 +22,7 @@ use ironauth_store::{
     CorrelationId, Enqueued, MESSAGE_DELIVERY_CONSUMER, MessageId, NewMessage, Resolution, Scope,
 };
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// The window every test below sends in, so a collapse is about the KEY rather than about
 /// two sends happening to straddle a boundary.
@@ -898,9 +898,36 @@ async fn send_at(
     now: u64,
     window_at: u64,
 ) -> Enqueued {
+    send_kind_at(
+        db,
+        env,
+        scope,
+        "email_otp",
+        recipient,
+        budget,
+        now,
+        window_at,
+    )
+    .await
+}
+
+/// As `send_at`, with the kind chosen by the caller. The rate budget is per RECIPIENT, so a
+/// second kind to an exhausted mailbox is refused too, which is what lets a test tell a
+/// payload that reports the refused send's kind apart from one that hardcodes a spelling.
+#[allow(clippy::too_many_arguments)]
+async fn send_kind_at(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    kind: &str,
+    recipient: &str,
+    budget: RateBudget,
+    now: u64,
+    window_at: u64,
+) -> Enqueued {
     let normalized = normalize_recipient(recipient).expect("a deliverable address");
-    let key = dedup_key("email_otp", recipient, window_index(window_at, WINDOW_SECS))
-        .expect("a dedup key");
+    let key =
+        dedup_key(kind, recipient, window_index(window_at, WINDOW_SECS)).expect("a dedup key");
     let id = MessageId::generate(env, &scope);
     db.store()
         .scoped(scope)
@@ -909,11 +936,11 @@ async fn send_at(
             env,
             NewMessage {
                 id: &id,
-                kind: "email_otp",
+                kind,
                 recipient: &normalized,
                 dedup_key: &key,
             },
-            &payload("email_otp"),
+            &payload(kind),
             budget,
             now,
         )
@@ -1525,35 +1552,90 @@ async fn concurrent_sends_to_one_recipient_cannot_exceed_the_budget() {
 #[tokio::test]
 async fn a_rate_limited_send_emits_the_message_rate_limited_event() {
     let db = TestDatabase::start().await;
-    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x15c);
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x15c);
     let scope = db.seed_scope(&env).await;
     provision_keys(&db, &env, scope).await;
+
+    // The env clock and the `now` handed to `enqueue` are two different clocks, and a fixture
+    // that leaves the first at the epoch while the second sits at 10_100 emits an envelope
+    // whose two timestamps disagree by three hours. Advance them together, so the envelope is
+    // coherent AND `occurred_at_unix_ms` has a value an assertion can pin.
+    clock.advance(Duration::from_secs(10_000));
 
     let budget = RateBudget::new(1, 3_600);
     assert_eq!(
         send_at(&db, &env, scope, "ada@example.test", budget, 10_000, 1_000).await,
         Enqueued::Accepted
     );
-    let before = webhook_events(&db, scope).await.len();
+    // Sampled AFTER the accept and asserted absolutely: a baseline read here instead would
+    // absorb a spurious emission on the accept path into the starting count, and this event
+    // means "your send was refused". An accepted send must announce nothing.
+    assert!(
+        webhook_events(&db, scope).await.is_empty(),
+        "an accepted send must not announce a rate limit"
+    );
 
-    let refused = send_at(&db, &env, scope, "ada@example.test", budget, 10_100, 90_000).await;
+    clock.advance(Duration::from_secs(100));
+    // A DIFFERENT kind, because the budget is per RECIPIENT: this is refused just as a repeat
+    // `email_otp` would be, and it is what makes the payload's `kind` a measured field rather
+    // than one constant compared against another.
+    let refused = send_kind_at(
+        &db,
+        &env,
+        scope,
+        "magic_link",
+        "ada@example.test",
+        budget,
+        10_100,
+        90_000,
+    )
+    .await;
     assert!(matches!(refused, Enqueued::RateLimited { .. }));
 
     let events = webhook_events(&db, scope).await;
     assert_eq!(
         events.len(),
-        before + 1,
+        1,
         "the refusal must announce itself: a block nobody can observe reads to an operator \
          exactly like mail that silently never arrived"
     );
     let emitted = events.last().expect("an event");
     assert_eq!(emitted["type"], "message.rate_limited");
+    assert_eq!(
+        emitted["occurred_at_unix_ms"],
+        serde_json::json!(10_100_u64 * 1_000),
+        "the envelope is stamped from the env clock at the moment of the refusal"
+    );
     let payload = &emitted["payload"];
-    assert_eq!(payload["kind"], "email_otp");
+    assert_eq!(
+        payload["kind"], "magic_link",
+        "the payload reports the kind of the send that was REFUSED"
+    );
     assert_eq!(
         payload["retry_after_unix_seconds"],
         serde_json::json!(10_000_u64 + 3_600),
         "the event carries the instant the oldest counted send leaves the window"
+    );
+
+    // The refused send wrote no ledger row, so `messages` holds exactly the accepted one, and
+    // its `recipient_bidx` is the value the event is supposed to be carrying. Read it from the
+    // TABLE rather than recomputing it with the same `hex_of` the producer calls: an
+    // expectation derived from the code under test cannot fail.
+    let ledger: Vec<String> = sqlx::query_scalar(
+        "SELECT encode(recipient_bidx, 'hex') FROM messages \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the ledger blind index");
+    assert_eq!(ledger.len(), 1, "only the accepted send is recorded");
+    assert_eq!(
+        payload["recipient_bidx"].as_str(),
+        Some(ledger[0].as_str()),
+        "the event's index must be THIS recipient's, so a reader can correlate it with the \
+         ledger: an all-zero constant is hex-shaped too"
     );
 
     // The ADDRESS must not be in it. A rate-limit feed is by construction a list of the
@@ -1564,12 +1646,97 @@ async fn a_rate_limited_send_emits_the_message_rate_limited_event() {
         !rendered.contains("ada@example.test") && !rendered.contains("ada"),
         "the event must carry the blind index, never the address: {rendered}"
     );
-    assert!(
-        payload["recipient_bidx"]
-            .as_str()
-            .is_some_and(|value| value.chars().all(|c| c.is_ascii_hexdigit())),
-        "and the index is the hex of the blind index: {payload}"
+}
+
+/// Two refused recipients get two ordering keys, and each key is that recipient's own index.
+///
+/// The producer's comment claims the feed is "ordered per RECIPIENT, so one person's refusals
+/// arrive in order and different people's never wait on each other". A constant subject
+/// satisfies the first half and breaks the second, and nothing else in this file reads
+/// `ordering_key` for the `webhook.event` consumer, so without this the sentence is unmeasured.
+#[tokio::test]
+async fn refusals_are_ordered_per_recipient_and_never_share_a_key() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x15d);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+    clock.advance(Duration::from_secs(10_000));
+
+    let budget = RateBudget::new(1, 3_600);
+    for recipient in ["ada@example.test", "grace@example.test"] {
+        assert_eq!(
+            send_at(&db, &env, scope, recipient, budget, 10_000, 1_000).await,
+            Enqueued::Accepted
+        );
+    }
+    for recipient in ["ada@example.test", "grace@example.test"] {
+        assert!(matches!(
+            send_at(&db, &env, scope, recipient, budget, 10_100, 90_000).await,
+            Enqueued::RateLimited { .. }
+        ));
+    }
+
+    let rows = webhook_event_rows(&db, scope).await;
+    assert_eq!(rows.len(), 2, "one event per refusal");
+
+    let keys: std::collections::BTreeSet<&String> = rows.iter().map(|(key, _)| key).collect();
+    assert_eq!(
+        keys.len(),
+        2,
+        "a constant subject collapses both recipients into one serial group, so one person's \
+         stuck refusal would hold up everyone else's: {keys:?}"
     );
+
+    // Each key is its OWN row's index, which is the identity a per-recipient key has to
+    // satisfy. Two distinct keys alone would also pass for a per-EVENT key, which would
+    // inflate the groups to one apiece and order nothing.
+    for (key, envelope) in &rows {
+        assert_eq!(
+            Some(key.as_str()),
+            envelope["payload"]["recipient_bidx"].as_str(),
+            "the ordering key must be the recipient's index, not merely distinct: {envelope}"
+        );
+    }
+
+    let indexes: std::collections::BTreeSet<String> = rows
+        .iter()
+        .filter_map(|(_, envelope)| {
+            envelope["payload"]["recipient_bidx"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    let ledger: std::collections::BTreeSet<String> = sqlx::query_scalar(
+        "SELECT encode(recipient_bidx, 'hex') FROM messages \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the ledger blind indexes")
+    .into_iter()
+    .collect();
+    assert_eq!(
+        indexes, ledger,
+        "the two events name the two mailboxes the ledger recorded"
+    );
+}
+
+/// Every event queued for the webhook fan-out in this scope, oldest first, with its ordering
+/// key. `webhook_events` reads the envelope alone, which leaves the key it was filed under
+/// unread by any assertion.
+async fn webhook_event_rows(db: &TestDatabase, scope: Scope) -> Vec<(String, serde_json::Value)> {
+    sqlx::query_as::<_, (String, serde_json::Value)>(
+        "SELECT ordering_key, payload FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND consumer = 'webhook.event' \
+         ORDER BY sequence",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the queued events")
 }
 
 /// Every event queued for the webhook fan-out in this scope, oldest first.
