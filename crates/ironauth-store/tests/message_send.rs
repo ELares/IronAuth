@@ -14,12 +14,14 @@
 //! double-clicking "email me a code" issues two concurrent requests that both observe no row.
 
 use ironauth_env::Env;
+use ironauth_store::message_feedback::SuppressionReason;
 use ironauth_store::message_hygiene::{dedup_key, normalize_recipient, window_index};
 use ironauth_store::message_rate::RateBudget;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, Enqueued, MESSAGE_DELIVERY_CONSUMER, MessageId, NewMessage, Resolution, Scope,
 };
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// The window every test below sends in, so a collapse is about the KEY rather than about
@@ -1136,5 +1138,381 @@ async fn the_budget_refills_once_the_window_passes() {
         .await,
         Enqueued::Accepted,
         "and past the window the budget has refilled"
+    );
+}
+
+/// The reason comes FROM THE TABLE, not from a constant. A hardcoded literal passed the
+/// suppression test, so the column was never actually read back.
+#[tokio::test]
+async fn the_suppression_reason_is_the_one_that_was_recorded() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x154);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    // Two different recipients, suppressed for two DIFFERENT reasons. A constant cannot
+    // satisfy both.
+    for (address, reason) in [
+        ("ada@example.test", SuppressionReason::HardBounce),
+        ("grace@example.test", SuppressionReason::Complaint),
+    ] {
+        db.store()
+            .scoped(scope)
+            .messages()
+            .suppress(&normalize_recipient(address).expect("address"), reason)
+            .await
+            .expect("suppress");
+    }
+
+    assert_eq!(
+        send_at(
+            &db,
+            &env,
+            scope,
+            "ada@example.test",
+            RateBudget::new(9, 3_600),
+            1_000,
+            1_000
+        )
+        .await,
+        Enqueued::Suppressed {
+            reason: "hard_bounce".to_owned()
+        }
+    );
+    assert_eq!(
+        send_at(
+            &db,
+            &env,
+            scope,
+            "grace@example.test",
+            RateBudget::new(9, 3_600),
+            1_000,
+            2_000
+        )
+        .await,
+        Enqueued::Suppressed {
+            reason: "complaint".to_owned()
+        },
+        "the reason must be read back per recipient, not fixed"
+    );
+}
+
+/// `suppress` is idempotent and the FIRST reason stands. A second hard bounce does not make an
+/// address more suppressed, and two rows would make "why" ambiguous.
+#[tokio::test]
+async fn suppressing_twice_keeps_the_first_reason() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x155);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+    let address = normalize_recipient("ada@example.test").expect("address");
+    let repo = db.store();
+
+    repo.scoped(scope)
+        .messages()
+        .suppress(&address, SuppressionReason::HardBounce)
+        .await
+        .expect("first");
+    repo.scoped(scope)
+        .messages()
+        .suppress(&address, SuppressionReason::Complaint)
+        .await
+        .expect("second");
+
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM message_suppressions WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count");
+    assert_eq!(rows, 1, "one suppression per recipient");
+    assert_eq!(
+        send_at(
+            &db,
+            &env,
+            scope,
+            "ada@example.test",
+            RateBudget::new(9, 3_600),
+            1_000,
+            1_000
+        )
+        .await,
+        Enqueued::Suppressed {
+            reason: "hard_bounce".to_owned()
+        },
+        "the first reason stands"
+    );
+}
+
+/// EVERY reason the feedback module can produce must satisfy the CHECK. A variant the column
+/// refuses is a suppression that cannot be recorded, discovered at the moment a provider
+/// reports a bounce -- the worst moment to find a constraint mismatch. `unsubscribe` was
+/// missing from the first version of the constraint.
+#[tokio::test]
+async fn every_suppression_reason_the_feedback_module_produces_is_storable() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x156);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    for (n, reason) in [
+        SuppressionReason::Complaint,
+        SuppressionReason::HardBounce,
+        SuppressionReason::RepeatedSoftBounce,
+        SuppressionReason::Unsubscribe,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let address = format!("user{n}@example.test");
+        db.store()
+            .scoped(scope)
+            .messages()
+            .suppress(&address, reason)
+            .await
+            .unwrap_or_else(|error| panic!("{reason:?} must be storable: {error:?}"));
+    }
+}
+
+/// The budget is per RECIPIENT, not per scope. A scope-wide limit passed every test.
+#[tokio::test]
+async fn the_budget_is_per_recipient_not_per_scope() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x157);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let budget = RateBudget::new(1, 3_600);
+    assert_eq!(
+        send_at(&db, &env, scope, "ada@example.test", budget, 1_000, 1_000).await,
+        Enqueued::Accepted
+    );
+    // A DIFFERENT recipient, same scope, same window. A scope-wide counter refuses this.
+    assert_eq!(
+        send_at(&db, &env, scope, "grace@example.test", budget, 1_100, 2_000).await,
+        Enqueued::Accepted,
+        "one recipient's budget must not spend another's: a scope-wide limit would silence \
+         every user as soon as one of them was busy"
+    );
+    // And the FIRST recipient is still limited, so the budget is real.
+    assert!(matches!(
+        send_at(&db, &env, scope, "ada@example.test", budget, 1_200, 3_000).await,
+        Enqueued::RateLimited { .. }
+    ));
+}
+
+/// The RETRY INSTANT is derived from the oldest counted send, not invented. `now + 1` passed
+/// both rate tests, which would tell a caller to come back before the window had moved.
+#[tokio::test]
+async fn the_retry_instant_is_when_the_oldest_counted_send_leaves_the_window() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x158);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let window = 3_600_u64;
+    let budget = RateBudget::new(1, window);
+    let first_sent_at = 10_000_u64;
+    assert_eq!(
+        send_at(
+            &db,
+            &env,
+            scope,
+            "ada@example.test",
+            budget,
+            first_sent_at,
+            1_000
+        )
+        .await,
+        Enqueued::Accepted
+    );
+
+    let now = first_sent_at + 100;
+    match send_at(&db, &env, scope, "ada@example.test", budget, now, 90_000).await {
+        Enqueued::RateLimited {
+            retry_after_epoch_seconds,
+        } => assert_eq!(
+            retry_after_epoch_seconds,
+            first_sent_at + window,
+            "the retry instant is the oldest counted send plus one window, not a guess"
+        ),
+        other => panic!("expected a rate limit, got {other:?}"),
+    }
+}
+
+/// The CONFIGURED window length is used. Doubling it passed every test, so a deployment's
+/// window was decoration.
+#[tokio::test]
+async fn the_configured_window_length_decides_what_counts() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x159);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    // One send at t=10_000, then a second at t=10_500.
+    assert_eq!(
+        send_at(
+            &db,
+            &env,
+            scope,
+            "ada@example.test",
+            RateBudget::new(1, 600),
+            10_000,
+            1_000
+        )
+        .await,
+        Enqueued::Accepted
+    );
+    // A 600-second window still contains the first send, so this is refused.
+    assert!(
+        matches!(
+            send_at(
+                &db,
+                &env,
+                scope,
+                "ada@example.test",
+                RateBudget::new(1, 600),
+                10_500,
+                90_000
+            )
+            .await,
+            Enqueued::RateLimited { .. }
+        ),
+        "500 seconds later is inside a 600-second window"
+    );
+    // A 300-second window does NOT, so the same instant is accepted. Same ledger, same clock,
+    // different configured window: the window is what decides.
+    assert_eq!(
+        send_at(
+            &db,
+            &env,
+            scope,
+            "ada@example.test",
+            RateBudget::new(1, 300),
+            10_500,
+            90_000
+        )
+        .await,
+        Enqueued::Accepted,
+        "and outside a 300-second one"
+    );
+}
+
+/// A FUTURE-stamped row does not block a recipient. Counting it would make one bad timestamp a
+/// permanent block with no remedy short of deleting the row.
+#[tokio::test]
+async fn a_future_stamped_send_does_not_block_the_present() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x15a);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let budget = RateBudget::new(1, 3_600);
+    // A send stamped far in the future.
+    assert_eq!(
+        send_at(
+            &db,
+            &env,
+            scope,
+            "ada@example.test",
+            budget,
+            9_000_000,
+            1_000
+        )
+        .await,
+        Enqueued::Accepted
+    );
+    // A send NOW is unaffected by it.
+    assert_eq!(
+        send_at(&db, &env, scope, "ada@example.test", budget, 10_000, 90_000).await,
+        Enqueued::Accepted,
+        "a row stamped in the future is not yet a send and must not spend the budget"
+    );
+}
+
+/// How many simultaneous sends the concurrency test races.
+const RACERS: usize = 8;
+
+/// CONCURRENT sends to one recipient cannot exceed the budget.
+///
+/// Measured before the fix: eight simultaneous enqueues all passed a budget of ONE and all
+/// eight rows landed. Checking a budget in one transaction and inserting in another is a
+/// read-then-act, and the gap is reachable.
+///
+/// The dedup keys DIFFER on purpose. Eight identical sends share one key and the `ON CONFLICT`
+/// refuses seven of them, so a same-key fixture passes whether or not the budget is enforced
+/// and cannot tell the collapse from the limit. Different keys is the shape that goes straight
+/// through: two message kinds for one address, or a burst straddling a window edge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_sends_to_one_recipient_cannot_exceed_the_budget() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x15b);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let budget = RateBudget::new(1, 3_600);
+    let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+    let store = db.store().clone();
+
+    let mut handles = Vec::with_capacity(RACERS);
+    for n in 0..RACERS {
+        let barrier = Arc::clone(&barrier);
+        let store = store.clone();
+        let env = env.clone();
+        handles.push(tokio::spawn(async move {
+            // Distinct dedup windows, so the UNIQUE cannot be what refuses them.
+            let window_at = 1_000 + (n as u64) * 100_000;
+            let normalized = normalize_recipient("ada@example.test").expect("address");
+            let key = dedup_key(
+                "email_otp",
+                "ada@example.test",
+                window_index(window_at, WINDOW_SECS),
+            )
+            .expect("key");
+            let id = MessageId::generate(&env, &scope);
+            barrier.wait().await;
+            store
+                .scoped(scope)
+                .messages()
+                .enqueue(
+                    &env,
+                    NewMessage {
+                        id: &id,
+                        kind: "email_otp",
+                        recipient: &normalized,
+                        dedup_key: &key,
+                    },
+                    &payload("email_otp"),
+                    budget,
+                    1_000,
+                )
+                .await
+                .expect("enqueue")
+        }));
+    }
+
+    let mut accepted = 0_usize;
+    for handle in handles {
+        if handle.await.expect("task") == Enqueued::Accepted {
+            accepted += 1;
+        }
+    }
+
+    assert_eq!(
+        accepted, 1,
+        "a budget of one must admit exactly one send however many arrive at once; without \
+         serialising the count with the insert, all {RACERS} passed"
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .messages()
+            .count()
+            .await
+            .expect("count"),
+        1,
+        "and exactly one row may land"
     );
 }

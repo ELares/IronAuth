@@ -91,7 +91,23 @@ pub enum SuppressionReason {
 }
 
 impl SuppressionReason {
-    /// A stable, value-free description.
+    /// The stable wire token this reason is STORED under.
+    ///
+    /// Distinct from [`Self::as_str`], which is a sentence for a human. A column, a CHECK
+    /// constraint and an operator's GROUP BY all need a token that does not change when
+    /// somebody improves the wording, and a database that stored the sentence would make the
+    /// two impossible to tell apart.
+    #[must_use]
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::Complaint => "complaint",
+            Self::HardBounce => "hard_bounce",
+            Self::RepeatedSoftBounce => "repeated_soft_bounce",
+            Self::Unsubscribe => "unsubscribe",
+        }
+    }
+
+    /// A stable, value-free description, for a human reading a report.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {

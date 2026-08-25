@@ -2,9 +2,10 @@
 --
 -- "Sends to suppressed addresses are blocked and recorded with a queryable reason." The
 -- decision of WHEN an address becomes suppressed already exists, pure and tested, in
--- `message_feedback::suppression_action`: a hard bounce suppresses immediately, a complaint
--- suppresses immediately, and repeated soft bounces suppress on the third. What was missing was
--- somewhere to write the answer down and something that reads it before a send.
+-- `message_feedback::suppression_action`: a hard bounce and a complaint suppress immediately,
+-- and CONSECUTIVE soft bounces suppress at `SOFT_BOUNCE_THRESHOLD`, which is five and counts
+-- the triggering event, with a single success in between resetting the run. What was missing
+-- was somewhere to write the answer down and something that reads it before a send.
 --
 -- # Why an address is suppressed, and why the reason is a column
 --
@@ -37,7 +38,11 @@ CREATE TABLE message_suppressions (
     CONSTRAINT message_suppressions_recipient_nonempty
         CHECK (octet_length(recipient_bidx) > 0),
     CONSTRAINT message_suppressions_reason_known
-        CHECK (reason IN ('hard_bounce', 'complaint', 'repeated_soft_bounce', 'manual')),
+        -- Exactly the tokens `message_feedback::SuppressionReason` can produce, and nothing
+        -- else. An enum variant the CHECK refuses is a suppression that cannot be recorded,
+        -- which fails at the moment a provider reports a bounce -- the worst moment to
+        -- discover a constraint mismatch. `unsubscribe` was missing from the first version.
+        CHECK (reason IN ('complaint', 'hard_bounce', 'repeated_soft_bounce', 'unsubscribe')),
 
     -- One suppression per recipient per scope. A second hard bounce does not make an address
     -- more suppressed, and two rows would make "why" ambiguous.
