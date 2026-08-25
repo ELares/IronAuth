@@ -1852,6 +1852,10 @@ async fn delivery_jobs(
 /// completed original and queue NOTHING: the operator sees success, the ledger says pending,
 /// and no mail is ever sent. Asserting only "the state moved" would pass against exactly that.
 #[tokio::test]
+// One narrative: the key, the payload, the ordering key, the state, the count and the
+// timestamp all belong to the SAME resend. Splitting it would put the act in one function and
+// what it changed in another.
+#[allow(clippy::too_many_lines)]
 async fn a_failed_message_resends_under_a_delivery_key_of_its_own() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x160);
@@ -1879,6 +1883,16 @@ async fn a_failed_message_resends_under_a_delivery_key_of_its_own() {
         )
         .await
         .expect("resolve failed");
+
+    // As epoch micros, because this crate carries no time type sqlx can decode a timestamptz
+    // into. The comparison stays in SQL either way.
+    let before_resend: i64 = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint FROM messages WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read updated_at before the resend");
 
     let resent = db
         .store()
@@ -1945,17 +1959,22 @@ async fn a_failed_message_resends_under_a_delivery_key_of_its_own() {
          the resend already failed"
     );
     assert_eq!(record.resend_count, 1);
-    // Asked of the DATABASE rather than decoded into a time type the crate does not depend on.
-    let moved: bool =
-        sqlx::query_scalar("SELECT updated_at > created_at FROM messages WHERE id = $1")
-            .bind(id.to_string())
-            .fetch_one(db.owner_pool())
-            .await
-            .expect("compare the timestamps");
+    // Compared against the instant captured BEFORE the resend, not against `created_at`. The
+    // `resolve` above already moved `updated_at` past `created_at`, so the original form held
+    // for any test that had touched the row at all and said nothing about the resend.
+    let moved: bool = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint > $2 \
+         FROM messages WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .bind(before_resend)
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("compare the timestamps");
     assert!(
         moved,
-        "the resend transition stamps updated_at, which is what a status surface reports as \
-         'last changed'"
+        "the resend transition must stamp updated_at, which is what a status surface reports \
+         as 'last changed'"
     );
 }
 
@@ -2260,7 +2279,13 @@ async fn a_message_id_from_another_scope_cannot_be_resent() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x168);
     let scope = db.seed_scope(&env).await;
-    let other = db.seed_scope(&env).await;
+    // A sibling ENVIRONMENT of the SAME tenant, so exactly one dimension varies. `seed_scope`
+    // mints a fresh tenant too, and a fixture that differs on both cannot say which one the
+    // guard is reading -- a scope check that compared only tenants would pass it.
+    let other = Scope::new(
+        scope.tenant(),
+        db.seed_environment(&env, scope.tenant()).await,
+    );
     provision_keys(&db, &env, scope).await;
 
     let (_, id) = send_with_id(&db, &env, scope, "email_otp", "ada@example.test", 1_000).await;

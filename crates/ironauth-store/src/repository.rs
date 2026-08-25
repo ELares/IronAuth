@@ -22966,9 +22966,14 @@ impl MessageRepo<'_> {
     /// That is a deliberate choice rather than an oversight. The budget counts sends in a
     /// window to stop automated pumping through the PUBLIC doors; charging an operator's
     /// recovery against it would refuse a resend precisely for the recipients whose mail has
-    /// been failing, which is everyone who needs one. The control is the management
-    /// permission, and `resend_count` is the durable record of how often it was used, which is
-    /// what the question "why did this person get four copies" reduces to.
+    /// been failing, which is everyone who needs one. `resend_count` is the durable record of
+    /// how often it was used, which is what the question "why did this person get four copies"
+    /// reduces to.
+    ///
+    /// It is worth being exact about what stands in for a bound, because an earlier draft named
+    /// a control that does not exist: there is NO caller yet. Whatever permission gates the
+    /// management endpoint is issue #111 criterion 1's remaining work, and whether it is
+    /// sufficient is a question for that endpoint rather than a property this function has.
     ///
     /// Suppression IS consulted, and the difference is in [`Resent::Suppressed`]: a hard bounce
     /// or a complaint is an obligation to the recipient, not delivery advice to the sender.
@@ -23057,8 +23062,9 @@ impl MessageRepo<'_> {
         };
 
         // A job of its OWN. Re-filing under the original key would collide with the completed
-        // original on the outbox UNIQUE and silently do nothing: the operator would see
-        // success, the ledger would say pending, and no mail would ever be sent.
+        // original on the outbox UNIQUE, and `enqueue_outbox_in_tx` is the RAISING enqueue, so
+        // that collision aborts this transaction: the row never moves and the operator gets a
+        // database error rather than a resend.
         enqueue_outbox_in_tx(
             &mut tx,
             env,
@@ -23118,9 +23124,11 @@ impl MessageRepo<'_> {
 
     /// Claim this message for delivery, moving it `pending` -> `sending`.
     ///
-    /// Returns `true` if THIS caller won it. The transition is the mutual exclusion: a
-    /// conditional UPDATE on `state = 'pending'` is serialised by the row lock, so of two
-    /// workers racing, exactly one sees a row affected and the other sees none.
+    /// Returns [`None`] if this caller LOST it, and `Some(generation)` if it won -- where the
+    /// generation is the `resend_count` the claim was granted under, and every subsequent write
+    /// for this delivery must carry it. The transition is the mutual exclusion: a conditional
+    /// UPDATE on `state = 'pending'` is serialised by the row lock, so of two workers racing,
+    /// exactly one sees a row affected and the other sees none.
     ///
     /// The read-then-act it replaces was not safe. The outbox leases a job, but a lease can
     /// LAPSE: a worker that stalls past its visibility timeout has its job re-claimed while it
@@ -23167,7 +23175,15 @@ impl MessageRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
     /// on a persistence failure.
-    pub async fn release_claim(&self, id: &MessageId, generation: i32) -> Result<(), StoreError> {
+    /// `generation` is the value [`Self::claim_for_delivery`] returned. Returns whether the
+    /// claim was actually RELEASED: `false` means this worker no longer owns the row, which is
+    /// the correct outcome for a stale worker and not an error.
+    ///
+    /// Reporting it matters. Returning `Ok(())` either way made a wrong generation here
+    /// completely silent -- no send, no failure record, no dead letter, retry budget unspent,
+    /// which is exactly the harm `release_then`'s own doc names -- and it is what let a
+    /// hardcoded `0` at four call sites survive the whole suite.
+    pub async fn release_claim(&self, id: &MessageId, generation: i32) -> Result<bool, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -23175,7 +23191,7 @@ impl MessageRepo<'_> {
         // Fenced on the generation for the same reason `resolve` is: a worker that lost its
         // message to a resend must not drag the row back to `pending` underneath whichever
         // worker now holds it, which would arm a THIRD delivery of the same mail.
-        sqlx::query(
+        let released = sqlx::query(
             "UPDATE messages SET state = 'pending', updated_at = now() \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'sending' \
                AND resend_count = $4",
@@ -23185,9 +23201,10 @@ impl MessageRepo<'_> {
         .bind(self.scope.environment().to_string())
         .bind(generation)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
         tx.commit().await?;
-        Ok(())
+        Ok(released == 1)
     }
 
     /// Open this message's sealed recipient, or [`None`] if it carries none.
@@ -23251,6 +23268,10 @@ impl MessageRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the identifier is out of this scope or names no row;
     /// [`StoreError::Database`] on a persistence failure.
+    /// `generation` is the value [`Self::claim_for_delivery`] returned. A resolve carrying a
+    /// STALE one -- the row was resent out from under this worker -- affects no rows and is
+    /// refused with [`StoreError::NotFound`], which is how a worker learns it no longer owns
+    /// the message it just mailed.
     pub async fn resolve(
         &self,
         id: &MessageId,

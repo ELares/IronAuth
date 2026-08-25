@@ -48,6 +48,7 @@ use std::sync::Arc;
 
 use ironauth_env::Env;
 
+use crate::error::StoreError;
 use crate::message_delivery::{MessageProvider, deliver};
 use crate::message_failover::GiveUpReason;
 use crate::message_prepare::PreparedMessage;
@@ -109,6 +110,8 @@ async fn release_then(
     label: &'static str,
 ) -> ConsumerError {
     if messages.release_claim(id, generation).await.is_err() {
+        // A stale generation returns Ok(false), not Err, so this arm is a real persistence
+        // fault rather than "somebody else owns the row".
         // The release itself failed. Retry anyway: the row stays `sending` and this attempt is
         // not recorded as a completion, which is the safe direction.
         return ConsumerError::retryable("release_failed");
@@ -259,17 +262,23 @@ impl OutboxConsumer for MessageDeliveryConsumer {
 
             let report = deliver(&self.providers, &prepared).await;
             if report.delivered_by.is_some() {
-                messages
-                    .resolve(&id, generation, Resolution::Sent)
-                    .await
-                    .map_err(|_| ConsumerError::retryable("resolve_failed"))?;
-                return Ok(());
+                // SUPERSEDED IS NOT A FAILURE. The mail is out. If an operator resent this row
+                // while the provider was accepting it, the resolve carries a stale generation
+                // and affects nothing -- and retrying THIS job would hand the same recipient
+                // the same message again, which is what the claim exists to prevent. The
+                // generation that owns the row now is the one that will resolve it.
+                match messages.resolve(&id, generation, Resolution::Sent).await {
+                    Ok(()) | Err(StoreError::NotFound) => return Ok(()),
+                    Err(_) => return Err(ConsumerError::retryable("resolve_failed")),
+                }
             }
 
             match report.gave_up {
                 // The message is undeliverable as written. Finished, not deferred.
                 Some(GiveUpReason::MessageRejected) => {
-                    messages
+                    // Superseded is not a failure here either: a provider has already refused
+                    // this message, so re-offering it on a retry cannot change the outcome.
+                    match messages
                         .resolve(
                             &id,
                             generation,
@@ -278,8 +287,10 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                             },
                         )
                         .await
-                        .map_err(|_| ConsumerError::retryable("resolve_failed"))?;
-                    Ok(())
+                    {
+                        Ok(()) | Err(StoreError::NotFound) => Ok(()),
+                        Err(_) => Err(ConsumerError::retryable("resolve_failed")),
+                    }
                 }
                 // The infrastructure is down, not the message. Leave the row PENDING and let
                 // the outbox retry: resolving it `failed` here would tell an operator the send
@@ -288,6 +299,8 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                     // Nothing was delivered and the substrate will try again, so the claim is
                     // RELEASED rather than left held: a row stuck in `sending` with a retry
                     // queued behind it would be claimed by nobody and finished by nobody.
+                    // `false` means the row was resent out from under this worker, which is
+                    // the correct outcome and not a fault: the new generation owns it now.
                     messages
                         .release_claim(&id, generation)
                         .await

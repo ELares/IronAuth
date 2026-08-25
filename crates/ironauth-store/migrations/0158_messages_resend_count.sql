@@ -39,8 +39,13 @@
 -- table exists to avoid.
 --
 -- What this does NOT do is bound how often a message may be resent. Resolve-then-resend in a
--- loop is unbounded, and the counter below records it rather than limiting it. The control is
--- the management permission required to call resend at all.
+-- loop is unbounded, and the counter below records it rather than limiting it.
+--
+-- NOTHING bounds it today, and this text ships frozen, so it says that rather than naming a
+-- control. `MessageRepo::resend` has no production caller yet; the endpoint that will have one,
+-- and whatever permission gates it, are issue #111 criterion 1's remaining work. When that
+-- lands, whether the gate is sufficient is a question to answer there and not a promise to
+-- make here.
 --
 -- # Why `sending` is resendable at all
 --
