@@ -607,6 +607,11 @@ impl Harness {
         let armed_txt = std::sync::Arc::new(FixedTxt(std::sync::Mutex::new(Ok(Vec::new()))));
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
+            // The data-plane store the message resend writes through (issue #111 criterion 1),
+            // from the SAME handle the registry above is built from, mirroring production where
+            // one pool serves both. Without it the resend endpoint answers 503 and the
+            // whole-surface sweep would read a deployment gap as the endpoint's real behaviour.
+            .with_data_store(db.store().clone())
             .with_signing_registry(registry)
             .with_federation(federation)
             .with_signup_quarantine_enabled(true)

@@ -1264,6 +1264,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one message's delivery status.
+         * @description # Errors
+         *
+         *     [`ApiError::NotFound`] when the identifier names no message of this scope -- including one
+         *     that parses but belongs to another, which is the same answer on purpose: distinguishing
+         *     them would confirm the existence of another tenant's message.
+         */
+        get: operations["getMessageStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}/resend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-queue a terminal message for delivery.
+         * @description # Why this writes through the DATA plane
+         *
+         *     `messages` grants the control role SELECT only, deliberately, and its own test says why:
+         *     "UPDATE here makes the management surface a mailer". The separation is kept and the work
+         *     moves instead: this endpoint DECIDES, and the data plane, which is the thing that mails,
+         *     performs it, exactly as it did for the original send. When no data-plane store is wired the
+         *     endpoint refuses with 503 rather than reaching for the control store, because falling back
+         *     would be precisely the widening the split exists to prevent.
+         *
+         *     # Why every refusal is a 200
+         *
+         *     `Suppressed`, `NotResendable` and `PayloadExpired` are ANSWERS, not errors. Each says
+         *     something different and actionable -- the recipient must not be mailed, the message is not
+         *     in a state a resend can act on, the variables have been reaped -- and collapsing them into a
+         *     4xx would lose which one it was. The request was understood and acted on; the body reports
+         *     what happened.
+         *
+         *     # Errors
+         *
+         *     [`ApiError::NotFound`] when the identifier names no message of this scope;
+         *     [`ApiError::NotConfigured`] (503) when no data-plane store is wired.
+         */
+        post: operations["resendMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
         parameters: {
             query?: never;
@@ -5454,6 +5518,36 @@ export interface components {
             /** @description The member user (`usr_...`). */
             user_id: string;
         };
+        /** @description One message's delivery status. */
+        MessageStatusView: {
+            /**
+             * Format: int64
+             * @description When the send was accepted, as epoch milliseconds.
+             */
+            created_at_unix_ms: number;
+            /** @description Why a failed delivery failed, as a classification rather than a provider response. */
+            failure_reason?: string | null;
+            /** @description The `msg_` identifier. */
+            id: string;
+            /** @description Which message this was: `email_otp`, `magic_link`, and so on. */
+            kind: string;
+            /** @description The recipient's BLIND INDEX, hex-encoded. Never the address; see the module header. */
+            recipient_bidx: string;
+            /**
+             * Format: int32
+             * @description How many times an operator has re-queued this message. Zero for one that was only ever
+             *     sent once, and the answer to "why did this person get four copies".
+             */
+            resend_count: number;
+            /** @description `pending`, `sending`, `sent` or `failed`. */
+            state: string;
+            /**
+             * Format: int64
+             * @description When the row last changed, as epoch milliseconds. A `failed` message with no date is
+             *     half an answer: a failure ten seconds old and one from last week are different problems.
+             */
+            updated_at_unix_ms: number;
+        };
         /** @description An environment's lazy-migration progress (issue #56). */
         MigrationProgressView: {
             /**
@@ -6496,6 +6590,21 @@ export interface components {
              *     too.
              */
             since_unix_ms?: number | null;
+        };
+        /** @description What a resend request did. */
+        ResendView: {
+            /**
+             * Format: int32
+             * @description Which re-queue this was, present only when the outcome is `requeued`.
+             */
+            attempt?: number | null;
+            /** @description `requeued`, `suppressed`, `not_resendable` or `payload_expired`. */
+            outcome: string;
+            /**
+             * @description Why the request was refused, present only when there is a reason to give: the
+             *     suppression classification, or the state a `not_resendable` message is actually in.
+             */
+            reason?: string | null;
         };
         /** @description A page of resource servers. */
         ResourceServerList: {
@@ -14133,6 +14242,126 @@ export interface operations {
             };
             /** @description Idempotency-Key reused with a different request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getMessageStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The message identifier */
+                message_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The message's delivery status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MessageStatusView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such message in this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resendMessage: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required: a retry must not mail twice */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The message identifier */
+                message_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The re-queue was attempted; the body says what happened */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResendView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such message in this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No data-plane store is wired, so no resend can be performed */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

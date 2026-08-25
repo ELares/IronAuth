@@ -1851,6 +1851,20 @@ impl<'a> ActingStore<'a> {
         }
     }
 
+    /// Re-queueing an outbound message (issue #111 criterion 1). DATA plane.
+    ///
+    /// The management API decides whether to resend; this is where the decision is written
+    /// down and audited. It is on the acting store because it CAUSES MAIL and an unaudited
+    /// send-again is not something an operator surface should be able to do.
+    #[must_use]
+    pub fn messages(&self) -> ActingMessageRepo<'a> {
+        ActingMessageRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
     /// Authoring message template overrides (issue #111). CONTROL plane.
     #[must_use]
     pub fn message_templates(&self) -> ActingMessageTemplateRepo<'a> {
@@ -22498,6 +22512,14 @@ pub struct MessageRecord {
     /// How many times an operator has re-queued this message. Zero for a message that was
     /// only ever sent once, which is the answer to "why did this person get four copies".
     pub resend_count: i32,
+    /// When the send was accepted, as epoch milliseconds.
+    pub created_at_unix_ms: i64,
+    /// When the row last changed, as epoch milliseconds.
+    ///
+    /// Without these two a status surface can say a message is `failed` but not WHEN, which is
+    /// the first thing anyone asks: a failure from ten seconds ago and one from last week are
+    /// different problems, and `pending` is only alarming once it is old.
+    pub updated_at_unix_ms: i64,
 }
 
 /// What enqueuing one outbound message needs (issue #111).
@@ -22571,6 +22593,111 @@ fn delivery_idempotency_key(id: &MessageId, attempt: i32) -> String {
     } else {
         format!("{id}#{attempt}")
     }
+}
+
+/// Re-queue a terminal message, inside the CALLER's transaction.
+///
+/// Extracted so the audited path can put the audit row and this write in ONE transaction. An
+/// audit row committed separately from the thing it describes is a row that can outlive a
+/// rolled-back write, or be missing for one that landed.
+async fn resend_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    id: &MessageId,
+) -> Result<Resent, StoreError> {
+    let row = sqlx::query(
+        "SELECT state, recipient_bidx, resend_count FROM messages \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+    let state: String = row.get("state");
+    let bidx: Vec<u8> = row.get("recipient_bidx");
+    let previous_attempt: i32 = row.get("resend_count");
+
+    // SUPPRESSION FIRST, before the state check, so an operator resending to a complained
+    // address is told THAT rather than "this message is already sent". The two refusals
+    // are not interchangeable: one is about this row and the other is about the person.
+    let suppressed: Option<String> = sqlx::query_scalar(
+        "SELECT reason FROM message_suppressions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND recipient_bidx = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(&bidx)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(reason) = suppressed {
+        return Ok(Resent::Suppressed { reason });
+    }
+
+    // The payload of the most recent attempt, read BEFORE the row is moved: a resend that
+    // moved the row and then discovered the payload was gone would leave a `pending`
+    // message no job will ever deliver, which reads to an operator exactly like mail that
+    // is merely slow.
+    let payload: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM outbox_messages \
+             WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
+               AND idempotency_key = $4",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(MESSAGE_DELIVERY_CONSUMER)
+    .bind(delivery_idempotency_key(id, previous_attempt))
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(payload) = payload else {
+        return Ok(Resent::PayloadExpired);
+    };
+
+    // THE COMPARE-AND-SWAP. `sending` is resendable because 0156 left recovering a stuck
+    // row to a person: a worker that died mid-delivery leaves one no other worker will
+    // take, and refusing here would strand it for good. It can double-deliver, and that is
+    // the operator's call to make with knowledge the database does not have.
+    let attempt: Option<i32> = sqlx::query_scalar(
+        "UPDATE messages \
+             SET state = 'pending', failure_reason = NULL, \
+                 resend_count = resend_count + 1, updated_at = now() \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+               AND state IN ('failed', 'sending') \
+             RETURNING resend_count",
+    )
+    .bind(id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(attempt) = attempt else {
+        // Lost the race, or never resendable. The state read at the top is what the caller
+        // is told; under a concurrent resend that is the state it was in when we looked,
+        // which is the honest answer to "why did mine not take effect".
+        return Ok(Resent::NotResendable { state });
+    };
+
+    // A job of its OWN. Re-filing under the original key would collide with the completed
+    // original on the outbox UNIQUE, and `enqueue_outbox_in_tx` is the RAISING enqueue, so
+    // that collision aborts this transaction: the row never moves and the operator gets a
+    // database error rather than a resend.
+    enqueue_outbox_in_tx(
+        tx,
+        env,
+        scope,
+        &NewOutboxMessage {
+            consumer: MESSAGE_DELIVERY_CONSUMER,
+            idempotency_key: &delivery_idempotency_key(id, attempt),
+            // The same per-recipient key as the original, so a resend stays ordered behind
+            // this person's other mail rather than overtaking it.
+            ordering_key: &hex_of(&bidx),
+            payload,
+        },
+    )
+    .await?;
+    Ok(Resent::Requeued { attempt })
 }
 
 /// The message-id half of a delivery job's idempotency key: the inverse of
@@ -22987,100 +23114,9 @@ impl MessageRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
-
-        let row = sqlx::query(
-            "SELECT state, recipient_bidx, resend_count FROM messages \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
-        )
-        .bind(id.to_string())
-        .bind(self.scope.tenant().to_string())
-        .bind(self.scope.environment().to_string())
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(StoreError::NotFound)?;
-        let state: String = row.get("state");
-        let bidx: Vec<u8> = row.get("recipient_bidx");
-        let previous_attempt: i32 = row.get("resend_count");
-
-        // SUPPRESSION FIRST, before the state check, so an operator resending to a complained
-        // address is told THAT rather than "this message is already sent". The two refusals
-        // are not interchangeable: one is about this row and the other is about the person.
-        let suppressed: Option<String> = sqlx::query_scalar(
-            "SELECT reason FROM message_suppressions \
-             WHERE tenant_id = $1 AND environment_id = $2 AND recipient_bidx = $3",
-        )
-        .bind(self.scope.tenant().to_string())
-        .bind(self.scope.environment().to_string())
-        .bind(&bidx)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(reason) = suppressed {
-            return Ok(Resent::Suppressed { reason });
-        }
-
-        // The payload of the most recent attempt, read BEFORE the row is moved: a resend that
-        // moved the row and then discovered the payload was gone would leave a `pending`
-        // message no job will ever deliver, which reads to an operator exactly like mail that
-        // is merely slow.
-        let payload: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT payload FROM outbox_messages \
-             WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
-               AND idempotency_key = $4",
-        )
-        .bind(self.scope.tenant().to_string())
-        .bind(self.scope.environment().to_string())
-        .bind(MESSAGE_DELIVERY_CONSUMER)
-        .bind(delivery_idempotency_key(id, previous_attempt))
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(payload) = payload else {
-            return Ok(Resent::PayloadExpired);
-        };
-
-        // THE COMPARE-AND-SWAP. `sending` is resendable because 0156 left recovering a stuck
-        // row to a person: a worker that died mid-delivery leaves one no other worker will
-        // take, and refusing here would strand it for good. It can double-deliver, and that is
-        // the operator's call to make with knowledge the database does not have.
-        let attempt: Option<i32> = sqlx::query_scalar(
-            "UPDATE messages \
-             SET state = 'pending', failure_reason = NULL, \
-                 resend_count = resend_count + 1, updated_at = now() \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
-               AND state IN ('failed', 'sending') \
-             RETURNING resend_count",
-        )
-        .bind(id.to_string())
-        .bind(self.scope.tenant().to_string())
-        .bind(self.scope.environment().to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(attempt) = attempt else {
-            // Lost the race, or never resendable. The state read at the top is what the caller
-            // is told; under a concurrent resend that is the state it was in when we looked,
-            // which is the honest answer to "why did mine not take effect".
-            return Ok(Resent::NotResendable { state });
-        };
-
-        // A job of its OWN. Re-filing under the original key would collide with the completed
-        // original on the outbox UNIQUE, and `enqueue_outbox_in_tx` is the RAISING enqueue, so
-        // that collision aborts this transaction: the row never moves and the operator gets a
-        // database error rather than a resend.
-        enqueue_outbox_in_tx(
-            &mut tx,
-            env,
-            self.scope,
-            &NewOutboxMessage {
-                consumer: MESSAGE_DELIVERY_CONSUMER,
-                idempotency_key: &delivery_idempotency_key(id, attempt),
-                // The same per-recipient key as the original, so a resend stays ordered behind
-                // this person's other mail rather than overtaking it.
-                ordering_key: &hex_of(&bidx),
-                payload,
-            },
-        )
-        .await?;
+        let outcome = resend_in_tx(&mut tx, env, self.scope, id).await?;
         tx.commit().await?;
-        Ok(Resent::Requeued { attempt })
+        Ok(outcome)
     }
 
     /// Record that this recipient is suppressed (issue #111 criterion 6).
@@ -23321,7 +23357,9 @@ impl MessageRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, kind, recipient_bidx, state, failure_reason, resend_count \
+            "SELECT id, kind, recipient_bidx, state, failure_reason, resend_count, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_unix_ms, \
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint AS updated_at_unix_ms \
              FROM messages \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
@@ -23342,6 +23380,8 @@ impl MessageRepo<'_> {
                     state: row.get("state"),
                     failure_reason: row.get("failure_reason"),
                     resend_count: row.get("resend_count"),
+                    created_at_unix_ms: row.get("created_at_unix_ms"),
+                    updated_at_unix_ms: row.get("updated_at_unix_ms"),
                 }))
             }
         }
@@ -31560,6 +31600,59 @@ fn locale_bundle_from_row(row: &sqlx::postgres::PgRow) -> LocaleBundleRecord {
 /// SELECT alone. An app role that could author a template could rewrite what every recipient
 /// of that environment is sent, which is a strictly larger power than anything else the send
 /// path needs.
+/// Message operations that AUDIT, for the operator surface (issue #111 criterion 1).
+pub struct ActingMessageRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingMessageRepo<'_> {
+    /// Re-queue a terminal message, auditing `message.resend` in the SAME transaction.
+    ///
+    /// Audited because it CAUSES MAIL, and what it re-delivers is whatever the original send
+    /// carried -- for an `email_otp` the code, for a magic link the token. "Who re-sent this,
+    /// and when" is the first question an incident asks, and the unaudited
+    /// [`MessageRepo::resend`] cannot answer it.
+    ///
+    /// The audit row and the re-queue share one transaction, so neither can outlive the other:
+    /// a row describing a write that rolled back is worse than no row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope or names no row;
+    /// [`StoreError::Database`] on a persistence failure.
+    ///
+    /// Carries no idempotency write: that row is control-plane and this transaction is
+    /// data-plane. See [`Store::record_cross_plane_idempotency`].
+    pub async fn resend(&self, env: &Env, id: &MessageId) -> Result<Resent, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let target = *id;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MessageResend,
+                target: &target,
+            },
+            async move |tx| {
+                // No idempotency row here: `idempotency_keys` is a CONTROL-plane table and
+                // this write is on the data plane, so the app role has no grant on it and the
+                // two cannot share a transaction. The caller records it separately through
+                // `Store::record_cross_plane_idempotency`, which documents why that is safe.
+                resend_in_tx(tx, env, scope, &target).await
+            },
+            false,
+        )
+        .await
+    }
+}
+
 pub struct ActingMessageTemplateRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -55889,6 +55982,17 @@ async fn insert_resolved_idempotency<R>(
 /// collision (a concurrent request already stored this key) surfaces as the
 /// distinct [`StoreError::IdempotencyConflict`] so the caller can re-read and
 /// replay rather than double-execute.
+/// Write ONE idempotency row in its own transaction, for [`Store::record_cross_plane_idempotency`].
+pub(crate) async fn record_idempotency_alone(
+    pool: &sqlx::PgPool,
+    write: IdempotencyWrite<'_>,
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    insert_idempotency(&mut tx, Some(write)).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn insert_idempotency(
     tx: &mut Transaction<'_, Postgres>,
     idempotency: Option<IdempotencyWrite<'_>>,

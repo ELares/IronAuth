@@ -136,6 +136,21 @@ pub struct AdminState {
 #[allow(clippy::struct_excessive_bools)]
 struct Inner {
     store: Store,
+    // The DATA-plane store, when this process could open one (issue #111 criterion 1).
+    //
+    // The management surface is a control-plane surface and stays one: this is not a second
+    // way to reach the same tables. It exists because ONE operation must write a table the
+    // control role deliberately cannot -- re-queueing an outbound message -- and `messages`
+    // grants the control role SELECT only, on purpose. Its own test says why: "UPDATE here
+    // makes the management surface a mailer."
+    //
+    // So the split is kept and the work moves rather than the grant: the management API
+    // decides WHETHER to resend, and the data plane, which is the thing that mails, performs
+    // it, exactly as it did for the original send.
+    //
+    // `None` when no data-plane store could be opened, and every reader fails closed rather
+    // than falling back to the control store, which would be the grant widening this avoids.
+    data_store: Option<Store>,
     env: Env,
     // Wrapped in SecretString so it cannot leak through Debug/logs; the value is
     // reachable only via `.expose()` at the constant-time comparison site.
@@ -324,6 +339,10 @@ impl AdminState {
         Ok(Self {
             inner: Arc::new(Inner {
                 store,
+                // Attached by the boot wiring when a data-plane store is reachable; absent here so
+                // a state built without it fails the resend closed rather than silently using
+                // the control store.
+                data_store: None,
                 env,
                 bootstrap_operator_token,
                 bootstrap_operator_id: OperatorId::from_seed_bytes(BOOTSTRAP_SEED),
@@ -412,6 +431,33 @@ impl AdminState {
     #[must_use]
     pub(crate) fn signing_registry(&self) -> Option<&IssuerRegistry> {
         self.inner.signing_registry.as_deref()
+    }
+
+    /// The DATA-plane store, when one was wired (issue #111 criterion 1).
+    ///
+    /// Reachable by exactly one caller, the message resend endpoint, and for exactly one
+    /// reason: `messages` grants the control role SELECT only, deliberately. See [`Inner`].
+    ///
+    /// Returning [`None`] is a REFUSAL, not a fallback. A caller that quietly used the
+    /// control store instead would produce a permission error at best and, if the grant ever
+    /// widened, the mailer-on-the-management-surface this separation exists to prevent.
+    #[must_use]
+    pub(crate) fn data_store(&self) -> Option<&Store> {
+        self.inner.data_store.as_ref()
+    }
+
+    /// Attach the data-plane store (issue #111 criterion 1).
+    ///
+    /// Handed the SAME store the issuer registry is built from, so this process opens ONE
+    /// data-plane pool rather than two. `connect_data_plane_registry` records why that
+    /// matters: two pools were "two chances for one operator-visible value to be derived
+    /// differently".
+    #[must_use]
+    pub fn with_data_store(mut self, store: Store) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.data_store = Some(store);
+        }
+        self
     }
 
     /// The shared data-plane issuer registry HANDLE, for the boot-wiring harness only

@@ -3105,3 +3105,286 @@ async fn the_subject_mapping_surface_splits_reading_from_authoring() {
         "write_config deleted a subject mapping: {body}"
     );
 }
+
+/// `management.read` is required AND sufficient for the per-message status endpoint (#111).
+///
+/// Both directions, because either half alone proves nothing: a test that only asserted the
+/// refusal would pass against an endpoint that refused everybody, and one that only asserted
+/// the success would pass against an endpoint with no gate at all.
+///
+/// The message id names no row, so the allowed half answers 404 rather than 200. That is
+/// deliberate: what is under test is WHICH PERMISSION reaches the handler, and a 404 proves the
+/// gate was passed just as well as a 200 would, while keeping the fixture free of a real send.
+/// 403 and 404 are exactly the two answers that separate "refused at the gate" from "allowed
+/// through it".
+#[tokio::test]
+async fn read_is_required_and_sufficient_for_message_status() {
+    let h = Harness::start(51).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-message").await;
+
+    // An identifier that reaches no row. It need not parse: the handler gates on the
+    // permission BEFORE it parses, so anything past the gate answers 404 either way, and 403
+    // versus 404 is exactly what separates "refused at the gate" from "allowed through it".
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/messages/msg_absentmessage");
+
+    // A credential restricted to a DIFFERENT permission, not to none: an empty set could be
+    // refused by an earlier check and would say nothing about which permission this requires.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_config credential must not read message status: {body}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a read credential must reach the handler, which then reports the absent message: \
+         {body}"
+    );
+}
+
+/// `management.write_users` is required AND sufficient for the message resend (#111).
+///
+/// Both directions, for the reason the status test gives: refusal-only passes against an
+/// endpoint that refuses everybody, and success-only passes against one with no gate.
+///
+/// The allowed half lands on 404 rather than 200 because the identifier names no message. That
+/// is what is wanted here: the question is WHICH PERMISSION reaches the handler, and 403 versus
+/// 404 answers it exactly. The endpoint's real outcomes are covered by the store's own tests.
+#[tokio::test]
+async fn write_users_is_required_and_sufficient_for_message_resend() {
+    let h = Harness::start(52).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-resend").await;
+
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/messages/msg_absent/resend");
+
+    // A DIFFERENT permission, not an empty set: an empty set could be refused by an earlier
+    // check and would say nothing about which permission this endpoint requires.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.post_as(&path, &secret, "k-resend-refused", "").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not re-queue mail: {body}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+    let (status, _, body) = h.post_as(&path, &secret, "k-resend-allowed", "").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_users credential must reach the handler, which then reports the absent \
+         message: {body}"
+    );
+}
+
+/// The status endpoint returns the blind index and NEVER the address (issue #111 criterion 1).
+///
+/// THE TEST THIS FILE WAS MISSING. Every case that touched this route used an identifier that
+/// fails `parse_in_scope`, so the handler answered 404 and its whole body -- the query, the
+/// view, the hex fold, the serialization -- was never executed by anything. Review replaced
+/// `recipient_bidx` with the opened plaintext address and all 741 tests in this crate passed.
+/// The behaviour was correct and guarded by nothing, which is the shape a later edit removes.
+///
+/// So this drives a real 200 and asserts the VALUE, not the shape: a 64-character hex string
+/// would be satisfied by a constant, and "contains no address" would be satisfied by an empty
+/// body.
+#[tokio::test]
+async fn message_status_returns_the_blind_index_and_never_the_address() {
+    let h = Harness::start(53).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant"),
+        EnvironmentId::parse(&environment).expect("environment"),
+    );
+    let env = ironauth_env::Env::system();
+
+    // Seeded through the store, since no create route exists for a message. The address is
+    // distinctive so "the body does not contain it" is a real assertion rather than a
+    // coincidence about short strings.
+    let address = "ada-status-probe@example.test";
+    let id = ironauth_store::MessageId::generate(&env, &scope);
+    let bidx: Vec<u8> = (0_u8..32).map(|n| n ^ 0x5a).collect();
+    // State and reason in ONE statement: `messages_failure_reason_paired` requires them to
+    // agree, so a `failed` row inserted without its reason is refused rather than patched up.
+    sqlx::query(
+        "INSERT INTO messages \
+         (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key, state, \
+          failure_reason) \
+         VALUES ($1, $2, $3, 'email_otp', $4, $5, 'failed', 'bounced')",
+    )
+    .bind(id.to_string())
+    .bind(&tenant)
+    .bind(&environment)
+    .bind(&bidx)
+    .bind(format!("probe-{id}"))
+    .execute(h.db().owner_pool())
+    .await
+    .expect("seed a message");
+
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/messages/{id}");
+    let (status, _, body) = h.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "the message exists: {body}");
+    let view: Value = serde_json::from_str(&body).expect("a JSON body");
+
+    // THE VALUE, not the shape. Hex of the row's OWN index, computed here from the bytes the
+    // fixture inserted rather than by calling the same fold the handler calls.
+    let expected: String = {
+        use std::fmt::Write as _;
+        bidx.iter().fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+    };
+    assert_eq!(
+        view["recipient_bidx"].as_str(),
+        Some(expected.as_str()),
+        "the index must be THIS message's: a 64-character hex constant would satisfy a \
+         shape-only assertion"
+    );
+    assert_eq!(view["state"], "failed");
+    assert_eq!(view["failure_reason"], "bounced");
+    assert_eq!(view["kind"], "email_otp");
+    assert!(
+        view["created_at_unix_ms"].as_i64().is_some_and(|ms| ms > 0)
+            && view["updated_at_unix_ms"].as_i64().is_some_and(|ms| ms > 0),
+        "a failed message must be datable: {body}"
+    );
+
+    // AND NEVER THE ADDRESS. Asserted over the whole serialized body, so a leak through any
+    // field fails here, not only through the one the header talks about.
+    assert!(
+        !body.contains(address) && !body.contains("ada-status-probe"),
+        "the response must never carry the recipient: {body}"
+    );
+}
+
+/// A message id from another scope is not readable, and the refusal reveals nothing.
+///
+/// What this does and does not prove, stated exactly. The fence is STRUCTURAL: `ScopedId`
+/// exposes no scope-blind parse at all, only `parse_in_scope`, which folds "wrong prefix",
+/// "not base64", "wrong length" and "wrong scope" into one `NotInScope` carrying no detail. So
+/// there is no check here a mutation could delete, and a test claiming to catch one would be
+/// claiming something the type system already guarantees.
+///
+/// What it pins is the OBSERVABLE consequence: that this handler resolves ids through that
+/// path rather than by some other lookup, and that the refusal is byte-identical to a garbage
+/// identifier's. Both fixtures vary ONE dimension from the caller's scope -- a sibling
+/// environment of the same tenant, and a different tenant -- so neither can pass by a
+/// comparison that only looks at tenants.
+#[tokio::test]
+async fn a_message_from_another_scope_is_not_readable_and_the_refusal_reveals_nothing() {
+    let h = Harness::start(54).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (other_tenant, other_environment) = h.create_tenant("rival", "k-rival").await;
+    let env = ironauth_env::Env::system();
+
+    let sibling_environment = {
+        let (status, _, body) = h
+            .post(
+                &format!("/v1/tenants/{tenant}/environments"),
+                "k-sibling",
+                &serde_json::json!({ "display_name": "sibling", "kind": "dev" }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed a sibling env: {body}");
+        let created: Value = serde_json::from_str(&body).expect("a JSON body");
+        created["id"]
+            .as_str()
+            .expect("the new environment's id")
+            .to_owned()
+    };
+
+    // Minted under a SIBLING ENVIRONMENT of the caller's own tenant, and under ANOTHER TENANT.
+    let elsewhere = [
+        Scope::new(
+            TenantId::parse(&tenant).expect("tenant"),
+            EnvironmentId::parse(&sibling_environment).expect("sibling"),
+        ),
+        Scope::new(
+            TenantId::parse(&other_tenant).expect("other tenant"),
+            EnvironmentId::parse(&other_environment).expect("other environment"),
+        ),
+    ];
+
+    let (_, _, garbage) = h
+        .get(&format!(
+            "/v1/tenants/{tenant}/environments/{environment}/messages/not-an-identifier"
+        ))
+        .await;
+
+    for scope in elsewhere {
+        let id = ironauth_store::MessageId::generate(&env, &scope);
+        let (status, _, body) = h
+            .get(&format!(
+                "/v1/tenants/{tenant}/environments/{environment}/messages/{id}"
+            ))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an identifier minted elsewhere must not resolve here: {body}"
+        );
+        assert_eq!(
+            body, garbage,
+            "and it must answer EXACTLY as a garbage identifier does, or the difference tells \
+             a caller that some other scope's message exists"
+        );
+    }
+}
+
+/// A resend without an Idempotency-Key is refused (issue #111 criterion 1).
+///
+/// This POST CAUSES MAIL, so a retry that re-executes is a recipient getting the message twice
+/// -- the harm the whole `messages` ledger exists to prevent, arriving through the recovery
+/// path. The header is required on every POST on this surface, and this endpoint shipped
+/// without asking for one.
+///
+/// Driven at an absent message on purpose: the key check runs before the identifier is parsed,
+/// so a 400 here cannot be the endpoint merely failing to find the row (which is a 404).
+#[tokio::test]
+async fn a_resend_without_an_idempotency_key_is_refused() {
+    let h = Harness::start(55).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/messages/msg_absent/resend");
+
+    let (status, _, body) = h.post(&path, "", "").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the Idempotency-Key is required on a POST that mails somebody: {body}"
+    );
+
+    // With a key, the same request reaches the handler and reports the absent message. 400 to
+    // 404 is what shows the key check opened rather than the route answering the same way for
+    // a different reason.
+    let (status, _, body) = h.post(&path, "k-resend-present", "").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "with a key it reaches the handler: {body}"
+    );
+}

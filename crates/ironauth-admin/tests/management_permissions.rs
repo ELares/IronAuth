@@ -358,6 +358,8 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         ManagementPermission::WriteCredentials,
     ),
     ("listProjectGrants", ManagementPermission::Read),
+    ("getMessageStatus", ManagementPermission::Read),
+    ("resendMessage", ManagementPermission::WriteUsers),
     (
         "withdrawProjectGrant",
         ManagementPermission::WriteOrganizations,
@@ -595,6 +597,17 @@ const PERMISSION_PROVEN: &[&str] = &[
     // so neither a blanket refusal nor a missing gate would pass it.
     "readEventFeed",
     "exportUsage",
+    // Proven in `delegated_admin.rs::read_is_required_and_sufficient_for_message_status`, in
+    // BOTH directions: a `write_config` credential gets 403 and a `read` one reaches the
+    // handler (404 on an absent message), so neither a blanket refusal nor a missing gate
+    // would pass it.
+    "getMessageStatus",
+    // Proven in `delegated_admin.rs::write_users_is_required_and_sufficient_for_message_resend`,
+    // in BOTH directions: a `read` credential gets 403 and a `write_users` one reaches the
+    // handler. `write_users` rather than `write_credentials` because every operation in the
+    // credentials set MINTS a credential and this one mints nothing; the sibling
+    // `resendInvitation` is classified the same way.
+    "resendMessage",
     // Proven in `usage_export.rs::write_config_is_required_and_sufficient_for_publishing`,
     // in BOTH directions: a credential restricted to `management.read` is refused 403 and
     // one restricted to `management.write_config` is allowed. Publishing appends to the feed
@@ -727,12 +740,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        181,
+        183,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        37,
+        39,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -746,6 +759,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
 /// differs from what was built.
 const ADMIN_SOURCES: &[(&str, &str)] = &[
     ("api_keys.rs", include_str!("../src/api_keys.rs")),
+    ("messages.rs", include_str!("../src/messages.rs")),
     (
         "service_account_keys.rs",
         include_str!("../src/service_account_keys.rs"),

@@ -890,6 +890,12 @@ pub enum Action {
     /// reason a locale bundle's entries are not -- an audit row is a record that somebody
     /// changed something, not a copy of what they wrote.
     MessageTemplateSet,
+    /// An operator re-queued an outbound message for delivery (issue #111 criterion 1).
+    ///
+    /// Audited because it CAUSES MAIL. The row this re-delivers carries whatever the original
+    /// send carried, which for an `email_otp` is the code and for a magic link is the token, so
+    /// "who re-sent this, and when" is exactly the question an incident asks.
+    MessageResend,
     /// An HTTP FLOW TARGET was registered or reconfigured through the management API
     /// (issue #112). The audit row names the target id and scope; the target's config is not
     /// recorded here, for the reason a locale bundle's entries are not -- an audit row records
@@ -1545,6 +1551,7 @@ impl Action {
             Action::LocaleSet => "locale.set",
             Action::LocaleDelete => "locale.delete",
             Action::MessageTemplateSet => "message_template.set",
+            Action::MessageResend => "message.resend",
             Action::FlowTargetSet => "flow_target.set",
             Action::FlowTargetDelete => "flow_target.delete",
             Action::FlowTargetReplayDeadLetters => "flow_target.replay_dead_letters",

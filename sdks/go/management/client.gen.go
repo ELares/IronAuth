@@ -736,6 +736,13 @@ func (c *Client) GetMds3Health(tenant_id string, environment_id string, query ur
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/webauthn/mds3/health", query, nil)
 }
 
+// GetMessageStatus performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}.
+//
+// Read one message's delivery status.
+func (c *Client) GetMessageStatus(tenant_id string, environment_id string, message_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/messages/" + escape(message_id), query, nil)
+}
+
 // GetMigrationProgress performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress.
 //
 // Report the environment's lazy-migration progress.
@@ -1399,6 +1406,13 @@ func (c *Client) ReplayWebhookDeadLetters(tenant_id string, environment_id strin
 // Resend a pending invitation: invalidate the prior token and issue a fresh one.
 func (c *Client) ResendInvitation(tenant_id string, environment_id string, invitation_id string, query url.Values) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/invitations/" + escape(invitation_id) + "/resend", query, nil)
+}
+
+// ResendMessage performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}/resend.
+//
+// Re-queue a terminal message for delivery.
+func (c *Client) ResendMessage(tenant_id string, environment_id string, message_id string, query url.Values) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/messages/" + escape(message_id) + "/resend", query, nil)
 }
 
 // RestoreTenant performs POST /v1/tenants/{tenant_id}/restore.
