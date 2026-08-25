@@ -70,6 +70,7 @@ mod input;
 mod invitations;
 mod keys;
 mod locales;
+mod messages;
 pub mod usage;
 
 /// SIEM log stream delivery (issue #110): the sink interface, the HTTP sink, and the
@@ -520,6 +521,13 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants",
             post(project_grants::create_project_grant).get(project_grants::list_project_grants),
+        )
+        // One outbound message's delivery status (issue #111 criterion 1). A READ, which is
+        // all the control plane holds on `messages`; the resend half writes and needs the data
+        // plane, so it lands separately.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}",
+            get(messages::get_message_status),
         )
         // API keys owned by an organization (issue #99, criterion 6). Read-only for now;
         // create, rotate and revoke follow. The store operations behind them all exist and

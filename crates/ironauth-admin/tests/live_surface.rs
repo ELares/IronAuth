@@ -1449,6 +1449,14 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/log-streams"),
         ),
+        // One message's delivery status (issue #111 criterion 1). The identifier names no row,
+        // which is what this sweep needs: it drives the ROUTE and its scope handling, and the
+        // handler's own tests cover what it returns for a message that exists.
+        Case::empty(
+            "messages.getMessageStatus",
+            "GET",
+            format!("{base}/messages/msg_absentmessage"),
+        ),
         Case::json(
             "log_streams.createLogStream",
             "POST",

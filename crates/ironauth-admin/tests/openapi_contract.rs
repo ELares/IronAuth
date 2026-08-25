@@ -180,6 +180,7 @@ fn operation_ids_are_the_stable_set() {
             "getLocale",
             "getManagementKey",
             "getMds3Health",
+            "getMessageStatus",
             "getMigrationProgress",
             "getMigrationRun",
             "getOperator",
@@ -578,6 +579,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/violations",
@@ -830,7 +832,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        242,
+        243,
         "the documented route count is pinned"
     );
 

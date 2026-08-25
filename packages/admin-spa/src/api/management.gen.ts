@@ -1264,6 +1264,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one message's delivery status.
+         * @description # Errors
+         *
+         *     [`ApiError::NotFound`] when the identifier names no message of this scope -- including one
+         *     that parses but belongs to another, which is the same answer on purpose: distinguishing
+         *     them would confirm the existence of another tenant's message.
+         */
+        get: operations["getMessageStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
         parameters: {
             query?: never;
@@ -5453,6 +5477,25 @@ export interface components {
             state: string;
             /** @description The member user (`usr_...`). */
             user_id: string;
+        };
+        /** @description One message's delivery status. */
+        MessageStatusView: {
+            /** @description Why a failed delivery failed, as a classification rather than a provider response. */
+            failure_reason?: string | null;
+            /** @description The `msg_` identifier. */
+            id: string;
+            /** @description Which message this was: `email_otp`, `magic_link`, and so on. */
+            kind: string;
+            /** @description The recipient's BLIND INDEX, hex-encoded. Never the address; see the module header. */
+            recipient_bidx: string;
+            /**
+             * Format: int32
+             * @description How many times an operator has re-queued this message. Zero for one that was only ever
+             *     sent once, and the answer to "why did this person get four copies".
+             */
+            resend_count: number;
+            /** @description `pending`, `sending`, `sent` or `failed`. */
+            state: string;
         };
         /** @description An environment's lazy-migration progress (issue #56). */
         MigrationProgressView: {
@@ -14133,6 +14176,60 @@ export interface operations {
             };
             /** @description Idempotency-Key reused with a different request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getMessageStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The message identifier */
+                message_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The message's delivery status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MessageStatusView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such message in this scope */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

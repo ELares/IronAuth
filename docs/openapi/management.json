@@ -9136,6 +9136,92 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}": {
+      "get": {
+        "tags": [
+          "messages"
+        ],
+        "summary": "Read one message's delivery status.",
+        "description": "# Errors\n\n[`ApiError::NotFound`] when the identifier names no message of this scope -- including one\nthat parses but belongs to another, which is the same answer on purpose: distinguishing\nthem would confirm the existence of another tenant's message.",
+        "operationId": "getMessageStatus",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "message_id",
+            "in": "path",
+            "description": "The message identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The message's delivery status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageStatusView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such message in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
       "get": {
         "tags": [
@@ -27624,6 +27710,47 @@
           "user_id": {
             "type": "string",
             "description": "The member user (`usr_...`)."
+          }
+        }
+      },
+      "MessageStatusView": {
+        "type": "object",
+        "description": "One message's delivery status.",
+        "required": [
+          "id",
+          "kind",
+          "recipient_bidx",
+          "state",
+          "resend_count"
+        ],
+        "properties": {
+          "failure_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why a failed delivery failed, as a classification rather than a provider response."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `msg_` identifier."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Which message this was: `email_otp`, `magic_link`, and so on."
+          },
+          "recipient_bidx": {
+            "type": "string",
+            "description": "The recipient's BLIND INDEX, hex-encoded. Never the address; see the module header."
+          },
+          "resend_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many times an operator has re-queued this message. Zero for one that was only ever\nsent once, and the answer to \"why did this person get four copies\"."
+          },
+          "state": {
+            "type": "string",
+            "description": "`pending`, `sending`, `sent` or `failed`."
           }
         }
       },

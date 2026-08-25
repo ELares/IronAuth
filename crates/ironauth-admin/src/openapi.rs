@@ -286,6 +286,7 @@ use crate::views::{
         crate::routing_rules::list_routing_rules,
         crate::project_grants::create_project_grant,
         crate::project_grants::list_project_grants,
+        crate::messages::get_message_status,
         crate::api_keys::list_organization_api_keys,
         crate::api_keys::create_organization_api_key,
         crate::api_keys::revoke_organization_api_key,

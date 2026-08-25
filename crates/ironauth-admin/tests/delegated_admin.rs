@@ -3105,3 +3105,53 @@ async fn the_subject_mapping_surface_splits_reading_from_authoring() {
         "write_config deleted a subject mapping: {body}"
     );
 }
+
+/// `management.read` is required AND sufficient for the per-message status endpoint (#111).
+///
+/// Both directions, because either half alone proves nothing: a test that only asserted the
+/// refusal would pass against an endpoint that refused everybody, and one that only asserted
+/// the success would pass against an endpoint with no gate at all.
+///
+/// The message id names no row, so the allowed half answers 404 rather than 200. That is
+/// deliberate: what is under test is WHICH PERMISSION reaches the handler, and a 404 proves the
+/// gate was passed just as well as a 200 would, while keeping the fixture free of a real send.
+/// 403 and 404 are exactly the two answers that separate "refused at the gate" from "allowed
+/// through it".
+#[tokio::test]
+async fn read_is_required_and_sufficient_for_message_status() {
+    let h = Harness::start(51).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-message").await;
+
+    // An identifier that reaches no row. It need not parse: the handler gates on the
+    // permission BEFORE it parses, so anything past the gate answers 404 either way, and 403
+    // versus 404 is exactly what separates "refused at the gate" from "allowed through it".
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/messages/msg_absentmessage");
+
+    // A credential restricted to a DIFFERENT permission, not to none: an empty set could be
+    // refused by an earlier check and would say nothing about which permission this requires.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_config credential must not read message status: {body}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a read credential must reach the handler, which then reports the absent message: \
+         {body}"
+    );
+}
