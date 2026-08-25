@@ -175,6 +175,7 @@ metrics-exporter-prometheus = { workspace = true }
 [[test]]
 name = "metering_inline_queries"
 path = "tests/metering_inline_queries.rs"
+required-features = ["testing"]
 
 # Structural exclusion of forbidden flows: the grant-type, response-type, and
 # PKCE-method registries cannot express ROPC, authorization-endpoint access
