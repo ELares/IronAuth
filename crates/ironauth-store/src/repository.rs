@@ -106,6 +106,8 @@ use crate::identifier::{
 };
 use crate::impersonation::Impersonation;
 use crate::locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
+use crate::message_feedback::SuppressionReason;
+use crate::message_rate::RateBudget;
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recovery::{
@@ -22516,12 +22518,118 @@ pub struct NewMessage<'a> {
 }
 
 /// Whether an enqueue wrote a new message or collapsed onto one already in the window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Enqueued {
     /// A new message was written and a delivery job queued.
     Accepted,
     /// An identical send is already in this window, so nothing was written or queued.
     Collapsed,
+    /// The recipient is SUPPRESSED. Nothing was written or queued (issue #111 criterion 6).
+    ///
+    /// Distinct from [`Enqueued::Collapsed`] because they are opposite answers to "should I
+    /// try again later": a collapse means the recipient already has this message, and a
+    /// suppression means they must not be sent one at all until somebody un-suppresses them.
+    Suppressed {
+        /// Why, as the classification the suppression was recorded under.
+        reason: String,
+    },
+    /// The per-recipient rate limit refused this send (issue #111 criterion 5).
+    ///
+    /// Distinct from [`Enqueued::Suppressed`] because a suppression is PERMANENT and the
+    /// caller should stop asking, while this is TEMPORARY and carries the instant a retry
+    /// could succeed. Folding them together would have a caller either give up on a send that
+    /// would work in a minute, or retry forever one that never will.
+    RateLimited {
+        /// The epoch second at which this recipient's oldest counted send leaves the window.
+        retry_after_epoch_seconds: u64,
+    },
+}
+
+/// Suppression and the per-recipient budget, evaluated inside a caller's transaction.
+///
+/// Takes the OPEN transaction rather than opening its own, which is the whole point: the
+/// decision and the insert have to be one transaction under one lock, or eight concurrent
+/// sends all pass a budget of one. Returns the refusal, or [`None`] to proceed.
+async fn hygiene_refusal(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    scope: Scope,
+    bidx: &BlindIndex,
+    budget: RateBudget,
+    now_epoch_seconds: u64,
+) -> Result<Option<Enqueued>, StoreError> {
+    // HYGIENE FIRST, before the row and before the job. `message_prepare` states the
+    // ordering and the reason: putting a recipient's data through the pipeline for a
+    // message policy has already refused makes the logs read as though a send was
+    // prepared when it never should have been. Refusing here also means a blocked send
+    // never occupies the collapse window, so a later legitimate send is not swallowed by
+    // one that was refused.
+    let suppressed: Option<String> = sqlx::query_scalar(
+        "SELECT reason FROM message_suppressions \
+         WHERE tenant_id = $1 AND environment_id = $2 AND recipient_bidx = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(bidx.as_bytes())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(reason) = suppressed {
+        return Ok(Some(Enqueued::Suppressed { reason }));
+    }
+
+    // The window is applied IN SQL and the answer is an aggregate, not a page of rows.
+    // Fetching a bounded page and filtering in Rust made any budget above that bound
+    // unenforceable -- measured, 1501 in-window sends passed a limit of 1001 -- and left
+    // the ORDER BY and the LIMIT unpinned, so reversing the sort turned the whole limit
+    // into a no-op with every test still green. An aggregate is exact at any scale and
+    // has no ordering to get wrong.
+    // The window is `(now - window, now]`, BOUNDED AT BOTH ENDS.
+    //
+    // Only the lower bound existed at first, and two clock values defeated the limit
+    // through the gap. A `now` of zero makes the cutoff zero, so every row is "after" it
+    // and the count is the recipient's whole history -- which sounds strict and is the
+    // opposite: `rate_decision` then reports the oldest send's window as the retry
+    // instant, in 1970, so the block expires immediately and never recurs. And a single
+    // FUTURE-stamped row counts in every window from now until that timestamp passes,
+    // blocking the recipient with no remedy short of deleting the row.
+    //
+    // Counting only what is in the past closes both: a future row is not yet a send, and
+    // a zero clock has an empty window rather than an unbounded one.
+    let cutoff =
+        i64::try_from(now_epoch_seconds.saturating_sub(budget.window_seconds)).unwrap_or(i64::MAX);
+    let ceiling = i64::try_from(now_epoch_seconds).unwrap_or(i64::MAX);
+    let counted: (i64, Option<i64>) = sqlx::query_as(
+        "SELECT count(*)::bigint, EXTRACT(EPOCH FROM min(created_at))::bigint \
+         FROM messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND recipient_bidx = $3 \
+           AND created_at > to_timestamp($4) AND created_at <= to_timestamp($5)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(bidx.as_bytes())
+    .bind(cutoff)
+    .bind(ceiling)
+    .fetch_one(&mut **tx)
+    .await?;
+    let used = u32::try_from(counted.0).unwrap_or(u32::MAX);
+    if used >= budget.limit {
+        // The oldest counted send leaves the window one window after it was made, which
+        // is the earliest instant a retry could succeed.
+        let oldest = u64::try_from(counted.1.unwrap_or(0)).unwrap_or(0);
+        return Ok(Some(Enqueued::RateLimited {
+            retry_after_epoch_seconds: oldest.saturating_add(budget.window_seconds),
+        }));
+    }
+    Ok(None)
+}
+
+/// Lowercase hex, for building an advisory-lock key from a blind index.
+fn hex_of(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// How a delivery attempt ended (issue #111 criterion 1).
@@ -22576,6 +22684,8 @@ impl MessageRepo<'_> {
         env: &Env,
         message: NewMessage<'_>,
         payload: &serde_json::Value,
+        budget: RateBudget,
+        now_epoch_seconds: u64,
     ) -> Result<Enqueued, StoreError> {
         if message.id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -22593,7 +22703,45 @@ impl MessageRepo<'_> {
             use std::fmt::Write as _;
             let _ = write!(ordering_key, "{byte:02x}");
         }
+
         let mut tx = begin_scoped(self.store, scope).await?;
+
+        // SERIALISE PER RECIPIENT, as the first statement of the transaction that also does
+        // the counting and the insert.
+        //
+        // Checking a budget in one transaction and inserting in another is a read-then-act,
+        // and the gap is reachable: measured, eight concurrent sends to one recipient all
+        // passed a budget of ONE and all eight rows landed. The `ON CONFLICT` catches the
+        // literal double-click, because those share a dedup key, but a burst whose keys
+        // DIFFER -- two message kinds, or a burst straddling a window edge -- goes straight
+        // through. That is the harm `message_rate` names: delivering at twice the intended
+        // rate in a moment.
+        //
+        // A conditional `INSERT ... SELECT ... WHERE count < limit` does NOT fix it under
+        // READ COMMITTED: each statement takes a fresh snapshot and neither racer sees the
+        // other's uncommitted row.
+        //
+        // The lock space is its own. The two-argument space is the DCR client quota and the
+        // single-argument space is config promotion and group reparent, so this hashes a
+        // PREFIXED string to keep a recipient's lock from colliding with either.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!(
+                "ironauth.message-send.{}.{}.{}",
+                scope.tenant(),
+                scope.environment(),
+                hex_of(bidx.as_bytes())
+            ))
+            .execute(&mut *tx)
+            .await?;
+
+        // Suppression and the per-recipient budget, inside the transaction the lock guards.
+        if let Some(refusal) =
+            hygiene_refusal(&mut tx, scope, &bidx, budget, now_epoch_seconds).await?
+        {
+            tx.commit().await?;
+            return Ok(refusal);
+        }
+
         // The address, sealed under the scope's active DEK. The consumer cannot mail a blind
         // index, so a queued send has to be able to recover what it is sending to; sealing it
         // here is what keeps that out of the outbox payload, which every consumer worker reads
@@ -22607,8 +22755,8 @@ impl MessageRepo<'_> {
         let inserted = sqlx::query(
             "INSERT INTO messages \
              (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key, \
-              recipient_sealed, pii_dek_version) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+              recipient_sealed, pii_dek_version, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9), to_timestamp($9)) \
              ON CONFLICT (tenant_id, environment_id, dedup_key) DO NOTHING",
         )
         .bind(message.id.to_string())
@@ -22619,6 +22767,12 @@ impl MessageRepo<'_> {
         .bind(message.dedup_key)
         .bind(sealed.into_bytes())
         .bind(dek_version)
+        // The CALLER's clock, not the database's. The rate limit reads these timestamps back
+        // and compares them against a caller-supplied instant, so the two have to be the same
+        // time source: with `now()` here, a deterministic clock in a test compares real
+        // timestamps against synthetic ones and every send counts as in-window forever. In
+        // production both are wall clock and the bug is invisible, which is the worst kind.
+        .bind(i64::try_from(now_epoch_seconds).unwrap_or(i64::MAX))
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -22648,6 +22802,45 @@ impl MessageRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(Enqueued::Accepted)
+    }
+
+    /// Record that this recipient is suppressed (issue #111 criterion 6).
+    ///
+    /// The DECISION of when an address becomes suppressed is not made here: it is
+    /// [`message_feedback::suppression_action`](crate::message_feedback::suppression_action),
+    /// which is pure and knows the bounce and complaint rules. This writes the answer down.
+    ///
+    /// Without this, criterion 6's block was unreachable in production: `enqueue` consulted a
+    /// table that nothing could ever write to, so the check was correct and could never fire.
+    ///
+    /// Idempotent. A second hard bounce does not make an address more suppressed, and two rows
+    /// would make "why" ambiguous, so the first reason stands.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn suppress(
+        &self,
+        recipient: &str,
+        reason: SuppressionReason,
+    ) -> Result<(), StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidx = message_recipient_blind_index(master, self.scope, recipient);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO message_suppressions \
+             (tenant_id, environment_id, recipient_bidx, reason) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (tenant_id, environment_id, recipient_bidx) DO NOTHING",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(bidx.as_bytes())
+        .bind(reason.token())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Claim this message for delivery, moving it `pending` -> `sending`.
