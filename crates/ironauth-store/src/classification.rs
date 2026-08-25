@@ -198,6 +198,17 @@ pub enum ResourceType {
     /// pointers and group / scope names, never values): a config snapshot carries it and a
     /// promotion replays it, so it is Promotable.
     FlowVersion,
+    /// A per-environment message template (issue #111): one subject / text / HTML body triple
+    /// per (kind, locale) at the ENVIRONMENT level. The bodies are safe-templating source that
+    /// interpolates data and executes nothing, and the table is credential-free by construction
+    /// (migration 0145: "a store that could hold an SMTP credential is a store that can leak one
+    /// through a config read, an export, or a promotion snapshot"), so it is non-secret
+    /// per-environment config a snapshot carries and a promotion replays: Promotable.
+    ///
+    /// The TENANT and ORGANIZATION levels of the same table are NOT this type. A tenant-level
+    /// template is not per-environment, and a per-organization override is runtime data that
+    /// rides org export, never a snapshot, exactly as issue #111 requires.
+    MessageTemplate,
     /// A per-organization named role (issue #97): one entry in an organization's role
     /// set. A role in M10 is a NAME only (what it grants is issue #98). It is scoped to
     /// an ORGANIZATION, and organizations are themselves Runtime and never travel in a
@@ -232,7 +243,7 @@ impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 32] = [
+    pub const ALL: [ResourceType; 33] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -261,6 +272,7 @@ impl ResourceType {
         ResourceType::LocaleBundle,
         ResourceType::SignupForm,
         ResourceType::FlowVersion,
+        ResourceType::MessageTemplate,
         ResourceType::OrgRole,
         ResourceType::OrgGroup,
         ResourceType::OrgAuthPolicy,
@@ -299,6 +311,7 @@ impl ResourceType {
             ResourceType::LocaleBundle => "locale_bundle",
             ResourceType::SignupForm => "signup_form",
             ResourceType::FlowVersion => "flow_version",
+            ResourceType::MessageTemplate => "message_template",
             ResourceType::OrgRole => "org_role",
             ResourceType::OrgGroup => "org_group",
             ResourceType::OrgAuthPolicy => "org_auth_policy",
@@ -339,6 +352,7 @@ impl ResourceType {
             | ResourceType::LocaleBundle
             | ResourceType::SignupForm
             | ResourceType::FlowVersion
+            | ResourceType::MessageTemplate
             | ResourceType::OrgRole
             | ResourceType::OrgGroup
             | ResourceType::OrgAuthPolicy
@@ -413,7 +427,8 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         | ResourceType::Brand
         | ResourceType::LocaleBundle
         | ResourceType::SignupForm
-        | ResourceType::FlowVersion => Promotable,
+        | ResourceType::FlowVersion
+        | ResourceType::MessageTemplate => Promotable,
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the

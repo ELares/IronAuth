@@ -159,6 +159,41 @@ pub fn render(
     Ok(out)
 }
 
+/// Check that a template is STRUCTURALLY well-formed, without rendering it.
+///
+/// A snapshot may carry a hand-authored template, and a promotion that accepted an unterminated
+/// `{{` would store a body that fails at SEND time, when the recipient is the one who discovers
+/// it. This is the template equivalent of the load-validity gate a journey artifact passes.
+///
+/// It answers syntax only: whether every placeholder closes and every name is well formed. It
+/// deliberately does NOT answer whether the names are ones the sender will supply, because the
+/// context depends on the message kind and a template for one kind is not wrong for naming a
+/// placeholder another kind supplies.
+///
+/// Implemented by driving [`render`] rather than by walking the template again. A second walk
+/// would be a second parser, and the two would drift: the one that decides what a placeholder
+/// IS must be the one that decides whether a template is valid. Each round supplies the name
+/// the last round reported missing, so it terminates in as many rounds as the template has
+/// distinct placeholders.
+///
+/// # Errors
+///
+/// [`RenderError::UnterminatedPlaceholder`] or [`RenderError::MalformedPlaceholderName`].
+pub fn validate_syntax(template: &str) -> Result<(), RenderError> {
+    let mut context = RenderContext::new();
+    loop {
+        match render(template, &context, RenderMode::Text) {
+            Ok(_) => return Ok(()),
+            // Not a syntax fault: supply it and go round again, so the walk reaches the REST
+            // of the template instead of stopping at the first placeholder.
+            Err(RenderError::UnknownPlaceholder(name)) => {
+                context.insert(name, String::new());
+            }
+            Err(structural) => return Err(structural),
+        }
+    }
+}
+
 /// Render a value destined for an email HEADER (a subject, a sender name).
 ///
 /// Control characters are REFUSED, not escaped and not stripped. A header has no escape

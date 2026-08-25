@@ -229,6 +229,8 @@ promoted_resource_types! {
     LocaleBundle;
     /// An append-only custom-journey version, keyed by `journey_id@version` (issue #92).
     FlowVersion;
+    /// A per-environment message template, keyed by `kind/locale` (issue #111).
+    MessageTemplate;
 }
 
 /// Whether a resource change creates, updates, or deletes a target resource.
@@ -390,6 +392,12 @@ pub fn diff(source: &Snapshot, target: &Snapshot) -> ConfigDiff {
                 &keyed_brands(&target.resources),
                 &mut changes,
             ),
+            PromotedResourceType::MessageTemplate => diff_keyed(
+                ResourceType::MessageTemplate,
+                &keyed_message_templates(&source.resources),
+                &keyed_message_templates(&target.resources),
+                &mut changes,
+            ),
             PromotedResourceType::LocaleBundle => diff_keyed(
                 ResourceType::LocaleBundle,
                 &keyed_locale_bundles(&source.resources),
@@ -512,6 +520,73 @@ fn keyed_flow_versions(resources: &SnapshotResources) -> BTreeMap<String, serde_
 
 /// The `journey_id@version` natural key of a custom-journey version (issue #92).
 #[must_use]
+/// The natural key of a message template: its `kind` and `locale`, joined by `/` (issue #111).
+///
+/// Both halves are ESCAPED rather than joined raw. `Locale::new` normalizes a tag but does not
+/// constrain its character set, and `message_templates.kind` carries no CHECK, so neither half
+/// is guaranteed to be free of the separator: a raw join would make `a/b` + `c` and `a` + `b/c`
+/// the same key, and two different templates would diff as one. `flow_version_key` can join raw
+/// only because its tail is an integer.
+pub(crate) fn message_template_key(kind: &str, locale: &str) -> String {
+    format!(
+        "{}/{}",
+        escape_key_segment(kind),
+        escape_key_segment(locale)
+    )
+}
+
+/// Escape `\` and `/` in one half of a [`message_template_key`], so the separator that survives
+/// is only ever the one this function put there.
+fn escape_key_segment(segment: &str) -> String {
+    segment.replace('\\', "\\\\").replace('/', "\\/")
+}
+
+/// Recover the `(kind, locale)` pair from a [`message_template_key`] (issue #111).
+///
+/// Splits at the one UNESCAPED `/`, then unescapes each half. Returns [`None`] for a key with no
+/// unescaped separator or with a trailing lone `\` (neither is produced by
+/// [`message_template_key`]).
+#[must_use]
+pub(crate) fn split_message_template_key(key: &str) -> Option<(String, String)> {
+    let mut kind = String::new();
+    let mut chars = key.chars();
+    // Walk to the separator, consuming escapes so an escaped `/` cannot end the first half.
+    let separator_found = loop {
+        match chars.next() {
+            None => break false,
+            Some('/') => break true,
+            Some('\\') => kind.push(chars.next()?),
+            Some(other) => kind.push(other),
+        }
+    };
+    if !separator_found {
+        return None;
+    }
+    let mut locale = String::new();
+    loop {
+        match chars.next() {
+            None => break,
+            Some('\\') => locale.push(chars.next()?),
+            Some(other) => locale.push(other),
+        }
+    }
+    Some((kind, locale))
+}
+
+/// The message templates of a snapshot, keyed by `kind/locale`.
+fn keyed_message_templates(resources: &SnapshotResources) -> BTreeMap<String, serde_json::Value> {
+    resources
+        .message_template
+        .iter()
+        .map(|template| {
+            (
+                message_template_key(&template.kind, &template.locale),
+                serde_json::to_value(template).unwrap_or(serde_json::Value::Null),
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn flow_version_key(journey_id: &str, version: i32) -> String {
     format!("{journey_id}@{version}")
 }
@@ -770,6 +845,14 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             // no field gates auth (the default locale selects a language, not a journey),
             // so the whole definition travels as authored.
             locale_bundle: snapshot.resources.locale_bundle.clone(),
+            // Message templates (issue #111) ARE promoted and need no normalization. Every
+            // field is promotable DEFINITION -- a kind, a BCP47 locale, the subject and
+            // bodies, and the lock flag -- and none is a scope-embedded identifier. That is
+            // exactly what a signup form lacks: its key is a scope-embedded `ClientId`, while
+            // a template's `(kind, locale)` is two plain strings that mean the same thing in
+            // every environment. The snapshot carries the ENVIRONMENT level only, so a tenant
+            // default and a per-organization override cannot travel here.
+            message_template: snapshot.resources.message_template.clone(),
             // Signup forms (issue #87) are carried in the EXPORT but are NOT promoted. This
             // is a DELIBERATE, MEASURED exclusion, not a later slice, and the distinction
             // matters: the other omissions above are work that is merely unwritten, while
@@ -1221,10 +1304,10 @@ mod tests {
     use crate::esv::{Reference, ReferenceKind};
     use crate::snapshot::{
         BrandAssetMetaSnapshot, BrandSnapshot, ClientSnapshot, ConnectorSnapshot,
-        DcrPolicySnapshot, FlowVersionSnapshot, LocaleBundleSnapshot, OrgConnectionSnapshot,
-        ResourceServerSnapshot, RoutingRuleSnapshot, SNAPSHOT_RESOURCE_TYPES,
-        SNAPSHOT_SCHEMA_VERSION, SignupFormSnapshot, Snapshot, SnapshotResources,
-        UpstreamTokenGrantSnapshot, VariableSnapshot,
+        DcrPolicySnapshot, FlowVersionSnapshot, LocaleBundleSnapshot, MessageTemplateSnapshot,
+        OrgConnectionSnapshot, ResourceServerSnapshot, RoutingRuleSnapshot,
+        SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, SignupFormSnapshot, Snapshot,
+        SnapshotResources, UpstreamTokenGrantSnapshot, VariableSnapshot,
     };
 
     fn snapshot(resources: SnapshotResources) -> Snapshot {
@@ -1403,6 +1486,43 @@ mod tests {
     }
 
     #[test]
+    fn message_template_key_round_trips_when_either_half_holds_the_separator() {
+        // The ordinary case reads as the operator wrote it.
+        assert_eq!(
+            super::message_template_key("email_otp", "en-us"),
+            "email_otp/en-us"
+        );
+        assert_eq!(
+            super::split_message_template_key("email_otp/en-us"),
+            Some(("email_otp".to_owned(), "en-us".to_owned()))
+        );
+        // Neither half is character-constrained: `Locale::new` normalizes a tag but does not
+        // restrict it, and `message_templates.kind` carries no CHECK. A raw join would make
+        // these two DIFFERENT templates collide on one key, and the diff would treat one as
+        // an update of the other.
+        let left = super::message_template_key("a/b", "c");
+        let right = super::message_template_key("a", "b/c");
+        assert_ne!(left, right, "a raw join would make these the same key");
+        assert_eq!(
+            super::split_message_template_key(&left),
+            Some(("a/b".to_owned(), "c".to_owned()))
+        );
+        assert_eq!(
+            super::split_message_template_key(&right),
+            Some(("a".to_owned(), "b/c".to_owned()))
+        );
+        // A literal backslash survives, including one immediately before the separator.
+        let backslash = super::message_template_key("a\\", "b");
+        assert_eq!(
+            super::split_message_template_key(&backslash),
+            Some(("a\\".to_owned(), "b".to_owned())),
+            "a trailing backslash must not escape the separator itself"
+        );
+        // A key with no unescaped separator is not one of ours.
+        assert_eq!(super::split_message_template_key("no-separator"), None);
+    }
+
+    #[test]
     fn flow_version_key_round_trips_even_with_an_at_in_the_journey_id() {
         assert_eq!(super::flow_version_key("login", 3), "login@3");
         assert_eq!(
@@ -1524,6 +1644,14 @@ mod tests {
                 version: 1,
                 artifact: serde_json::json!({"id": "login_v1"}),
                 pinned: true,
+            }],
+            message_template: vec![MessageTemplateSnapshot {
+                kind: "email_otp".to_owned(),
+                locale: "en".to_owned(),
+                subject: "Your code".to_owned(),
+                body_text: "Code: {{ code }}".to_owned(),
+                body_html: Some("<p>Code: {{ code }}</p>".to_owned()),
+                locked: false,
             }],
         })
     }
