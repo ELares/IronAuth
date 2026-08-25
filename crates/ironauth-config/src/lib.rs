@@ -207,6 +207,10 @@ pub struct Config {
     #[serde(default)]
     pub flow_targets: FlowTargetsConfig,
 
+    /// Outbound message delivery (issue #111).
+    #[serde(default)]
+    pub messaging: MessagingConfig,
+
     /// Audit retention (issue #109): the per-stream windows, and whether THIS process
     /// sweeps to them.
     ///
@@ -623,6 +627,48 @@ pub struct FlowTargetsConfig {
     /// or a delivery still in flight when its lease expires is redelivered underneath itself
     /// and the receiver sees the same signup twice under one `webhook-id`.
     pub delivery_timeout_secs: u64,
+}
+
+/// One configured message provider, in failover order (issue #111).
+///
+/// The ORDER of the list is the failover order and it is the operator's, not ours: the primary
+/// is first, and each subsequent provider is tried only when the one before it was
+/// UNAVAILABLE. A provider that refuses the MESSAGE ends the walk, because every provider is
+/// looking at the same message and would refuse it too.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MessageProviderConfig {
+    /// The operator's name for this provider. It lands in the delivery record and in failover
+    /// reporting, so it should read like a provider ("postmark", "ses-primary") rather than
+    /// like a URL.
+    pub name: String,
+
+    /// The HTTPS endpoint one send POSTs to.
+    ///
+    /// Plaintext is refused by the outbound fetch layer, which this never opts out of: a
+    /// message body carries a login code and the recipient's address.
+    pub endpoint: String,
+}
+
+/// Outbound MESSAGE delivery settings (issue #111).
+///
+/// These belong to the message consumer, not to the queue: how the queue is drained
+/// (concurrency, lease, backoff, retention) is `[outbox]`, which an operator tunes once for
+/// every consumer rather than per subsystem.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct MessagingConfig {
+    /// Whether THIS process drains the `message.delivery` queue. OFF by default, like every
+    /// other outbound consumer: no deployment gains mandatory background infrastructure by
+    /// upgrading, and a deployment that wants messages says so.
+    pub delivery_enabled: bool,
+
+    /// The providers to try, in failover order. Empty is valid while delivery is off.
+    ///
+    /// Enabling delivery with an EMPTY list is refused at boot rather than at the first
+    /// message: a consumer with no provider dead-letters everything it drains, and it would do
+    /// so silently, one queued login code at a time, until somebody read the dead-letter queue.
+    pub providers: Vec<MessageProviderConfig>,
 }
 
 /// Outbound webhook delivery settings (issue #105).
@@ -5369,6 +5415,7 @@ impl Config {
         validate_backchannel_logout_lease(&self.oidc, &self.outbox)?;
         validate_webhook_delivery_lease(&self.webhooks, &self.outbox)?;
         validate_flow_targets(&self.flow_targets)?;
+        validate_messaging(&self.messaging)?;
         validate_flow_target_delivery_lease(&self.flow_targets, &self.outbox)?;
         Ok(())
     }
@@ -7158,6 +7205,64 @@ fn validate_traits(traits: &TraitsConfig) -> Result<(), ConfigError> {
                 traits.migration_batch_size
             ),
         });
+    }
+    Ok(())
+}
+
+/// Validate outbound message delivery (issue #111).
+///
+/// Enabling delivery with NO providers is refused at boot. A consumer with an empty provider
+/// list dead-letters every message it drains, and it does so silently, one queued login code
+/// at a time, until somebody reads the dead-letter queue. Failing here instead turns a slow
+/// invisible outage into a startup error naming the section that caused it.
+///
+/// The names and endpoints are checked whether or not delivery is enabled, for the reason the
+/// flow-target bounds are: a value that is meaningless while nothing reads it is still
+/// meaningless when something starts to.
+fn validate_messaging(messaging: &MessagingConfig) -> Result<(), ConfigError> {
+    if messaging.delivery_enabled && messaging.providers.is_empty() {
+        return Err(ConfigError::Invalid {
+            message: "messaging.delivery_enabled is on with no messaging.providers: a \
+                      consumer with no provider dead-letters every message it drains"
+                .to_owned(),
+        });
+    }
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for provider in &messaging.providers {
+        if provider.name.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                message: "a messaging.providers entry has an empty name; the name is what a \
+                          delivery record and a failover report identify it by"
+                    .to_owned(),
+            });
+        }
+        if !seen.insert(provider.name.as_str()) {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "messaging.providers has two entries named `{}`; a delivery record could \
+                     not say which one accepted the message",
+                    provider.name
+                ),
+            });
+        }
+        if provider.endpoint.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "messaging.providers entry `{}` has an empty endpoint",
+                    provider.name
+                ),
+            });
+        }
+        if !provider.endpoint.starts_with("https://") {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "messaging.providers entry `{}` must use https: a message body carries a \
+                     login code and the recipient's address, and the outbound fetch layer \
+                     refuses plaintext anyway, so this would fail at the first send",
+                    provider.name
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -10800,5 +10905,96 @@ enabled = true
             ),
             "an idle window wider than the absolute max age must be rejected"
         );
+    }
+
+    /// Enabling delivery with no providers is refused at boot.
+    ///
+    /// The alternative is a consumer that dead-letters every message it drains, silently, one
+    /// queued login code at a time, until somebody reads the dead-letter queue. A startup
+    /// error naming the section is strictly better than a slow invisible outage.
+    #[test]
+    fn validate_messaging_refuses_delivery_with_no_providers() {
+        let mut messaging = MessagingConfig::default();
+        validate_messaging(&messaging).expect("off with no providers is fine");
+
+        messaging.delivery_enabled = true;
+        assert!(
+            matches!(
+                validate_messaging(&messaging),
+                Err(ConfigError::Invalid { .. })
+            ),
+            "delivery on with an empty provider list must not boot"
+        );
+
+        messaging.providers.push(MessageProviderConfig {
+            name: "postmark".to_owned(),
+            endpoint: "https://relay.example.test/send".to_owned(),
+        });
+        validate_messaging(&messaging).expect("one provider is enough");
+    }
+
+    /// Provider entries are checked whether or not delivery is enabled, and each refusal has a
+    /// consequence rather than a preference behind it.
+    #[test]
+    fn validate_messaging_rejects_unusable_provider_entries() {
+        let base = |name: &str, endpoint: &str| MessagingConfig {
+            delivery_enabled: false,
+            providers: vec![MessageProviderConfig {
+                name: name.to_owned(),
+                endpoint: endpoint.to_owned(),
+            }],
+        };
+
+        // An unnamed provider cannot be identified in a delivery record or a failover report.
+        assert!(matches!(
+            validate_messaging(&base("  ", "https://relay.example.test/send")),
+            Err(ConfigError::Invalid { .. })
+        ));
+        // An empty endpoint has nowhere to send.
+        assert!(matches!(
+            validate_messaging(&base("postmark", "")),
+            Err(ConfigError::Invalid { .. })
+        ));
+        // Plaintext carries a login code and the recipient's address in the clear, and the
+        // outbound fetch layer refuses it anyway, so this would fail at the first send.
+        assert!(matches!(
+            validate_messaging(&base("postmark", "http://relay.example.test/send")),
+            Err(ConfigError::Invalid { .. })
+        ));
+
+        // Two providers under one name: a delivery record could not say which accepted it.
+        let duplicated = MessagingConfig {
+            delivery_enabled: false,
+            providers: vec![
+                MessageProviderConfig {
+                    name: "ses".to_owned(),
+                    endpoint: "https://a.example.test/send".to_owned(),
+                },
+                MessageProviderConfig {
+                    name: "ses".to_owned(),
+                    endpoint: "https://b.example.test/send".to_owned(),
+                },
+            ],
+        };
+        assert!(matches!(
+            validate_messaging(&duplicated),
+            Err(ConfigError::Invalid { .. })
+        ));
+
+        // And a well-formed pair passes, so the refusals above are not just "everything fails".
+        let good = MessagingConfig {
+            delivery_enabled: true,
+            providers: vec![
+                MessageProviderConfig {
+                    name: "primary".to_owned(),
+                    endpoint: "https://a.example.test/send".to_owned(),
+                },
+                MessageProviderConfig {
+                    name: "fallback".to_owned(),
+                    endpoint: "https://b.example.test/send".to_owned(),
+                },
+            ],
+        };
+        validate_messaging(&good).expect("two distinct https providers are valid");
     }
 }

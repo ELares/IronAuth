@@ -13,6 +13,8 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::events::WebhookFanoutConsumer;
 use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTargetReplayConsumer};
+use ironauth_admin::message_composer::DefaultComposer;
+use ironauth_admin::message_http_provider::HttpMessageProvider;
 use ironauth_admin::offboarding_worker::OffboardingConsumer;
 use ironauth_admin::trait_migration_worker::TraitMigrationConsumer;
 use ironauth_admin::webhook_delivery::{
@@ -36,6 +38,7 @@ use ironauth_oidc::{
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_server::{Server, ServerError};
+use ironauth_store::message_consumer::MessageDeliveryConsumer;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ironauth_store::{
@@ -346,6 +349,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
         let flow_target_inputs = flow_target_delivery_inputs(&config, &env);
+        let message_delivery = message_delivery_inputs(&config, &env);
         let trait_migration = trait_migration_inputs(&config, &env);
         let offboarding = offboarding_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
@@ -453,6 +457,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => spawn_flow_target_delivery_pools(inputs).await,
             None => Vec::new(),
         };
+        // The message delivery worker (issue #111), behind its own switch for the reason every
+        // outbound consumer here is: it is a different subsystem and must not require another
+        // one's configuration to run. BOUND so the shutdown below can await it.
+        let message_delivery_pools = match message_delivery {
+            Some(inputs) => spawn_message_delivery_pools(inputs).await,
+            None => Vec::new(),
+        };
         // The trait migration worker (issue #53), behind its own switch for the same
         // reason webhook delivery is: it is a different subsystem and must not require
         // another one's configuration to run. BOUND so the shutdown below can await it.
@@ -523,6 +534,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .into_iter()
             .chain(webhook_pools)
             .chain(flow_target_pools)
+            .chain(message_delivery_pools)
             .chain(trait_migration_pools)
             .chain(offboarding_pools)
             .chain(log_stream_replay_pools)
@@ -2939,6 +2951,161 @@ async fn spawn_backchannel_logout_pools(
 ///
 /// Every early return is logged and starts NOTHING; the rest of the server runs unaffected
 /// and the queue is durable, so the work waits rather than being lost.
+/// What the message delivery worker needs from config (issue #111).
+struct MessageDeliveryInputs {
+    messaging: ironauth_config::MessagingConfig,
+    outbox: OutboxConfig,
+    data_plane_dsn: String,
+    control_dsn: Option<String>,
+    master: Option<Arc<MasterKey>>,
+    sender_domain: String,
+    env: Env,
+}
+
+/// Capture the message delivery worker inputs from config (issue #111), or `None` when the
+/// worker is off. OFF by default, like every other outbound consumer: no deployment gains
+/// mandatory background infrastructure by upgrading.
+fn message_delivery_inputs(config: &Config, env: &Env) -> Option<MessageDeliveryInputs> {
+    if !config.messaging.delivery_enabled {
+        return None;
+    }
+    Some(MessageDeliveryInputs {
+        messaging: config.messaging.clone(),
+        outbox: config.outbox.clone(),
+        data_plane_dsn: config.database.url.expose().to_owned(),
+        control_dsn: select_control_dsn(config),
+        master: resolve_master_key(config),
+        // The right-hand side of every Message-ID this deployment stamps. RFC 5322 section
+        // 3.6.4 wants it globally unique, and the deployment's own public host is what makes
+        // it so rather than merely random. Falls back to a reserved name rather than to
+        // something that might belong to somebody else: `.invalid` is reserved by RFC 2606
+        // exactly so it can never resolve.
+        sender_domain: config
+            .server
+            .public_url
+            .as_deref()
+            .and_then(|url| url.split("://").nth(1).map(str::to_owned))
+            .map(|rest| {
+                rest.split('/')
+                    .next()
+                    .unwrap_or_default()
+                    .split(':')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "ironauth.invalid".to_owned()),
+        env: env.clone(),
+    })
+}
+
+/// Start the message delivery worker (issue #111) on the generic outbox worker pool.
+///
+/// The FIFTH production consumer of the #104 framework, and the one that finally gives the
+/// eleven `message_*` modules a caller in a running process rather than in a test.
+async fn spawn_message_delivery_pools(inputs: MessageDeliveryInputs) -> Vec<OutboxWorkerPool> {
+    let MessageDeliveryInputs {
+        messaging,
+        outbox,
+        data_plane_dsn,
+        control_dsn,
+        master,
+        sender_domain,
+        env,
+    } = inputs;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "message delivery worker not started: no control-plane DSN to enumerate scopes \
+             (set admin.control_database_url, or run in dev_mode). The delivery queue is \
+             durable, so nothing is lost; enable the control plane to drain it."
+        );
+        return Vec::new();
+    };
+    // Refusing to start beats starting a worker that cannot send. Every message opens its
+    // recipient from a sealed column, so without a master key EVERY delivery fails at the
+    // unseal, burns its whole attempt budget, and dead-letters. That turns one missing
+    // configuration value into permanently discarded login codes.
+    let Some(master) = master else {
+        tracing::error!(
+            "message delivery worker not started: database.master_key is unset, so no \
+             message's recipient could be opened and every delivery would dead-letter. The \
+             queue is durable; set database.master_key to drain it."
+        );
+        return Vec::new();
+    };
+
+    let data_store = match Store::connect(&data_plane_dsn).await {
+        Ok(store) => store.with_master_key(master),
+        Err(error) => {
+            tracing::error!(%error, "message delivery worker not started: data-plane connect failed");
+            return Vec::new();
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "message delivery worker not started: control-plane connect failed");
+            return Vec::new();
+        }
+    };
+
+    // One fetcher for every provider. The SSRF policy, the timeouts and the response ceiling
+    // are the outbound ones an operator already tuned, not per-provider settings.
+    let fetcher = match ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default()) {
+        Ok(fetcher) => Arc::new(fetcher),
+        Err(error) => {
+            tracing::error!(%error, "message delivery worker not started: fetcher setup failed");
+            return Vec::new();
+        }
+    };
+    // In CONFIGURED order, which is the failover order: the primary is first and each
+    // subsequent provider is tried only when the previous was unavailable. Config validation
+    // has already refused an enabled worker with an empty list, so this cannot be empty here.
+    let providers: Vec<Box<dyn ironauth_store::message_delivery::MessageProvider>> = messaging
+        .providers
+        .iter()
+        .map(|configured| {
+            Box::new(HttpMessageProvider::new(
+                configured.name.clone(),
+                configured.endpoint.clone(),
+                Arc::clone(&fetcher),
+            )) as Box<dyn ironauth_store::message_delivery::MessageProvider>
+        })
+        .collect();
+    let provider_names: Vec<String> = messaging
+        .providers
+        .iter()
+        .map(|configured| configured.name.clone())
+        .collect();
+
+    let composer = Arc::new(DefaultComposer::new(sender_domain))
+        as Arc<dyn ironauth_store::message_consumer::MessageComposer>;
+
+    let mut consumers = ConsumerRegistry::new();
+    if let Err(error) = consumers.register(Arc::new(MessageDeliveryConsumer::new(
+        data_store.clone(),
+        providers,
+        composer,
+    )) as Arc<dyn OutboxConsumer>)
+    {
+        tracing::error!(%error, "message delivery worker not started: duplicate consumer name");
+        return Vec::new();
+    }
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer = outbox_observer();
+    let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
+
+    tracing::info!(
+        providers = ?provider_names,
+        pools = pools.len(),
+        "message delivery worker started"
+    );
+    pools
+}
+
 async fn spawn_flow_target_delivery_pools(
     inputs: FlowTargetDeliveryInputs,
 ) -> Vec<OutboxWorkerPool> {
