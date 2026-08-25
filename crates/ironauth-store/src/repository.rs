@@ -22503,12 +22503,13 @@ pub struct NewMessage<'a> {
     /// `message_hygiene::normalize_recipient`. It is blind-indexed on the way in and never
     /// stored as written.
     ///
-    /// The store cannot check that precondition and does not pretend to: normalization is
-    /// not idempotent-detectable from the result, and the same address written two ways
-    /// produces two different blind indexes and two different dedup keys, so an unnormalized
-    /// caller silently loses its own collapse. The doors call `normalize_recipient` once and
-    /// pass the result to both this and `dedup_key`, which is what keeps the two agreeing
-    /// about who the recipient is.
+    /// The store cannot check that precondition and does not pretend to. What an unnormalized
+    /// caller actually loses is narrower than it looks: `dedup_key` normalizes internally, so
+    /// the COLLAPSE still works. What diverges is the blind index, which is computed from
+    /// exactly what is passed here, so the same mailbox written two ways lands two rows whose
+    /// indexes disagree, and a listing or a suppression check keyed on the index sees two
+    /// recipients where there is one. The doors call `normalize_recipient` once and pass the
+    /// result to both, which is what keeps the two agreeing about who the recipient is.
     pub recipient: &'a str,
     /// The collapse key from `message_hygiene::dedup_key`.
     pub dedup_key: &'a str,
@@ -22649,6 +22650,69 @@ impl MessageRepo<'_> {
         Ok(Enqueued::Accepted)
     }
 
+    /// Claim this message for delivery, moving it `pending` -> `sending`.
+    ///
+    /// Returns `true` if THIS caller won it. The transition is the mutual exclusion: a
+    /// conditional UPDATE on `state = 'pending'` is serialised by the row lock, so of two
+    /// workers racing, exactly one sees a row affected and the other sees none.
+    ///
+    /// The read-then-act it replaces was not safe. The outbox leases a job, but a lease can
+    /// LAPSE: a worker that stalls past its visibility timeout has its job re-claimed while it
+    /// is still running, and then both observe `pending` and both hand the message to a
+    /// provider. At-least-once delivery of the JOB is the substrate's contract and is right;
+    /// at-least-once delivery of the MAIL is somebody receiving the same code twice.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn claim_for_delivery(&self, id: &MessageId) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let claimed = sqlx::query(
+            "UPDATE messages SET state = 'sending', updated_at = now() \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'pending'",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(claimed == 1)
+    }
+
+    /// Release a claim, moving `sending` back to `pending` so a retry can take it.
+    ///
+    /// For the outage case ONLY: every provider was unavailable, nothing was delivered, and
+    /// the substrate is going to try again. A message that reached a provider is resolved, not
+    /// released.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn release_claim(&self, id: &MessageId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "UPDATE messages SET state = 'pending', updated_at = now() \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND state = 'sending'",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Open this message's sealed recipient, or [`None`] if it carries none.
     ///
     /// The ONLY way an address leaves this table. Returns the live address, so a caller mails
@@ -22721,7 +22785,8 @@ impl MessageRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let updated = sqlx::query(
             "UPDATE messages SET state = $1, failure_reason = $2, updated_at = now() \
-             WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 AND state = 'pending'",
+             WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
+             AND state IN ('pending', 'sending')",
         )
         .bind(state)
         .bind(reason)
@@ -67415,4 +67480,84 @@ async fn meter_token_issued(
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod message_recipient_seal_tests {
+    use ironauth_env::Env;
+    use ironauth_jose::{Dek, MasterKey, Sealed};
+
+    use super::{
+        email_factor_recipient_bidx_aad, email_factor_recipient_seal_aad,
+        message_recipient_bidx_aad, message_recipient_seal_aad,
+    };
+    use crate::id::{EnvironmentId, TenantId};
+    use crate::scope::Scope;
+
+    /// Migration 0155 says the sealed recipient is bound "under its own AAD label so a seal
+    /// from one table cannot be opened in the context of another", and until this test that
+    /// sentence rested entirely on two string constants differing. A one-character edit to
+    /// either made the two contexts identical and every behavioural test still passed, because
+    /// both the seal and the open use the SAME helper and are self-consistent under any label.
+    ///
+    /// A property that holds cross-function has to be asserted cross-function. Modelled on
+    /// `upstream_token_seal_tests` above, which does the same job for the upstream token seal.
+    #[test]
+    fn a_messages_seal_cannot_be_opened_as_an_email_factor_seal() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 11);
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let dek = Dek::generate(env.entropy());
+        let address = b"ada@example.test";
+        let version = 1;
+
+        let sealed = dek
+            .seal(
+                env.entropy(),
+                &message_recipient_seal_aad(scope, version),
+                address,
+            )
+            .into_bytes();
+
+        // Its own context opens it.
+        let opened = dek
+            .open(
+                &message_recipient_seal_aad(scope, version),
+                &Sealed::from_bytes(sealed.clone()).expect("decodes"),
+            )
+            .expect("the seal opens in the context it was made in");
+        assert_eq!(opened, address);
+
+        // The email-factor context does NOT, which is the whole claim. A shared label would
+        // make the two interchangeable and let a `messages` row's recipient be opened as
+        // though it were an `email_otp_codes` row's, and the other way round.
+        assert!(
+            dek.open(
+                &email_factor_recipient_seal_aad(scope, version),
+                &Sealed::from_bytes(sealed).expect("decodes"),
+            )
+            .is_err(),
+            "a messages seal must not open as an email-factor seal; if this fails, the two \
+             labels have been made equal and the tables share a key space"
+        );
+    }
+
+    /// The same separation for the BLIND INDEX, which is the half that would silently produce
+    /// a working cross-table join key rather than an error: equal labels mean the same address
+    /// hashes identically in both tables, and anyone holding one could join it to the other.
+    #[test]
+    fn a_messages_blind_index_is_not_an_email_factor_blind_index() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 12);
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let master = MasterKey::generate("sep-test", env.entropy());
+        let address = "ada@example.test";
+
+        let ours = master.blind_index(&message_recipient_bidx_aad(scope, address));
+        let theirs = master.blind_index(&email_factor_recipient_bidx_aad(scope, address));
+        assert_ne!(
+            ours.as_bytes(),
+            theirs.as_bytes(),
+            "the same address must not hash to the same index in two tables; equal indexes \
+             are a join key across them for anyone holding either"
+        );
+    }
 }

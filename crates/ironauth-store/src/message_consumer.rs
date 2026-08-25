@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The delivery consumer: the first production caller of the messaging island (issue #111).
+//! The delivery consumer for the messaging island (issue #111).
+//!
+//! WHAT IS AND IS NOT WIRED, first, because the distinction is easy to overstate. This module
+//! is the thing that finally CALLS the island: it drives `prepare_message` and `deliver` over
+//! a real ledger row and writes down what happened, and its tests exercise that end to end
+//! against Postgres. Nothing in the shipped binary constructs it yet, and nothing enqueues a
+//! message in production either. Both are deliberate and both are the next changes: a consumer
+//! registered with an empty provider list would dead-letter every message it drained, so boot
+//! wiring waits on a real channel (SMTP), and the doors wait on the template resolution that
+//! decides what a message says. Until then this is a caller with a test harness for a caller,
+//! which is more than the island had and less than a product.
 //!
 //! Eleven `message_*` modules decide everything about a send and, until this, not one of them
-//! ran outside a test. [`message_prepare`](crate::message_prepare) composes suppression, rate
+//! ran outside a unit test. [`message_prepare`](crate::message_prepare) composes suppression, rate
 //! limiting, template resolution, rendering and MIME into a [`PreparedMessage`];
 //! [`message_delivery`](crate::message_delivery) walks the configured providers and applies the
 //! failover policy. What was missing between them was something that reads a queued row, drives
@@ -139,9 +149,19 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                 // absence, so the job is finished rather than deferred.
                 return Ok(());
             };
-            if record.state != "pending" {
-                // Already resolved by an earlier attempt whose completion did not land. The
-                // send is not repeated: at-least-once delivery of the JOB must not become
+            // CLAIM IT, rather than reading the state and acting on what it said. The read
+            // and the send are two steps and the window between them is real: the outbox
+            // leases a job, but a lease can LAPSE, and a worker whose job was re-claimed while
+            // it is still running would observe `pending` alongside the new owner and both
+            // would mail. The conditional UPDATE is serialised on the row, so exactly one
+            // worker wins and the loser stops here.
+            if !messages
+                .claim_for_delivery(&id)
+                .await
+                .map_err(|_| ConsumerError::retryable("claim_failed"))?
+            {
+                // Somebody else has it, or it is already resolved. Either way this attempt
+                // sends nothing: at-least-once delivery of the JOB must not become
                 // at-least-once delivery of the MAIL.
                 return Ok(());
             }
@@ -208,12 +228,26 @@ impl OutboxConsumer for MessageDeliveryConsumer {
                 // the outbox retry: resolving it `failed` here would tell an operator the send
                 // is finished while the substrate is still going to try again.
                 Some(GiveUpReason::AllProvidersExhausted) => {
+                    // Nothing was delivered and the substrate will try again, so the claim is
+                    // RELEASED rather than left held: a row stuck in `sending` with a retry
+                    // queued behind it would be claimed by nobody and finished by nobody.
+                    messages
+                        .release_claim(&id)
+                        .await
+                        .map_err(|_| ConsumerError::retryable("release_failed"))?;
                     Err(ConsumerError::retryable("all_providers_unavailable"))
                 }
                 // No provider configured at all. A deployment error, and retrying a deployment
                 // error forever is how a queue fills up silently, so it dead-letters where
                 // somebody will see it.
                 Some(GiveUpReason::NoProvidersConfigured) | None => {
+                    // A deployment error. The job dead-letters, so the row must not stay
+                    // `sending`: released, so that configuring a provider and replaying the
+                    // dead letter finds a message it can still send.
+                    messages
+                        .release_claim(&id)
+                        .await
+                        .map_err(|_| ConsumerError::retryable("release_failed"))?;
                     Err(ConsumerError::permanent("no_providers_configured"))
                 }
             }

@@ -349,17 +349,22 @@ async fn the_row_holds_a_blind_index_and_never_the_address() {
     assert_eq!(record.state, "pending");
     assert_eq!(record.failure_reason, None);
 
-    // The plaintext address must appear NOWHERE the row can be read from, including the
-    // delivery job the same transaction queued. Read through the owner pool so this is a
-    // statement about what is ON DISK rather than about what one role can see.
+    // The plaintext address must appear NOWHERE the row can be read from. Read through the
+    // owner pool so this is a statement about what is ON DISK rather than what one role sees.
+    //
+    // `position(bytea in bytea)`, NOT a cast to text. Postgres renders bytea as `\x` plus hex
+    // under the default `bytea_output`, and `@` and `.` are not hex digits, so
+    // `recipient_bidx::text LIKE '%ada@example.test%'` is UNSATISFIABLE: it reports zero leaks
+    // for ANY column content, the plaintext address included. Measured: with the address bound
+    // straight into the column, all sixteen tests stayed green under that predicate.
     let leaked: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM messages \
          WHERE tenant_id = $1 AND environment_id = $2 \
-         AND recipient_bidx::text LIKE $3",
+         AND position($3::bytea in recipient_bidx) > 0",
     )
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
-    .bind(format!("%{address}%"))
+    .bind(address.as_bytes())
     .fetch_one(db.owner_pool())
     .await
     .expect("scan the stored index");
@@ -747,7 +752,7 @@ async fn the_sealed_recipient_round_trips_and_is_not_the_address_in_disguise() {
     provision_keys(&db, &env, scope).await;
 
     let address = "ada@example.test";
-    send(&db, &env, scope, "email_otp", address, 1_000).await;
+    let (_, id) = send_with_id(&db, &env, scope, "email_otp", address, 1_000).await;
 
     let row: (Vec<u8>, i32) = sqlx::query_as(
         "SELECT recipient_sealed, pii_dek_version FROM messages \
@@ -764,6 +769,22 @@ async fn the_sealed_recipient_round_trips_and_is_not_the_address_in_disguise() {
     assert!(
         !as_text.contains(address) && !as_text.contains("ada"),
         "the stored bytes must be ciphertext, not the address with extra steps"
+    );
+
+    // And it ROUND TRIPS, which is the half the title claimed and the body did not measure:
+    // this test read the column and looked at it, and never once opened it. `open_recipient`
+    // could have returned a constant and nothing here would have noticed.
+    let opened = db
+        .store()
+        .scoped(scope)
+        .messages()
+        .open_recipient(&id)
+        .await
+        .expect("open the sealed recipient")
+        .expect("a queued send carries one");
+    assert_eq!(
+        opened, "ada@example.test",
+        "what the consumer mails must be what the door addressed"
     );
 }
 

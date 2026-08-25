@@ -23,7 +23,7 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{CorrelationId, MessageId, NewMessage, OutboxMessage, Scope};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 const WINDOW_SECS: u64 = 300;
 
@@ -44,6 +44,29 @@ impl MessageProvider for ScriptedProvider {
         Box::pin(async move {
             self.attempts.fetch_add(1, Ordering::Relaxed);
             self.outcome
+        })
+    }
+}
+
+/// A provider that counts entry and then PARKS, so a test can hold one worker inside its
+/// delivery while it runs another. Counting at entry is the point: it records that a worker
+/// reached a provider at all, which is what "mailed the recipient" means here.
+#[derive(Debug)]
+struct GatedProvider {
+    entered: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl MessageProvider for GatedProvider {
+    fn name(&self) -> &'static str {
+        "gated"
+    }
+
+    fn send<'a>(&'a self, _message: &'a PreparedMessage) -> SendFuture<'a> {
+        Box::pin(async move {
+            self.entered.fetch_add(1, Ordering::Relaxed);
+            self.release.notified().await;
+            Outcome::Delivered
         })
     }
 }
@@ -350,4 +373,179 @@ async fn a_replayed_job_does_not_send_the_message_twice() {
         "the second attempt must not mail the recipient again"
     );
     assert_eq!(state_of(&db, scope, &id).await, ("sent".to_owned(), None));
+}
+
+/// TWO WORKERS, ONE JOB. The case a lapsed lease produces, and the one the read-then-act
+/// version got wrong: both observed `pending`, both delivered, and a person received the same
+/// code twice.
+///
+/// The interleaving is FORCED rather than hoped for. `tokio::join!` on two handles is not
+/// enough: the futures interleave only at await points, so the first can finish entirely
+/// before the second starts and the race window never opens. Measured, a `join!` version of
+/// this test passed against the read-then-act code it was written to catch.
+///
+/// So worker A is held INSIDE its provider while worker B runs start to finish. Under
+/// read-then-act B also observes `pending`, reaches a provider, and the entry count goes to
+/// two. Under the claim B loses the conditional UPDATE and returns without composing or
+/// sending, so the count stays at one.
+#[tokio::test]
+async fn two_workers_holding_one_job_mail_the_recipient_once() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x136);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = enqueue_send(&db, &env, scope, "ada@example.test").await;
+    // ONE counter and ONE gate, shared by both workers: the question is how many times the
+    // recipient was handed to a provider in total, not what either worker did alone.
+    let entered = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let build = || {
+        MessageDeliveryConsumer::new(
+            db.store().clone(),
+            vec![Box::new(GatedProvider {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }) as Box<dyn MessageProvider>],
+            Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+        )
+    };
+    let a = build();
+    let b = build();
+
+    // Start A and wait until it is parked inside the provider.
+    let a_env = env.clone();
+    let a_job = job.clone();
+    let a_run = async move { a.handle(&a_env, scope, &a_job).await };
+    tokio::pin!(a_run);
+    let mut parked = false;
+    for _ in 0..200 {
+        tokio::select! {
+            biased;
+            _ = &mut a_run => break,
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        if entered.load(Ordering::Relaxed) >= 1 {
+            parked = true;
+            break;
+        }
+    }
+    assert!(parked, "worker A should be inside its provider");
+
+    // Now run B to completion while A is still mid-flight. Under the claim it returns at once
+    // having sent nothing; under read-then-act it enters the provider and parks too, which the
+    // timeout below turns into a visible failure rather than a hang.
+    let b_outcome = tokio::time::timeout(Duration::from_secs(2), b.handle(&env, scope, &job)).await;
+    let b_entered_provider = entered.load(Ordering::Relaxed) >= 2;
+
+    release.notify_waiters();
+    let _ = tokio::time::timeout(Duration::from_secs(5), a_run).await;
+    if let Ok(outcome) = b_outcome {
+        outcome.expect("worker b");
+    }
+
+    assert!(
+        !b_entered_provider,
+        "the second worker must not reach a provider: with a lapsed lease both workers hold \
+         the same job, and two providers entered is the recipient mailed twice"
+    );
+    assert_eq!(
+        entered.load(Ordering::Relaxed),
+        1,
+        "exactly one worker may hand this message to a provider"
+    );
+    assert_eq!(state_of(&db, scope, &id).await, ("sent".to_owned(), None));
+}
+
+/// A job naming a row that no longer exists completes rather than retrying. Retention pruned
+/// it, or it never committed; either way re-reading finds the same absence.
+#[tokio::test]
+async fn a_job_for_a_missing_row_completes_rather_than_retrying() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x137);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = enqueue_send(&db, &env, scope, "ada@example.test").await;
+    sqlx::query("DELETE FROM messages WHERE id = $1")
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("prune the row");
+
+    let (primary, tries) = provider("primary", Outcome::Delivered);
+    let consumer = MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![primary],
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    );
+    consumer
+        .handle(&env, scope, &job)
+        .await
+        .expect("a missing row is finished, not deferred");
+    assert_eq!(tries.load(Ordering::Relaxed), 0);
+}
+
+/// A row with no sealed recipient is recorded and finished. It predates migration 0155 and
+/// there is no plaintext anywhere to seal it from, so no number of retries can make it sendable.
+#[tokio::test]
+async fn a_row_without_a_sealed_recipient_is_recorded_not_retried() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x138);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = enqueue_send(&db, &env, scope, "ada@example.test").await;
+    sqlx::query(
+        "UPDATE messages SET recipient_sealed = NULL, pii_dek_version = NULL WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("simulate a pre-0155 row");
+
+    let (primary, tries) = provider("primary", Outcome::Delivered);
+    let consumer = MessageDeliveryConsumer::new(
+        db.store().clone(),
+        vec![primary],
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    );
+    consumer.handle(&env, scope, &job).await.expect("finished");
+
+    assert_eq!(tries.load(Ordering::Relaxed), 0);
+    let (state, reason) = state_of(&db, scope, &id).await;
+    assert_eq!(state, "failed");
+    assert_eq!(reason.as_deref(), Some("no_sealed_recipient"));
+}
+
+/// No providers configured is a DEPLOYMENT error: it dead-letters rather than retrying
+/// forever, and the row is released so that configuring a provider and replaying the dead
+/// letter finds a message it can still send.
+#[tokio::test]
+async fn no_providers_configured_dead_letters_and_leaves_the_row_sendable() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x139);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let (id, job) = enqueue_send(&db, &env, scope, "ada@example.test").await;
+    let consumer = MessageDeliveryConsumer::new(
+        db.store().clone(),
+        Vec::new(),
+        Arc::new(RecordingComposer::default()) as Arc<dyn MessageComposer>,
+    );
+
+    let error = consumer
+        .handle(&env, scope, &job)
+        .await
+        .expect_err("a deployment error is not a completion");
+    assert!(
+        !error.is_retryable(),
+        "retrying a missing configuration forever is how a queue fills up silently"
+    );
+    assert_eq!(
+        state_of(&db, scope, &id).await,
+        ("pending".to_owned(), None),
+        "the row must be sendable again once somebody configures a provider"
+    );
 }
