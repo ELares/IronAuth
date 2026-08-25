@@ -14,6 +14,7 @@
 resolver = "2"
 members = [
     "crates/ironauth-env",
+    "crates/ironauth-cel",
     "crates/ironauth-config",
     "crates/ironauth-server",
     "crates/ironauth-store",
@@ -60,6 +61,7 @@ ironauth-kms = { path = "crates/ironauth-kms", version = "0.1.0" }
 ironauth-admin = { path = "crates/ironauth-admin", version = "0.1.0" }
 ironauth-admin-ui = { path = "crates/ironauth-admin-ui", version = "0.1.0" }
 ironauth-oidc = { path = "crates/ironauth-oidc", version = "0.1.0" }
+ironauth-cel = { path = "crates/ironauth-cel" }
 ironauth-quota = { path = "crates/ironauth-quota", version = "0.1.0" }
 ironauth-screening = { path = "crates/ironauth-screening", version = "0.1.0" }
 ironauth-apply = { path = "crates/ironauth-apply", version = "0.1.0" }
