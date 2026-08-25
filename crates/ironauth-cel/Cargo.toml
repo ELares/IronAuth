@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-cel"
+version = "0.1.0"
+description = "Cost-bounded CEL evaluation for IronAuth: a deterministic budget refused before evaluation, never a wall clock"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The CEL interpreter (issue #113). Pure Rust and MIT, so the musl static lane holds; the
+# alternative on crates.io, `cel-cxx`, binds the C++ implementation and would break it.
+#
+# It provides no cost accounting of any kind, which is why this crate exists: see the module
+# header for the measurement that rules out the two obvious substitutes.
+cel = "0.14"
+
+[lints]
+workspace = true
