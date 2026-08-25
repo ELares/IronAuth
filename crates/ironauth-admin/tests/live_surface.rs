@@ -307,6 +307,11 @@ struct Fixture {
     org_connection: String,
     /// A real domain rule, so the verify case addresses a live one (issue #96).
     routing_rule: String,
+    /// A LIVE message row, so the resend case answers something OTHER than the uniform
+    /// not-found at a live environment. Without it the case is non-discriminating: an absent
+    /// message is a 404 at a live environment and a soft-deleted one alike, so driving it
+    /// would measure nothing about the fence, which the sweep detects and refuses.
+    message: String,
     /// A LIVE grant, so the withdrawal case measures the environment fence rather than
     /// an id that never resolved (issue #102).
     project_grant: String,
@@ -1173,9 +1178,34 @@ impl Fixture {
         assert_eq!(status, StatusCode::OK, "plan the promotion: {plan}");
         let base_revision = field(&plan, "/base_revision", "seed plan base revision");
 
+        // A LIVE message row, so the resend case answers something other than the uniform
+        // not-found at a live environment. Inserted directly rather than through `enqueue`:
+        // the row is the fixture, and enqueue would additionally need provisioned envelope
+        // keys and a sealed recipient that nothing here reads. `resend` refuses it (there is
+        // no delivery job to re-queue), and a REFUSAL is a discriminating answer -- 200 with a
+        // reason at a live environment, the uniform 404 at a soft-deleted one.
+        // GENERATED for the scope, not synthesized: a `msg_` identifier embeds its (tenant,
+        // environment) and the handler parses it IN SCOPE, so a hand-built string is refused
+        // at the parse and the case goes back to answering the uniform not-found.
+        let message = ironauth_store::MessageId::generate(&env, &scope).to_string();
+        sqlx::query(
+            "INSERT INTO messages \
+             (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key) \
+             VALUES ($1, $2, $3, 'email_otp', $4, $5)",
+        )
+        .bind(&message)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(vec![0x11_u8; 32])
+        .bind(format!("seed-{message}"))
+        .execute(h.db().owner_pool())
+        .await
+        .expect("seed a message row");
+
         Self {
             tenant,
             environment,
+            message,
             org_connection,
             routing_rule,
             project_grant,
@@ -1236,6 +1266,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         doomed_environment,
         operator,
         client,
+        message,
         org_connection,
         routing_rule,
         project_grant,
@@ -1455,7 +1486,14 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         Case::empty(
             "messages.getMessageStatus",
             "GET",
-            format!("{base}/messages/msg_absentmessage"),
+            format!("{base}/messages/{message}"),
+        ),
+        // The resend WRITE. It reaches the handler and refuses with 404 on an absent message,
+        // which is what this sweep needs: the route, its scope handling, and its gate.
+        Case::empty(
+            "messages.resendMessage",
+            "POST",
+            format!("{base}/messages/{message}/resend"),
         ),
         Case::json(
             "log_streams.createLogStream",
@@ -2719,6 +2757,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         doomed_environment: "env_1".to_owned(),
         operator: "opr_0".to_owned(),
         client: "cli_0".to_owned(),
+        message: "msg_0".to_owned(),
         service_account: "sva_0".to_owned(),
         sa_api_key: "akey_0".to_owned(),
         pat: "akey_1".to_owned(),

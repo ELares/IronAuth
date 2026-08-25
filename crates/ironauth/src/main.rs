@@ -739,7 +739,11 @@ async fn build_admin_state(
             // the same keys, and two chances for one operator-visible value to be
             // derived differently. `None` when the data-plane store is unreachable,
             // which leaves both installs off (each fails closed).
-            let data_plane_registry = connect_data_plane_registry(config, shared).await;
+            let (data_plane_registry, data_plane_store) =
+                match connect_data_plane_registry(config, shared).await {
+                    Some((registry, store)) => (Some(registry), Some(store)),
+                    None => (None, None),
+                };
             // Everything that reaches BOTH planes (issue #414): the two config sections
             // that live outside `[admin]` because both planes consume them (the
             // `[organizations]` group nesting bound, issue #97, and the `[token_claims]`
@@ -780,6 +784,13 @@ async fn build_admin_state(
             // can resolve an environment's actually signable ID-token algorithms and write
             // the per-client column through the data plane (the only role that can).
             // Absent a reachable data-plane store the wizard's write endpoint fails closed.
+            // The message resend endpoint's ONLY reach into the data plane (issue #111
+            // criterion 1). Absent it the endpoint refuses with 503 rather than falling back
+            // to the control store, which would be the grant widening the split prevents.
+            let state = match data_plane_store {
+                Some(store) => state.with_data_store(store),
+                None => state,
+            };
             let state = install_signing_registry(state, data_plane_registry.clone());
             // Arm the OIDC-session credential bridge (issue #90, PR 2) when the operator has
             // configured an admin issuer and a management audience AND the OIDC data plane is
@@ -816,7 +827,7 @@ async fn build_admin_state(
 async fn connect_data_plane_registry(
     config: &Config,
     shared: &SharedPlaneInputs,
-) -> Option<Arc<IssuerRegistry>> {
+) -> Option<(Arc<IssuerRegistry>, Store)> {
     let store = match Store::connect(config.database.url.expose()).await {
         Ok(store) => store,
         Err(error) => {
@@ -840,11 +851,19 @@ async fn connect_data_plane_registry(
         Some(wakes) => store.with_wake_dispatcher(wakes),
         None => store,
     };
-    Some(Arc::new(IssuerRegistry::store_backed(
+    // The store is CLONED into the registry rather than opened twice. `Store` is a handle
+    // over a pool, so both halves share one set of connections, which is the property the
+    // comment above this function is about: "two connection pools where one does".
+    //
+    // The second half goes to the management state, where exactly one endpoint needs it: a
+    // message resend writes a table the control role deliberately cannot (issue #111
+    // criterion 1).
+    let registry = Arc::new(IssuerRegistry::store_backed(
         shared.issuer_base().clone(),
         *shared.jwks_cache(),
-        store,
-    )))
+        store.clone(),
+    ));
+    Some((registry, store))
 }
 
 /// Share the data-plane issuer registry with the management state (issue #93).

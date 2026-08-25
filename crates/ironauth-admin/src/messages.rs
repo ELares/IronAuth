@@ -28,13 +28,13 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use ironauth_store::MessageId;
+use ironauth_store::{MessageId, Resent};
 use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
-use crate::org_context::resolve_scope;
+use crate::org_context::{require_live_environment, resolve_scope};
 use crate::response::json;
 use crate::state::AdminState;
 
@@ -120,6 +120,126 @@ pub async fn get_message_status(
         state: record.state,
         failure_reason: record.failure_reason,
         resend_count: record.resend_count,
+    };
+    let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// What a resend request did.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ResendView {
+    /// `requeued`, `suppressed`, `not_resendable` or `payload_expired`.
+    pub outcome: String,
+    /// Which re-queue this was, present only when the outcome is `requeued`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<i32>,
+    /// Why the request was refused, present only when there is a reason to give: the
+    /// suppression classification, or the state a `not_resendable` message is actually in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}/resend",
+    operation_id = "resendMessage",
+    tag = "messages",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("message_id" = String, Path, description = "The message identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The re-queue was attempted; the body says what happened", body = ResendView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "No such message in this scope", body = ErrorBody),
+        (status = 503, description = "No data-plane store is wired, so no resend can be performed", body = ErrorBody)
+    )
+)]
+/// Re-queue a terminal message for delivery.
+///
+/// # Why this writes through the DATA plane
+///
+/// `messages` grants the control role SELECT only, deliberately, and its own test says why:
+/// "UPDATE here makes the management surface a mailer". The separation is kept and the work
+/// moves instead: this endpoint DECIDES, and the data plane, which is the thing that mails,
+/// performs it, exactly as it did for the original send. When no data-plane store is wired the
+/// endpoint refuses with 503 rather than reaching for the control store, because falling back
+/// would be precisely the widening the split exists to prevent.
+///
+/// # Why every refusal is a 200
+///
+/// `Suppressed`, `NotResendable` and `PayloadExpired` are ANSWERS, not errors. Each says
+/// something different and actionable -- the recipient must not be mailed, the message is not
+/// in a state a resend can act on, the variables have been reaped -- and collapsing them into a
+/// 4xx would lose which one it was. The request was understood and acted on; the body reports
+/// what happened.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when the identifier names no message of this scope;
+/// [`ApiError::NotConfigured`] (503) when no data-plane store is wired.
+pub async fn resend_message(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, message_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): re-queueing a message is a credential-adjacent
+    // write, so it takes the credentials permission rather than the config one.
+    principal.require_permission(ManagementPermission::WriteCredentials)?;
+    // A WRITE into a decommissioned environment is refused, like every other write on this
+    // surface. `resolve_scope` alone does not do it: reads of a soft-deleted environment stay
+    // available on purpose (an operator still needs to see what was there), so the liveness
+    // fence is the write's own. Without it this endpoint answered 200 and RE-QUEUED MAIL for
+    // an environment somebody had decommissioned, which `live_surface`'s soft-delete sweep
+    // caught the moment its fixture named a real message.
+    require_live_environment(&state, &scope).await?;
+
+    let id = MessageId::parse_in_scope(&message_id, &scope).map_err(|_| ApiError::NotFound)?;
+    let Some(data_store) = state.data_store() else {
+        // NotConfigured, which renders 503 and means exactly this: "a dependency this
+        // request needs is not installed in this deployment". Not a 500, which would claim
+        // the request was at fault, and not a plain refusal, which an operator would read as
+        // "this message cannot be resent" and go looking at the message.
+        return Err(ApiError::NotConfigured(
+            "no data-plane store is wired, so no message can be re-queued".to_owned(),
+        ));
+    };
+
+    let outcome = data_store
+        .scoped(scope)
+        .messages()
+        .resend(state.env(), &id)
+        .await
+        .map_err(|error| match error {
+            ironauth_store::StoreError::NotFound => ApiError::NotFound,
+            _ => ApiError::Internal,
+        })?;
+
+    let view = match outcome {
+        Resent::Requeued { attempt } => ResendView {
+            outcome: "requeued".to_owned(),
+            attempt: Some(attempt),
+            reason: None,
+        },
+        Resent::Suppressed { reason } => ResendView {
+            outcome: "suppressed".to_owned(),
+            attempt: None,
+            reason: Some(reason),
+        },
+        Resent::NotResendable { state } => ResendView {
+            outcome: "not_resendable".to_owned(),
+            attempt: None,
+            reason: Some(state),
+        },
+        Resent::PayloadExpired => ResendView {
+            outcome: "payload_expired".to_owned(),
+            attempt: None,
+            reason: None,
+        },
     };
     let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))

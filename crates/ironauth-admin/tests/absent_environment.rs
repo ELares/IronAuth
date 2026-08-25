@@ -370,6 +370,20 @@ fn external_issuer_cases(base: &str) -> Vec<Case> {
     ]
 }
 
+/// The message resend write (issue #111 criterion 1).
+///
+/// Its own function rather than an entry appended to a neighbouring list, because these case
+/// lists sit near the 100-line clippy ceiling and growing one pushes it over -- which a
+/// targeted `cargo test` does not catch and only the lint reports.
+fn message_cases(base: &str) -> Vec<Case> {
+    vec![Case {
+        label: "messages.resendMessage",
+        method: "POST",
+        path: format!("{base}/messages/msg_absentmessage/resend"),
+        body: None,
+    }]
+}
+
 /// The SIEM log stream configuration writes (issue #110).
 fn log_stream_cases(base: &str) -> Vec<Case> {
     vec![
@@ -1393,6 +1407,7 @@ fn all_cases(tenant: &str, environment: &str) -> Vec<Case> {
     cases.extend(flow_target_cases(&base));
     cases.extend(external_issuer_cases(&base));
     cases.extend(log_stream_cases(&base));
+    cases.extend(message_cases(&base));
     cases.extend(client_cases(&base, &ids));
     cases.extend(secret_cases(&base));
     cases.extend(posture_cases(&base, &ids));

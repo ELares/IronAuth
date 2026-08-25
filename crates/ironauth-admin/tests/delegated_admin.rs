@@ -3155,3 +3155,47 @@ async fn read_is_required_and_sufficient_for_message_status() {
          {body}"
     );
 }
+
+/// `management.write_credentials` is required AND sufficient for the message resend (#111).
+///
+/// Both directions, for the reason the status test gives: refusal-only passes against an
+/// endpoint that refuses everybody, and success-only passes against one with no gate.
+///
+/// The allowed half lands on 404 rather than 200 because the identifier names no message. That
+/// is what is wanted here: the question is WHICH PERMISSION reaches the handler, and 403 versus
+/// 404 answers it exactly. The endpoint's real outcomes are covered by the store's own tests.
+#[tokio::test]
+async fn write_credentials_is_required_and_sufficient_for_message_resend() {
+    let h = Harness::start(52).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-resend").await;
+
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/messages/msg_absent/resend");
+
+    // A DIFFERENT permission, not an empty set: an empty set could be refused by an earlier
+    // check and would say nothing about which permission this endpoint requires.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.post_as(&path, &secret, "k-resend-refused", "").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not re-queue mail: {body}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_credentials"],
+    )
+    .await;
+    let (status, _, body) = h.post_as(&path, &secret, "k-resend-allowed", "").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_credentials credential must reach the handler, which then reports the absent \
+         message: {body}"
+    );
+}

@@ -9222,6 +9222,102 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}/resend": {
+      "post": {
+        "tags": [
+          "messages"
+        ],
+        "summary": "Re-queue a terminal message for delivery.",
+        "description": "# Why this writes through the DATA plane\n\n`messages` grants the control role SELECT only, deliberately, and its own test says why:\n\"UPDATE here makes the management surface a mailer\". The separation is kept and the work\nmoves instead: this endpoint DECIDES, and the data plane, which is the thing that mails,\nperforms it, exactly as it did for the original send. When no data-plane store is wired the\nendpoint refuses with 503 rather than reaching for the control store, because falling back\nwould be precisely the widening the split exists to prevent.\n\n# Why every refusal is a 200\n\n`Suppressed`, `NotResendable` and `PayloadExpired` are ANSWERS, not errors. Each says\nsomething different and actionable -- the recipient must not be mailed, the message is not\nin a state a resend can act on, the variables have been reaped -- and collapsing them into a\n4xx would lose which one it was. The request was understood and acted on; the body reports\nwhat happened.\n\n# Errors\n\n[`ApiError::NotFound`] when the identifier names no message of this scope;\n[`ApiError::NotConfigured`] (503) when no data-plane store is wired.",
+        "operationId": "resendMessage",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "message_id",
+            "in": "path",
+            "description": "The message identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The re-queue was attempted; the body says what happened",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResendView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such message in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No data-plane store is wired, so no resend can be performed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
       "get": {
         "tags": [
@@ -29319,6 +29415,34 @@
           }
         },
         "additionalProperties": false
+      },
+      "ResendView": {
+        "type": "object",
+        "description": "What a resend request did.",
+        "required": [
+          "outcome"
+        ],
+        "properties": {
+          "attempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Which re-queue this was, present only when the outcome is `requeued`."
+          },
+          "outcome": {
+            "type": "string",
+            "description": "`requeued`, `suppressed`, `not_resendable` or `payload_expired`."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the request was refused, present only when there is a reason to give: the\nsuppression classification, or the state a `not_resendable` message is actually in."
+          }
+        }
       },
       "ResourceServerList": {
         "type": "object",

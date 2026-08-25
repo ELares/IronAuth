@@ -276,6 +276,7 @@ fn operation_ids_are_the_stable_set() {
             "replayLogStreamDeadLetters",
             "replayWebhookDeadLetters",
             "resendInvitation",
+            "resendMessage",
             "restoreTenant",
             "resumeIdentityImport",
             "resumeTenant",
@@ -670,6 +671,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters/replay",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}/resend",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/abandon",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
@@ -832,7 +834,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        243,
+        244,
         "the documented route count is pinned"
     );
 
