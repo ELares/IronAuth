@@ -1004,6 +1004,35 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A send REFUSED by the per-recipient rate limit (issue #111 criterion 5), which asks
+        // that exceeding the limit both block the send and emit this.
+        //
+        // The payload carries NO ADDRESS. A rate-limit event is, by construction, about a
+        // recipient somebody is sending a lot of mail to, and the feed is the one artifact a
+        // tenant hands to third-party sync targets: putting the address here would make the
+        // event stream a directory of exactly the mailboxes under pressure, which is a list
+        // worth stealing. The blind index identifies the recipient well enough to group and
+        // to correlate with the ledger, and identifies them to nobody who does not already
+        // hold the tenant's key.
+        //
+        // `retry_after_unix_seconds` is the instant the oldest counted send leaves the
+        // window, so a consumer can tell a user when to come back rather than leaving them to
+        // guess. `kind` is the message kind, because "we are rate limiting your login codes"
+        // and "we are rate limiting your marketing" are different operational facts.
+        "message.rate_limited",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "recipient_bidx": {"type": "string", "minLength": 1},
+                "kind": {"type": "string", "minLength": 1},
+                "retry_after_unix_seconds": {"type": "integer"}
+            },
+            "required": ["recipient_bidx", "kind", "retry_after_unix_seconds"]
+        }"#,
+    ),
+    (
         // THE THREE TYPES METERING COUNTS (issue #107). They are registered here, beside
         // every other type, because `UsageTally` names them as string constants and an
         // unregistered type is refused by `validate_event` at the fan-out -- so a metering

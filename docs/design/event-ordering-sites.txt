@@ -57,6 +57,7 @@ crates/ironauth-store/src/repository.rs:enqueue_async_delivery:1
 crates/ironauth-store/src/repository.rs:enqueue_session_ended_event:1
 crates/ironauth-store/src/repository.rs:extend_with_event:1
 crates/ironauth-store/src/repository.rs:hard_delete_with_event:1
+crates/ironauth-store/src/repository.rs:hygiene_refusal:1
 crates/ironauth-store/src/repository.rs:insert_session_row:1
 crates/ironauth-store/src/repository.rs:issue_with_event:1
 crates/ironauth-store/src/repository.rs:lift_with_event:1

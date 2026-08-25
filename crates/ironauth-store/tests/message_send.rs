@@ -1516,3 +1516,72 @@ async fn concurrent_sends_to_one_recipient_cannot_exceed_the_budget() {
         "and exactly one row may land"
     );
 }
+
+/// CRITERION 5's other half: exceeding the limit BLOCKS the send AND EMITS the event.
+///
+/// The conjunction is the point. A block nobody can observe is indistinguishable to an
+/// operator from mail that silently never arrived, which is the complaint the criterion exists
+/// to answer.
+#[tokio::test]
+async fn a_rate_limited_send_emits_the_message_rate_limited_event() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x15c);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let budget = RateBudget::new(1, 3_600);
+    assert_eq!(
+        send_at(&db, &env, scope, "ada@example.test", budget, 10_000, 1_000).await,
+        Enqueued::Accepted
+    );
+    let before = webhook_events(&db, scope).await.len();
+
+    let refused = send_at(&db, &env, scope, "ada@example.test", budget, 10_100, 90_000).await;
+    assert!(matches!(refused, Enqueued::RateLimited { .. }));
+
+    let events = webhook_events(&db, scope).await;
+    assert_eq!(
+        events.len(),
+        before + 1,
+        "the refusal must announce itself: a block nobody can observe reads to an operator \
+         exactly like mail that silently never arrived"
+    );
+    let emitted = events.last().expect("an event");
+    assert_eq!(emitted["type"], "message.rate_limited");
+    let payload = &emitted["payload"];
+    assert_eq!(payload["kind"], "email_otp");
+    assert_eq!(
+        payload["retry_after_unix_seconds"],
+        serde_json::json!(10_000_u64 + 3_600),
+        "the event carries the instant the oldest counted send leaves the window"
+    );
+
+    // The ADDRESS must not be in it. A rate-limit feed is by construction a list of the
+    // mailboxes under most pressure, and the event stream is what a tenant hands to
+    // third-party sync targets.
+    let rendered = emitted.to_string();
+    assert!(
+        !rendered.contains("ada@example.test") && !rendered.contains("ada"),
+        "the event must carry the blind index, never the address: {rendered}"
+    );
+    assert!(
+        payload["recipient_bidx"]
+            .as_str()
+            .is_some_and(|value| value.chars().all(|c| c.is_ascii_hexdigit())),
+        "and the index is the hex of the blind index: {payload}"
+    );
+}
+
+/// Every event queued for the webhook fan-out in this scope, oldest first.
+async fn webhook_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND consumer = 'webhook.event' \
+         ORDER BY sequence",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the queued events")
+}
