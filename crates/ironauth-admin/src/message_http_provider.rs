@@ -84,6 +84,29 @@ impl HttpMessageProvider {
         })
         .to_string()
     }
+
+    /// Build the request one send POSTs.
+    ///
+    /// Separated from [`MessageProvider::send`] so it can be ASSERTED. Everything decided here
+    /// -- the purpose, the method, the content type, the body -- was previously unmeasured, and
+    /// a review found every one of them survives being changed: the method could become GET,
+    /// the body could be emptied, the content type could be dropped, and the purpose could be
+    /// swapped to `WebhookDelivery`, with the whole suite green. The purpose swap is the one
+    /// that matters most quietly: `ironauth_fetch::observe` emits it as a metric label and a
+    /// tracing field, so a wrong purpose files message deliveries into the webhook series,
+    /// which is exactly what giving messages their own purpose was for.
+    fn request_for(&self, message: &PreparedMessage) -> ironauth_fetch::FetchRequest {
+        ironauth_fetch::FetchRequest::new(
+            ironauth_fetch::FetchPurpose::MessageDelivery,
+            http::Method::POST,
+            self.endpoint.clone(),
+        )
+        .header(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        )
+        .body(Self::body(message))
+    }
 }
 
 impl MessageProvider for HttpMessageProvider {
@@ -93,18 +116,7 @@ impl MessageProvider for HttpMessageProvider {
 
     fn send<'a>(&'a self, message: &'a PreparedMessage) -> SendFuture<'a> {
         Box::pin(async move {
-            let request = ironauth_fetch::FetchRequest::new(
-                ironauth_fetch::FetchPurpose::MessageDelivery,
-                http::Method::POST,
-                self.endpoint.clone(),
-            )
-            .header(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/json"),
-            )
-            .body(Self::body(message));
-
-            match self.fetcher.fetch(request).await {
+            match self.fetcher.fetch(self.request_for(message)).await {
                 Ok(response) => classify_status(Some(response.status().as_u16())),
                 // No status at all. Every one of these is about the PROVIDER or the
                 // deployment's own configuration, never about the recipient, so failing over
@@ -152,8 +164,11 @@ mod tests {
     /// must not print it. A provider list is logged when failover reports which one was tried.
     #[test]
     fn debug_does_not_print_the_endpoint() {
+        // The name is deliberately NOT a substring of the endpoint. An earlier version used
+        // "relay" against host "relay.example.test", so the "the name is shown" assertion
+        // passed on the endpoint's own text and could not tell the two apart.
         let provider = HttpMessageProvider::new(
-            "relay",
+            "courier-one",
             "https://user:secret@relay.example.test/send?key=abcdef",
             Arc::new(ironauth_fetch::Fetcher::for_tests(
                 ironauth_fetch::FetchLimits::default(),
@@ -161,8 +176,8 @@ mod tests {
         );
         let rendered = format!("{provider:?}");
         assert!(
-            rendered.contains("relay"),
-            "the operator's name is safe to show"
+            rendered.contains("courier-one"),
+            "the operator's name is safe to show: {rendered}"
         );
         assert!(
             !rendered.contains("secret") && !rendered.contains("abcdef"),
@@ -170,17 +185,84 @@ mod tests {
         );
     }
 
-    /// The provider reports the operator's name, which is what lands in the delivery record and
-    /// in failover reporting.
+    /// The provider reports the operator's name, which is what lands in the delivery record
+    /// and in failover reporting. TWO fixtures, because one lets `name()` return a hardcoded
+    /// constant and pass.
     #[test]
     fn the_provider_reports_its_configured_name() {
-        let provider = HttpMessageProvider::new(
-            "postmark",
-            "https://relay.example.test/send",
+        for configured in ["postmark", "ses"] {
+            let provider = HttpMessageProvider::new(
+                configured,
+                "https://relay.example.test/send",
+                Arc::new(ironauth_fetch::Fetcher::for_tests(
+                    ironauth_fetch::FetchLimits::default(),
+                )),
+            );
+            assert_eq!(MessageProvider::name(&provider), configured);
+        }
+    }
+
+    fn provider_at(endpoint: &str) -> HttpMessageProvider {
+        HttpMessageProvider::new(
+            "courier-one",
+            endpoint,
             Arc::new(ironauth_fetch::Fetcher::for_tests(
                 ironauth_fetch::FetchLimits::default(),
             )),
+        )
+    }
+
+    /// Everything the request DECIDES, asserted. A review found each of these survives being
+    /// changed with the whole suite green: the method could become GET, the body could be
+    /// emptied, the content type dropped, and the purpose swapped to `WebhookDelivery`.
+    #[test]
+    fn the_request_carries_the_purpose_method_content_type_and_body() {
+        let provider = provider_at("https://relay.example.test/send");
+        let request = provider.request_for(&message());
+
+        assert_eq!(
+            request.purpose_for_test(),
+            ironauth_fetch::FetchPurpose::MessageDelivery,
+            "a message must not be attributed to the webhook purpose: the purpose is emitted \
+             as a metric label and a tracing field, so the wrong one files these deliveries \
+             into another subsystem's series"
         );
-        assert_eq!(MessageProvider::name(&provider), "postmark");
+        assert_eq!(request.method_for_test(), http::Method::POST);
+        assert_eq!(request.url_for_test(), "https://relay.example.test/send");
+        assert!(
+            request.headers_for_test().iter().any(|(name, value)| {
+                name == http::header::CONTENT_TYPE && value == "application/json"
+            }),
+            "a relay that cannot tell what it was sent will not parse it"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body_for_test()).expect("the body is the json");
+        assert_eq!(body["to"], "ada@example.test");
+    }
+
+    /// `send()` itself, which nothing measured: a version that never contacts the fetcher and
+    /// reported every message `Delivered` passed all three original tests.
+    ///
+    /// A plaintext target is REFUSED by the fetcher (this provider never opts into plaintext),
+    /// so this drives the real `send` down its error arm without a server or a network. A
+    /// refusal is about the configured ENDPOINT, never about the recipient, so it must fail
+    /// over rather than report the message rejected: reporting rejection would mean a
+    /// misconfigured endpoint silently discards mail at every provider in turn.
+    #[tokio::test]
+    async fn a_refused_target_is_provider_unavailable_and_never_delivered() {
+        let provider = provider_at("http://relay.example.test/send");
+        let outcome = provider.send(&message()).await;
+        assert_eq!(
+            outcome,
+            Outcome::ProviderUnavailable,
+            "a transport refusal is about the endpoint, not the message: reporting anything \
+             else either drops the mail or bounces it at every vendor"
+        );
+        assert_ne!(
+            outcome,
+            Outcome::Delivered,
+            "and a send that reports success without contacting anything resolves the ledger \
+             row to `sent` for a message nobody received"
+        );
     }
 }

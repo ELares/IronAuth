@@ -367,6 +367,46 @@ impl FetchRequest {
         self
     }
 
+    /// The purpose this request is attributed to. Test-harness only.
+    ///
+    /// Exposed because the purpose is not decoration: `observe.rs` emits it as a metric label
+    /// and a tracing field, so a caller that attributes its fetches to the wrong purpose files
+    /// them into another subsystem's series. A caller cannot assert it built the request it
+    /// meant to build without being able to read it back.
+    #[cfg(feature = "test-harness")]
+    #[must_use]
+    pub fn purpose_for_test(&self) -> FetchPurpose {
+        self.purpose
+    }
+
+    /// The HTTP method. Test-harness only.
+    #[cfg(feature = "test-harness")]
+    #[must_use]
+    pub fn method_for_test(&self) -> &Method {
+        &self.method
+    }
+
+    /// The target URL. Test-harness only.
+    #[cfg(feature = "test-harness")]
+    #[must_use]
+    pub fn url_for_test(&self) -> &str {
+        &self.url
+    }
+
+    /// The headers set on this request, in insertion order. Test-harness only.
+    #[cfg(feature = "test-harness")]
+    #[must_use]
+    pub fn headers_for_test(&self) -> &[(HeaderName, HeaderValue)] {
+        &self.headers
+    }
+
+    /// The request body. Test-harness only.
+    #[cfg(feature = "test-harness")]
+    #[must_use]
+    pub fn body_for_test(&self) -> &[u8] {
+        &self.body
+    }
+
     /// Permit a plaintext `http` target for this request. Off by default; the
     /// seam exists so later non-production guardrails can gate it.
     #[must_use]
