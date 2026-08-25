@@ -51,7 +51,7 @@ crates/ironauth-store/src/repository.rs:create_with_user_inner:1
 crates/ironauth-store/src/repository.rs:decide:2
 crates/ironauth-store/src/repository.rs:delete:1
 crates/ironauth-store/src/repository.rs:delete_with_event:22
-crates/ironauth-store/src/repository.rs:enqueue:1
+crates/ironauth-store/src/repository.rs:enqueue:2
 crates/ironauth-store/src/repository.rs:enqueue_all:1
 crates/ironauth-store/src/repository.rs:enqueue_async_delivery:1
 crates/ironauth-store/src/repository.rs:enqueue_session_ended_event:1
