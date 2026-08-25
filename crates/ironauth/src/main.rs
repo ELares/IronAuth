@@ -791,6 +791,9 @@ async fn build_admin_state(
                 Some(store) => state.with_data_store(store),
                 None => state,
             };
+            // The issuer registry, as before. Its own reasoning lives on
+            // `connect_data_plane_registry`, above; the block just added displaced this line
+            // from the comment that describes it.
             let state = install_signing_registry(state, data_plane_registry.clone());
             // Arm the OIDC-session credential bridge (issue #90, PR 2) when the operator has
             // configured an admin issuer and a management audience AND the OIDC data plane is

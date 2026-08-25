@@ -1488,9 +1488,9 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/messages/{message}"),
         ),
-        // The resend WRITE, at the same seeded message. Its live answer is a 200 carrying a
-        // refusal (there is no delivery job to re-queue), which is what makes it discriminating
-        // against the soft-deleted environment's uniform not-found.
+        // The resend WRITE, at the same seeded message. Its live answer is a 200 carrying
+        // `payload_expired` -- the seeded row has no delivery job to re-queue -- and that is
+        // what makes it discriminating against the soft-deleted environment's uniform 404.
         Case::empty(
             "messages.resendMessage",
             "POST",

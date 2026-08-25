@@ -38,14 +38,15 @@
 //! row first.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
-use ironauth_store::{MessageId, Resent};
+use ironauth_store::{CorrelationId, IdempotencyWrite, MessageId, Resent};
 use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
+use crate::idempotency;
 use crate::org_context::{require_live_environment, resolve_scope};
 use crate::response::json;
 use crate::state::AdminState;
@@ -166,7 +167,8 @@ pub struct ResendView {
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("message_id" = String, Path, description = "The message identifier")
+        ("message_id" = String, Path, description = "The message identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required: a retry must not mail twice")
     ),
     security(("bearer" = [])),
     responses(
@@ -204,11 +206,39 @@ pub async fn resend_message(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, message_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
-    // Delegated administration (issue #102): re-queueing a message is a credential-adjacent
-    // write, so it takes the credentials permission rather than the config one.
-    principal.require_permission(ManagementPermission::WriteCredentials)?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_users`, matching the
+    // nearest sibling `invitations::resend_invitation`.
+    //
+    // An earlier version used `write_credentials` on the grounds that a resend is
+    // "credential-adjacent". That reasoning does not survive the comparison: every other
+    // operation in the credentials set MINTS a credential, and this one mints nothing. It
+    // re-delivers a message to a user, which is what the invitation resend does and what
+    // `write_users` is for.
+    principal.require_permission(ManagementPermission::WriteUsers)?;
+    // Sudo mutation gate (issue #73). Every other environment-scoped mutation on this surface
+    // reaches this, and this one did not: with sudo armed, a credential outside its window
+    // could not change a translation string but COULD re-mail a live one-time credential,
+    // because what a resend re-queues is the original payload -- the OTP code, the magic-link
+    // token. Gated before the idempotency replay so a challenge writes nothing.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+
+    // An Idempotency-Key, because this POST CAUSES MAIL. Without one a retried request -- a
+    // proxy, a double click, a client library's backoff -- re-queues a second delivery and the
+    // recipient gets the message twice, which is the harm the whole `messages` ledger exists
+    // to prevent.
+    let key = idempotency::required_key(&headers)?;
+    // No request body, so the fingerprint is over the empty one.
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &[]);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
     // A WRITE into a decommissioned environment is refused, like every other write on this
     // surface. `resolve_scope` alone does not do it: reads of a soft-deleted environment stay
     // available on purpose (an operator still needs to see what was there), so the liveness
@@ -230,29 +260,59 @@ pub async fn resend_message(
 
     let outcome = data_store
         .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
         .messages()
         .resend(state.env(), &id)
         .await
         .map_err(|error| match error {
             ironauth_store::StoreError::NotFound => ApiError::NotFound,
+            ironauth_store::StoreError::IdempotencyConflict => ApiError::IdempotencyKeyConflict,
             _ => ApiError::Internal,
         })?;
 
+    let body = render_resend(&outcome).map_err(|_| ApiError::Internal)?;
+
+    // Recorded on the CONTROL plane, in its own transaction, because `idempotency_keys` is a
+    // control-plane table and the write above is data-plane. Not atomic with the resend, and
+    // deliberately so: what stops a retry mailing twice is the compare-and-swap, which has
+    // already moved the message out of its terminal state. A retry that beats this row finds
+    // the message `pending` and is refused as not-resendable, which mails nothing.
+    state
+        .store()
+        .record_cross_plane_idempotency(IdempotencyWrite {
+            credential_ref: &credential_ref,
+            key: &key,
+            request_fingerprint: &fingerprint,
+            response_status: 200,
+            response_body: &body,
+        })
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    Ok(json(StatusCode::OK, body))
+}
+
+/// The response body for a resend outcome.
+///
+/// One renderer, called both for the live response and (through
+/// [`ResolvedIdempotencyWrite`]) for the body a replay returns, so the two cannot be different
+/// bytes for the same outcome.
+fn render_resend(outcome: &Resent) -> Result<String, serde_json::Error> {
     let view = match outcome {
         Resent::Requeued { attempt } => ResendView {
             outcome: "requeued".to_owned(),
-            attempt: Some(attempt),
+            attempt: Some(*attempt),
             reason: None,
         },
         Resent::Suppressed { reason } => ResendView {
             outcome: "suppressed".to_owned(),
             attempt: None,
-            reason: Some(reason),
+            reason: Some(reason.clone()),
         },
         Resent::NotResendable { state } => ResendView {
             outcome: "not_resendable".to_owned(),
             attempt: None,
-            reason: Some(state),
+            reason: Some(state.clone()),
         },
         Resent::PayloadExpired => ResendView {
             outcome: "payload_expired".to_owned(),
@@ -260,6 +320,5 @@ pub async fn resend_message(
             reason: None,
         },
     };
-    let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
-    Ok(json(StatusCode::OK, body))
+    serde_json::to_string(&view)
 }

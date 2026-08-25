@@ -188,6 +188,11 @@ const ACCOUNT_CHANGE_DOMAINS: &[&str] = &[
     "human",
     "identifier",
     "invitation",
+    // A resend re-delivers a message to a PRINCIPAL -- for an `email_otp` the code, for a
+    // magic link the token -- so it belongs with `invitation`, whose resend it mirrors, rather
+    // than with the config domains where `message_template` sits. The template is
+    // configuration; the send is something that happens to a person.
+    "message",
     "service",
     "service_account",
     "signup",

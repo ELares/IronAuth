@@ -3156,7 +3156,7 @@ async fn read_is_required_and_sufficient_for_message_status() {
     );
 }
 
-/// `management.write_credentials` is required AND sufficient for the message resend (#111).
+/// `management.write_users` is required AND sufficient for the message resend (#111).
 ///
 /// Both directions, for the reason the status test gives: refusal-only passes against an
 /// endpoint that refuses everybody, and success-only passes against one with no gate.
@@ -3165,7 +3165,7 @@ async fn read_is_required_and_sufficient_for_message_status() {
 /// is what is wanted here: the question is WHICH PERMISSION reaches the handler, and 403 versus
 /// 404 answers it exactly. The endpoint's real outcomes are covered by the store's own tests.
 #[tokio::test]
-async fn write_credentials_is_required_and_sufficient_for_message_resend() {
+async fn write_users_is_required_and_sufficient_for_message_resend() {
     let h = Harness::start(52).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
     let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-resend").await;
@@ -3188,14 +3188,14 @@ async fn write_credentials_is_required_and_sufficient_for_message_resend() {
         &tenant,
         &environment,
         &key_id,
-        &["management.write_credentials"],
+        &["management.write_users"],
     )
     .await;
     let (status, _, body) = h.post_as(&path, &secret, "k-resend-allowed", "").await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
-        "a write_credentials credential must reach the handler, which then reports the absent \
+        "a write_users credential must reach the handler, which then reports the absent \
          message: {body}"
     );
 }
@@ -3353,4 +3353,38 @@ async fn a_message_from_another_scope_is_not_readable_and_the_refusal_reveals_no
              a caller that some other scope's message exists"
         );
     }
+}
+
+/// A resend without an Idempotency-Key is refused (issue #111 criterion 1).
+///
+/// This POST CAUSES MAIL, so a retry that re-executes is a recipient getting the message twice
+/// -- the harm the whole `messages` ledger exists to prevent, arriving through the recovery
+/// path. The header is required on every POST on this surface, and this endpoint shipped
+/// without asking for one.
+///
+/// Driven at an absent message on purpose: the key check runs before the identifier is parsed,
+/// so a 400 here cannot be the endpoint merely failing to find the row (which is a 404).
+#[tokio::test]
+async fn a_resend_without_an_idempotency_key_is_refused() {
+    let h = Harness::start(55).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/messages/msg_absent/resend");
+
+    let (status, _, body) = h.post(&path, "", "").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the Idempotency-Key is required on a POST that mails somebody: {body}"
+    );
+
+    // With a key, the same request reaches the handler and reports the absent message. 400 to
+    // 404 is what shows the key check opened rather than the route answering the same way for
+    // a different reason.
+    let (status, _, body) = h.post(&path, "k-resend-present", "").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "with a key it reaches the handler: {body}"
+    );
 }

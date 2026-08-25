@@ -1704,3 +1704,44 @@ async fn a_usage_publish_is_sudo_gated() {
         "the elevated publish succeeds: {published}"
     );
 }
+
+/// A message resend is sudo-gated, like every other environment-scoped mutation (issue #111).
+///
+/// THE GATE THIS TEST EXISTS FOR. `resend_message` shipped without `require_fresh_privilege`,
+/// and what a resend re-delivers is a CREDENTIAL: the original payload, which for an
+/// `email_otp` carries the code and for a magic link the token. So with sudo armed, a stale
+/// credential could not change a translation string but could re-mail a live one-time secret.
+///
+/// The challenge must fire BEFORE the endpoint looks at anything: a stale request must not
+/// discover whether the message exists, and must not write.
+#[tokio::test]
+async fn a_message_resend_is_sudo_gated() {
+    let (harness, _clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    // The identifier names no row, deliberately: a gated request is refused before it is
+    // parsed, so the challenge below cannot be the endpoint merely failing to find it.
+    let path = format!("/v1/tenants/{tenant}/environments/{env}/messages/msg_absent/resend");
+
+    let (status, _, challenge) = harness.post(&path, "r1", "").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a stale resend is challenged: {challenge}"
+    );
+    assert!(
+        challenge.contains("insufficient_user_authentication"),
+        "the challenge body carries the RFC 9470 error: {challenge}"
+    );
+
+    // After elevation the same request reaches the handler, which then reports the absent
+    // message. 401 -> 404 is the transition that shows the gate opened rather than the route
+    // answering the same way for a different reason.
+    let (status, _, elevated) = harness.post(&elevate_path(&tenant, &env), "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {elevated}");
+    let (status, _, body) = harness.post(&path, "r2", "").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the elevated resend reaches the handler: {body}"
+    );
+}

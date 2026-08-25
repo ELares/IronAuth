@@ -14308,7 +14308,10 @@ export interface operations {
     resendMessage: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required: a retry must not mail twice */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description The tenant identifier */
                 tenant_id: string;
