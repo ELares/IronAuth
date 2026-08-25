@@ -27817,9 +27817,16 @@
           "kind",
           "recipient_bidx",
           "state",
-          "resend_count"
+          "resend_count",
+          "created_at_unix_ms",
+          "updated_at_unix_ms"
         ],
         "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the send was accepted, as epoch milliseconds."
+          },
           "failure_reason": {
             "type": [
               "string",
@@ -27847,6 +27854,11 @@
           "state": {
             "type": "string",
             "description": "`pending`, `sending`, `sent` or `failed`."
+          },
+          "updated_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the row last changed, as epoch milliseconds. A `failed` message with no date is\nhalf an answer: a failure ten seconds old and one from last week are different problems."
           }
         }
       },

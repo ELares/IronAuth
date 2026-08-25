@@ -22498,6 +22498,14 @@ pub struct MessageRecord {
     /// How many times an operator has re-queued this message. Zero for a message that was
     /// only ever sent once, which is the answer to "why did this person get four copies".
     pub resend_count: i32,
+    /// When the send was accepted, as epoch milliseconds.
+    pub created_at_unix_ms: i64,
+    /// When the row last changed, as epoch milliseconds.
+    ///
+    /// Without these two a status surface can say a message is `failed` but not WHEN, which is
+    /// the first thing anyone asks: a failure from ten seconds ago and one from last week are
+    /// different problems, and `pending` is only alarming once it is old.
+    pub updated_at_unix_ms: i64,
 }
 
 /// What enqueuing one outbound message needs (issue #111).
@@ -23321,7 +23329,9 @@ impl MessageRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, kind, recipient_bidx, state, failure_reason, resend_count \
+            "SELECT id, kind, recipient_bidx, state, failure_reason, resend_count, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_unix_ms, \
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint AS updated_at_unix_ms \
              FROM messages \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
@@ -23342,6 +23352,8 @@ impl MessageRepo<'_> {
                     state: row.get("state"),
                     failure_reason: row.get("failure_reason"),
                     resend_count: row.get("resend_count"),
+                    created_at_unix_ms: row.get("created_at_unix_ms"),
+                    updated_at_unix_ms: row.get("updated_at_unix_ms"),
                 }))
             }
         }

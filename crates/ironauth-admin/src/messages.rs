@@ -20,10 +20,22 @@
 //! The RECIPIENT. The ledger holds a blind index and a sealed address, and the seal opens on
 //! exactly one path, at the moment of delivery (`MessageRepo::open_recipient`). An operator
 //! endpoint that opened it would make a support tool into a way to read every address a tenant
-//! has ever mailed, which is the plaintext column 0154 refused to add. The blind index is
-//! returned instead: it correlates a message with the suppression list and with the
-//! `message.rate_limited` feed, which is what an operator actually needs to answer "why did
-//! this person stop receiving mail", and it identifies nobody who is not already known.
+//! has ever mailed, which is the plaintext column 0154 refused to add.
+//!
+//! The blind index goes out instead. It is the key the `message.rate_limited` event carries, so
+//! an operator can join a message against that feed today. It is ALSO the key
+//! `message_suppressions` is stored under -- but no management API exposes that table yet, so
+//! that half is what the index WILL join on when a suppression surface ships, not something a
+//! caller can do now. Worth being exact, because an earlier draft claimed the correlation as a
+//! present capability.
+//!
+//! # Scope
+//!
+//! ENVIRONMENT-wide, for any credential holding `management.read`. A `messages` row carries no
+//! organization column, so an organization-confined delegated administrator sees the whole
+//! environment's sends, exactly as it does on the event feed. That follows from the ledger's
+//! shape rather than from a decision taken here: fencing it would need an organization on the
+//! row first.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -55,6 +67,11 @@ pub struct MessageStatusView {
     /// How many times an operator has re-queued this message. Zero for one that was only ever
     /// sent once, and the answer to "why did this person get four copies".
     pub resend_count: i32,
+    /// When the send was accepted, as epoch milliseconds.
+    pub created_at_unix_ms: i64,
+    /// When the row last changed, as epoch milliseconds. A `failed` message with no date is
+    /// half an answer: a failure ten seconds old and one from last week are different problems.
+    pub updated_at_unix_ms: i64,
 }
 
 #[utoipa::path(
@@ -120,6 +137,8 @@ pub async fn get_message_status(
         state: record.state,
         failure_reason: record.failure_reason,
         resend_count: record.resend_count,
+        created_at_unix_ms: record.created_at_unix_ms,
+        updated_at_unix_ms: record.updated_at_unix_ms,
     };
     let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))

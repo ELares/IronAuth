@@ -1480,16 +1480,17 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/log-streams"),
         ),
-        // One message's delivery status (issue #111 criterion 1). The identifier names no row,
-        // which is what this sweep needs: it drives the ROUTE and its scope handling, and the
-        // handler's own tests cover what it returns for a message that exists.
+        // One message's delivery status (issue #111 criterion 1), at the SEEDED message, so
+        // the sweep reaches the handler's body rather than stopping at the identifier parse.
+        // What it returns is asserted in `delegated_admin.rs`; this drives the route.
         Case::empty(
             "messages.getMessageStatus",
             "GET",
             format!("{base}/messages/{message}"),
         ),
-        // The resend WRITE. It reaches the handler and refuses with 404 on an absent message,
-        // which is what this sweep needs: the route, its scope handling, and its gate.
+        // The resend WRITE, at the same seeded message. Its live answer is a 200 carrying a
+        // refusal (there is no delivery job to re-queue), which is what makes it discriminating
+        // against the soft-deleted environment's uniform not-found.
         Case::empty(
             "messages.resendMessage",
             "POST",

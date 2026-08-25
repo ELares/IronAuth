@@ -3199,3 +3199,158 @@ async fn write_credentials_is_required_and_sufficient_for_message_resend() {
          message: {body}"
     );
 }
+
+/// The status endpoint returns the blind index and NEVER the address (issue #111 criterion 1).
+///
+/// THE TEST THIS FILE WAS MISSING. Every case that touched this route used an identifier that
+/// fails `parse_in_scope`, so the handler answered 404 and its whole body -- the query, the
+/// view, the hex fold, the serialization -- was never executed by anything. Review replaced
+/// `recipient_bidx` with the opened plaintext address and all 741 tests in this crate passed.
+/// The behaviour was correct and guarded by nothing, which is the shape a later edit removes.
+///
+/// So this drives a real 200 and asserts the VALUE, not the shape: a 64-character hex string
+/// would be satisfied by a constant, and "contains no address" would be satisfied by an empty
+/// body.
+#[tokio::test]
+async fn message_status_returns_the_blind_index_and_never_the_address() {
+    let h = Harness::start(53).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant"),
+        EnvironmentId::parse(&environment).expect("environment"),
+    );
+    let env = ironauth_env::Env::system();
+
+    // Seeded through the store, since no create route exists for a message. The address is
+    // distinctive so "the body does not contain it" is a real assertion rather than a
+    // coincidence about short strings.
+    let address = "ada-status-probe@example.test";
+    let id = ironauth_store::MessageId::generate(&env, &scope);
+    let bidx: Vec<u8> = (0_u8..32).map(|n| n ^ 0x5a).collect();
+    // State and reason in ONE statement: `messages_failure_reason_paired` requires them to
+    // agree, so a `failed` row inserted without its reason is refused rather than patched up.
+    sqlx::query(
+        "INSERT INTO messages \
+         (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key, state, \
+          failure_reason) \
+         VALUES ($1, $2, $3, 'email_otp', $4, $5, 'failed', 'bounced')",
+    )
+    .bind(id.to_string())
+    .bind(&tenant)
+    .bind(&environment)
+    .bind(&bidx)
+    .bind(format!("probe-{id}"))
+    .execute(h.db().owner_pool())
+    .await
+    .expect("seed a message");
+
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/messages/{id}");
+    let (status, _, body) = h.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "the message exists: {body}");
+    let view: Value = serde_json::from_str(&body).expect("a JSON body");
+
+    // THE VALUE, not the shape. Hex of the row's OWN index, computed here from the bytes the
+    // fixture inserted rather than by calling the same fold the handler calls.
+    let expected: String = {
+        use std::fmt::Write as _;
+        bidx.iter().fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+    };
+    assert_eq!(
+        view["recipient_bidx"].as_str(),
+        Some(expected.as_str()),
+        "the index must be THIS message's: a 64-character hex constant would satisfy a \
+         shape-only assertion"
+    );
+    assert_eq!(view["state"], "failed");
+    assert_eq!(view["failure_reason"], "bounced");
+    assert_eq!(view["kind"], "email_otp");
+    assert!(
+        view["created_at_unix_ms"].as_i64().is_some_and(|ms| ms > 0)
+            && view["updated_at_unix_ms"].as_i64().is_some_and(|ms| ms > 0),
+        "a failed message must be datable: {body}"
+    );
+
+    // AND NEVER THE ADDRESS. Asserted over the whole serialized body, so a leak through any
+    // field fails here, not only through the one the header talks about.
+    assert!(
+        !body.contains(address) && !body.contains("ada-status-probe"),
+        "the response must never carry the recipient: {body}"
+    );
+}
+
+/// A message id from another scope is not readable, and the refusal reveals nothing.
+///
+/// What this does and does not prove, stated exactly. The fence is STRUCTURAL: `ScopedId`
+/// exposes no scope-blind parse at all, only `parse_in_scope`, which folds "wrong prefix",
+/// "not base64", "wrong length" and "wrong scope" into one `NotInScope` carrying no detail. So
+/// there is no check here a mutation could delete, and a test claiming to catch one would be
+/// claiming something the type system already guarantees.
+///
+/// What it pins is the OBSERVABLE consequence: that this handler resolves ids through that
+/// path rather than by some other lookup, and that the refusal is byte-identical to a garbage
+/// identifier's. Both fixtures vary ONE dimension from the caller's scope -- a sibling
+/// environment of the same tenant, and a different tenant -- so neither can pass by a
+/// comparison that only looks at tenants.
+#[tokio::test]
+async fn a_message_from_another_scope_is_not_readable_and_the_refusal_reveals_nothing() {
+    let h = Harness::start(54).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (other_tenant, other_environment) = h.create_tenant("rival", "k-rival").await;
+    let env = ironauth_env::Env::system();
+
+    let sibling_environment = {
+        let (status, _, body) = h
+            .post(
+                &format!("/v1/tenants/{tenant}/environments"),
+                "k-sibling",
+                &serde_json::json!({ "display_name": "sibling", "kind": "dev" }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed a sibling env: {body}");
+        let created: Value = serde_json::from_str(&body).expect("a JSON body");
+        created["id"]
+            .as_str()
+            .expect("the new environment's id")
+            .to_owned()
+    };
+
+    // Minted under a SIBLING ENVIRONMENT of the caller's own tenant, and under ANOTHER TENANT.
+    let elsewhere = [
+        Scope::new(
+            TenantId::parse(&tenant).expect("tenant"),
+            EnvironmentId::parse(&sibling_environment).expect("sibling"),
+        ),
+        Scope::new(
+            TenantId::parse(&other_tenant).expect("other tenant"),
+            EnvironmentId::parse(&other_environment).expect("other environment"),
+        ),
+    ];
+
+    let (_, _, garbage) = h
+        .get(&format!(
+            "/v1/tenants/{tenant}/environments/{environment}/messages/not-an-identifier"
+        ))
+        .await;
+
+    for scope in elsewhere {
+        let id = ironauth_store::MessageId::generate(&env, &scope);
+        let (status, _, body) = h
+            .get(&format!(
+                "/v1/tenants/{tenant}/environments/{environment}/messages/{id}"
+            ))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an identifier minted elsewhere must not resolve here: {body}"
+        );
+        assert_eq!(
+            body, garbage,
+            "and it must answer EXACTLY as a garbage identifier does, or the difference tells \
+             a caller that some other scope's message exists"
+        );
+    }
+}

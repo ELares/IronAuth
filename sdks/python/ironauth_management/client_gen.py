@@ -431,6 +431,10 @@ class Client:
         """Report the environment's FIDO MDS3 cache health. GET /v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/webauthn/mds3/health", query, None)
 
+    def get_message_status(self, tenant_id: str, environment_id: str, message_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Read one message's delivery status. GET /v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/messages/{urllib.parse.quote(message_id)}", query, None)
+
     def get_migration_progress(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Report the environment's lazy-migration progress. GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/migration/progress", query, None)
@@ -810,6 +814,10 @@ class Client:
     def resend_invitation(self, tenant_id: str, environment_id: str, invitation_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Resend a pending invitation: invalidate the prior token and issue a fresh one. POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/resend."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/invitations/{urllib.parse.quote(invitation_id)}/resend", query, None)
+
+    def resend_message(self, tenant_id: str, environment_id: str, message_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Re-queue a terminal message for delivery. POST /v1/tenants/{tenant_id}/environments/{environment_id}/messages/{message_id}/resend."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/messages/{urllib.parse.quote(message_id)}/resend", query, None)
 
     def restore_tenant(self, tenant_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Restore a soft-deleted (offboarded) tenant inside its retention window. POST /v1/tenants/{tenant_id}/restore."""

@@ -5520,6 +5520,11 @@ export interface components {
         };
         /** @description One message's delivery status. */
         MessageStatusView: {
+            /**
+             * Format: int64
+             * @description When the send was accepted, as epoch milliseconds.
+             */
+            created_at_unix_ms: number;
             /** @description Why a failed delivery failed, as a classification rather than a provider response. */
             failure_reason?: string | null;
             /** @description The `msg_` identifier. */
@@ -5536,6 +5541,12 @@ export interface components {
             resend_count: number;
             /** @description `pending`, `sending`, `sent` or `failed`. */
             state: string;
+            /**
+             * Format: int64
+             * @description When the row last changed, as epoch milliseconds. A `failed` message with no date is
+             *     half an answer: a failure ten seconds old and one from last week are different problems.
+             */
+            updated_at_unix_ms: number;
         };
         /** @description An environment's lazy-migration progress (issue #56). */
         MigrationProgressView: {
