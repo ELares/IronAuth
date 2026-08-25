@@ -2,15 +2,12 @@
 
 //! The delivery consumer for the messaging island (issue #111).
 //!
-//! WHAT IS AND IS NOT WIRED, first, because the distinction is easy to overstate. This module
-//! is the thing that finally CALLS the island: it drives `prepare_message` and `deliver` over
-//! a real ledger row and writes down what happened, and its tests exercise that end to end
-//! against Postgres. Nothing in the shipped binary constructs it yet, and nothing enqueues a
-//! message in production either. Both are deliberate and both are the next changes: a consumer
-//! registered with an empty provider list would dead-letter every message it drained, so boot
-//! wiring waits on a real channel (SMTP), and the doors wait on the template resolution that
-//! decides what a message says. Until then this is a caller with a test harness for a caller,
-//! which is more than the island had and less than a product.
+//! WHAT IS AND IS NOT WIRED. The shipped binary constructs this and registers it as a
+//! consumer pool when `messaging.delivery_enabled` is set, so the island runs in a process
+//! rather than only under test. What is still missing is a PRODUCER: nothing in production
+//! enqueues a message yet, because the doors that would are waiting on the template
+//! resolution that decides what a message says. So the worker is real and the queue it
+//! drains is empty, which is the honest state and is one step short of a product.
 //!
 //! Eleven `message_*` modules decide everything about a send and, until this, not one of them
 //! ran outside a unit test. [`message_prepare`](crate::message_prepare) composes suppression, rate

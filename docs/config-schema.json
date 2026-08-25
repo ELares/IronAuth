@@ -851,6 +851,45 @@
       },
       "type": "object"
     },
+    "MessageProviderConfig": {
+      "additionalProperties": false,
+      "description": "One configured message provider, in failover order (issue #111).\n\nThe ORDER of the list is the failover order and it is the operator's, not ours: the primary\nis first, and each subsequent provider is tried only when the one before it was\nUNAVAILABLE. A provider that refuses the MESSAGE ends the walk, because every provider is\nlooking at the same message and would refuse it too.",
+      "properties": {
+        "endpoint": {
+          "description": "The HTTPS endpoint one send POSTs to.\n\nPlaintext is refused by the outbound fetch layer, which this never opts out of: a\nmessage body carries a login code and the recipient's address.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The operator's name for this provider. It lands in the delivery record and in failover\nreporting, so it should read like a provider (\"postmark\", \"ses-primary\") rather than\nlike a URL.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "endpoint"
+      ],
+      "type": "object"
+    },
+    "MessagingConfig": {
+      "additionalProperties": false,
+      "description": "Outbound MESSAGE delivery settings (issue #111).\n\nThese belong to the message consumer, not to the queue: how the queue is drained\n(concurrency, lease, backoff, retention) is `[outbox]`, which an operator tunes once for\nevery consumer rather than per subsystem.",
+      "properties": {
+        "delivery_enabled": {
+          "default": false,
+          "description": "Whether THIS process drains the `message.delivery` queue. OFF by default, like every\nother outbound consumer: no deployment gains mandatory background infrastructure by\nupgrading, and a deployment that wants messages says so.",
+          "type": "boolean"
+        },
+        "providers": {
+          "default": [],
+          "description": "The providers to try, in failover order. Empty is valid while delivery is off.\n\nEnabling delivery with an EMPTY list is refused at boot rather than at the first\nmessage: a consumer with no provider dead-letters everything it drains, and it would do\nso silently, one queued login code at a time, until somebody read the dead-letter queue.",
+          "items": {
+            "$ref": "#/$defs/MessageProviderConfig"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "OidcConfig": {
       "additionalProperties": false,
       "description": "OIDC provider settings (issue #12).\n\nThe public authorization and token endpoints. Lifetimes are configurable (the\ntunability principle) with safe defaults, never a baked-in one-way choice: the\nauthorization code is short-lived and single-use, the access token a little\nlonger. Mounting is opt-in so the default (and database-free) boot is\nunchanged.",
@@ -2826,6 +2865,14 @@
         "shipping_enabled": false
       },
       "description": "SIEM log stream shipping (issue #110): whether THIS process ships configured\nstreams to their sinks, and how often.\n\nSeparate from `[webhooks]` on purpose. That gates the tenant-facing event\ndeliverer; this gates the operator-facing audit export, and a deployment routinely\nwants one without the other."
+    },
+    "messaging": {
+      "$ref": "#/$defs/MessagingConfig",
+      "default": {
+        "delivery_enabled": false,
+        "providers": []
+      },
+      "description": "Outbound message delivery (issue #111)."
     },
     "oidc": {
       "$ref": "#/$defs/OidcConfig",

@@ -13,6 +13,8 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::events::WebhookFanoutConsumer;
 use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTargetReplayConsumer};
+use ironauth_admin::message_composer::DefaultComposer;
+use ironauth_admin::message_http_provider::HttpMessageProvider;
 use ironauth_admin::offboarding_worker::OffboardingConsumer;
 use ironauth_admin::trait_migration_worker::TraitMigrationConsumer;
 use ironauth_admin::webhook_delivery::{
@@ -36,6 +38,7 @@ use ironauth_oidc::{
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_server::{Server, ServerError};
+use ironauth_store::message_consumer::MessageDeliveryConsumer;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ironauth_store::{
@@ -346,6 +349,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
         let flow_target_inputs = flow_target_delivery_inputs(&config, &env);
+        let message_delivery = message_delivery_inputs(&config, &env);
         let trait_migration = trait_migration_inputs(&config, &env);
         let offboarding = offboarding_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
@@ -453,6 +457,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => spawn_flow_target_delivery_pools(inputs).await,
             None => Vec::new(),
         };
+        // The message delivery worker (issue #111), behind its own switch for the reason every
+        // outbound consumer here is: it is a different subsystem and must not require another
+        // one's configuration to run. BOUND so the shutdown below can await it.
+        let message_delivery_pools = match message_delivery {
+            Some(inputs) => spawn_message_delivery_pools(inputs).await,
+            None => Vec::new(),
+        };
         // The trait migration worker (issue #53), behind its own switch for the same
         // reason webhook delivery is: it is a different subsystem and must not require
         // another one's configuration to run. BOUND so the shutdown below can await it.
@@ -523,6 +534,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .into_iter()
             .chain(webhook_pools)
             .chain(flow_target_pools)
+            .chain(message_delivery_pools)
             .chain(trait_migration_pools)
             .chain(offboarding_pools)
             .chain(log_stream_replay_pools)
@@ -2924,6 +2936,163 @@ async fn spawn_backchannel_logout_pools(
         consumers = ?consumers.names(),
         pools = pools.len(),
         "back-channel logout delivery started on the outbox consumer pools"
+    );
+    pools
+}
+
+/// What the message delivery worker needs from config (issue #111).
+struct MessageDeliveryInputs {
+    messaging: ironauth_config::MessagingConfig,
+    outbox: OutboxConfig,
+    data_plane_dsn: String,
+    control_dsn: Option<String>,
+    master: Option<Arc<MasterKey>>,
+    sender_domain: String,
+    env: Env,
+}
+
+/// Capture the message delivery worker inputs from config (issue #111), or `None` when the
+/// worker is off. OFF by default, like every other outbound consumer: no deployment gains
+/// mandatory background infrastructure by upgrading.
+fn message_delivery_inputs(config: &Config, env: &Env) -> Option<MessageDeliveryInputs> {
+    if !config.messaging.delivery_enabled {
+        return None;
+    }
+    Some(MessageDeliveryInputs {
+        messaging: config.messaging.clone(),
+        outbox: config.outbox.clone(),
+        data_plane_dsn: config.database.url.expose().to_owned(),
+        control_dsn: select_control_dsn(config),
+        master: resolve_master_key(config),
+        // The right-hand side of every Message-ID this deployment stamps. RFC 5322 section
+        // 3.6.4 wants it globally unique, and the deployment's own public host is what makes
+        // it so rather than merely random. Falls back to a reserved name rather than to
+        // something that might belong to somebody else: `.invalid` is reserved by RFC 2606
+        // exactly so it can never resolve.
+        sender_domain: config
+            .server
+            .public_url
+            .as_deref()
+            .and_then(|url| url.parse::<http::Uri>().ok())
+            .and_then(|uri| uri.host().map(str::to_owned))
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "ironauth.invalid".to_owned()),
+        env: env.clone(),
+    })
+}
+
+/// The configured providers as (name, endpoint), IN CONFIGURED ORDER.
+///
+/// Split out so the ORDER can be asserted. The order is the failover order and it is the
+/// operator's: the primary is first, and reversing it silently demotes the provider they chose
+/// to last resort. Built inline, that decision was untestable without a database and a
+/// fetcher, and a review confirmed a `.rev()` inserted here survived the entire suite.
+fn provider_specs(messaging: &ironauth_config::MessagingConfig) -> Vec<(String, String)> {
+    messaging
+        .providers
+        .iter()
+        .map(|configured| (configured.name.clone(), configured.endpoint.clone()))
+        .collect()
+}
+
+/// Start the message delivery worker (issue #111) on the generic outbox worker pool.
+///
+/// The FIFTH production consumer of the #104 framework, and the one that finally gives the
+/// eleven `message_*` modules a caller in a running process rather than in a test.
+async fn spawn_message_delivery_pools(inputs: MessageDeliveryInputs) -> Vec<OutboxWorkerPool> {
+    let MessageDeliveryInputs {
+        messaging,
+        outbox,
+        data_plane_dsn,
+        control_dsn,
+        master,
+        sender_domain,
+        env,
+    } = inputs;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "message delivery worker not started: no control-plane DSN to enumerate scopes \
+             (set admin.control_database_url, or run in dev_mode). The delivery queue is \
+             durable, so nothing is lost; enable the control plane to drain it."
+        );
+        return Vec::new();
+    };
+    // Refusing to start beats starting a worker that cannot send. Every message opens its
+    // recipient from a sealed column, so without a master key EVERY delivery fails at the
+    // unseal, burns its whole attempt budget, and dead-letters. That turns one missing
+    // configuration value into permanently discarded login codes.
+    let Some(master) = master else {
+        tracing::error!(
+            "message delivery worker not started: database.master_key is unset, so no \
+             message's recipient could be opened and every delivery would dead-letter. The \
+             queue is durable; set database.master_key to drain it."
+        );
+        return Vec::new();
+    };
+
+    let data_store = match Store::connect(&data_plane_dsn).await {
+        Ok(store) => store.with_master_key(master),
+        Err(error) => {
+            tracing::error!(%error, "message delivery worker not started: data-plane connect failed");
+            return Vec::new();
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "message delivery worker not started: control-plane connect failed");
+            return Vec::new();
+        }
+    };
+
+    // One fetcher for every provider. The SSRF policy, the timeouts and the response ceiling
+    // are the outbound ones an operator already tuned, not per-provider settings.
+    let fetcher = match ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default()) {
+        Ok(fetcher) => Arc::new(fetcher),
+        Err(error) => {
+            tracing::error!(%error, "message delivery worker not started: fetcher setup failed");
+            return Vec::new();
+        }
+    };
+    // In CONFIGURED order, which is the failover order: the primary is first and each
+    // subsequent provider is tried only when the previous was unavailable. Config validation
+    // has already refused an enabled worker with an empty list, so this cannot be empty here.
+    let specs = provider_specs(&messaging);
+    let provider_names: Vec<String> = specs.iter().map(|(name, _)| name.clone()).collect();
+    let providers: Vec<Box<dyn ironauth_store::message_delivery::MessageProvider>> = specs
+        .iter()
+        .map(|(name, endpoint)| {
+            Box::new(HttpMessageProvider::new(
+                name.clone(),
+                endpoint.clone(),
+                Arc::clone(&fetcher),
+            )) as Box<dyn ironauth_store::message_delivery::MessageProvider>
+        })
+        .collect();
+
+    let composer = Arc::new(DefaultComposer::new(sender_domain))
+        as Arc<dyn ironauth_store::message_consumer::MessageComposer>;
+
+    let mut consumers = ConsumerRegistry::new();
+    if let Err(error) = consumers.register(Arc::new(MessageDeliveryConsumer::new(
+        data_store.clone(),
+        providers,
+        composer,
+    )) as Arc<dyn OutboxConsumer>)
+    {
+        tracing::error!(%error, "message delivery worker not started: duplicate consumer name");
+        return Vec::new();
+    }
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer = outbox_observer();
+    let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
+
+    tracing::info!(
+        providers = ?provider_names,
+        pools = pools.len(),
+        "message delivery worker started"
     );
     pools
 }
@@ -5937,5 +6106,99 @@ mod tests {
                  scope's pass are different sizes of outage and must not share a series"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod message_delivery_wiring_tests {
+    use super::{message_delivery_inputs, provider_specs};
+    use ironauth_config::{Config, MessageProviderConfig, MessagingConfig};
+    use ironauth_env::Env;
+
+    fn messaging(enabled: bool, names: &[&str]) -> MessagingConfig {
+        MessagingConfig {
+            delivery_enabled: enabled,
+            providers: names
+                .iter()
+                .map(|name| MessageProviderConfig {
+                    name: (*name).to_owned(),
+                    endpoint: format!("https://{name}.example.test/send"),
+                })
+                .collect(),
+        }
+    }
+
+    fn config_with(messaging: MessagingConfig) -> Config {
+        Config {
+            messaging,
+            ..Config::default()
+        }
+    }
+
+    /// The enable gate points the right way.
+    ///
+    /// A review inverted it -- so the worker started only when an operator turned delivery OFF
+    /// -- and the whole suite stayed bit-identical, clippy included. A feature that can be
+    /// wired backwards with nothing going red is a feature nothing measures.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn the_worker_starts_when_delivery_is_enabled_and_not_when_it_is_off() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 31);
+
+        let off = config_with(messaging(false, &["primary"]));
+        assert!(
+            message_delivery_inputs(&off, &env).is_none(),
+            "delivery off must not start a worker"
+        );
+
+        let on = config_with(messaging(true, &["primary"]));
+        assert!(
+            message_delivery_inputs(&on, &env).is_some(),
+            "delivery on must start one; inverted, the worker runs exactly when the operator \
+             asked for silence"
+        );
+    }
+
+    /// CONFIGURED order is FAILOVER order.
+    ///
+    /// The primary is first and each subsequent provider is tried only when the one before it
+    /// was unavailable, so reversing the list silently demotes the operator's primary to last
+    /// resort. Measured: a `.rev()` here survived the entire suite before this test.
+    #[test]
+    fn the_provider_list_preserves_the_configured_order() {
+        let specs = provider_specs(&messaging(true, &["primary", "secondary", "tertiary"]));
+        let names: Vec<&str> = specs.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["primary", "secondary", "tertiary"],
+            "the operator's order is the failover order"
+        );
+        assert_eq!(specs[0].1, "https://primary.example.test/send");
+    }
+
+    /// The delivery pool is awaited by the graceful shutdown rather than dropped.
+    ///
+    /// A dropped pool stops its workers at the next flag check, which is the opposite of a
+    /// graceful stop: a message mid-delivery has its lease lapse instead of finishing. This is
+    /// a text pin, the same shape `outbox_observer_pin.rs` uses for the observer seams, because
+    /// the alternative is booting a server to observe a shutdown ordering.
+    #[test]
+    fn the_delivery_pool_is_chained_into_the_shutdown() {
+        // Search only the code ABOVE this test module. `include_str!` reads the whole file,
+        // and the needle appears in this test's own source, so an unscoped `contains` finds
+        // itself and passes however the shutdown is written. Measured: it did exactly that --
+        // deleting the real chain call left this test green.
+        let source = include_str!("main.rs");
+        let marker = concat!("mod ", "message_delivery_wiring_tests");
+        let code = source
+            .split(marker)
+            .next()
+            .expect("the file has a first part");
+        let needle = concat!(".chain(", "message_delivery_pools)");
+        assert!(
+            code.contains(needle),
+            "the message delivery pool must be chained into the shutdown loop; dropping it \
+             instead stops workers at the next flag check rather than awaiting them"
+        );
     }
 }

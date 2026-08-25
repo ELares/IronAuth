@@ -9,6 +9,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Parsing the deployment public URL to the host half of every Message-ID (issue #111).
+http.workspace = true
 ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-server.workspace = true

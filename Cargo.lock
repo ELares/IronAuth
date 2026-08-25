@@ -1489,6 +1489,7 @@ name = "ironauth"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "http",
  "ironauth-admin",
  "ironauth-admin-ui",
  "ironauth-apply",

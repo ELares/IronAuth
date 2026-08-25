@@ -85,6 +85,7 @@ mod flow_targets;
 mod log_streams;
 mod mds3_health;
 mod memberships;
+pub mod message_composer;
 pub mod message_http_provider;
 mod migration;
 mod migration_runs;
