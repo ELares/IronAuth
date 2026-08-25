@@ -468,26 +468,39 @@ async fn enqueue_refuses_an_identifier_from_another_scope_and_writes_nothing() {
 ///
 /// Asserting "both are present after a success" does not measure atomicity: two sequential
 /// commits produce that too. What distinguishes them is what a FAILURE leaves behind, so this
-/// makes the second write fail (the outbox job hits a deferred constraint it cannot satisfy)
-/// and requires the first to be gone with it.
+/// makes the SECOND write fail and requires the first to be gone with it.
+///
+/// The failure is induced with a row, not with DDL. An earlier version added a CHECK
+/// constraint to `outbox_messages` and dropped it afterwards, which passed locally and hung
+/// CI's ironbus lane for thirty minutes: `ALTER TABLE` takes an ACCESS EXCLUSIVE lock, and in
+/// that lane a live consumer is polling the same table, so the ALTER queued behind it and
+/// every later reader queued behind the ALTER. Occupying the outbox's unique
+/// (tenant, environment, consumer, idempotency_key) with the id this enqueue is about to use
+/// needs only a row lock, and fails the insert for exactly the reason the test is about.
 #[tokio::test]
 async fn a_failed_delivery_job_takes_the_message_row_with_it() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x11c);
     let scope = db.seed_scope(&env).await;
 
-    // Force the SECOND write in the transaction to fail: a CHECK on the outbox that the
-    // enqueue cannot satisfy. If the two writes were separate transactions the message row
-    // would survive this.
+    // The id this send will use, minted first so its delivery job's idempotency key can be
+    // taken before the send is made.
+    let id = MessageId::generate(&env, &scope);
     sqlx::query(
-        "ALTER TABLE outbox_messages ADD CONSTRAINT probe_message_delivery_refused \
-         CHECK (consumer <> 'message.delivery')",
+        "INSERT INTO outbox_messages \
+         (id, tenant_id, environment_id, consumer, idempotency_key, ordering_key, payload, \
+          next_attempt_at, enqueued_at) \
+         VALUES ($1, $2, $3, $4, $5, 'squatter', '{}'::jsonb, now(), now())",
     )
+    .bind("obx_squatter_probe")
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(MESSAGE_DELIVERY_CONSUMER)
+    .bind(id.to_string())
     .execute(db.owner_pool())
     .await
-    .expect("install the probe constraint");
+    .expect("occupy the idempotency key this send will want");
 
-    let id = MessageId::generate(&env, &scope);
     let key = dedup_key(
         "email_otp",
         "ada@example.test",
@@ -509,7 +522,10 @@ async fn a_failed_delivery_job_takes_the_message_row_with_it() {
             &payload("email_otp"),
         )
         .await;
-    assert!(outcome.is_err(), "the delivery job could not be queued");
+    assert!(
+        outcome.is_err(),
+        "the delivery job could not be queued, so the enqueue must fail"
+    );
 
     let rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM messages WHERE tenant_id = $1 AND environment_id = $2",
@@ -524,11 +540,6 @@ async fn a_failed_delivery_job_takes_the_message_row_with_it() {
         "a message recorded without its delivery job never sends, and an operator reading \
          the ledger would be told it did"
     );
-
-    sqlx::query("ALTER TABLE outbox_messages DROP CONSTRAINT probe_message_delivery_refused")
-        .execute(db.owner_pool())
-        .await
-        .expect("remove the probe constraint");
 }
 
 /// Row-level security on `messages` is real, not merely declared.
