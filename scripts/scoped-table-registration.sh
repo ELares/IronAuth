@@ -77,7 +77,7 @@ exceptions = set(sys.argv[1:])
 # The size of the derived set today. Raise it when tables are added; LOWER it only
 # in the change that deliberately drops one. Its job is to make a pattern that
 # stops matching fail loudly instead of reporting a smaller clean run.
-FORCED_FLOOR = 118
+FORCED_FLOOR = 119
 
 
 def statements(text):

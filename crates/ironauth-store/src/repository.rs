@@ -106,6 +106,7 @@ use crate::identifier::{
 };
 use crate::impersonation::Impersonation;
 use crate::locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
+use crate::message_rate::{RateBudget, RateDecision, rate_decision};
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recovery::{
@@ -22516,12 +22517,31 @@ pub struct NewMessage<'a> {
 }
 
 /// Whether an enqueue wrote a new message or collapsed onto one already in the window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Enqueued {
     /// A new message was written and a delivery job queued.
     Accepted,
     /// An identical send is already in this window, so nothing was written or queued.
     Collapsed,
+    /// The recipient is SUPPRESSED. Nothing was written or queued (issue #111 criterion 6).
+    ///
+    /// Distinct from [`Enqueued::Collapsed`] because they are opposite answers to "should I
+    /// try again later": a collapse means the recipient already has this message, and a
+    /// suppression means they must not be sent one at all until somebody un-suppresses them.
+    Suppressed {
+        /// Why, as the classification the suppression was recorded under.
+        reason: String,
+    },
+    /// The per-recipient rate limit refused this send (issue #111 criterion 5).
+    ///
+    /// Distinct from [`Enqueued::Suppressed`] because a suppression is PERMANENT and the
+    /// caller should stop asking, while this is TEMPORARY and carries the instant a retry
+    /// could succeed. Folding them together would have a caller either give up on a send that
+    /// would work in a minute, or retry forever one that never will.
+    RateLimited {
+        /// The epoch second at which this recipient's oldest counted send leaves the window.
+        retry_after_epoch_seconds: u64,
+    },
 }
 
 /// How a delivery attempt ended (issue #111 criterion 1).
@@ -22576,6 +22596,8 @@ impl MessageRepo<'_> {
         env: &Env,
         message: NewMessage<'_>,
         payload: &serde_json::Value,
+        budget: RateBudget,
+        now_epoch_seconds: u64,
     ) -> Result<Enqueued, StoreError> {
         if message.id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -22593,6 +22615,24 @@ impl MessageRepo<'_> {
             use std::fmt::Write as _;
             let _ = write!(ordering_key, "{byte:02x}");
         }
+
+        // HYGIENE FIRST, before the row and before the job. `message_prepare` states the
+        // ordering and the reason: putting a recipient's data through the pipeline for a
+        // message that policy has already refused makes the logs read as though a send was
+        // prepared when it never should have been. Refusing here also means a blocked send
+        // never occupies the collapse window, so a later legitimate send is not swallowed by
+        // one that was refused.
+        if let Some(reason) = self.suppression_reason(&bidx).await? {
+            return Ok(Enqueued::Suppressed { reason });
+        }
+        if let RateDecision::Block {
+            retry_after_epoch_seconds,
+        } = self.rate_decision(&bidx, budget, now_epoch_seconds).await?
+        {
+            return Ok(Enqueued::RateLimited {
+                retry_after_epoch_seconds,
+            });
+        }
         let mut tx = begin_scoped(self.store, scope).await?;
         // The address, sealed under the scope's active DEK. The consumer cannot mail a blind
         // index, so a queued send has to be able to recover what it is sending to; sealing it
@@ -22607,8 +22647,8 @@ impl MessageRepo<'_> {
         let inserted = sqlx::query(
             "INSERT INTO messages \
              (id, tenant_id, environment_id, kind, recipient_bidx, dedup_key, \
-              recipient_sealed, pii_dek_version) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+              recipient_sealed, pii_dek_version, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9), to_timestamp($9)) \
              ON CONFLICT (tenant_id, environment_id, dedup_key) DO NOTHING",
         )
         .bind(message.id.to_string())
@@ -22619,6 +22659,12 @@ impl MessageRepo<'_> {
         .bind(message.dedup_key)
         .bind(sealed.into_bytes())
         .bind(dek_version)
+        // The CALLER's clock, not the database's. The rate limit reads these timestamps back
+        // and compares them against a caller-supplied instant, so the two have to be the same
+        // time source: with `now()` here, a deterministic clock in a test compares real
+        // timestamps against synthetic ones and every send counts as in-window forever. In
+        // production both are wall clock and the bug is invisible, which is the worst kind.
+        .bind(i64::try_from(now_epoch_seconds).unwrap_or(i64::MAX))
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -22648,6 +22694,66 @@ impl MessageRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(Enqueued::Accepted)
+    }
+
+    /// Why this recipient is suppressed, or [`None`] (issue #111 criterion 6).
+    ///
+    /// Keyed on the blind index, so this asks "is this mailbox suppressed" without the table
+    /// ever holding the mailbox.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    async fn suppression_reason(&self, bidx: &BlindIndex) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT reason FROM message_suppressions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND recipient_bidx = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(bidx.as_bytes())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Whether this recipient is within their send budget (issue #111 criterion 5).
+    ///
+    /// The recent-send history comes from the LEDGER rather than from a counter table. That is
+    /// deliberate: the ledger already records every accepted send with its timestamp, so a
+    /// separate counter would be a second source of truth that can disagree with the first,
+    /// and the disagreement would surface as a user who is rate limited according to one and
+    /// not the other. A refused send writes no row, so it correctly does not count against the
+    /// budget it was refused by.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    async fn rate_decision(
+        &self,
+        bidx: &BlindIndex,
+        budget: RateBudget,
+        now_epoch_seconds: u64,
+    ) -> Result<RateDecision, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let sent_at: Vec<i64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM created_at)::bigint FROM messages \
+             WHERE tenant_id = $1 AND environment_id = $2 AND recipient_bidx = $3 \
+             ORDER BY created_at DESC LIMIT 1000",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(bidx.as_bytes())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let recent: Vec<u64> = sent_at
+            .into_iter()
+            .map(|seconds| u64::try_from(seconds).unwrap_or(0))
+            .collect();
+        Ok(rate_decision(&recent, now_epoch_seconds, budget))
     }
 
     /// Claim this message for delivery, moving it `pending` -> `sending`.

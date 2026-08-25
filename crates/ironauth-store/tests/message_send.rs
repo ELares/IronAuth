@@ -15,6 +15,7 @@
 
 use ironauth_env::Env;
 use ironauth_store::message_hygiene::{dedup_key, normalize_recipient, window_index};
+use ironauth_store::message_rate::RateBudget;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, Enqueued, MESSAGE_DELIVERY_CONSUMER, MessageId, NewMessage, Resolution, Scope,
@@ -78,6 +79,10 @@ async fn send_with_id(
                 dedup_key: &key,
             },
             &payload(kind),
+            // A budget wide enough that these tests are about the COLLAPSE, not the rate
+            // limit. The rate limit has its own tests.
+            RateBudget::new(1_000, 3_600),
+            at_secs,
         )
         .await
         .expect("enqueue");
@@ -109,6 +114,10 @@ async fn send(
                 dedup_key: &key,
             },
             &payload(kind),
+            // A budget wide enough that these tests are about the COLLAPSE, not the rate
+            // limit. The rate limit has its own tests.
+            RateBudget::new(1_000, 3_600),
+            at_secs,
         )
         .await
         .expect("enqueue")
@@ -327,6 +336,8 @@ async fn the_row_holds_a_blind_index_and_never_the_address() {
                 dedup_key: &key,
             },
             &payload("email_otp"),
+            RateBudget::new(1_000, 3_600),
+            1_000,
         )
         .await
         .expect("enqueue");
@@ -514,6 +525,8 @@ async fn enqueue_refuses_an_identifier_from_another_scope_and_writes_nothing() {
                 dedup_key: &key,
             },
             &payload("email_otp"),
+            RateBudget::new(1_000, 3_600),
+            1_000,
         )
         .await;
     assert!(
@@ -596,6 +609,8 @@ async fn a_failed_delivery_job_takes_the_message_row_with_it() {
                 dedup_key: &key,
             },
             &payload("email_otp"),
+            RateBudget::new(1_000, 3_600),
+            1_000,
         )
         .await;
     assert!(
@@ -868,5 +883,258 @@ async fn a_failed_delivery_records_its_reason() {
     assert_eq!(
         record.failure_reason.as_deref(),
         Some("all_providers_unavailable")
+    );
+}
+
+/// Enqueue with an explicit budget and clock, for the hygiene tests.
+async fn send_at(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    recipient: &str,
+    budget: RateBudget,
+    now: u64,
+    window_at: u64,
+) -> Enqueued {
+    let normalized = normalize_recipient(recipient).expect("a deliverable address");
+    let key = dedup_key("email_otp", recipient, window_index(window_at, WINDOW_SECS))
+        .expect("a dedup key");
+    let id = MessageId::generate(env, &scope);
+    db.store()
+        .scoped(scope)
+        .messages()
+        .enqueue(
+            env,
+            NewMessage {
+                id: &id,
+                kind: "email_otp",
+                recipient: &normalized,
+                dedup_key: &key,
+            },
+            &payload("email_otp"),
+            budget,
+            now,
+        )
+        .await
+        .expect("enqueue")
+}
+
+/// Suppress a recipient with a reason.
+async fn suppress(db: &TestDatabase, scope: Scope, bidx: &[u8], reason: &str) {
+    sqlx::query(
+        "INSERT INTO message_suppressions \
+         (tenant_id, environment_id, recipient_bidx, reason) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(bidx)
+    .bind(reason)
+    .execute(db.owner_pool())
+    .await
+    .expect("record a suppression");
+}
+
+/// CRITERION 6. A send to a suppressed address is BLOCKED and the reason is queryable.
+///
+/// Blocked means nothing is written and nothing is queued: continuing to mail an address that
+/// hard bounced burns the sending domain's reputation for every other tenant on it, and
+/// continuing to mail one that complained is what gets a sender blocklisted.
+#[tokio::test]
+async fn a_send_to_a_suppressed_recipient_is_blocked_with_its_reason() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x150);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    // Learn the blind index by making one accepted send, then suppress that recipient.
+    let accepted = send_at(
+        &db,
+        &env,
+        scope,
+        "ada@example.test",
+        RateBudget::new(1_000, 3_600),
+        1_000,
+        1_000,
+    )
+    .await;
+    assert_eq!(accepted, Enqueued::Accepted);
+    let bidx: Vec<u8> = sqlx::query_scalar(
+        "SELECT recipient_bidx FROM messages WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("the index");
+    suppress(&db, scope, &bidx, "hard_bounce").await;
+
+    let before = queued(&db, scope).await;
+    // A LATER window, so a collapse cannot be what blocks it.
+    let refused = send_at(
+        &db,
+        &env,
+        scope,
+        "ada@example.test",
+        RateBudget::new(1_000, 3_600),
+        90_000,
+        90_000,
+    )
+    .await;
+    assert_eq!(
+        refused,
+        Enqueued::Suppressed {
+            reason: "hard_bounce".to_owned()
+        },
+        "a suppressed recipient must be refused WITH the reason: the operator's question is \
+         never whether it is suppressed, it is why their user gets no mail"
+    );
+    assert_eq!(
+        queued(&db, scope).await,
+        before,
+        "a blocked send must queue no delivery"
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .messages()
+            .count()
+            .await
+            .expect("count"),
+        1,
+        "and write no row: a blocked send that occupied the collapse window would swallow a \
+         later legitimate one"
+    );
+}
+
+/// A DIFFERENT recipient is unaffected: suppression is per mailbox, not per scope.
+#[tokio::test]
+async fn suppressing_one_recipient_does_not_block_another() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x151);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    send_at(
+        &db,
+        &env,
+        scope,
+        "ada@example.test",
+        RateBudget::new(1_000, 3_600),
+        1_000,
+        1_000,
+    )
+    .await;
+    let bidx: Vec<u8> = sqlx::query_scalar(
+        "SELECT recipient_bidx FROM messages WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("the index");
+    suppress(&db, scope, &bidx, "complaint").await;
+
+    let other = send_at(
+        &db,
+        &env,
+        scope,
+        "grace@example.test",
+        RateBudget::new(1_000, 3_600),
+        90_000,
+        90_000,
+    )
+    .await;
+    assert_eq!(
+        other,
+        Enqueued::Accepted,
+        "one suppressed mailbox must not silence the whole environment"
+    );
+}
+
+/// CRITERION 5. Exceeding the per-recipient budget BLOCKS the send.
+///
+/// The budget counts accepted sends in the window. A refused send writes no row, so it does not
+/// count against the budget that refused it -- otherwise one refusal would extend the block for
+/// a full window every time the caller retried.
+#[tokio::test]
+async fn exceeding_the_per_recipient_budget_blocks_the_send() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x152);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let budget = RateBudget::new(2, 3_600);
+    // The two clocks are decoupled ON PURPOSE. The rate clock stays close together so all
+    // three sends fall inside one 3600-second budget window, while the dedup window index is
+    // pushed far apart so none of them collapses onto another. Using one value for both makes
+    // the sends age out of the budget before the third arrives, and the test then passes for
+    // the wrong reason -- it did, before this comment.
+    for (n, now, window_at) in [(1_u32, 1_000_u64, 1_000_u64), (2, 1_200, 90_000)] {
+        let outcome = send_at(&db, &env, scope, "ada@example.test", budget, now, window_at).await;
+        assert_eq!(outcome, Enqueued::Accepted, "send {n} is within budget");
+    }
+
+    let before = queued(&db, scope).await;
+    let refused = send_at(&db, &env, scope, "ada@example.test", budget, 1_400, 180_000).await;
+    match refused {
+        Enqueued::RateLimited {
+            retry_after_epoch_seconds,
+        } => assert!(
+            retry_after_epoch_seconds > 1_400,
+            "the caller must be told WHEN to come back, not left to guess: {retry_after_epoch_seconds}"
+        ),
+        other => panic!("the third send must be rate limited, got {other:?}"),
+    }
+    assert_eq!(
+        queued(&db, scope).await,
+        before,
+        "a blocked send queues nothing"
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .messages()
+            .count()
+            .await
+            .expect("count"),
+        2,
+        "and writes no row, so the refusal does not extend its own block"
+    );
+}
+
+/// A send OUTSIDE the window is allowed again, so the limit is a window rather than a cap.
+#[tokio::test]
+async fn the_budget_refills_once_the_window_passes() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x153);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    // A one-hour budget of one. The second send is inside it, the third is past it.
+    let budget = RateBudget::new(1, 3_600);
+    assert_eq!(
+        send_at(&db, &env, scope, "ada@example.test", budget, 1_000, 1_000).await,
+        Enqueued::Accepted
+    );
+    assert!(
+        matches!(
+            send_at(&db, &env, scope, "ada@example.test", budget, 2_000, 90_000).await,
+            Enqueued::RateLimited { .. }
+        ),
+        "a second send inside the window is over budget"
+    );
+    assert_eq!(
+        send_at(
+            &db,
+            &env,
+            scope,
+            "ada@example.test",
+            budget,
+            100_000,
+            180_000
+        )
+        .await,
+        Enqueued::Accepted,
+        "and past the window the budget has refilled"
     );
 }

@@ -17,6 +17,7 @@ use ironauth_store::message_delivery::{MessageProvider, SendFuture};
 use ironauth_store::message_failover::Outcome;
 use ironauth_store::message_hygiene::{dedup_key, normalize_recipient, window_index};
 use ironauth_store::message_prepare::PreparedMessage;
+use ironauth_store::message_rate::RateBudget;
 use ironauth_store::message_template::{Locale, TemplateLevel};
 use ironauth_store::outbox::OutboxConsumer;
 use ironauth_store::test_support::TestDatabase;
@@ -163,6 +164,8 @@ async fn enqueue_send(
                 dedup_key: &key,
             },
             &serde_json::json!({ "code": "123456" }),
+            RateBudget::new(1_000, 3_600),
+            1_000,
         )
         .await
         .expect("enqueue");
