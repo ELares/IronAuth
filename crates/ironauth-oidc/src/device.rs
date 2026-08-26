@@ -663,6 +663,8 @@ async fn mint_device_tokens(
             id_token_signer: None,
             // The device-authorization grant carries no DPoP proof: a bearer token.
             confirmation: None,
+            // The pre-token hook is the only writer; every other path contributes none.
+            access_extra_claims: crate::tokens::no_extra_claims(),
         },
         &target,
     )

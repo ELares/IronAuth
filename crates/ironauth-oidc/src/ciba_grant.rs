@@ -368,6 +368,8 @@ async fn mint_ciba_tokens(
             extra_claims: &extra_claims,
             id_token_signer: None,
             confirmation: None,
+            // The pre-token hook is the only writer; every other path contributes none.
+            access_extra_claims: crate::tokens::no_extra_claims(),
         },
         &target,
     )
