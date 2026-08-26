@@ -32379,9 +32379,9 @@ impl ActingClaimsMappingRepo<'_> {
 
     /// Delete this client's mapping and audit `claims_mapping.delete` in the same transaction.
     ///
-    /// Deleting a mapping RESTORES THE UNSHAPED TOKEN, which is a widening: claims the mapping
-    /// filtered out come back, and claims it placed in one token appear in both. That is why it
-    /// is audited, and why the audit is not optional.
+    /// Deleting a mapping RESTORES THE UNMAPPED TOKEN, in both directions: claims the mapping
+    /// filtered out come back to the ID token, and a claim it had PLACED in the access token
+    /// stops reaching one. That is why it is audited, and why the audit is not optional.
     ///
     /// # Errors
     ///

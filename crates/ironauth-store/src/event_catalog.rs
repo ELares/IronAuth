@@ -2108,9 +2108,11 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
-        // Removing a mapping restores the UNSHAPED token, which is a widening: claims the
-        // mapping filtered out come back, and claims it placed in one token appear in both.
-        // That is the direction that matters on an audit stream.
+        // Removing a mapping restores the UNMAPPED token, and that is a change in BOTH
+        // directions: claims the mapping filtered out come back to the ID token, and a claim it
+        // had placed in the access token stops reaching one. Both are why it belongs on an
+        // audit stream -- a consumer cannot tell which without refetching, and either can break
+        // something downstream.
         "claims_mapping.deleted",
         1,
         r#"{

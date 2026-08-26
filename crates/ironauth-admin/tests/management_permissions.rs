@@ -177,8 +177,9 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // because a mapping decides the shape of EVERY token a client is issued -- which claims it
     // carries, under what names, and in which of the two tokens -- so a credential that could
     // set one could change what every resource server downstream sees. The DELETE is classified
-    // the same way for the reason that is easy to miss: removing a mapping is a WIDENING, since
-    // claims it filtered out come back and claims it placed in one token appear in both.
+    // the same way for the reason that is easy to miss: removing a mapping CHANGES THE SHAPE OF
+    // EVERY TOKEN in both directions -- claims it filtered out come back to the ID token, and a
+    // claim it had placed in the access token stops reaching one.
     ("setClaimsMapping", ManagementPermission::WriteConfig),
     ("deleteClaimsMapping", ManagementPermission::WriteConfig),
     ("getClaimsMapping", ManagementPermission::Read),

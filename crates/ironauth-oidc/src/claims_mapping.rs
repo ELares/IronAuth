@@ -575,7 +575,8 @@ mod tests {
         );
     }
 
-    /// A claim no rule places goes in BOTH, which is what happened before mappings existed.
+    /// A claim no rule places stays in the ID TOKEN, which is where the extra-claims bag went
+    /// before this layer had a reader.
     #[test]
     fn an_unplaced_claim_stays_where_it_went_before_this_layer_existed() {
         let mapped = apply(&[], &source()).expect("applies");

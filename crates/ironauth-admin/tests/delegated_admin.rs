@@ -3437,10 +3437,11 @@ async fn write_config_is_required_and_sufficient_for_a_claims_mapping_write() {
 
 /// `management.write_config` is required AND sufficient for a claim-mapping DELETE (#113).
 ///
-/// Classified the same as the write, and pinned separately, because the reason is one that is
-/// easy to get wrong: deleting a mapping RESTORES THE UNSHAPED TOKEN. Claims the mapping filtered
-/// out come back and claims it placed in one token appear in both, so a delete is a widening
-/// rather than a removal of authority.
+/// Classified the same as the write, and pinned separately, because the reason is easy to get
+/// wrong in both directions. Deleting a mapping RESTORES THE UNMAPPED TOKEN: claims the mapping
+/// filtered out come back to the ID token, and a claim it had PLACED in the access token stops
+/// reaching one. So a delete is not "a removal of authority" -- it is a change to the shape of
+/// every token this client is issued, which is the same thing the write is.
 #[tokio::test]
 async fn write_config_is_required_and_sufficient_for_a_claims_mapping_delete() {
     let h = Harness::start(64).await;

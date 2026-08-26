@@ -9,7 +9,8 @@
 //! So the assertions here are all of the form "mint a token and look at what is in it". Every one
 //! of them was false before this change, whatever the unit tests said:
 //!
-//! - a `static` rule puts a claim in a token, and in BOTH tokens when nothing places it
+//! - a `static` rule reaches the ID token, and the access token only when a rule PLACES it
+//!   there -- the default was `Both`, which made installing any mapping a widening
 //! - `place` moves a claim into one token and OUT of the other
 //! - `rename` and `filter_list` act on a claim the SERVER contributed, not one the mapping
 //!   invented, which is the case an operator actually has

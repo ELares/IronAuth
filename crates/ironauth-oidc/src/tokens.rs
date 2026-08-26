@@ -2075,7 +2075,9 @@ mod tests {
         use std::sync::OnceLock;
         static EMPTY: OnceLock<crate::claims_mapping_at_issuance::MappedAccessClaims> =
             OnceLock::new();
-        EMPTY.get_or_init(crate::claims_mapping_at_issuance::MappedAccessClaims::default)
+        EMPTY.get_or_init(|| {
+            crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(serde_json::Map::new())
+        })
     }
 
     /// A minimal request over a throwaway scope, for the pure claim builder.

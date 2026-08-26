@@ -11,8 +11,11 @@
 -- The operation exists now: `ActingClaimsMappingRepo::delete`, audited as
 -- `claims_mapping.delete`, behind the management API's `DELETE .../claims-mapping`.
 --
--- CONTROL PLANE ONLY, which is the same split 0159 drew for INSERT and UPDATE. Deleting a
--- mapping RESTORES THE UNSHAPED TOKEN -- claims the mapping filtered out come back, and claims
--- it placed in one token appear in both -- so it is a widening, and the plane that mints tokens
--- must not be able to perform one on itself.
+-- CONTROL PLANE ONLY, which is the same split 0159 drew for INSERT and UPDATE.
+--
+-- Deleting a mapping restores the UNMAPPED token, and that is a change in BOTH directions:
+-- claims the mapping filtered out come back to the ID token, and a claim it had PLACED in the
+-- access token stops reaching one, so a resource server authorizing on it starts refusing.
+-- Either way it changes the shape of every token this client is issued, and the plane that
+-- mints them must not be able to do that to itself.
 GRANT DELETE ON claims_mappings TO ironauth_control;

@@ -269,9 +269,14 @@ pub async fn delete_claims_mapping(
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
     principal.require_permission(ManagementPermission::WriteConfig)?;
-    // Deleting a mapping RESTORES THE UNSHAPED TOKEN: claims the mapping filtered out come back,
-    // and claims it placed in one token appear in both. That is a widening, so it demands fresh
-    // privilege exactly as the write does.
+    // Deleting a mapping RESTORES THE UNMAPPED TOKEN, and that changes what every token this
+    // client is issued carries -- in BOTH directions. Claims the mapping filtered out come back
+    // to the ID token, and a claim it had PLACED in the access token stops reaching one, so a
+    // resource server authorizing on it starts refusing. Either direction is a change to the
+    // shape of every token, which is why it demands fresh privilege exactly as the write does.
+    //
+    // (An earlier version of this comment said the claims "appear in both". That was true of a
+    // default placement of `Both`, which review measured as a widening and which is gone.)
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let client = parse_client_id(&client_id, scope)?;
     crate::org_context::require_live_environment(&state, &scope).await?;

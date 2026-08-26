@@ -231,7 +231,13 @@ pub async fn apply_to(
 ///
 /// The wrapped map may be empty. That is `NoMapping`, and it is the common case: a client with
 /// no mapping contributes no access-token claims and issues exactly what it did before.
-#[derive(Debug, Clone, Default)]
+// NO `Default`. The derive was a PUBLIC associated function, so any code in any crate could
+// build this without calling `apply_to` -- which is the entire fence, and the comments above
+// claimed it held. Measured: replacing the FedCM door's resolver call with
+// `MappedAccessClaims::default()` compiled clean with zero clippy warnings. A newtype whose
+// bypass is one derive away is not a fence, and the derive was the one thing nobody grepped for
+// while `none_for_a_clientless_mint` was advertised as the only hatch.
+#[derive(Debug, Clone)]
 pub struct MappedAccessClaims(serde_json::Map<String, serde_json::Value>);
 
 impl MappedAccessClaims {
