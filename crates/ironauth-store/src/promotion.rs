@@ -518,8 +518,6 @@ fn keyed_flow_versions(resources: &SnapshotResources) -> BTreeMap<String, serde_
         .collect()
 }
 
-/// The `journey_id@version` natural key of a custom-journey version (issue #92).
-#[must_use]
 /// The natural key of a message template: its `kind` and `locale`, joined by `/` (issue #111).
 ///
 /// Both halves are ESCAPED rather than joined raw. `Locale::new` normalizes a tag but does not
@@ -587,6 +585,8 @@ fn keyed_message_templates(resources: &SnapshotResources) -> BTreeMap<String, se
         .collect()
 }
 
+/// The `journey_id@version` natural key of a custom-journey version (issue #92).
+#[must_use]
 pub(crate) fn flow_version_key(journey_id: &str, version: i32) -> String {
     format!("{journey_id}@{version}")
 }

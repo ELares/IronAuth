@@ -403,14 +403,6 @@ pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
     Ok(())
 }
 
-/// Apply `rules` to `source`, producing the per-token claim sets.
-///
-/// Validates first, so an unvalidated mapping cannot half-apply: a refusal leaves the caller
-/// with no claims rather than with the claims the rules before the bad one produced.
-///
-/// # Errors
-///
-/// [`MappingRefusal`], exactly as [`validate`].
 /// How many tokens the caller is going to mint from this mapping's output.
 ///
 /// The mapping model has two destinations because most grants mint two tokens. Three do not:
@@ -438,9 +430,12 @@ pub enum Destination {
 
 /// Apply `rules` to `source` for a caller minting two tokens.
 ///
+/// Validates first, so an unvalidated mapping cannot half-apply: a refusal leaves the caller
+/// with no claims rather than with the claims the rules before the bad one produced.
+///
 /// # Errors
 ///
-/// [`MappingRefusal`] if a rule writes a claim no mapping may write.
+/// [`MappingRefusal`], exactly as [`validate`].
 pub fn apply(
     rules: &[MappingRule],
     source: &BTreeMap<String, serde_json::Value>,
@@ -450,9 +445,12 @@ pub fn apply(
 
 /// Apply `rules` to `source`, projecting onto `destination`.
 ///
+/// Validates first, so an unvalidated mapping cannot half-apply: a refusal leaves the caller
+/// with no claims rather than with the claims the rules before the bad one produced.
+///
 /// # Errors
 ///
-/// [`MappingRefusal`] if a rule writes a claim no mapping may write.
+/// [`MappingRefusal`], exactly as [`validate`].
 pub fn apply_for(
     rules: &[MappingRule],
     source: &BTreeMap<String, serde_json::Value>,

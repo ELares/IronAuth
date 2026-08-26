@@ -648,6 +648,19 @@ mod tests {
         // for any tick length, including a 1 ms one that puts the guarantee back at 100 ms.
         let guaranteed = super::EPOCH_TICK
             * u32::try_from(limits().epoch_deadline - 1).expect("the deadline fits a u32 of ticks");
+        // BOUNDED ON BOTH SIDES. Review set the constant to 100_001 and 824 tests stayed
+        // green: every guard here was a floor, so the direction this bound was just moved --
+        // weaker -- was the one direction nothing measured. A deadline is a promise that a hook
+        // cannot hold a request indefinitely, and a floor alone cannot express that.
+        //
+        // Five seconds is the ceiling because the deadline's whole job is to be shorter than
+        // whatever the caller's own timeout is; past that it stops being a bound on anything
+        // and the request budget becomes the real limit.
+        assert!(
+            guaranteed <= std::time::Duration::from_secs(5),
+            "a hook is guaranteed {guaranteed:?}, which is long enough that this stops being a \
+             bound: past the caller's own timeout the deadline cannot be what ends a hung hook"
+        );
         assert!(
             guaranteed >= std::time::Duration::from_secs(1),
             "a hook is guaranteed {guaranteed:?}, which is not enough to survive a scheduler \

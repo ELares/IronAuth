@@ -113,7 +113,12 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 # logic cannot read a clock outside the seam that makes it testable, and a benchmark target is
 # not protocol logic -- it is not compiled into the server, and threading an `Env` into it would
 # add a dependency for no property gained. Still zero exemptions on a request path.
-scan time-via-env 'SystemTime::now|Instant::now' 11
+# 11 -> 12: `token_hook_at_issuance.rs` times a fuel abort. A 500 alone cannot say WHICH
+# bound stopped a runaway guest, and after the epoch deadline was raised to a second the two
+# became distinguishable only by elapsed time -- fuel stops the spinner in milliseconds, the
+# deadline cannot fire before 1s. Reading the frozen Clock seam there would report zero and
+# make the distinction unmeasurable, which is the one case this rule is not protecting.
+scan time-via-env 'SystemTime::now|Instant::now' 12
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.
@@ -336,6 +341,86 @@ while IFS=$'\t' read -r _count path; do
     fail=1
   fi
 done < "$token_inventory"
+
+# Rule doc-attachment: a doc comment is attached to the item it describes.
+#
+# Inserting a new item immediately above an existing doc block splits the block from its item,
+# and Rust accepts the result silently. This has shipped SIX times in this effort: a repo doc
+# landed above the wrong repo, a `#[must_use]` was orphaned twice in one file, a harness doc
+# ended up describing the function below it, and most recently `Destination` was inserted
+# between `apply`'s doc and `apply`, giving an infallible enum an "# Errors" section and leaving
+# `apply`'s no-half-apply guarantee documented on nothing.
+#
+# Resolving to be careful has not worked, so it is a gate. Two shapes, both mechanical:
+#
+#   (a) an attribute line immediately followed by a doc line. Legal Rust, always a mistake:
+#       it means a doc block was written UNDER an attribute that belongs to a different item.
+#   (b) a doc block containing "# Errors" or "# Panics" whose item is not a function. Those
+#       sections describe a return or a call, so on a struct or an enum they are a doc that
+#       was severed from the function it was written for.
+doc_attachment=$(
+  git ls-files '*.rs' | python3 -c '
+import sys, pathlib
+
+bad = []
+for path in (line.strip() for line in sys.stdin if line.strip()):
+    try:
+        lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        continue
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        # (a) attribute immediately followed by a doc line
+        if stripped.startswith("#[") and stripped.endswith("]") and i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if nxt.startswith("///"):
+                bad.append(f"{path}:{i+2}: doc comment written under an attribute; the block "
+                           f"above belongs to a different item")
+        # (b) an Errors/Panics section on a non-fn item
+        if stripped.startswith("///"):
+            start = i
+            while i < len(lines) and lines[i].strip().startswith("///"):
+                i += 1
+            block = [lines[k].strip() for k in range(start, i)]
+            if any(b.rstrip() in ("/// # Errors", "/// # Panics") for b in block):
+                # Skip over the item ATTRIBUTES, which may span many lines. Counting brackets
+                # rather than matching a prefix: a multi-line `#[allow(...)]` continues with
+                # bare identifiers and `//` comments, and a skip that stopped at the first of
+                # those reports the comment as the item and buries the real defect in noise.
+                j = i
+                depth = 0
+                while j < len(lines):
+                    line = lines[j]
+                    naked = line.strip()
+                    # A plain `//` comment between the doc and its item is ordinary: the doc
+                    # is for the reader of the API, the comment for the reader of the body.
+                    if (depth == 0 and naked and not naked.startswith("#[")
+                            and not (naked.startswith("//") and not naked.startswith("///"))):
+                        break
+                    depth += line.count("[") - line.count("]")
+                    j += 1
+                    if depth <= 0 and (not naked or naked.startswith("#[")):
+                        depth = 0
+                        if naked.startswith("#[") and naked.endswith("]"):
+                            continue
+                        if not naked:
+                            continue
+                item = lines[j].strip() if j < len(lines) else ""
+                if "fn " not in item:
+                    bad.append(f"{path}:{start+1}: an \"# Errors\"/\"# Panics\" doc section is "
+                               f"attached to `{item[:60]}`, which is not a function")
+            continue
+        i += 1
+for entry in bad:
+    print(entry)
+'
+)
+if [ -n "$doc_attachment" ]; then
+  echo "invariant-lints: rule 'doc-attachment' violated:"
+  echo "$doc_attachment"
+  fail=1
+fi
 
 if [ "$fail" -ne 0 ]; then
   exit 1

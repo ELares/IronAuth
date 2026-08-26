@@ -273,18 +273,40 @@ async fn a_deployment_with_no_engine_does_not_run_a_deployed_hook() {
 /// hook can REMOVE a claim as easily as add one, so continuing past one that aborted issues a
 /// token whose shape nobody chose. And an abort means code behaving in a way its author did not
 /// intend, which is not a state to mint a credential from.
+///
+/// # Why this times the failure
+///
+/// A 500 alone does not say WHICH bound stopped the guest, and the two are not
+/// interchangeable: fuel counts instructions and is deterministic, while the epoch deadline
+/// counts wall-clock ticks and a descheduled guest trips it exactly as a runaway one does.
+/// Review pointed out that raising the deadline silently changed which bound aborts this
+/// spinner, with nothing red either way -- the test asserted a status code and called it fuel.
+///
+/// Elapsed time separates them. Fuel stops this guest after 50M instructions, which is
+/// milliseconds; the deadline cannot fire before a full second. So a failure that arrives
+/// quickly is a FUEL failure, and one that takes a second is the backstop firing instead --
+/// which would mean fuel had stopped bounding the thing this test is named for.
 #[tokio::test]
 async fn a_hook_that_exhausts_its_fuel_fails_the_issuance() {
     let harness = harness_with_hooks().await;
     deploy(&harness, ironauth_hooks::fixtures::FUEL_BOMB, 1).await;
 
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement. The rule keeps protocol logic on the Env clock so issuance is deterministic; here real elapsed time IS the observation, because it is the only thing that distinguishes a fuel abort from a deadline abort, and routing it through a frozen clock would make the distinction unmeasurable by construction
     let (status, body) = exchange(&harness)
         .await
         .expect_err("the exchange must fail");
+    let elapsed = started.elapsed();
     assert_eq!(
         status,
         StatusCode::INTERNAL_SERVER_ERROR,
         "a hook that ran away is a server fault, not a client one: {body}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the abort took {elapsed:?}, so the EPOCH DEADLINE stopped this guest and not its \
+         fuel. Fuel bounds 50M instructions, which is milliseconds; the deadline floor is a \
+         whole second. A spinner outrunning its fuel budget means the budget stopped bounding \
+         it, and this test would have gone on passing on the backstop."
     );
 
     // And the SAME harness issues once the hook is replaced with a working one, so the
@@ -888,6 +910,22 @@ async fn the_client_credentials_grant_runs_the_hook() {
         "and which client, since the two are both strings and a transport that swapped them \
          would leave every assertion above green: {echoed:?}"
     );
+    // THE DISCARD. `ECHO_REQUEST` returns `echo_subject` in its ID-TOKEN list and nowhere else,
+    // and this grant mints no ID token, so that claim must not appear.
+    //
+    // Nothing pinned this before. Review restored the union -- `contributed.access_token
+    // .chain(contributed.id_token)` -- and all 100 tests stayed green while `echo_subject`
+    // landed in a token whose readers are the resource servers in `aud`. The placement test
+    // below cannot see it: it installs a mapping and no hook, so the discard never runs.
+    //
+    // It is also what keeps the contribution cap at 32 rather than 64, since `fence` applies
+    // `filter_hook_claims` once per list and these grants run no mint size budget.
+    assert_eq!(
+        echoed.get("echo_subject"),
+        None,
+        "the hook's ID-token list is DISCARDED on a grant that mints no ID token; a claim the \
+         author put there must not reach the access token: {echoed:?}"
+    );
 }
 
 /// THE CODE EXCHANGE identifies itself as `authorization_code` (issue #113 criterion 1).
@@ -1043,6 +1081,19 @@ async fn a_machine_clients_static_claims_survive_a_hook_that_ignores_them() {
         "and the hook did run, so the assertion above is not satisfied by a dead hook: \
          {issued:?}"
     );
+    // THE SUBJECT reached the guest. Review measured that nothing could see it: setting the
+    // `subject` argument to `None` at all three machine doors left the whole suite green,
+    // because the only fixture reporting it put it in the ID-token list that these grants
+    // discard. A hook gating on identity -- which is what that field is for -- would have taken
+    // the wrong branch on every issuance with nothing red.
+    assert!(
+        issued
+            .get("echo_access_subject")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.starts_with("sva_")),
+        "the guest was told whose token this is, and it is the service-account principal: \
+         {issued:?}"
+    );
 }
 
 /// A `place: id_token` RULE KEEPS ITS CLAIM OUT OF A MACHINE TOKEN.
@@ -1069,7 +1120,9 @@ async fn a_machine_token_honours_a_claim_placed_in_the_id_token() {
         r#"[{"kind":"static","name":"locale_pref","value":"en-GB"},
             {"kind":"place","name":"locale_pref","placement":"id_token"},
             {"kind":"static","name":"tier","value":"gold"},
-            {"kind":"place","name":"tier","placement":"access_token"}]"#,
+            {"kind":"place","name":"tier","placement":"access_token"},
+            {"kind":"static","name":"region","value":"eu"},
+            {"kind":"place","name":"region","placement":"both"}]"#,
     )
     .await;
 
@@ -1092,5 +1145,14 @@ async fn a_machine_token_honours_a_claim_placed_in_the_id_token() {
         Some(&Value::from("payments")),
         "and an UNPLACED claim lands too: the operator expressed no opinion, and the only token \
          that exists is where it goes: {issued:?}"
+    );
+    // `both` is the fourth arm and it was documented without being measured: review dropped it
+    // from the projection and 916 tests stayed green while the claim silently vanished from
+    // every machine token. "Both tokens" on a grant with one token means the one that exists.
+    assert_eq!(
+        issued.get("region"),
+        Some(&Value::from("eu")),
+        "a `both`-placed claim lands: one of the two tokens it names is this one, and dropping \
+         it would empty it from every machine token with nothing red: {issued:?}"
     );
 }

@@ -92,6 +92,10 @@ pub mod fixtures {
     /// to fill. That makes it the discriminator for WHICH LIST the host hands a machine
     /// client's existing claims over in: neither `good` nor `echo-only` can catch putting them
     /// in the ID-token list, because both echo that list back.
+    ///
+    /// It also reports the request's SUBJECT into the access list. `echo-request` reports it
+    /// into the ID-token list, which a machine grant discards, so this is the only fixture that
+    /// can observe the subject on those three doors at all.
     pub const ECHO_ACCESS_ONLY: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_ECHO_ACCESS_ONLY"));
 
     /// A hook that returns every SCALAR request field as a claim.
