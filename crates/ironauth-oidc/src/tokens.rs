@@ -1316,45 +1316,69 @@ fn mint_at_jwt(
         build_access_token_claims(request, iat, exp, &jti_text, &audience, permission)
     };
 
-    let (payload, outcome) = match request.permissions {
-        None => (
-            serde_json::to_vec(&build(PermissionClaim::Absent)).map_err(|_| ())?,
-            PermissionBudgetOutcome::NotApplicable,
-        ),
-        Some(permissions) => {
-            let budget = PermissionBudget::from_config(state.token_claims());
-            let status = PermissionStatus::from(budget.overflow);
-            // The header the signing core will build, from the SAME function it
-            // builds it with, so a predicted length equals the minted one by
-            // construction rather than by two call sites happening to agree.
-            let header = protected_header(signer, &options).map_err(|_| ())?;
-            let signature_len = signer.signature_len();
-            let withheld =
-                serde_json::to_vec(&build(PermissionClaim::Withheld(status))).map_err(|_| ())?;
-            let withheld_len = compact_len(&header, &withheld, signature_len);
-            let mut full: Option<Vec<u8>> = None;
-            let outcome =
-                permission_budget::decide(&budget, Some(permissions.len()), withheld_len, || {
-                    let bytes = serde_json::to_vec(&build(PermissionClaim::Set(permissions)))
-                        .map_err(|_| ())?;
-                    let len = compact_len(&header, &bytes, signature_len);
-                    full = Some(bytes);
-                    Ok(len)
-                })?;
-            match outcome {
-                // The thunk necessarily ran to reach this variant, so the retained
-                // bytes are present; `ok_or` rather than an unwrap keeps the
-                // unreachable case a fail-closed error instead of a panic on the
-                // issuance path.
-                PermissionBudgetOutcome::Emitted { .. } => (full.ok_or(())?, outcome),
-                PermissionBudgetOutcome::Withheld { .. }
-                | PermissionBudgetOutcome::NotApplicable => (withheld, outcome),
-            }
-        }
-    };
+    let header = protected_header(signer, &options).map_err(|_| ())?;
+    let (payload, outcome) = at_jwt_payload(
+        &PermissionBudget::from_config(state.token_claims()),
+        request,
+        &header,
+        signer.signature_len(),
+        &build,
+    )?;
 
     let token = sign_jws_with_policy(policy, signer, &payload, &options).map_err(|_| ())?;
     Ok((MintedAccessToken::Jwt { token, jti }, outcome))
+}
+
+/// Decide the permission claim and produce the EXACT bytes that will be signed.
+///
+/// Extracted from [`mint_at_jwt`] so the decision can be exercised without an [`OidcState`], a
+/// signer, or a database. That is not a tidiness refactor: the property this function carries is
+/// that **the bytes measured are the bytes signed**, and before it existed the only test of that
+/// property compared two calls to the claim builder and never reached
+/// [`crate::permission_budget::decide`] at all. A mutation that measured a bag-stripped build
+/// while shipping the real one -- literally "the budget judges a token smaller than the one that
+/// ships" -- left the whole suite green.
+///
+/// Returns the payload to sign and what the budget decided.
+///
+/// # Errors
+///
+/// `Err(())` if a claim set fails to serialize, which the caller maps to a `server_error` so a
+/// mint failure fails closed.
+fn at_jwt_payload(
+    budget: &PermissionBudget,
+    request: &MintRequest<'_>,
+    header: &[u8],
+    signature_len: usize,
+    build: &dyn Fn(PermissionClaim<'_>) -> serde_json::Value,
+) -> Result<(Vec<u8>, PermissionBudgetOutcome), ()> {
+    let Some(permissions) = request.permissions else {
+        return Ok((
+            serde_json::to_vec(&build(PermissionClaim::Absent)).map_err(|_| ())?,
+            PermissionBudgetOutcome::NotApplicable,
+        ));
+    };
+
+    let status = PermissionStatus::from(budget.overflow);
+    let withheld = serde_json::to_vec(&build(PermissionClaim::Withheld(status))).map_err(|_| ())?;
+    let withheld_len = compact_len(header, &withheld, signature_len);
+    let mut full: Option<Vec<u8>> = None;
+    let outcome = permission_budget::decide(budget, Some(permissions.len()), withheld_len, || {
+        let bytes =
+            serde_json::to_vec(&build(PermissionClaim::Set(permissions))).map_err(|_| ())?;
+        let len = compact_len(header, &bytes, signature_len);
+        full = Some(bytes);
+        Ok(len)
+    })?;
+    Ok(match outcome {
+        // The thunk necessarily ran to reach this variant, so the retained bytes are present;
+        // `ok_or` rather than an unwrap keeps the unreachable case a fail-closed error instead
+        // of a panic on the issuance path.
+        PermissionBudgetOutcome::Emitted { .. } => (full.ok_or(())?, outcome),
+        PermissionBudgetOutcome::Withheld { .. } | PermissionBudgetOutcome::NotApplicable => {
+            (withheld, outcome)
+        }
+    })
 }
 
 /// Mint an OPAQUE access token for `target` (issue #29): the scope-declaring
@@ -1498,6 +1522,19 @@ mod access_extra_claims_tests {
     use super::*;
     use serde_json::json;
 
+    /// A budget that refuses nothing, built from the shipped config default so this test never
+    /// has to name the private overflow enum.
+    fn generous_budget() -> crate::permission_budget::PermissionBudget {
+        let mut budget = crate::permission_budget::PermissionBudget::from_config(
+            &ironauth_config::TokenClaimsConfig::default(),
+        );
+        budget.max_token_bytes = usize::MAX;
+        budget.warn_token_bytes = usize::MAX;
+        budget.max_permission_count = 100;
+        budget.warn_permission_count = 100;
+        budget
+    }
+
     fn bag(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
         pairs
             .iter()
@@ -1505,10 +1542,19 @@ mod access_extra_claims_tests {
             .collect()
     }
 
-    /// A claim in the access bag reaches the ACCESS token.
+    /// A claim in the access bag reaches the ACCESS token, and so does the next one.
+    ///
+    /// TWO admissible claims, and a protected one that sorts before both. With a single-entry
+    /// bag, folding only the first entry (`.iter().take(1)`) passes: a hook returning two
+    /// claims would have the alphabetically later one silently dropped while reporting both as
+    /// accepted.
     #[test]
     fn an_access_extra_claim_lands_in_the_access_token() {
-        let extra = bag(&[("tier", json!("gold"))]);
+        let extra = bag(&[
+            ("aud", json!("forged")),
+            ("account_tier", json!("gold")),
+            ("region", json!("eu")),
+        ]);
         let mut req = super::tests::request("usr_abc", "pwd");
         req.access_extra_claims = &extra;
         let claims = build_access_token_claims(
@@ -1519,7 +1565,15 @@ mod access_extra_claims_tests {
             &json!("cli_example"),
             PermissionClaim::Absent,
         );
-        assert_eq!(claims["tier"], "gold");
+        assert_eq!(claims["account_tier"], "gold");
+        assert_eq!(
+            claims["region"], "eu",
+            "the second admissible claim must land too, not only the first"
+        );
+        assert_ne!(
+            claims["aud"], "forged",
+            "the protected claim sorts first and must still be refused"
+        );
     }
 
     /// The two bags are separate: neither feeds the other's token.
@@ -1588,7 +1642,7 @@ mod access_extra_claims_tests {
         }
     }
 
-    /// Every claim the access-token builder sets is a PROTECTED name.
+    /// Every claim the access-token builder can emit, on EVERY branch, is a PROTECTED name.
     ///
     /// This is the property that makes the fence sufficient, and it is the one worth pinning.
     /// The fold uses `entry().or_insert_with()` so a protocol claim wins on ordering as well as
@@ -1601,28 +1655,72 @@ mod access_extra_claims_tests {
     /// issuer claim whose name is NOT in the protected set, the ordering stops being redundant
     /// and starts being the only thing preventing a hook from overwriting it -- and this test
     /// is what turns red to say so.
+    ///
+    /// EVERY BRANCH. The first version of this test populated `org_id` and one permission
+    /// variant and took 10 of the builder's 16 emission sites; an unprotected claim added
+    /// beside `cnf`, `act`, `roles` or `permissions_status` went unchecked, and four mutants
+    /// proved it. The fixture below sets every optional field, and the assertion is over the
+    /// UNION of both permission variants, because they are mutually exclusive by construction
+    /// and neither call alone can see the other's claim.
     #[test]
     fn every_claim_the_access_builder_sets_is_protected() {
+        let roles = super::tests::role_set(&["admin", "billing"]);
+        let permissions: std::collections::BTreeSet<String> =
+            ["billing.read".to_owned()].into_iter().collect();
+        let confirmation = ironauth_jose::Confirmation::Jkt("thumbprint".to_owned());
         let mut req = super::tests::request("usr_abc", "pwd");
         req.org_id = Some("org_real");
-        let claims = build_access_token_claims(
-            &req,
-            1,
-            2,
-            "tok",
-            &json!("cli_example"),
-            PermissionClaim::Set(&std::collections::BTreeSet::from([
-                "billing.read".to_owned()
-            ])),
+        req.oauth_scope = Some("openid profile");
+        req.auth_time_unix_micros = Some(1_700_000_000_000_000);
+        req.actor = Some(TokenActor {
+            subject: "usr_admin",
+            reason_code: "support",
+        });
+        req.roles = Some(&roles);
+        req.confirmation = Some(&confirmation);
+
+        let mut emitted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for permission in [
+            PermissionClaim::Set(&permissions),
+            PermissionClaim::Withheld(PermissionStatus::BudgetExceeded),
+            PermissionClaim::Absent,
+        ] {
+            let claims =
+                build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"), permission);
+            for name in claims.as_object().expect("an object").keys() {
+                emitted.insert(name.clone());
+            }
+        }
+
+        // The loop covering nothing, or covering one branch, would satisfy the assertion below.
+        assert!(
+            emitted.len() >= 15,
+            "the fixture must take every branch; only {} claims emitted: {emitted:?}",
+            emitted.len()
         );
-        let object = claims.as_object().expect("an object");
-        assert!(!object.is_empty(), "the builder emitted nothing to check");
-        for name in object.keys() {
+        for name in &emitted {
             assert!(
                 PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name.as_str()),
                 "`{name}` is emitted by the builder but is NOT protected, so the extra-claims \
                  fence no longer covers everything the protocol sets and the fold's ordering \
                  has become load-bearing: give it its own test"
+            );
+        }
+        // The specific branches the first version missed, named so a fixture that stops
+        // populating one of them fails here rather than silently shrinking the check.
+        for name in [
+            "cnf",
+            "act",
+            "roles",
+            "permissions",
+            "permissions_status",
+            "scope",
+            "auth_time",
+            "org_id",
+        ] {
+            assert!(
+                emitted.contains(name),
+                "the fixture no longer takes the `{name}` branch, so nothing checks it"
             );
         }
     }
@@ -1648,46 +1746,174 @@ mod access_extra_claims_tests {
         assert_ne!(claims["iss"], "https://evil.test");
     }
 
-    /// The claims are inside the bytes the permission budget measures.
+    /// An access-token extra claim can flip the budget's VERDICT.
     ///
-    /// THE point of folding here rather than after the build. The budget decides from the
-    /// SERIALIZED length of what this builder produces, so a claim added here changes that
-    /// length; a claim folded in after the decision would not, and issue #98 would be judging a
-    /// token smaller than the one that ships.
+    /// This is the PR's load-bearing claim, asserted on the budget's own decision rather than on
+    /// a proxy. The previous version of this test serialized the claim builder twice and
+    /// compared lengths; it never constructed a `PermissionBudget` and never called `decide`, so
+    /// a mutation that measured a bag-stripped build while SHIPPING the real one -- exactly "the
+    /// budget judges a token smaller than the one that ships" -- left the whole suite green.
     ///
-    /// Measured by comparing the two serializations rather than by asserting the budget's
-    /// verdict, because a verdict depends on a configured limit and would pass or fail for
-    /// reasons other than the one under test.
+    /// The bound is chosen from the measurement: mint once with an empty bag, read the emitted
+    /// size, and set `max_token_bytes` to exactly that. The same request with one more claim
+    /// must then be over. If the extra claim were folded in after the decision, the second run
+    /// would still fit and would still be Emitted.
     #[test]
-    fn an_access_extra_claim_changes_the_length_the_budget_measures() {
+    fn an_access_extra_claim_can_push_the_budget_over() {
+        use crate::permission_budget::{PermissionBudget, PermissionBudgetOutcome};
+
+        let permissions: std::collections::BTreeSet<String> =
+            ["billing.read".to_owned(), "billing.write".to_owned()]
+                .into_iter()
+                .collect();
         let mut req = super::tests::request("usr_abc", "pwd");
-        let without = serde_json::to_vec(&build_access_token_claims(
-            &req,
-            1,
-            2,
-            "tok",
-            &json!("cli_example"),
-            PermissionClaim::Absent,
-        ))
-        .expect("serialize");
+        req.permissions = Some(&permissions);
 
-        let extra = bag(&[("tier", json!("a".repeat(512)))]);
-        req.access_extra_claims = &extra;
-        let with = serde_json::to_vec(&build_access_token_claims(
-            &req,
-            1,
-            2,
-            "tok",
-            &json!("cli_example"),
-            PermissionClaim::Absent,
-        ))
-        .expect("serialize");
-
+        // A stand-in for the signing header and signature: their exact contents do not matter,
+        // only that the SAME values are used for both runs, so the difference between them is
+        // the extra claim and nothing else.
+        let header = b"header";
+        let signature_len = 64;
+        let generous = generous_budget();
+        let audience = json!("cli_example");
+        let build_base = |permission: PermissionClaim<'_>| {
+            build_access_token_claims(&req, 1, 2, "tok", &audience, permission)
+        };
+        let (baseline_bytes, baseline) =
+            at_jwt_payload(&generous, &req, header, signature_len, &build_base)
+                .expect("baseline mints");
         assert!(
-            with.len() >= without.len() + 512,
-            "the extra claim must be inside the measured bytes: {} vs {}",
-            with.len(),
-            without.len()
+            matches!(baseline, PermissionBudgetOutcome::Emitted { .. }),
+            "the baseline must EMIT, or the test measures nothing: {baseline:?}"
+        );
+        let exactly_fits = super::compact_len(header, &baseline_bytes, signature_len);
+
+        // At exactly the emitted size, the same request still fits.
+        let tight = PermissionBudget {
+            max_token_bytes: exactly_fits,
+            ..generous
+        };
+        let (_, still_fits) = at_jwt_payload(&tight, &req, header, signature_len, &build_base)
+            .expect("mints at the bound");
+        assert!(
+            matches!(still_fits, PermissionBudgetOutcome::Emitted { .. }),
+            "the bound is inclusive of the token that produced it: {still_fits:?}"
+        );
+
+        // One more claim, same bound: the budget must now WITHHOLD. It can only know that if the
+        // claim is inside the bytes it measured.
+        let extra = bag(&[("account_tier", json!("g".repeat(64)))]);
+        let mut with_extra = super::tests::request("usr_abc", "pwd");
+        with_extra.permissions = Some(&permissions);
+        with_extra.access_extra_claims = &extra;
+        let build_extra = |permission: PermissionClaim<'_>| {
+            build_access_token_claims(&with_extra, 1, 2, "tok", &audience, permission)
+        };
+        let (_, over) = at_jwt_payload(&tight, &with_extra, header, signature_len, &build_extra)
+            .expect("mints over the bound");
+        assert!(
+            matches!(over, PermissionBudgetOutcome::Withheld { .. }),
+            "an extra claim must be inside what the budget measures, or #98 is an estimate \
+             rather than a guarantee: {over:?}"
+        );
+    }
+
+    /// The size reported for a WITHHELD token is the size of the token that ships.
+    ///
+    /// The mirror of the emitted-path check, and it needs its own test: under-measuring the
+    /// withheld variant does not change the verdict, so the flip test cannot see it. What it
+    /// corrupts is `roles_only_token_bytes`, which the module doc calls "the exact compact-token
+    /// size of the token that SHIPS" and which an operator reads to decide whether the fallback
+    /// is itself over budget. A number measured against a form that never shipped answers that
+    /// question wrongly.
+    #[test]
+    fn a_withheld_token_reports_the_size_it_actually_ships() {
+        use crate::permission_budget::{PermissionBudgetOutcome, PermissionWithheldReason};
+
+        let permissions: std::collections::BTreeSet<String> =
+            (0..40).map(|index| format!("scope.{index:03}")).collect();
+        let extra = bag(&[("account_tier", json!("g".repeat(128)))]);
+        let mut req = super::tests::request("usr_abc", "pwd");
+        req.permissions = Some(&permissions);
+        req.access_extra_claims = &extra;
+
+        let header = b"header";
+        let signature_len = 64;
+        // A count bound the set exceeds, so the withholding is certain and the test does not
+        // depend on byte arithmetic to reach the branch it is about.
+        let mut budget = generous_budget();
+        budget.max_permission_count = 5;
+        budget.warn_permission_count = 5;
+
+        let audience = json!("cli_example");
+        let build = |permission: PermissionClaim<'_>| {
+            build_access_token_claims(&req, 1, 2, "tok", &audience, permission)
+        };
+        let (payload, outcome) =
+            at_jwt_payload(&budget, &req, header, signature_len, &build).expect("mints");
+
+        let PermissionBudgetOutcome::Withheld {
+            reason,
+            roles_only_token_bytes,
+            ..
+        } = outcome
+        else {
+            panic!("a count of 40 against a bound of 5 must withhold: {outcome:?}");
+        };
+        assert_eq!(reason, PermissionWithheldReason::CountExceeded);
+        assert_eq!(
+            roles_only_token_bytes,
+            super::compact_len(header, &payload, signature_len),
+            "the reported withheld size must be the size of the payload that ships"
+        );
+        let text = String::from_utf8(payload).expect("utf-8");
+        assert!(
+            text.contains("account_tier"),
+            "the shipped withheld token carries the extra claim, so the measurement must too"
+        );
+        assert!(
+            !text.contains("\"permissions\":"),
+            "a withheld token must not carry the permission claim"
+        );
+    }
+
+    /// The bytes the budget measured are the bytes that get signed.
+    ///
+    /// The other half of the same guarantee: a token judged to fit must be the token that
+    /// ships. Asserted by re-measuring the returned payload against the bound it was judged
+    /// under.
+    #[test]
+    fn the_measured_payload_is_the_returned_payload() {
+        use crate::permission_budget::PermissionBudgetOutcome;
+
+        let permissions: std::collections::BTreeSet<String> =
+            ["billing.read".to_owned()].into_iter().collect();
+        let extra = bag(&[("account_tier", json!("gold"))]);
+        let mut req = super::tests::request("usr_abc", "pwd");
+        req.permissions = Some(&permissions);
+        req.access_extra_claims = &extra;
+
+        let header = b"header";
+        let signature_len = 64;
+        let budget = generous_budget();
+        let build = |permission: PermissionClaim<'_>| {
+            build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"), permission)
+        };
+        let (payload, outcome) =
+            at_jwt_payload(&budget, &req, header, signature_len, &build).expect("mints");
+
+        let PermissionBudgetOutcome::Emitted { token_bytes, .. } = outcome else {
+            panic!("a generous budget must emit: {outcome:?}");
+        };
+        assert_eq!(
+            token_bytes,
+            super::compact_len(header, &payload, signature_len),
+            "the size the budget reported must be the size of the payload it returned"
+        );
+        let text = String::from_utf8(payload).expect("utf-8");
+        assert!(
+            text.contains("account_tier"),
+            "the measured payload must be the one carrying the extra claim"
         );
     }
 }
@@ -1738,7 +1964,7 @@ mod tests {
     /// An owned role set for the `roles`-claim tests, deliberately built in a
     /// NON-alphabetical insertion order so an assertion on the emitted order is about
     /// the [`BTreeSet`] and not about how the test happened to write it down.
-    fn role_set(slugs: &[&str]) -> BTreeSet<String> {
+    pub(super) fn role_set(slugs: &[&str]) -> BTreeSet<String> {
         slugs.iter().map(|slug| (*slug).to_owned()).collect()
     }
 
@@ -2312,9 +2538,12 @@ mod tests {
             "a benign extra claim still lands, so the drop is TARGETED"
         );
 
-        // The access token carries the ISSUER's decision, never the forged one. The
-        // code flow merges no client custom claims into the access token at all, so the
-        // guarantee here is that the builder's own output is unaffected by the bag.
+        // The access token carries the ISSUER's decision, never the forged one. The access
+        // token now has its own extra-claims bag (issue #113, `access_extra_claims`), fenced
+        // against PROTECTED_ACCESS_TOKEN_CLAIMS exactly as this one is -- and it is EMPTY on
+        // this path, because this test drives `req.extra_claims` only. So the guarantee here is
+        // still that the builder's own output is unaffected by the ID-token bag, and the access
+        // bag's own fence is proved by `the_access_bag_cannot_set_any_reserved_claim`.
         let at_claims = build_access_token_claims(
             &req,
             1,
