@@ -2418,7 +2418,7 @@ async fn concurrent_resends_of_one_message_queue_one_job() {
     );
 }
 
-/// A resend that RE-QUEUES emits `message.resent`; one refused by suppression emits nothing.
+/// Each re-queue emits `message.resent` carrying ITS OWN attempt number.
 ///
 /// Issue #108 criterion 6: every management write announces itself. A resend is the one write
 /// on this surface that causes mail, and it announced nothing -- `scripts/producer-coverage.py`
@@ -2431,7 +2431,7 @@ async fn concurrent_resends_of_one_message_queue_one_job() {
 /// recipient's behalf. No mail is queued, so no event may claim any was: a subscriber that
 /// counted a suppressed resend as a delivery would be counting mail that does not exist.
 #[tokio::test]
-async fn a_requeueing_resend_emits_and_a_suppressed_one_does_not() {
+async fn each_requeue_announces_its_own_attempt_number() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x1_6e);
     let scope = db.seed_scope(&env).await;
@@ -2544,51 +2544,6 @@ async fn a_requeueing_resend_emits_and_a_suppressed_one_does_not() {
         "the attempts are the store's own, in order. A builder handed in from outside can only \
          guess: {events:?}"
     );
-
-    // SUPPRESS the recipient, then resend again. Nothing is queued, so nothing may be
-    // announced.
-    // Read the blind index off the row rather than recomputing it: the point is to suppress
-    // THIS message's recipient, and a recomputation that drifted from what `enqueue` stored
-    // would suppress nobody while the test still read as a suppression case.
-    let bidx: Vec<u8> =
-        sqlx::query_scalar("SELECT recipient_bidx FROM messages WHERE id = $1 AND tenant_id = $2")
-            .bind(id.to_string())
-            .bind(scope.tenant().to_string())
-            .fetch_one(db.owner_pool())
-            .await
-            .expect("read the recipient blind index");
-    suppress(&db, scope, &bidx, "hard_bounce").await;
-    db.store()
-        .scoped(scope)
-        .messages()
-        .resolve(
-            &id,
-            generation_of(&db, scope, &id).await,
-            Resolution::Failed {
-                reason: "all_providers_unavailable",
-            },
-        )
-        .await
-        .expect("resolve failed again");
-
-    let refused = db
-        .store()
-        .scoped(scope)
-        .acting(db.test_actor(&env), CorrelationId::generate(&env))
-        .messages()
-        .resend_with_event(&env, &id, Some(&build_event))
-        .await
-        .expect("the refusal is an outcome, not an error");
-    assert!(
-        matches!(refused, Resent::Suppressed { .. }),
-        "the recipient is suppressed: {refused:?}"
-    );
-    assert!(
-        drain_message_events(&db, scope).await.is_empty(),
-        "a resend that queued no mail must announce nothing. The two events above were drained \
-         AND completed, so nothing is blocking this read: empty here means nothing was written, \
-         not that the feed was ordered behind something."
-    );
 }
 
 /// The webhook-bound events for `scope`, claimed AND COMPLETED until the feed is empty.
@@ -2631,4 +2586,92 @@ async fn drain_message_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json
             payloads.push(message.payload);
         }
     }
+}
+
+/// A resend refused by SUPPRESSION announces nothing.
+///
+/// The negative half of `each_requeue_announces_its_own_attempt_number`, and it is the guard
+/// rather than a second spelling of it. A suppressed recipient is a hard bounce or a complaint,
+/// and the store refuses the resend on the recipient's behalf: no mail is queued, so no event
+/// may claim any was. A subscriber that counted a suppressed resend as a delivery would be
+/// counting mail that does not exist.
+#[tokio::test]
+async fn a_resend_refused_by_suppression_announces_nothing() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x1_6f);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let id = send_with_payload(
+        &db,
+        &env,
+        scope,
+        "suppressed@example.test",
+        1_000,
+        &serde_json::json!({ "kind": "email_otp", "code": "hunter2" }),
+    )
+    .await;
+    let subject = id.to_string();
+    let build_event = |outcome: &Resent| {
+        let Resent::Requeued { attempt } = outcome else {
+            return None;
+        };
+        let event_id = format!("evt_message_resent_{attempt}");
+        let envelope = ironauth_store::event_catalog::envelope(
+            &event_id,
+            "message.resent",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            1,
+            &serde_json::json!({ "message_id": subject, "attempt": attempt }),
+        )?;
+        Some(ironauth_store::OwnedDomainEvent {
+            id: event_id,
+            subject: subject.clone(),
+            envelope,
+        })
+    };
+    // Suppress the recipient before the resend.
+    // Read the blind index off the row rather than recomputing it: the point is to suppress
+    // THIS message's recipient, and a recomputation that drifted from what `enqueue` stored
+    // would suppress nobody while the test still read as a suppression case.
+    let bidx: Vec<u8> =
+        sqlx::query_scalar("SELECT recipient_bidx FROM messages WHERE id = $1 AND tenant_id = $2")
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("read the recipient blind index");
+    suppress(&db, scope, &bidx, "hard_bounce").await;
+    db.store()
+        .scoped(scope)
+        .messages()
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed {
+                reason: "all_providers_unavailable",
+            },
+        )
+        .await
+        .expect("resolve failed again");
+
+    let refused = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .messages()
+        .resend_with_event(&env, &id, Some(&build_event))
+        .await
+        .expect("the refusal is an outcome, not an error");
+    assert!(
+        matches!(refused, Resent::Suppressed { .. }),
+        "the recipient is suppressed: {refused:?}"
+    );
+    assert!(
+        drain_message_events(&db, scope).await.is_empty(),
+        "a resend that queued no mail must announce nothing. The two events above were drained \
+         AND completed, so nothing is blocking this read: empty here means nothing was written, \
+         not that the feed was ordered behind something."
+    );
 }
