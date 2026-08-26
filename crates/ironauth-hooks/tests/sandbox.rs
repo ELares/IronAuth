@@ -98,15 +98,23 @@ fn a_healthy_hook_runs_and_its_claims_come_back() {
 
 /// A hook that opens a socket cannot start.
 ///
-/// Criterion 2, and the mechanism matters as much as the outcome: this is not a connection
-/// that gets refused, it is an instantiation that fails because the linker offers no
+/// Criterion 2, and the mechanism matters as much as the outcome: this is not a connection that
+/// gets refused, it is IMPORT RESOLUTION that fails because the host surface offers no
 /// `wasi:sockets`. The guest's own code never runs.
+///
+/// It now fails at LOAD rather than at the first call. Resolving a component's imports moved to
+/// `HookEngine::load` when the warm path stopped rebuilding its linker per invocation, and the
+/// refusal moved with it. That is the better place for it: a hook asking for a capability the
+/// sandbox does not grant is a property of the ARTIFACT, not of any particular request, so an
+/// operator learns it when the component is first loaded instead of on somebody's login.
 #[test]
 fn a_guest_that_opens_a_socket_cannot_start() {
     let engine = HookEngine::new().expect("engine");
-    let hook = engine.load(&guest(NET_ESCAPE)).expect("it compiles fine");
-    let error = hook
-        .customize(&engine, &Limits::claim_shaping(), &request())
+    // REFUSED AT LOAD, not at call. `HookEngine::load` resolves the component's
+    // imports against the host surface now, so a guest asking for a capability the
+    // sandbox does not offer never becomes a `LoadedHook` at all.
+    let error = engine
+        .load(&guest(NET_ESCAPE))
         .expect_err("a hook that imports sockets must not instantiate");
     assert_eq!(
         error.abort_kind(),
@@ -133,9 +141,11 @@ fn a_guest_that_opens_a_socket_cannot_start() {
 #[test]
 fn a_guest_that_draws_randomness_cannot_start() {
     let engine = HookEngine::new().expect("engine");
-    let hook = engine.load(&guest(RANDOM_ESCAPE)).expect("compiles");
-    let error = hook
-        .customize(&engine, &Limits::claim_shaping(), &request())
+    // REFUSED AT LOAD, not at call. `HookEngine::load` resolves the component's
+    // imports against the host surface now, so a guest asking for a capability the
+    // sandbox does not offer never becomes a `LoadedHook` at all.
+    let error = engine
+        .load(&guest(RANDOM_ESCAPE))
         .expect_err("a hook that imports randomness must not instantiate");
     assert_eq!(error.abort_kind(), Some(AbortKind::Unlinkable));
     assert!(
@@ -148,9 +158,11 @@ fn a_guest_that_draws_randomness_cannot_start() {
 #[test]
 fn a_guest_that_opens_a_file_cannot_start() {
     let engine = HookEngine::new().expect("engine");
-    let hook = engine.load(&guest(FS_ESCAPE)).expect("compiles");
-    let error = hook
-        .customize(&engine, &Limits::claim_shaping(), &request())
+    // REFUSED AT LOAD, not at call. `HookEngine::load` resolves the component's
+    // imports against the host surface now, so a guest asking for a capability the
+    // sandbox does not offer never becomes a `LoadedHook` at all.
+    let error = engine
+        .load(&guest(FS_ESCAPE))
         .expect_err("a hook that imports the filesystem must not instantiate");
     assert_eq!(error.abort_kind(), Some(AbortKind::Unlinkable));
     assert!(
@@ -240,9 +252,9 @@ fn a_forged_precompiled_artifact_is_refused() {
 #[test]
 fn a_guest_that_reads_the_wall_clock_cannot_start() {
     let engine = HookEngine::new().expect("engine");
-    let hook = engine.load(&guest(WALL_CLOCK_ESCAPE)).expect("compiles");
-    let error = hook
-        .customize(&engine, &Limits::claim_shaping(), &request())
+    // REFUSED AT LOAD; see the socket case.
+    let error = engine
+        .load(&guest(WALL_CLOCK_ESCAPE))
         .expect_err("a hook that imports wall-clock must not instantiate");
     assert_eq!(
         error.abort_kind(),
