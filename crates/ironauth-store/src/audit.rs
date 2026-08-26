@@ -916,6 +916,11 @@ pub enum Action {
     /// restoring whatever the next level up provides. The audit row names the template id and
     /// scope.
     MessageTemplateDelete,
+    /// A per-environment, per-client DECLARATIVE CLAIM MAPPING was written or overwritten
+    /// (issue #113): a first write or an overwrite of the already-validated rule set. The audit
+    /// row names the CLIENT, because this table has no id of its own and the client is the thing
+    /// whose tokens changed shape. The rules themselves are not recorded here.
+    ClaimsMappingSet,
     /// A per-environment, per-client SIGNUP FORM was set through the management API (issue #87):
     /// a first write or an overwrite of the fail-fast validated field list. The audit row names
     /// the signup form id and scope; the field list itself is not recorded here.
@@ -1556,6 +1561,7 @@ impl Action {
             Action::FlowTargetDelete => "flow_target.delete",
             Action::FlowTargetReplayDeadLetters => "flow_target.replay_dead_letters",
             Action::MessageTemplateDelete => "message_template.delete",
+            Action::ClaimsMappingSet => "claims_mapping.set",
             Action::SignupFormSet => "signup_form.set",
             Action::SignupFormDelete => "signup_form.delete",
             Action::FlowVersionCreate => "flow_version.create",

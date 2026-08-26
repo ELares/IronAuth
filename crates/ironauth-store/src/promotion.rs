@@ -873,6 +873,13 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             // blocker (the source key does not parse in the target scope) rather than
             // describing it.
             signup_form: Vec::new(),
+            // `claims_mapping` (issue #113) is keyed the same way and is blocked on the same
+            // missing primitive: its natural key is an authorize `client_id`, a scope-embedded
+            // id that cannot address the same logical client in another environment. It
+            // EXPORTS, so the criterion's "promote via config snapshots" is satisfied for the
+            // snapshot document, and the transactional engine omits it until client promotion
+            // has a key to work with.
+            claims_mapping: Vec::new(),
             // Custom-journey versions (issue #92) ARE promoted by the transactional engine: the
             // append-only version DEFINITIONS travel and are reconstructed in the target. The
             // projection carries each version's `(journey_id, version, artifact)` but NORMALIZES
@@ -1303,11 +1310,11 @@ mod tests {
     use crate::classification::{ResourceClassification, ResourceType, classify};
     use crate::esv::{Reference, ReferenceKind};
     use crate::snapshot::{
-        BrandAssetMetaSnapshot, BrandSnapshot, ClientSnapshot, ConnectorSnapshot,
-        DcrPolicySnapshot, FlowVersionSnapshot, LocaleBundleSnapshot, MessageTemplateSnapshot,
-        OrgConnectionSnapshot, ResourceServerSnapshot, RoutingRuleSnapshot,
-        SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, SignupFormSnapshot, Snapshot,
-        SnapshotResources, UpstreamTokenGrantSnapshot, VariableSnapshot,
+        BrandAssetMetaSnapshot, BrandSnapshot, ClaimsMappingSnapshot, ClientSnapshot,
+        ConnectorSnapshot, DcrPolicySnapshot, FlowVersionSnapshot, LocaleBundleSnapshot,
+        MessageTemplateSnapshot, OrgConnectionSnapshot, ResourceServerSnapshot,
+        RoutingRuleSnapshot, SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, SignupFormSnapshot,
+        Snapshot, SnapshotResources, UpstreamTokenGrantSnapshot, VariableSnapshot,
     };
 
     fn snapshot(resources: SnapshotResources) -> Snapshot {
@@ -1638,6 +1645,13 @@ mod tests {
             signup_form: vec![SignupFormSnapshot {
                 client_id: "cli_source".to_owned(),
                 fields: serde_json::json!([]),
+            }],
+            // Populated, not empty: this fixture exists to prove the promoted projection DROPS
+            // the types the engine cannot key into the target, and an empty vector would prove
+            // nothing about whether it dropped them or never had them.
+            claims_mapping: vec![ClaimsMappingSnapshot {
+                client_id: "cli_source".to_owned(),
+                rules: serde_json::json!([{"kind": "static", "name": "tier", "value": "gold"}]),
             }],
             flow_version: vec![FlowVersionSnapshot {
                 journey_id: "login".to_owned(),

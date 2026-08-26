@@ -182,6 +182,18 @@ name = "locale_bundles"
 path = "tests/locale_bundles.rs"
 required-features = ["testing"]
 
+# Per-environment, per-client declarative claim mappings (issue #113): the grant split as the
+# migration draws it (control-plane write, and a data plane holding nothing at all until the
+# mint-side reader lands), the shape constraint deciding both the type and the count, both
+# conjuncts of the RLS policy on the read AND the write side, the overwrite-idempotent-on-client
+# invariant, the promotable snapshot round-trip (export then validate, byte-identical re-export),
+# cross-scope isolation, and the scope foreign key refusing a write into an environment that
+# does not exist.
+[[test]]
+name = "claims_mappings"
+path = "tests/claims_mappings.rs"
+required-features = ["testing"]
+
 # Per-environment, per-client signup forms (issue #87): the control-plane set / data-plane read
 # repo, the overwrite-idempotent-on-client invariant, the promotable snapshot round-trip (export
 # both-sides, byte-identical), delete, and cross-tenant isolation, against a real database.

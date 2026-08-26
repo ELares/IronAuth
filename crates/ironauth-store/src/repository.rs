@@ -63,6 +63,7 @@ use crate::audit::{ActingContext, Action, ActorRef};
 use crate::brand::{
     BrandAssetKind, BrandAssetMeta, BrandAssetRecord, BrandRecord, NewBrand, NewBrandAsset,
 };
+use crate::claims_mapping_store::ClaimsMappingRecord;
 use crate::classification::ResourceType;
 use crate::client_admin_grant::{ClientAdminGrantRecord, NewClientAdminGrant};
 use crate::connector::{ConnectorCapabilities, ConnectorRecord, NewConnector, StoredCapabilities};
@@ -799,6 +800,17 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn locale_bundles(&self) -> LocaleBundleRepo<'a> {
         LocaleBundleRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only declarative claim mapping repository for this scope (issue #113): read a
+    /// client's rules on the issuance path and list the scope's rule sets for the
+    /// config-snapshot export. Read-only by design; writing a mapping is a control-plane action.
+    #[must_use]
+    pub fn claims_mappings(&self) -> ClaimsMappingRepo<'a> {
+        ClaimsMappingRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1879,6 +1891,21 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn flow_targets(&self) -> ActingFlowTargetRepo<'a> {
         ActingFlowTargetRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating declarative claim mapping repository for this scope and actor (issue #113):
+    /// write a client's rule set, audited.
+    ///
+    /// The control plane's INSERT and UPDATE grants exist for THIS, and for nothing else yet.
+    /// The migration's own rule is that a privilege arrives with its caller, so the caller lands
+    /// with the grants rather than after them.
+    #[must_use]
+    pub fn claims_mappings(&self) -> ActingClaimsMappingRepo<'a> {
+        ActingClaimsMappingRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -32134,12 +32161,151 @@ impl SignupFormRepo<'_> {
     }
 }
 
+/// The read-only per-environment, per-client declarative claim mapping repository (issue #113):
+/// read a client's rules on the issuance path, and list a scope's rule sets for the
+/// config-snapshot export. Every read is scope-forced under row-level security, so a mapping of
+/// another scope is a uniform not-found.
+///
+/// READ ONLY. Writing a mapping is a control-plane action performed by
+/// [`ActingClaimsMappingRepo::set`], audited as `claims_mapping.set`; the admin HTTP surface
+/// that will call it is not in this change.
+///
+/// The data plane holds no grant on this table YET: the issuance-path reader that needs one does
+/// not exist, and a privilege whose only exerciser is a test is one an attacker inherits for
+/// free. When that reader lands it takes SELECT and nothing more, because the plane that mints
+/// tokens must not be able to change the shape of the tokens it mints.
+pub struct ClaimsMappingRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ClaimsMappingRepo<'_> {
+    /// A client's rule set within scope, or [`None`] when the client has no mapping installed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, client_id: &str) -> Result<Option<ClaimsMappingRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT client_id, rules::text AS rules \
+             FROM claims_mappings \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| claims_mapping_from_row(&row)))
+    }
+
+    /// EVERY rule set in this scope (no pagination), ordered by client id: the set the config
+    /// snapshot export (issue #43) projects.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<ClaimsMappingRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT client_id, rules::text AS rules \
+             FROM claims_mappings \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY client_id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(claims_mapping_from_row).collect())
+    }
+}
+
+/// Build a [`ClaimsMappingRecord`] from a `claims_mappings` row.
+fn claims_mapping_from_row(row: &sqlx::postgres::PgRow) -> ClaimsMappingRecord {
+    ClaimsMappingRecord {
+        client_id: row.get("client_id"),
+        rules_json: row.get("rules"),
+    }
+}
+
 /// Build a [`SignupFormRecord`] from a `signup_forms` row (the shared read projection).
 fn signup_form_from_row(row: &sqlx::postgres::PgRow) -> SignupFormRecord {
     SignupFormRecord {
         id: row.get("id"),
         client_id: row.get("client_id"),
         fields_json: row.get("fields"),
+    }
+}
+
+/// The mutating declarative claim mapping repository for one scope and actor (issue #113).
+///
+/// The rule document is stored VERBATIM as the caller's already-validated JSON string. This
+/// crate cannot validate it: the `validate` function in `ironauth-oidc`'s claims-mapping module
+/// is what decides whether a rule targets a reserved claim, and the dependency runs the other
+/// way. The admin path that calls this validates first, exactly as the signup-forms path
+/// validates a field list against the scope's trait schema before writing it.
+pub struct ActingClaimsMappingRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingClaimsMappingRepo<'_> {
+    /// Write a client's rule set (a first write or an overwrite) and audit
+    /// `claims_mapping.set` in the same transaction.
+    ///
+    /// One row per (scope, client), so a repeat write overwrites in place and a set is
+    /// idempotent on the client id. The audit TARGET is the client itself: this table has no id
+    /// of its own, and the client is the thing whose tokens changed shape, which is what an
+    /// auditor is looking for.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn set(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        rules_json: &str,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client_id = client.to_string();
+        let rules = rules_json.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClaimsMappingSet,
+                target: client,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO claims_mappings \
+                     (tenant_id, environment_id, client_id, rules) \
+                     VALUES ($1, $2, $3, $4::jsonb) \
+                     ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE \
+                     SET rules = EXCLUDED.rules, updated_at = now()",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&rules)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 }
 
@@ -60484,6 +60650,13 @@ async fn read_promoted_snapshot(
         // target read omits them exactly like `client`, which is excluded for the
         // identical reason, keeping the promotion revision consistent.
         signup_form: Vec::new(),
+        // `claims_mapping` (issue #113) is keyed the same way and is blocked on the same
+        // missing primitive: its natural key is an authorize `client_id`, a scope-embedded
+        // id that cannot address the same logical client in another environment. It
+        // EXPORTS, so the criterion's "promote via config snapshots" is satisfied for the
+        // snapshot document, and the transactional engine omits it until client promotion
+        // has a key to work with.
+        claims_mapping: Vec::new(),
         // The PROMOTED types, filled by the exhaustive dispatch below.
         resource_server: Vec::new(),
         dcr_policy: Vec::new(),
