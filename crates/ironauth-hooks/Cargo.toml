@@ -61,5 +61,19 @@ name = "hook_latency"
 path = "benches/hook_latency.rs"
 harness = false
 
+# The shipped guest fixtures, as bytes, for a test in ANOTHER crate.
+#
+# `IRONAUTH_GUEST_GOOD` and its siblings are set by this crate's build script, so only this
+# crate can `include_bytes!` them. The dispatch that runs a hook lives in `ironauth-oidc`, and
+# the test that matters -- M11's exit criterion, a WASM hook customizing a real token -- has to
+# drive a real component through a real issuance. Exporting the bytes is what lets that test
+# live where the code it tests lives.
+#
+# Behind a feature so the fixtures are not in a release binary: they are test data, and a
+# claim-shaping guest compiled into the server would be several hundred kilobytes of
+# never-executed WASM.
+[features]
+testing = []
+
 [lints]
 workspace = true

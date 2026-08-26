@@ -351,10 +351,13 @@ async fn mint_ciba_tokens(
     // names -- so a door that skipped it would issue MORE than the operator configured, and
     // whichever door that is becomes the one to use. A fault fails the issuance, for the reason
     // `claims_mapping_at_issuance`'s header gives.
-    let access_extra_claims = crate::claims_mapping_at_issuance::apply_to(
+    let access_extra_claims = crate::claims_mapping_at_issuance::apply_to_with_hook(
         state.store(),
+        state.hook_engine(),
         scope,
         &client_id,
+        "urn:openid:params:grant-type:ciba",
+        Some(&approved.subject),
         &mut extra_claims,
     )
     .await

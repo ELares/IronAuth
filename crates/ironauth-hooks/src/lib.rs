@@ -47,3 +47,48 @@ pub use engine::{Customization, HookEngine, LoadedHook, Request};
 pub use error::{AbortKind, HookError};
 pub use limits::Limits;
 pub use sandbox::{FROZEN_RESOLUTION_NS, Observed, Sandbox};
+
+/// The shipped guest fixtures, as bytes, for tests in other crates.
+///
+/// The build script compiles `guests/` and hands each artifact's path to this crate through an
+/// environment variable, so only this crate can `include_bytes!` one. The dispatch that RUNS a
+/// hook lives in `ironauth-oidc`, and the test that matters -- M11's exit criterion, a WASM hook
+/// customizing a real token -- has to drive a real component through a real issuance.
+///
+/// Feature-gated, because these are test data: a claim-shaping guest compiled into the server
+/// would be several hundred kilobytes of WASM nothing ever executes.
+#[cfg(feature = "testing")]
+pub mod fixtures {
+    /// A hook that adds `tier` to the access token and echoes everything else untouched.
+    ///
+    /// The well-behaved one. What makes it the right fixture for an end-to-end test is that
+    /// `tier` is a name the protected-claim fence ALLOWS -- so a token that lacks it afterwards
+    /// means the dispatch did not run, rather than that the fence did its job.
+    pub const GOOD: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_GOOD"));
+
+    /// A hook that spins until its fuel runs out.
+    pub const FUEL_BOMB: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_FUEL_BOMB"));
+
+    /// A hook that returns an error of its own rather than a customization.
+    pub const DECLINER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_DECLINER"));
+
+    /// A hook that returns `sub` and `iss` -- the identity and the issuer.
+    ///
+    /// Issue #113 criterion 5's "or hook" half. It also returns one claim the fence ALLOWS, so
+    /// a test can tell "the fence dropped the forged claims" from "the hook never ran", which
+    /// are the same observation without it.
+    pub const CLAIM_FORGER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CLAIM_FORGER"));
+
+    /// A hook that REMOVES `email` and adds a marker.
+    ///
+    /// The WIT contract is a replace, so dropping a claim means not echoing it. The marker is
+    /// what lets a test tell a removal from a hook that never ran.
+    pub const CLAIM_STRIPPER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CLAIM_STRIPPER"));
+
+    /// A hook that echoes both claim lists unchanged, plus a marker.
+    ///
+    /// The identity under the replace contract, and the shape that exposes a cap on hook OUTPUT
+    /// silently capping the TOKEN: a deployment with more than 32 extra claims deploying a
+    /// do-nothing hook must not lose any of them.
+    pub const ECHO_ONLY: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_ECHO_ONLY"));
+}

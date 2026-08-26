@@ -1262,6 +1262,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0161_claims_mappings_delete_grant.sql"),
         },
+        Migration {
+            version: 162,
+            name: "token_hooks",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0162_token_hooks.sql"),
+        },
     ]
 }
 

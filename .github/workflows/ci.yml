@@ -462,15 +462,39 @@ jobs:
       # This lane has been RED on main since ironauth-cel landed (#993); branch protection
       # requires a review but no CI job, so nothing surfaced it. Fixed here because a branch
       # cannot be green while it is not.
-      - run: cargo check --workspace --all-features --all-targets --exclude ironauth-hooks --exclude ironauth-cel
-      # The two excluded crates are checked AT THEIR OWN declared MSRV, so the numbers
-      # docs/COMPATIBILITY.md publishes for them are compiled rather than asserted. Without this
-      # the exclusion above is the only thing anyone checks, and a crate could quietly need a
-      # newer compiler than its manifest claims while every lane stayed green.
+      #
+      # `--all-features` USED TO BE ON THIS LINE, and it was the bug. `--exclude` drops a
+      # workspace MEMBER from the list of crates to check; it says nothing about what the
+      # members still being checked DEPEND on. So the moment issue #114 gave `ironauth-oidc` an
+      # optional `wasm-hooks` feature, `--all-features` turned it on, `ironauth-oidc` pulled
+      # wasmtime, and this lane compiled the very crate the two `--exclude` flags above were
+      # written to keep out -- under 1.85, against wasmtime's declared 1.95.
+      #
+      # The MSRV is a promise about what a CONSUMER compiles, so this lane now checks that:
+      # default features, libraries and binaries. `--all-targets` came off with it, because a
+      # dev-dependency is not something a consumer builds either, and `ironauth-oidc`'s tests
+      # dev-depend on `ironauth-hooks` for its guest fixtures. `scripts/msrv-audit.sh` enforces
+      # the same two boundaries against `cargo metadata` and explains them at length.
+      # Installed here rather than lower down because the all-features check below runs under
+      # 1.95, not only the two per-crate checks that used to be the sole users.
       - name: Install the toolchains the excluded crates declare
         run: rustup toolchain install 1.95 --profile minimal && rustup toolchain install 1.86 --profile minimal
       - name: Install the WASM target for 1.95
         run: rustup target add wasm32-wasip2 --toolchain 1.95
+      - name: The shipped graph, at the promised MSRV
+        run: cargo check --workspace --exclude ironauth-hooks --exclude ironauth-cel
+      # Everything the default graph does not reach is still checked, at the toolchain the
+      # highest-declaring member names. Without this the feature combinations behind an
+      # optional dependency would be compiled by no lane at all, which is how `wasm-hooks`
+      # could have shipped broken while every check stayed green.
+      - name: Everything else, at the highest MSRV any member declares
+        env:
+          RUSTUP_TOOLCHAIN: "1.95"
+        run: cargo check --workspace --all-features --all-targets
+      # The two excluded crates are checked AT THEIR OWN declared MSRV, so the numbers
+      # docs/COMPATIBILITY.md publishes for them are compiled rather than asserted. Without this
+      # the exclusion above is the only thing anyone checks, and a crate could quietly need a
+      # newer compiler than its manifest claims while every lane stayed green.
       - name: ironauth-hooks at its declared 1.95
         env:
           RUSTUP_TOOLCHAIN: "1.95"

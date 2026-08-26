@@ -5,13 +5,28 @@
 //! `bench-config.toml` and against the committed baseline. A benchmark whose output only a human
 //! reads cannot fail a build.
 //!
-//! # What "cold" means here, and why it is the whole invocation
+//! # What "cold" means here, and why it changed
 //!
-//! Cold is `deserialize + instantiate + call`, measured fresh each iteration: a precompiled
-//! artifact loaded, a store built, and the hook run once. That is what a deployment pays for the
-//! first invocation of a hook it has not run recently, and it is the number the criterion bounds
-//! at 1 ms. Measuring only `deserialize` would report a smaller number for a thing nobody
-//! experiences.
+//! Cold is `Component::new + instantiate + call`, measured fresh each iteration: the component
+//! COMPILED, a store built, and the hook run once. That is what a deployment pays the first time
+//! a process sees a given hook, and it is the number the criterion bounds at 1 ms.
+//!
+//! It used to be `deserialize + instantiate + call` over a precompiled artifact, and that became
+//! a measurement of a path nothing runs. When issue #114's dispatch landed it did not use the
+//! AOT pair at all: `engine.compile` and `load_precompiled` have zero production callers, and
+//! the request path calls `HookEngine::load`. So this benchmark reported 128 microseconds for a
+//! sequence the server never executes while the shipped one compiled -- measured at 33 ms, which
+//! is 33x the gate it was passing.
+//!
+//! That is the defect this file's own gate exists to prevent, wearing the benchmark instead of
+//! the code, and it is why the cold number is now the compile: a gate is only worth its runner
+//! time if the call sequence it times is the one the server makes.
+//!
+//! The consequence is that COLD NO LONGER FITS THE 1 ms BOUND, and it should not: compiling is
+//! milliseconds and always was. What the criterion's microsecond claim is about is the
+//! per-invocation cost, which is WARM -- and what makes warm the number a deployment actually
+//! pays is the dispatch's per-process component cache. See `hook-bench-gate.sh` for how the two
+//! are bounded differently now.
 //!
 //! Warm is a repeated call on an already-LOADED hook. It is not a repeated call on a shared
 //! instance, and the difference is worth stating because it makes the number look worse than a
@@ -83,32 +98,21 @@ fn request() -> Request {
 fn main() {
     let engine = HookEngine::new().expect("engine");
     let wasm = std::fs::read(env!("IRONAUTH_GUEST_GOOD")).expect("the benchmark guest");
-    // AOT, because that is what the criterion measures: a deployment compiles at deploy time and
-    // the request path only ever deserializes.
-    let artifact = engine.compile(&wasm).expect("precompile");
     let limits = Limits::claim_shaping();
     let request = request();
 
     let mut cold_samples = Vec::with_capacity(COLD_ITERATIONS);
     for _ in 0..COLD_ITERATIONS {
         let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement: elapsed time is this benchmark's entire output, and a bench target is not protocol logic (it is not compiled into the server), which is what the rule protects
-        // SAFETY: `artifact` is the output of `engine.compile` above, in this process, on this
-        // engine. That is exactly the provenance `load_precompiled` requires.
-        #[expect(
-            unsafe_code,
-            reason = "the AOT path is what criterion 4 measures; it cannot be benchmarked \
-                      without exercising it, and the provenance is satisfied above"
-        )]
-        let hook = unsafe { engine.load_precompiled(&artifact) }.expect("load");
+        // `load`, which is `Component::new`: the SAME call the dispatch makes on a cache miss.
+        // No `unsafe`, because the dispatch has none either -- the AOT pair measured slower
+        // (34.0 ms against 32.8) and was the only unsafe block in the crate it lived in.
+        let hook = engine.load(&wasm).expect("load");
         hook.customize(&engine, &limits, &request).expect("call");
         cold_samples.push(started.elapsed().as_nanos());
     }
 
-    #[expect(
-        unsafe_code,
-        reason = "same provenance as the cold loop; the warm loop needs one loaded hook"
-    )]
-    let hook = unsafe { engine.load_precompiled(&artifact) }.expect("load");
+    let hook = engine.load(&wasm).expect("load");
     // One call outside the measurement so the warm number is not the first call.
     hook.customize(&engine, &limits, &request).expect("warm up");
     let mut warm_samples = Vec::with_capacity(WARM_ITERATIONS);
@@ -125,7 +129,7 @@ fn main() {
         "{{\"cold_p95_micros\":{:.3},\"warm_p95_micros\":{:.3},\"artifact_bytes\":{},\"cold_iterations\":{},\"warm_iterations\":{}}}",
         micros(cold_p95_ns),
         micros(warm_p95_ns),
-        artifact.len(),
+        wasm.len(),
         // The LENGTHS, not the constants. They agree today because the constants are the loop
         // bounds, but the gate's sample floor would then be reading a claim about the data
         // rather than the data -- and a loop that broke early would report the count it meant

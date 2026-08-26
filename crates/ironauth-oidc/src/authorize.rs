@@ -1380,10 +1380,13 @@ async fn mint_front_channel_id_token(
     // A fault is `Err(())`, which this function's caller turns into a refused authorization.
     // Failing closed here matches the token endpoint for the reason `claims_mapping_at_issuance`
     // gives: a mapping can REMOVE a claim, so ignoring one over-claims.
-    let access_extra_claims = crate::claims_mapping_at_issuance::apply_to(
+    let access_extra_claims = crate::claims_mapping_at_issuance::apply_to_with_hook(
         state.store(),
+        state.hook_engine(),
         scope,
         &client_id_str,
+        "implicit",
+        Some(resolved.subject),
         &mut extra_claims,
     )
     .await

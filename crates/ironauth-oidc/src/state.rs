@@ -406,6 +406,14 @@ pub struct OidcState {
     // The claims-enrichment hook (issue #100): the seam an external PDP or FGA merges
     // extra claims through at issuance. `None` (the default) leaves issuance unchanged.
     claims_enrichment_hook: Option<Arc<crate::enrichment::ClaimsEnrichmentHook>>,
+    /// The WASM hook runtime (issue #114), absent unless a deployment enables hooks.
+    ///
+    /// ONE runtime for the process, held here rather than built per invocation: it owns the
+    /// wasmtime engine, whose epoch counter a driver advances, and the compiled-component cache
+    /// that keeps a hooked issuance in microseconds instead of recompiling 33 ms every time.
+    /// Measured -- `precompile_component` on the shipped fixture is a median of 34 ms, and the
+    /// first version of the dispatch paid it on every login.
+    hook_engine: Option<Arc<crate::token_hook::HookRuntime>>,
     // The outbound client SYNC HTTP flow targets are called through (issue #112). `None`
     // (the default) is not "skip the targets": a registered target with no fetcher takes the
     // unavailable path and its failure policy, so a boot that forgot to install one cannot
@@ -1015,6 +1023,7 @@ impl OidcState {
             quota: None,
             migration_hook: None,
             claims_enrichment_hook: None,
+            hook_engine: None,
             flow_target_fetcher: None,
             hashing_pool: None,
             custom_journey_source: None,
@@ -1599,6 +1608,25 @@ impl OidcState {
     #[must_use]
     pub fn claims_enrichment_hook(&self) -> Option<&Arc<crate::enrichment::ClaimsEnrichmentHook>> {
         self.claims_enrichment_hook.as_ref()
+    }
+
+    /// Install the WASM hook runtime (issue #114). Absent by default, which leaves token
+    /// issuance byte-for-byte as it was before hooks existed -- a deployment that has not
+    /// enabled them never reads `token_hooks` and never compiles anything.
+    #[cfg(feature = "wasm-hooks")]
+    #[must_use]
+    pub fn with_hook_engine(mut self, engine: Arc<crate::token_hook::HookRuntime>) -> Self {
+        self.hook_engine = Some(engine);
+        self
+    }
+
+    /// The installed WASM hook runtime, if any (issue #114).
+    ///
+    /// Always present, and always `None` without the `wasm-hooks` feature because `HookRuntime`
+    /// is uninhabited there. That is what lets the issuance seam keep one signature.
+    #[must_use]
+    pub fn hook_engine(&self) -> Option<&Arc<crate::token_hook::HookRuntime>> {
+        self.hook_engine.as_ref()
     }
 
     /// Install the outbound client sync HTTP flow targets are called through (issue #112).

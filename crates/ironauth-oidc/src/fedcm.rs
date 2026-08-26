@@ -678,10 +678,13 @@ async fn mint_assertion(
     // `claims_mapping_at_issuance`'s header gives.
     //
     // This function returns `Option<String>`, so a fault is `None` and the assertion is refused.
-    let access_extra_claims = crate::claims_mapping_at_issuance::apply_to(
+    let access_extra_claims = crate::claims_mapping_at_issuance::apply_to_with_hook(
         state.store(),
+        state.hook_engine(),
         scope,
         &client_id_str,
+        "urn:ietf:params:oauth:grant-type:fedcm",
+        Some(public_subject),
         &mut extra_claims,
     )
     .await

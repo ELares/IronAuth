@@ -916,6 +916,12 @@ pub enum Action {
     /// restoring whatever the next level up provides. The audit row names the template id and
     /// scope.
     MessageTemplateDelete,
+    /// A WASM TOKEN HOOK was deployed or replaced (issue #114). The audit row names the CLIENT
+    /// whose tokens the deployed code now shapes -- this table has no id of its own, and a hook
+    /// is code running inside the token mint, which is the most privileged thing an operator
+    /// installs here. The component itself is not recorded: an audit stream is not a binary
+    /// store, and the bytes are already durable in the row the audit points at.
+    TokenHookSet,
     /// A per-environment, per-client DECLARATIVE CLAIM MAPPING was written or overwritten
     /// (issue #113): a first write or an overwrite of the already-validated rule set. The audit
     /// row names the CLIENT, because this table has no id of its own and the client is the thing
@@ -1575,6 +1581,7 @@ impl Action {
             Action::FlowTargetDelete => "flow_target.delete",
             Action::FlowTargetReplayDeadLetters => "flow_target.replay_dead_letters",
             Action::MessageTemplateDelete => "message_template.delete",
+            Action::TokenHookSet => "token_hook.set",
             Action::ClaimsMappingSet => "claims_mapping.set",
             Action::ClaimsMappingRefused => "claims_mapping.refused",
             Action::ClaimsMappingDelete => "claims_mapping.delete",

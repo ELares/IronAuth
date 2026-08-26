@@ -110,6 +110,7 @@ pub mod token_act_chain;
 pub mod token_customize;
 pub mod token_exchange;
 pub mod token_exchange_decision;
+pub mod token_hook_store;
 pub mod token_type_negotiation;
 pub mod trait_schema;
 

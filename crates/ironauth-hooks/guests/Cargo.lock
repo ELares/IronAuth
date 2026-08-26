@@ -15,7 +15,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "claim-forger"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
+name = "claim-stripper"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "decliner"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
+name = "echo-only"
 version = "0.0.0"
 dependencies = [
  "wit-bindgen 0.46.0",

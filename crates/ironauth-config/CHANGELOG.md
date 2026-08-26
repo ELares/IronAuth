@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The `wasm-hooks` experimental feature (issue #114 criterion 7).** Off by default and
+  acknowledgment-gated. The reason is the ABI rather than the runtime: the sandbox is
+  adversarially tested and the latency is benchmarked and gated, but a hook is a compiled
+  artifact built against a WIT interface, and issue #114's differentiator is a version-stable
+  one. Promising decade stability for an interface with one implementation and no external users
+  is a promise made before the evidence.
+
 - **New section `[flow_targets]`** (issue #112 criterion 2), with two settings and a new
   public const. `flow_targets.delivery_enabled` (default `false`) gates whether THIS process
   drains the `flow_target.delivery` queue and POSTs to registered async targets, matching the

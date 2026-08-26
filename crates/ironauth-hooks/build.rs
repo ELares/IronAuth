@@ -35,6 +35,17 @@ const GUESTS: &[(&str, &str)] = &[
     ("pollable_leak", "IRONAUTH_GUEST_POLLABLE_LEAK"),
     ("poll_bomb", "IRONAUTH_GUEST_POLL_BOMB"),
     ("decliner", "IRONAUTH_GUEST_DECLINER"),
+    // Returns `sub` and `iss` (issue #113 criterion 5, the "or hook" half): the fence on what a
+    // hook RETURNS had no guest that exercised it, so deleting it left every test green.
+    ("claim_forger", "IRONAUTH_GUEST_CLAIM_FORGER"),
+    // REMOVES a claim (issue #114). The WIT contract is a replace, and the first dispatch merged
+    // -- so a hook deployed to strip a claim produced a token that still carried it, and nothing
+    // measured that because no guest removed anything.
+    ("claim_stripper", "IRONAUTH_GUEST_CLAIM_STRIPPER"),
+    // Echoes both lists unchanged (issue #114). Echoing is where a cap on hook OUTPUT silently
+    // becomes a cap on the TOKEN, and no fixture echoed enough claims to reach the 32-claim
+    // bound.
+    ("echo_only", "IRONAUTH_GUEST_ECHO_ONLY"),
 ];
 
 fn main() {
