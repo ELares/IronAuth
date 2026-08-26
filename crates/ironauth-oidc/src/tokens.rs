@@ -1668,10 +1668,14 @@ mod access_extra_claims_tests {
     /// EVERY BRANCH. The first version of this test populated `org_id` and one permission
     /// variant and took 10 of the builder's 16 emission sites; an unprotected claim added
     /// beside `cnf`, `act`, `roles` or `permissions_status` went unchecked, and four mutants
-    /// proved it. The fixture below sets every optional field on `MintRequest`, including the
-    /// four this builder ignores today, and the assertion is over the UNION of all THREE
-    /// permission variants -- the two that emit a claim are mutually exclusive by construction,
-    /// so no single call can see the other's.
+    /// proved it. The second version set ten of `MintRequest`'s twelve optional fields, and the
+    /// two it missed let a claim gated on `request.permissions` through untouched.
+    ///
+    /// The fixture sets every optional field the builder could read, including the ones it
+    /// ignores today, and the assertion is over the UNION of all THREE permission variants --
+    /// the two that emit a claim are mutually exclusive by construction, so no single call can
+    /// see the other's. `id_token_signer` is the one field left unset, because it is an
+    /// ID-token concern this builder has no access to.
     #[test]
     fn every_claim_the_access_builder_sets_is_protected() {
         let roles = super::tests::role_set(&["admin", "billing"]);
@@ -1689,6 +1693,13 @@ mod access_extra_claims_tests {
         req.sid = Some("sess_1");
         req.at_hash = Some("athash");
         req.c_hash = Some("chash");
+        // `permissions` too, and it is not redundant with the loop below: the loop varies the
+        // PermissionClaim the caller passes, while this is the field the BUILDER reads. A claim
+        // gated on `request.permissions` -- `claims["permission_count"] = json!(resolved.len())`
+        // -- is emitted on neither of those loop variants unless this is set, and it passed 848
+        // tests unprotected. The builder ignores the field today, so the emitted set and the
+        // count of 16 do not move.
+        req.permissions = Some(&permissions);
         req.actor = Some(TokenActor {
             subject: "usr_admin",
             reason_code: "support",
