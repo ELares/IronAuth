@@ -17,10 +17,13 @@
 //! text it knows. `Recovery` and `Registration` carry a confirm link; mailing them without it
 //! would not be a degraded message, it would be a broken flow.
 //!
-//! Everything this producer does not render is DELEGATED, unchanged, to the sender it wraps.
-//! `the_link_carrying_purposes_are_delegated_not_queued` and
-//! `the_four_token_carrying_methods_are_delegated` are what make that true rather than
-//! intended.
+//! Everything this producer does not render is DELEGATED, unchanged, to the sender it wraps --
+//! and that is true on THREE axes, because review found it broken on two of them in turn. By
+//! METHOD (`the_four_token_carrying_methods_are_delegated`), by PURPOSE
+//! (`the_link_carrying_purposes_are_delegated_not_queued`), and by RECIPIENT
+//! (`a_recipient_this_ledger_cannot_address_is_delegated`) -- the last because these alerts go
+//! to every verified channel, a verified phone has no `@`, and dropping it moved every
+//! phone-channel alert from "logged" to nothing.
 
 use ironauth_env::Env;
 use ironauth_oidc::message_sender::{MessagingVerificationSender, notice_body};
@@ -265,19 +268,67 @@ async fn the_payload_carries_no_secret_and_nothing_the_composer_cannot_use() {
         "the payload's message id is the row's own: {payload}"
     );
 
-    // And the body is the rendered notice, which is what makes the message composable at all.
+    // And the body is the rendered notice. Compared against a LITERAL, not against
+    // `notice_body(purpose)` -- which is the function under test, so that comparison is
+    // `f(x) == f(x)` and holds for whatever the function returns. It held for an EMPTY body,
+    // for the OTHER purpose's text, and for a body carrying a live token.
     assert_eq!(
         object["body"].as_str(),
-        notice_body(VerificationPurpose::AccountUnlinked),
-        "the body is the rendered text for THIS purpose: {payload}"
+        Some(
+            "A sign-in method was removed from your account. If this was you, no action is \
+             needed. If it was not, change your password and review your sign-in methods."
+        ),
+        "the body is the text for THIS purpose: {payload}"
     );
-    assert!(
-        !object["body"]
-            .as_str()
-            .expect("a string body")
-            .contains("http"),
-        "a coarse alert carries no link; a body with one would be a token on a durable queue"
+}
+
+/// The two rendered bodies say different things, and neither may carry a link.
+///
+/// Kept as one test over BOTH purposes rather than an assertion inside each purpose's test,
+/// because splitting them is how three mutations survived: the no-link check was applied only
+/// to `AccountUnlinked` and the text check only to `AccountLinked`, so neither purpose ever got
+/// both. A rule that holds for one of two cases is a rule the other case is exempt from.
+#[test]
+fn every_rendered_body_is_distinct_non_empty_and_link_free() {
+    let bodies: Vec<&'static str> = [
+        VerificationPurpose::AccountLinked,
+        VerificationPurpose::AccountUnlinked,
+    ]
+    .into_iter()
+    .map(|purpose| notice_body(purpose).expect("this producer renders both alerts"))
+    .collect();
+
+    for body in &bodies {
+        assert!(
+            !body.trim().is_empty(),
+            "an empty body walks around the composer's `missing_body` refusal and ships a \
+             blank mail, which its own doc calls worse than composing nothing"
+        );
+        assert!(
+            !body.contains("http") && !body.contains("://"),
+            "a coarse alert carries no link. A body with one is a token on a durable jsonb \
+             queue every consumer worker reads: {body}"
+        );
+    }
+    assert_ne!(
+        bodies[0], bodies[1],
+        "the two alerts describe opposite events, so one carrying the other's text tells a \
+         user a sign-in method was ADDED when one was REMOVED"
     );
+
+    // And the purposes this producer does not render have no body at all, so the branch that
+    // delegates them cannot be satisfied by an invented one.
+    for purpose in [
+        VerificationPurpose::Registration,
+        VerificationPurpose::Recovery,
+    ] {
+        assert_eq!(
+            notice_body(purpose),
+            None,
+            "{} carries a link in its real message and must not be rendered here",
+            purpose.as_str()
+        );
+    }
 }
 
 /// Two DIFFERENT purposes to one recipient do not collapse onto each other.
@@ -362,23 +413,45 @@ async fn a_repeat_inside_the_window_collapses() {
     // new_send` pins that the window moves.
 }
 
-/// An undeliverable recipient queues nothing and does not panic.
+/// A recipient this ledger cannot address is DELEGATED, not dropped.
 ///
-/// This door fires for every verified channel, and a tenant whose identifier type is a username
-/// reaches it with something that is not an address.
+/// `account.rs` dispatches these alerts to every VERIFIED channel, and a verified phone reaches
+/// this door as a number -- which is the default, since `annotated_verification_kinds` reports
+/// `phone: true` for any deployment carrying no `verification_addresses` annotation. A phone
+/// number has no `@`, so `normalize_recipient` refuses it.
+///
+/// The first version of this test asserted only `count == 0`, which is satisfied by dropping
+/// the send entirely -- and that is what the producer did. Turning messaging on moved every
+/// phone-channel alert from "logged by the transport that was already there" to nothing, while
+/// the module header claimed everything this producer does not handle is delegated unchanged.
+/// Counting what did NOT happen cannot distinguish "handled elsewhere" from "lost".
 #[tokio::test]
-async fn an_undeliverable_recipient_queues_nothing() {
+async fn a_recipient_this_ledger_cannot_address_is_delegated() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     provision(&db, &env, scope).await;
+    let (sender, delegate) = sender(&db, &env);
 
-    sender(&db, &env)
-        .0
-        .send(scope, VerificationPurpose::AccountLinked, "not-an-address")
-        .await;
+    for recipient in ["+15555550123", "not-an-address"] {
+        sender
+            .send(scope, VerificationPurpose::AccountLinked, recipient)
+            .await;
+    }
 
-    assert_eq!(count(&db, scope, None).await, 0);
+    assert_eq!(
+        count(&db, scope, None).await,
+        0,
+        "neither reaches the ledger: this producer sends email"
+    );
+    assert_eq!(
+        delegate.calls(),
+        vec![
+            "send:account_linked".to_owned(),
+            "send:account_linked".to_owned()
+        ],
+        "and BOTH reach the wrapped transport, which is the half `count == 0` cannot see"
+    );
 }
 
 /// The recipient is stored blind-indexed, never as written.

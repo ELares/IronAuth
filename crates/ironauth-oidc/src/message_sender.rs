@@ -97,6 +97,20 @@ const _: () = assert!(NOTICE_WINDOW_SECS >= 60);
 /// become one: a purpose reaching here that has no body is one whose real message carries a
 /// link, and inventing a linkless body for it would send a real person a mail they cannot act
 /// on. The caller delegates instead.
+///
+/// # What is asserted about these strings, and why it is not "whatever the function returns"
+///
+/// `notice_enqueues.rs` compared the payload's body against `notice_body(purpose)` -- the
+/// function under test -- which is `f(x) == f(x)` and holds for every possible body. Three
+/// mutations survived both suites: making the unlink alert EMPTY (so it ships as a blank mail,
+/// walking around the `missing_body` refusal whose own doc says a delivered empty message is
+/// worse than none); giving the unlink alert the LINK alert's text (telling a user a sign-in
+/// method was added when one was removed); and putting a live token in the linked alert's body,
+/// which is the one rule this whole module is organised around.
+///
+/// So the tests assert LITERAL text per purpose, that the two differ, that neither is empty,
+/// and that neither contains a URL -- and they do it for BOTH purposes rather than splitting
+/// the checks across two fixtures, which is how all three survived.
 #[must_use]
 pub fn notice_body(purpose: VerificationPurpose) -> Option<&'static str> {
     match purpose {
@@ -180,34 +194,45 @@ impl MessagingVerificationSender {
         }
     }
 
-    /// Enqueue one rendered notice. Separate from [`Self::send`] so the delegation decision and
-    /// the ledger write read as two things.
+    /// Enqueue one rendered notice, or DELEGATE if this producer cannot carry it.
+    ///
+    /// Every path out of this function either enqueues or delegates. That is not tidiness: the
+    /// first version RETURNED on a recipient it could not normalize, and `account.rs` dispatches
+    /// these alerts to every verified channel -- including a verified PHONE, which has no `@` and
+    /// so fails `normalize_recipient`. Turning messaging on therefore moved every phone-channel
+    /// alert from "logged by the transport that was there" to nothing at all, while the module
+    /// header claimed everything this producer does not handle is delegated unchanged. It was
+    /// the same defect review had already found on the METHOD axis, wearing the recipient axis.
     async fn enqueue_notice(&self, scope: Scope, purpose: VerificationPurpose, recipient: &str) {
         let Some(body) = notice_body(purpose) else {
-            // Unreachable through `send`, which checks before calling. Kept as a refusal rather
-            // than an `expect` because the failure it guards against is a purpose added later
-            // with no body, and mailing an empty message to a real person is worse than not
-            // mailing one.
+            // Unreachable through `send`, which checks before calling. Kept as a delegation
+            // rather than an `expect` because the failure it guards against is a purpose added
+            // later with no body, and the safe answer for one is the transport that was already
+            // carrying it.
             tracing::error!(
                 target: "ironauth.messaging",
                 purpose = purpose.as_str(),
                 "notice not queued: no body is rendered for this purpose"
             );
+            self.inner.send(scope, purpose, recipient).await;
             return;
         };
-        let Some(recipient) = normalize_recipient(recipient) else {
-            // Not a deliverable address. This door fires for every VERIFIED channel, and a
-            // tenant whose identifier type is a username or a phone reaches here with something
-            // that is not an email. Recorded rather than swallowed, and not an error in the
-            // action that triggered it.
+        let Some(normalized) = normalize_recipient(recipient) else {
+            // Not an email address. This door fires for every VERIFIED channel, and a tenant
+            // with a verified PHONE reaches here with a number -- which is the default, since
+            // `annotated_verification_kinds` reports `phone: true` for any deployment carrying
+            // no `verification_addresses` annotation. Delegated, because a channel this ledger
+            // cannot address is one the wrapped transport was addressing before.
             tracing::debug!(
                 target: "ironauth.messaging",
                 tenant = %scope.tenant(),
                 purpose = purpose.as_str(),
-                "notice not queued: the recipient is not a deliverable address"
+                "notice not queued here: the recipient is not an email address; delegating"
             );
+            self.inner.send(scope, purpose, recipient).await;
             return;
         };
+        let recipient = normalized;
 
         let kind = purpose.as_str();
         let now = self.env.clock().now_utc();
@@ -219,7 +244,12 @@ impl MessagingVerificationSender {
             &recipient,
             window_index(epoch_seconds, NOTICE_WINDOW_SECS),
         ) else {
-            tracing::warn!(target: "ironauth.messaging", kind, "notice not queued: no dedup key");
+            tracing::warn!(
+                target: "ironauth.messaging",
+                kind,
+                "notice not queued here: no dedup key; delegating"
+            );
+            self.inner.send(scope, purpose, recipient.as_str()).await;
             return;
         };
 

@@ -1406,13 +1406,16 @@ async fn build_oidc_plane(
             // else.
             let logging: std::sync::Arc<dyn ironauth_oidc::VerificationSender> =
                 std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender);
-            if config.messaging.delivery_enabled {
+            if notice_producer_installs(config) {
                 std::sync::Arc::new(
                     ironauth_oidc::message_sender::MessagingVerificationSender::new(
                         logging,
                         messaging_store.clone(),
                         messaging_env.clone(),
-                        ironauth_store::message_rate::RateBudget::new(3, 3_600),
+                        ironauth_store::message_rate::RateBudget::new(
+                            NOTICE_RATE_BUDGET.0,
+                            NOTICE_RATE_BUDGET.1,
+                        ),
                     ),
                 ) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
             } else {
@@ -3020,21 +3023,63 @@ fn message_delivery_inputs(config: &Config, env: &Env) -> Option<MessageDelivery
         data_plane_dsn: config.database.url.expose().to_owned(),
         control_dsn: select_control_dsn(config),
         master: resolve_master_key(config),
-        // The right-hand side of every Message-ID this deployment stamps. RFC 5322 section
-        // 3.6.4 wants it globally unique, and the deployment's own public host is what makes
-        // it so rather than merely random. Falls back to a reserved name rather than to
-        // something that might belong to somebody else: `.invalid` is reserved by RFC 2606
-        // exactly so it can never resolve.
-        sender_domain: config
-            .server
-            .public_url
-            .as_deref()
-            .and_then(|url| url.parse::<http::Uri>().ok())
-            .and_then(|uri| uri.host().map(str::to_owned))
-            .filter(|host| !host.is_empty())
-            .unwrap_or_else(|| "ironauth.invalid".to_owned()),
+        sender_domain: sender_domain(config.server.public_url.as_deref()),
         env: env.clone(),
     })
+}
+
+/// How many notices one recipient may be sent in an hour.
+///
+/// Three, matching the shape the ledger's own tests use for a real budget. Named rather than
+/// written at the call site so the value a deployment runs is the value a test can name: every
+/// suite exercising this producer used `RateBudget::new(100, 3_600)`, so the SHIPPED budget was
+/// the one configuration nothing ever ran.
+/// (per-recipient sends, window seconds). Not a `const RateBudget` because `RateBudget::new` is
+/// not a `const fn`; the pair is what a test names and what the call site passes.
+const NOTICE_RATE_BUDGET: (u32, u64) = (3, 3_600);
+
+/// Whether the messaging producer replaces the logging transport (issue #111).
+///
+/// Extracted for the reason the sibling `message_delivery_inputs` was, and stated there: "a
+/// feature that can be wired backwards with nothing going red is a feature nothing measures."
+/// This gate lived inline in a closure inside `build_oidc_plane`, which only the boot path
+/// calls; the integration tests set `DEV_CAPTURE` before boot and take the capture arm, so
+/// INVERTING this condition installed the producer exactly when the operator asked for silence
+/// and no test in the tree noticed.
+fn notice_producer_installs(config: &Config) -> bool {
+    config.messaging.delivery_enabled
+}
+
+/// The right-hand side of every `Message-ID` this deployment stamps.
+///
+/// RFC 5322 section 3.6.4 wants it globally unique, and the deployment's own public host is what
+/// makes it so rather than merely random. The fallback is a reserved name rather than something
+/// that might belong to somebody else: `.invalid` is reserved by RFC 2606 exactly so it can
+/// never resolve.
+///
+/// # Why a host without a dot falls back rather than being used
+///
+/// `message_mime::message_id` refuses a domain with no `.`, `prepare_message` maps that to
+/// `PrepareError::Mime`, `compose` returns `mime_failed`, and the delivery consumer resolves the
+/// row `Failed` with NO provider contacted and no retry. So a public URL of `http://localhost`
+/// or `https://op` does not degrade delivery -- it stops it, for every message, silently.
+///
+/// Both of those ship in this repository: `deploy/ironauth.toml` sets
+/// `public_url = "http://localhost:8443"` and `deploy/conformance/ironauth.toml` sets
+/// `https://op`. A configured host was therefore strictly WORSE than an unset one, because the
+/// unset case already fell back to a domain that works.
+///
+/// This is the second instance of the defect the `boundary_for` fix in this same change is
+/// about: a value that only ever met the composer once a real producer existed. So the filter is
+/// the composer's own rule rather than "non-empty", and the fallback covers both.
+fn sender_domain(public_url: Option<&str>) -> String {
+    public_url
+        .and_then(|url| url.parse::<http::Uri>().ok())
+        .and_then(|uri| uri.host().map(str::to_owned))
+        // The composer's rule, not a weaker copy of it: a host it would refuse is one that
+        // stops delivery entirely, so it must not become the sender domain.
+        .filter(|host| ironauth_store::message_mime::is_usable_message_id_domain(host))
+        .unwrap_or_else(|| "ironauth.invalid".to_owned())
 }
 
 /// The configured providers as (name, endpoint), IN CONFIGURED ORDER.
@@ -6167,7 +6212,7 @@ mod tests {
 
 #[cfg(test)]
 mod message_delivery_wiring_tests {
-    use super::{message_delivery_inputs, provider_specs};
+    use super::{message_delivery_inputs, notice_producer_installs, provider_specs, sender_domain};
     use ironauth_config::{Config, MessageProviderConfig, MessagingConfig};
     use ironauth_env::Env;
 
@@ -6212,6 +6257,56 @@ mod message_delivery_wiring_tests {
             message_delivery_inputs(&on, &env).is_some(),
             "delivery on must start one; inverted, the worker runs exactly when the operator \
              asked for silence"
+        );
+    }
+
+    /// The PRODUCER gate is the consumer gate, and it is not inverted.
+    ///
+    /// The sibling test above guards the consumer's gate and says why. This one exists because
+    /// the producer's gate had none: it sat inline in a closure inside `build_oidc_plane`, which
+    /// only the boot path calls, and every integration test sets `DEV_CAPTURE` first and takes
+    /// the capture arm. Inverting the condition installed the messaging producer precisely when
+    /// the operator asked for silence, with nothing red.
+    #[test]
+    fn the_notice_producer_installs_when_delivery_is_enabled_and_not_when_it_is_off() {
+        assert!(
+            !notice_producer_installs(&config_with(messaging(false, &["primary"]))),
+            "delivery off keeps the logging transport"
+        );
+        assert!(
+            notice_producer_installs(&config_with(messaging(true, &["primary"]))),
+            "delivery on installs the producer; inverted, an operator who turned messaging OFF \
+             is the one who gets real mail"
+        );
+    }
+
+    /// A public host the composer would refuse never becomes the sender domain.
+    ///
+    /// `message_id` refuses a domain with no dot, the composer turns that into `mime_failed`,
+    /// and the consumer resolves the row `Failed` with no provider contacted and no retry -- for
+    /// EVERY message. Both hosts asserted here ship in this repository's own deployment files,
+    /// so a configured public URL was strictly worse than an unset one.
+    #[test]
+    fn a_public_host_the_composer_would_refuse_falls_back() {
+        for refused in [
+            Some("http://localhost:8443"),
+            Some("https://op"),
+            Some("http://[::1]:8443"),
+            Some("not a url at all"),
+            None,
+        ] {
+            assert_eq!(
+                sender_domain(refused),
+                "ironauth.invalid",
+                "{refused:?} cannot stamp a Message-ID, so it must not be the sender domain"
+            );
+        }
+
+        // And a real host IS used, so the assertions above are not passing because everything
+        // falls back.
+        assert_eq!(
+            sender_domain(Some("https://auth.example.test:8443/base")),
+            "auth.example.test"
         );
     }
 
