@@ -1897,6 +1897,21 @@ impl<'a> ActingStore<'a> {
         }
     }
 
+    /// The mutating declarative claim mapping repository for this scope and actor (issue #113):
+    /// write a client's rule set, audited.
+    ///
+    /// The control plane's INSERT and UPDATE grants exist for THIS, and for nothing else yet.
+    /// The migration's own rule is that a privilege arrives with its caller, so the caller lands
+    /// with the grants rather than after them.
+    #[must_use]
+    pub fn claims_mappings(&self) -> ActingClaimsMappingRepo<'a> {
+        ActingClaimsMappingRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
     /// The mutating per-environment, per-client signup form repository for this scope and actor
     /// (issue #87): set (create or overwrite) a client's signup form, audited, and delete it,
     /// audited. The field list is stored already fail-fast validated by the admin signup-forms
@@ -32225,6 +32240,75 @@ fn signup_form_from_row(row: &sqlx::postgres::PgRow) -> SignupFormRecord {
 /// #87): set (create or overwrite) a client's form, audited, and delete it, audited. The field
 /// list is stored verbatim as the caller's ALREADY fail-fast validated JSON string (the admin
 /// signup-forms path validates it against the scope's active trait schema before the write).
+/// The mutating declarative claim mapping repository for one scope and actor (issue #113).
+///
+/// The rule document is stored VERBATIM as the caller's already-validated JSON string. This
+/// crate cannot validate it: the `validate` function in `ironauth-oidc`'s claims-mapping module
+/// is what decides whether a rule targets a reserved claim, and the dependency runs the other
+/// way. The admin path that calls this validates first, exactly as the signup-forms path
+/// validates a field list against the scope's trait schema before writing it.
+pub struct ActingClaimsMappingRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingClaimsMappingRepo<'_> {
+    /// Write a client's rule set (a first write or an overwrite) and audit
+    /// `claims_mapping.set` in the same transaction.
+    ///
+    /// One row per (scope, client), so a repeat write overwrites in place and a set is
+    /// idempotent on the client id. The audit TARGET is the client itself: this table has no id
+    /// of its own, and the client is the thing whose tokens changed shape, which is what an
+    /// auditor is looking for.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn set(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        rules_json: &str,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client_id = client.to_string();
+        let rules = rules_json.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClaimsMappingSet,
+                target: client,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO claims_mappings \
+                     (tenant_id, environment_id, client_id, rules) \
+                     VALUES ($1, $2, $3, $4::jsonb) \
+                     ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE \
+                     SET rules = EXCLUDED.rules, updated_at = now()",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&rules)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
 pub struct ActingSignupFormRepo<'a> {
     store: &'a Store,
     scope: Scope,

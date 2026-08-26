@@ -966,12 +966,25 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
         claims_mapping.push(ClaimsMappingSnapshot {
             client_id: record.client_id,
             // Parsed rather than carried as a string, so the document canonicalizes recursively
-            // and two environments with the same rules export byte-identically. A row that does
-            // not parse is a database that disagrees with its own CHECK constraint, so it
-            // surfaces as an error rather than travelling as opaque text.
+            // and two environments with the same rules export byte-identically.
+            //
+            // A parse failure here is NOT only "a database that disagrees with its own CHECK".
+            // The CHECK decides shape; `serde_json` additionally rejects values the shape
+            // permits -- a float outside f64's range, or nesting past its recursion limit -- so
+            // a row can satisfy every constraint and still fail to parse. When that happens the
+            // WHOLE environment's export fails, naming neither the client nor the table, which
+            // is fail-closed but unhelpful. Bounding what a rule may contain belongs with the
+            // admin write path that accepts it; this is the honest description of what happens
+            // until then.
             rules: serde_json::from_str(&record.rules_json).map_err(serde_fault)?,
         });
     }
+    // Redundant with the repository query's `ORDER BY client_id`, and kept for the reason
+    // `signup_form` keeps its own: the export's determinism should not rest on the database's
+    // planner, which a future index or a parallel scan could change without anyone editing this
+    // file. Deleting this line is therefore an EQUIVALENT mutation today and survives, which is
+    // the expected result rather than a gap: `the_export_is_ordered_by_client_id_whatever_order_
+    // the_writes_arrived_in` pins the PROPERTY, and either mechanism alone satisfies it.
     claims_mapping.sort_by(|a, b| a.client_id.cmp(&b.client_id));
 
     let mut signup_form = Vec::new();

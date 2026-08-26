@@ -247,6 +247,9 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     "resource_server",
     "routing_rule",
     "signing_key",
+    // A claim mapping shapes what a client's tokens carry, which is configuration of an
+    // entity rather than a change to an account or an access grant (issue #113).
+    "claims_mapping",
     "signup_form",
     "sms_config",
     "sms_route",
