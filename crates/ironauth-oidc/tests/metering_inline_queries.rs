@@ -132,7 +132,29 @@ fn touches_the_event_feed_other_than_appending(text: &str) -> bool {
 ///
 /// A RATCHET, not an observation: move it deliberately and say why in the commit, the same way
 /// `MINIMUM_ENTRIES` and the migration chain's applied count are moved.
-const REDEMPTION_STATEMENTS: usize = 64;
+///
+/// # 64 -> 69, issue #113's claim-mapping resolver
+///
+/// Five statements, and they are one scoped read: `BEGIN`, two `set_config` for the RLS scope,
+/// the `SELECT` from `claims_mappings`, `COMMIT`. That is what `begin_scoped` costs, so it is
+/// the same shape every other scoped read in the tree has rather than anything this path does
+/// unusually.
+///
+/// MEASURED rather than reasoned: removing only the code-exchange resolver call and re-running
+/// this test returns the count to exactly 64. So the five are the resolver and nothing else
+/// drifted underneath it.
+///
+/// It is NOT metering, which is the regression this ratchet exists to catch. The criterion's
+/// concern is a counter, a tally, or a materialized view updated on the way through a login --
+/// something whose cost grows with what it aggregates and which the feed's async fold exists to
+/// avoid. This is a per-client config read whose result shapes the token being minted, on the
+/// path that mints it, and whose absence would mean the mapping did not apply.
+///
+/// The cost is real and worth stating rather than absorbing: five statements on every code
+/// exchange, for a feature most clients have not configured. Making it cheaper means either
+/// caching per (scope, client) with an invalidation story, or threading the resolver into a
+/// transaction the redemption already opens. Both are their own change.
+const REDEMPTION_STATEMENTS: usize = 69;
 
 /// Redeeming an authorization code touches the event feed ONLY to append to it.
 ///
