@@ -706,6 +706,8 @@ async fn mint_assertion(
         id_token_signer: None,
         // FedCM mints an ID token only, never a DPoP-bound access token (issue #368).
         confirmation: None,
+        // The pre-token hook is the only writer; every other path contributes none.
+        access_extra_claims: crate::tokens::no_extra_claims(),
     };
     tokens::mint_id_token(state, signer, entry.policy(), &request)
         .ok()

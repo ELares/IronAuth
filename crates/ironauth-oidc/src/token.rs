@@ -1432,6 +1432,8 @@ async fn mint_tokens(
             // (issue #368): the `cnf` claim is issuer-set only, so a client cannot
             // self-assert it. None leaves a plain bearer access token.
             confirmation,
+            // The pre-token hook is the only writer; every other path contributes none.
+            access_extra_claims: crate::tokens::no_extra_claims(),
         },
         target,
     )
@@ -2488,6 +2490,8 @@ async fn mint_refresh_access(
             // proof was presented (enforced in [`enforce_refresh_dpop`]); [`None`]
             // leaves an unbound family's rotated token bearer, byte identical.
             confirmation,
+            // The pre-token hook is the only writer; every other path contributes none.
+            access_extra_claims: crate::tokens::no_extra_claims(),
         },
         target,
     )

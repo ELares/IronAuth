@@ -1414,6 +1414,8 @@ async fn mint_front_channel_id_token(
         // The front-channel authorize response mints no DPoP-bound access token here
         // (DPoP binds at the token endpoint, issue #368): a plain token.
         confirmation: None,
+        // The pre-token hook is the only writer; every other path contributes none.
+        access_extra_claims: crate::tokens::no_extra_claims(),
     };
     tokens::mint_id_token(state, signer, entry.policy(), &request).map(|(id_token, _jti)| id_token)
 }

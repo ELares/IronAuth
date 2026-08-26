@@ -542,6 +542,33 @@ pub struct MintRequest<'a> {
     /// win: an entry whose name is already set (for example `sub`) is never
     /// overwritten.
     pub extra_claims: &'a serde_json::Map<String, serde_json::Value>,
+    /// Extra claims to place in the ACCESS token (issue #113).
+    ///
+    /// The counterpart of [`Self::extra_claims`], and separate from it because the two tokens
+    /// are read by different parties for different purposes: an ID token is the client's
+    /// identity receipt, an access token is what a resource server authorizes against, and a
+    /// claim belongs in one, the other, or both by an explicit decision rather than by
+    /// arriving through one bag that feeds both.
+    ///
+    /// Empty on every path but the pre-token hook's. Before this existed, the ID token had a
+    /// custom-claim channel and the user-authentication access token had NONE, so a hook
+    /// promised both halves of `token_customize`'s contract and only one had anywhere to land.
+    ///
+    /// # It is folded where the size is measured, and that is not incidental
+    ///
+    /// [`build_access_token_claims`] is called by the closure `mint_at_jwt` hands to
+    /// [`crate::permission_budget::decide`], so a claim placed here is inside the bytes the
+    /// budget measures, by construction rather than by a caller remembering to measure after
+    /// folding. Folding it in afterwards would let the budget judge a token smaller than the
+    /// one that ships, which turns issue #98's size guarantee into a size estimate, and would
+    /// make the `roles_only_token_bytes` it reports a measurement of a token that never
+    /// existed.
+    ///
+    /// Fenced against [`PROTECTED_ACCESS_TOKEN_CLAIMS`] at the fold, exactly as
+    /// [`Self::extra_claims`] is. The fence is at the CHANNEL, not only at whoever writes into
+    /// it: the hook's own fence in `claims_mapping` is the first line, and this one holds for
+    /// any future writer that has not been invented yet.
+    pub access_extra_claims: &'a serde_json::Map<String, serde_json::Value>,
     /// The per-client ID-token signing key (issue #30): the environment key of the
     /// algorithm this client negotiated as its `id_token_signed_response_alg` at
     /// dynamic registration. When [`Some`], the ID token (ONLY the ID token, never
@@ -861,7 +888,40 @@ pub(crate) fn build_access_token_claims(
             confirmation.embed_in_claims(object);
         }
     }
+
+    // Extra claims (issue #113): the pre-token hook's accepted access-token claims. Fenced
+    // against the reserved set here and not only at the hook, for the reason the ID token's
+    // equivalent fold gives: "protocol wins" by insertion order is no protection for a claim
+    // the protocol did NOT set on THIS token. `org_id` on a no-org session and `cnf` on a
+    // no-binding session are absent rather than present, so an unfenced bag could introduce
+    // them rather than merely fail to overwrite them.
+    //
+    // LAST, after every issuer claim including `cnf`, so `or_insert_with` finds a protocol
+    // claim already in place and leaves it. Folding earlier would make the fence the only
+    // thing standing between this bag and a protocol claim, and a fence plus an ordering is
+    // two reasons where one would do.
+    if let serde_json::Value::Object(object) = &mut claims {
+        for (name, value) in request.access_extra_claims {
+            if PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name.as_str()) {
+                continue;
+            }
+            object.entry(name.clone()).or_insert_with(|| value.clone());
+        }
+    }
     claims
+}
+
+/// An empty claim bag, for a mint that contributes none.
+///
+/// A shared `'static` rather than a temporary at each call site, because
+/// [`MintRequest`] holds borrows and every site would otherwise need its own binding to keep
+/// alive. Every path but the pre-token hook's passes this for
+/// [`MintRequest::access_extra_claims`].
+#[must_use]
+pub fn no_extra_claims() -> &'static serde_json::Map<String, serde_json::Value> {
+    use std::sync::OnceLock;
+    static EMPTY: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
+    EMPTY.get_or_init(serde_json::Map::new)
 }
 
 /// Everything a client-credentials (M2M) access token needs (issue #23). Distinct
@@ -1434,6 +1494,205 @@ fn epoch_micros(at: SystemTime) -> i64 {
 }
 
 #[cfg(test)]
+mod access_extra_claims_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn bag(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone()))
+            .collect()
+    }
+
+    /// A claim in the access bag reaches the ACCESS token.
+    #[test]
+    fn an_access_extra_claim_lands_in_the_access_token() {
+        let extra = bag(&[("tier", json!("gold"))]);
+        let mut req = super::tests::request("usr_abc", "pwd");
+        req.access_extra_claims = &extra;
+        let claims = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
+        assert_eq!(claims["tier"], "gold");
+    }
+
+    /// The two bags are separate: neither feeds the other's token.
+    ///
+    /// The whole reason for a second field rather than reusing `extra_claims`. If one bag fed
+    /// both, a hook placing a claim in the ID token would silently place it in the access token
+    /// too, and the contract's two lists would be one list wearing two names.
+    #[test]
+    fn the_two_claim_bags_do_not_feed_each_others_tokens() {
+        let id_only = bag(&[("id_side", json!(1))]);
+        let access_only = bag(&[("access_side", json!(1))]);
+        let mut req = super::tests::request("usr_abc", "pwd");
+        req.extra_claims = &id_only;
+        req.access_extra_claims = &access_only;
+
+        let id = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
+        assert_eq!(id["id_side"], 1);
+        assert!(
+            id.get("access_side").is_none(),
+            "an access-bag claim must not reach the ID token"
+        );
+
+        let access = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
+        assert_eq!(access["access_side"], 1);
+        assert!(
+            access.get("id_side").is_none(),
+            "an ID-bag claim must not reach the access token"
+        );
+    }
+
+    /// The channel is fenced, not merely the writer.
+    ///
+    /// Every reserved name, not a sample, and asserted for the case that matters most: a claim
+    /// the protocol did NOT set on this token. `or_insert_with` would happily insert `cnf` on a
+    /// no-binding session, so ordering alone is no fence.
+    #[test]
+    fn the_access_bag_cannot_set_any_reserved_claim() {
+        for name in PROTECTED_ACCESS_TOKEN_CLAIMS {
+            let extra = bag(&[(name, json!("forged"))]);
+            let mut req = super::tests::request("usr_abc", "pwd");
+            req.org_id = None;
+            req.confirmation = None;
+            req.access_extra_claims = &extra;
+            let claims = build_access_token_claims(
+                &req,
+                1,
+                2,
+                "tok",
+                &json!("cli_example"),
+                PermissionClaim::Absent,
+            );
+            assert_ne!(
+                claims
+                    .get(*name)
+                    .map(|value| value.as_str() == Some("forged")),
+                Some(true),
+                "{name} was forged through the access-token extra bag"
+            );
+        }
+    }
+
+    /// Every claim the access-token builder sets is a PROTECTED name.
+    ///
+    /// This is the property that makes the fence sufficient, and it is the one worth pinning.
+    /// The fold uses `entry().or_insert_with()` so a protocol claim wins on ordering as well as
+    /// on the fence, but that ordering is currently unexercisable: the fence drops every
+    /// protected name first, and every name the builder emits is protected, so no value ever
+    /// reaches the insert whose key the protocol already set. Swapping `or_insert_with` for a
+    /// plain `insert` is therefore an EQUIVALENT mutation, verified by running it.
+    ///
+    /// That equivalence is a fact about today's builder, not a law. The moment someone emits an
+    /// issuer claim whose name is NOT in the protected set, the ordering stops being redundant
+    /// and starts being the only thing preventing a hook from overwriting it -- and this test
+    /// is what turns red to say so.
+    #[test]
+    fn every_claim_the_access_builder_sets_is_protected() {
+        let mut req = super::tests::request("usr_abc", "pwd");
+        req.org_id = Some("org_real");
+        let claims = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Set(&std::collections::BTreeSet::from([
+                "billing.read".to_owned()
+            ])),
+        );
+        let object = claims.as_object().expect("an object");
+        assert!(!object.is_empty(), "the builder emitted nothing to check");
+        for name in object.keys() {
+            assert!(
+                PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name.as_str()),
+                "`{name}` is emitted by the builder but is NOT protected, so the extra-claims \
+                 fence no longer covers everything the protocol sets and the fold's ordering \
+                 has become load-bearing: give it its own test"
+            );
+        }
+    }
+
+    /// A protocol claim the mint DID set is not overwritten.
+    #[test]
+    fn a_protocol_claim_wins_over_the_access_bag() {
+        let extra = bag(&[
+            ("sub", json!("attacker")),
+            ("iss", json!("https://evil.test")),
+        ]);
+        let mut req = super::tests::request("usr_abc", "pwd");
+        req.access_extra_claims = &extra;
+        let claims = build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        );
+        assert_eq!(claims["sub"], "usr_abc");
+        assert_ne!(claims["iss"], "https://evil.test");
+    }
+
+    /// The claims are inside the bytes the permission budget measures.
+    ///
+    /// THE point of folding here rather than after the build. The budget decides from the
+    /// SERIALIZED length of what this builder produces, so a claim added here changes that
+    /// length; a claim folded in after the decision would not, and issue #98 would be judging a
+    /// token smaller than the one that ships.
+    ///
+    /// Measured by comparing the two serializations rather than by asserting the budget's
+    /// verdict, because a verdict depends on a configured limit and would pass or fail for
+    /// reasons other than the one under test.
+    #[test]
+    fn an_access_extra_claim_changes_the_length_the_budget_measures() {
+        let mut req = super::tests::request("usr_abc", "pwd");
+        let without = serde_json::to_vec(&build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        ))
+        .expect("serialize");
+
+        let extra = bag(&[("tier", json!("a".repeat(512)))]);
+        req.access_extra_claims = &extra;
+        let with = serde_json::to_vec(&build_access_token_claims(
+            &req,
+            1,
+            2,
+            "tok",
+            &json!("cli_example"),
+            PermissionClaim::Absent,
+        ))
+        .expect("serialize");
+
+        assert!(
+            with.len() >= without.len() + 512,
+            "the extra claim must be inside the measured bytes: {} vs {}",
+            with.len(),
+            without.len()
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ironauth_env::Env;
@@ -1448,7 +1707,9 @@ mod tests {
     }
 
     /// A minimal request over a throwaway scope, for the pure claim builder.
-    fn request<'a>(subject: &'a str, auth_methods: &'a str) -> MintRequest<'a> {
+    /// `pub(super)` so the sibling `access_extra_claims_tests` module can build the same
+    /// request these tests do, rather than keeping a second copy that could drift from it.
+    pub(super) fn request<'a>(subject: &'a str, auth_methods: &'a str) -> MintRequest<'a> {
         let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 1);
         let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
         MintRequest {
@@ -1468,6 +1729,7 @@ mod tests {
             at_hash: None,
             c_hash: None,
             extra_claims: empty_extra(),
+            access_extra_claims: empty_extra(),
             id_token_signer: None,
             confirmation: None,
         }
@@ -1630,7 +1892,9 @@ mod tests {
         // insertion-order "protocol wins" would be no protection; the id-token fold
         // filters PROTECTED_ACCESS_TOKEN_CLAIMS explicitly, so a forged org_id from the
         // bag (or the claims-request parameter) is dropped, not stamped. The access
-        // token merges no client custom claims at all on the code flow.
+        // token's own extra-claims bag (issue #113) is fenced identically, and is empty on
+        // this path: `req.extra_claims` feeds the ID token only, so a forged `org_id` planted
+        // there cannot reach the access token through the access bag either.
         req.org_id = None;
         req.extra_claims = &extra; // still { "org_id": "org_forged" }
         let id_none = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
