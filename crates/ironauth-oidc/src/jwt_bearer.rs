@@ -813,16 +813,23 @@ async fn mint_and_persist(
     // The mapped-identity access token carries the RFC 9068 protocol claims with the
     // mapped principal as `sub` and NO auth-context claims (there was no interactive
     // user authentication event to derive an acr/auth_time from), reusing the SAME
-    // claim builder and signing core as the M2M grant. No per-issuer custom claims.
-    // No per-issuer STATIC claims, but the client's mapping and hook still run (issue #113
-    // criterion 1 names `jwt:bearer` explicitly). The source document is empty, so with nothing
-    // configured this is the empty bag it always was.
+    // claim builder and signing core as the M2M grant.
+    // No per-issuer STATIC claims, and none of the presenting client's
+    // `clients.custom_token_claims` either: this token speaks for a mapped federated principal,
+    // and that blob describes the client's own service account. The client's declarative
+    // MAPPING and its hook DO run, which issue #113 criterion 1 names `jwt:bearer` for
+    // explicitly. The source document is empty, so with nothing configured this is the empty
+    // bag it always was.
     let no_custom = crate::claims_mapping_at_issuance::apply_to_machine_token(
         state.store(),
         state.hook_engine(),
         scope,
         client_id_str,
-        "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        // The wire value, from the registry, not a literal beside it. Issue #113 asks the
+        // grant to be identified in the payload, and a hook that gates on it is reading
+        // this string: a door with its own copy can hand a guest a grant name the
+        // endpoint does not accept, and only a test comparing two literals would notice.
+        crate::registry::GrantType::JwtBearer.as_str(),
         Some(principal),
         &serde_json::Map::new(),
     )

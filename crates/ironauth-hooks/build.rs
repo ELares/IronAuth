@@ -28,6 +28,7 @@ const GUESTS: &[(&str, &str)] = &[
     ("random_escape", "IRONAUTH_GUEST_RANDOM_ESCAPE"),
     ("fs_escape", "IRONAUTH_GUEST_FS_ESCAPE"),
     ("echo_request", "IRONAUTH_GUEST_ECHO_REQUEST"),
+    ("echo_access_only", "IRONAUTH_GUEST_ECHO_ACCESS_ONLY"),
     ("wall_clock_escape", "IRONAUTH_GUEST_WALL_CLOCK_ESCAPE"),
     ("monotonic_reader", "IRONAUTH_GUEST_MONOTONIC_READER"),
     ("sleeper", "IRONAUTH_GUEST_SLEEPER"),

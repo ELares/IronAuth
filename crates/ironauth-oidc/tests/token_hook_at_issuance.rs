@@ -50,16 +50,68 @@ async fn deploy_for(
     component: &[u8],
     payload_version: i32,
 ) {
+    // DELEGATES. `Harness::deploy_token_hook`'s own doc says copying the write would let one
+    // copy drift from the schema the other checks, and the first version of this function was
+    // that copy, byte for byte, in the same diff.
+    harness
+        .deploy_token_hook(client, component, payload_version)
+        .await;
+}
+
+/// Set a client's STATIC custom claims (the `clients.custom_token_claims` blob).
+///
+/// Through the DATA-PLANE store: `clients` is not a control-plane table, and reaching for
+/// `control_store()` fails with `permission denied for table clients`.
+async fn set_static_claims(harness: &Harness, client: &ironauth_store::ClientId, json: &str) {
+    let env = harness.env().clone();
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .clients()
+        .set_custom_token_claims(&env, client, Some(json))
+        .await
+        .expect("set the static claims");
+}
+
+/// Store `rules` as `client`'s declarative mapping, through the audited admin write.
+///
+/// Not a raw INSERT: the write path is where `validate` runs, so a test that inserted directly
+/// could store a rule set the admin surface would refuse and then assert on how issuance
+/// handled it, which measures a state the system cannot reach.
+async fn install_mapping(harness: &Harness, client: &ironauth_store::ClientId, rules: &str) {
     let env = harness.env().clone();
     harness
         .db()
         .control_store()
         .scoped(harness.scope())
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
-        .token_hooks()
-        .set(&env, client, component, payload_version)
+        .claims_mappings()
+        .set(&env, client, rules)
         .await
-        .expect("deploy the hook");
+        .expect("store the mapping");
+}
+
+/// Run a `client_credentials` exchange and return the access token's claims.
+async fn machine_claims(
+    harness: &Harness,
+    client_id: &str,
+    secret: &str,
+) -> serde_json::Map<String, Value> {
+    let (status, _headers, body) = harness
+        .token_with_auth(
+            &form(&[("grant_type", "client_credentials")]),
+            Some(&format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"))
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "client_credentials: {body}");
+    claims(json(&body)["access_token"].as_str().expect("access"))
 }
 
 /// A unique login handle drawn from the deterministic entropy stream.
@@ -939,5 +991,106 @@ async fn the_refresh_grant_runs_the_hook() {
         Some(&Value::from("refresh_token")),
         "a REFRESHED access token ran the hook AND was identified as a refresh: {:?}",
         claims(&access)
+    );
+}
+
+/// A MACHINE CLIENT'S STATIC CLAIMS SURVIVE A HOOK THAT DOES NOT MENTION THEM.
+///
+/// The property is WHICH LIST the claims arrive in, and it is narrower than it first looks.
+///
+/// The WIT contract is a REPLACE, so a hook that returns a list it built from scratch drops
+/// whatever was in that list. That is the contract working, on every grant, and it is not what
+/// this pins.
+///
+/// What was broken is that the seam handed a machine client's static claims over as
+/// `id_token_claims`, on a grant that mints no ID token. So an author writing for
+/// `client_credentials` -- who reads `access_token_claims`, appends, returns it, and leaves the
+/// ID list empty because there is no ID token -- did everything right under the contract and
+/// still deleted every static claim the client had. The claims were never in the list they
+/// were reading.
+///
+/// `ECHO_ACCESS_ONLY` is exactly that author, and it is the only fixture that can catch this.
+/// `GOOD` and `ECHO_ONLY` both echo `id_token_claims` back, so the old union folded the claims
+/// in by accident and they passed; `ECHO_REQUEST` builds both lists from scratch, so it drops
+/// them either way and proves nothing about where they were.
+#[tokio::test]
+async fn a_machine_clients_static_claims_survive_a_hook_that_ignores_them() {
+    let harness = harness_with_hooks().await;
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    set_static_claims(&harness, &client, r#"{"department":"payments"}"#).await;
+    deploy_for(
+        &harness,
+        &client,
+        ironauth_hooks::fixtures::ECHO_ACCESS_ONLY,
+        1,
+    )
+    .await;
+
+    let issued = machine_claims(&harness, &client_id, &secret).await;
+    assert_eq!(
+        issued.get("department"),
+        Some(&Value::from("payments")),
+        "a hook that never mentions the static claims must not delete them; the guest is handed \
+         them as ACCESS-token claims, which is where they live on a token with no ID token: \
+         {issued:?}"
+    );
+    assert_eq!(
+        issued.get("echo_access_only_ran"),
+        Some(&Value::from(true)),
+        "and the hook did run, so the assertion above is not satisfied by a dead hook: \
+         {issued:?}"
+    );
+}
+
+/// A `place: id_token` RULE KEEPS ITS CLAIM OUT OF A MACHINE TOKEN.
+///
+/// The rule means "keep this away from the resource servers in `aud`", and on these three grants
+/// `aud` is who reads the only token there is. Review measured the inversion: the same rule set
+/// that `claims_mapping_at_issuance.rs`'s `place_moves_a_claim_into_one_token_and_out_of_the_other`
+/// uses to assert the claim is ABSENT from a code-grant access token put it INTO a
+/// `client_credentials` one, because the seam folded the two halves together.
+///
+/// Both directions are asserted. A projection that dropped everything would satisfy the first
+/// assertion and destroy the feature.
+#[tokio::test]
+async fn a_machine_token_honours_a_claim_placed_in_the_id_token() {
+    let harness = harness_with_hooks().await;
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    set_static_claims(&harness, &client, r#"{"department":"payments"}"#).await;
+    install_mapping(
+        &harness,
+        &client,
+        r#"[{"kind":"static","name":"locale_pref","value":"en-GB"},
+            {"kind":"place","name":"locale_pref","placement":"id_token"},
+            {"kind":"static","name":"tier","value":"gold"},
+            {"kind":"place","name":"tier","placement":"access_token"}]"#,
+    )
+    .await;
+
+    let issued = machine_claims(&harness, &client_id, &secret).await;
+    assert_eq!(
+        issued.get("locale_pref"),
+        None,
+        "a claim placed in the ID token is NOT EMITTED on a grant that mints no ID token; \
+         emitting it puts it in front of every resource server the rule exists to hide it \
+         from: {issued:?}"
+    );
+    assert_eq!(
+        issued.get("tier"),
+        Some(&Value::from("gold")),
+        "an access-placed claim still lands, so the projection is not simply dropping the \
+         mapping: {issued:?}"
+    );
+    assert_eq!(
+        issued.get("department"),
+        Some(&Value::from("payments")),
+        "and an UNPLACED claim lands too: the operator expressed no opinion, and the only token \
+         that exists is where it goes: {issued:?}"
     );
 }

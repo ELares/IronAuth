@@ -85,6 +85,15 @@ pub mod fixtures {
     /// what lets a test tell a removal from a hook that never ran.
     pub const CLAIM_STRIPPER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CLAIM_STRIPPER"));
 
+    /// A hook written the way a MACHINE-GRANT author writes one.
+    ///
+    /// Echoes `access_token_claims` faithfully, adds a marker, and returns an EMPTY
+    /// `id_token_claims`, because the three grants that mint one access token have no ID token
+    /// to fill. That makes it the discriminator for WHICH LIST the host hands a machine
+    /// client's existing claims over in: neither `good` nor `echo-only` can catch putting them
+    /// in the ID-token list, because both echo that list back.
+    pub const ECHO_ACCESS_ONLY: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_ECHO_ACCESS_ONLY"));
+
     /// A hook that returns every SCALAR request field as a claim.
     ///
     /// Already used by the sandbox suite to prove the TRANSPORT carries each field. Exported

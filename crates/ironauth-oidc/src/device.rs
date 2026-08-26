@@ -625,7 +625,11 @@ async fn mint_device_tokens(
         state.hook_engine(),
         scope,
         &grant.client_id,
-        "urn:ietf:params:oauth:grant-type:device_code",
+        // The wire value, from the registry, not a literal beside it. Issue #113 asks the
+        // grant to be identified in the payload, and a hook that gates on it is reading
+        // this string: a door with its own copy can hand a guest a grant name the
+        // endpoint does not accept, and only a test comparing two literals would notice.
+        crate::registry::GrantType::DeviceCode.as_str(),
         Some(&grant.subject),
         &mut extra_claims,
     )

@@ -1469,7 +1469,7 @@ async fn build_oidc_plane(
                     std::sync::Arc::new(ironauth_oidc::token_hook::HookRuntime::new(engine));
                 let ticker = std::sync::Arc::clone(runtime.engine());
                 tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+                    let mut interval = tokio::time::interval(ironauth_oidc::token_hook::EPOCH_TICK);
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         interval.tick().await;

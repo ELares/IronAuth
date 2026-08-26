@@ -411,9 +411,52 @@ pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
 /// # Errors
 ///
 /// [`MappingRefusal`], exactly as [`validate`].
+/// How many tokens the caller is going to mint from this mapping's output.
+///
+/// The mapping model has two destinations because most grants mint two tokens. Three do not:
+/// `client_credentials`, `jwt:bearer` and token exchange mint ONE access token and no ID token,
+/// through `ClientCredentialsMintRequest`. Handing them a two-token answer forces the caller to
+/// invent a projection, and the first one invented was a union -- which quietly INVERTED
+/// `place: id_token`, the one rule whose entire meaning is "keep this out of the access token".
+///
+/// So the projection is made here, where the difference between "the operator placed this" and
+/// "nothing placed this, so it defaulted" is still visible. After the partition below it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    /// An ID token and an access token. Placement means what it says.
+    TwoTokens,
+    /// One access token, and no ID token to put anything in.
+    ///
+    /// An UNPLACED claim goes to the one token that exists: the operator expressed no opinion
+    /// and dropping it would empty every machine token the day anyone installed a mapping.
+    ///
+    /// A claim placed `id_token` is NOT EMITTED. That rule exists to keep a claim away from the
+    /// resource servers in `aud`, which is exactly who reads this token, so honouring it means
+    /// leaving the claim out. `place: access_token` and `place: both` are emitted.
+    OneAccessToken,
+}
+
+/// Apply `rules` to `source` for a caller minting two tokens.
+///
+/// # Errors
+///
+/// [`MappingRefusal`] if a rule writes a claim no mapping may write.
 pub fn apply(
     rules: &[MappingRule],
     source: &BTreeMap<String, serde_json::Value>,
+) -> Result<MappedClaims, MappingRefusal> {
+    apply_for(rules, source, Destination::TwoTokens)
+}
+
+/// Apply `rules` to `source`, projecting onto `destination`.
+///
+/// # Errors
+///
+/// [`MappingRefusal`] if a rule writes a claim no mapping may write.
+pub fn apply_for(
+    rules: &[MappingRule],
+    source: &BTreeMap<String, serde_json::Value>,
+    destination: Destination,
 ) -> Result<MappedClaims, MappingRefusal> {
     validate(rules)?;
 
@@ -494,17 +537,30 @@ pub fn apply(
 
     let mut mapped = MappedClaims::default();
     for (name, value) in working {
-        match placements.get(&name).copied().unwrap_or(Placement::IdToken) {
-            Placement::IdToken => {
-                mapped.id_token.insert(name, value);
-            }
-            Placement::AccessToken => {
-                mapped.access_token.insert(name, value);
-            }
-            Placement::Both => {
-                mapped.id_token.insert(name.clone(), value.clone());
-                mapped.access_token.insert(name, value);
-            }
+        // The EXPLICIT placement, before the default is applied. On a one-token grant the two
+        // must be told apart: `None` there means the operator said nothing and the claim goes
+        // in the only token, while `Some(IdToken)` means the operator asked for it to stay out
+        // of an access token and there is no other token to put it in.
+        let placed = placements.get(&name).copied();
+        match destination {
+            Destination::OneAccessToken => match placed {
+                Some(Placement::IdToken) => {}
+                Some(Placement::AccessToken | Placement::Both) | None => {
+                    mapped.access_token.insert(name, value);
+                }
+            },
+            Destination::TwoTokens => match placed.unwrap_or(Placement::IdToken) {
+                Placement::IdToken => {
+                    mapped.id_token.insert(name, value);
+                }
+                Placement::AccessToken => {
+                    mapped.access_token.insert(name, value);
+                }
+                Placement::Both => {
+                    mapped.id_token.insert(name.clone(), value.clone());
+                    mapped.access_token.insert(name, value);
+                }
+            },
         }
     }
     Ok(mapped)

@@ -211,7 +211,11 @@ async fn mint_and_persist(
         state.hook_engine(),
         scope,
         &client_id_str,
-        "client_credentials",
+        // The wire value, from the registry, not a literal beside it. Issue #113 asks the
+        // grant to be identified in the payload, and a hook that gates on it is reading
+        // this string: a door with its own copy can hand a guest a grant name the
+        // endpoint does not accept, and only a test comparing two literals would notice.
+        crate::registry::GrantType::ClientCredentials.as_str(),
         Some(&subject),
         &static_claims,
     )

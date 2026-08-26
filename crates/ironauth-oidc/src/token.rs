@@ -412,7 +412,11 @@ async fn authorization_code_grant(
         state,
         scope,
         &bindings.client_id,
-        "authorization_code",
+        // The wire value, from the registry, not a literal beside it. Issue #113 asks the
+        // grant to be identified in the payload, and a hook that gates on it is reading
+        // this string: a door with its own copy can hand a guest a grant name the
+        // endpoint does not accept, and only a test comparing two literals would notice.
+        crate::registry::GrantType::AuthorizationCode.as_str(),
         Some(&bindings.subject),
         &mut extra_claims,
     )
@@ -2528,7 +2532,7 @@ async fn mint_refresh_access(
         state,
         scope,
         &resolution.client_id,
-        "refresh_token",
+        crate::registry::GrantType::RefreshToken.as_str(),
         Some(&resolution.subject),
         &mut extra_claims,
     )

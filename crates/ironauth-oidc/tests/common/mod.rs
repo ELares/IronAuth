@@ -320,29 +320,28 @@ impl Harness {
     /// the deadline from one tick to two was asserted by nothing, because nothing could assert
     /// it.
     ///
-    /// ONE MILLISECOND rather than production's ten, so a test that means to hit the deadline
-    /// does not spend a tenth of a second doing it. The RATIO is what the dispatch's two-tick
-    /// delta is about, and the ratio is the same.
-    #[cfg(feature = "wasm-hooks")]
     /// Drive the epoch, at THE SAME RATE THE SERVER DOES.
     ///
-    /// 10 ms, matching `ironauth/src/main.rs`. It was 1 ms, which was chosen to make a
-    /// deadline test finish quickly and turned out to be a flaky-test generator: an epoch
-    /// deadline bounds WALL time, not CPU time, so a hook the scheduler descheduled trips it
-    /// exactly as a runaway hook does. With `epoch_deadline: 2` at 1 ms a hook had between 1
-    /// and 2 ms of wall clock, and fourteen concurrent tests on a laptop routinely exceeded
-    /// that doing microseconds of work. Every trip fails the issuance, so it surfaced as an
-    /// occasional `server_error` from whichever grant lost the race.
+    /// [`token_hook::EPOCH_TICK`], the same constant `ironauth/src/main.rs` ticks on. It was a
+    /// 1 ms literal here against a 10 ms literal there, and that is a flaky-test generator:
+    /// an epoch deadline bounds WALL time, not CPU time, so a hook the scheduler descheduled
+    /// trips it exactly as a runaway hook does. Ten times harsher than production is not a
+    /// stricter test, it is a different one, and it failed issuances the server would not have.
     ///
-    /// The distinction is worth carrying past this function: FUEL bounds instructions and is
-    /// deterministic, the DEADLINE bounds wall time and is not. A fail-closed hook plus a
-    /// wall-clock deadline converts CPU contention into failed logins, which is a real
-    /// production property and not a test artifact -- the test harness only reached it sooner
-    /// by ticking ten times faster than the server.
+    /// Reading the constant rather than copying its value is the point: a tick interval and a
+    /// tick COUNT are only a duration together, and `EPOCH_TICKS_PER_HOOK` is chosen against
+    /// THIS interval.
+    ///
+    /// The distinction is worth carrying past this function. FUEL bounds instructions and is
+    /// deterministic; the DEADLINE bounds wall time and is not. A fail-closed hook plus a
+    /// wall-clock deadline converts CPU contention into failed logins, which is a production
+    /// property rather than a test artifact -- review reproduced it here at a 20 ms ceiling by
+    /// running 24 spinners on 14 cores, which is what raised the deadline to a full second.
+    #[cfg(feature = "wasm-hooks")]
     fn spawn_epoch_driver(runtime: &Arc<ironauth_oidc::token_hook::HookRuntime>) {
         let ticker = Arc::clone(runtime.engine());
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+            let mut interval = tokio::time::interval(ironauth_oidc::token_hook::EPOCH_TICK);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;

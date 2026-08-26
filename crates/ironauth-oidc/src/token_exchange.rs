@@ -275,7 +275,11 @@ async fn shaped_claims(
         state.hook_engine(),
         scope,
         client_id,
-        "urn:ietf:params:oauth:grant-type:token-exchange",
+        // The wire value, from the registry, not a literal beside it. Issue #113 asks the
+        // grant to be identified in the payload, and a hook that gates on it is reading
+        // this string: a door with its own copy can hand a guest a grant name the
+        // endpoint does not accept, and only a test comparing two literals would notice.
+        crate::registry::GrantType::TokenExchange.as_str(),
         Some(subject),
         &serde_json::Map::new(),
     )
@@ -356,11 +360,18 @@ async fn issue(
             subject: &subject.subject,
             client_id: client_id_str,
             oauth_scope: granted_scope,
-            // An exchange carries no per-client STATIC custom claims. They are a property
-            // of a client minting its OWN machine token; attaching them to a token that
-            // speaks for somebody else would let a client decorate another subject's
-            // identity with claims that subject never had. The mapping and the hook DO run
-            // (see above); what is withheld is the static blob, not the extension point.
+            // An exchange carries no `clients.custom_token_claims`. Those describe the
+            // client's own SERVICE ACCOUNT, so putting them on a token that speaks for a user
+            // conflates two identities.
+            //
+            // The client's declarative MAPPING does run, and a `static` rule in it WILL reach
+            // this token. Review flagged that as a contradiction of the sentence above, and it
+            // is only a contradiction if the reason is "config must not decorate another
+            // subject". It is not: a client's mapping already shapes the tokens it causes to be
+            // minted for interactive users, so a `static` rule landing here is the same power
+            // rather than a new one, and the authorization-bearing names are fenced from both
+            // mappings and hooks. `the_mapping_reaches_an_exchanged_token` pins it so it stays
+            // a decision. What separates the two is identity, not origin.
             custom_claims: &custom_claims,
             act: decision.act.as_ref(),
         },

@@ -446,25 +446,69 @@ async fn invoke(
         })
 }
 
+/// How often the epoch advances.
+///
+/// EXPORTED, and the server's ticker reads it rather than declaring its own. It was a
+/// `from_millis(10)` literal in `ironauth/src/main.rs` and another in the integration harness,
+/// and the harness's was 1 ms -- ten times harsher than production. That is not a stricter
+/// test, it is a DIFFERENT one, and it made a guest doing microseconds of work fail an issuance
+/// on a busy machine while the server it was standing in for would not have.
+///
+/// A tick interval and a tick COUNT are only a duration together, so they cannot live in
+/// separate files and be trusted to agree.
+pub const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The number of whole epoch ticks a hook is guaranteed, plus the partial one it starts in.
+///
+/// With [`EPOCH_TICK`] that is a floor of ONE SECOND of wall clock, which
+/// `the_epoch_deadline_clears_any_plausible_scheduling_delay` computes rather than restates.
+///
+/// # Why the bound is sized for the SCHEDULER and not for the work
+///
+/// A claim-shaping hook does tens of microseconds of work, so a wall-clock bound sized for the
+/// work would be a fraction of a millisecond. That was the mistake. FUEL counts executed
+/// instructions and is deterministic: the same guest on the same input burns the same fuel on
+/// an idle laptop and a saturated server, and `claim_shaping`'s 50M is the real CPU bound. An
+/// EPOCH DEADLINE counts ticks of a wall clock, so a guest the scheduler descheduled trips it
+/// exactly as a runaway guest does, and wasmtime cannot tell the two apart.
+///
+/// So this bound has to clear the worst SCHEDULING delay, not the worst work. It was 2 ticks
+/// (10 to 20 ms), and review measured what that costs: with 24 spinners on 14 cores, 2 of 6
+/// full runs of the hook suite failed with `server_error` from a guest doing microseconds of
+/// work. A CI runner with 2 vCPUs, or a host under a traffic spike, is that machine.
+///
+/// One second cannot be reached by scheduling delay on a machine that is serving requests at
+/// all, and it is still a hard stop: fuel already bounds CPU, so what remains for the deadline
+/// to catch is a guest that executes without burning fuel, which no shipped hook does. A login
+/// tolerates a second far better than it tolerates a random 500.
+///
+/// # What this is NOT
+///
+/// A guarantee. It is a bound sized so that tripping it means something is genuinely wrong,
+/// rather than that the machine was busy. Making it configurable is the honest end state (the
+/// tunability rule: an environment-dependent tradeoff belongs in settings with a safe default),
+/// and it is not in this change.
+const EPOCH_TICKS_PER_HOOK: u64 = 101;
+
 /// The bounds one invocation runs under.
 ///
-/// `Limits::claim_shaping` with the EPOCH DEADLINE RAISED FROM ONE TICK TO TWO, and the reason
-/// is arithmetic rather than generosity. wasmtime sets the deadline to `current_epoch + delta`,
-/// so with a free-running ticker and a delta of one, the time a hook actually gets is uniform in
-/// (0, one tick] -- it inherits however much of the current tick remains. Measured against a
-/// 10 ms ticker: a hook doing 78 microseconds of work trapped on 0.40% of invocations, and one
-/// doing 544 microseconds on 4.15%.
+/// `Limits::claim_shaping` with the epoch deadline raised, for the reason on
+/// [`EPOCH_TICKS_PER_HOOK`]. Everything else is the shipped preset, which
+/// `only_the_deadline_departs_from_the_shipped_preset` pins.
 ///
-/// Every abort fails the issuance, so that is a random `server_error` on roughly one login in a
-/// hundred for a hooked client. A delta of two guarantees at least one WHOLE tick and at most
-/// two, which is a bound rather than a lottery.
+/// The delta is at least 2 for a second, arithmetic reason: wasmtime sets the deadline to
+/// `current_epoch + delta`, so a store created at an arbitrary point inside a tick gets
+/// whatever remains of it. A delta of 1 is therefore uniform in (0, one tick] -- measured
+/// against a 10 ms ticker, a hook doing 78 microseconds of work trapped on 0.40% of
+/// invocations and one doing 544 microseconds on 4.15%. Any delta of 2 or more guarantees at
+/// least `delta - 1` WHOLE ticks, which is a bound rather than a lottery.
 ///
 /// `Limits::claim_shaping`'s own doc says a limit that trips during ordinary work teaches
 /// operators to raise it without reading it. A limit that trips at random is worse: there is
 /// nothing to read.
 fn limits() -> Limits {
     Limits {
-        epoch_deadline: 2,
+        epoch_deadline: EPOCH_TICKS_PER_HOOK,
         ..Limits::claim_shaping()
     }
 }
@@ -599,7 +643,19 @@ mod tests {
     /// So the pin is on the value, and it stops a silent revert. What it cannot do is notice
     /// somebody removing the ticker, which is why the harness now runs one.
     #[test]
-    fn the_epoch_deadline_spans_at_least_one_whole_tick() {
+    fn the_epoch_deadline_clears_any_plausible_scheduling_delay() {
+        // COMPUTED from the tick interval, not restated. A test asserting `== 101` would pass
+        // for any tick length, including a 1 ms one that puts the guarantee back at 100 ms.
+        let guaranteed = super::EPOCH_TICK
+            * u32::try_from(limits().epoch_deadline - 1).expect("the deadline fits a u32 of ticks");
+        assert!(
+            guaranteed >= std::time::Duration::from_secs(1),
+            "a hook is guaranteed {guaranteed:?}, which is not enough to survive a scheduler \
+             that descheduled it. The deadline bounds WALL time while fuel bounds CPU, so this \
+             number has to clear the worst scheduling delay and not the worst work: review \
+             measured 2 of 6 suite runs failing with `server_error` at a 20 ms ceiling under \
+             24 spinners on 14 cores."
+        );
         assert!(
             limits().epoch_deadline >= 2,
             "a deadline of one tick is whatever remains of the current one, which fails a \
@@ -627,10 +683,16 @@ mod tests {
 
     /// The payload version this server emits is the one the table admits.
     ///
-    /// Two constants in two artifacts -- `PAYLOAD_VERSION` here and
-    /// `token_hooks_payload_version_known` in migration 0162 -- and the dispatch's version check
-    /// can only fire when they disagree. Pinned so the pair moves together: a migration that
-    /// admitted 2 while this emitted 1 would deploy hooks the dispatch then refuses at every
+    /// THREE artifacts declare the version and only two of the three can be tied by code.
+    ///
+    /// `TOKEN_CUSTOMIZE_VERSION` (the schema registry) and `PAYLOAD_VERSION` (what this
+    /// dispatch emits) are now ONE constant, because the second is an alias of the first. That
+    /// pair cannot drift.
+    ///
+    /// The third is `token_hooks_payload_version_known` in migration 0162, which is SQL text in
+    /// a file that is frozen once shipped, so it cannot be an alias of anything. This is the
+    /// tie for it, and it is a text scan for that reason. A migration admitting 2 while the
+    /// server emits 1 would let a hook be deployed that the dispatch then refuses at every
     /// login.
     #[test]
     fn the_emitted_payload_version_is_the_one_the_table_admits() {

@@ -114,6 +114,28 @@ pub async fn resolve(
     client_id: &str,
     source: &BTreeMap<String, serde_json::Value>,
 ) -> Result<Resolved, MappingFault> {
+    resolve_for(
+        store,
+        scope,
+        client_id,
+        source,
+        claims_mapping::Destination::TwoTokens,
+    )
+    .await
+}
+
+/// As [`resolve`], projecting the mapping onto `destination`.
+///
+/// # Errors
+///
+/// [`MappingFault`], as [`resolve`].
+pub async fn resolve_for(
+    store: &Store,
+    scope: Scope,
+    client_id: &str,
+    source: &BTreeMap<String, serde_json::Value>,
+    destination: claims_mapping::Destination,
+) -> Result<Resolved, MappingFault> {
     let record = store
         .scoped(scope)
         .claims_mappings()
@@ -145,7 +167,7 @@ pub async fn resolve(
         MappingFault::Unreadable
     })?;
 
-    claims_mapping::apply(&rules, source)
+    claims_mapping::apply_for(&rules, source, destination)
         .map(Resolved::Mapped)
         .map_err(|refusal| {
             tracing::error!(
@@ -305,33 +327,66 @@ pub async fn apply_to_with_hook(
 
 /// Resolve and run the same mapping and hook for a token that has NO ID token.
 ///
-/// `client_credentials`, `jwt:bearer` and token exchange mint one access token and nothing
-/// else, so they build a `ClientCredentialsMintRequest` rather than a [`MintRequest`]. Before
-/// this existed they reached NEITHER the mapping NOR the hook, and issue #113 names that exact
-/// shape as the thing to avoid:
+/// `client_credentials`, `jwt:bearer` and token exchange mint one access token and nothing else,
+/// so they build a `ClientCredentialsMintRequest`. Before this existed they reached NEITHER the
+/// mapping NOR the hook, and issue #113 names that exact shape as the thing to avoid:
 ///
 /// > Auth0 covers machine-to-machine only through a separate credentials-exchange hook, an
 /// > inconsistency to avoid.
 ///
-/// We had the inconsistency by accident rather than by design. `MintRequest::access_extra_claims`
-/// is fenced by [`MappedAccessClaims`], and that fence is a field on ONE struct: the three doors
-/// that build the other struct were never in a position to be asked. See that type's header.
+/// We had the inconsistency by accident. `MintRequest::access_extra_claims` is fenced by
+/// [`MappedAccessClaims`], and that fence is a field on ONE struct: the three doors that build
+/// the other struct were never in a position to be asked. See that type's header.
 ///
-/// # One token, so both placements land in it
+/// # ONE TOKEN, top to bottom, and the first version of this was a union
 ///
-/// [`apply_to_with_hook`] splits its output because a mapping decides which of two tokens a
-/// claim goes in. Here there is one token, so the ID-token half has nowhere else to go and is
-/// folded into the result rather than dropped. A placement rule on a machine client is
-/// therefore inert instead of lossy, which is the behaviour an operator writing one rule set
-/// for all their clients would expect. Where a claim lands in both, the access-token side wins.
+/// The first version delegated to [`apply_to_with_hook`] and merged the two halves it returned.
+/// That was wrong in two measured ways, and both are the same mistake: taking a two-token answer
+/// and inventing a projection after the information needed to project it is gone.
 ///
-/// With no mapping and no hook the result is `static_claims` unchanged, which is exactly what
-/// these three doors issued before, so wiring them up is not a behaviour change for anyone who
-/// has not configured one.
+/// **It inverted `place: id_token`.** That rule means "keep this claim away from the resource
+/// servers in `aud`", and it is the DEFAULT for an unplaced claim only because reaching an
+/// access token has to be asked for -- see `claims_mapping::apply_for`, which records the
+/// disclosure this prevented. Folding the ID half into the access token put an
+/// explicitly-excluded claim into the one token the rule exists to keep it out of. Now the
+/// projection happens in `apply_for`, where "the operator placed this" and "nothing placed
+/// this" are still distinguishable: unplaced lands in the one token, `id_token` is not emitted.
+///
+/// **It deleted the client's static claims the day a hook was deployed.** The union handed the
+/// static blob to the guest as `id_token_claims`, for a token with no ID token. The WIT contract
+/// is a REPLACE, so a hook author who filled `access_token_claims` and left the other list
+/// empty -- the natural thing to write for a machine grant -- silently emptied every static
+/// claim. Review measured it: `department` present before the hook, absent after a guest that
+/// does nothing but echo. Now the guest is handed the claims where they actually live, as
+/// `access_token_claims`, and an EMPTY id list.
+///
+/// The hook's `id_token_claims` response is DISCARDED here, because there is no ID token to put
+/// it in. That also restores the contribution cap: `filter_hook_claims` bounds a hook at 32
+/// claims per token, and fencing two halves into one token made it 64 on exactly the grants
+/// whose mint runs no size budget.
+///
+/// # What is NOT withheld, and what is
+///
+/// The client's declarative MAPPING runs on all three, including the two whose token speaks for
+/// somebody else. That is consistent with every other grant: a client's mapping already shapes
+/// the tokens it causes to be minted for interactive users, and a `static` rule reaching an
+/// exchanged token is the same power, not a new one. `the_mapping_reaches_an_exchanged_token`
+/// pins it so it is a decision rather than an accident.
+///
+/// What stays withheld from a delegated token is `clients.custom_token_claims`, and the reason
+/// is narrower than "config must not decorate another subject": those claims describe the
+/// client's own SERVICE ACCOUNT, so putting them on a token that speaks for a user conflates two
+/// identities. A mapping is a token-shaping facility; that blob is an identity's attributes.
+/// `token_exchange.rs` and `jwt_bearer.rs` pass an empty source for that reason.
 ///
 /// # Errors
 ///
-/// [`MappingFault`], as [`apply_to_with_hook`].
+/// [`MappingFault`], as [`apply_to_with_hook`]. Note that all three doors gained failure modes
+/// they did not have: a `claims_mappings` read now happens on every issuance and a store error
+/// fails it closed. For `client_credentials` that sits directly beside `load_custom_claims`,
+/// which is deliberately fail-OPEN, and the two now disagree by design: a malformed static blob
+/// under-claims, while shaping that did not run means an entitlement the operator meant to
+/// REMOVE is still in the token.
 pub async fn apply_to_machine_token(
     store: &Store,
     runtime: Option<&std::sync::Arc<crate::token_hook::HookRuntime>>,
@@ -341,26 +396,83 @@ pub async fn apply_to_machine_token(
     subject: Option<&str>,
     static_claims: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<MappedAccessClaims, MappingFault> {
-    let mut single = static_claims.clone();
-    let access = apply_to_with_hook(
+    let source = as_source(static_claims);
+    let mut single = match resolve_for(
         store,
-        runtime,
         scope,
         client_id,
-        grant_type,
-        subject,
-        &mut single,
+        &source,
+        claims_mapping::Destination::OneAccessToken,
     )
-    .await?;
-    single.extend(access.0);
-    Ok(MappedAccessClaims(single))
+    .await?
+    {
+        // Untouched, which is what these three doors issued before this seam existed.
+        Resolved::NoMapping => static_claims.clone(),
+        Resolved::Mapped(mapped) => as_claims(mapped.access_token),
+    };
+
+    let Some(runtime) = runtime else {
+        return Ok(MappedAccessClaims(single));
+    };
+
+    #[cfg(not(feature = "wasm-hooks"))]
+    {
+        let _ = (grant_type, subject, &mut single);
+        runtime.unreachable()
+    }
+
+    #[cfg(feature = "wasm-hooks")]
+    {
+        // EMPTY, and that is the contract for a grant with no ID token: there is no list of
+        // ID-token claims because there is no ID token.
+        let no_id_token = serde_json::Map::new();
+        let contributed = crate::token_hook::run(
+            store,
+            runtime,
+            &crate::token_hook::Invocation {
+                scope,
+                client_id,
+                grant_type,
+                subject,
+                id_token_claims: &no_id_token,
+                access_token_claims: &single,
+            },
+        )
+        .await
+        .map_err(|fault| {
+            tracing::error!(
+                target: "ironauth.hooks",
+                tenant = %scope.tenant(),
+                client_id,
+                grant_type,
+                ?fault,
+                "refusing the issuance because the client's hook did not complete"
+            );
+            MappingFault::Refused
+        })?;
+
+        if let Some(contributed) = contributed {
+            // REPLACE, as everywhere else. `contributed.id_token` is dropped: a hook that fills
+            // it on a machine grant is answering a question nobody asked, and there is nowhere
+            // to put it. Dropping rather than erroring because the shipped `echo-request`
+            // fixture fills it, and because a hook written once for every grant is the point of
+            // the uniform contract.
+            single = contributed.access_token.into_iter().collect();
+        }
+        Ok(MappedAccessClaims(single))
+    }
 }
 
 /// The access-token claims a mapping produced, in a wrapper only this module can build.
 ///
-/// `MintRequest::access_extra_claims` takes one of these, so a door that mints a token for a
-/// client CANNOT do it without calling [`apply_to_with_hook`] -- the field has no other source. That is
-/// the point, and it is a repair rather than a flourish.
+/// TWO fields take one of these -- `MintRequest::access_extra_claims` and
+/// `ClientCredentialsMintRequest::custom_claims` -- so a door that mints a token for a client
+/// CANNOT do it without calling [`apply_to_with_hook`] or [`apply_to_machine_token`]. Neither
+/// field has another source. That is the point, and it is a repair rather than a flourish.
+///
+/// It was one field until issue #113's criterion-1 audit, and that is exactly how three grants
+/// came to mint tokens that ran no mapping and no hook: a fence is a property of a FIELD, and
+/// those doors filled in a different one.
 ///
 /// # WHAT THIS FENCE DOES NOT PROVE
 ///
@@ -371,7 +483,9 @@ pub async fn apply_to_machine_token(
 /// `MappedAccessClaims` and no test fails.
 ///
 /// So each door needs its own test, and each of those needs to be confirmed against exactly
-/// that mutation. Seven of the eight are:
+/// that mutation. There are NINE production mint doors -- every caller of `tokens::mint*`, which
+/// is `authorize`, `ciba_grant`, `client_credentials`, `device`, `fedcm`, `jwt_bearer`,
+/// `token_exchange` and two in `token` -- and eight of the nine are covered:
 ///
 /// | Door | Test |
 /// | --- | --- |
@@ -384,6 +498,11 @@ pub async fn apply_to_machine_token(
 /// | `jwt:bearer` | `the_jwt_bearer_grant_runs_the_hook` |
 /// | token exchange | `the_token_exchange_grant_runs_the_hook` |
 ///
+/// The first two rows are ONE call site, `token.rs`'s `apply_claims_mapping`, so the table's
+/// per-row independence is real for the other six and not for those. Mutating that single line
+/// takes down ten tests at once, which is coverage but not per-door coverage: what distinguishes
+/// the two rows is the grant string each asserts, not a separate wiring.
+///
 /// **FEDCM IS NOT.** `fedcm.rs` passes `state.hook_engine()` and nothing measures that it does.
 /// No test in the suite drives the id-assertion endpoint to a minted token -- the flow needs
 /// the `Sec-Fetch-Dest: webidentity` posture, an account selection and RP metadata that no
@@ -394,8 +513,9 @@ pub async fn apply_to_machine_token(
 /// and it is about the mapping. The rename carried the sentence onto the hook, where it was
 /// never true.
 ///
-/// Review measured the alternative: with the field taking a plain map, emptying the mapping
-/// call at the FedCM, CIBA and front-channel-authorize doors each left the whole suite green,
+/// Review measured the alternative, BEFORE any of those tests existed: with the field taking a
+/// plain map, emptying the mapping call at the FedCM, CIBA and front-channel-authorize doors
+/// each left the whole suite green,
 /// because those three are driven by no test that installs a mapping. A structural argument
 /// ("they all call the same function") is not a measurement, and structure cannot express
 /// reachability. Now the compiler asks the question at every door, including doors nobody has
@@ -408,7 +528,9 @@ pub async fn apply_to_machine_token(
 // claimed it held. Measured: replacing the FedCM door's resolver call with
 // `MappedAccessClaims::default()` compiled clean with zero clippy warnings. A newtype whose
 // bypass is one derive away is not a fence, and the derive was the one thing nobody grepped for
-// while `none_for_a_clientless_mint` was advertised as the only hatch.
+// while a `none_for_a_clientless_mint` constructor was advertised as the only hatch. That
+// constructor is gone too: review found it had ZERO callers repo-wide while remaining a public
+// way to build this type without resolving anything, which is a bypass kept open for nobody.
 #[derive(Debug, Clone)]
 pub struct MappedAccessClaims(serde_json::Map<String, serde_json::Value>);
 
@@ -429,16 +551,5 @@ impl MappedAccessClaims {
     #[must_use]
     pub fn for_test(claims: serde_json::Map<String, serde_json::Value>) -> Self {
         Self(claims)
-    }
-
-    /// No mapping applied, for a path that mints a token for NO client.
-    ///
-    /// Deliberately narrow, and deliberately not `Default`-by-accident: the only honest use is a
-    /// mint that has no client id to look a mapping up by. A door that HAS one must call
-    /// [`apply_to_with_hook`]; reaching for this instead is the bypass the wrapper exists to prevent, and
-    /// it is greppable.
-    #[must_use]
-    pub fn none_for_a_clientless_mint() -> Self {
-        Self(serde_json::Map::new())
     }
 }

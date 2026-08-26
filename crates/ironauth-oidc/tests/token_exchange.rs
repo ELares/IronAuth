@@ -105,6 +105,21 @@ async fn exchange(
     (status, value)
 }
 
+/// The claims of the access token in a successful exchange response.
+#[cfg(feature = "wasm-hooks")]
+fn exchanged_claims(body: &Value) -> Value {
+    use base64::Engine as _;
+    let access = body["access_token"].as_str().expect("access token");
+    let payload = access
+        .split('.')
+        .nth(1)
+        .expect("a JWT payload segment, so the exchanged token is an at+jwt");
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("base64url payload");
+    serde_json::from_slice(&decoded).expect("claims json")
+}
+
 /// Introspect a token as a given client.
 async fn introspect(harness: &Harness, token: &str, client: &str, secret: &str) -> Value {
     let request = Request::builder()
@@ -876,8 +891,6 @@ async fn an_actor_token_and_its_type_must_travel_together() {
 #[cfg(feature = "wasm-hooks")]
 #[tokio::test]
 async fn the_token_exchange_grant_runs_the_hook() {
-    use base64::Engine as _;
-
     let harness = Harness::start_with_hook_engine_and_config(
         std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine")),
         OidcConfig {
@@ -891,7 +904,8 @@ async fn the_token_exchange_grant_runs_the_hook() {
     harness
         .deploy_token_hook(&client, ironauth_hooks::fixtures::ECHO_REQUEST, 1)
         .await;
-    let (subject, subject_token) = access_token_for_named_user(&harness, &client, &secret).await;
+    let (exchanged_for, subject_token) =
+        access_token_for_named_user(&harness, &client, &secret).await;
 
     let (status, body) = exchange(
         &harness,
@@ -905,15 +919,7 @@ async fn the_token_exchange_grant_runs_the_hook() {
     .await;
     assert_eq!(status, StatusCode::OK, "exchange: {body}");
 
-    let access = body["access_token"].as_str().expect("access token");
-    let payload = access
-        .split('.')
-        .nth(1)
-        .expect("a JWT payload segment, so the exchanged token is an at+jwt");
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .expect("base64url payload");
-    let claims: Value = serde_json::from_slice(&decoded).expect("claims json");
+    let claims = exchanged_claims(&body);
 
     // The VALUE, not just the presence: see the jwt:bearer test for why the grant string is
     // the thing worth asserting at a door.
@@ -922,11 +928,86 @@ async fn the_token_exchange_grant_runs_the_hook() {
         "an EXCHANGED token ran the hook AND told it which grant this is, or token exchange \
          is a way around a deployed hook: {claims}"
     );
-    // The exchange still speaks for the original subject. A fold that replaced the claim set
-    // rather than adding to it would satisfy the assertion above and quietly reissue the token
-    // under nobody.
+    // NOT an assertion on `sub`. Review pointed out that one cannot fail: `sub` is written
+    // into the mint's own JSON literal from a separate struct field, and then refused three
+    // more times on the way back in (mapping `validate`, `filter_hook_claims`, and the mint's
+    // own `PROTECTED_ACCESS_TOKEN_CLAIMS` skip). "The fold did nothing at all" satisfies it.
+    //
+    // What CAN move is the subject the hook was TOLD, which is the input the WIT contract
+    // carries and the thing a hook branching on identity would read. `echo_subject` crosses in
+    // the ID-token list, which this grant discards, so it is read from the hook's own report.
     assert_eq!(
-        claims["sub"], subject,
-        "and the token still names the subject it was exchanged for: {claims}"
+        claims["sub"], exchanged_for,
+        "the fixture exchanged the token it meant to, so the assertions below describe the \
+         right token: {claims}"
+    );
+    assert_eq!(
+        claims["echo_client_id"],
+        client.to_string(),
+        "the guest was told which client is exchanging: {claims}"
+    );
+}
+
+/// A CLIENT'S MAPPING REACHES AN EXCHANGED TOKEN, and that is a decision rather than an oversight.
+///
+/// `clients.custom_token_claims` is withheld from a token that speaks for another subject,
+/// because those claims describe the client's own service account. A `static` MAPPING rule is
+/// not withheld, and review flagged the two as inconsistent.
+///
+/// They are consistent under the reason actually being applied, which is about IDENTITY rather
+/// than about origin: a client's mapping already shapes every token it causes to be minted for
+/// an interactive user, so a `static` rule reaching an exchanged token is the same power and not
+/// a new one. The authorization-bearing names (`roles`, `permissions`, `org_id`, `scope`, `cnf`,
+/// `act`, and the protocol claims) are refused to mappings and hooks alike.
+///
+/// Pinned so that if anyone later decides the other way, they change a test rather than
+/// discover a behaviour.
+#[cfg(feature = "wasm-hooks")]
+#[tokio::test]
+async fn the_mapping_reaches_an_exchanged_token() {
+    let harness = Harness::start_with_hook_engine_and_config(
+        std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine")),
+        OidcConfig {
+            enforce_client_grant_types: true,
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        },
+    )
+    .await;
+    let (client, secret) = exchanging_client(&harness).await;
+    let env = harness.env().clone();
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            harness.db().test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .claims_mappings()
+        .set(
+            &env,
+            &client,
+            r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .await
+        .expect("store the mapping");
+    let (_subject, subject_token) = access_token_for_named_user(&harness, &client, &secret).await;
+
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &subject_token),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "exchange: {body}");
+    let claims = exchanged_claims(&body);
+    assert_eq!(
+        claims["tier"], "gold",
+        "an unplaced `static` rule lands on the one token this grant mints: {claims}"
     );
 }
