@@ -258,26 +258,21 @@ pub async fn resend_message(
         ));
     };
 
-    // The event is built BEFORE the write and handed in, so it lands in the same transaction
-    // as the re-queue. A resend causes mail, and until now it announced nothing: an integrator
-    // watching the feed could not tell an operator's resend from a provider double-delivering.
+    // A BUILDER, not a built event, and the store calls it with what the write actually did.
+    // Only the write knows the attempt number -- `resend_in_tx` reads and increments
+    // `resend_count` under the row lock -- so an event built out here could only carry a guess,
+    // and the first version of this carried the literal 1 forever.
     //
-    // `None` here means the type is not registered, which `event_catalog::envelope` answers.
-    // The write still happens: refusing to re-send mail because an event could not be built
-    // would make the feed a dependency of the delivery, which it is not.
-    let pending = resent_event(&state, scope, &id);
+    // Returning `None` is how the outcomes that queued no mail announce nothing. It is also
+    // what an unregistered event type produces, and the write still happens either way:
+    // refusing to re-send mail because an event could not be built would make the feed a
+    // dependency of the delivery, which it is not.
+    let build_event = |outcome: &ironauth_store::Resent| resent_event(&state, scope, &id, outcome);
     let outcome = data_store
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .messages()
-        .resend_with_event(
-            state.env(),
-            &id,
-            pending
-                .as_ref()
-                .map(crate::events::PendingEvent::domain_event)
-                .as_ref(),
-        )
+        .resend_with_event(state.env(), &id, Some(&build_event))
         .await
         .map_err(|error| match error {
             ironauth_store::StoreError::NotFound => ApiError::NotFound,
@@ -309,19 +304,30 @@ pub async fn resend_message(
 
 /// The `message.resent` event for one re-queue (issue #111, issue #108 criterion 6).
 ///
+/// CALLED BY THE STORE, inside the transaction, with the outcome of the write. That is the only
+/// place the attempt number exists: `resend_in_tx` reads and increments `resend_count` under
+/// the row lock, so a caller building this beforehand can only guess. The first version did
+/// exactly that -- a literal 1 -- and review measured a second resend announcing `attempt: 1`
+/// while the HTTP body correctly said 2. A subscriber reading 1 four times concludes four
+/// FIRST resends, which is the provider-double-delivery story this event exists to rule out.
+///
+/// `None` for every outcome that queued no mail: a suppressed recipient, a message in a state a
+/// resend cannot act on, and a payload the retention sweep already reaped. An event for any of
+/// them would say mail went out when none did.
+///
 /// NO ADDRESS and no body. The event feed is the artifact a tenant hands to third-party sync
 /// targets, and a resend event is by construction about somebody being mailed right now, so the
-/// payload carries the ledger id and the attempt number and nothing a subscriber could use as a
-/// directory. `message.rate_limited` withholds the recipient for the same reason.
-///
-/// The ATTEMPT number is filled in by the store, which is the only place that knows it: this
-/// builds the envelope around a placeholder and the store never sees a resend it did not
-/// perform, so the two cannot disagree about whether one happened.
+/// payload carries the ledger id and the attempt and nothing usable as a directory.
+/// `message.rate_limited` withholds the recipient for the same reason.
 fn resent_event(
     state: &AdminState,
     scope: ironauth_store::Scope,
     message_id: &MessageId,
-) -> Option<crate::events::PendingEvent> {
+    outcome: &ironauth_store::Resent,
+) -> Option<ironauth_store::OwnedDomainEvent> {
+    let ironauth_store::Resent::Requeued { attempt } = outcome else {
+        return None;
+    };
     let id = format!("evt_{}", CorrelationId::generate(state.env()));
     let subject = message_id.to_string();
     let envelope = ironauth_store::event_catalog::envelope(
@@ -330,9 +336,9 @@ fn resent_event(
         &scope.tenant().to_string(),
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,
-        &serde_json::json!({ "message_id": subject, "attempt": 1 }),
+        &serde_json::json!({ "message_id": subject, "attempt": attempt }),
     )?;
-    Some(crate::events::PendingEvent {
+    Some(ironauth_store::OwnedDomainEvent {
         id,
         subject,
         envelope,

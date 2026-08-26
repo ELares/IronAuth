@@ -393,6 +393,13 @@ func (c *Client) DeleteBrandLogo(tenant_id string, environment_id string, slug s
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/brands/" + escape(slug) + "/logo", query, nil)
 }
 
+// DeleteClaimsMapping performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping.
+//
+// Delete a per-environment, per-client declarative claim mapping.
+func (c *Client) DeleteClaimsMapping(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/claims-mapping", query, nil)
+}
+
 // DeleteClientAdminConsent performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent.
 //
 // Delete (revoke) a per-environment, per-client admin consent pre-authorization.
@@ -615,6 +622,13 @@ func (c *Client) GetAuthzenConfiguration(tenant_id string, environment_id string
 // Get a per-environment brand by slug.
 func (c *Client) GetBrand(tenant_id string, environment_id string, slug string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/brands/" + escape(slug), query, nil)
+}
+
+// GetClaimsMapping performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping.
+//
+// Get a per-environment, per-client declarative claim mapping.
+func (c *Client) GetClaimsMapping(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/claims-mapping", query, nil)
 }
 
 // GetClientAdminConsent performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent.
@@ -1546,6 +1560,13 @@ func (c *Client) SetBrandFavicon(tenant_id string, environment_id string, slug s
 // Upload (create or overwrite) a brand's logo.
 func (c *Client) SetBrandLogo(tenant_id string, environment_id string, slug string, query url.Values, body any) (*http.Response, error) {
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/brands/" + escape(slug) + "/logo", query, body)
+}
+
+// SetClaimsMapping performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping.
+//
+// Set (create or overwrite) a per-environment, per-client declarative claim mapping.
+func (c *Client) SetClaimsMapping(tenant_id string, environment_id string, client_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/claims-mapping", query, body)
 }
 
 // SetClientAdminConsent performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent.

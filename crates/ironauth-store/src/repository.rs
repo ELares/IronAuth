@@ -31729,9 +31729,20 @@ impl ActingMessageRepo<'_> {
     /// only because `outbox_messages` grants INSERT to the data-plane role -- the idempotency
     /// row above cannot join this transaction for exactly the opposite reason.
     ///
-    /// The event is emitted ONLY for [`Resent::Requeued`]. A suppressed recipient and a message
-    /// in a state a resend cannot act on both queue nothing, and announcing either would tell a
-    /// subscriber mail went out when none did.
+    /// THE EVENT IS BUILT FROM THE OUTCOME, not handed in ready-made, and that is the whole
+    /// reason this takes a [`ResolvedEventBuilder`] rather than a [`DomainEvent`].
+    ///
+    /// The attempt number is the durable answer to "why did this person get four copies", and
+    /// only this write knows it: `resend_in_tx` reads and increments `resend_count` inside the
+    /// transaction. An event built by the caller beforehand can only carry a guess, and the
+    /// first version of this carried the literal 1 forever -- review measured a second resend
+    /// announcing `attempt: 1` while the HTTP body correctly said 2, which is exactly the
+    /// provider-double-delivery story the event exists to distinguish from an operator resend.
+    ///
+    /// The builder also decides WHETHER to emit, by returning `None`. All THREE of the other
+    /// [`Resent`] variants queue no mail -- a suppressed recipient, a message in a state a
+    /// resend cannot act on, and a payload the retention sweep has already reaped -- and
+    /// announcing any of them would tell a subscriber mail went out when none did.
     ///
     /// # Errors
     ///
@@ -31740,7 +31751,7 @@ impl ActingMessageRepo<'_> {
         &self,
         env: &Env,
         id: &MessageId,
-        event: Option<&DomainEvent<'_>>,
+        event: Option<ResolvedEventBuilder<'_, Resent>>,
     ) -> Result<Resent, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -31758,9 +31769,12 @@ impl ActingMessageRepo<'_> {
             },
             async move |tx| {
                 let outcome = resend_in_tx(tx, env, scope, &target).await?;
-                if matches!(outcome, Resent::Requeued { .. }) {
-                    enqueue_domain_event(tx, env, scope, event).await?;
-                }
+                // Built HERE, from what the write actually did, and enqueued in the same
+                // transaction. `None` from the builder is the no-mail outcomes announcing
+                // nothing.
+                let resolved = event.and_then(|build| build(&outcome));
+                let borrowed = resolved.as_ref().map(OwnedDomainEvent::borrowed);
+                enqueue_domain_event(tx, env, scope, borrowed.as_ref()).await?;
                 Ok(outcome)
             },
             false,

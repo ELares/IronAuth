@@ -1017,11 +1017,16 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // `attempt` is the durable answer to "why did this person get four copies", so it rides
         // the event rather than needing a follow-up read.
         //
-        // EMITTED ONLY WHEN A RESEND ACTUALLY RE-QUEUED. The other two outcomes wrote no mail: a
-        // SUPPRESSED recipient is a hard bounce or a complaint the store refuses on the
-        // recipient's behalf, and a message in a state a resend cannot act on is a no-op. An
-        // event for either would tell a subscriber that mail went out when none did, which is
-        // worse than the silence this replaces.
+        // EMITTED ONLY WHEN A RESEND ACTUALLY RE-QUEUED. `Resent` has FOUR variants and the
+        // other THREE all wrote no mail: a SUPPRESSED recipient is a hard bounce or a complaint
+        // the store refuses on the recipient's behalf, a message in a state a resend cannot act
+        // on is a no-op, and a PAYLOAD the diagnostics retention sweep already reaped cannot be
+        // re-queued at all. An event for any of them would tell a subscriber that mail went out
+        // when none did, which is worse than the silence this replaces.
+        //
+        // The count is written out because an earlier version of this comment said "the other
+        // two" and enumerated two, leaving the retention-expiry path -- the one whose behaviour
+        // is least obvious -- unmentioned in the case analysis that justifies the guard.
         "message.resent",
         1,
         r#"{

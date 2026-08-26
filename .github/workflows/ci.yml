@@ -756,9 +756,11 @@ jobs:
       # silently skipped them would be green while testing no sandbox at all.
       #
       # This lane did not need the target until issue #114 wired `ironauth-hooks` into
-      # `ironauth-oidc`, at which point every step here that compiles the workspace started
-      # reaching the build script. It failed as `can't find crate for core` while compiling
-      # `futures-sink`, which names neither this crate nor the real cause.
+      # `ironauth-oidc`. No step here compiles the whole workspace -- the invariant scripts build
+      # named packages -- but `ironauth-oidc` now DEV-depends on `ironauth-hooks` for its guest
+      # fixtures, so any of them that links `ironauth-oidc`'s test targets runs that crate's
+      # build script. It failed as `can't find crate for core` while compiling `futures-sink`,
+      # which names neither the crate at fault nor the cause.
       - name: Install the WASM target the hook fixtures build for
         run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
