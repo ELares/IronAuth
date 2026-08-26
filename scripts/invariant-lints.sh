@@ -113,12 +113,7 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 # logic cannot read a clock outside the seam that makes it testable, and a benchmark target is
 # not protocol logic -- it is not compiled into the server, and threading an `Env` into it would
 # add a dependency for no property gained. Still zero exemptions on a request path.
-# 11 -> 12: `token_hook_at_issuance.rs` times a fuel abort. A 500 alone cannot say WHICH
-# bound stopped a runaway guest, and after the epoch deadline was raised to a second the two
-# became distinguishable only by elapsed time -- fuel stops the spinner in milliseconds, the
-# deadline cannot fire before 1s. Reading the frozen Clock seam there would report zero and
-# make the distinction unmeasurable, which is the one case this rule is not protecting.
-scan time-via-env 'SystemTime::now|Instant::now' 12
+scan time-via-env 'SystemTime::now|Instant::now' 11
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.
@@ -342,80 +337,104 @@ while IFS=$'\t' read -r _count path; do
   fi
 done < "$token_inventory"
 
-# Rule doc-attachment: a doc comment is attached to the item it describes.
+# Rule doc-attachment: one item does not carry TWO doc blocks split by an attribute.
 #
-# Inserting a new item immediately above an existing doc block splits the block from its item,
-# and Rust accepts the result silently. This has shipped SIX times in this effort: a repo doc
-# landed above the wrong repo, a `#[must_use]` was orphaned twice in one file, a harness doc
-# ended up describing the function below it, and most recently `Destination` was inserted
-# between `apply`'s doc and `apply`, giving an infallible enum an "# Errors" section and leaving
-# `apply`'s no-half-apply guarantee documented on nothing.
+# The defect: inserting a new item immediately above an existing doc block splits that block
+# from its item. Rust accepts it silently, and it has shipped SIX times in this effort -- a repo
+# doc landed above the wrong repo, a `#[must_use]` was orphaned twice in one file, and
+# `Destination` was inserted between `apply`'s doc and `apply`.
 #
-# Resolving to be careful has not worked, so it is a gate. Two shapes, both mechanical:
+# The signature is precise: a doc block, then an attribute, then ANOTHER doc block, then the
+# item. Both blocks now document that one item, and the first one is describing something else
+# entirely. That is what `flow_version_key` looked like after #989 orphaned its doc and its
+# `#[must_use]` onto `message_template_key`, and what `spawn_epoch_driver` looked like when a
+# rewritten doc was stacked under its `#[cfg]`.
 #
-#   (a) an attribute line immediately followed by a doc line. Legal Rust, always a mistake:
-#       it means a doc block was written UNDER an attribute that belongs to a different item.
-#   (b) a doc block containing "# Errors" or "# Panics" whose item is not a function. Those
-#       sections describe a return or a call, so on a struct or an enum they are a doc that
-#       was severed from the function it was written for.
+# WHY NOT THE BROADER "a doc follows an attribute". That was the first version of this rule and
+# it was wrong: `#[utoipa::path(...)]` followed by the handler's doc is the established style on
+# the admin surface, legal, and correctly attached. A gate that fires on the house style gets
+# silenced rather than obeyed. The two-block shape has no legitimate use: nobody writes a second
+# doc block for the same item on the far side of an attribute on purpose.
+#
+# WHAT IT DOES NOT CATCH, said plainly: the general class. An item inserted WITH ITS OWN doc
+# above another item's doc is well-ordered at every point and reads clean here; deciding that
+# needs a parser and a notion of which prose belongs to which item. This catches the shape that
+# compiles silently AND leaves a visible seam, which is the one that survives review.
+#
+# Walks the same trees as the rules above (`crates` and `fuzz`, working tree) so one gate cannot
+# answer about a different file set than the rest.
 doc_attachment=$(
-  git ls-files '*.rs' | python3 -c '
+  find crates fuzz -name '*.rs' -type f 2>/dev/null | python3 -c '
 import sys, pathlib
 
+
+def attribute_end(lines, start):
+    """Index just past the attribute beginning at `start`, or None if it is not one."""
+    if not lines[start].lstrip().startswith("#["):
+        return None
+    depth, index = 0, start
+    while index < len(lines):
+        # Brackets inside a string literal are not nesting: `reason = "see foo[0]"` would
+        # otherwise run the walk off the end of the attribute and into the item.
+        quoted, escaped, bare = False, False, []
+        for character in lines[index]:
+            if escaped:
+                escaped = False
+            elif character == chr(92):
+                escaped = True
+            elif character == chr(34):
+                quoted = not quoted
+            elif not quoted:
+                bare.append(character)
+        text = "".join(bare)
+        depth += text.count("[") - text.count("]")
+        index += 1
+        if depth <= 0:
+            return index
+    return None
+
+
 bad = []
-for path in (line.strip() for line in sys.stdin if line.strip()):
+for path in sorted(line.strip() for line in sys.stdin if line.strip()):
     try:
         lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         continue
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].strip()
-        # (a) attribute immediately followed by a doc line
-        if stripped.startswith("#[") and stripped.endswith("]") and i + 1 < len(lines):
-            nxt = lines[i + 1].strip()
-            if nxt.startswith("///"):
-                bad.append(f"{path}:{i+2}: doc comment written under an attribute; the block "
-                           f"above belongs to a different item")
-        # (b) an Errors/Panics section on a non-fn item
-        if stripped.startswith("///"):
-            start = i
-            while i < len(lines) and lines[i].strip().startswith("///"):
-                i += 1
-            block = [lines[k].strip() for k in range(start, i)]
-            if any(b.rstrip() in ("/// # Errors", "/// # Panics") for b in block):
-                # Skip over the item ATTRIBUTES, which may span many lines. Counting brackets
-                # rather than matching a prefix: a multi-line `#[allow(...)]` continues with
-                # bare identifiers and `//` comments, and a skip that stopped at the first of
-                # those reports the comment as the item and buries the real defect in noise.
-                j = i
-                depth = 0
-                while j < len(lines):
-                    line = lines[j]
-                    naked = line.strip()
-                    # A plain `//` comment between the doc and its item is ordinary: the doc
-                    # is for the reader of the API, the comment for the reader of the body.
-                    if (depth == 0 and naked and not naked.startswith("#[")
-                            and not (naked.startswith("//") and not naked.startswith("///"))):
-                        break
-                    depth += line.count("[") - line.count("]")
-                    j += 1
-                    if depth <= 0 and (not naked or naked.startswith("#[")):
-                        depth = 0
-                        if naked.startswith("#[") and naked.endswith("]"):
-                            continue
-                        if not naked:
-                            continue
-                item = lines[j].strip() if j < len(lines) else ""
-                if "fn " not in item:
-                    bad.append(f"{path}:{start+1}: an \"# Errors\"/\"# Panics\" doc section is "
-                               f"attached to `{item[:60]}`, which is not a function")
+    index = 0
+    while index < len(lines):
+        naked = lines[index].strip()
+        # Outer docs only. `//!` is a module header and never attaches to a following item.
+        if not (naked.startswith("///") and not naked.startswith("////")):
+            index += 1
             continue
-        i += 1
+        first_block = index
+        while index < len(lines) and lines[index].strip().startswith("///"):
+            index += 1
+        # An attribute (or several), possibly with blanks and plain comments between.
+        saw_attribute, probe = False, index
+        while probe < len(lines):
+            here = lines[probe].strip()
+            if not here or (here.startswith("//") and not here.startswith("///")):
+                probe += 1
+                continue
+            end = attribute_end(lines, probe)
+            if end is None:
+                break
+            saw_attribute, probe = True, end
+        if saw_attribute and probe < len(lines) and lines[probe].strip().startswith("///"):
+            bad.append(
+                f"{path}:{first_block+1}: this doc block and the one at line {probe+1} both "
+                f"document the item below, separated by an attribute. That is the shape an item "
+                f"inserted above an existing doc block leaves behind, and the first block is "
+                f"describing something else. Reattach it to what it is about."
+            )
 for entry in bad:
     print(entry)
 '
 )
+# An exemption marker, because every other rule here has one and a gate with no way to say
+# "this is deliberate" gets deleted rather than argued with.
+doc_attachment=$(printf "%s" "$doc_attachment" | grep -v "invariant-allow: doc-attachment" || true)
 if [ -n "$doc_attachment" ]; then
   echo "invariant-lints: rule 'doc-attachment' violated:"
   echo "$doc_attachment"

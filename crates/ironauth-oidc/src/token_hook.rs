@@ -484,13 +484,28 @@ pub const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10)
 /// `a_hook_that_exhausts_its_fuel_fails_the_issuance` -- a test that now TIMES the abort
 /// precisely so it cannot silently start passing on this deadline instead.
 ///
-/// So what is left for the deadline is a guest that consumes wall clock without burning fuel.
-/// The one way that happened before was a HOST call that blocked: a guest whose body was a
-/// 30-second sleep held a request thread for the full 30 seconds, because fuel counts
-/// instructions a sleeping guest is not executing and the deadline is only checked while wasm
-/// runs. That class is closed -- no host function this sandbox links may block, and
-/// `a_hook_cannot_wait` holds it closed -- which is exactly why the deadline can afford to be a
-/// second: it is the second line, not the first.
+/// So what is left for the deadline is a guest that consumes wall clock while still EXECUTING.
+///
+/// A guest that blocks is not that, and the distinction matters because it is the one this
+/// paragraph previously got backwards. A blocking HOST call -- a guest whose body was a
+/// 30-second sleep held a request thread for the full 30 seconds -- is invisible to BOTH
+/// bounds: fuel counts instructions a sleeping guest is not executing, and the deadline is only
+/// checked while wasm runs, so it fires when the host call returns and not before. The deadline
+/// never bounded that class at any length, so raising it does not weaken it and could not have
+/// been justified by it.
+///
+/// What holds that class closed is the sandbox linking no host function that can block, and
+/// TWO tests hold the two waiting functions the clock exposes: `a_hook_cannot_wait` covers
+/// `subscribe-duration` and `a_hook_cannot_wait_on_an_instant` covers `subscribe-instant`. An
+/// earlier version of this paragraph named only the first, which is exactly the trap that
+/// second test was written for -- its own doc records that reintroducing a real timer on
+/// `subscribe-instant` alone held the host thread for twenty seconds with every other test in
+/// the file green.
+///
+/// The UNIVERSAL half is still prose. Nothing enumerates the host functions
+/// `Sandbox::link` registers and asserts that none of them can block, so a future
+/// `add_to_linker` that waits would reopen the class with both named tests passing. That
+/// inventory is the honest next piece of work on the sandbox, and it is not in this change.
 ///
 /// # The cost, stated rather than papered over
 ///

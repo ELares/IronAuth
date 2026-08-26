@@ -88,7 +88,14 @@ pub enum Resolved {
     Mapped(MappedClaims),
 }
 
-/// Read this client's mapping and apply it to `source`.
+/// Read this client's mapping and apply it to `source`, projecting onto `destination`.
+///
+/// PRIVATE, and the two-token `resolve` wrapper that used to sit above it is deleted.
+/// Neither had a caller outside this module: every door goes through
+/// [`apply_to_with_hook`] or [`apply_to_machine_token`], which is what those two are for.
+/// A public resolver is how the next door quietly picks the wrong `Destination` for the
+/// mint it is doing -- and the reason given for keeping `resolve` public, "the two
+/// ID-token-only doors read it", was false. They read `apply_to_with_hook` like the rest.
 ///
 /// # The three doors this does not reach DIRECTLY, and where they went
 ///
@@ -111,36 +118,11 @@ pub enum Resolved {
 /// It is now done. The source is the client's static bag for `client_credentials` and an empty
 /// document for the other two, and [`apply_to_machine_token`] says why those two differ.
 ///
+///
 /// # Errors
 ///
 /// [`MappingFault`] when the store cannot answer or the stored document cannot be read or
 /// applied. Every one fails the issuance; see the module header for why.
-pub async fn resolve(
-    store: &Store,
-    scope: Scope,
-    client_id: &str,
-    source: &BTreeMap<String, serde_json::Value>,
-) -> Result<Resolved, MappingFault> {
-    resolve_for(
-        store,
-        scope,
-        client_id,
-        source,
-        claims_mapping::Destination::TwoTokens,
-    )
-    .await
-}
-
-/// As [`resolve`], projecting the mapping onto `destination`.
-///
-/// PRIVATE. It has no caller outside this module, and a public function nothing calls is the
-/// shape this module already deleted once for cause -- it is how the next door quietly picks
-/// the wrong `Destination` for the mint it is doing. `resolve` stays public because the two
-/// ID-token-only doors read it.
-///
-/// # Errors
-///
-/// [`MappingFault`], as [`resolve`].
 async fn resolve_for(
     store: &Store,
     scope: Scope,
@@ -254,7 +236,17 @@ pub async fn apply_to_with_hook(
     extra_claims: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<MappedAccessClaims, MappingFault> {
     let source = as_source(extra_claims);
-    let mut access = match resolve(store, scope, client_id, &source).await? {
+    let mut access = match resolve_for(
+        store,
+        scope,
+        client_id,
+        &source,
+        // TWO tokens: this seam rewrites `extra_claims` into the ID-token set and returns the
+        // access-token set, so placement means what it says.
+        claims_mapping::Destination::TwoTokens,
+    )
+    .await?
+    {
         // Untouched. NOT "an empty mapping applied": a client with no mapping issues exactly
         // what it issued before this seam existed, and the two cases produce opposite results
         // for the same input.

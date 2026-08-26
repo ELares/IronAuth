@@ -427,21 +427,30 @@ pub enum Destination {
     /// leaving the claim out. `place: access_token` and `place: both` are emitted -- `both`
     /// names two tokens and one of them is this one.
     ///
-    /// # A rule ORDER that reads differently under the two destinations
+    /// # A RULE ORDER THAT DISCLOSES, and it is not the one an earlier note here named
     ///
-    /// `place` is keyed on a NAME, and `rename` carries a placement across with the value. So
-    /// `place: a -> id_token` followed by `rename: b -> a` leaves `a` placed, while the reverse
-    /// order leaves the renamed `a` UNPLACED, because the `place` matched a name that did not
-    /// exist yet.
+    /// `place` is keyed on a NAME and `rename` carries a placement across with the value, so
+    /// placing the claim you then rename is safe and placing it afterwards is not:
     ///
-    /// Under `TwoTokens` that difference is invisible in the disclosure direction: unplaced
-    /// defaults to the ID token, which is where an `id_token` placement would have put it
-    /// anyway. Under `OneAccessToken` the two orders are OPPOSITE -- placed means not emitted,
-    /// unplaced means emitted into the token the resource servers read.
+    /// - `place(email -> id_token)` THEN `rename(email -> contact)` moves the placement onto
+    ///   `contact`, which is withheld here as asked.
+    /// - `rename(email -> contact)` THEN `place(email -> id_token)` places a name that no
+    ///   longer exists. `contact` is UNPLACED, and unplaced on this destination means the one
+    ///   token there is -- so the claim the operator asked to keep out of an access token is in
+    ///   one, under a different name.
     ///
-    /// Both behaviours are coherent (the operator who writes `place` before the claim exists
-    /// has not placed anything), and neither is a defect. It is recorded because the rule order
-    /// stops being cosmetic on a machine client, and nothing about writing the rules says so.
+    /// Under `TwoTokens` the same slip is invisible: unplaced defaults to the ID token, which
+    /// is where the placement would have put it anyway. The order only becomes a disclosure
+    /// when there is one token, which is why it is written down here.
+    ///
+    /// `a_place_after_a_rename_names_nothing_and_the_claim_is_emitted` pins both orders.
+    ///
+    /// An earlier version of this section named a different pair -- `place(a)` then
+    /// `rename(b -> a)` against its reverse -- and called them opposite. Measured: they are
+    /// identical and both withhold, because in one order the placement is written onto the
+    /// destination name and in the other it is carried onto it. That note taught the safe order
+    /// as the dangerous one, which is worse than no note, and the test above asserts the
+    /// correction so it cannot rot back.
     OneAccessToken,
 }
 
@@ -582,6 +591,115 @@ mod tests {
 
     fn only(rule: MappingRule) -> MappedClaims {
         apply_for(&[rule], &source(), Destination::TwoTokens).expect("applies")
+    }
+
+    /// A `place` naming a claim a RENAME already moved away is inert, and on a one-token grant
+    /// that means the claim is EMITTED.
+    ///
+    /// `place` is keyed on a name and `rename` carries a placement across with the value, so
+    /// the two orders are genuinely different and only one is safe:
+    ///
+    /// - `place(email -> id_token)` THEN `rename(email -> contact)`: the placement moves with
+    ///   the value, `contact` is placed, nothing is emitted.
+    /// - `rename(email -> contact)` THEN `place(email -> id_token)`: the place names a claim
+    ///   that no longer exists, `contact` is UNPLACED, and on a machine grant unplaced means
+    ///   the one token there is, which every resource server in `aud` reads.
+    ///
+    /// So an operator who writes the rename first has asked for `email` to stay out of an
+    /// access token and put it there under another name. Rule ORDER is the whole difference.
+    ///
+    /// This test exists because the note that used to sit on `Destination` described a
+    /// DIFFERENT pair -- `place(a)` then `rename(b -> a)` against its reverse -- and called
+    /// them opposite. They are identical, and both withhold. A hazard note naming the wrong
+    /// pair is worse than none: it teaches the safe order as the dangerous one.
+    #[test]
+    fn a_place_after_a_rename_names_nothing_and_the_claim_is_emitted() {
+        let mut only_email = BTreeMap::new();
+        only_email.insert("email".to_owned(), serde_json::json!("ada@example.test"));
+
+        let safe = apply_for(
+            &[
+                MappingRule::Place {
+                    name: "email".to_owned(),
+                    placement: Placement::IdToken,
+                },
+                MappingRule::Rename {
+                    from: "email".to_owned(),
+                    to: "contact".to_owned(),
+                },
+            ],
+            &only_email,
+            Destination::OneAccessToken,
+        )
+        .expect("applies");
+        assert!(
+            safe.access_token.is_empty(),
+            "placing BEFORE the rename carries the placement onto the new name: {:?}",
+            safe.access_token
+        );
+
+        let hazard = apply_for(
+            &[
+                MappingRule::Rename {
+                    from: "email".to_owned(),
+                    to: "contact".to_owned(),
+                },
+                MappingRule::Place {
+                    name: "email".to_owned(),
+                    placement: Placement::IdToken,
+                },
+            ],
+            &only_email,
+            Destination::OneAccessToken,
+        )
+        .expect("applies");
+        assert_eq!(
+            hazard.access_token.keys().collect::<Vec<_>>(),
+            vec!["contact"],
+            "placing AFTER the rename names a claim that is gone, so the renamed claim is \
+             unplaced and lands in the one token the resource servers read: {:?}",
+            hazard.access_token
+        );
+
+        // The pair the old note named, which is NOT order-sensitive. Asserted so the
+        // correction cannot rot back into the wrong claim.
+        let mut only_b = BTreeMap::new();
+        only_b.insert("b".to_owned(), serde_json::json!("value"));
+        let place_first = apply_for(
+            &[
+                MappingRule::Place {
+                    name: "a".to_owned(),
+                    placement: Placement::IdToken,
+                },
+                MappingRule::Rename {
+                    from: "b".to_owned(),
+                    to: "a".to_owned(),
+                },
+            ],
+            &only_b,
+            Destination::OneAccessToken,
+        )
+        .expect("applies");
+        let rename_first = apply_for(
+            &[
+                MappingRule::Rename {
+                    from: "b".to_owned(),
+                    to: "a".to_owned(),
+                },
+                MappingRule::Place {
+                    name: "a".to_owned(),
+                    placement: Placement::IdToken,
+                },
+            ],
+            &only_b,
+            Destination::OneAccessToken,
+        )
+        .expect("applies");
+        assert_eq!(
+            place_first.access_token, rename_first.access_token,
+            "placing the DESTINATION name is order-insensitive; the old note said otherwise"
+        );
+        assert!(place_first.access_token.is_empty(), "and both withhold");
     }
 
     /// CRITERION 4, all four operations, with no custom code.

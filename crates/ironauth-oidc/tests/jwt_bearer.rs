@@ -3730,6 +3730,14 @@ async fn the_jwt_bearer_grant_runs_the_hook() {
         claims["echo_grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer",
         "the guest was told which grant this is, or a hook cannot gate on it: {claims}"
     );
+    // AND WHICH SUBJECT. Round 2 closed this at `client_credentials` and left the sibling:
+    // review measured that setting the subject argument to `None` here, and separately to an
+    // empty string, left all 85 tests green. `echo_subject` crosses in the ID-token list,
+    // which this grant discards, so `echo_access_subject` is the only way to see it.
+    assert_eq!(
+        claims["echo_access_subject"], MAPPED_PRINCIPAL,
+        "the guest was told whose token this is, and it is the mapped principal: {claims}"
+    );
     // `sub` is asserted as a FIXTURE check, not as a property of the seam. Review pointed out
     // that it cannot fail: the mint writes `sub` into its own JSON literal from a separate
     // struct field, and it is then refused three more times on the way back in (mapping

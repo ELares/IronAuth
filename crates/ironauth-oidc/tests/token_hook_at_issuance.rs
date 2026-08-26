@@ -282,25 +282,33 @@ async fn a_deployment_with_no_engine_does_not_run_a_deployed_hook() {
 /// token whose shape nobody chose. And an abort means code behaving in a way its author did not
 /// intend, which is not a state to mint a credential from.
 ///
-/// # Why this times the failure
+/// # WHICH BOUND FIRED IS NOT ASSERTED HERE, and the attempt to is instructive
 ///
-/// A 500 alone does not say WHICH bound stopped the guest, and the two are not
-/// interchangeable: fuel counts instructions and is deterministic, while the epoch deadline
-/// counts wall-clock ticks and a descheduled guest trips it exactly as a runaway one does.
-/// Review pointed out that raising the deadline silently changed which bound aborts this
-/// spinner, with nothing red either way -- the test asserted a status code and called it fuel.
+/// A 500 does not say whether fuel or the epoch deadline stopped the guest, and the two are not
+/// interchangeable: fuel counts instructions and is deterministic, while the deadline counts
+/// wall-clock ticks and a descheduled guest trips it exactly as a runaway one does. Round 2
+/// tried to separate them by ELAPSED TIME -- fuel stops this guest in milliseconds, the
+/// deadline cannot fire before a second -- and asserted the failure arrived in under a second.
 ///
-/// Elapsed time separates them. Fuel stops this guest after 50M instructions, which is
-/// milliseconds; the deadline cannot fire before a full second. So a failure that arrives
-/// quickly is a FUEL failure, and one that takes a second is the backstop firing instead --
-/// which would mean fuel had stopped bounding the thing this test is named for.
+/// Review measured the window that assertion actually covered:
 ///
-/// The SECOND attempt is the one timed, and that is not incidental. The first pays a cranelift
-/// compile, which is tens of milliseconds when the machine is idle and over a second when it is
-/// not -- so timing the first conflates "the deadline fired" with "the build was busy". This
-/// failed exactly that way when three test binaries ran at once. The dispatch caches the
-/// compiled component per (scope, client, digest), so by the second attempt the only thing left
-/// between the request and the abort is the guest burning its fuel.
+/// ```text
+/// fuel_bomb_window            230.3ms
+/// one seed_user inside it     211.7ms      (Argon2id at OWASP parameters, unoptimized)
+/// same window, GOOD fixture   227.9ms      (zero fuel burned)
+/// ```
+///
+/// 92% of it is one password hash, and the window with a hook that burns NO fuel is within 1%
+/// of the window with the bomb. The guest's own burn is about 2ms. So the one-second ceiling
+/// was charged almost entirely against work that is not the hook, and a correct fuel abort
+/// behind a contended Argon2id could breach it and print a message blaming a deadline that
+/// never fired.
+///
+/// The assertion is gone rather than widened, because widening it would keep a number that
+/// measures the wrong thing. WHICH BOUND fires is measured where the guest runs without a login
+/// around it: `ironauth-hooks`' `a_hook_that_spins_is_aborted_by_fuel` and
+/// `the_default_fuel_stops_a_runaway_quickly`. What THIS test is for is the seam -- that a
+/// runaway hook fails the issuance rather than minting a half-shaped token.
 #[tokio::test]
 async fn a_hook_that_exhausts_its_fuel_fails_the_issuance() {
     let harness = harness_with_hooks().await;
@@ -316,24 +324,16 @@ async fn a_hook_that_exhausts_its_fuel_fails_the_issuance() {
         "a hook that ran away is a server fault, not a client one: {body}"
     );
 
-    // Second attempt: the component is cached, so this is the guest burning its fuel and
-    // nothing else.
-    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement. The rule keeps protocol logic on the Env clock so issuance is deterministic; here real elapsed time IS the observation, because it is the only thing that distinguishes a fuel abort from a deadline abort, and routing it through a frozen clock would make the distinction unmeasurable by construction
+    // A SECOND attempt, on the cached component. Not a timing probe: it asserts the refusal is
+    // a property of the hook rather than of the first compile, so a dispatch that failed once
+    // and then quietly succeeded from cache would be caught.
     let (status, body) = exchange(&harness)
         .await
         .expect_err("the cached hook must fail the same way");
-    let elapsed = started.elapsed();
     assert_eq!(
         status,
         StatusCode::INTERNAL_SERVER_ERROR,
         "a cached runaway hook is still a server fault: {body}"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_secs(1),
-        "the abort took {elapsed:?}, so the EPOCH DEADLINE stopped this guest and not its \
-         fuel. Fuel bounds 50M instructions, which is milliseconds; the deadline floor is a \
-         whole second. A spinner outrunning its fuel budget means the budget stopped bounding \
-         it, and this test would have gone on passing on the backstop."
     );
 
     // And the SAME harness issues once the hook is replaced with a working one, so the

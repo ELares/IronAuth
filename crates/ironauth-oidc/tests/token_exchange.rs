@@ -936,12 +936,13 @@ async fn the_token_exchange_grant_runs_the_hook() {
     // What CAN move is the CLIENT the hook was told, which crosses in the access list and so
     // survives this grant's discard of the id-token list.
     //
-    // The subject the hook was told is NOT read here, and this comment used to say it was.
-    // `echo-request` reports the subject only into the id-token list, which this grant
-    // discards, so no assertion in this file can see it. `echo-access-only` reports it into the
-    // access list and `a_machine_clients_static_claims_survive_a_hook_that_ignores_them` is
-    // where that is measured -- on `client_credentials`, which passes the subject through the
-    // same seam this door does.
+    // AND THE SUBJECT, read here rather than deferred to another grant's test. An earlier
+    // version of this comment said the residual was covered by the `client_credentials` test
+    // "which passes the subject through the same seam this door does" -- true of the seam and
+    // false of the ARGUMENT, which each door supplies itself. Review measured the gap: setting
+    // this door's subject to `None`, and separately to an empty string, left all 85 tests
+    // green. That matters most here, because this is the grant whose token speaks for somebody
+    // other than the caller.
     assert_eq!(
         claims["sub"], exchanged_for,
         "the fixture exchanged the token it meant to, so the assertions below describe the \
@@ -951,6 +952,10 @@ async fn the_token_exchange_grant_runs_the_hook() {
         claims["echo_client_id"],
         client.to_string(),
         "the guest was told which client is exchanging: {claims}"
+    );
+    assert_eq!(
+        claims["echo_access_subject"], exchanged_for,
+        "and whose token it is shaping, which on an exchange is NOT the caller: {claims}"
     );
 }
 
