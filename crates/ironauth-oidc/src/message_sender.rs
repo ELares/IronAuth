@@ -16,17 +16,23 @@
 //! all synchronous, and `enqueue` is an async transactional write. A sync method cannot await
 //! one. `deliver_new_device_notice` is async now, and this is what implements it.
 //!
-//! # Why the new-device notice is the right first door
+//! # Which door may use this path, and why it is only one
 //!
-//! It is a NOTIFICATION. The doors that carry a secret the same request also returns -- email
-//! OTP, magic links -- are deliberately kept off this path, and `message_composer` says so:
-//! "their bodies are delivered in the request that minted them". Wiring email OTP through the
-//! collapse was tried once and withdrawn, because a 60-second window turned five
-//! `advanced_recovery` tests red: the recovery flow calls `/otp/send` twice by design, and
-//! collapsing the second call is correct for mail and wrong for that flow.
+//! `message_composer` states the rule: a payload rides "a durable queue every consumer worker
+//! reads", so "this path is for messages whose variables are safe to write down".
 //!
-//! A new-device notice has neither problem. Nothing returns it in a response, and a second
-//! identical notice inside the window is exactly what the collapse is for.
+//! Four of the five delivery doors carry a token in their body -- an OTP code, a magic link, a
+//! disavowal link, a recovery-cancellation link -- and every one of them is excluded by that
+//! rule. The FIFTH, `send`, carries no body variables at all: a scope, a coarse purpose, and a
+//! recipient. Its body comes from a template.
+//!
+//! I chose the new-device notice first and was wrong: its disavowal link is a single-use token
+//! that signs a user out everywhere, and putting it in the payload would have published it to
+//! anything reading the outbox. The test is not "does the same request also return it" but the
+//! composer's: are its variables safe to write down?
+//!
+//! `send` has live callers -- `account.rs` fires `AccountLinked` and `AccountUnlinked` to every
+//! verified channel, purposes documented as "a coarse security alert... never an OTP".
 //!
 //! # Failure is logged, not propagated
 //!
@@ -41,28 +47,32 @@ use ironauth_store::message_hygiene::{dedup_key, normalize_recipient, window_ind
 use ironauth_store::message_rate::RateBudget;
 use ironauth_store::{Enqueued, MessageId, NewMessage, Store};
 
-use crate::verification::{NewDeviceNotice, VerificationSender};
+use ironauth_store::Scope;
 
-/// The message kind a new-device notice is recorded under.
-///
-/// The ledger groups and rate-limits by kind, and the dedup key is built from it, so two
-/// different notifications to one recipient never collapse onto each other.
-pub const NEW_DEVICE_KIND: &str = "new_device";
+use crate::verification::{VerificationPurpose, VerificationSender};
 
-/// How wide the collapse window is for a new-device notice, in seconds.
+// The message kind a notice is recorded under is the PURPOSE's own wire name, not a constant.
+// The ledger groups and rate-limits by kind and the dedup key is built from it, so an
+// account-linked alert and an account-unlinked alert to one recipient never collapse onto each
+// other -- which they would if every notice shared one kind.
+
+/// How wide the collapse window is for a notice, in seconds.
 ///
-/// Fifteen minutes. A second notice for the same recipient inside it is the same event seen
-/// twice -- a retried login, a second tab -- and mailing it twice is the failure this window
-/// exists to prevent. It is deliberately wider than an OTP window would be, because a notice
-/// has no code that expires.
-pub const NEW_DEVICE_WINDOW_SECS: u64 = 900;
+/// Fifteen minutes. A second notice of the SAME purpose to the same recipient inside it is the
+/// same event seen twice, and mailing it twice is the failure this window exists to prevent.
+/// Wider than an OTP window would be, because a notice has no code that expires.
+///
+/// The key is (purpose, recipient, window), so two DIFFERENT purposes never collapse onto each
+/// other. That matters: a collapse across purposes would suppress an alert about one event
+/// because an unrelated one had just fired.
+pub const NOTICE_WINDOW_SECS: u64 = 900;
 
 /// A compile-time floor on the window.
 ///
 /// A window of zero or a few seconds collapses nothing, which would silently turn a retried
 /// login into two mails. Asserted beside the constant rather than in a test, because a test
 /// comparing the value to itself is the shape that cannot fail.
-const _: () = assert!(NEW_DEVICE_WINDOW_SECS >= 60);
+const _: () = assert!(NOTICE_WINDOW_SECS >= 60);
 
 /// A `VerificationSender` that writes notices into the messaging ledger.
 pub struct MessagingVerificationSender {
@@ -93,67 +103,60 @@ impl MessagingVerificationSender {
 
 #[async_trait::async_trait]
 impl VerificationSender for MessagingVerificationSender {
-    fn send(
-        &self,
-        _scope: ironauth_store::Scope,
-        _purpose: crate::verification::VerificationPurpose,
-        _recipient: &str,
-    ) {
-        // The generic notification carries no body this ledger could deliver. It stays a no-op
-        // until a door that needs it exists, rather than enqueuing an empty message so this
-        // impl looks complete.
-    }
-
-    async fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
-        let Some(recipient) = normalize_recipient(message.recipient) else {
-            // Not a deliverable address. Recorded rather than swallowed: a notice that cannot be
-            // addressed is a real fact about this account, and it is not an error in the login.
-            tracing::warn!(
+    async fn send(&self, scope: Scope, purpose: VerificationPurpose, recipient: &str) {
+        let Some(recipient) = normalize_recipient(recipient) else {
+            // Not a deliverable address. This door fires for every VERIFIED channel, and a
+            // tenant whose identifier type is a username or a phone reaches here with something
+            // that is not an email. Recorded rather than swallowed, and not an error in the
+            // action that triggered it.
+            tracing::debug!(
                 target: "ironauth.messaging",
-                tenant = %message.scope.tenant(),
-                environment = %message.scope.environment(),
-                kind = NEW_DEVICE_KIND,
-                "new-device notice not queued: the recipient is not a deliverable address"
+                tenant = %scope.tenant(),
+                purpose = purpose.as_str(),
+                "notice not queued: the recipient is not a deliverable address"
             );
             return;
         };
 
+        let kind = purpose.as_str();
         let now = self.env.clock().now_utc();
         let epoch_seconds = now
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |delta| delta.as_secs());
         let Some(key) = dedup_key(
-            NEW_DEVICE_KIND,
+            kind,
             &recipient,
-            window_index(epoch_seconds, NEW_DEVICE_WINDOW_SECS),
+            window_index(epoch_seconds, NOTICE_WINDOW_SECS),
         ) else {
-            tracing::warn!(
-                target: "ironauth.messaging",
-                kind = NEW_DEVICE_KIND,
-                "new-device notice not queued: no dedup key"
-            );
+            tracing::warn!(target: "ironauth.messaging", kind, "notice not queued: no dedup key");
             return;
         };
 
-        // The payload the renderer reads. No token and no precise location: the disavowal link
-        // is single-use and IS the sensitive part, so it rides the sealed payload the ledger
-        // already encrypts rather than any log line.
+        let id = MessageId::generate(&self.env, &scope);
+        // The payload carries NO secret, and that is the whole reason this door may use this
+        // path. `message_composer` states the rule: a payload rides a durable queue every
+        // consumer worker reads, so "this path is for messages whose variables are safe to write
+        // down". A purpose and a message id are; a token is not, which is why the four
+        // token-carrying doors are excluded.
+        //
+        // `message_id` is REQUIRED: without it `DefaultComposer::compose` returns
+        // `Err("no_message_id")`, the consumer marks the job Failed, and every notice terminates
+        // without a provider ever being contacted. The body itself comes from the template, not
+        // from here.
         let payload = serde_json::json!({
-            "user_agent": message.user_agent,
-            "location_hint": message.location_hint,
-            "disavowal_link": message.disavowal_link,
+            "message_id": id.to_string(),
+            "purpose": kind,
         });
 
-        let id = MessageId::generate(&self.env, &message.scope);
         let outcome = self
             .store
-            .scoped(message.scope)
+            .scoped(scope)
             .messages()
             .enqueue(
                 &self.env,
                 NewMessage {
                     id: &id,
-                    kind: NEW_DEVICE_KIND,
+                    kind,
                     recipient: &recipient,
                     dedup_key: &key,
                 },
@@ -167,23 +170,22 @@ impl VerificationSender for MessagingVerificationSender {
             Ok(Enqueued::Accepted) => {}
             Ok(Enqueued::Collapsed) => tracing::debug!(
                 target: "ironauth.messaging",
-                kind = NEW_DEVICE_KIND,
-                "new-device notice collapsed onto one already in the window"
+                kind,
+                "notice collapsed onto one already in the window"
             ),
             Ok(other) => tracing::info!(
                 target: "ironauth.messaging",
-                kind = NEW_DEVICE_KIND,
+                kind,
                 outcome = ?other,
-                "new-device notice was not queued"
+                "notice was not queued"
             ),
-            // A login that already succeeded must not fail because a NOTICE could not be
-            // queued. Logged with the reason rather than dropped, so a ledger that is refusing
-            // writes is visible instead of silent.
+            // The action that triggered this has already succeeded, so it must not fail over a
+            // NOTICE. What it must not do is fail silently, so the reason is recorded.
             Err(error) => tracing::error!(
                 target: "ironauth.messaging",
-                kind = NEW_DEVICE_KIND,
+                kind,
                 ?error,
-                "new-device notice could not be queued"
+                "notice could not be queued"
             ),
         }
     }

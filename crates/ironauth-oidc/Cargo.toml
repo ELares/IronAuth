@@ -179,12 +179,14 @@ metrics-exporter-prometheus = { workspace = true }
 # ALONE in its binary by necessity, not by preference: it installs a global tracing
 # subscriber, and `tracing` caches callsite interest process-wide, so a sibling test
 # reaching sqlx's callsite first would silence the capture for the whole process.
-# The messaging ledger has a PRODUCER (issue #111): a new-device notice delivered through
-# the VerificationSender seam lands a row and its delivery job, collapses on a repeat inside the
-# window, and queues nothing for an unaddressable recipient.
+# The messaging ledger has a PRODUCER (issue #111): a coarse notice delivered through the
+# VerificationSender `send` seam lands a row and its delivery job, carries a payload with no
+# secret that still composes, keeps two purposes from collapsing onto each other, collapses a
+# repeat inside the window, queues nothing for an unaddressable recipient, and stores the
+# recipient blind-indexed.
 [[test]]
-name = "new_device_notice_enqueues"
-path = "tests/new_device_notice_enqueues.rs"
+name = "notice_enqueues"
+path = "tests/notice_enqueues.rs"
 required-features = ["testing"]
 
 [[test]]

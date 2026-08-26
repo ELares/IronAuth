@@ -45,10 +45,15 @@ struct NewDeviceRecord {
 
 #[async_trait::async_trait]
 impl VerificationSender for RecordingSender {
-    fn send(&self, _scope: ironauth_store::Scope, _purpose: VerificationPurpose, _recipient: &str) {
+    async fn send(
+        &self,
+        _scope: ironauth_store::Scope,
+        _purpose: VerificationPurpose,
+        _recipient: &str,
+    ) {
     }
 
-    async fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
+    fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
         self.notices.lock().expect("lock").push(NewDeviceRecord {
             recipient: message.recipient.to_owned(),
             user_agent: message.user_agent.to_owned(),

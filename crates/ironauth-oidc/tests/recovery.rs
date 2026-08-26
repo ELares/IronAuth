@@ -68,8 +68,14 @@ impl RecordingSender {
     }
 }
 
+#[async_trait::async_trait]
 impl VerificationSender for RecordingSender {
-    fn send(&self, _scope: ironauth_store::Scope, purpose: VerificationPurpose, recipient: &str) {
+    async fn send(
+        &self,
+        _scope: ironauth_store::Scope,
+        purpose: VerificationPurpose,
+        recipient: &str,
+    ) {
         if purpose == VerificationPurpose::Recovery {
             self.notified
                 .lock()

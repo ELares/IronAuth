@@ -1391,6 +1391,11 @@ async fn build_oidc_plane(
             // suppression check, the failover and both management endpoints were implemented,
             // tested, and fed by nothing.
             //
+            // It feeds the ONE door whose variables are safe to write down. A payload rides a
+            // durable queue every consumer worker reads, so a door carrying a token in its body
+            // -- an OTP code, a magic link, a disavowal link, a cancellation link -- cannot use
+            // this path at all until the ledger has a sealed-payload mode.
+            //
             // Gated on `messaging.delivery_enabled` alone, so a deployment that has not turned
             // messaging on keeps the logging transport and behaves exactly as before. Turning it
             // on is what makes a new-device notice a real queued message.

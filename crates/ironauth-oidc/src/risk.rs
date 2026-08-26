@@ -1155,15 +1155,13 @@ pub(crate) async fn after_successful_login(
             let link = disavowal_link(state, &token);
             let hint =
                 crate::account::coarse_location(ctx.ip).unwrap_or_else(|| "unknown".to_owned());
-            state
-                .deliver_new_device_notice(&crate::verification::NewDeviceNotice {
-                    scope,
-                    recipient,
-                    user_agent: ctx.user_agent,
-                    location_hint: &hint,
-                    disavowal_link: &link,
-                })
-                .await;
+            state.deliver_new_device_notice(&crate::verification::NewDeviceNotice {
+                scope,
+                recipient,
+                user_agent: ctx.user_agent,
+                location_hint: &hint,
+                disavowal_link: &link,
+            });
         }
     }
     record_login_geo(state, scope, subject, ctx).await;

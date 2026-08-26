@@ -213,7 +213,28 @@ impl SmsSender for LoggingSmsSender {
 pub trait VerificationSender: Send + Sync + std::fmt::Debug {
     /// Deliver a verification message of `purpose` to `recipient` in `scope`. Called ONLY
     /// for a recipient a send is permitted to (never a suppressed one).
-    fn send(&self, scope: Scope, purpose: VerificationPurpose, recipient: &str);
+    ///
+    /// # Why THIS method is async and its siblings are not
+    ///
+    /// A real transport writes to the `messages` ledger, and that write is an async
+    /// transactional one; a synchronous method cannot await it. That is the mechanical reason
+    /// the whole messaging island -- the ledger, the collapse, the rate limit, the suppression
+    /// check, the failover, both management endpoints -- exists, is tested, and had no producer
+    /// (issue #111).
+    ///
+    /// This is the ONLY door that may use that path, and the reason is not the seam, it is the
+    /// payload. `message_composer` states the rule: "A caller that puts a live secret in it has
+    /// put that secret on a durable queue every consumer worker reads... This path is for
+    /// messages whose variables are safe to write down." Four of the five delivery methods carry
+    /// a token in their body -- an OTP code, a magic link, a disavowal link, a cancellation link
+    /// -- and are excluded by that rule. This one carries NO body variables at all: a scope, a
+    /// purpose, and a recipient. The body comes from a template.
+    ///
+    /// So the others stay synchronous not because widening the seam is expensive, but because
+    /// there is nothing for them to widen it TOWARD: the ledger cannot carry what they deliver
+    /// until it has a sealed-payload mode, which migration 0154 says it "does not currently
+    /// offer".
+    async fn send(&self, scope: Scope, purpose: VerificationPurpose, recipient: &str);
 
     /// Deliver an email-OTP code (issue #68). Called ONLY for a recipient a send is
     /// permitted to (never a suppressed one). The default is a no-op, so a deployment
@@ -233,24 +254,7 @@ pub trait VerificationSender: Send + Sync + std::fmt::Debug {
     /// a deployment with no transport wired behaves as before; a real transport (M11)
     /// overrides it.
     ///
-    /// # Why this one is `async` and its siblings are not
-    ///
-    /// A real transport writes to the `messages` ledger, and that write is an async
-    /// transactional one. A synchronous method cannot await it, which is the mechanical reason
-    /// the whole messaging island -- the ledger, the collapse, the rate limit, the suppression
-    /// check, the failover, both management endpoints -- exists, is tested, and has no producer
-    /// (see issue #111).
-    ///
-    /// ONE method rather than all five, deliberately. Making the others async today would
-    /// change eleven implementations to buy nothing: their producers do not exist yet, and a
-    /// seam widened ahead of its callers is the same defect as a ledger with no writer. Each
-    /// follows when the door that feeds it does. This one moves now because it has a producer
-    /// in the same change.
-    ///
-    /// A new-device NOTICE is the right first door: it carries no secret that the same request
-    /// also returns, so it does not run into the reason email OTP and magic links are kept off
-    /// this path, and it is not the email-OTP wiring that was tried and withdrawn.
-    async fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
+    fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
         let _ = message;
     }
 
@@ -270,7 +274,7 @@ pub struct NullVerificationSender;
 
 #[async_trait::async_trait]
 impl VerificationSender for NullVerificationSender {
-    fn send(&self, _scope: Scope, _purpose: VerificationPurpose, _recipient: &str) {
+    async fn send(&self, _scope: Scope, _purpose: VerificationPurpose, _recipient: &str) {
         // No transport yet (issue #64). Intentionally does nothing.
     }
 }
@@ -287,7 +291,7 @@ pub struct LoggingVerificationSender;
 
 #[async_trait::async_trait]
 impl VerificationSender for LoggingVerificationSender {
-    fn send(&self, scope: Scope, purpose: VerificationPurpose, _recipient: &str) {
+    async fn send(&self, scope: Scope, purpose: VerificationPurpose, _recipient: &str) {
         tracing::info!(
             target: "ironauth.verification",
             purpose = purpose.as_str(),
@@ -331,7 +335,7 @@ impl VerificationSender for LoggingVerificationSender {
         );
     }
 
-    async fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
+    fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
         tracing::info!(
             target: "ironauth.verification",
             tenant = %message.scope.tenant(),

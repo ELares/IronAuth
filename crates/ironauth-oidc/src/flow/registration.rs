@@ -312,12 +312,14 @@ pub(super) async fn advance_registration(
                 .await,
             Ok(Some(_))
         );
-        state.dispatch_verification(
-            scope,
-            crate::verification::VerificationPurpose::Registration,
-            identifier,
-            recipient_known,
-        );
+        state
+            .dispatch_verification(
+                scope,
+                crate::verification::VerificationPurpose::Registration,
+                identifier,
+                recipient_known,
+            )
+            .await;
         return Ok(RegistrationStep::Ack {
             message_id: message::REGISTER_ACK,
         });

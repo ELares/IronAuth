@@ -170,12 +170,14 @@ pub async fn register_post(
                 .await,
             Ok(Some(_))
         );
-        state.dispatch_verification(
-            resume.scope,
-            crate::verification::VerificationPurpose::Registration,
-            identifier,
-            recipient_known,
-        );
+        state
+            .dispatch_verification(
+                resume.scope,
+                crate::verification::VerificationPurpose::Registration,
+                identifier,
+                recipient_known,
+            )
+            .await;
         return registration_ack_page(banner);
     }
 
