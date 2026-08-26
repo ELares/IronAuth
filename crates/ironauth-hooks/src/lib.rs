@@ -33,8 +33,8 @@
 //! blocks and neither one can see a hook that allocates.
 //!
 //! **What a hook is allowed to say** is NOT here. [`LoadedHook::customize`] returns the claims
-//! a hook asked for, unfiltered, and `ironauth_oidc::claims_mapping::filter_hook_claims` is
-//! what decides which of them may be minted. Keeping the transport and the fence apart means
+//! a hook asked for, unfiltered. `filter_hook_claims`, in `ironauth-oidc`'s claims-mapping
+//! module, is what decides which of them may be minted. Keeping the transport and the fence apart means
 //! the fence is a step visible in the caller rather than a thing this crate is trusted to have
 //! remembered.
 

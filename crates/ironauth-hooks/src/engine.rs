@@ -39,6 +39,13 @@ wasmtime::component::bindgen!({
     world: "token-customize-hook",
 });
 
+// Aliased so the generated path is written once. The generated namespace repeats the WIT
+// interface name, and `scripts/dormant-module-scan.sh` counts a bare `name::` anywhere in
+// `crates/` as a reference to a MODULE of that name -- so spelling the full path at each use
+// site made `ironauth-store`'s unrelated `token_customize` module look wired. One alias keeps
+// the collision to a single line that a reader can see for what it is.
+use exports::ironauth::hooks::token_customize as wit_hook;
+
 /// A compiled-code cache and the configuration every hook runs under.
 #[derive(Clone)]
 pub struct HookEngine {
@@ -62,7 +69,7 @@ impl HookEngine {
         config.consume_fuel(true);
         config.epoch_interruption(true);
         Ok(Self {
-            engine: Engine::new(&config).map_err(HookError::from_load)?,
+            engine: Engine::new(&config).map_err(HookError::from_engine)?,
         })
     }
 
@@ -166,8 +173,25 @@ pub struct Customization {
 impl LoadedHook {
     /// Run the hook's `customize` export under `limits`.
     ///
+    /// # This is SYNCHRONOUS and must not be called from an async runtime worker thread
+    ///
+    /// The sandbox links `wasmtime-wasi`'s SYNC bindings, and every one of them enters the
+    /// host through `in_tokio`, which PANICS when it is already on a tokio worker. IronAuth's
+    /// server is async, so calling this directly from a request handler panics the host process
+    /// the first time a guest polls or reads a stream: not an error, not a trap, a panic in the
+    /// middle of a login.
+    ///
+    /// Measured: the same hook that returns in 1.16 ms under `spawn_blocking` panics at
+    /// `wasmtime-wasi/src/runtime.rs` and exits 101 when invoked from a `#[tokio::main]`
+    /// multi-thread main. A `#[test]` fn has no ambient runtime, so the suite in this crate
+    /// cannot see it, which is exactly why it is written here.
+    ///
+    /// **Call this from `tokio::task::spawn_blocking`** (or any thread with no ambient
+    /// runtime). The dispatch that wires hooks into the token mint has to do that, and this is
+    /// the note it needs to have read.
+    ///
     /// The returned claims have NOT been fenced. Every name here came from guest code and is
-    /// a request, not a decision. `ironauth_oidc::claims_mapping::filter_hook_claims` is what
+    /// a request, not a decision. `filter_hook_claims`, in `ironauth-oidc`'s claims-mapping module, is what
     /// turns it into one, and it refuses a reserved name, an untrimmed one, an over-long one,
     /// and anything past its claim bound. Keeping the fence out of this crate is deliberate: it
     /// makes filtering a step visible in the caller rather than something this function is
@@ -195,7 +219,7 @@ impl LoadedHook {
 
         let hook = TokenCustomizeHook::instantiate(&mut store, &self.component, &linker)
             .map_err(HookError::from_instantiate)?;
-        let wit_request = exports::ironauth::hooks::token_customize::Request {
+        let wit_request = wit_hook::Request {
             payload_version: request.payload_version,
             grant_type: request.grant_type.clone(),
             client_id: request.client_id.clone(),

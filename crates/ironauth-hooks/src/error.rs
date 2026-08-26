@@ -39,6 +39,12 @@ pub enum AbortKind {
     /// a DEPLOYMENT error rather than a runtime one, and it is the same answer every time, so a
     /// failure policy that retries is retrying something that cannot change.
     Unlinkable,
+    /// The runtime itself could not be built.
+    ///
+    /// A deployment or platform fault, not a hook outcome: no hook was involved, and no
+    /// per-hook failure policy should fire on it. Distinct from [`Self::Invalid`], which is a
+    /// statement about uploaded bytes that do not exist at that point.
+    EngineUnavailable,
     /// The bytes are not a hook this deployment can run.
     ///
     /// A truncated upload, something that is not WebAssembly at all, or a precompiled artifact
@@ -102,6 +108,14 @@ impl HookError {
         }
     }
 
+    /// Classify a failure to build the runtime.
+    pub(crate) fn from_engine(error: wasmtime::Error) -> Self {
+        Self::Aborted {
+            kind: AbortKind::EngineUnavailable,
+            source: error,
+        }
+    }
+
     /// Classify a wasmtime error from compiling or loading bytes.
     ///
     /// Separate from [`Self::from_instantiate`] because nothing on this path is about
@@ -130,6 +144,7 @@ impl core::fmt::Display for HookError {
                 let what = match kind {
                     AbortKind::Unlinkable => "asked for a capability it was not granted",
                     AbortKind::Invalid => "could not be loaded",
+                    AbortKind::EngineUnavailable => "could not run: the runtime is unavailable",
                     AbortKind::OutOfFuel => "exhausted its fuel",
                     AbortKind::DeadlineExceeded => "passed its deadline",
                     AbortKind::Trapped => "trapped",

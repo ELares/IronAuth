@@ -22,6 +22,8 @@ const SLEEPER: &str = env!("IRONAUTH_GUEST_SLEEPER");
 const RANDOM_ESCAPE: &str = env!("IRONAUTH_GUEST_RANDOM_ESCAPE");
 const FS_ESCAPE: &str = env!("IRONAUTH_GUEST_FS_ESCAPE");
 const ECHO_REQUEST: &str = env!("IRONAUTH_GUEST_ECHO_REQUEST");
+const INSTANT_WAITER: &str = env!("IRONAUTH_GUEST_INSTANT_WAITER");
+const POLLABLE_LEAK: &str = env!("IRONAUTH_GUEST_POLLABLE_LEAK");
 
 fn request() -> Request {
     Request {
@@ -256,10 +258,29 @@ fn the_monotonic_clock_is_present_and_tells_a_hook_nothing() {
     );
     // Two claims returned, two claims asserted. A resolution of zero is a value a guest could
     // divide by, and the guest already reports it.
+    // The PROPERTY, not the constant. Comparing the reported value to the constant moves with
+    // it: setting FROZEN_RESOLUTION_NS to 0 satisfied that equality while every guest computing
+    // `elapsed / resolution` divided by zero and trapped on every invocation.
+    // The absolute reading, not only the delta: a clock stuck at ANY constant gives a zero
+    // delta, so this is what distinguishes frozen-at-zero from frozen-at-12.3-seconds.
     assert_eq!(
-        claim("resolution_ns"),
-        ironauth_hooks::FROZEN_RESOLUTION_NS.to_string(),
-        "the resolution must stay fine-grained rather than becoming another way to say zero"
+        claim("now_ns"),
+        "0",
+        "the clock must read zero, not merely fail to advance"
+    );
+    let resolution: u64 = claim("resolution_ns").parse().expect("a number");
+    assert!(
+        resolution > 0,
+        "a guest is free to divide by the resolution, so it must never be zero"
+    );
+    assert!(
+        resolution <= 1_000,
+        "the clock must stay fine-grained, not {resolution}ns"
+    );
+    assert_eq!(
+        resolution,
+        ironauth_hooks::FROZEN_RESOLUTION_NS,
+        "the reported resolution must be the one the sandbox documents"
     );
 }
 
@@ -280,12 +301,137 @@ fn a_hook_cannot_wait() {
     let engine = HookEngine::new().expect("engine");
     let hook = engine.load(&guest(SLEEPER)).expect("load");
     let started = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness: the assertion is that a 30-second sleep did NOT take 30 seconds, which is a claim about real elapsed time and cannot be made against a frozen seam
-    hook.customize(&engine, &Limits::claim_shaping(), &request())
+    let outcome = hook
+        .customize(&engine, &Limits::claim_shaping(), &request())
         .expect("the wait is answered immediately, so the hook completes");
+    let elapsed = started.elapsed();
+    // The bound is DERIVED from what the fixture asked for, not hard-coded. With a fixed five
+    // seconds, deleting the sleep from the guest leaves this test green -- and it then passes
+    // against a sandbox where waiting still works, which is the one thing it exists to catch.
+    let requested: u64 = outcome
+        .access_token_claims
+        .iter()
+        .find(|(name, _)| name == "requested_sleep_seconds")
+        .map(|(_, value)| value.parse().expect("a number"))
+        .expect("the fixture must report the wait it asked for");
+    assert!(
+        requested >= 10,
+        "the fixture must ask for a wait long enough to be unmistakable, not {requested}s"
+    );
+    assert!(
+        elapsed * 6 < std::time::Duration::from_secs(requested),
+        "a hook asked to wait {requested}s and the call took {elapsed:?}"
+    );
+}
+
+/// A hook cannot wait on an INSTANT either.
+///
+/// `subscribe-instant` is the clock's other waiting function, and it is a separate code path
+/// from `subscribe-duration`. Reintroducing a real timer on this one alone held the host thread
+/// for twenty seconds with every other test in this file green.
+#[test]
+fn a_hook_cannot_wait_on_an_instant() {
+    let engine = HookEngine::new().expect("engine");
+    let hook = engine.load(&guest(INSTANT_WAITER)).expect("load");
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness: the assertion is that a wait until the end of time returned promptly, which is a claim about real elapsed time
+    hook.customize(&engine, &Limits::claim_shaping(), &request())
+        .expect("a wait on an instant is answered immediately");
     let elapsed = started.elapsed();
     assert!(
         elapsed < std::time::Duration::from_secs(5),
-        "a hook asked to sleep for 30s held the thread for {elapsed:?}"
+        "a hook waiting until u64::MAX held the thread for {elapsed:?}"
+    );
+}
+
+/// A hook cannot exhaust the HOST's heap through the resource table.
+///
+/// The bound that matters here is not the memory cap. `StoreLimits` governs core-wasm memories,
+/// tables and instances; a pollable is none of those, so a guest that leaks them grows the
+/// HOST's component resource table instead. Measured before this was capped: 100 MiB of host
+/// heap under a 16 MiB guest ceiling, unchanged by every `StoreLimits` knob.
+#[test]
+fn a_hook_cannot_exhaust_the_host_resource_table() {
+    let engine = HookEngine::new().expect("engine");
+    let hook = engine.load(&guest(POLLABLE_LEAK)).expect("load");
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness: an unbounded table would make this run until the host is out of memory, so the bound is a real elapsed one
+    // The CAP is what decides, shown by moving only the cap. The guest asks for 3000
+    // pollables: under a cap of 512 it must be refused, under 8192 it must succeed. Asserting
+    // only that something stopped it would not distinguish the cap from fuel -- an unbounded
+    // leak is stopped by fuel too, which is why removing the cap entirely left the first
+    // version of this test green.
+    let error = hook
+        .customize(
+            &engine,
+            &Limits {
+                max_host_resources: 512,
+                ..Limits::claim_shaping()
+            },
+            &request(),
+        )
+        .expect_err("3000 pollables must not fit under a cap of 512");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the leak must be refused promptly, not after exhausting the host"
+    );
+    assert_ne!(
+        error.abort_kind(),
+        Some(AbortKind::Unlinkable),
+        "the guest must have RUN and been refused a resource: {error}"
+    );
+
+    let outcome = hook
+        .customize(
+            &engine,
+            &Limits {
+                max_host_resources: 8192,
+                ..Limits::claim_shaping()
+            },
+            &request(),
+        )
+        .expect("the same guest must complete when the cap allows it");
+    assert_eq!(
+        outcome
+            .access_token_claims
+            .iter()
+            .find(|(name, _)| name == "pollables_created")
+            .map(|(_, value)| value.as_str()),
+        Some("3000"),
+        "the completing run must be the same guest doing the same work"
+    );
+
+    // And the SHIPPED default must be a real bound, not an inherited million.
+    assert!(
+        Limits::claim_shaping().max_host_resources <= 8192,
+        "the default host-resource cap is too high to bound anything"
+    );
+}
+
+/// A deadline that expires during INSTANTIATION is not reported as a capability refusal.
+///
+/// `from_instantiate` is reached for both, and binning a trap by its call site would tell a
+/// failure policy that a hook asked for something it was not granted -- which is unfixable by
+/// the operator it is reported to, and wrong.
+#[test]
+fn a_deadline_that_expires_during_instantiation_is_not_a_capability_refusal() {
+    let engine = HookEngine::new().expect("engine");
+    let hook = engine.load(&guest(GOOD)).expect("load");
+    // A deadline of ZERO ticks is already reached the moment it is set, so the interrupt fires
+    // at the first epoch check, which happens while the component is being instantiated. That
+    // is deterministic, where racing a ticker against instantiation is not.
+    let error = hook
+        .customize(
+            &engine,
+            &Limits {
+                epoch_deadline: 0,
+                ..Limits::claim_shaping()
+            },
+            &request(),
+        )
+        .expect_err("a deadline of zero ticks must abort");
+    assert_eq!(
+        error.abort_kind(),
+        Some(AbortKind::DeadlineExceeded),
+        "a deadline that fired during instantiation must not read as Unlinkable: {error}"
     );
 }
 
@@ -408,12 +554,60 @@ fn the_default_limits_bound_a_runaway_hook() {
         "the default memory cap, not fuel, must be what stopped it: {error}"
     );
 
-    // The default deadline must be reachable. `u64::MAX` would make the epoch backstop
-    // unreachable for every deployment, and nothing else here would notice.
+    // The deadline is pinned BEHAVIOURALLY, by driving it. A range check (`<= 16`) passes for
+    // any value in the range, so raising the default from 1 to 16 -- a 16x weaker backstop --
+    // left it green. Ticking exactly `epoch_deadline` times must abort a spinner, whatever that
+    // number is, which is the property "the default is reachable" actually means.
+    // Exactly ONE tick, and the default must be reachable by it. Ticking
+    // `defaults.epoch_deadline` times instead would pass for any value, so raising the default
+    // from 1 to 16 -- a 16x weaker backstop -- left the first version of this green.
+    assert_eq!(
+        defaults.epoch_deadline, 1,
+        "the default deadline must be one tick, so a deployment's tick interval IS its timeout"
+    );
+    let ticker_engine = engine.clone();
+    let ticker = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ticker_engine.tick();
+    });
+    let error = spinner
+        .customize(
+            &engine,
+            &Limits {
+                // Enough that fuel cannot be what stops it within the tick window, but finite,
+                // so a broken deadline fails this test instead of hanging it.
+                fuel: 100_000_000_000,
+                ..defaults
+            },
+            &request(),
+        )
+        .expect_err("the DEFAULT deadline must stop a spinner once it is driven");
+    ticker.join().expect("ticker");
+    assert_eq!(
+        error.abort_kind(),
+        Some(AbortKind::DeadlineExceeded),
+        "one tick must reach the default deadline: {error}"
+    );
+}
+
+/// The default fuel is small enough to bite quickly, not merely finite.
+///
+/// A 1000x raise leaves every other test green while taking the default runaway abort from
+/// milliseconds to seconds, which on a login path is the difference between a bounded hook and
+/// a stalled one.
+#[test]
+fn the_default_fuel_stops_a_runaway_quickly() {
+    let engine = HookEngine::new().expect("engine");
+    let spinner = engine.load(&guest(FUEL_BOMB)).expect("load");
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness: the claim is that the DEFAULT budget aborts a runaway in a bounded wall-clock time, which is what makes it a usable default
+    let error = spinner
+        .customize(&engine, &Limits::claim_shaping(), &request())
+        .expect_err("the default fuel must stop an infinite loop");
+    let elapsed = started.elapsed();
+    assert_eq!(error.abort_kind(), Some(AbortKind::OutOfFuel));
     assert!(
-        defaults.epoch_deadline <= 16,
-        "a default deadline of {} ticks is not a backstop anybody reaches",
-        defaults.epoch_deadline
+        elapsed < std::time::Duration::from_millis(500),
+        "the default fuel took {elapsed:?} to stop a spinner, which is too long for a login path"
     );
 }
 

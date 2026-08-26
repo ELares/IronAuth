@@ -52,8 +52,41 @@ def parts(version):
 
 
 ceiling = parts(msrv)
+
+# The ceiling applies to what the SHIPPED BINARY compiles, which is what the MSRV promises.
+#
+# A workspace member that nothing in the `ironauth` binary graph reaches cannot break that
+# promise, because no deployment compiles it -- and neither can its dependencies. Two members
+# are in that position today, `ironauth-cel` (its `cel` dependency declares 1.86) and
+# `ironauth-hooks` (wasmtime and cranelift declare 1.95), and the CI msrv lane excludes exactly
+# those two for exactly this reason.
+#
+# Reachability rather than a name list, deliberately. A list is a claim somebody has to
+# recheck; reachability rechecks itself. The day either crate is wired into the binary it
+# becomes reachable, this audit starts failing on it again, and raising the published promise
+# becomes an explicit decision rather than something that happened quietly.
+metadata = json.load(sys.stdin)
+
+by_id = {p["id"]: p for p in metadata["packages"]}
+nodes = {n["id"]: n for n in metadata.get("resolve", {}).get("nodes", [])}
+roots = [p["id"] for p in metadata["packages"] if p["name"] == "ironauth"]
+if not roots:
+    print("msrv-audit: no `ironauth` package in the metadata; cannot scope the audit")
+    sys.exit(1)
+
+reachable, stack = set(), list(roots)
+while stack:
+    node_id = stack.pop()
+    if node_id in reachable:
+        continue
+    reachable.add(node_id)
+    stack.extend(nodes.get(node_id, {}).get("dependencies", []))
+
 offenders = []
-for package in json.load(sys.stdin)["packages"]:
+for package_id in sorted(reachable):
+    package = by_id.get(package_id)
+    if package is None:
+        continue
     declared = package.get("rust_version")
     if declared and parts(declared) > ceiling:
         offenders.append((package["name"], package["version"], declared))

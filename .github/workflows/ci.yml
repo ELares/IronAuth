@@ -506,6 +506,10 @@ jobs:
         with:
           command: check
           manifest-path: crates/ironauth-hooks/guests/Cargo.toml
+          # Its OWN policy file. The root one carries advisory ignores whose justifications
+          # name crates absent from this workspace, and inheriting them would extend an
+          # exception to a graph nobody reasoned about. See that file's header.
+          arguments: --config crates/ironauth-hooks/guests/deny.toml
 
   dev-boot-time:
     name: emulator boots, stays offline, and completes an OTP login

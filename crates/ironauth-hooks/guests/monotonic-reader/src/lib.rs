@@ -29,6 +29,13 @@ impl Guest for Hook {
                     name: "resolution_ns".to_string(),
                     value_json: resolution.to_string(),
                 },
+                // The RAW reading, not only the delta. A clock stuck at any CONSTANT gives a
+                // zero delta, so a `now()` returning 12.3 seconds every time satisfied the
+                // elapsed assertion while handing every hook a plausible-looking wall time.
+                Claim {
+                    name: "now_ns".to_string(),
+                    value_json: start.to_string(),
+                },
             ],
         })
     }

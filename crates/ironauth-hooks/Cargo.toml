@@ -23,8 +23,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# The WASM runtime (issue #114). Apache-2.0 WITH LLVM-exception, and its MSRV is 1.85,
-# which is this workspace's promise exactly.
+# The WASM runtime (issue #114). Apache-2.0 WITH LLVM-exception, which the licence policy
+# already allows. Its MSRV is 1.95, ABOVE the workspace promise of 1.85, which is why this
+# crate carries its own `rust-version` above and why the msrv lane scopes itself to what the
+# shipped binary reaches.
 #
 # `cranelift` is the compiling backend and is what makes AOT precompilation possible; the
 # runtime never compiles a hook on the request path, only deserializes what deployment

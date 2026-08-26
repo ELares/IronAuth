@@ -92,6 +92,14 @@ impl HasData for HasTable {
 /// to divide by a resolution.
 pub const FROZEN_RESOLUTION_NS: u64 = 1;
 
+/// A compile-time floor on the resolution.
+///
+/// Zero is the one value that is worse than a wrong one: the doc above says a guest is free to
+/// divide by the resolution, and a guest that does so against zero traps on every invocation.
+/// Asserted here rather than only in a test, because a test that compares the reported value to
+/// this constant moves with it.
+const _: () = assert!(FROZEN_RESOLUTION_NS > 0);
+
 /// A pollable that is ready the moment it is asked.
 ///
 /// This is what makes the frozen clock a real bound rather than a cosmetic one, and it closes
@@ -173,9 +181,23 @@ impl Sandbox {
         // Nothing is granted: no environment, no standard streams, no preopened directories,
         // no network. The clock is not configured here either, because the sandbox's clock is
         // not this context's clock: see `FrozenClockView`.
+        // The host resource table is capped, and this is the bound that actually holds.
+        //
+        // `StoreLimits` governs core-wasm memories, tables and instances. A POLLABLE is none of
+        // those: it lives in the component resource table, whose only ceiling is wasmtime's own
+        // default of a million entries. A hook looping on `subscribe_duration` and leaking the
+        // handles drove 100 MiB of HOST heap under a 16 MiB guest cap, and every StoreLimits
+        // knob was irrelevant to it -- deleting all four changed the number by a megabyte.
+        //
+        // 4096 is far more than a claim-shaping hook needs (the shipped fixtures use single
+        // digits) and small enough that exhausting it costs kilobytes. A guest that exceeds it
+        // gets an error from the host function, which surfaces as an ordinary trap.
+        let mut table = ResourceTable::new();
+        table.set_max_capacity(limits.max_host_resources);
+
         Self {
             ctx: WasiCtxBuilder::new().build(),
-            table: ResourceTable::new(),
+            table,
             // The memory cap alone bounds one linear memory, and a guest can multiply what it
             // costs the HOST without ever exceeding it: many memories, a growing table, or a
             // resource handle per host call. A measured example drove 137 MB of host heap under
@@ -227,7 +249,6 @@ impl Sandbox {
         sync::io::poll::add_to_linker::<Self, HasTable>(linker, |s: &mut Self| &mut s.table)?;
         sync::io::streams::add_to_linker::<Self, HasTable>(linker, |s: &mut Self| &mut s.table)?;
 
-        // The single clock, frozen. wall-clock is NOT added.
         // The single clock, frozen in all FOUR of its functions. wall-clock is NOT added.
         //
         // Implemented here rather than routed to `wasmtime_wasi`'s, because that one builds its

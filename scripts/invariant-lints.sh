@@ -91,7 +91,17 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 #     import so the sandbox can be shown refusing it.
 # None is host protocol logic reading a clock behind the ironauth-env seam, which is what this
 # rule protects.
-scan time-via-env 'SystemTime::now|Instant::now' 6
+# Raised again, 6 -> 9, for three more TIMING harnesses in the hooks sandbox, each of which
+# asserts a claim about real elapsed time that a frozen seam cannot make:
+#   - `a_hook_cannot_wait_on_an_instant`  (a wait until u64::MAX returned promptly)
+#   - `a_hook_cannot_exhaust_the_host_resource_table`  (the refusal was prompt, not after
+#     exhausting the host)
+#   - `the_default_fuel_stops_a_runaway_quickly`  (the DEFAULT budget aborts a spinner in
+#     bounded wall-clock time, which is what makes it usable as a default)
+# None is host protocol logic reading a clock behind the ironauth-env seam, which is what this
+# rule protects. Every one of the nine is a test or a wasm guest fixture; zero are on a request
+# path.
+scan time-via-env 'SystemTime::now|Instant::now' 9
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.

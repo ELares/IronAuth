@@ -69,23 +69,28 @@ allow() {
 # this scan asks "does anything in the tree name this module", not "is it on a request path",
 # and narrowing it to call sites would need a parser rather than a grep.
 #
-# Three kinds of match are excluded, each because it is not a reference to THIS module:
+# `|| true` wraps the WHOLE pipeline, not just the first grep: under `set -o pipefail` a
+# no-match grep exits 1 and kills the pipeline, which would make this script exit silently on
+# the FIRST module nobody references. That is the failure mode where a gate reports nothing and
+# looks like it passed.
 #
-#   - a line whose match sits in a `//` comment. A doc comment naming a module is prose, and
-#     counting it means documenting a dormant module is what makes it look wired.
-#   - anything under a `guests/` directory. Those are separate cargo workspaces of WASM guest
-#     fixtures, compiled for another target and linked into nothing here.
-#   - a path rooted at `exports::`, which is wit-bindgen's generated namespace. This scan
-#     matches on a NAME, so `exports::ironauth::hooks::token_customize::Request` reads as a
-#     reference to `ironauth-store/token_customize`; they are unrelated modules that happen to
-#     share a word. A name-keyed scan cannot tell them apart, so the generated namespace is
-#     excluded by hand.
+# A rustdoc link counts as a reference, and that is deliberate: this scan asks "does anything in
+# the tree NAME this module", not "is it on a request path", and narrowing it to call sites
+# would need a parser rather than a grep. The consequence is worth stating because it bit: a doc
+# comment written as `module::function` makes that module look wired. Write `module` alone, or
+# name the crate, rather than narrowing this filter to accommodate prose -- a detector loosened
+# to let one PR through stops holding for every module it checks.
 refs_for() {
+#
+# `guests/` is excluded, and this is a CONSISTENCY fix rather than a narrowing. The main loop
+# globs `crates/*/src/*.rs`, which never matches `crates/*/guests/*/src/lib.rs`, so a guest
+# fixture is not a module this scan can flag -- but the reference count was recursive over
+# `crates/`, so those same files counted as callers. One half of the scan could see them and the
+# other could not. They are a separate cargo workspace compiled to another target and they link
+# into nothing here.
   count="$( { grep -rn --include='*.rs' -e "${1}::" crates/ 2>/dev/null \
     | grep -v "/${1}\.rs:" \
-    | grep -v '/guests/' \
-    | grep -v 'exports::' \
-    | grep -vE '^[^:]*:[0-9]+:[[:space:]]*(//|/\*)' | wc -l; } || true )"
+    | grep -v '/guests/' | wc -l; } || true )"
   count="$(echo "$count" | tr -d ' ')"
   [ -n "$count" ] || count=0
   echo "$count"

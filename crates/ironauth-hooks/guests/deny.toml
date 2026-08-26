@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The WASM guest fixtures' supply-chain policy.
+#
+# Its OWN file rather than the root `deny.toml`, and the reason is the advisory ignores. The
+# root policy carries scoped exceptions whose written justifications name crates that do not
+# exist in this workspace (`cssparser`, `xxhash-rust`, the lz4_flex pin). Pointing the guest
+# lane at the root file would silently extend those ignores to a 57-crate tree they were never
+# reasoned about, and an advisory ignore that nobody wrote for this graph is an advisory nobody
+# is looking at.
+#
+# So: same licence policy, same bans, same sources -- and NO advisory ignores at all. If an
+# advisory lands here it fails, and somebody decides about it in this context.
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

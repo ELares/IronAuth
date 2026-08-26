@@ -31,6 +31,8 @@ const GUESTS: &[(&str, &str)] = &[
     ("wall_clock_escape", "IRONAUTH_GUEST_WALL_CLOCK_ESCAPE"),
     ("monotonic_reader", "IRONAUTH_GUEST_MONOTONIC_READER"),
     ("sleeper", "IRONAUTH_GUEST_SLEEPER"),
+    ("instant_waiter", "IRONAUTH_GUEST_INSTANT_WAITER"),
+    ("pollable_leak", "IRONAUTH_GUEST_POLLABLE_LEAK"),
     ("decliner", "IRONAUTH_GUEST_DECLINER"),
 ];
 

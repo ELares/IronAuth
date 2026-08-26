@@ -31,6 +31,14 @@ pub struct Limits {
     pub epoch_deadline: u64,
     /// The ceiling on linear memory, in bytes.
     pub memory_bytes: usize,
+    /// The most HOST resources one invocation may hold at once.
+    ///
+    /// A fourth bound, and it is not covered by the other three. `StoreLimits` governs
+    /// core-wasm memories, tables and instances; a pollable is none of those, so it lands in the
+    /// host's component resource table instead. A guest looping on `subscribe_duration` and
+    /// leaking the handles drove 100 MiB of HOST heap under a 16 MiB guest cap, with every
+    /// other bound irrelevant to it.
+    pub max_host_resources: usize,
 }
 
 impl Limits {
@@ -52,6 +60,10 @@ impl Limits {
             epoch_deadline: 1,
             // 16 MiB. A claim set that needs more than this is not a claim set.
             memory_bytes: 16 << 20,
+            // Far more than a claim-shaping hook needs (the shipped fixtures use single
+            // digits), and small enough that exhausting it costs kilobytes rather than
+            // gigabytes.
+            max_host_resources: 4096,
         }
     }
 }
