@@ -273,6 +273,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a per-environment, per-client declarative claim mapping. */
+        get: operations["getClaimsMapping"];
+        /** Set (create or overwrite) a per-environment, per-client declarative claim mapping. */
+        put: operations["setClaimsMapping"];
+        post?: never;
+        /** Delete a per-environment, per-client declarative claim mapping. */
+        delete: operations["deleteClaimsMapping"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form": {
         parameters: {
             query?: never;
@@ -3646,6 +3665,25 @@ export interface components {
             session_ids?: string[];
         };
         /**
+         * @description A per-environment, per-client declarative claim mapping, as returned by the management API
+         *     (issue #113).
+         *
+         *     No secret SLOT: a rule names claim names, a static value, and a token placement, and none of
+         *     those is a credential field or a user reference.
+         *
+         *     Not "no secret is possible", which an earlier version said. A `static` rule's value is
+         *     arbitrary operator-supplied JSON and this view returns it verbatim to any `management.read`
+         *     credential -- so an operator who puts a secret in one has put it somewhere a reader can see
+         *     it. What the type guarantees is that nothing here is a secret by DESIGN; what an operator
+         *     writes into a free-form value is theirs.
+         */
+        ClaimsMappingView: {
+            /** @description The authorize client id whose tokens these rules shape (the per-environment natural key). */
+            client_id: string;
+            /** @description The ordered rule list, as stored. */
+            rules: Record<string, never>;
+        };
+        /**
          * @description A per-environment, per-client admin consent pre-authorization, as returned by the management
          *     API (issue #88, PR 4).
          */
@@ -7012,6 +7050,22 @@ export interface components {
             tokens_dark?: Record<string, never>;
         };
         /**
+         * @description The body to set a per-environment, per-client declarative claim mapping (issue #113).
+         *
+         *     The `rules` document is the ordered rule list, exactly as `ironauth-oidc`'s
+         *     `claims_mapping::MappingRule` defines it: an array of objects tagged by `kind`.
+         *
+         *     Carried as a raw JSON value rather than a typed list, and that is deliberate rather than
+         *     laziness. `ironauth-admin` would otherwise need its own definition of a rule, which is a
+         *     SECOND definition of one wire format -- the drift criterion 5 exists to prevent. The handler
+         *     parses it against the one definition that governs it and refuses anything else with a loud
+         *     400 naming what it could not read.
+         */
+        SetClaimsMappingRequest: {
+            /** @description The ordered rule list. */
+            rules: Record<string, never>;
+        };
+        /**
          * @description The body to set (create or overwrite) a per-environment, per-client admin consent
          *     pre-authorization (issue #88, PR 4).
          *
@@ -9414,6 +9468,179 @@ export interface operations {
                 };
             };
             /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getClaimsMapping: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the rules shape */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The claim mapping */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClaimsMappingView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed client id, or no mapping installed */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setClaimsMapping: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the rules shape */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetClaimsMappingRequest"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClaimsMappingView"];
+                };
+            };
+            /** @description A rule that is unreadable or that writes a protected claim */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or malformed client id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteClaimsMapping: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the rules shape */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed client id, or no mapping installed */
             404: {
                 headers: {
                     [name: string]: unknown;
