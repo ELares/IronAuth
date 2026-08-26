@@ -51,10 +51,14 @@ class = "ubuntu-latest"
 # component at 86.9 ms and the job failed on a healthy system. A ceiling derived from the machine
 # that is not going to enforce it is not a ceiling.
 #
-# So: 86.9 ms observed on `ubuntu-latest`, and this is roughly 3x that. Wide enough that a slower
-# runner in the same class does not turn the gate into noise, tight enough that a change which
-# DOUBLES compile time is still caught. Cold is a cranelift compile and always will be
-# milliseconds; the relative baseline check below is what watches it move.
+# So: 86.9 ms observed on `ubuntu-latest`, and this is roughly 3x that -- wide enough that a
+# slower runner in the same class does not turn the gate into noise.
+#
+# It does NOT catch a doubling, and an earlier version of this sentence claimed it did. 86.9 x 2
+# is 174 ms, under this ceiling, so a change that doubled compile time would pass. What catches
+# that is the RELATIVE check below, against a committed baseline, with its own 100% tolerance --
+# this absolute number is the backstop for a collapse, not the regression detector. Saying
+# otherwise was arithmetic contradicted by the same sentence's own figure.
 cold_p95_micros = 250000
 # UNCHANGED at the criterion's own number, and now met with room rather than by luck.
 #

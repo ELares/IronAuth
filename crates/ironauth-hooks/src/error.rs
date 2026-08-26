@@ -137,6 +137,13 @@ impl HookError {
     ///
     /// NOT a way to invent an abort. The kind must be one this crate already returned for these
     /// bytes; a caller that guesses is asserting a classification it did not measure.
+    ///
+    /// WHAT IS LOST, stated because a recalled error is not the original: `wasmtime::Error`
+    /// carries a `Caused by:` chain and a downcastable source, and a caller that stored
+    /// `to_string()` has kept only the rendered text. The classification survives, which is
+    /// what a failure policy acts on, and the text survives, which is what an operator reads.
+    /// The chain does not. Pass the message you got from `Display`, not one you compose, or the
+    /// kind phrase ends up in the string twice.
     #[must_use]
     pub fn recalled(kind: AbortKind, reason: String) -> Self {
         Self::Aborted {

@@ -166,13 +166,22 @@ type HookCache = std::sync::Mutex<std::collections::HashMap<HookKey, Cached>>;
 enum Cached {
     /// Compiled and linked. The common case.
     Loaded(Arc<LoadedHook>),
-    /// Refused, and it will be refused identically next time.
+    /// Refused for a reason that cannot change: the component asks for a capability the host
+    /// does not offer.
     ///
-    /// Only for refusals that are a property of the ARTIFACT -- unlinkable imports, bytes that
-    /// are not a component. Those are the same answer for the same bytes on the same engine, so
-    /// caching them is caching a fact. A transient failure is NOT cached: retrying that is
-    /// retrying something that can change, and a poisoned entry would refuse a client's hook
-    /// forever over one bad minute.
+    /// ONLY [`AbortKind::Unlinkable`], and the narrowness is the point. That kind comes from
+    /// import resolution, which is a pure function of what the component imports and what
+    /// `Sandbox::link` registered -- same bytes, same engine, same answer, forever. Caching it
+    /// is caching a fact.
+    ///
+    /// NOT `Invalid`, which was the first version of this and was wrong. `HookError::from_load`
+    /// bins EVERY `Component::new` failure as `Invalid` whatever its cause, so a host that
+    /// momentarily cannot allocate an executable mapping produces one -- and caching it would
+    /// refuse that client's hook for the life of the process over one bad second, with the host
+    /// healthy again immediately after. Review measured exactly that: a one-shot transient
+    /// injected into `load` left attempts two and three failing against a healthy host and the
+    /// shipped GOOD fixture. The predicate `abort_kind().is_some()` could not express the
+    /// distinction it claimed to; naming the one kind does.
     Refused {
         /// Preserved so the dispatch still classifies the fault as it did.
         kind: ironauth_hooks::AbortKind,
@@ -235,6 +244,19 @@ type HookKey = (String, String, String, [u8; 32]);
 /// because the cost of being too small is recompiling 33 ms on a login and the cost of being too
 /// large is memory a deployment can measure.
 const MAX_CACHED_HOOKS: usize = 256;
+
+/// How many REFUSALS the cache remembers, counted separately from compiled components.
+///
+/// Separate because the two cost nothing alike. A cached component is machine code, tens of
+/// megabytes for a large one, which is what sizes `MAX_CACHED_HOOKS`. A cached refusal is a
+/// `Copy` enum and a short message.
+///
+/// Bounded anyway, and lower, because the thing being remembered is a MISTAKE: a deployment
+/// with more than this many distinct unlinkable components does not need a bigger map, it needs
+/// to hear that its hooks do not link. Counting refusals against the component budget was the
+/// first version and it let a client that redeploys broken bytes evict the cache out from under
+/// every working hook in the process, which review measured at a lowered bound.
+const MAX_CACHED_REFUSALS: usize = 32;
 
 /// What a hook contributed, after the fence.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -427,17 +449,26 @@ async fn loaded_hook(
     let loaded = match outcome {
         Ok(hook) => Arc::new(hook),
         Err(error) => {
-            // Remember a refusal the ARTIFACT earns, so the next request is a map lookup rather
-            // than another 33 ms compile of something that cannot run. `abort_kind` is `Some`
-            // exactly for the deterministic refusals; a `Declined` (including the join failure
-            // above) is not cached, because it can change.
-            if let Some(kind) = error.abort_kind() {
+            // Remember ONLY an unlinkable component, so the next request is a map lookup
+            // rather than another 33 ms compile of something that cannot run. Every other
+            // failure -- a compile that ran out of memory, a declined join -- can succeed on
+            // the next attempt, and a cached one would refuse a healthy hook forever.
+            if error.abort_kind() == Some(ironauth_hooks::AbortKind::Unlinkable) {
                 if let Ok(mut map) = cache.lock() {
-                    if map.len() < MAX_CACHED_HOOKS {
+                    // A SEPARATE budget from the compiled components. A refusal is a `Copy`
+                    // enum and a short string, not the tens of megabytes `MAX_CACHED_HOOKS` was
+                    // sized for, and counting them together lets a client that redeploys broken
+                    // bytes 256 times deny the cache to every WORKING hook in the process --
+                    // measured, at a lowered bound, as a working hook never being admitted.
+                    let refusals = map
+                        .values()
+                        .filter(|entry| matches!(entry, Cached::Refused { .. }))
+                        .count();
+                    if refusals < MAX_CACHED_REFUSALS {
                         map.insert(
                             key,
                             Cached::Refused {
-                                kind,
+                                kind: ironauth_hooks::AbortKind::Unlinkable,
                                 reason: error.to_string(),
                             },
                         );
@@ -884,6 +915,125 @@ mod tests {
                 "the reactor drove another task while the hook compiled; zero means the compile \
                  ran inline on the only thread this runtime has, which is a stall every other \
                  request on that worker pays"
+            );
+        });
+    }
+
+    /// A REMEMBERED REFUSAL IS READ, not merely written.
+    ///
+    /// The integration test beside this one asserts a cache ENTRY exists after three refused
+    /// issuances. Review showed that is not the property: delete the recall arm's early return
+    /// so it falls through and recompiles, and the entry is still written on every miss, so the
+    /// count assertion passes while every request pays the full cranelift compile the cache
+    /// exists to avoid. Entry count cannot see the read.
+    ///
+    /// ELAPSED TIME CAN, here, because there is no login around it. A compile of the escape
+    /// guest is tens of milliseconds; a map lookup is microseconds. The second call is asserted
+    /// at under a millisecond, which is two orders of magnitude below a compile and two above a
+    /// lookup -- a margin no scheduler noise closes, unlike the fuel test that tried to time a
+    /// whole Argon2id-bearing exchange and was measuring a password hash.
+    #[test]
+    fn a_remembered_refusal_is_recalled_rather_than_recompiled() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            let engine =
+                std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine"));
+            let cache: std::sync::Arc<super::HookCache> =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let scope = ironauth_store::Scope::new(
+                ironauth_store::TenantId::from_seed_bytes([3_u8; 16]),
+                ironauth_store::EnvironmentId::from_seed_bytes([4_u8; 16]),
+            );
+
+            // NET_ESCAPE imports `wasi:sockets`, which the sandbox does not link.
+            let first = loaded_hook(
+                &engine,
+                &cache,
+                scope,
+                "a-client",
+                ironauth_hooks::fixtures::NET_ESCAPE,
+            )
+            .await
+            .expect_err("an unlinkable component cannot load");
+            assert_eq!(
+                first.abort_kind(),
+                Some(ironauth_hooks::AbortKind::Unlinkable),
+                "refused for the capability, not for anything else: {first}"
+            );
+
+            let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement: whether the second call RECOMPILED or recalled is a claim about elapsed time and nothing else, and a frozen Clock seam would report zero for both
+            let second = loaded_hook(
+                &engine,
+                &cache,
+                scope,
+                "a-client",
+                ironauth_hooks::fixtures::NET_ESCAPE,
+            )
+            .await
+            .expect_err("still refused");
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                second.abort_kind(),
+                Some(ironauth_hooks::AbortKind::Unlinkable),
+                "and the recalled refusal classifies identically: {second}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(1),
+                "the second refusal took {elapsed:?}, which is a COMPILE, not a recall. The \
+                 entry being present is not the property; reading it is."
+            );
+        });
+    }
+
+    /// A failure that is NOT a capability refusal is not remembered.
+    ///
+    /// This is the guard on the predicate, and the predicate is the whole safety of the
+    /// refusal cache. `HookError::from_load` bins EVERY `Component::new` failure as
+    /// [`AbortKind::Invalid`](ironauth_hooks::AbortKind::Invalid) whatever its cause, so a host
+    /// that momentarily cannot allocate an executable mapping produces the same kind as bytes
+    /// that are not a component at all. Caching that class would refuse a healthy client's hook
+    /// for the life of the process over one bad second -- review measured exactly that against
+    /// the first version, which tested `abort_kind().is_some()`.
+    ///
+    /// Garbage bytes stand in for the transient deliberately: the point is not that garbage is
+    /// retryable, it is that `Invalid` CANNOT BE TOLD APART from a transient, so nothing in
+    /// that class may be remembered. A cache entry here would mean the predicate had widened.
+    #[test]
+    fn a_failure_that_is_not_a_capability_refusal_is_not_remembered() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            let engine =
+                std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine"));
+            let cache: std::sync::Arc<super::HookCache> =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let scope = ironauth_store::Scope::new(
+                ironauth_store::TenantId::from_seed_bytes([5_u8; 16]),
+                ironauth_store::EnvironmentId::from_seed_bytes([6_u8; 16]),
+            );
+
+            let error = loaded_hook(&engine, &cache, scope, "a-client", b"not a component")
+                .await
+                .expect_err("garbage is not a component");
+            assert_eq!(
+                error.abort_kind(),
+                Some(ironauth_hooks::AbortKind::Invalid),
+                "the same kind a transient host failure produces: {error}"
+            );
+            assert_eq!(
+                cache.lock().expect("cache").len(),
+                0,
+                "an `Invalid` must NOT be remembered: it is indistinguishable from a host that \
+                 could not allocate for a second, and remembering that refuses a healthy hook \
+                 until the process restarts"
             );
         });
     }
