@@ -1316,7 +1316,15 @@ fn mint_at_jwt(
         build_access_token_claims(request, iat, exp, &jti_text, &audience, permission)
     };
 
-    let header = protected_header(signer, &options).map_err(|_| ())?;
+    // The header is built ONLY when there is a permission set to weigh. Hoisting it out of the
+    // branch made every no-permission mint -- which the comment above calls the overwhelmingly
+    // common path -- allocate and serialize a header that `at_jwt_payload` then returns without
+    // reading. An empty slice is the honest stand-in on the path that never measures anything.
+    let header = if request.permissions.is_some() {
+        protected_header(signer, &options).map_err(|_| ())?
+    } else {
+        Vec::new()
+    };
     let (payload, outcome) = at_jwt_payload(
         &PermissionBudget::from_config(state.token_claims()),
         request,
@@ -1544,10 +1552,11 @@ mod access_extra_claims_tests {
 
     /// A claim in the access bag reaches the ACCESS token, and so does the next one.
     ///
-    /// TWO admissible claims, and a protected one that sorts before both. With a single-entry
-    /// bag, folding only the first entry (`.iter().take(1)`) passes: a hook returning two
-    /// claims would have the alphabetically later one silently dropped while reporting both as
-    /// accepted.
+    /// TWO admissible claims with a protected one BETWEEN them in sort order (`account_tier`,
+    /// `aud`, `region`). With a single-entry bag, folding only the first entry
+    /// (`.iter().take(1)`) passes: a hook returning two claims would have the alphabetically
+    /// later one silently dropped while reporting both as accepted. The protected name sitting
+    /// between them also means a fold that stopped AT the fence would drop `region`.
     #[test]
     fn an_access_extra_claim_lands_in_the_access_token() {
         let extra = bag(&[
@@ -1572,7 +1581,7 @@ mod access_extra_claims_tests {
         );
         assert_ne!(
             claims["aud"], "forged",
-            "the protected claim sorts first and must still be refused"
+            "the protected claim sits between the two admissible ones and must still be refused"
         );
     }
 
@@ -1659,9 +1668,10 @@ mod access_extra_claims_tests {
     /// EVERY BRANCH. The first version of this test populated `org_id` and one permission
     /// variant and took 10 of the builder's 16 emission sites; an unprotected claim added
     /// beside `cnf`, `act`, `roles` or `permissions_status` went unchecked, and four mutants
-    /// proved it. The fixture below sets every optional field, and the assertion is over the
-    /// UNION of both permission variants, because they are mutually exclusive by construction
-    /// and neither call alone can see the other's claim.
+    /// proved it. The fixture below sets every optional field on `MintRequest`, including the
+    /// four this builder ignores today, and the assertion is over the UNION of all THREE
+    /// permission variants -- the two that emit a claim are mutually exclusive by construction,
+    /// so no single call can see the other's.
     #[test]
     fn every_claim_the_access_builder_sets_is_protected() {
         let roles = super::tests::role_set(&["admin", "billing"]);
@@ -1672,6 +1682,13 @@ mod access_extra_claims_tests {
         req.org_id = Some("org_real");
         req.oauth_scope = Some("openid profile");
         req.auth_time_unix_micros = Some(1_700_000_000_000_000);
+        // The four the builder ignores TODAY. Setting them costs nothing and fires the moment
+        // one of them starts being emitted: adding `claims["session_id"] = json!(sid)` was a
+        // real mutant that survived, because a field the fixture leaves None cannot be checked.
+        req.nonce = Some("n-once");
+        req.sid = Some("sess_1");
+        req.at_hash = Some("athash");
+        req.c_hash = Some("chash");
         req.actor = Some(TokenActor {
             subject: "usr_admin",
             reason_code: "support",
@@ -1693,10 +1710,13 @@ mod access_extra_claims_tests {
         }
 
         // The loop covering nothing, or covering one branch, would satisfy the assertion below.
-        assert!(
-            emitted.len() >= 15,
-            "the fixture must take every branch; only {} claims emitted: {emitted:?}",
-            emitted.len()
+        // The EXACT count, not a floor. At `>= 15` an unconditional claim could be deleted and
+        // the assertion would still hold; an exact count also forces anyone ADDING one to look
+        // at this test rather than sail past a threshold.
+        assert_eq!(
+            emitted.len(),
+            16,
+            "the fixture must take every branch and emit exactly the known set: {emitted:?}"
         );
         for name in &emitted {
             assert!(
@@ -1874,6 +1894,106 @@ mod access_extra_claims_tests {
         assert!(
             !text.contains("\"permissions\":"),
             "a withheld token must not carry the permission claim"
+        );
+        assert!(
+            text.contains("permissions_status"),
+            "a withheld token must carry the status marker that tells a resource server WHY, \
+             or dropping the marker entirely turns nothing red"
+        );
+    }
+
+    /// A BYTE-bound withholding also ships the payload it measured.
+    ///
+    /// The count-bound test cannot see this. `decide` returns `CountExceeded` before it ever
+    /// calls the thunk, so the `full` bytes are never produced and the branch that CHOOSES
+    /// between `full` and `withheld` is never exercised. Under a byte bound the thunk DOES run,
+    /// `full` is `Some`, and returning it on a withholding -- `full.unwrap_or(withheld)` --
+    /// ships the oversized token the budget just refused, with every other test green.
+    #[test]
+    fn a_byte_bound_withholding_ships_the_roles_only_token() {
+        use crate::permission_budget::{PermissionBudgetOutcome, PermissionWithheldReason};
+
+        let permissions: std::collections::BTreeSet<String> =
+            ["billing.read".to_owned(), "billing.write".to_owned()]
+                .into_iter()
+                .collect();
+        let mut req = super::tests::request("usr_abc", "pwd");
+        req.permissions = Some(&permissions);
+
+        let header = b"header";
+        let signature_len = 64;
+        let audience = json!("cli_example");
+        let build = |permission: PermissionClaim<'_>| {
+            build_access_token_claims(&req, 1, 2, "tok", &audience, permission)
+        };
+
+        // Measure the roles-only form, then set the bound to exactly it: the full form is
+        // strictly larger, so the count passes and the BYTES are what withhold.
+        let withheld_only = serde_json::to_vec(&build(PermissionClaim::Withheld(
+            crate::permission_budget::PermissionStatus::from(generous_budget().overflow),
+        )))
+        .expect("serialize");
+        let bound = super::compact_len(header, &withheld_only, signature_len);
+
+        let mut budget = generous_budget();
+        budget.max_token_bytes = bound;
+        budget.warn_token_bytes = bound;
+
+        let (payload, outcome) =
+            at_jwt_payload(&budget, &req, header, signature_len, &build).expect("mints");
+        let PermissionBudgetOutcome::Withheld {
+            reason,
+            roles_only_token_bytes,
+            ..
+        } = outcome
+        else {
+            panic!("the full form must not fit under its own roles-only size: {outcome:?}");
+        };
+        assert!(
+            matches!(reason, PermissionWithheldReason::ByteExceeded { .. }),
+            "this test exists to reach the BYTE branch, not the count one: {reason:?}"
+        );
+        assert_eq!(
+            roles_only_token_bytes,
+            super::compact_len(header, &payload, signature_len),
+            "the reported size must be the size of the payload that ships"
+        );
+        let text = String::from_utf8(payload).expect("utf-8");
+        assert!(
+            !text.contains("\"permissions\":"),
+            "the SHIPPED payload must be the roles-only one, not the oversized form the budget \
+             just refused"
+        );
+        assert!(text.contains("permissions_status"));
+    }
+
+    /// A mint with no permission set reports `NotApplicable` and stamps no marker.
+    ///
+    /// The extracted function's third branch. Without this, replacing its `PermissionClaim::
+    /// Absent` with a withholding stamps `permissions_status` on every token for a subject with
+    /// no organization context -- telling every resource server a set was withheld when none
+    /// existed -- and nothing turns red.
+    #[test]
+    fn a_mint_with_no_permission_set_is_not_applicable_and_marks_nothing() {
+        use crate::permission_budget::PermissionBudgetOutcome;
+
+        let req = super::tests::request("usr_abc", "pwd");
+        assert!(req.permissions.is_none(), "the fixture must have no set");
+        let audience = json!("cli_example");
+        let build = |permission: PermissionClaim<'_>| {
+            build_access_token_claims(&req, 1, 2, "tok", &audience, permission)
+        };
+        let (payload, outcome) =
+            at_jwt_payload(&generous_budget(), &req, b"header", 64, &build).expect("mints");
+        assert!(
+            matches!(outcome, PermissionBudgetOutcome::NotApplicable),
+            "no set in play is NotApplicable: {outcome:?}"
+        );
+        let text = String::from_utf8(payload).expect("utf-8");
+        assert!(!text.contains("\"permissions\":"));
+        assert!(
+            !text.contains("permissions_status"),
+            "a token for a subject with no org context must not claim a set was withheld"
         );
     }
 
