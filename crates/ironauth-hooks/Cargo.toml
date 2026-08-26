@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-hooks"
+version = "0.1.0"
+description = "In-process WASM component hooks for IronAuth: a deny-by-default capability sandbox with fuel, deadline, and memory bounds"
+edition.workspace = true
+# NOT the workspace MSRV, and this is the one place in the tree that departs from it.
+#
+# wasmtime 48 and cranelift both declare rust-version = "1.95.0". The workspace promises 1.85
+# (docs/COMPATIBILITY.md, and the CI msrv lane checks it), so this crate cannot honour that
+# promise and there is no version of the runtime that would let it: the MSRV is a property of
+# the dependency, not of how it is used.
+#
+# Recorded here rather than raised workspace-wide because the two have very different
+# consequences. Nothing depends on this crate yet, so the SHIPPED binary's MSRV is still 1.85
+# and the published promise is intact. The day the hook dispatch wires this into `ironauth`,
+# the product MSRV becomes 1.95 and that is an owner decision about a published compatibility
+# promise, not a side effect of a dependency bump. The msrv CI lane excludes this crate for
+# exactly as long as that is true.
+rust-version = "1.95"
+
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The WASM runtime (issue #114). Apache-2.0 WITH LLVM-exception, which the licence policy
+# already allows. Its MSRV is 1.95, ABOVE the workspace promise of 1.85, which is why this
+# crate carries its own `rust-version` above and why the msrv lane scopes itself to what the
+# shipped binary reaches.
+#
+# `cranelift` is the compiling backend and is what makes AOT precompilation possible; the
+# runtime never compiles a hook on the request path, only deserializes what deployment
+# already compiled. See `engine.rs` for why that distinction is a security boundary and
+# not just a latency one.
+wasmtime = { version = "48", default-features = false, features = [
+    "component-model",
+    "cranelift",
+    "runtime",
+    "std",
+] }
+# The WASI host implementations. Only fourteen of its interfaces are ever added to a
+# linker; see `sandbox.rs` for the list and for what is deliberately left out. The count is
+# documentation; what actually pins the sandbox are the escape fixtures in guests/, one per
+# absent capability family, each asserted to fail at instantiation.
+wasmtime-wasi = "48"
+wasmtime-wasi-io = "48"
+
+[dev-dependencies]
+# For ONE test: that calling `customize` from a tokio worker thread panics. That is a real
+# constraint on the dispatch and the doc comment used to say a `#[test]` fn could not observe
+# it, which was wrong -- a test can build its own runtime. An executable warning outlives a
+# written one: if someone swaps the sandbox to wasmtime-wasi's async bindings, this goes red and
+# the doc comment gets corrected with it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

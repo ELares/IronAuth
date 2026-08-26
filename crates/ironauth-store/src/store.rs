@@ -195,7 +195,7 @@ impl Store {
     /// The management resend is the one operation whose decision is control-plane and whose
     /// write is data-plane, and `idempotency_keys` is a control-plane table the app role holds
     /// no grant on -- so the two genuinely cannot share a transaction. A resend that tried died
-    /// on `permission denied for table idempotency_keys`, which is how this was found.
+    /// on `permission denied for table idempotency_keys`, which is how this was found. query-audit-allow: prose quoting a Postgres error message, not a query
     ///
     /// SEPARATE, therefore, and the reason that is safe rather than a compromise: what stops a
     /// retried resend mailing twice is not this row, it is the compare-and-swap. A resend moves

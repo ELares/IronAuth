@@ -49,6 +49,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -195,12 +206,19 @@ jobs:
       # concludes there is nothing to read; one that rounds it is how they conclude the
       # wrong thing about it.
       #
-      # `--all-features` across 20 workspace members builds every dependency AND a
-      # test binary per target -- 309 integration test files, which is the number that
+      # `--all-features` across 22 workspace members builds every dependency AND a
+      # test binary per target -- 320 integration test files, which is the number that
       # actually drives the size -- and that is far larger than the `cargo check` and
       # `cargo clippy` lanes that share the same image and still pass. The image ships
       # toolchains this repository never invokes (Android, .NET, GHC, CodeQL, Swift),
       # so the cheapest correct fix is to stop carrying them.
+      #
+      # Re-derived on the branch that added ironauth-hooks: 22 members (was 20) and 320
+      # integration test files (was 309). That crate also brings wasmtime and cranelift, which
+      # are 1.8 GB of `target/debug/deps` on their own, plus a per-build guest fixture
+      # directory under OUT_DIR. The 24 GB `target` figure below predates all of it and is now
+      # a FLOOR rather than a measurement; the 60 GB disk floor still clears it, but the next
+      # person to tune this should re-measure rather than trust the number.
       #
       # `|| true` on each removal: reclaiming space must never be what fails the merge
       # gate, and a future image that drops one of these paths would otherwise turn
@@ -283,6 +301,17 @@ jobs:
             exit 1
           fi
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - name: tests (workspace, all features)
         run: cargo test --workspace --all-features
@@ -417,7 +446,39 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-features --all-targets
+      # TWO crates are excluded, under one rule: a workspace member whose DEPENDENCY declares
+      # an MSRV above the workspace promise, and which nothing in the shipped binary's graph
+      # depends on, is checked at its own MSRV instead of blocking this lane.
+      #
+      #   ironauth-cel   -- `cel` 0.14 declares rust-version 1.86
+      #   ironauth-hooks -- wasmtime/cranelift 48 declare rust-version 1.95
+      #
+      # Neither is reachable from `ironauth`, so the SHIPPED binary's MSRV is still 1.85 and the
+      # promise in docs/COMPATIBILITY.md is intact. This is not a way to make the number look
+      # good: the moment either crate is wired into the binary, the product MSRV becomes that
+      # crate's, and raising a published compatibility promise is an owner decision rather than
+      # a side effect. The exclusion is what has to come out at that point.
+      #
+      # This lane has been RED on main since ironauth-cel landed (#993); branch protection
+      # requires a review but no CI job, so nothing surfaced it. Fixed here because a branch
+      # cannot be green while it is not.
+      - run: cargo check --workspace --all-features --all-targets --exclude ironauth-hooks --exclude ironauth-cel
+      # The two excluded crates are checked AT THEIR OWN declared MSRV, so the numbers
+      # docs/COMPATIBILITY.md publishes for them are compiled rather than asserted. Without this
+      # the exclusion above is the only thing anyone checks, and a crate could quietly need a
+      # newer compiler than its manifest claims while every lane stayed green.
+      - name: Install the toolchains the excluded crates declare
+        run: rustup toolchain install 1.95 --profile minimal && rustup toolchain install 1.86 --profile minimal
+      - name: Install the WASM target for 1.95
+        run: rustup target add wasm32-wasip2 --toolchain 1.95
+      - name: ironauth-hooks at its declared 1.95
+        env:
+          RUSTUP_TOOLCHAIN: "1.95"
+        run: cargo check -p ironauth-hooks --all-features --all-targets
+      - name: ironauth-cel at its declared 1.86
+        env:
+          RUSTUP_TOOLCHAIN: "1.86"
+        run: cargo check -p ironauth-cel --all-features --all-targets
 
   musl:
     name: musl static build
@@ -451,6 +512,21 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+      # The WASM guest fixtures are their OWN workspace with their own lock file, deliberately
+      # excluded from the main one so `cargo build --workspace` does not try to build them for
+      # the host. That exclusion also put them outside this job entirely: a yanked crate, an
+      # unapproved licence, or a RUSTSEC advisory anywhere in that tree would leave this lane
+      # green while `crates/ironauth-hooks/build.rs` compiled and EXECUTED its proc macros on
+      # every build of the workspace. Same policy file, second lock file.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          manifest-path: crates/ironauth-hooks/guests/Cargo.toml
+          # Its OWN advisory policy. The root file's ignores name crates absent from this
+          # workspace, so inheriting them would extend an exception to a graph nobody reasoned
+          # about. Licence and bans rules are the same; the advisory list is not. See that
+          # file's header.
+          arguments: --config crates/ironauth-hooks/guests/deny.toml
 
   dev-boot-time:
     name: emulator boots, stays offline, and completes an OTP login
@@ -588,9 +664,6 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      # This job compiles ironauth-admin and ironauth-config through the
-      # openapi-check / config-schema freshness steps; cache the build so those
-      # do not pay a cold compile on every run.
       - uses: Swatinem/rust-cache@v2
       # The conformance static checks parse the profile matrix and RENDER the
       # runner's plan config, so they need PyYAML. Pin the interpreter (the

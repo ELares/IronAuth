@@ -52,8 +52,61 @@ def parts(version):
 
 
 ceiling = parts(msrv)
+
+# The ceiling applies to what the SHIPPED BINARY compiles, which is what the MSRV promises.
+#
+# A workspace member that nothing in the `ironauth` binary graph reaches cannot break that
+# promise, because no deployment compiles it -- and neither can its dependencies. Two members
+# are in that position today, `ironauth-cel` (its `cel` dependency declares 1.86) and
+# `ironauth-hooks` (wasmtime and cranelift declare 1.95), and the CI msrv lane excludes exactly
+# those two for exactly this reason.
+#
+# Reachability rather than a name list, deliberately. A list is a claim somebody has to
+# recheck; reachability rechecks itself. The day either crate is wired into the binary it
+# becomes reachable, this audit starts failing on it again, and raising the published promise
+# becomes an explicit decision rather than something that happened quietly.
+metadata = json.load(sys.stdin)
+
+by_id = {p["id"]: p for p in metadata["packages"]}
+resolve = metadata.get("resolve") or {}
+nodes = {n["id"]: n for n in resolve.get("nodes") or []}
+
+# A degenerate document must FAIL, not read as clean. `cargo metadata --no-deps` and any future
+# flag change produce no resolve graph, and an empty graph makes every package unreachable, which
+# this audit would otherwise report as "no package declares a rust-version above 1.85" while 37
+# of them do. A scoped audit that cannot see anything is not a clean audit.
+if not nodes:
+    print("msrv-audit: cargo metadata carried no resolve graph, so nothing could be scoped.")
+    print("            This is a FAILURE rather than a clean run: with no graph every package")
+    print("            is unreachable and every offender would be silently skipped.")
+    sys.exit(1)
+
+# The roots are what the CI msrv lane COMPILES, which is the workspace minus the crates that
+# lane excludes -- not the binary alone. Rooting at `ironauth` was narrower than the lane and
+# made `ironauth-importers`, which the lane does compile, invisible to this audit.
+EXCLUDED = {"ironauth-hooks", "ironauth-cel"}
+roots = [
+    package_id
+    for package_id in metadata.get("workspace_members", [])
+    if by_id.get(package_id, {}).get("name") not in EXCLUDED
+]
+if not roots:
+    print("msrv-audit: no workspace members to scope the audit to")
+    sys.exit(1)
+
+reachable, stack = set(), list(roots)
+while stack:
+    node_id = stack.pop()
+    if node_id in reachable:
+        continue
+    reachable.add(node_id)
+    stack.extend(nodes.get(node_id, {}).get("dependencies", []))
+
 offenders = []
-for package in json.load(sys.stdin)["packages"]:
+for package_id in sorted(reachable):
+    package = by_id.get(package_id)
+    if package is None:
+        continue
     declared = package.get("rust_version")
     if declared and parts(declared) > ceiling:
         offenders.append((package["name"], package["version"], declared))

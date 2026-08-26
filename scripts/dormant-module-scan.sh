@@ -68,9 +68,22 @@ allow() {
 # A rustdoc link counts, as does a mention in a test. That is deliberate and long-standing:
 # this scan asks "does anything in the tree name this module", not "is it on a request path",
 # and narrowing it to call sites would need a parser rather than a grep.
+#
+# Guest workspaces are excluded, and this is a CONSISTENCY fix rather than a narrowing. The main
+# loop globs `crates/*/src/*.rs`, which never matches `crates/<crate>/guests/*/src/lib.rs`, so a
+# guest fixture is not a module this scan can flag -- but the reference count was recursive over
+# `crates/`, so those same files counted as callers. One half of the scan could see them and the
+# other could not. They are separate cargo workspaces compiled to another target and they link
+# into nothing here.
+#
+# ANCHORED to `crates/<crate>/guests/`, not a bare `/guests/` substring. Unanchored, a future
+# host module at `crates/<crate>/src/guests/handler.rs` -- exactly the wiring the allowlist
+# entries are waiting on -- would have its references swallowed and the entry would read as
+# callerless forever.
 refs_for() {
   count="$( { grep -rn --include='*.rs' -e "${1}::" crates/ 2>/dev/null \
-    | grep -v "/${1}\.rs:" | wc -l; } || true )"
+    | grep -v "/${1}\.rs:" \
+    | grep -vE '^crates/[^/]+/guests/' | wc -l; } || true )"
   count="$(echo "$count" | tr -d ' ')"
   [ -n "$count" ] || count=0
   echo "$count"

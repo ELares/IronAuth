@@ -4,7 +4,11 @@ name = "ironauth-cel"
 version = "0.1.0"
 description = "Cost-bounded CEL evaluation for IronAuth: a deterministic budget refused before evaluation, never a wall clock"
 edition.workspace = true
-rust-version.workspace = true
+# NOT the workspace MSRV: `cel` 0.14 declares rust-version 1.86. Nothing depends on this
+# crate yet, so the shipped binary's MSRV is unaffected and the 1.85 promise in
+# docs/COMPATIBILITY.md holds; the CI msrv lane excludes this crate for exactly as long as
+# that is true. See the comment on that lane for the rule both exclusions follow.
+rust-version = "1.86"
 license.workspace = true
 repository.workspace = true
 

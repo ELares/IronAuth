@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// The `token.customize` hook interface, issue #114.
+//
+// This is the WASM transport for the contract issue #113 defines in
+// `ironauth-store::token_customize`. That contract is the authority on what the payload
+// MEANS; this file is the authority on how it CROSSES the guest boundary, and the two are
+// held together by a test that builds a WIT request from a `TokenCustomizePayload` and
+// asserts every field survives.
+//
+// Versioning is the decade-ABI commitment #114 asks for. The package version is the
+// interface version, and it is not the payload version: `payload-version` inside the
+// request is #113's field and moves on #113's schedule. A guest compiled against
+// 0.1.0 keeps working when 0.2.0 ships, because the host offers both.
+package ironauth:hooks@0.1.0;
+
+/// A single claim, carried as a name and its JSON encoding.
+///
+/// WIT has no arbitrary-JSON type, and inventing a variant that covered "whatever
+/// `serde_json::Value` can hold" would be a second, weaker schema for the same data. The
+/// JSON text IS the interchange format the schema registry already validates, so it crosses
+/// as text and is parsed on each side against the one schema that governs it.
+interface types {
+  record claim {
+    /// The claim name. The host fences reserved names on the way back in, in
+    /// `filter_hook_claims` in `ironauth-oidc`. This crate carries the transport, never the
+    /// decision.
+    name: string,
+    /// The claim value, JSON-encoded. A hook that emits text which is not valid JSON has
+    /// its claim refused rather than folded in as a string.
+    value-json: string,
+  }
+}
+
+interface token-customize {
+  use types.{claim};
+
+  /// What the host hands a hook for one token issuance.
+  ///
+  /// Field-for-field `ironauth_store::token_customize::TokenCustomizePayload`.
+  record request {
+    /// #113's payload version, explicit in every invocation.
+    payload-version: u32,
+    /// The wire `grant_type` being exchanged, so one hook can serve every grant.
+    grant-type: string,
+    /// The OAuth client the tokens are for.
+    client-id: string,
+    /// The pseudonymous subject, absent for a grant with no user.
+    subject: option<string>,
+    /// Claims destined for the ID token, after declarative mapping.
+    id-token-claims: list<claim>,
+    /// Claims destined for the access token, after declarative mapping.
+    access-token-claims: list<claim>,
+  }
+
+  /// What a hook hands back.
+  ///
+  /// The full claim set, not a delta. A delta would need its own removal encoding and would
+  /// make "what will the token contain" a question about two artifacts instead of one.
+  /// Reserved names present here are dropped and reported, never minted.
+  record response {
+    id-token-claims: list<claim>,
+    access-token-claims: list<claim>,
+  }
+
+  /// Customize the claims for one token issuance.
+  ///
+  /// The error case is the hook declining deliberately, and it is NOT the same thing as a
+  /// trap: this returns a reason the host can log and apply the per-hook failure policy to,
+  /// whereas a fuel or deadline abort has no reason to return because the guest never got
+  /// to finish. Both are handled; only this one is the hook author's own message.
+  customize: func(req: request) -> result<response, string>;
+}
+
+/// The world a `token.customize` hook implements.
+///
+/// It imports NOTHING. Every capability is opt-in and is added to the linker by the host
+/// per hook, so the default world is the deny-by-default sandbox criterion 2 asks for:
+/// what a guest never imports, it can never call.
+world token-customize-hook {
+  export token-customize;
+}

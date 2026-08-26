@@ -293,7 +293,7 @@ mod tests {
             // the least noisy estimator of work done.
             (0..3)
                 .map(|_| {
-                    let start = std::time::Instant::now();
+                    let start = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness: this test measures the REAL elapsed cost of validate_syntax to pin the quadratic regression from #989, so routing it through the Clock seam (a frozen ManualClock under test) would measure the seam and always report zero
                     assert!(super::validate_syntax(template).is_ok());
                     start.elapsed().as_micros()
                 })
