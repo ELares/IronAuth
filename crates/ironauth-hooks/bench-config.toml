@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The hook latency benchmark's configuration (issue #114, criterion 4).
+#
+# The criterion asks for cold and warm p95 "measured by the CI benchmark job on the pinned
+# runner class named in the benchmark config". This file IS that config: the runner class is
+# named here rather than only in the workflow, so the number a release publishes can be read
+# together with the machine it was taken on.
+#
+# The binding is not prose. `scripts/hook-bench-gate.sh` reads BOTH this file and the workflow
+# and refuses to run if the job's `runs-on` is not the class named here, so a workflow edited to
+# a different machine fails instead of silently publishing numbers from somewhere else.
+
+[runner]
+# The pinned runner class. Every published number is taken on this and comparing across classes
+# is meaningless: a p95 is a property of the measurement, not only of the code.
+class = "ubuntu-latest"
+
+[gates]
+# The criterion's two hard bounds. The job FAILS above either.
+#
+# These may be TIGHTENED here and never loosened. `scripts/hook-bench-gate.sh` carries the
+# criterion's own numbers as constants and refuses a config asking it to enforce less, because
+# these two lines ARE the criterion: as plain unbounded config they were one edit away from a
+# gate that admits a full second, and the run still printed "clean". Lowering them as the
+# runtime improves is exactly what this file is for; raising them is an edit to the script.
+cold_p95_micros = 1000
+warm_p95_micros = 100
+
+[target]
+# The 120-microsecond cold start the issue keeps as "a stated target, not a gate". Reported
+# alongside the gate so a release can see how far from it the runtime is; never enforced.
+cold_p95_micros = 120
+
+[regression]
+# How much worse than the committed baseline a run may be before the job fails.
+#
+# Generous on purpose. A shared CI runner is noisy and a benchmark that fails on ordinary
+# variance teaches people to re-run it until it passes, which is worse than no benchmark: the
+# gates above are the real bound, and this catches a step change rather than a drift.
+tolerance_percent = 50
+
+# The ceiling on the line above lives in `scripts/hook-bench-gate.sh`, NOT here.
+#
+# It was here, as `max_tolerance_percent`, and that was the same defect one level out: two
+# adjacent lines in one file, both editable together, so setting both to 1e9 admitted a 12400%
+# regression and printed "clean". A bound in the same artifact as the thing it bounds is not a
+# bound. The script's `MAX_TOLERANCE_PERCENT` is what refuses a looser value.
+
+[samples]
+# The FLOORS on how many samples a published p95 may rest on.
+#
+# The benchmark reports its iteration counts and nothing read them, so `COLD_ITERATIONS` could
+# fall from 200 to 1 -- making the "p95" a single sample -- invisibly to the gate and to the
+# baseline it is compared against. A number is only comparable to another number taken the same
+# way, and the sample count is part of "the same way".
+#
+# Raisable here, never lowerable: as plain config these were floors that could themselves be set
+# to zero, which is a floor made of nothing.
+min_cold_iterations = 200
+min_warm_iterations = 5000

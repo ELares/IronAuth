@@ -503,6 +503,68 @@ jobs:
             echo "binary is not static" && exit 1
           fi
 
+  hook-bench:
+    name: hook latency (issue #114 criterion 4)
+    # PINNED, and the class is named in crates/ironauth-hooks/bench-config.toml as well.
+    # `scripts/hook-bench-gate.sh` reads both and refuses to run when they disagree, so this
+    # line cannot drift to a different machine while the config keeps publishing the old class.
+    # A p95 is a property of the machine as much as of the code.
+    #
+    # The gate also refuses to run as any job but this one, and records the MEASURED machine
+    # (RUNNER_OS / RUNNER_ARCH / ImageOS / ImageVersion) in the baseline rather than this label.
+    # ImageVersion is the one that moves when GitHub rotates the image -- ImageOS is only the OS
+    # major -- so a rotation refuses the comparison instead of silently continuing it, which is
+    # precisely the "a p95 is a property of the machine" event.
+    runs-on: ubuntu-latest
+    # Generous because the run this job is DESIGNED to have -- the first one on a new machine,
+    # which fails and prints the baseline to commit -- is also the one with a cold cache, and it
+    # builds wasmtime and cranelift in release plus the wasm guest fixtures.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # The benchmark runs a real guest component, so the fixtures have to build. Added
+        # through rustup rather than the action's `targets:` input because rust-toolchain.toml
+        # pins the toolchain cargo actually uses.
+        run: rustup target add wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      # The gate parses ci.yml to check this job's `runs-on` against the config, so it needs
+      # PyYAML. Provisioned here rather than assumed: the repository treats PyYAML as a third
+      # party package scripts must not require (see fuzz-matrix-freshness.sh), and the gate has
+      # no degraded path -- the check it needs it for is the one that cannot be skipped.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: provision the gate's python deps (hash pinned)
+        run: python3 -m pip install --require-hashes -r deploy/conformance/requirements.txt
+      - name: Measure and gate
+        run: ./scripts/hook-bench-gate.sh
+      # Criterion 4: "numbers are published per release". The release workflow attaches the
+      # committed baseline; this keeps the run's OWN measurement, which is what a bisect needs
+      # and what the baseline is not (the baseline changes only when somebody commits one).
+      - name: Publish this run's measurement
+        # A failing gate still publishes what it measured: that run's numbers are the ones
+        # somebody needs. `error` and not `ignore`, because a publish step that cannot fail is
+        # the same defect this whole gate is about -- on an already-red job it adds a second
+        # red, which is the right amount of noise for "and the numbers were not published".
+        #
+        # Several CI paths exit BEFORE the measurement is written -- a bench build failure, a
+        # wrong GITHUB_JOB, an out-of-range config, an unidentifiable machine. An earlier
+        # version of this comment claimed the file is written "on every CI path before it
+        # decides anything", which is false; the behaviour above is right anyway, and the
+        # reason is the one stated rather than the one that was.
+        #
+        # `success() || failure()` rather than `always()`: `always()` also fires on
+        # CANCELLATION, and this workflow sets cancel-in-progress for pull requests, so every
+        # superseded push would leave a failed upload step nobody should read as a signal.
+        if: success() || failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hook-latency-measurement
+          path: target/hook-bench-measurement.json
+          if-no-files-found: error
+
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
     runs-on: ubuntu-latest

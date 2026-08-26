@@ -31,6 +31,40 @@ jobs:
           crate_version=$(grep -m1 '^version' crates/ironauth/Cargo.toml | cut -d'"' -f2)
           echo "tag=$tag_version crate=$crate_version"
           test "$tag_version" = "$crate_version"
+      # Issue #114 criterion 4 asks for the hook latency numbers to be "published per release".
+      # Checked HERE rather than beside the asset copy, and the reason is what happens if it is
+      # not: the build job attests build provenance to a public transparency log BEFORE it
+      # reaches the asset list, so a missing file there leaves a pushed tag and a published
+      # attestation with no release behind it. A precondition of releasing belongs in the job
+      # that runs before anything is signed.
+      - name: the hook latency baseline exists and says something
+        # `-s` alone was the first version, and a one-byte junk file satisfies it -- which would
+        # publish that byte as `hook-latency.json`, hash it into SHA256SUMS, and call the
+        # criterion met. The keys are checked because they are what makes the file an ANSWER to
+        # "what was this measured at, and on what".
+        run: |
+          python3 - <<'CHECK'
+          import json, pathlib, sys
+
+          path = pathlib.Path("crates/ironauth-hooks/bench-baseline.json")
+          if not path.is_file() or path.stat().st_size == 0:
+              print(f"{path} is missing or empty.", file=sys.stderr)
+              print("It is a release asset (issue #114 criterion 4: numbers published per", file=sys.stderr)
+              print("release). The hook-bench CI job prints the exact contents to commit on", file=sys.stderr)
+              print("its first run against a given machine.", file=sys.stderr)
+              sys.exit(1)
+          try:
+              baseline = json.loads(path.read_text(encoding="utf-8"))
+          except json.JSONDecodeError as error:
+              print(f"{path} is not JSON: {error}", file=sys.stderr)
+              sys.exit(1)
+          required = ("runner_class", "machine", "cold_p95_micros", "warm_p95_micros")
+          missing = [key for key in required if not baseline.get(key)]
+          if missing:
+              print(f"{path} is missing {missing}.", file=sys.stderr)
+              print("A published figure with no machine beside it is not a measurement.", file=sys.stderr)
+              sys.exit(1)
+          CHECK
 
   build:
     name: build, sbom, attest, release
@@ -63,6 +97,10 @@ jobs:
           # is freshness-checked in CI (scripts/config-schema.sh); ship it as a
           # release asset so it is downloadable per version alongside the binary.
           cp docs/config-schema.json dist/config-schema.json
+          # The hook latency numbers (issue #114 criterion 4). Staged BEFORE the manifest below,
+          # because an asset added after `sha256sum *` is the one asset a downloader cannot
+          # verify -- which is a worse outcome than not publishing it.
+          cp crates/ironauth-hooks/bench-baseline.json dist/hook-latency.json
           cd dist && sha256sum * > SHA256SUMS
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
@@ -80,7 +118,8 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes-file dist/RELEASE_NOTES.md \
-            dist/ironauth-x86_64-linux-musl dist/SHA256SUMS dist/config-schema.json dist/*.cdx.json
+            dist/ironauth-x86_64-linux-musl dist/SHA256SUMS dist/config-schema.json dist/*.cdx.json \
+            dist/hook-latency.json
 
   image:
     name: container image, signed

@@ -53,5 +53,13 @@ wasmtime-wasi-io = "48"
 # the doc comment gets corrected with it.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
+# The latency benchmark (issue #114, criterion 4). `harness = false` because it emits JSON for
+# a gate script rather than running libtest: a benchmark whose output only a human reads cannot
+# fail a build, and the criterion asks for a job that fails on regression.
+[[bench]]
+name = "hook_latency"
+path = "benches/hook_latency.rs"
+harness = false
+
 [lints]
 workspace = true

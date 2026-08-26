@@ -101,7 +101,19 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 # None is host protocol logic reading a clock behind the ironauth-env seam, which is what this
 # rule protects. Every one of the nine is a test or a wasm guest fixture; zero are on a request
 # path.
-scan time-via-env 'SystemTime::now|Instant::now' 9
+# Raised again, 9 -> 11, for the two loops of the hook latency benchmark (issue #114,
+# criterion 4). Elapsed time is not something these read on the way to doing something else; it
+# is the benchmark's entire output, the number the CI job gates on and the number a release
+# publishes.
+#
+# The reason is NOT "the seam would report zero", which an earlier version of this paragraph
+# claimed. `Clock::monotonic` on the production `SystemClock` is `Instant::now()`, so a bench
+# holding a real `Env` would measure the same thing; only `Env::deterministic`'s `ManualClock`
+# freezes. The actual reason is narrower and worth stating correctly: the rule exists so PROTOCOL
+# logic cannot read a clock outside the seam that makes it testable, and a benchmark target is
+# not protocol logic -- it is not compiled into the server, and threading an `Env` into it would
+# add a dependency for no property gained. Still zero exemptions on a request path.
+scan time-via-env 'SystemTime::now|Instant::now' 11
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.
