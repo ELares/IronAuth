@@ -31690,30 +31690,13 @@ impl ActingMessageRepo<'_> {
     /// Carries no idempotency write: that row is control-plane and this transaction is
     /// data-plane. See [`Store::record_cross_plane_idempotency`].
     pub async fn resend(&self, env: &Env, id: &MessageId) -> Result<Resent, StoreError> {
-        if id.scope() != self.scope {
-            return Err(StoreError::NotFound);
-        }
-        let scope = self.scope;
-        let target = *id;
-        write_audited(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::MessageResend,
-                target: &target,
-            },
-            async move |tx| {
-                // No idempotency row here: `idempotency_keys` is a CONTROL-plane table and
-                // this write is on the data plane, so the app role has no grant on it and the
-                // two cannot share a transaction. The caller records it separately through
-                // `Store::record_cross_plane_idempotency`, which documents why that is safe.
-                resend_in_tx(tx, env, scope, &target).await
-            },
-            false,
-        )
-        .await
+        // DELEGATES, as `ActingInvitationRepo::resend` does to its own `_with_event` sibling.
+        // It was a full copy of the audited write, which is two places for one transaction to
+        // drift -- and it has no caller now that the handler emits, so the copy was carrying no
+        // weight at all. Kept rather than deleted because "resend without announcing" is a
+        // legitimate thing for a future caller to want; what is not legitimate is a second
+        // implementation of it.
+        self.resend_with_event(env, id, None).await
     }
 
     /// [`Self::resend`], additionally emitting `message.resent` (issue #111, issue #108

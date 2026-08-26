@@ -2426,10 +2426,8 @@ async fn concurrent_resends_of_one_message_queue_one_job() {
 /// For a resend that is the difference between "an operator re-sent it" and "our provider
 /// double-delivered".
 ///
-/// THE NEGATIVE HALF IS THE GUARD, not a second spelling of the positive. A suppressed
-/// recipient is a hard bounce or a complaint, and the store refuses the resend on the
-/// recipient's behalf. No mail is queued, so no event may claim any was: a subscriber that
-/// counted a suppressed resend as a delivery would be counting mail that does not exist.
+/// The negative half lives in `a_resend_refused_by_suppression_announces_nothing`, which this
+/// function used to contain before it was split for length.
 #[tokio::test]
 async fn each_requeue_announces_its_own_attempt_number() {
     let db = TestDatabase::start().await;
@@ -2502,9 +2500,14 @@ async fn each_requeue_announces_its_own_attempt_number() {
     // four times concluded four FIRST resends -- the provider-double-delivery story this event
     // exists to rule out.
     //
-    // BOTH are drained together, AFTER both resends, and that is not tidiness: the outbox will
-    // not hand out an event while an earlier one for the same subject is incomplete, so
-    // draining in between hides the second behind the first and reports zero.
+    // BOTH are drained together, AFTER both resends, so the in-order `(1, 2)` assertion below
+    // is a single observation of the feed rather than two readings stitched together.
+    //
+    // NOT because draining in between would hide anything. An earlier version of this comment
+    // said it "reports zero", and that is false of `drain_message_events`, which COMPLETES what
+    // it claims and so releases the ordering group -- measured: draining between the resends
+    // returns 1 then 1, both correct. It is true only of a claim-only drain, which is what the
+    // helper's own doc explains it is not.
     db.store()
         .scoped(scope)
         .messages()
@@ -2670,8 +2673,8 @@ async fn a_resend_refused_by_suppression_announces_nothing() {
     );
     assert!(
         drain_message_events(&db, scope).await.is_empty(),
-        "a resend that queued no mail must announce nothing. The two events above were drained \
-         AND completed, so nothing is blocking this read: empty here means nothing was written, \
-         not that the feed was ordered behind something."
+        "a resend that queued no mail must announce nothing. Nothing was ever enqueued in this \
+         scope -- this test has its own database and its only resend is the refused one -- so \
+         an empty answer means nothing was written rather than that a read was blocked."
     );
 }
