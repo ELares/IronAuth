@@ -6,9 +6,16 @@
 //! > token placement with NO CUSTOM CODE.
 //!
 //! Four operations, configured as data. The point of the criterion is the "no custom code": an
-//! operator who wants `groups` renamed to `roles` in the access token should not need a hook, a
-//! WASM module, or a CEL expression. Those exist for the cases this cannot express; this exists
-//! so they are not needed for the cases it can.
+//! operator who wants `groups` renamed to `team_groups` in the access token should not need a
+//! hook, a WASM module, or a CEL expression. Those exist for the cases this cannot express;
+//! this exists so they are not needed for the cases it can.
+//!
+//! The example says `team_groups` rather than `roles`, and the correction is worth keeping.
+//! `roles` is RESERVED at the token mint, where `tokens.rs` drops a self-asserted one rather
+//! than emitting it -- so the obvious illustration was a rename this layer would have accepted
+//! and the mint would have silently discarded. That is exactly the "quietly inert forever"
+//! outcome the refusal below exists to prevent, and writing it into the header as the flagship
+//! use case would have taught every reader the wrong thing.
 //!
 //! # Protected claims are refused, not dropped
 //!
@@ -33,6 +40,25 @@
 use std::collections::BTreeMap;
 
 use crate::scope_claims::is_protected_claim;
+use crate::tokens::PROTECTED_ACCESS_TOKEN_CLAIMS;
+
+/// Whether a mapping may write `name`.
+///
+/// The union of the release floor and the MINT fold, not the floor alone. `PROTECTED_CLAIMS`
+/// is five names; `PROTECTED_ACCESS_TOKEN_CLAIMS` is twenty-five, and the extra twenty are the
+/// ones something makes a decision on: `scope` authorizes IronAuth's own management API, `cnf`
+/// drives `DPoP` proof-of-possession, and `permissions`/`roles`/`org_id` are what `tokens.rs`
+/// calls "the only claims in the set a resource server makes an ACCESS decision on, so a
+/// self-asserted one is a privilege escalation rather than a cosmetic lie".
+///
+/// The repo already said the five were a floor. `scope_claims`'s own superset test carries the
+/// sentence: "the mint fold is the second fence and must not be narrower than the FIRST". This
+/// module gated on the floor, which made it the one operator-facing claim path in the tree that
+/// would admit `scope` or `permissions` -- the ID-token extra claims, the client-credentials
+/// custom claims, and the enrichment hook's config-load check all refuse them already.
+fn is_writable_by_a_mapping(name: &str) -> bool {
+    !is_protected_claim(name) && !PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name)
+}
 
 /// Which token a claim is written into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,17 +131,39 @@ impl MappingRule {
 pub struct MappingRefusal {
     /// Which rule, by position, so an operator can find it in a list of forty.
     pub rule_index: usize,
-    /// The protected claim it tried to write.
+    /// The claim it tried to write.
     pub claim: String,
+    /// Why.
+    pub reason: RefusalReason,
+}
+
+/// Why a rule was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The claim is reserved: the protocol's own, or one something makes a decision on.
+    Reserved,
+    /// The claim name is empty or only whitespace.
+    ///
+    /// Refused for the reason the enrichment hook's config-load check refuses it: a claim with
+    /// no name is not a claim, and a mapping that wrote one would put a key nobody can address
+    /// into every token.
+    EmptyName,
 }
 
 impl core::fmt::Display for MappingRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "rule {} writes the protected claim `{}`, which no mapping may set",
-            self.rule_index, self.claim
-        )
+        match self.reason {
+            RefusalReason::Reserved => write!(
+                f,
+                "rule {} writes the reserved claim `{}`, which no mapping may set",
+                self.rule_index, self.claim
+            ),
+            RefusalReason::EmptyName => write!(
+                f,
+                "rule {} writes a claim with an empty name",
+                self.rule_index
+            ),
+        }
     }
 }
 
@@ -143,10 +191,18 @@ pub struct MappedClaims {
 pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
     for (index, rule) in rules.iter().enumerate() {
         let written = rule.written_claim();
-        if is_protected_claim(written) {
+        if written.trim().is_empty() {
             return Err(MappingRefusal {
                 rule_index: index,
                 claim: written.to_owned(),
+                reason: RefusalReason::EmptyName,
+            });
+        }
+        if !is_writable_by_a_mapping(written) {
+            return Err(MappingRefusal {
+                rule_index: index,
+                claim: written.to_owned(),
+                reason: RefusalReason::Reserved,
             });
         }
     }
@@ -176,10 +232,20 @@ pub fn apply(
     for rule in rules {
         match rule {
             MappingRule::Rename { from, to } => {
-                // REMOVED from the source. A rename that left the original behind would be a
-                // copy, and an operator renaming `groups` to `roles` to stop leaking the
-                // internal name would still be leaking it.
-                if let Some(value) = working.remove(from) {
+                // A PROTECTED source is COPIED, not moved. Renaming `sub` to `subject` is
+                // allowed -- copying the identity into a claim of the operator's choosing is
+                // theirs to do -- but the rename also REMOVED it, so `sub` vanished from both
+                // tokens. Deleting a protected claim is overriding it: a token with no `sub`
+                // is not a token whose `sub` an operator chose to leave out.
+                let taken = if is_protected_claim(from) || !is_writable_by_a_mapping(from) {
+                    working.get(from).cloned()
+                } else {
+                    // REMOVED for an ordinary claim. A rename that left the original behind
+                    // would be a copy, and an operator renaming an internal name to stop
+                    // leaking it would still be leaking it.
+                    working.remove(from)
+                };
+                if let Some(value) = taken {
                     working.insert(to.clone(), value);
                     // The placement follows the value: a claim renamed after being placed keeps
                     // where it was put.
@@ -193,20 +259,28 @@ pub fn apply(
             }
             MappingRule::FilterList { name, allow } => {
                 if let Some(serde_json::Value::Array(members)) = working.get(name) {
-                    let kept: Vec<serde_json::Value> = members
-                        .iter()
-                        .filter(|member| {
-                            member
-                                .as_str()
-                                .is_some_and(|text| allow.iter().any(|a| a == text))
-                        })
-                        .cloned()
-                        .collect();
-                    working.insert(name.clone(), serde_json::Value::Array(kept));
+                    // A list holding anything that is NOT a string is left alone too, for the
+                    // same reason a string is: the rule allows NAMES, so a list of objects is a
+                    // configuration mistake rather than a list with nothing allowed in it. The
+                    // first version filtered it to empty, which is precisely the silent data
+                    // loss the comment below claims to avoid -- the comment was right and the
+                    // code did not implement it.
+                    if members.iter().all(serde_json::Value::is_string) {
+                        let kept: Vec<serde_json::Value> = members
+                            .iter()
+                            .filter(|member| {
+                                member
+                                    .as_str()
+                                    .is_some_and(|text| allow.iter().any(|a| a == text))
+                            })
+                            .cloned()
+                            .collect();
+                        working.insert(name.clone(), serde_json::Value::Array(kept));
+                    }
                 }
-                // A claim that is absent, or is not a list, is left ALONE rather than emptied.
-                // Emptying it would turn a configuration mistake (filtering a string) into
-                // silent data loss in every token.
+                // A claim that is absent, or is not a list of strings, is left ALONE rather
+                // than emptied. Emptying it would turn a configuration mistake into silent
+                // data loss in every token.
             }
             MappingRule::Place { name, placement } => {
                 placements.insert(name.clone(), *placement);
@@ -234,7 +308,7 @@ pub fn apply(
 
 #[cfg(test)]
 mod tests {
-    use super::{MappedClaims, MappingRule, Placement, apply, validate};
+    use super::{MappedClaims, MappingRule, Placement, RefusalReason, apply, validate};
     use std::collections::BTreeMap;
 
     fn source() -> BTreeMap<String, serde_json::Value> {
@@ -255,10 +329,10 @@ mod tests {
         // operator renaming an internal name to stop leaking it would still be leaking it.
         let renamed = only(MappingRule::Rename {
             from: "groups".to_owned(),
-            to: "roles".to_owned(),
+            to: "team_groups".to_owned(),
         });
         assert_eq!(
-            renamed.id_token["roles"],
+            renamed.id_token["team_groups"],
             serde_json::json!(["eng", "sre", "hr"])
         );
         assert!(
@@ -370,6 +444,16 @@ mod tests {
         )
         .expect("renaming FROM a protected claim is allowed");
         assert_eq!(mapped.id_token["subject"], serde_json::json!("usr_ada"));
+        // AND `sub` SURVIVES. The original test asserted only that the copy landed, so it
+        // passed against a rename that DELETED the subject from both tokens -- and a token
+        // with no `sub` is not a token whose `sub` an operator chose to leave out. Deleting a
+        // protected claim is overriding it.
+        assert_eq!(
+            mapped.id_token["sub"],
+            serde_json::json!("usr_ada"),
+            "renaming FROM a protected claim must COPY, never move"
+        );
+        assert_eq!(mapped.access_token["sub"], serde_json::json!("usr_ada"));
     }
 
     /// The refusal names the OFFENDING rule's position, not the first rule.
@@ -395,6 +479,118 @@ mod tests {
             "an operator with forty rules needs the index of the wrong one"
         );
         assert_eq!(refusal.claim, "iat");
+    }
+
+    /// THE WIDER FENCE. A mapping may not write anything the MINT reserves either.
+    ///
+    /// The five-name release floor was the only gate here, and the repo already said five is a
+    /// floor: `scope_claims`'s own superset test carries "the mint fold is the second fence and
+    /// must not be narrower than the FIRST". Gating on the floor made this the one
+    /// operator-facing claim path in the tree that would admit `scope` or `permissions` --
+    /// claims IronAuth's own management API and `DPoP` verifier make decisions on.
+    #[test]
+    fn a_mapping_may_not_write_anything_the_mint_reserves() {
+        for name in crate::tokens::PROTECTED_ACCESS_TOKEN_CLAIMS {
+            let refusal = validate(&[MappingRule::Static {
+                name: (*name).to_owned(),
+                value: serde_json::json!("forged"),
+            }])
+            .expect_err("must be refused");
+            assert_eq!(refusal.claim, *name);
+            assert_eq!(refusal.reason, RefusalReason::Reserved);
+        }
+
+        // The ones that matter most, named so a future edit to the list has to think about
+        // them rather than merely keep the loop above green.
+        for name in [
+            "scope",
+            "permissions",
+            "roles",
+            "cnf",
+            "azp",
+            "org_id",
+            "amr",
+        ] {
+            assert!(
+                validate(&[MappingRule::Rename {
+                    from: "email".to_owned(),
+                    to: name.to_owned(),
+                }])
+                .is_err(),
+                "{name} is a claim something makes a decision on"
+            );
+        }
+    }
+
+    /// A claim name that is empty, or only whitespace, is refused with its own reason.
+    #[test]
+    fn an_empty_claim_name_is_refused() {
+        for name in ["", "   ", "\t"] {
+            let refusal = validate(&[MappingRule::Static {
+                name: name.to_owned(),
+                value: serde_json::json!(1),
+            }])
+            .expect_err("must be refused");
+            assert_eq!(
+                refusal.reason,
+                RefusalReason::EmptyName,
+                "an empty name is its own fault, not a reserved-claim one"
+            );
+        }
+    }
+
+    /// A list holding anything that is not a string is left ALONE, not emptied.
+    ///
+    /// The comment said so and the code did the opposite: filtering a list of objects produced
+    /// an empty list, which is exactly the silent data loss the comment claims to avoid.
+    #[test]
+    fn filtering_a_list_of_non_strings_leaves_it_alone() {
+        for value in [
+            serde_json::json!([{"id": 1}, {"id": 2}]),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(["ok", 7]),
+        ] {
+            let mut claims = BTreeMap::new();
+            claims.insert("things".to_owned(), value.clone());
+            let mapped = apply(
+                &[MappingRule::FilterList {
+                    name: "things".to_owned(),
+                    allow: vec!["ok".to_owned()],
+                }],
+                &claims,
+            )
+            .expect("applies");
+            assert_eq!(
+                mapped.id_token["things"], value,
+                "a list the rule cannot express an opinion about is not a list with nothing \
+                 allowed in it"
+            );
+        }
+    }
+
+    /// The refusal's DISPLAY names the rule and the claim, which is the operator-facing artifact.
+    #[test]
+    fn the_refusal_reads_as_something_an_operator_can_act_on() {
+        let reserved = validate(&[MappingRule::Static {
+            name: "scope".to_owned(),
+            value: serde_json::json!("admin"),
+        }])
+        .expect_err("refused");
+        let rendered = reserved.to_string();
+        assert!(
+            rendered.contains("scope") && rendered.contains("rule 0"),
+            "the message must name the claim and the rule: {rendered}"
+        );
+
+        let empty = validate(&[MappingRule::Static {
+            name: " ".to_owned(),
+            value: serde_json::json!(1),
+        }])
+        .expect_err("refused");
+        assert!(
+            empty.to_string().contains("empty name"),
+            "and an empty name reads differently from a reserved one: {empty}"
+        );
     }
 
     /// A refused mapping applies NOTHING, rather than the rules before the bad one.
@@ -448,10 +644,10 @@ mod tests {
             &[
                 MappingRule::Rename {
                     from: "groups".to_owned(),
-                    to: "roles".to_owned(),
+                    to: "team_groups".to_owned(),
                 },
                 MappingRule::Static {
-                    name: "roles".to_owned(),
+                    name: "team_groups".to_owned(),
                     value: serde_json::json!(["fixed"]),
                 },
             ],
@@ -459,7 +655,7 @@ mod tests {
         )
         .expect("applies");
         assert_eq!(
-            rename_then_static.id_token["roles"],
+            rename_then_static.id_token["team_groups"],
             serde_json::json!(["fixed"]),
             "the later static wins"
         );
@@ -467,19 +663,19 @@ mod tests {
         let static_then_rename = apply(
             &[
                 MappingRule::Static {
-                    name: "roles".to_owned(),
+                    name: "team_groups".to_owned(),
                     value: serde_json::json!(["fixed"]),
                 },
                 MappingRule::Rename {
                     from: "groups".to_owned(),
-                    to: "roles".to_owned(),
+                    to: "team_groups".to_owned(),
                 },
             ],
             &source(),
         )
         .expect("applies");
         assert_eq!(
-            static_then_rename.id_token["roles"],
+            static_then_rename.id_token["team_groups"],
             serde_json::json!(["eng", "sre", "hr"]),
             "the later rename wins; the sequence is the operator's and is applied as written"
         );
@@ -496,14 +692,15 @@ mod tests {
                 },
                 MappingRule::Rename {
                     from: "groups".to_owned(),
-                    to: "roles".to_owned(),
+                    to: "team_groups".to_owned(),
                 },
             ],
             &source(),
         )
         .expect("applies");
         assert!(
-            mapped.access_token.contains_key("roles") && !mapped.id_token.contains_key("roles"),
+            mapped.access_token.contains_key("team_groups")
+                && !mapped.id_token.contains_key("team_groups"),
             "the placement follows the value: id={:?} access={:?}",
             mapped.id_token.keys().collect::<Vec<_>>(),
             mapped.access_token.keys().collect::<Vec<_>>()
