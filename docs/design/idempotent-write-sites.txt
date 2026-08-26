@@ -55,6 +55,7 @@ crates/ironauth-admin/src/log_shipper.rs:observe:0
 crates/ironauth-admin/src/log_streams.rs:create_log_stream:0
 crates/ironauth-admin/src/log_streams.rs:replay_log_stream_dead_letters:0
 crates/ironauth-admin/src/memberships.rs:create_membership:1
+crates/ironauth-admin/src/messages.rs:resend_message:1
 crates/ironauth-admin/src/migration_runs.rs:abandon_migration_run:1
 crates/ironauth-admin/src/migration_runs.rs:detail_view:0
 crates/ironauth-admin/src/org_context.rs:require_live_environment:0

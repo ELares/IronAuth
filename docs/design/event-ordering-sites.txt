@@ -29,6 +29,7 @@
 crates/ironauth-admin/src/events.rs:explode:1
 crates/ironauth-admin/src/trait_migration_worker.rs:advance_one:1
 crates/ironauth-oidc/src/backchannel.rs:explode:1
+crates/ironauth-oidc/src/message_sender.rs:enqueue_notice:1
 crates/ironauth-store/src/repository.rs:abandon_with_event:1
 crates/ironauth-store/src/repository.rs:activate_version_idempotent_with_event:1
 crates/ironauth-store/src/repository.rs:add_allowlist_country_with_event:1
@@ -76,6 +77,7 @@ crates/ironauth-store/src/repository.rs:remove_with_event:4
 crates/ironauth-store/src/repository.rs:reparent_with_event:1
 crates/ironauth-store/src/repository.rs:request_dead_letter_replay:1
 crates/ironauth-store/src/repository.rs:request_dead_letter_replay_with_event:2
+crates/ironauth-store/src/repository.rs:resend_in_tx:1
 crates/ironauth-store/src/repository.rs:resend_with_event:1
 crates/ironauth-store/src/repository.rs:restore_with_event:1
 crates/ironauth-store/src/repository.rs:revoke_all_for_user_with_event:1
