@@ -1283,6 +1283,29 @@
       "type": "message.rate_limited"
     },
     {
+      "domain": "message",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "message_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "message_id",
+          "attempt"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "message.resent"
+    },
+    {
       "domain": "message_template",
       "payload_schema": {
         "additionalProperties": false,

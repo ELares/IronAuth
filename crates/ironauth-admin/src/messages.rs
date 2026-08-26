@@ -258,11 +258,26 @@ pub async fn resend_message(
         ));
     };
 
+    // The event is built BEFORE the write and handed in, so it lands in the same transaction
+    // as the re-queue. A resend causes mail, and until now it announced nothing: an integrator
+    // watching the feed could not tell an operator's resend from a provider double-delivering.
+    //
+    // `None` here means the type is not registered, which `event_catalog::envelope` answers.
+    // The write still happens: refusing to re-send mail because an event could not be built
+    // would make the feed a dependency of the delivery, which it is not.
+    let pending = resent_event(&state, scope, &id);
     let outcome = data_store
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .messages()
-        .resend(state.env(), &id)
+        .resend_with_event(
+            state.env(),
+            &id,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await
         .map_err(|error| match error {
             ironauth_store::StoreError::NotFound => ApiError::NotFound,
@@ -290,6 +305,38 @@ pub async fn resend_message(
         .map_err(|_| ApiError::Internal)?;
 
     Ok(json(StatusCode::OK, body))
+}
+
+/// The `message.resent` event for one re-queue (issue #111, issue #108 criterion 6).
+///
+/// NO ADDRESS and no body. The event feed is the artifact a tenant hands to third-party sync
+/// targets, and a resend event is by construction about somebody being mailed right now, so the
+/// payload carries the ledger id and the attempt number and nothing a subscriber could use as a
+/// directory. `message.rate_limited` withholds the recipient for the same reason.
+///
+/// The ATTEMPT number is filled in by the store, which is the only place that knows it: this
+/// builds the envelope around a placeholder and the store never sees a resend it did not
+/// perform, so the two cannot disagree about whether one happened.
+fn resent_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    message_id: &MessageId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = message_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "message.resent",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "message_id": subject, "attempt": 1 }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }
 
 /// The response body for a resend outcome.

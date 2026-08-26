@@ -31715,6 +31715,58 @@ impl ActingMessageRepo<'_> {
         )
         .await
     }
+
+    /// [`Self::resend`], additionally emitting `message.resent` (issue #111, issue #108
+    /// criterion 6).
+    ///
+    /// A resend is the one management write on this surface that CAUSES MAIL, and it announced
+    /// nothing: `scripts/producer-coverage.py` names it, and a write no event describes is
+    /// invisible to every integrator watching the feed. For this write that is the difference
+    /// between "an operator re-sent it" and "our provider double-delivered".
+    ///
+    /// THE EVENT IS APPENDED IN THE SAME TRANSACTION as the re-queue, so a subscriber cannot
+    /// see a resend that did not happen and cannot miss one that did. That is possible here
+    /// only because `outbox_messages` grants INSERT to the data-plane role -- the idempotency
+    /// row above cannot join this transaction for exactly the opposite reason.
+    ///
+    /// The event is emitted ONLY for [`Resent::Requeued`]. A suppressed recipient and a message
+    /// in a state a resend cannot act on both queue nothing, and announcing either would tell a
+    /// subscriber mail went out when none did.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resend`].
+    pub async fn resend_with_event(
+        &self,
+        env: &Env,
+        id: &MessageId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<Resent, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let target = *id;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MessageResend,
+                target: &target,
+            },
+            async move |tx| {
+                let outcome = resend_in_tx(tx, env, scope, &target).await?;
+                if matches!(outcome, Resent::Requeued { .. }) {
+                    enqueue_domain_event(tx, env, scope, event).await?;
+                }
+                Ok(outcome)
+            },
+            false,
+        )
+        .await
+    }
 }
 
 pub struct ActingMessageTemplateRepo<'a> {

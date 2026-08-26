@@ -2417,3 +2417,139 @@ async fn concurrent_resends_of_one_message_queue_one_job() {
         "and exactly one extra job exists"
     );
 }
+
+/// A resend that RE-QUEUES emits `message.resent`; one refused by suppression emits nothing.
+///
+/// Issue #108 criterion 6: every management write announces itself. A resend is the one write
+/// on this surface that causes mail, and it announced nothing -- `scripts/producer-coverage.py`
+/// named it, and a write no event describes is invisible to every integrator watching the feed.
+/// For a resend that is the difference between "an operator re-sent it" and "our provider
+/// double-delivered".
+///
+/// THE NEGATIVE HALF IS THE GUARD, not a second spelling of the positive. A suppressed
+/// recipient is a hard bounce or a complaint, and the store refuses the resend on the
+/// recipient's behalf. No mail is queued, so no event may claim any was: a subscriber that
+/// counted a suppressed resend as a delivery would be counting mail that does not exist.
+#[tokio::test]
+async fn a_requeueing_resend_emits_and_a_suppressed_one_does_not() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x1_6e);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let id = send_with_payload(
+        &db,
+        &env,
+        scope,
+        "resent@example.test",
+        1_000,
+        &serde_json::json!({ "kind": "email_otp", "code": "hunter2" }),
+    )
+    .await;
+    db.store()
+        .scoped(scope)
+        .messages()
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed {
+                reason: "all_providers_unavailable",
+            },
+        )
+        .await
+        .expect("resolve failed");
+
+    let subject = id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_message_resent",
+        "message.resent",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1,
+        &serde_json::json!({ "message_id": subject, "attempt": 1 }),
+    )
+    .expect("message.resent is registered");
+    let domain_event = ironauth_store::DomainEvent {
+        id: "evt_message_resent",
+        subject: &subject,
+        envelope: &envelope,
+    };
+
+    let resent = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .messages()
+        .resend_with_event(&env, &id, Some(&domain_event))
+        .await
+        .expect("resend");
+    assert_eq!(resent, Resent::Requeued { attempt: 1 });
+
+    let events = queued_message_events(&db, scope).await;
+    assert_eq!(events.len(), 1, "the re-queue enqueues exactly one event");
+    assert_eq!(events[0]["type"], "message.resent");
+    assert_eq!(events[0]["payload"]["message_id"], subject);
+    ironauth_store::event_catalog::validate_event(&events[0])
+        .expect("the envelope validates against the registry the fan-out enforces");
+
+    // SUPPRESS the recipient, then resend again. Nothing is queued, so nothing may be
+    // announced.
+    // Read the blind index off the row rather than recomputing it: the point is to suppress
+    // THIS message's recipient, and a recomputation that drifted from what `enqueue` stored
+    // would suppress nobody while the test still read as a suppression case.
+    let bidx: Vec<u8> =
+        sqlx::query_scalar("SELECT recipient_bidx FROM messages WHERE id = $1 AND tenant_id = $2")
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("read the recipient blind index");
+    suppress(&db, scope, &bidx, "hard_bounce").await;
+    db.store()
+        .scoped(scope)
+        .messages()
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed {
+                reason: "all_providers_unavailable",
+            },
+        )
+        .await
+        .expect("resolve failed again");
+
+    let refused = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .messages()
+        .resend_with_event(&env, &id, Some(&domain_event))
+        .await
+        .expect("the refusal is an outcome, not an error");
+    assert!(
+        matches!(refused, Resent::Suppressed { .. }),
+        "the recipient is suppressed: {refused:?}"
+    );
+    assert!(
+        queued_message_events(&db, scope).await.is_empty(),
+        "a resend that queued no mail must announce nothing"
+    );
+}
+
+/// The webhook-bound events queued for `scope`, drained.
+async fn queued_message_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim webhook events")
+        .into_iter()
+        .map(|message| message.payload)
+        .collect()
+}

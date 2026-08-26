@@ -78,7 +78,7 @@ crates/ironauth-store/src/repository.rs:reparent_with_event:1
 crates/ironauth-store/src/repository.rs:request_dead_letter_replay:1
 crates/ironauth-store/src/repository.rs:request_dead_letter_replay_with_event:2
 crates/ironauth-store/src/repository.rs:resend_in_tx:1
-crates/ironauth-store/src/repository.rs:resend_with_event:1
+crates/ironauth-store/src/repository.rs:resend_with_event:2
 crates/ironauth-store/src/repository.rs:restore_with_event:1
 crates/ironauth-store/src/repository.rs:revoke_all_for_user_with_event:1
 crates/ironauth-store/src/repository.rs:revoke_inner:1
