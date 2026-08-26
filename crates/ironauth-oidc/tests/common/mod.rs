@@ -290,6 +290,7 @@ impl Harness {
     /// gives: the property under test is that a deployment which enables hooks reaches them
     /// from a real request, and an engine probed on a throwaway clone proves the builder works
     /// and says nothing about the wiring.
+    #[cfg(feature = "wasm-hooks")]
     pub async fn start_with_hook_engine(engine: Arc<ironauth_hooks::HookEngine>) -> Self {
         Self::start_with_hook_engine_and_config(engine, OidcConfig::default()).await
     }
@@ -300,6 +301,7 @@ impl Harness {
     /// SERVER-resolved claim in the bag a hook operates on: without it the only claims present
     /// are ones a rule or the hook itself invented, and removing one of those would say nothing
     /// about whether a hook can drop what the mint produced.
+    #[cfg(feature = "wasm-hooks")]
     pub async fn start_with_hook_engine_and_config(
         engine: Arc<ironauth_hooks::HookEngine>,
         config: OidcConfig,
@@ -421,8 +423,14 @@ impl Harness {
         // from, exactly as the boot path does. Absent unless a test asked for it, which is what
         // makes `a_deployment_with_no_engine_does_not_run_a_deployed_hook` a real control
         // rather than a restatement of the default.
+        // Without the `wasm-hooks` feature `HookRuntime` is uninhabited, so the `Some` arm is
+        // unreachable and the compiler proves it -- the same shape the issuance seam uses, for
+        // the same reason: one signature across both builds rather than two that can drift.
         let state = match hook_runtime {
+            #[cfg(feature = "wasm-hooks")]
             Some(runtime) => state.with_hook_engine(runtime),
+            #[cfg(not(feature = "wasm-hooks"))]
+            Some(runtime) => runtime.unreachable(),
             None => state,
         };
         let issuer = state.issuer_for(&scope);
