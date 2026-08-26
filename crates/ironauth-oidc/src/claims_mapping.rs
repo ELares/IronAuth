@@ -390,7 +390,12 @@ pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
         if let Some(reason) = refuse_name(written) {
             return Err(MappingRefusal {
                 rule_index: index,
-                claim: written.to_owned(),
+                // TRUNCATED, by the same function the hook path uses. `reportable`'s own doc
+                // says "the bound has to apply to BOTH outputs or it is not a bound", and this
+                // was the output it did not apply to: the name is reflected in a 400 body and
+                // logged verbatim at issuance for a hand-edited row, so an unbounded one is an
+                // unbounded string in two places a bound was supposed to cover.
+                claim: reportable(written),
                 reason,
             });
         }

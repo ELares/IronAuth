@@ -1910,8 +1910,14 @@ pub struct SetClaimsMappingRequest {
 /// A per-environment, per-client declarative claim mapping, as returned by the management API
 /// (issue #113).
 ///
-/// No secret slot, and none is possible: a rule names claim names, a static value, and a token
-/// placement. It never names a credential and never names a user.
+/// No secret SLOT: a rule names claim names, a static value, and a token placement, and none of
+/// those is a credential field or a user reference.
+///
+/// Not "no secret is possible", which an earlier version said. A `static` rule's value is
+/// arbitrary operator-supplied JSON and this view returns it verbatim to any `management.read`
+/// credential -- so an operator who puts a secret in one has put it somewhere a reader can see
+/// it. What the type guarantees is that nothing here is a secret by DESIGN; what an operator
+/// writes into a free-form value is theirs.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClaimsMappingView {
     /// The authorize client id whose tokens these rules shape (the per-environment natural key).

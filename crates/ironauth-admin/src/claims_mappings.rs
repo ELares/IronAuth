@@ -9,8 +9,14 @@
 //!
 //! # Every write is validated before it is stored, and every REFUSAL is audited
 //!
-//! `ironauth_oidc::claims_mapping::validate` is the one fence: a rule may not write `iss`, `sub`,
-//! `aud`, `exp`, `iat`, or any of the twenty-five names the mint treats as issuer-set. A refusal
+//! `ironauth_oidc::claims_mapping::validate` is the one fence: a rule may not write any of the
+//! twenty-five names the mint treats as issuer-set, which include `iss`, `sub`, `aud`, `exp` and
+//! `iat`. (Twenty-five is the union, not five plus twenty-five.)
+//!
+//! It bounds the NAME and not the COUNT: a thirty-three-rule document passes `validate` and is
+//! refused by the table's CHECK constraint, which surfaces as a 500 rather than an audited 400.
+//! That is a real gap and it is #113's, not this module's -- closing it means teaching the write
+//! path to read a check violation, which is a change to a shared helper's contract. A refusal
 //! is a loud 400 naming the rule INDEX and the claim, never a value, and nothing is written.
 //!
 //! And the refusal is written to the audit log. Criterion 5 asks that attempts to override a
@@ -99,6 +105,10 @@ fn refusal_reason(refusal: &MappingRefusal) -> &'static str {
         RefusalReason::EmptyName => "empty_claim_name",
         RefusalReason::Untrimmed => "untrimmed_claim_name",
         RefusalReason::NameTooLong => "claim_name_too_long",
+        // UNREACHABLE from this surface: `validate` carries no count bound, so only
+        // `filter_hook_claims` produces this. Kept because the match is exhaustive and the
+        // alternative is a catch-all arm that would give a future reason the wrong token
+        // silently -- which is the one thing the distinctness test exists to prevent.
         RefusalReason::TooManyClaims => "too_many_claims",
     }
 }
@@ -152,6 +162,13 @@ pub async fn set_claims_mapping(
     // reasons: a document this version cannot read is a different operator problem from a rule
     // that names a protected claim, and an audit stream that collapsed them could not tell an
     // integration bug from an override attempt.
+    //
+    // The audit write is `?`-propagated, so a store fault turns what would be a 400 into a 500.
+    // That is deliberate and it is the uncomfortable direction: criterion 5 asks for "rejected
+    // AND audited", and answering 400 when the audit did not land would report both while
+    // delivering one. An operator retries a 500; nobody retrieves an audit row that was never
+    // written. Stated here because it is a surprising status code for a validation error, and
+    // the surprise is the cost of the conjunction.
     let rules = match claims_mapping::parse(&rules_json) {
         Ok(rules) => rules,
         Err(error) => {
