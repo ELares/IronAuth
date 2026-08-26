@@ -60,6 +60,61 @@ fn is_writable_by_a_mapping(name: &str) -> bool {
     !is_protected_claim(name) && !PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name)
 }
 
+/// The most claims a hook may contribute to one token.
+///
+/// Deliberately the enrichment hook's bound, not a number chosen here, because the sentence
+/// `ironauth-config` wrote beside that one applies verbatim and more strongly: "a claim is
+/// cheap to send and expensive to carry, since every one of them rides in every token this
+/// subject is issued from now on. The token-size budget (issue #98) is the backstop that
+/// refuses an over-large token; this is what stops a misbehaving FGA pushing a thousand claims
+/// into that budget in the first place."
+///
+/// More strongly, because the enrichment hook's filter is an ALLOWLIST an operator populates a
+/// name at a time, so its output is bounded by construction. A pre-token hook is a DENYLIST
+/// applied to code an integrator deployed, so without this it is unbounded. The more
+/// privileged of the two hooks must not have the weaker bound.
+///
+/// Tied by definition rather than copied, so the two cannot drift apart silently.
+pub const MAX_HOOK_CLAIMS: usize = ironauth_config::OIDC_MAX_ENRICHED_CLAIMS;
+
+/// The longest a claim name may be, in bytes.
+///
+/// A name is a JWT object key that rides in every token and every log line that records the
+/// attempt. Nothing legitimate needs more than this; a hook that sends more is either broken or
+/// is using the audit trail as a write buffer.
+pub const MAX_CLAIM_NAME_BYTES: usize = 128;
+
+/// The one judgement both fences make about a claim name.
+///
+/// Both halves of criterion 5 call this and nothing else, so they are not two fences kept in
+/// agreement, they are one fence with two callers. That distinction matters for what the tests
+/// have to do: a test comparing the two callers to each other cannot fail, because there is
+/// only one list to disagree with. The tests that hold this honest are the ones that assert
+/// ABSOLUTELY, naming the claims that must be refused.
+///
+/// Returns [`None`] if the name may be written.
+fn refuse_name(name: &str) -> Option<RefusalReason> {
+    if name.trim().is_empty() {
+        return Some(RefusalReason::EmptyName);
+    }
+    // Refused rather than trimmed, and the difference is the whole point. Trimming would make
+    // `"sub "` into `sub`, so a padded name would either collide with a claim already present
+    // or silently become the reserved one it was padded to evade. Refusing means the string
+    // this function judged and the string a caller stores are the same string, which is what
+    // stops a later "normalise the key" tidy-up from reopening the fence: there is no second
+    // form of the name for a normalisation to produce.
+    if name != name.trim() {
+        return Some(RefusalReason::Untrimmed);
+    }
+    if name.len() > MAX_CLAIM_NAME_BYTES {
+        return Some(RefusalReason::NameTooLong);
+    }
+    if !is_writable_by_a_mapping(name) {
+        return Some(RefusalReason::Reserved);
+    }
+    None
+}
+
 /// Which token a claim is written into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
@@ -148,6 +203,22 @@ pub enum RefusalReason {
     /// no name is not a claim, and a mapping that wrote one would put a key nobody can address
     /// into every token.
     EmptyName,
+    /// The claim name has leading or trailing whitespace.
+    ///
+    /// Its own reason rather than folded into [`Self::Reserved`], because it is a different
+    /// mistake with a different fix: `"sub "` is not an attempt to write a reserved claim that
+    /// the fence caught, it is a name that would have become one under any normalisation. The
+    /// operator-facing message says which, so the fix is "remove the space" rather than
+    /// "choose a different claim".
+    Untrimmed,
+    /// The claim name is longer than [`MAX_CLAIM_NAME_BYTES`].
+    NameTooLong,
+    /// A hook returned more than [`MAX_HOOK_CLAIMS`] writable claims.
+    ///
+    /// Produced only by [`filter_hook_claims`]. A mapping's length is bounded when it is
+    /// written, by an operator who can see the list; a hook's is not bounded by anything until
+    /// here.
+    TooManyClaims,
 }
 
 impl core::fmt::Display for MappingRefusal {
@@ -162,6 +233,23 @@ impl core::fmt::Display for MappingRefusal {
                 f,
                 "rule {} writes a claim with an empty name",
                 self.rule_index
+            ),
+            RefusalReason::Untrimmed => write!(
+                f,
+                "rule {} writes the claim `{}`, whose name has leading or trailing whitespace",
+                self.rule_index, self.claim
+            ),
+            RefusalReason::NameTooLong => write!(
+                f,
+                "rule {} writes a claim whose name is {} bytes, over the {} byte limit",
+                self.rule_index,
+                self.claim.len(),
+                MAX_CLAIM_NAME_BYTES
+            ),
+            RefusalReason::TooManyClaims => write!(
+                f,
+                "rule {} exceeds the {} claim limit",
+                self.rule_index, MAX_HOOK_CLAIMS
             ),
         }
     }
@@ -191,18 +279,11 @@ pub struct MappedClaims {
 pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
     for (index, rule) in rules.iter().enumerate() {
         let written = rule.written_claim();
-        if written.trim().is_empty() {
+        if let Some(reason) = refuse_name(written) {
             return Err(MappingRefusal {
                 rule_index: index,
                 claim: written.to_owned(),
-                reason: RefusalReason::EmptyName,
-            });
-        }
-        if !is_writable_by_a_mapping(written) {
-            return Err(MappingRefusal {
-                rule_index: index,
-                claim: written.to_owned(),
-                reason: RefusalReason::Reserved,
+                reason,
             });
         }
     }
@@ -617,7 +698,9 @@ mod tests {
         );
         for reserved in ["sub", "iss", "scope", "permissions", "cnf", "azp", "roles"] {
             assert!(
-                outcome.refused.iter().any(|name| name == reserved),
+                outcome
+                    .refused
+                    .contains(&(reserved.to_owned(), RefusalReason::Reserved)),
                 "{reserved} must be reported so an auditor knows it was attempted"
             );
             assert!(
@@ -645,42 +728,236 @@ mod tests {
             serde_json::json!("gold"),
             "one bad claim must not take the good ones with it"
         );
-        assert_eq!(outcome.refused, vec!["sub".to_owned()]);
+        assert_eq!(
+            outcome.refused,
+            vec![("sub".to_owned(), RefusalReason::Reserved)]
+        );
     }
 
-    /// The hook fence and the mapping fence are THE SAME fence.
+    /// Every name any of the three protected lists holds is refused to a HOOK.
     ///
-    /// Two lists would drift, and the one that drifted narrower would be the hole. Asserted
-    /// over the whole reserved set rather than by sampling.
+    /// Asserted ABSOLUTELY, which is the whole point of the rewrite. The first version of this
+    /// test compared the hook fence to the mapping fence, and both of them call one predicate,
+    /// so it was `assert_eq!(f(n), f(n))`: deleting the fence outright left it green. A test
+    /// that derives its expectation from the code under test cannot fail, and this one exists
+    /// precisely to fail when the fence narrows.
+    ///
+    /// All three lists, because `scope_claims` pins only the five-name floor into the other
+    /// two. Nothing pinned `RESERVED_ENRICHMENT_CLAIMS` into the mint fold, so a name added
+    /// there and nowhere else would be refused at config load and accepted from a hook.
     #[test]
-    fn the_hook_and_mapping_fences_admit_exactly_the_same_names() {
+    fn a_hook_may_not_set_any_protected_claim() {
+        let mut checked = 0;
         for name in crate::tokens::PROTECTED_ACCESS_TOKEN_CLAIMS
             .iter()
             .chain(crate::scope_claims::PROTECTED_CLAIMS.iter())
+            .chain(ironauth_config::RESERVED_ENRICHMENT_CLAIMS.iter())
         {
-            let mapping_refuses = validate(&[MappingRule::Static {
-                name: (*name).to_owned(),
-                value: serde_json::json!(1),
-            }])
-            .is_err();
             let mut returned = BTreeMap::new();
             returned.insert((*name).to_owned(), serde_json::json!(1));
-            let hook_refuses = !super::filter_hook_claims(&returned).refused.is_empty();
+            let outcome = super::filter_hook_claims(&returned);
+            assert!(
+                outcome.accepted.is_empty(),
+                "{name} was accepted from a hook"
+            );
             assert_eq!(
-                mapping_refuses, hook_refuses,
-                "{name}: the two fences must agree, or the narrower one is the hole"
+                outcome.refused,
+                vec![((*name).to_owned(), RefusalReason::Reserved)],
+                "{name} must be refused as reserved"
+            );
+            checked += 1;
+        }
+        // The loop covering nothing would satisfy every assertion above it.
+        assert!(checked >= 25, "only {checked} names checked");
+    }
+
+    /// The names a hook must never set, written out by hand.
+    ///
+    /// The test above loops the constants, so narrowing a constant narrows the test with it.
+    /// This one names them, so removing a claim from `PROTECTED_ACCESS_TOKEN_CLAIMS` has to be
+    /// an edit somebody makes here too.
+    #[test]
+    fn the_claims_a_hook_may_never_set_are_these() {
+        for name in [
+            "iss",
+            "sub",
+            "aud",
+            "exp",
+            "iat",
+            "nbf",
+            "jti",
+            "client_id",
+            "scope",
+            "typ",
+            "token_type",
+            "acr",
+            "amr",
+            "auth_time",
+            "nonce",
+            "azp",
+            "cnf",
+            "at_hash",
+            "c_hash",
+            "sid",
+            "org_id",
+            "roles",
+            "permissions",
+            "permissions_status",
+            "act",
+        ] {
+            let mut returned = BTreeMap::new();
+            returned.insert(name.to_owned(), serde_json::json!("attacker"));
+            assert!(
+                super::filter_hook_claims(&returned).accepted.is_empty(),
+                "a hook set {name}"
             );
         }
     }
 
-    /// An empty claim name is refused on the hook side too.
+    /// A claim name with no name is refused, on every shape of "no name" the mapping half tests.
     #[test]
     fn a_hook_cannot_set_a_claim_with_no_name() {
+        for name in ["", "   ", "\t"] {
+            let mut returned = BTreeMap::new();
+            returned.insert(name.to_owned(), serde_json::json!(1));
+            let outcome = super::filter_hook_claims(&returned);
+            assert!(outcome.accepted.is_empty(), "{name:?} was accepted");
+            assert_eq!(
+                outcome.refused,
+                vec![(name.to_owned(), RefusalReason::EmptyName)],
+                "{name:?} must be refused as an empty name, under its own reported name"
+            );
+        }
+    }
+
+    /// A padded reserved name is refused, and refused under the name the hook actually sent.
+    ///
+    /// `"sub "` is in none of the protected lists, which hold exact strings, so before this it
+    /// was accepted and `refused` was empty: the attempt was neither rejected nor audited, and
+    /// criterion 5 asks for both. It is refused rather than trimmed so that the string judged
+    /// and the string stored are the same string.
+    #[test]
+    fn a_padded_reserved_name_is_refused_and_reported_as_sent() {
+        for name in ["sub ", " scope", "cnf\n", "permissions\t", " tier"] {
+            let mut returned = BTreeMap::new();
+            returned.insert(name.to_owned(), serde_json::json!("attacker"));
+            let outcome = super::filter_hook_claims(&returned);
+            assert!(outcome.accepted.is_empty(), "{name:?} was accepted");
+            assert_eq!(
+                outcome.refused,
+                vec![(name.to_owned(), RefusalReason::Untrimmed)],
+                "{name:?} must be audited under the name the hook sent"
+            );
+        }
+    }
+
+    /// An accepted claim is stored under the exact bytes the fence judged.
+    ///
+    /// A round-trip check, and deliberately NOT claimed as the guard against a normalising
+    /// refactor, because it cannot be one. Trimming the key in the accept branch is an
+    /// EQUIVALENT mutation: that branch is reached only when `refuse_name` returned `None`,
+    /// which requires `name == name.trim()`, so `name.trim()` and `name` are the same string
+    /// there by construction. I verified it by mutation and it survives, as it must.
+    ///
+    /// What actually closes that hole is one line upstream: `refuse_name` refusing an
+    /// untrimmed name outright, so there is never a second form of a name for a normalisation
+    /// to collapse. Deleting THAT is caught, by
+    /// `a_padded_reserved_name_is_refused_and_reported_as_sent`.
+    #[test]
+    fn an_accepted_claim_keeps_the_exact_name_the_fence_judged() {
         let mut returned = BTreeMap::new();
-        returned.insert("   ".to_owned(), serde_json::json!(1));
+        returned.insert("tier".to_owned(), serde_json::json!("gold"));
+        let outcome = super::filter_hook_claims(&returned);
+        assert_eq!(
+            outcome.accepted.keys().collect::<Vec<_>>(),
+            vec!["tier"],
+            "the stored key must be the judged key"
+        );
+    }
+
+    /// `refused` is ordered by claim name, which is what the field doc now says.
+    #[test]
+    fn refusals_are_reported_in_claim_name_order() {
+        let mut returned = BTreeMap::new();
+        for name in ["sub", "azp", "iss"] {
+            returned.insert(name.to_owned(), serde_json::json!(1));
+        }
+        let outcome = super::filter_hook_claims(&returned);
+        assert_eq!(
+            outcome
+                .refused
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["azp", "iss", "sub"]
+        );
+    }
+
+    /// A hook cannot contribute more than `MAX_HOOK_CLAIMS`, and the overflow is audited.
+    #[test]
+    fn a_hook_cannot_return_unboundedly_many_claims() {
+        let mut returned = BTreeMap::new();
+        for index in 0..(super::MAX_HOOK_CLAIMS * 4) {
+            returned.insert(format!("c{index:05}"), serde_json::json!(1));
+        }
+        let outcome = super::filter_hook_claims(&returned);
+        assert_eq!(outcome.accepted.len(), super::MAX_HOOK_CLAIMS);
+        assert_eq!(
+            outcome.refused.len(),
+            super::MAX_HOOK_CLAIMS * 3,
+            "the overflow must be reported, not dropped"
+        );
+        assert!(
+            outcome
+                .refused
+                .iter()
+                .all(|(_, reason)| *reason == RefusalReason::TooManyClaims)
+        );
+    }
+
+    /// A claim name longer than the limit is refused.
+    #[test]
+    fn a_hook_cannot_set_an_unboundedly_long_claim_name() {
+        let name = "c".repeat(super::MAX_CLAIM_NAME_BYTES + 1);
+        let mut returned = BTreeMap::new();
+        returned.insert(name.clone(), serde_json::json!(1));
         let outcome = super::filter_hook_claims(&returned);
         assert!(outcome.accepted.is_empty());
-        assert_eq!(outcome.refused.len(), 1);
+        assert_eq!(outcome.refused, vec![(name, RefusalReason::NameTooLong)]);
+
+        let at_limit = "c".repeat(super::MAX_CLAIM_NAME_BYTES);
+        let mut ok = BTreeMap::new();
+        ok.insert(at_limit.clone(), serde_json::json!(1));
+        assert_eq!(
+            super::filter_hook_claims(&ok).accepted.len(),
+            1,
+            "the limit is inclusive, or the bound is off by one"
+        );
+    }
+
+    /// The bound a hook gets is the bound the enrichment hook gets.
+    #[test]
+    fn the_hook_claim_bound_is_tied_to_the_enrichment_bound() {
+        assert_eq!(
+            super::MAX_HOOK_CLAIMS,
+            ironauth_config::OIDC_MAX_ENRICHED_CLAIMS,
+            "the more privileged hook must not get the weaker bound"
+        );
+    }
+
+    /// A mapping refuses a padded name too, since both halves call one function.
+    #[test]
+    fn a_mapping_cannot_write_a_padded_reserved_name() {
+        let refusal = validate(&[MappingRule::Static {
+            name: "sub ".to_owned(),
+            value: serde_json::json!(1),
+        }])
+        .expect_err("a padded reserved name must be refused");
+        assert_eq!(refusal.reason, RefusalReason::Untrimmed);
+        assert!(
+            refusal.to_string().contains("whitespace"),
+            "the message must say what to fix: {refusal}"
+        );
     }
 
     /// A refused mapping applies NOTHING, rather than the rules before the bad one.
@@ -803,14 +1080,23 @@ mod tests {
 pub struct HookOutcome {
     /// The claims that survived, ready to fold into the token being built.
     pub accepted: BTreeMap<String, serde_json::Value>,
-    /// The reserved claims the hook tried to set, in the order it sent them.
+    /// What was refused and why, sorted by claim name.
+    ///
+    /// Sorted, not in the order the hook sent them: the parameter is a [`BTreeMap`], so wire
+    /// order was discarded by the caller before this function was entered and no
+    /// implementation here could recover it. Claim-name order is the better audit property
+    /// anyway, because it makes the row reproducible across two invocations that returned the
+    /// same set.
+    ///
+    /// The reason travels with the name because the two refusals need different fixes, and an
+    /// audit row that says only "refused" cannot tell an integrator which one they hit.
     ///
     /// NOT an error and not silently discarded: a list. Criterion 5 says an attempt is
     /// "rejected and AUDITED", and an auditor needs to know which claims were attempted by
     /// whom. Returning them lets the caller write that row; dropping them would leave the
     /// audit with nothing to say, and failing the whole invocation would let one bad claim
     /// take down every login through a client whose hook is merely sloppy.
-    pub refused: Vec<String>,
+    pub refused: Vec<(String, RefusalReason)>,
 }
 
 /// Filter what a hook returned, refusing the claims no hook may set.
@@ -831,6 +1117,16 @@ pub struct HookOutcome {
 /// criterion 5's sentence covers "any mapping OR HOOK" and a hook is the side with the wider
 /// reach. `scope` authorizes IronAuth's own management API and `cnf` drives `DPoP`; a hook that
 /// could set either would be choosing its own authorization.
+/// # Bounded, because a denylist alone is not a bound
+///
+/// The name fence refuses twenty-five names and would admit everything else without limit. A
+/// hook returning a hundred thousand claims would have every one of them accepted and, per the
+/// field doc above, folded into a token. [`MAX_HOOK_CLAIMS`] is what stops that, and the
+/// overflow is refused into `refused` rather than dropped, so the audit records that claims
+/// were lost instead of quietly minting a shorter token than the hook asked for.
+///
+/// Which claims overflow is decided in claim-name order, so it is the same set on every
+/// invocation given the same input rather than whichever ones happened to hash first.
 #[must_use]
 pub fn filter_hook_claims(returned: &BTreeMap<String, serde_json::Value>) -> HookOutcome {
     let mut outcome = HookOutcome {
@@ -838,10 +1134,14 @@ pub fn filter_hook_claims(returned: &BTreeMap<String, serde_json::Value>) -> Hoo
         refused: Vec::new(),
     };
     for (name, value) in returned {
-        if name.trim().is_empty() || !is_writable_by_a_mapping(name) {
-            outcome.refused.push(name.clone());
-        } else {
+        if let Some(reason) = refuse_name(name) {
+            outcome.refused.push((name.clone(), reason));
+        } else if outcome.accepted.len() < MAX_HOOK_CLAIMS {
             outcome.accepted.insert(name.clone(), value.clone());
+        } else {
+            outcome
+                .refused
+                .push((name.clone(), RefusalReason::TooManyClaims));
         }
     }
     outcome
