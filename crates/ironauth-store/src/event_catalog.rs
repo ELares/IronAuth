@@ -2088,6 +2088,41 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A claim mapping decides the SHAPE OF EVERY TOKEN a client is issued: which claims it
+        // carries, under what names, and in which of the two tokens. Changing one changes what
+        // every resource server downstream sees, so it belongs on the stream a SIEM watches.
+        //
+        // THE CLIENT ONLY, and no rules. The client is the stable address (this table has no id
+        // of its own and the write is an upsert keyed on it), and the rules are configuration a
+        // consumer refetches rather than something a notification should carry: an event that
+        // embedded them would put the whole document on every stream that subscribes.
+        "claims_mapping.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_id"]
+        }"#,
+    ),
+    (
+        // Removing a mapping restores the UNSHAPED token, which is a widening: claims the
+        // mapping filtered out come back, and claims it placed in one token appear in both.
+        // That is the direction that matters on an audit stream.
+        "claims_mapping.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_id"]
+        }"#,
+    ),
+    (
         // A signup form governs what a self-service REGISTRATION collects and requires, so
         // removing one changes who can sign up and with what. The client id rides along
         // because a signup form is per-client and that is how an operator refers to it.
@@ -2928,6 +2963,7 @@ mod tests {
         "locale_bundle.set",
         "message_template.set",
         "organization.default_role_set",
+        "claims_mapping.set",
         "signup_form.set",
         "step_up_policy.set",
         // `withdrawn` (withdraw/withdrew/withdrawn) and `resent` (resend/resent/resent).

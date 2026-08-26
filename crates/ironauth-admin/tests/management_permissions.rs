@@ -173,6 +173,15 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("setSignupForm", ManagementPermission::WriteConfig),
     ("deleteSignupForm", ManagementPermission::WriteConfig),
     ("getSignupForm", ManagementPermission::Read),
+    // Declarative claim mappings (issue #113). `write_config` rather than anything softer,
+    // because a mapping decides the shape of EVERY token a client is issued -- which claims it
+    // carries, under what names, and in which of the two tokens -- so a credential that could
+    // set one could change what every resource server downstream sees. The DELETE is classified
+    // the same way for the reason that is easy to miss: removing a mapping is a WIDENING, since
+    // claims it filtered out come back and claims it placed in one token appear in both.
+    ("setClaimsMapping", ManagementPermission::WriteConfig),
+    ("deleteClaimsMapping", ManagementPermission::WriteConfig),
+    ("getClaimsMapping", ManagementPermission::Read),
     // User sub-surfaces: identifiers, trait schemas, signup quarantine and recovery
     // approvals. Identifier UNIQUENESS and trait schemas are config rather than user
     // authority, because each changes a rule the whole environment obeys.
@@ -592,6 +601,14 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
 /// the false coverage claim this list exists to prevent. Hand-maintained, and only for
 /// operations somebody actually checked.
 const PERMISSION_PROVEN: &[&str] = &[
+    // Proven in `delegated_admin.rs`, each in BOTH directions: a credential holding a DIFFERENT
+    // permission gets 403 and the classified one reaches the handler (404 on an absent client),
+    // so neither a blanket refusal nor a missing gate would pass them. The DELETE is pinned
+    // separately from the write because its reason is the one that is easy to get wrong --
+    // removing a mapping restores the UNSHAPED token, so it is a widening.
+    "setClaimsMapping",
+    "deleteClaimsMapping",
+    "getClaimsMapping",
     // Proven in `read_is_required_and_sufficient_for_the_event_feed_and_usage_export`, in
     // BOTH directions: a `write_config` credential is refused and a `read` one is allowed,
     // so neither a blanket refusal nor a missing gate would pass it.
@@ -707,7 +724,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 181 operations declare a required permission and 37 have that permission proven. The other
+/// 186 operations declare a required permission and 42 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -722,7 +739,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// without somebody editing this assertion and noticing what they are doing.
 ///
 /// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 181 minus 37 is always 144. (It read "166 minus 22", then "171 minus 27", while
+/// its own: 186 minus 42 is always 144. (It read "166 minus 22", then "171 minus 27", while
 /// the pins above it moved twice without it, which is the hazard of writing an arithmetic
 /// identity beside the numbers it derives from rather than deriving it. Both operands are
 /// pinned by the two `assert_eq!`s in the test below; if you change either, change this
@@ -740,12 +757,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        183,
+        186,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        39,
+        42,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -759,6 +776,10 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
 /// differs from what was built.
 const ADMIN_SOURCES: &[(&str, &str)] = &[
     ("api_keys.rs", include_str!("../src/api_keys.rs")),
+    (
+        "claims_mappings.rs",
+        include_str!("../src/claims_mappings.rs"),
+    ),
     ("messages.rs", include_str!("../src/messages.rs")),
     (
         "service_account_keys.rs",

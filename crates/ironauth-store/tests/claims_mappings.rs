@@ -376,7 +376,7 @@ async fn the_row_level_policy_refuses_a_raw_read_from_another_scope() {
     );
 }
 
-/// The DATA plane cannot write a mapping, and the control plane cannot delete one.
+/// The DATA plane cannot write a mapping, and the CONTROL plane owns its whole lifecycle.
 ///
 /// Both are stated in the migration and neither was attempted by any test: widening the
 /// data-plane grant to INSERT and UPDATE -- letting the plane that mints tokens rewrite the
@@ -419,17 +419,15 @@ async fn the_grant_split_is_what_the_migration_says_it_is() {
             .await
             .expect("pin scope");
     }
-    let deleted = sqlx::query("DELETE FROM claims_mappings")
+    // The control plane MAY delete now: 0159 withheld the grant saying "the operation does not
+    // exist yet", and 0161 grants it because `ActingClaimsMappingRepo::delete` is that
+    // operation. Asserted rather than dropped, because the split is what is under test and
+    // "control may delete" is half of it -- the other half is the data plane, three statements
+    // above, which may not.
+    sqlx::query("DELETE FROM claims_mappings")
         .execute(&mut *control)
-        .await;
-    let message = deleted
-        .expect_err("no DELETE grant exists yet, by design")
-        .to_string();
-    assert!(
-        message.contains("permission denied"),
-        "removing a mapping is an operation that has no caller yet, so the privilege must not \
-         be held: {message}"
-    );
+        .await
+        .expect("the control plane owns this table's lifecycle, including removal");
 }
 
 /// A write is AUDITED, and the audit names the client whose tokens changed shape.

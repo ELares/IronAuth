@@ -861,6 +861,33 @@ impl Fixture {
             .await
             .expect("seed a remembered consent");
 
+        // A declarative claim mapping (issue #113), seeded rather than left to the sweep's own
+        // PUT case.
+        //
+        // The read sweep compares a soft-deleted environment's answer against a LIVE control
+        // harness, and the control drives every case in order -- so a GET that depends on the
+        // PUT beside it answers 200 at the control and 404 at the doomed environment, where the
+        // PUT was correctly refused. That difference is the fixture, not the fence.
+        //
+        // `getClaimsMapping` is 404 when no mapping is installed, deliberately: "no mapping"
+        // and "an empty mapping" produce opposite tokens, so a 200 carrying an empty rule list
+        // would report one as the other. Seeding is what makes both environments hold the same
+        // state, which is the only condition under which the comparison measures the fence.
+        // The CONTROL store: `claims_mappings` grants the data plane SELECT and nothing more,
+        // deliberately, so seeding through `h.store()` is a permission-denied rather than a
+        // seed. That refusal is the grant split working.
+        h.control_store()
+            .scoped(scope)
+            .acting(actor, CorrelationId::generate(&env))
+            .claims_mappings()
+            .set(
+                &env,
+                &ironauth_store::ClientId::parse_in_scope(&client, &scope).expect("client id"),
+                r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+            )
+            .await
+            .expect("seed a claim mapping");
+
         // A quarantined signup for the fraud-review queue.
         let quarantined_user = h
             .store()
@@ -1650,6 +1677,16 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/applications/{client}/signup-form"),
             &serde_json::json!({ "fields": [] }),
         ),
+        // Declarative claim mappings (issue #113): the same per-client shape as the signup
+        // form beside it. An empty rule list, because what these sweeps ask is whether the
+        // ENVIRONMENT is checked, and a body that could be refused on its own contents would
+        // answer a different question.
+        Case::json(
+            "claims_mappings.setClaimsMapping",
+            "PUT",
+            format!("{base}/applications/{client}/claims-mapping"),
+            &serde_json::json!({ "rules": [] }),
+        ),
         // Environment VARIABLE management (issue #235). All four operations are environment
         // scoped and take no parent beyond the environment, so a soft-deleted environment must
         // refuse the two writes and the two reads must read exactly like an absent one.
@@ -1701,6 +1738,16 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "signup_forms.deleteSignupForm",
             "DELETE",
             format!("{base}/applications/{client}/signup-form"),
+        ),
+        Case::empty(
+            "claims_mappings.getClaimsMapping",
+            "GET",
+            format!("{base}/applications/{client}/claims-mapping"),
+        ),
+        Case::empty(
+            "claims_mappings.deleteClaimsMapping",
+            "DELETE",
+            format!("{base}/applications/{client}/claims-mapping"),
         ),
         // ---- brands (issue #475) ----
         // A slug of its OWN, so the set/get/delete lifecycle below cannot disturb the seeded

@@ -566,6 +566,34 @@ fn secret_cases(base: &str) -> Vec<Case> {
     ]
 }
 
+/// The per-client DECLARATIVE CLAIM MAPPING writes (issue #113).
+///
+/// Their own function rather than two more entries in `client_cases`, which is already at the
+/// line ceiling. The ceiling is worth keeping rather than raising: this list is a catalogue, and
+/// a catalogue nobody finishes reading is one where a missing case hides.
+///
+/// An EMPTY rule list on the write, because the question these sweeps ask is whether an ABSENT
+/// environment answers the uniform not-found. A body that could be refused on its own contents
+/// would answer a different question, and would answer it identically whether or not the
+/// environment was checked at all.
+fn claims_mapping_cases(base: &str, ids: &Ids) -> Vec<Case> {
+    let Ids { client, .. } = ids;
+    vec![
+        Case {
+            label: "claims_mappings.setClaimsMapping",
+            method: "PUT",
+            path: format!("{base}/applications/{client}/claims-mapping"),
+            body: Some(body_of(&serde_json::json!({ "rules": [] }))),
+        },
+        Case {
+            label: "claims_mappings.deleteClaimsMapping",
+            method: "DELETE",
+            path: format!("{base}/applications/{client}/claims-mapping"),
+            body: None,
+        },
+    ]
+}
+
 fn client_cases(base: &str, ids: &Ids) -> Vec<Case> {
     let Ids { client, .. } = ids;
     vec![
@@ -1409,6 +1437,7 @@ fn all_cases(tenant: &str, environment: &str) -> Vec<Case> {
     cases.extend(log_stream_cases(&base));
     cases.extend(message_cases(&base));
     cases.extend(client_cases(&base, &ids));
+    cases.extend(claims_mapping_cases(&base, &ids));
     cases.extend(secret_cases(&base));
     cases.extend(posture_cases(&base, &ids));
     cases.extend(config_and_connector_cases(&base, &ids));

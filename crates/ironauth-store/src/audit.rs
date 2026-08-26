@@ -921,6 +921,20 @@ pub enum Action {
     /// row names the CLIENT, because this table has no id of its own and the client is the thing
     /// whose tokens changed shape. The rules themselves are not recorded here.
     ClaimsMappingSet,
+    /// A per-environment, per-client DECLARATIVE CLAIM MAPPING was REFUSED at the management API
+    /// (issue #113 criterion 5: protected claims "cannot be overridden by any mapping or hook;
+    /// attempts are rejected AND AUDITED").
+    ///
+    /// The refusal alone is not the whole criterion. A rejected attempt is an operator trying to
+    /// make `sub` say something else, and a rejection nobody can see afterwards is
+    /// indistinguishable from an attempt that was never made. The audit row names the CLIENT and
+    /// the REASON; it does not carry the rules, because a refused document is exactly the thing
+    /// not to copy onto an audit stream.
+    ClaimsMappingRefused,
+    /// A per-environment, per-client DECLARATIVE CLAIM MAPPING was deleted through the management
+    /// API (issue #113), restoring the UNSHAPED token for that client. The audit row names the
+    /// client.
+    ClaimsMappingDelete,
     /// A per-environment, per-client SIGNUP FORM was set through the management API (issue #87):
     /// a first write or an overwrite of the fail-fast validated field list. The audit row names
     /// the signup form id and scope; the field list itself is not recorded here.
@@ -1562,6 +1576,8 @@ impl Action {
             Action::FlowTargetReplayDeadLetters => "flow_target.replay_dead_letters",
             Action::MessageTemplateDelete => "message_template.delete",
             Action::ClaimsMappingSet => "claims_mapping.set",
+            Action::ClaimsMappingRefused => "claims_mapping.refused",
+            Action::ClaimsMappingDelete => "claims_mapping.delete",
             Action::SignupFormSet => "signup_form.set",
             Action::SignupFormDelete => "signup_form.delete",
             Action::FlowVersionCreate => "flow_version.create",

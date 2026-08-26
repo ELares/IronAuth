@@ -80,6 +80,7 @@ pub mod log_shipper;
 pub mod log_stream_signature;
 
 pub mod ciba_ping;
+mod claims_mappings;
 mod external_issuers;
 pub mod flow_target_delivery;
 mod flow_targets;
@@ -800,6 +801,15 @@ pub fn management_router(state: AdminState) -> Router {
             put(locales::set_locale)
                 .get(locales::get_locale)
                 .delete(locales::delete_locale),
+        )
+        // Per-environment, per-client DECLARATIVE CLAIM MAPPINGS (issue #113): set (validated
+        // against the one protected-claim fence, with every REFUSAL audited), get, and delete
+        // the rule list that shapes a client's tokens.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping",
+            put(claims_mappings::set_claims_mapping)
+                .get(claims_mappings::get_claims_mapping)
+                .delete(claims_mappings::delete_claims_mapping),
         )
         // Per-environment, per-client signup forms as data (issue #87): set (fail-fast validated
         // against the active trait schema), get, and delete a form keyed on the authorize client

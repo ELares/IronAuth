@@ -1,0 +1,18 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The control plane's DELETE on claims_mappings (issue #113).
+--
+-- 0159 created the table and deliberately withheld this grant, saying why:
+--
+--     No DELETE. Removing a client's mapping is an ordinary operation this table will need, and
+--     the operation does not exist yet; a privilege held by nobody is one an attacker inherits
+--     for free.
+--
+-- The operation exists now: `ActingClaimsMappingRepo::delete`, audited as
+-- `claims_mapping.delete`, behind the management API's `DELETE .../claims-mapping`.
+--
+-- CONTROL PLANE ONLY, which is the same split 0159 drew for INSERT and UPDATE. Deleting a
+-- mapping RESTORES THE UNSHAPED TOKEN -- claims the mapping filtered out come back, and claims
+-- it placed in one token appear in both -- so it is a widening, and the plane that mints tokens
+-- must not be able to perform one on itself.
+GRANT DELETE ON claims_mappings TO ironauth_control;
