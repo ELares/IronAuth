@@ -23,6 +23,7 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{ClientId, CorrelationId, export_snapshot, validate_document};
+use sqlx::Row as _;
 
 /// A rule set as the admin path would store it after validation: a rename and a static claim.
 const RULES: &str = r#"[{"kind":"rename","from":"dept","to":"department"},{"kind":"static","name":"tier","value":"gold"}]"#;
@@ -33,7 +34,6 @@ async fn a_mapping_written_on_the_control_plane_reads_back_on_the_data_plane() {
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let control = db.control_store();
-    let app = db.store();
     let client = ClientId::generate(&env, &scope);
 
     control
@@ -44,7 +44,7 @@ async fn a_mapping_written_on_the_control_plane_reads_back_on_the_data_plane() {
         .await
         .expect("write the mapping");
 
-    let record = app
+    let record = control
         .scoped(scope)
         .claims_mappings()
         .get(&client.to_string())
@@ -70,7 +70,7 @@ async fn a_mapping_written_on_the_control_plane_reads_back_on_the_data_plane() {
         )
         .await
         .expect("overwrite");
-    let all = app
+    let all = control
         .scoped(scope)
         .claims_mappings()
         .list_all()
@@ -147,7 +147,7 @@ async fn a_mapping_in_one_scope_is_invisible_in_another() {
         .expect("write in scope one");
 
     let other = db
-        .store()
+        .control_store()
         .scoped(two)
         .claims_mappings()
         .get(&client.to_string())
@@ -158,7 +158,7 @@ async fn a_mapping_in_one_scope_is_invisible_in_another() {
         "a mapping of another scope must be a uniform not-found"
     );
     assert!(
-        db.store()
+        db.control_store()
             .scoped(two)
             .claims_mappings()
             .list_all()
@@ -185,9 +185,16 @@ async fn a_write_into_a_scope_that_does_not_exist_is_refused() {
     );
     let client = ClientId::generate(&env, &absent);
 
-    // Without the scope foreign key this INSERT succeeds and parks an orphan row in an
-    // environment that does not exist; `is_absent_scope` converts the 23503 the key raises into
-    // a uniform not-found, and with no key there is no 23503 to convert.
+    // What this pins is the CONVERSION: an absent scope answers with the uniform not-found
+    // rather than a raw database error, so a caller cannot distinguish "no such environment"
+    // from "nothing there".
+    //
+    // It does NOT pin that the FOREIGN KEY is what refuses it -- measured: removing both keys
+    // leaves this test green, because the write is refused earlier for another reason. The key's
+    // existence is pinned by `every_scoped_table_declares_a_scope_foreign_key` in
+    // tests/absent_scope.rs, which enumerates every RLS-forcing table and fails when one has no
+    // scope key. Two tests, two properties; saying so here stops this one being read as proof
+    // of the other.
     let refused = db
         .control_store()
         .scoped(absent)
@@ -196,20 +203,25 @@ async fn a_write_into_a_scope_that_does_not_exist_is_refused() {
         .set(&env, &client, RULES)
         .await;
     assert!(
-        refused.is_err(),
-        "a write into an absent scope must be refused, not parked as an orphan"
+        matches!(refused, Err(ironauth_store::StoreError::NotFound)),
+        "an absent scope must convert to the UNIFORM not-found, which is the whole point of the \
+         foreign key: `is_absent_scope` matches SQLSTATE 23503 on a `_tenant_id_fkey` \
+         constraint, and with no key there is no 23503 to convert. Got: {refused:?}"
     );
 
-    // And the real scope is untouched by the attempt.
-    assert!(
-        db.store()
-            .scoped(real)
-            .claims_mappings()
-            .list_all()
-            .await
-            .expect("list")
-            .is_empty()
+    // And NOTHING was written anywhere. Counted as the cluster OWNER, not through a scoped
+    // read: a scoped read of the absent scope is empty whether the row landed or not, so it
+    // could not tell an orphan from a refusal.
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM claims_mappings")
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("count as owner");
+    let total: i64 = row.get("n");
+    assert_eq!(
+        total, 0,
+        "a refused write must leave no orphan row anywhere"
     );
+    let _ = real;
 }
 
 #[tokio::test]
@@ -293,4 +305,166 @@ fn a_malformed_claims_mapping_document_is_refused_on_import() {
     // everything is refused.
     let ok = document(r#"{"client_id":"cli_x","rules":[{"kind":"static","name":"tier"}]}"#);
     validate_document(ok.as_bytes()).expect("a well-formed mapping must be accepted");
+}
+
+/// The ROW-LEVEL SECURITY policy is what isolates a mapping, not the query's WHERE clause.
+///
+/// The cross-scope test above reads through `ClaimsMappingRepo`, whose SQL already filters by
+/// scope -- so it passes with the policy replaced by `USING (true)`, and it did. This one
+/// subverts the application filter the way `tests/rls.rs` does: a raw `SELECT` with NO scope
+/// predicate, on a connection pinned to another scope. Only the policy can refuse it.
+#[tokio::test]
+async fn the_row_level_policy_refuses_a_raw_read_from_another_scope() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let one = db.seed_scope(&env).await;
+    let two = db.seed_scope(&env).await;
+    let client = ClientId::generate(&env, &one);
+
+    db.control_store()
+        .scoped(one)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .claims_mappings()
+        .set(&env, &client, RULES)
+        .await
+        .expect("write in scope one");
+
+    let mut conn = db.control_pool().acquire().await.expect("acquire");
+    sqlx::query("SELECT set_config('ironauth.tenant_id', $1, false)")
+        .bind(two.tenant().to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("pin tenant to scope two");
+    sqlx::query("SELECT set_config('ironauth.environment_id', $1, false)")
+        .bind(two.environment().to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("pin environment to scope two");
+
+    // No WHERE clause at all: whatever comes back is what the POLICY allowed.
+    let rows = sqlx::query("SELECT client_id FROM claims_mappings")
+        .fetch_all(&mut *conn)
+        .await
+        .expect("raw read");
+    assert!(
+        rows.is_empty(),
+        "a raw read pinned to another scope must see nothing; the isolation is the policy, not \
+         the repository's WHERE clause"
+    );
+}
+
+/// The DATA plane cannot write a mapping, and the control plane cannot delete one.
+///
+/// Both are stated in the migration and neither was attempted by any test: widening the
+/// data-plane grant to INSERT and UPDATE -- letting the plane that mints tokens rewrite the
+/// shape of the tokens it mints -- left the whole suite green.
+#[tokio::test]
+async fn the_grant_split_is_what_the_migration_says_it_is() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let mut app = db.app_pool().acquire().await.expect("acquire app");
+    let refused = sqlx::query(
+        "INSERT INTO claims_mappings (tenant_id, environment_id, client_id, rules) \
+         VALUES ($1, $2, 'cli_x', '[]'::jsonb)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(&mut *app)
+    .await;
+    let message = refused
+        .expect_err("the data plane must not write")
+        .to_string();
+    assert!(
+        message.contains("permission denied"),
+        "the data plane must be refused by a GRANT, not by a policy or a filter: {message}"
+    );
+
+    // The control plane may write, and may NOT delete.
+    let mut control = db.control_pool().acquire().await.expect("acquire control");
+    for setting in ["ironauth.tenant_id", "ironauth.environment_id"] {
+        let value = if setting.ends_with("tenant_id") {
+            scope.tenant().to_string()
+        } else {
+            scope.environment().to_string()
+        };
+        sqlx::query("SELECT set_config($1, $2, false)")
+            .bind(setting)
+            .bind(value)
+            .execute(&mut *control)
+            .await
+            .expect("pin scope");
+    }
+    let deleted = sqlx::query("DELETE FROM claims_mappings")
+        .execute(&mut *control)
+        .await;
+    let message = deleted
+        .expect_err("no DELETE grant exists yet, by design")
+        .to_string();
+    assert!(
+        message.contains("permission denied"),
+        "removing a mapping is an operation that has no caller yet, so the privilege must not \
+         be held: {message}"
+    );
+}
+
+/// A write is AUDITED, and the audit names the client whose tokens changed shape.
+///
+/// Replacing the audited write with a plain transaction and the same INSERT left every test
+/// green: the mapping landed and nothing recorded who changed it.
+#[tokio::test]
+async fn a_write_records_an_audit_row_naming_the_client() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = ClientId::generate(&env, &scope);
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .claims_mappings()
+        .set(&env, &client, RULES)
+        .await
+        .expect("write");
+
+    let row = sqlx::query(
+        "SELECT action, target_id FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'claims_mapping.set'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("an audit row must exist for the write");
+    let target: String = row.get("target_id");
+    assert_eq!(
+        target,
+        client.to_string(),
+        "the audit target is the CLIENT: this table has no id of its own, and the client is the \
+         thing whose tokens changed shape"
+    );
+}
+
+/// A write for a client of ANOTHER scope is a uniform not-found.
+#[tokio::test]
+async fn a_write_for_a_client_of_another_scope_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let here = db.seed_scope(&env).await;
+    let elsewhere = db.seed_scope(&env).await;
+    let foreign = ClientId::generate(&env, &elsewhere);
+
+    let refused = db
+        .control_store()
+        .scoped(here)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .claims_mappings()
+        .set(&env, &foreign, RULES)
+        .await;
+    assert!(
+        matches!(refused, Err(ironauth_store::StoreError::NotFound)),
+        "a client id carries its scope, so one from elsewhere must not address this one: \
+         {refused:?}"
+    );
 }

@@ -405,11 +405,12 @@ pub struct LocaleBundleSnapshot {
     pub entries: serde_json::Value,
 }
 
-/// The secret-free projection of one per-environment, per-client signup form (issue #87). A
-/// signup form is NON-secret promotable config: the client id it governs and the field list
-/// (each field a trait pointer, a required flag, an order, a step, a narrowing-only rule object,
-/// and a label message id) travel as embedded parsed JSON so the field list canonicalizes
-/// recursively. No secret and no PII: only trait pointers, bounded rules, and numeric ids.
+/// The secret-free projection of one per-environment, per-client declarative claim mapping
+/// (issue #113). A mapping is NON-secret promotable config: the client it shapes tokens for and
+/// an ordered rule list, each rule naming claim names, a static value, and a token placement.
+/// The rules travel as embedded parsed JSON so the document canonicalizes recursively, which is
+/// what makes two environments with the same mapping export byte-identically. No secret and no
+/// PII: a rule names claims, never a credential and never a user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimsMappingSnapshot {
     /// The OAuth client these rules shape tokens for, unique per scope: the stable natural key
@@ -420,7 +421,11 @@ pub struct ClaimsMappingSnapshot {
     pub rules: serde_json::Value,
 }
 
-/// The secret-free projection of one per-environment, per-client signup form (issue #87).
+/// The secret-free projection of one per-environment, per-client signup form (issue #87). A
+/// signup form is NON-secret promotable config: the client id it governs and the field list
+/// (each field a trait pointer, a required flag, an order, a step, a narrowing-only rule object,
+/// and a label message id) travel as embedded parsed JSON so the field list canonicalizes
+/// recursively. No secret and no PII: only trait pointers, bounded rules, and numeric ids.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignupFormSnapshot {
     /// The authorize client id this form governs, unique per scope: the stable natural key the

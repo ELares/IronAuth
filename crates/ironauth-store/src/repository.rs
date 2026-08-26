@@ -32166,10 +32166,14 @@ impl SignupFormRepo<'_> {
 /// config-snapshot export. Every read is scope-forced under row-level security, so a mapping of
 /// another scope is a uniform not-found.
 ///
-/// READ ONLY, and that is the plane separation the migration's grants encode: `ironauth_app` has
-/// SELECT and nothing more, because the plane that mints tokens must not be able to change the
-/// shape of the tokens it mints. Writing a mapping is a control-plane action and gets its own
-/// acting repository when the admin surface lands.
+/// READ ONLY. Writing a mapping is a control-plane action performed by
+/// [`ActingClaimsMappingRepo::set`], audited as `claims_mapping.set`; the admin HTTP surface
+/// that will call it is not in this change.
+///
+/// The data plane holds no grant on this table YET: the issuance-path reader that needs one does
+/// not exist, and a privilege whose only exerciser is a test is one an attacker inherits for
+/// free. When that reader lands it takes SELECT and nothing more, because the plane that mints
+/// tokens must not be able to change the shape of the tokens it mints.
 pub struct ClaimsMappingRepo<'a> {
     store: &'a Store,
     scope: Scope,

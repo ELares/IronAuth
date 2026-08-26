@@ -79,18 +79,30 @@ CREATE TABLE claims_mappings (
     -- Named the obvious way, this constraint could never fire for any value: dropping it
     -- entirely produced byte-identical errors. The `_a_`/`_b_` infixes are what make the
     -- structural check the one that answers.
-    CONSTRAINT claims_mappings_rules_a_is_array
-        CHECK (jsonb_typeof(rules) = 'array'),
-    -- A bound on the document, for the reason the hook response has one: this is read on every
-    -- token issuance for the client, and an unbounded rule list is an unbounded cost on the
-    -- login path. Thirty-two matches OIDC_MAX_ENRICHED_CLAIMS, the ceiling the enrichment
-    -- hook's allowlist already carries, because both answer the same question: how many claims
-    -- may one mechanism contribute to a token.
+    -- ONE constraint for the whole document shape, not two ordered ones.
     --
-    -- Named to sort AFTER the structural check above, so a non-array is refused as a non-array
-    -- rather than raising 22023 out of this one.
-    CONSTRAINT claims_mappings_rules_b_bounded
-        CHECK (jsonb_array_length(rules) <= 32)
+    -- The first version had a separate array check and a separate length check, and the array
+    -- check could never fire: Postgres evaluates CHECKs in constraint-NAME order, and
+    -- `jsonb_array_length` RAISES 22023 on a non-array rather than returning false, so whichever
+    -- of the two sorted first decided every case. Renaming them with `_a_`/`_b_` infixes fixed
+    -- the ordering and left the fix resting on alphabetical luck, which nothing measures and the
+    -- next rename quietly breaks.
+    --
+    -- A CASE removes the dependence: the type test guards the length test in one expression, so
+    -- a non-array, a scalar and a JSON null are all plain check violations naming this
+    -- constraint, and a 33-element array is the same violation for the other reason.
+    --
+    -- Thirty-two matches OIDC_MAX_ENRICHED_CLAIMS, the ceiling the enrichment hook's allowlist
+    -- already carries, because both answer the same question: how many claims may one mechanism
+    -- contribute to a token. This is read on every issuance for the client, so an unbounded rule
+    -- list is an unbounded cost on the login path.
+    CONSTRAINT claims_mappings_rules_shape
+        CHECK (
+            CASE
+                WHEN jsonb_typeof(rules) = 'array' THEN jsonb_array_length(rules) <= 32
+                ELSE false
+            END
+        )
 );
 
 ALTER TABLE claims_mappings ENABLE ROW LEVEL SECURITY;
@@ -106,11 +118,14 @@ CREATE POLICY claims_mappings_scope ON claims_mappings
         AND environment_id = current_setting('ironauth.environment_id', true)
     );
 
--- The DATA plane READS the rules on the issuance path and never writes them. A mapping is
--- configuration: the plane that mints tokens must not be able to change the shape of the
--- tokens it mints, which is the same separation `messages` draws when it gives the control
--- plane SELECT only.
-GRANT SELECT ON claims_mappings TO ironauth_app;
+-- NO data-plane grant yet. The issuance path WILL read these on every token it mints, and that
+-- reader does not exist: its only exerciser today would be a test, and the rule this file states
+-- for DELETE applies just as much to SELECT -- "a privilege held by nobody is one an attacker
+-- inherits for free". It arrives with the mint-side reader.
+--
+-- When it does, the split is SELECT for the data plane and nothing more: the plane that mints
+-- tokens must not be able to change the shape of the tokens it mints, which is the same
+-- separation `messages` draws.
 
 -- The CONTROL plane is where an operator writes a mapping: `ActingClaimsMappingRepo::set`,
 -- audited as `claims_mapping.set`. The grants arrive WITH that caller rather than ahead of it,
