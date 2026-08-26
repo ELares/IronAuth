@@ -192,6 +192,12 @@ pub enum ResourceType {
     /// paths as RFC 6901 pointers plus a narrowing-only rule set: all non-secret per-environment
     /// config a config snapshot carries and a promotion replays, so it is Promotable.
     SignupForm,
+    /// A per-environment, per-client declarative claim mapping (issue #113): the ordered rule
+    /// list that renames, filters, statically sets, and places claims across the ID and access
+    /// tokens with no custom code. It is non-secret per-environment configuration -- a rule
+    /// names claim names and static values, never a credential -- so a config snapshot carries
+    /// it and a promotion replays it, which makes it Promotable.
+    ClaimsMapping,
     /// A per-environment custom-journey version (issue #92, PR 5): one immutable version of a
     /// declarative journey artifact in a (tenant, environment) registry, plus its active pin. The
     /// whole canonical artifact is non-secret per-environment config (a predicate references trait
@@ -247,7 +253,7 @@ impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 33] = [
+    pub const ALL: [ResourceType; 34] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -277,6 +283,7 @@ impl ResourceType {
         ResourceType::SignupForm,
         ResourceType::FlowVersion,
         ResourceType::MessageTemplate,
+        ResourceType::ClaimsMapping,
         ResourceType::OrgRole,
         ResourceType::OrgGroup,
         ResourceType::OrgAuthPolicy,
@@ -316,6 +323,7 @@ impl ResourceType {
             ResourceType::SignupForm => "signup_form",
             ResourceType::FlowVersion => "flow_version",
             ResourceType::MessageTemplate => "message_template",
+            ResourceType::ClaimsMapping => "claims_mapping",
             ResourceType::OrgRole => "org_role",
             ResourceType::OrgGroup => "org_group",
             ResourceType::OrgAuthPolicy => "org_auth_policy",
@@ -357,6 +365,7 @@ impl ResourceType {
             | ResourceType::SignupForm
             | ResourceType::FlowVersion
             | ResourceType::MessageTemplate
+            | ResourceType::ClaimsMapping
             | ResourceType::OrgRole
             | ResourceType::OrgGroup
             | ResourceType::OrgAuthPolicy
@@ -432,7 +441,8 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         | ResourceType::LocaleBundle
         | ResourceType::SignupForm
         | ResourceType::FlowVersion
-        | ResourceType::MessageTemplate => Promotable,
+        | ResourceType::MessageTemplate
+        | ResourceType::ClaimsMapping => Promotable,
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the

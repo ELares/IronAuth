@@ -53,6 +53,7 @@ pub mod audit;
 pub mod audit_retention;
 pub mod brand;
 pub mod ciba;
+pub mod claims_mapping_store;
 pub mod classification;
 pub mod client_admin_grant;
 pub mod connector;

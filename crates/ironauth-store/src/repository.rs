@@ -63,6 +63,7 @@ use crate::audit::{ActingContext, Action, ActorRef};
 use crate::brand::{
     BrandAssetKind, BrandAssetMeta, BrandAssetRecord, BrandRecord, NewBrand, NewBrandAsset,
 };
+use crate::claims_mapping_store::ClaimsMappingRecord;
 use crate::classification::ResourceType;
 use crate::client_admin_grant::{ClientAdminGrantRecord, NewClientAdminGrant};
 use crate::connector::{ConnectorCapabilities, ConnectorRecord, NewConnector, StoredCapabilities};
@@ -799,6 +800,17 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn locale_bundles(&self) -> LocaleBundleRepo<'a> {
         LocaleBundleRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only declarative claim mapping repository for this scope (issue #113): read a
+    /// client's rules on the issuance path and list the scope's rule sets for the
+    /// config-snapshot export. Read-only by design; writing a mapping is a control-plane action.
+    #[must_use]
+    pub fn claims_mappings(&self) -> ClaimsMappingRepo<'a> {
+        ClaimsMappingRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -32134,6 +32146,72 @@ impl SignupFormRepo<'_> {
     }
 }
 
+/// The read-only per-environment, per-client declarative claim mapping repository (issue #113):
+/// read a client's rules on the issuance path, and list a scope's rule sets for the
+/// config-snapshot export. Every read is scope-forced under row-level security, so a mapping of
+/// another scope is a uniform not-found.
+///
+/// READ ONLY, and that is the plane separation the migration's grants encode: `ironauth_app` has
+/// SELECT and nothing more, because the plane that mints tokens must not be able to change the
+/// shape of the tokens it mints. Writing a mapping is a control-plane action and gets its own
+/// acting repository when the admin surface lands.
+pub struct ClaimsMappingRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ClaimsMappingRepo<'_> {
+    /// A client's rule set within scope, or [`None`] when the client has no mapping installed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, client_id: &str) -> Result<Option<ClaimsMappingRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT client_id, rules::text AS rules \
+             FROM claims_mappings \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| claims_mapping_from_row(&row)))
+    }
+
+    /// EVERY rule set in this scope (no pagination), ordered by client id: the set the config
+    /// snapshot export (issue #43) projects.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<ClaimsMappingRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT client_id, rules::text AS rules \
+             FROM claims_mappings \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY client_id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(claims_mapping_from_row).collect())
+    }
+}
+
+/// Build a [`ClaimsMappingRecord`] from a `claims_mappings` row.
+fn claims_mapping_from_row(row: &sqlx::postgres::PgRow) -> ClaimsMappingRecord {
+    ClaimsMappingRecord {
+        client_id: row.get("client_id"),
+        rules_json: row.get("rules"),
+    }
+}
+
 /// Build a [`SignupFormRecord`] from a `signup_forms` row (the shared read projection).
 fn signup_form_from_row(row: &sqlx::postgres::PgRow) -> SignupFormRecord {
     SignupFormRecord {
@@ -60484,6 +60562,13 @@ async fn read_promoted_snapshot(
         // target read omits them exactly like `client`, which is excluded for the
         // identical reason, keeping the promotion revision consistent.
         signup_form: Vec::new(),
+        // `claims_mapping` (issue #113) is keyed the same way and is blocked on the same
+        // missing primitive: its natural key is an authorize `client_id`, a scope-embedded
+        // id that cannot address the same logical client in another environment. It
+        // EXPORTS, so the criterion's "promote via config snapshots" is satisfied for the
+        // snapshot document, and the transactional engine omits it until client promotion
+        // has a key to work with.
+        claims_mapping: Vec::new(),
         // The PROMOTED types, filled by the exhaustive dispatch below.
         resource_server: Vec::new(),
         dcr_policy: Vec::new(),

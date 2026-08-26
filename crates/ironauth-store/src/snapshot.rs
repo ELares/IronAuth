@@ -82,7 +82,7 @@ pub const CONNECTOR_CLIENT_SECRET_REFERENCE: &str = "connector_client_secret";
 /// (and by the export), and an environment-identity or runtime type can never be
 /// added without failing it. This is the live binding between the snapshot and the
 /// single source of truth, not a hand-maintained parallel list.
-pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 13] = [
+pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 14] = [
     ResourceType::Client,
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
@@ -96,6 +96,7 @@ pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 13] = [
     ResourceType::SignupForm,
     ResourceType::FlowVersion,
     ResourceType::MessageTemplate,
+    ResourceType::ClaimsMapping,
 ];
 
 /// A named reference to a secret in the environment-scoped secret store (issue
@@ -410,6 +411,17 @@ pub struct LocaleBundleSnapshot {
 /// and a label message id) travel as embedded parsed JSON so the field list canonicalizes
 /// recursively. No secret and no PII: only trait pointers, bounded rules, and numeric ids.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimsMappingSnapshot {
+    /// The OAuth client these rules shape tokens for, unique per scope: the stable natural key
+    /// the export orders by.
+    pub client_id: String,
+    /// The ordered rule list (a JSON array of rule objects), embedded as parsed JSON so it
+    /// canonicalizes recursively.
+    pub rules: serde_json::Value,
+}
+
+/// The secret-free projection of one per-environment, per-client signup form (issue #87).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignupFormSnapshot {
     /// The authorize client id this form governs, unique per scope: the stable natural key the
     /// export orders by.
@@ -531,6 +543,11 @@ pub struct SnapshotResources {
     /// rules); no secret and no PII travels (issue #87).
     #[serde(default)]
     pub signup_form: Vec<SignupFormSnapshot>,
+    /// The environment's per-environment, per-client declarative claim mappings
+    /// (`claims_mapping`). Each is secret-free config: a rule names claim names, a static value,
+    /// and a token placement, never a credential (issue #113).
+    #[serde(default)]
+    pub claims_mapping: Vec<ClaimsMappingSnapshot>,
     /// The environment's custom-journey versions (`flow_version`). Each is secret-free config (a
     /// journey id, a version, the whole canonical journey artifact, and the active-pin flag); a
     /// journey artifact references trait pointers and group / scope names, never values, so no
@@ -944,6 +961,19 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     // is a real persistence corruption, surfaced rather than swallowed). No secret and no PII
     // travels (only trait pointers, bounded rules, and numeric ids). Ordered by the stable
     // client-id natural key.
+    let mut claims_mapping = Vec::new();
+    for record in scoped.claims_mappings().list_all().await? {
+        claims_mapping.push(ClaimsMappingSnapshot {
+            client_id: record.client_id,
+            // Parsed rather than carried as a string, so the document canonicalizes recursively
+            // and two environments with the same rules export byte-identically. A row that does
+            // not parse is a database that disagrees with its own CHECK constraint, so it
+            // surfaces as an error rather than travelling as opaque text.
+            rules: serde_json::from_str(&record.rules_json).map_err(serde_fault)?,
+        });
+    }
+    claims_mapping.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+
     let mut signup_form = Vec::new();
     for record in scoped.signup_forms().list_all().await? {
         let fields: serde_json::Value =
@@ -1014,6 +1044,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             brand,
             locale_bundle,
             signup_form,
+            claims_mapping,
             flow_version,
             message_template,
         },
@@ -1205,6 +1236,18 @@ const LOCALE_BUNDLE_KEYS: [&str; 3] = ["locale", "is_env_default", "entries"];
 /// form holds no secret material and no PII (only trait pointers, bounded rules, and numeric
 /// ids). `reject_unknown_keys` refuses anything else.
 const SIGNUP_FORM_KEYS: [&str; 2] = ["client_id", "fields"];
+
+/// Every key a snapshot `claims_mapping` element may carry (issue #113). No secret slot: a rule
+/// names claim names, a static value, and a token placement, never a credential.
+const CLAIMS_MAPPING_KEYS: [&str; 2] = ["client_id", "rules"];
+
+/// The most rules one imported mapping may carry.
+///
+/// The same bound the table's CHECK constraint enforces. Duplicated here deliberately and not by
+/// accident: an import is validated BEFORE anything touches the database, so a document that
+/// would violate the constraint must be refused with a violation an operator can read rather
+/// than as a constraint error from a failed transaction.
+const CLAIMS_MAPPING_MAX_RULES: usize = 32;
 
 /// Every key a snapshot `flow_version` element may carry (issue #92, PR 5). No secret slot: a
 /// journey artifact holds no secret and no PII (a predicate references trait pointers and group /
@@ -1613,6 +1656,48 @@ fn validate_resource(
                 )),
                 None => violations.push(SnapshotViolation::new(
                     format!("{path}/fields"),
+                    "missing required array field",
+                )),
+            }
+        }
+        ResourceType::ClaimsMapping => {
+            // A declarative claim mapping is secret-free config (issue #113): a client id and an
+            // ordered rule list, each rule a JSON object naming claim names, a static value, and
+            // a token placement. The forbidden-secret-key scan above already blocks
+            // secret-shaped material.
+            //
+            // What is NOT checked here is whether a rule targets a RESERVED claim. That decision
+            // lives in the `validate` function of `ironauth-oidc`'s claims-mapping module, and
+            // this crate cannot call it:
+            // the dependency runs the other way. Re-implementing it here would put a second copy
+            // of the protected-claim list in the tree, which is precisely the drift issue #113's
+            // criterion 5 exists to prevent. So the import validates SHAPE, and the admin write
+            // path validates MEANING against the one list that governs it.
+            reject_unknown_keys(object, &CLAIMS_MAPPING_KEYS, None, path, violations);
+            require_nonempty_string(object, "client_id", path, violations);
+            match object.get("rules") {
+                Some(serde_json::Value::Array(items)) => {
+                    if items.len() > CLAIMS_MAPPING_MAX_RULES {
+                        violations.push(SnapshotViolation::new(
+                            format!("{path}/rules"),
+                            format!("must carry at most {CLAIMS_MAPPING_MAX_RULES} rules"),
+                        ));
+                    }
+                    for (index, item) in items.iter().enumerate() {
+                        if !item.is_object() {
+                            violations.push(SnapshotViolation::new(
+                                format!("{path}/rules/{index}"),
+                                "must be a JSON object",
+                            ));
+                        }
+                    }
+                }
+                Some(_) => violations.push(SnapshotViolation::new(
+                    format!("{path}/rules"),
+                    "must be a JSON array",
+                )),
+                None => violations.push(SnapshotViolation::new(
+                    format!("{path}/rules"),
                     "missing required array field",
                 )),
             }
@@ -2043,7 +2128,8 @@ mod tests {
         // variable) regardless of struct field order.
         assert_eq!(
             text,
-            "{\"resources\":{\"brand\":[],\"client\":[],\"connector\":[],\"dcr_policy\":[],\
+            "{\"resources\":{\"brand\":[],\"claims_mapping\":[],\"client\":[],\"connector\":[],\
+             \"dcr_policy\":[],\
              \"flow_version\":[],\"locale_bundle\":[],\"message_template\":[],\"org_connection\":[],\
              \"resource_server\":[],\"routing_rule\":[],\"signup_form\":[],\
              \"upstream_token_grant\":[],\"variable\":[]},\
