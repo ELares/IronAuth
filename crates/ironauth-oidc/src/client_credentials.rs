@@ -197,7 +197,30 @@ async fn mint_and_persist(
     // The per-client STATIC custom claims (fail-open: a malformed stored config
     // under-claims rather than failing issuance; the protected-claim guard is in the
     // mint regardless).
-    let custom_claims = load_custom_claims(state, scope, client_id).await;
+    let static_claims = load_custom_claims(state, scope, client_id).await;
+    // The mapping and the hook (issue #113 criterion 1). A machine token is the one an operator
+    // most wants to shape -- entitlement tiers, tenant tags, downstream routing -- and until
+    // this call it was the one grant with no extension point at all.
+    //
+    // Fail-CLOSED, unlike `load_custom_claims` above, and the two sit next to each other so the
+    // difference is visible: a static claim blob that will not parse under-claims, while a
+    // mapping or hook that will not run means the operator's shaping did not happen, and a
+    // shaped claim is as likely to REMOVE an entitlement as add one.
+    let custom_claims = crate::claims_mapping_at_issuance::apply_to_machine_token(
+        state.store(),
+        state.hook_engine(),
+        scope,
+        &client_id_str,
+        // The wire value, from the registry, not a literal beside it. Issue #113 asks the
+        // grant to be identified in the payload, and a hook that gates on it is reading
+        // this string: a door with its own copy can hand a guest a grant name the
+        // endpoint does not accept, and only a test comparing two literals would notice.
+        crate::registry::GrantType::ClientCredentials.as_str(),
+        Some(&subject),
+        &static_claims,
+    )
+    .await
+    .map_err(|_| TokenError::ServerError)?;
 
     // Resolve the access-token target: format (per resource-server config / env
     // default) and the default M2M audience (per config). The client-credentials

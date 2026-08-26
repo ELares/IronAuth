@@ -3685,3 +3685,71 @@ async fn an_issuer_that_rotated_past_the_resolved_jwks_is_diagnosed_as_an_unknow
         "and NOT as the coarse bucket, which is what it recorded before this change: {reasons:?}"
     );
 }
+
+/// THE JWT BEARER GRANT runs the hook (issue #113 criterion 1, which names it explicitly).
+///
+/// It builds a `ClientCredentialsMintRequest`, so before the criterion-1 audit it reached
+/// neither the client's declarative mapping nor its deployed hook. The `MappedAccessClaims`
+/// fence lives on `MintRequest`'s field and could not ask this door the question.
+///
+/// The test is HERE rather than in `token_hook_at_issuance.rs` because the trusted-issuer and
+/// subject-mapping scaffolding this grant needs exists only in this file, and a hook test that
+/// reimplemented it would be measuring its own copy.
+#[cfg(feature = "wasm-hooks")]
+#[tokio::test]
+async fn the_jwt_bearer_grant_runs_the_hook() {
+    let h = Harness::start_with_hook_engine(std::sync::Arc::new(
+        ironauth_hooks::HookEngine::new().expect("build the engine"),
+    ))
+    .await;
+    let client_id = seed_trust(&h).await;
+    h.deploy_token_hook(h.client_id(), ironauth_hooks::fixtures::ECHO_REQUEST, 1)
+        .await;
+
+    let asrt = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-hook",
+    );
+    let (status, _headers, body) = present(&h, &client_id, &asrt).await;
+    assert_eq!(status, StatusCode::OK, "exchange: {body}");
+
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_owned();
+    let claims = jwt_payload(&access);
+    // ECHO_REQUEST rather than GOOD, and this asserts the VALUE. Criterion 1 asks that the
+    // grant be identified in the payload, and every door passes that string as a literal, so a
+    // door that copied its neighbour's would be invisible to a test that only asked whether a
+    // hook ran. A hook gating on the grant type is a first-class use of this contract.
+    assert_eq!(
+        claims["echo_grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "the guest was told which grant this is, or a hook cannot gate on it: {claims}"
+    );
+    // AND WHICH SUBJECT. Round 2 closed this at `client_credentials` and left the sibling:
+    // review measured that setting the subject argument to `None` here, and separately to an
+    // empty string, left all 85 tests green. `echo_subject` crosses in the ID-token list,
+    // which this grant discards, so `echo_access_subject` is the only way to see it.
+    assert_eq!(
+        claims["echo_access_subject"], MAPPED_PRINCIPAL,
+        "the guest was told whose token this is, and it is the mapped principal: {claims}"
+    );
+    // `sub` is asserted as a FIXTURE check, not as a property of the seam. Review pointed out
+    // that it cannot fail: the mint writes `sub` into its own JSON literal from a separate
+    // struct field, and it is then refused three more times on the way back in (mapping
+    // `validate`, `filter_hook_claims`, and the mint's own protected-name skip). "The fold did
+    // nothing at all" satisfies it.
+    //
+    // The identical assertion in `token_exchange.rs` was rewritten to say so and this one was
+    // not, which is the same fix-one-site-and-leave-the-sibling this whole issue keeps
+    // producing. What it is good for is confirming the exchange resolved the principal it
+    // meant to, so the grant assertion above describes the right token.
+    assert_eq!(
+        claims["sub"], MAPPED_PRINCIPAL,
+        "the assertion above describes a token for the mapped principal: {claims}"
+    );
+}

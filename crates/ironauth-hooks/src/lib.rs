@@ -85,6 +85,29 @@ pub mod fixtures {
     /// what lets a test tell a removal from a hook that never ran.
     pub const CLAIM_STRIPPER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CLAIM_STRIPPER"));
 
+    /// A hook written the way a MACHINE-GRANT author writes one.
+    ///
+    /// Echoes `access_token_claims` faithfully, adds a marker, and returns an EMPTY
+    /// `id_token_claims`, because the three grants that mint one access token have no ID token
+    /// to fill. That makes it the discriminator for WHICH LIST the host hands a machine
+    /// client's existing claims over in: neither `good` nor `echo-only` can catch putting them
+    /// in the ID-token list, because both echo that list back.
+    ///
+    /// It also reports the request's SUBJECT into the access list. `echo-request` reports it
+    /// into the ID-token list, which a machine grant discards, so this is the only fixture that
+    /// can observe the subject on those three doors at all.
+    pub const ECHO_ACCESS_ONLY: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_ECHO_ACCESS_ONLY"));
+
+    /// A hook that returns every SCALAR request field as a claim.
+    ///
+    /// Already used by the sandbox suite to prove the TRANSPORT carries each field. Exported
+    /// here because that is a different question from whether each DOOR fills them in
+    /// correctly: `grant_type` is a plain string that every mint site passes as a literal, so a
+    /// door that copied the wrong one from its neighbour would look identical to one that got
+    /// it right. Issue #113 criterion 1 asks for the grant to be identified in the payload, and
+    /// this is what lets an end-to-end test read back which grant the guest was told it was.
+    pub const ECHO_REQUEST: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_ECHO_REQUEST"));
+
     /// A hook that echoes both claim lists unchanged, plus a marker.
     ///
     /// The identity under the replace contract, and the shape that exposes a cap on hook OUTPUT

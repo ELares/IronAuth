@@ -105,6 +105,21 @@ async fn exchange(
     (status, value)
 }
 
+/// The claims of the access token in a successful exchange response.
+#[cfg(feature = "wasm-hooks")]
+fn exchanged_claims(body: &Value) -> Value {
+    use base64::Engine as _;
+    let access = body["access_token"].as_str().expect("access token");
+    let payload = access
+        .split('.')
+        .nth(1)
+        .expect("a JWT payload segment, so the exchanged token is an at+jwt");
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("base64url payload");
+    serde_json::from_slice(&decoded).expect("claims json")
+}
+
 /// Introspect a token as a given client.
 async fn introspect(harness: &Harness, token: &str, client: &str, secret: &str) -> Value {
     let request = Request::builder()
@@ -855,4 +870,155 @@ async fn an_actor_token_and_its_type_must_travel_together() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["error"], "invalid_request", "{body}");
     }
+}
+
+/// TOKEN EXCHANGE runs the hook (issue #113 criterion 1, by extension).
+///
+/// The criterion names authorization code, refresh, `client_credentials`, device and JWT
+/// bearer.
+/// It does not name token exchange, and this door was wired anyway: it is the third builder of
+/// a `ClientCredentialsMintRequest`, and leaving one of the three unhooked would recreate the
+/// exact hole the criterion-1 audit found, in the door nobody thinks of as a grant.
+///
+/// Wiring it without measuring it would be worse than leaving it out, so this is the test.
+/// Confirmed: replacing `state.hook_engine()` with `None` in `token_exchange.rs` fails here
+/// and nowhere else in the suite.
+///
+/// Note what this means operationally: a hook shapes a token minted FOR ANOTHER SUBJECT. The
+/// per-client STATIC claims are still withheld from an exchanged token, because those describe
+/// the client rather than the subject it is speaking for; what a hook gets is the extension
+/// point, which is where downstream routing claims belong.
+#[cfg(feature = "wasm-hooks")]
+#[tokio::test]
+async fn the_token_exchange_grant_runs_the_hook() {
+    let harness = Harness::start_with_hook_engine_and_config(
+        std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine")),
+        OidcConfig {
+            enforce_client_grant_types: true,
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        },
+    )
+    .await;
+    let (client, secret) = exchanging_client(&harness).await;
+    harness
+        .deploy_token_hook(&client, ironauth_hooks::fixtures::ECHO_REQUEST, 1)
+        .await;
+    let (exchanged_for, subject_token) =
+        access_token_for_named_user(&harness, &client, &secret).await;
+
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &subject_token),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "exchange: {body}");
+
+    let claims = exchanged_claims(&body);
+
+    // The VALUE, not just the presence: see the jwt:bearer test for why the grant string is
+    // the thing worth asserting at a door.
+    assert_eq!(
+        claims["echo_grant_type"], "urn:ietf:params:oauth:grant-type:token-exchange",
+        "an EXCHANGED token ran the hook AND told it which grant this is, or token exchange \
+         is a way around a deployed hook: {claims}"
+    );
+    // NOT an assertion on `sub`. Review pointed out that one cannot fail: `sub` is written
+    // into the mint's own JSON literal from a separate struct field, and then refused three
+    // more times on the way back in (mapping `validate`, `filter_hook_claims`, and the mint's
+    // own `PROTECTED_ACCESS_TOKEN_CLAIMS` skip). "The fold did nothing at all" satisfies it.
+    //
+    // What CAN move is the CLIENT the hook was told, which crosses in the access list and so
+    // survives this grant's discard of the id-token list.
+    //
+    // AND THE SUBJECT, read here rather than deferred to another grant's test. An earlier
+    // version of this comment said the residual was covered by the `client_credentials` test
+    // "which passes the subject through the same seam this door does" -- true of the seam and
+    // false of the ARGUMENT, which each door supplies itself. Review measured the gap: setting
+    // this door's subject to `None`, and separately to an empty string, left all 85 tests
+    // green. That matters most here, because this is the grant whose token speaks for somebody
+    // other than the caller.
+    assert_eq!(
+        claims["sub"], exchanged_for,
+        "the fixture exchanged the token it meant to, so the assertions below describe the \
+         right token: {claims}"
+    );
+    assert_eq!(
+        claims["echo_client_id"],
+        client.to_string(),
+        "the guest was told which client is exchanging: {claims}"
+    );
+    assert_eq!(
+        claims["echo_access_subject"], exchanged_for,
+        "and whose token it is shaping, which on an exchange is NOT the caller: {claims}"
+    );
+}
+
+/// A CLIENT'S MAPPING REACHES AN EXCHANGED TOKEN, and that is a decision rather than an oversight.
+///
+/// `clients.custom_token_claims` is withheld from a token that speaks for another subject,
+/// because those claims describe the client's own service account. A `static` MAPPING rule is
+/// not withheld, and review flagged the two as inconsistent.
+///
+/// They are consistent under the reason actually being applied, which is about IDENTITY rather
+/// than about origin: a client's mapping already shapes every token it causes to be minted for
+/// an interactive user, so a `static` rule reaching an exchanged token is the same power and not
+/// a new one. The authorization-bearing names (`roles`, `permissions`, `org_id`, `scope`, `cnf`,
+/// `act`, and the protocol claims) are refused to mappings and hooks alike.
+///
+/// Pinned so that if anyone later decides the other way, they change a test rather than
+/// discover a behaviour.
+#[cfg(feature = "wasm-hooks")]
+#[tokio::test]
+async fn the_mapping_reaches_an_exchanged_token() {
+    let harness = Harness::start_with_hook_engine_and_config(
+        std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine")),
+        OidcConfig {
+            enforce_client_grant_types: true,
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        },
+    )
+    .await;
+    let (client, secret) = exchanging_client(&harness).await;
+    let env = harness.env().clone();
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            harness.db().test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .claims_mappings()
+        .set(
+            &env,
+            &client,
+            r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .await
+        .expect("store the mapping");
+    let (_subject, subject_token) = access_token_for_named_user(&harness, &client, &secret).await;
+
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &subject_token),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "exchange: {body}");
+    let claims = exchanged_claims(&body);
+    assert_eq!(
+        claims["tier"], "gold",
+        "an unplaced `static` rule lands on the one token this grant mints: {claims}"
+    );
 }

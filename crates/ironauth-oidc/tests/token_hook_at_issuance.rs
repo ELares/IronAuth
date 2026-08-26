@@ -29,22 +29,99 @@ use common::{
     location_param,
 };
 use ironauth_config::OidcConfig;
+use ironauth_oidc::ClientAuthMethod;
 use ironauth_store::CorrelationId;
 use serde_json::Value;
 use std::sync::Arc;
 
 /// Deploy `component` as the harness client's hook, through the audited control-plane write.
 async fn deploy(harness: &Harness, component: &[u8], payload_version: i32) {
+    deploy_for(harness, harness.client_id(), component, payload_version).await;
+}
+
+/// The same, for a client the test made itself.
+///
+/// The machine grants (`client_credentials`, `jwt:bearer`) authenticate a CONFIDENTIAL client
+/// the test creates, not the harness's default one, so their hook has to be deployed against
+/// that id.
+async fn deploy_for(
+    harness: &Harness,
+    client: &ironauth_store::ClientId,
+    component: &[u8],
+    payload_version: i32,
+) {
+    // DELEGATES. `Harness::deploy_token_hook`'s own doc says copying the write would let one
+    // copy drift from the schema the other checks, and the first version of this function was
+    // that copy, byte for byte, in the same diff.
+    harness
+        .deploy_token_hook(client, component, payload_version)
+        .await;
+}
+
+/// Set a client's STATIC custom claims (the `clients.custom_token_claims` blob).
+///
+/// Through the DATA-PLANE store: `clients` is not a control-plane table, and reaching for
+/// `control_store()` fails with `permission denied for table clients`.
+async fn set_static_claims(harness: &Harness, client: &ironauth_store::ClientId, json: &str) {
+    let env = harness.env().clone();
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .clients()
+        .set_custom_token_claims(&env, client, Some(json))
+        .await
+        .expect("set the static claims");
+}
+
+/// Store `rules` as `client`'s declarative mapping, through the AUDITED store write.
+///
+/// It does NOT validate. This doc used to say "the write path is where `validate` runs", and
+/// that is false of this call: `claims_mapping::validate` runs in the admin HANDLER
+/// (`ironauth-admin/src/claims_mappings.rs`), and `claims_mapping_store`'s own header says so
+/// -- "the fence is at the WRITE, in the admin path that validates before storing". This
+/// reaches the repository underneath that handler and skips the fence.
+///
+/// That is safe here, and the reason is worth knowing rather than assuming: `apply_for`
+/// validates again at ISSUANCE, before applying anything, so a rule set the admin surface would
+/// refuse is refused at the mint too.
+///
+/// (The corrected text was pasted from `tests/claims_mapping_at_issuance.rs`, whose version
+/// contrasts this against an `install_unvalidated` helper. There is no such helper in this
+/// file and no raw-write path here, so that clause contrasted against nothing and is gone.)
+async fn install_mapping(harness: &Harness, client: &ironauth_store::ClientId, rules: &str) {
     let env = harness.env().clone();
     harness
         .db()
         .control_store()
         .scoped(harness.scope())
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
-        .token_hooks()
-        .set(&env, harness.client_id(), component, payload_version)
+        .claims_mappings()
+        .set(&env, client, rules)
         .await
-        .expect("deploy the hook");
+        .expect("store the mapping");
+}
+
+/// Run a `client_credentials` exchange and return the access token's claims.
+async fn machine_claims(
+    harness: &Harness,
+    client_id: &str,
+    secret: &str,
+) -> serde_json::Map<String, Value> {
+    let (status, _headers, body) = harness
+        .token_with_auth(
+            &form(&[("grant_type", "client_credentials")]),
+            Some(&format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"))
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "client_credentials: {body}");
+    claims(json(&body)["access_token"].as_str().expect("access"))
 }
 
 /// A unique login handle drawn from the deterministic entropy stream.
@@ -206,11 +283,40 @@ async fn a_deployment_with_no_engine_does_not_run_a_deployed_hook() {
 /// hook can REMOVE a claim as easily as add one, so continuing past one that aborted issues a
 /// token whose shape nobody chose. And an abort means code behaving in a way its author did not
 /// intend, which is not a state to mint a credential from.
+///
+/// # WHICH BOUND FIRED IS NOT ASSERTED HERE, and the attempt to is instructive
+///
+/// A 500 does not say whether fuel or the epoch deadline stopped the guest, and the two are not
+/// interchangeable: fuel counts instructions and is deterministic, while the deadline counts
+/// wall-clock ticks and a descheduled guest trips it exactly as a runaway one does. Round 2
+/// tried to separate them by ELAPSED TIME -- fuel stops this guest in milliseconds, the
+/// deadline cannot fire before a second -- and asserted the failure arrived in under a second.
+///
+/// Review measured the window that assertion actually covered:
+///
+/// ```text
+/// fuel_bomb_window            230.3ms
+/// one seed_user inside it     211.7ms      (Argon2id at OWASP parameters, unoptimized)
+/// same window, GOOD fixture   227.9ms      (zero fuel burned)
+/// ```
+///
+/// 92% of it is one password hash, and the window with a hook that burns NO fuel is within 1%
+/// of the window with the bomb. The guest's own burn is about 2ms. So the one-second ceiling
+/// was charged almost entirely against work that is not the hook, and a correct fuel abort
+/// behind a contended Argon2id could breach it and print a message blaming a deadline that
+/// never fired.
+///
+/// The assertion is gone rather than widened, because widening it would keep a number that
+/// measures the wrong thing. WHICH BOUND fires is measured where the guest runs without a login
+/// around it: `ironauth-hooks`' `a_hook_that_spins_is_aborted_by_fuel` and
+/// `the_default_fuel_stops_a_runaway_quickly`. What THIS test is for is the seam -- that a
+/// runaway hook fails the issuance rather than minting a half-shaped token.
 #[tokio::test]
 async fn a_hook_that_exhausts_its_fuel_fails_the_issuance() {
     let harness = harness_with_hooks().await;
     deploy(&harness, ironauth_hooks::fixtures::FUEL_BOMB, 1).await;
 
+    // First attempt: pays the compile, and its cost says nothing about which bound fired.
     let (status, body) = exchange(&harness)
         .await
         .expect_err("the exchange must fail");
@@ -218,6 +324,18 @@ async fn a_hook_that_exhausts_its_fuel_fails_the_issuance() {
         status,
         StatusCode::INTERNAL_SERVER_ERROR,
         "a hook that ran away is a server fault, not a client one: {body}"
+    );
+
+    // A SECOND attempt, on the cached component. Not a timing probe: it asserts the refusal is
+    // a property of the hook rather than of the first compile, so a dispatch that failed once
+    // and then quietly succeeded from cache would be caught.
+    let (status, body) = exchange(&harness)
+        .await
+        .expect_err("the cached hook must fail the same way");
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a cached runaway hook is still a server fault: {body}"
     );
 
     // And the SAME harness issues once the hook is replaced with a working one, so the
@@ -590,13 +708,16 @@ async fn an_echoing_hook_does_not_lose_claims_past_the_contribution_cap() {
 /// including code deployed to REMOVE a claim, so the skipped door issues the wider token. And a
 /// door that silently skips is a door a client can choose.
 ///
-/// This drives the device grant end to end. The remaining three (authorize's front channel,
-/// CIBA, FedCM) are still covered only by the shared function; that is stated in the PR rather
-/// than papered over.
+/// This drives the device grant end to end. The sentence that used to follow -- that
+/// authorize's front channel, CIBA and FedCM were "still covered only by the shared function"
+/// -- was true when it was written and this PR falsified two thirds of it: both now have their
+/// own test and their own confirmed mutant. FedCM is the one that does not, and the door table
+/// on `MappedAccessClaims` is the single place that inventory lives, so this no longer keeps a
+/// second copy of it to drift.
 #[tokio::test]
 async fn the_device_grant_runs_the_hook() {
     let harness = harness_with_hooks().await;
-    deploy(&harness, ironauth_hooks::fixtures::GOOD, 1).await;
+    deploy(&harness, ironauth_hooks::fixtures::ECHO_REQUEST, 1).await;
 
     let client = *harness.client_id();
     harness
@@ -659,10 +780,10 @@ async fn the_device_grant_runs_the_hook() {
         .expect("access")
         .to_owned();
     assert_eq!(
-        claims(&access).get("tier"),
-        Some(&Value::from("gold")),
-        "a device-grant access token carries the hook's claim, or the device door is a way \
-         around a deployed hook: {:?}",
+        claims(&access).get("echo_grant_type"),
+        Some(&Value::from("urn:ietf:params:oauth:grant-type:device_code")),
+        "a device-grant access token ran the hook AND was identified as the device grant, or \
+         the device door is a way around a deployed hook: {:?}",
         claims(&access)
     );
 }
@@ -717,5 +838,316 @@ async fn the_front_channel_authorize_door_runs_the_hook() {
     assert!(
         issued.get("sub").is_some_and(Value::is_string),
         "the echo kept the subject: {issued:?}"
+    );
+}
+
+/// THE CLIENT-CREDENTIALS GRANT runs the hook (issue #113 criterion 1).
+///
+/// This grant builds a `ClientCredentialsMintRequest`, not a `MintRequest`, and until this test
+/// existed it reached neither the mapping nor the hook. The `MappedAccessClaims` fence was
+/// sound and simply did not extend to a second struct: a fence is a property of a FIELD, and
+/// these doors fill in a different one.
+///
+/// Machine tokens are the ones an operator most wants to shape, and issue #113 names this exact
+/// gap as the thing to avoid:
+///
+/// > Auth0 covers machine-to-machine only through a separate credentials-exchange hook, an
+/// > inconsistency to avoid.
+///
+/// Asserts BOTH halves, because the interesting failure is not "the hook did not run": it is
+/// the hook running and the static claims disappearing. A machine token has no ID token, so
+/// the mapping is resolved under `Destination::OneAccessToken` and the claims are handed to the
+/// guest as its ACCESS-token list -- and getting either of those wrong empties the token
+/// silently.
+#[tokio::test]
+async fn the_client_credentials_grant_runs_the_hook() {
+    let harness = harness_with_hooks().await;
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    deploy_for(&harness, &client, ironauth_hooks::fixtures::GOOD, 1).await;
+
+    set_static_claims(&harness, &client, r#"{"department":"payments"}"#).await;
+
+    let issued = machine_claims(&harness, &client_id, &secret).await;
+
+    assert_eq!(
+        issued.get("tier"),
+        Some(&Value::from("gold")),
+        "a machine token carries the hook's claim, or client_credentials is a grant with no \
+         extension point: {issued:?}"
+    );
+    assert_eq!(
+        issued.get("department"),
+        Some(&Value::from("payments")),
+        "and the client's STATIC claims survived the seam. A machine token has no ID token, so \
+         an UNPLACED claim goes to the one token that exists; dropping it instead would \
+         silently empty every machine token the day anyone installed a mapping: {issued:?}"
+    );
+
+    // A SECOND exchange, under a guest that reports what it was handed. Criterion 1 asks that
+    // the grant be identified in the payload, and the assertions above cannot show that: `GOOD`
+    // echoes its input and would look identical whatever grant string reached it.
+    //
+    // Two exchanges rather than one guest doing both, because `ECHO_REQUEST` REPLACES the claim
+    // lists (that is the contract) and so cannot also demonstrate that static claims survive.
+    deploy_for(&harness, &client, ironauth_hooks::fixtures::ECHO_REQUEST, 1).await;
+    let echoed = machine_claims(&harness, &client_id, &secret).await;
+    assert_eq!(
+        echoed.get("echo_grant_type"),
+        Some(&Value::from("client_credentials")),
+        "the guest was told which grant this is: {echoed:?}"
+    );
+    assert_eq!(
+        echoed.get("echo_client_id"),
+        Some(&Value::from(client_id.clone())),
+        "and which client, since the two are both strings and a transport that swapped them \
+         would leave every assertion above green: {echoed:?}"
+    );
+    // THE DISCARD. `ECHO_REQUEST` returns `echo_subject` in its ID-TOKEN list and nowhere else,
+    // and this grant mints no ID token, so that claim must not appear.
+    //
+    // Nothing pinned this before. Review restored the union -- `contributed.access_token
+    // .chain(contributed.id_token)` -- and all 100 tests stayed green while `echo_subject`
+    // landed in a token whose readers are the resource servers in `aud`. The placement test
+    // below cannot see it: it installs a mapping and no hook, so the discard never runs.
+    //
+    // It is also what keeps the contribution cap at 32 rather than 64, since `fence` applies
+    // `filter_hook_claims` once per list and these grants run no mint size budget.
+    assert_eq!(
+        echoed.get("echo_subject"),
+        None,
+        "the hook's ID-token list is DISCARDED on a grant that mints no ID token; a claim the \
+         author put there must not reach the access token: {echoed:?}"
+    );
+}
+
+/// THE CODE EXCHANGE identifies itself as `authorization_code` (issue #113 criterion 1).
+///
+/// The exit-criterion test above uses `GOOD`, which proves a hook shaped a real token and says
+/// nothing about what the payload told it. Every door passes its grant as a LITERAL, so the
+/// failure this catches is a door copying its neighbour's string -- invisible to any test that
+/// only asks whether a hook ran, and wrong for any hook that gates on the grant.
+#[tokio::test]
+async fn the_code_exchange_tells_the_hook_which_grant_it_is() {
+    let harness = harness_with_hooks().await;
+    deploy(&harness, ironauth_hooks::fixtures::ECHO_REQUEST, 1).await;
+
+    let (access, id_token) = exchange(&harness).await.expect("the exchange succeeds");
+    let issued = claims(&access);
+    assert_eq!(
+        issued.get("echo_grant_type"),
+        Some(&Value::from("authorization_code")),
+        "the guest was told this is a code exchange: {issued:?}"
+    );
+    assert_eq!(
+        issued.get("echo_payload_version"),
+        Some(&Value::from(1)),
+        "and which payload version, which criterion 6 requires be explicit in EVERY \
+         invocation: {issued:?}"
+    );
+    // The ID-token half of the same invocation. `echo_subject` is the only claim that crosses
+    // in that direction, so a transport that dropped the id-token list entirely would leave
+    // every access-token assertion above green.
+    let id_claims = claims(&id_token);
+    assert!(
+        id_claims.get("echo_subject").is_some_and(Value::is_string),
+        "the hook shaped the ID token too, and knew whose token it was: {id_claims:?}"
+    );
+}
+
+/// THE REFRESH GRANT runs the hook (issue #113 criterion 1, which names it explicitly).
+///
+/// It always did -- `token.rs` resolves the mapping for both `authorization_code` and
+/// `refresh_token` -- but nothing measured the second one, and the criterion asks for a test
+/// per grant rather than for a shared call site.
+///
+/// A refresh is where a stale hook result would be least visible: the client already holds a
+/// working token, so a refresh that quietly stopped shaping would look like a working refresh.
+#[tokio::test]
+async fn the_refresh_grant_runs_the_hook() {
+    let harness = harness_with_hooks().await;
+    deploy(&harness, ironauth_hooks::fixtures::ECHO_REQUEST, 1).await;
+
+    let client_id = harness.client_id().to_string();
+    let subject = harness.seed_unique_user().await;
+    harness.grant_consent(&subject, &client_id).await;
+    let cookie = harness.session_cookie(&subject).await;
+    // NO `offline_access`. This deployment issues a refresh token on an ordinary code
+    // exchange, and asking for a scope the harness client is not allowed refuses the
+    // authorization outright -- which surfaces as "no code in redirect" and reads like the
+    // hook broke the flow.
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(REDIRECT_URI),
+        enc("openid email"),
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
+    let code = location_param(&headers, "code").expect("code in redirect");
+
+    let (status, _headers, body) = harness
+        .token(&form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", &client_id),
+            ("code_verifier", PKCE_VERIFIER),
+        ]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "code exchange: {body}");
+    let refresh_token = json(&body)["refresh_token"]
+        .as_str()
+        .expect("a refresh token")
+        .to_owned();
+
+    let (status, _headers, body) = harness
+        .token(&form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh_token),
+            ("client_id", &client_id),
+        ]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "refresh: {body}");
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access")
+        .to_owned();
+    // The grant STRING, not just that a hook ran. A refresh reaching the same seam as the code
+    // exchange is the easy half; a refresh telling the hook it is an `authorization_code` is
+    // the failure a presence check cannot see, and a hook that gates on the grant would then
+    // shape a refresh as though it were a first issuance.
+    assert_eq!(
+        claims(&access).get("echo_grant_type"),
+        Some(&Value::from("refresh_token")),
+        "a REFRESHED access token ran the hook AND was identified as a refresh: {:?}",
+        claims(&access)
+    );
+}
+
+/// A MACHINE CLIENT'S STATIC CLAIMS SURVIVE A HOOK THAT DOES NOT MENTION THEM.
+///
+/// The property is WHICH LIST the claims arrive in, and it is narrower than it first looks.
+///
+/// The WIT contract is a REPLACE, so a hook that returns a list it built from scratch drops
+/// whatever was in that list. That is the contract working, on every grant, and it is not what
+/// this pins.
+///
+/// What was broken is that the seam handed a machine client's static claims over as
+/// `id_token_claims`, on a grant that mints no ID token. So an author writing for
+/// `client_credentials` -- who reads `access_token_claims`, appends, returns it, and leaves the
+/// ID list empty because there is no ID token -- did everything right under the contract and
+/// still deleted every static claim the client had. The claims were never in the list they
+/// were reading.
+///
+/// `ECHO_ACCESS_ONLY` is exactly that author, and it is the only fixture that can catch this.
+/// `GOOD` and `ECHO_ONLY` both echo `id_token_claims` back, so the old union folded the claims
+/// in by accident and they passed; `ECHO_REQUEST` builds both lists from scratch, so it drops
+/// them either way and proves nothing about where they were.
+#[tokio::test]
+async fn a_machine_clients_static_claims_survive_a_hook_that_ignores_them() {
+    let harness = harness_with_hooks().await;
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    set_static_claims(&harness, &client, r#"{"department":"payments"}"#).await;
+    deploy_for(
+        &harness,
+        &client,
+        ironauth_hooks::fixtures::ECHO_ACCESS_ONLY,
+        1,
+    )
+    .await;
+
+    let issued = machine_claims(&harness, &client_id, &secret).await;
+    assert_eq!(
+        issued.get("department"),
+        Some(&Value::from("payments")),
+        "a hook that never mentions the static claims must not delete them; the guest is handed \
+         them as ACCESS-token claims, which is where they live on a token with no ID token: \
+         {issued:?}"
+    );
+    assert_eq!(
+        issued.get("echo_access_only_ran"),
+        Some(&Value::from(true)),
+        "and the hook did run, so the assertion above is not satisfied by a dead hook: \
+         {issued:?}"
+    );
+    // THE SUBJECT reached the guest. Review measured that nothing could see it: setting the
+    // `subject` argument to `None` at all three machine doors left the whole suite green,
+    // because the only fixture reporting it put it in the ID-token list that these grants
+    // discard. A hook gating on identity -- which is what that field is for -- would have taken
+    // the wrong branch on every issuance with nothing red.
+    assert!(
+        issued
+            .get("echo_access_subject")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.starts_with("sva_")),
+        "the guest was told whose token this is, and it is the service-account principal: \
+         {issued:?}"
+    );
+}
+
+/// A `place: id_token` RULE KEEPS ITS CLAIM OUT OF A MACHINE TOKEN.
+///
+/// The rule means "keep this away from the resource servers in `aud`", and on these three grants
+/// `aud` is who reads the only token there is. Review measured the inversion: the same rule set
+/// that `claims_mapping_at_issuance.rs`'s `place_moves_a_claim_into_one_token_and_out_of_the_other`
+/// uses to assert the claim is ABSENT from a code-grant access token put it INTO a
+/// `client_credentials` one, because the seam folded the two halves together.
+///
+/// Both directions are asserted. A projection that dropped everything would satisfy the first
+/// assertion and destroy the feature.
+#[tokio::test]
+async fn a_machine_token_honours_a_claim_placed_in_the_id_token() {
+    let harness = harness_with_hooks().await;
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    set_static_claims(&harness, &client, r#"{"department":"payments"}"#).await;
+    install_mapping(
+        &harness,
+        &client,
+        r#"[{"kind":"static","name":"locale_pref","value":"en-GB"},
+            {"kind":"place","name":"locale_pref","placement":"id_token"},
+            {"kind":"static","name":"tier","value":"gold"},
+            {"kind":"place","name":"tier","placement":"access_token"},
+            {"kind":"static","name":"region","value":"eu"},
+            {"kind":"place","name":"region","placement":"both"}]"#,
+    )
+    .await;
+
+    let issued = machine_claims(&harness, &client_id, &secret).await;
+    assert_eq!(
+        issued.get("locale_pref"),
+        None,
+        "a claim placed in the ID token is NOT EMITTED on a grant that mints no ID token; \
+         emitting it puts it in front of every resource server the rule exists to hide it \
+         from: {issued:?}"
+    );
+    assert_eq!(
+        issued.get("tier"),
+        Some(&Value::from("gold")),
+        "an access-placed claim still lands, so the projection is not simply dropping the \
+         mapping: {issued:?}"
+    );
+    assert_eq!(
+        issued.get("department"),
+        Some(&Value::from("payments")),
+        "and an UNPLACED claim lands too: the operator expressed no opinion, and the only token \
+         that exists is where it goes: {issued:?}"
+    );
+    // `both` is the fourth arm and it was documented without being measured: review dropped it
+    // from the projection and 916 tests stayed green while the claim silently vanished from
+    // every machine token. "Both tokens" on a grant with one token means the one that exists.
+    assert_eq!(
+        issued.get("region"),
+        Some(&Value::from("eu")),
+        "a `both`-placed claim lands: one of the two tokens it names is this one, and dropping \
+         it would empty it from every machine token with nothing red: {issued:?}"
     );
 }

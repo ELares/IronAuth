@@ -867,3 +867,51 @@ async fn under_the_opaque_format_the_access_token_is_a_revocable_reference() {
         "revoking the CIBA grant must stop its access token resolving"
     );
 }
+
+/// THE CIBA GRANT runs the hook (issue #113/#114).
+///
+/// CIBA mints through its own `MintRequest`, so the `MappedAccessClaims` fence does force it to
+/// resolve the client's MAPPING. It cannot force it to pass a hook runtime: `None` is a legal
+/// value for that parameter (it is how a deployment with hooks disabled issues tokens), so a
+/// door that hard-codes it type-checks and every other test stays green.
+///
+/// Confirmed: replacing `state.hook_engine()` with `None` in `ciba_grant.rs` fails here.
+#[cfg(feature = "wasm-hooks")]
+#[tokio::test]
+async fn the_ciba_grant_runs_the_hook() {
+    use base64::Engine as _;
+
+    let harness = Harness::start_with_hook_engine(std::sync::Arc::new(
+        ironauth_hooks::HookEngine::new().expect("build the engine"),
+    ))
+    .await;
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, CIBA_GRANTS, None)
+        .await;
+    let client_id = client.to_string();
+    harness
+        .deploy_token_hook(&client, ironauth_hooks::fixtures::ECHO_REQUEST, 1)
+        .await;
+
+    let (auth_req_id, subject) = start_request(&harness, &client_id).await;
+    approve(&harness, &auth_req_id, &subject).await;
+    pace(&harness);
+
+    let (status, body) = redeem(&harness, &auth_req_id, &client_id).await;
+    assert_eq!(status, StatusCode::OK, "ciba redemption: {body}");
+    let access = body["access_token"].as_str().expect("access token");
+    let payload = access
+        .split('.')
+        .nth(1)
+        .expect("a JWT payload segment, so the CIBA token is an at+jwt");
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("base64url payload");
+    let claims: Value = serde_json::from_slice(&decoded).expect("claims json");
+    assert_eq!(
+        claims["echo_grant_type"], "urn:openid:params:grant-type:ciba",
+        "a CIBA access token ran the hook AND told it which grant this is, or the backchannel \
+         is a way around a deployed hook: {claims}"
+    );
+}

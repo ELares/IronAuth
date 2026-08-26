@@ -403,7 +403,58 @@ pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
     Ok(())
 }
 
-/// Apply `rules` to `source`, producing the per-token claim sets.
+/// How many tokens the caller is going to mint from this mapping's output.
+///
+/// The mapping model has two destinations because most grants mint two tokens. Three do not:
+/// `client_credentials`, `jwt:bearer` and token exchange mint ONE access token and no ID token,
+/// through `ClientCredentialsMintRequest`. Handing them a two-token answer forces the caller to
+/// invent a projection, and the first one invented was a union -- which quietly INVERTED
+/// `place: id_token`, the one rule whose entire meaning is "keep this out of the access token".
+///
+/// So the projection is made here, where the difference between "the operator placed this" and
+/// "nothing placed this, so it defaulted" is still visible. After the partition below it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    /// An ID token and an access token. Placement means what it says.
+    TwoTokens,
+    /// One access token, and no ID token to put anything in.
+    ///
+    /// An UNPLACED claim goes to the one token that exists: the operator expressed no opinion
+    /// and dropping it would empty every machine token the day anyone installed a mapping.
+    ///
+    /// A claim placed `id_token` is NOT EMITTED. That rule exists to keep a claim away from the
+    /// resource servers in `aud`, which is exactly who reads this token, so honouring it means
+    /// leaving the claim out. `place: access_token` and `place: both` are emitted -- `both`
+    /// names two tokens and one of them is this one.
+    ///
+    /// # A RULE ORDER THAT DISCLOSES, and it is not the one an earlier note here named
+    ///
+    /// `place` is keyed on a NAME and `rename` carries a placement across with the value, so
+    /// placing the claim you then rename is safe and placing it afterwards is not:
+    ///
+    /// - `place(email -> id_token)` THEN `rename(email -> contact)` moves the placement onto
+    ///   `contact`, which is withheld here as asked.
+    /// - `rename(email -> contact)` THEN `place(email -> id_token)` places a name that no
+    ///   longer exists. `contact` is UNPLACED, and unplaced on this destination means the one
+    ///   token there is -- so the claim the operator asked to keep out of an access token is in
+    ///   one, under a different name.
+    ///
+    /// Under `TwoTokens` the same slip is invisible: unplaced defaults to the ID token, which
+    /// is where the placement would have put it anyway. The order only becomes a disclosure
+    /// when there is one token, which is why it is written down here.
+    ///
+    /// `a_place_after_a_rename_names_nothing_and_the_claim_is_emitted` pins both orders.
+    ///
+    /// An earlier version of this section named a different pair -- `place(a)` then
+    /// `rename(b -> a)` against its reverse -- and called them opposite. Measured: they are
+    /// identical and both withhold, because in one order the placement is written onto the
+    /// destination name and in the other it is carried onto it. That note taught the safe order
+    /// as the dangerous one, which is worse than no note, and the test above asserts the
+    /// correction so it cannot rot back.
+    OneAccessToken,
+}
+
+/// Apply `rules` to `source`, projecting onto `destination`.
 ///
 /// Validates first, so an unvalidated mapping cannot half-apply: a refusal leaves the caller
 /// with no claims rather than with the claims the rules before the bad one produced.
@@ -411,9 +462,10 @@ pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
 /// # Errors
 ///
 /// [`MappingRefusal`], exactly as [`validate`].
-pub fn apply(
+pub fn apply_for(
     rules: &[MappingRule],
     source: &BTreeMap<String, serde_json::Value>,
+    destination: Destination,
 ) -> Result<MappedClaims, MappingRefusal> {
     validate(rules)?;
 
@@ -494,17 +546,30 @@ pub fn apply(
 
     let mut mapped = MappedClaims::default();
     for (name, value) in working {
-        match placements.get(&name).copied().unwrap_or(Placement::IdToken) {
-            Placement::IdToken => {
-                mapped.id_token.insert(name, value);
-            }
-            Placement::AccessToken => {
-                mapped.access_token.insert(name, value);
-            }
-            Placement::Both => {
-                mapped.id_token.insert(name.clone(), value.clone());
-                mapped.access_token.insert(name, value);
-            }
+        // The EXPLICIT placement, before the default is applied. On a one-token grant the two
+        // must be told apart: `None` there means the operator said nothing and the claim goes
+        // in the only token, while `Some(IdToken)` means the operator asked for it to stay out
+        // of an access token and there is no other token to put it in.
+        let placed = placements.get(&name).copied();
+        match destination {
+            Destination::OneAccessToken => match placed {
+                Some(Placement::IdToken) => {}
+                Some(Placement::AccessToken | Placement::Both) | None => {
+                    mapped.access_token.insert(name, value);
+                }
+            },
+            Destination::TwoTokens => match placed.unwrap_or(Placement::IdToken) {
+                Placement::IdToken => {
+                    mapped.id_token.insert(name, value);
+                }
+                Placement::AccessToken => {
+                    mapped.access_token.insert(name, value);
+                }
+                Placement::Both => {
+                    mapped.id_token.insert(name.clone(), value.clone());
+                    mapped.access_token.insert(name, value);
+                }
+            },
         }
     }
     Ok(mapped)
@@ -512,7 +577,9 @@ pub fn apply(
 
 #[cfg(test)]
 mod tests {
-    use super::{MappedClaims, MappingRule, Placement, RefusalReason, apply, validate};
+    use super::{
+        Destination, MappedClaims, MappingRule, Placement, RefusalReason, apply_for, validate,
+    };
     use std::collections::BTreeMap;
 
     fn source() -> BTreeMap<String, serde_json::Value> {
@@ -523,7 +590,116 @@ mod tests {
     }
 
     fn only(rule: MappingRule) -> MappedClaims {
-        apply(&[rule], &source()).expect("applies")
+        apply_for(&[rule], &source(), Destination::TwoTokens).expect("applies")
+    }
+
+    /// A `place` naming a claim a RENAME already moved away is inert, and on a one-token grant
+    /// that means the claim is EMITTED.
+    ///
+    /// `place` is keyed on a name and `rename` carries a placement across with the value, so
+    /// the two orders are genuinely different and only one is safe:
+    ///
+    /// - `place(email -> id_token)` THEN `rename(email -> contact)`: the placement moves with
+    ///   the value, `contact` is placed, nothing is emitted.
+    /// - `rename(email -> contact)` THEN `place(email -> id_token)`: the place names a claim
+    ///   that no longer exists, `contact` is UNPLACED, and on a machine grant unplaced means
+    ///   the one token there is, which every resource server in `aud` reads.
+    ///
+    /// So an operator who writes the rename first has asked for `email` to stay out of an
+    /// access token and put it there under another name. Rule ORDER is the whole difference.
+    ///
+    /// This test exists because the note that used to sit on `Destination` described a
+    /// DIFFERENT pair -- `place(a)` then `rename(b -> a)` against its reverse -- and called
+    /// them opposite. They are identical, and both withhold. A hazard note naming the wrong
+    /// pair is worse than none: it teaches the safe order as the dangerous one.
+    #[test]
+    fn a_place_after_a_rename_names_nothing_and_the_claim_is_emitted() {
+        let mut only_email = BTreeMap::new();
+        only_email.insert("email".to_owned(), serde_json::json!("ada@example.test"));
+
+        let safe = apply_for(
+            &[
+                MappingRule::Place {
+                    name: "email".to_owned(),
+                    placement: Placement::IdToken,
+                },
+                MappingRule::Rename {
+                    from: "email".to_owned(),
+                    to: "contact".to_owned(),
+                },
+            ],
+            &only_email,
+            Destination::OneAccessToken,
+        )
+        .expect("applies");
+        assert!(
+            safe.access_token.is_empty(),
+            "placing BEFORE the rename carries the placement onto the new name: {:?}",
+            safe.access_token
+        );
+
+        let hazard = apply_for(
+            &[
+                MappingRule::Rename {
+                    from: "email".to_owned(),
+                    to: "contact".to_owned(),
+                },
+                MappingRule::Place {
+                    name: "email".to_owned(),
+                    placement: Placement::IdToken,
+                },
+            ],
+            &only_email,
+            Destination::OneAccessToken,
+        )
+        .expect("applies");
+        assert_eq!(
+            hazard.access_token.keys().collect::<Vec<_>>(),
+            vec!["contact"],
+            "placing AFTER the rename names a claim that is gone, so the renamed claim is \
+             unplaced and lands in the one token the resource servers read: {:?}",
+            hazard.access_token
+        );
+
+        // The pair the old note named, which is NOT order-sensitive. Asserted so the
+        // correction cannot rot back into the wrong claim.
+        let mut only_b = BTreeMap::new();
+        only_b.insert("b".to_owned(), serde_json::json!("value"));
+        let place_first = apply_for(
+            &[
+                MappingRule::Place {
+                    name: "a".to_owned(),
+                    placement: Placement::IdToken,
+                },
+                MappingRule::Rename {
+                    from: "b".to_owned(),
+                    to: "a".to_owned(),
+                },
+            ],
+            &only_b,
+            Destination::OneAccessToken,
+        )
+        .expect("applies");
+        let rename_first = apply_for(
+            &[
+                MappingRule::Rename {
+                    from: "b".to_owned(),
+                    to: "a".to_owned(),
+                },
+                MappingRule::Place {
+                    name: "a".to_owned(),
+                    placement: Placement::IdToken,
+                },
+            ],
+            &only_b,
+            Destination::OneAccessToken,
+        )
+        .expect("applies");
+        assert_eq!(
+            place_first.access_token, rename_first.access_token,
+            "placing the DESTINATION name is order-insensitive; the old note said otherwise"
+        );
+        assert!(place_first.access_token.is_empty(), "and both withhold");
     }
 
     /// CRITERION 4, all four operations, with no custom code.
@@ -584,7 +760,7 @@ mod tests {
     /// before this layer had a reader.
     #[test]
     fn an_unplaced_claim_stays_where_it_went_before_this_layer_existed() {
-        let mapped = apply(&[], &source()).expect("applies");
+        let mapped = apply_for(&[], &source(), Destination::TwoTokens).expect("applies");
         for name in ["groups", "email"] {
             assert!(mapped.id_token.contains_key(name), "{name} in the id token");
             // NOT the access token, and this is the assertion the first version had backwards.
@@ -639,7 +815,10 @@ mod tests {
             );
             // And `apply` refuses the same thing, so validating on write and applying at
             // issuance cannot disagree.
-            assert!(apply(&[rule], &source()).is_err(), "case {index}");
+            assert!(
+                apply_for(&[rule], &source(), Destination::TwoTokens).is_err(),
+                "case {index}"
+            );
         }
     }
 
@@ -652,12 +831,13 @@ mod tests {
     fn reading_a_protected_claim_is_allowed_and_only_writing_is_refused() {
         let mut claims = source();
         claims.insert("sub".to_owned(), serde_json::json!("usr_ada"));
-        let mapped = apply(
+        let mapped = apply_for(
             &[MappingRule::Rename {
                 from: "sub".to_owned(),
                 to: "subject".to_owned(),
             }],
             &claims,
+            Destination::TwoTokens,
         )
         .expect("renaming FROM a protected claim is allowed");
         assert_eq!(mapped.id_token["subject"], serde_json::json!("usr_ada"));
@@ -771,12 +951,13 @@ mod tests {
         ] {
             let mut claims = BTreeMap::new();
             claims.insert("things".to_owned(), value.clone());
-            let mapped = apply(
+            let mapped = apply_for(
                 &[MappingRule::FilterList {
                     name: "things".to_owned(),
                     allow: vec!["ok".to_owned()],
                 }],
                 &claims,
+                Destination::TwoTokens,
             )
             .expect("applies");
             assert_eq!(
@@ -1330,7 +1511,7 @@ mod tests {
     /// A refused mapping applies NOTHING, rather than the rules before the bad one.
     #[test]
     fn a_refused_mapping_does_not_half_apply() {
-        let outcome = apply(
+        let outcome = apply_for(
             &[
                 MappingRule::Static {
                     name: "tier".to_owned(),
@@ -1342,6 +1523,7 @@ mod tests {
                 },
             ],
             &source(),
+            Destination::TwoTokens,
         );
         assert!(
             outcome.is_err(),
@@ -1374,7 +1556,7 @@ mod tests {
     /// Rules apply IN ORDER, and the order is observable.
     #[test]
     fn rules_apply_in_the_order_given() {
-        let rename_then_static = apply(
+        let rename_then_static = apply_for(
             &[
                 MappingRule::Rename {
                     from: "groups".to_owned(),
@@ -1386,6 +1568,7 @@ mod tests {
                 },
             ],
             &source(),
+            Destination::TwoTokens,
         )
         .expect("applies");
         assert_eq!(
@@ -1394,7 +1577,7 @@ mod tests {
             "the later static wins"
         );
 
-        let static_then_rename = apply(
+        let static_then_rename = apply_for(
             &[
                 MappingRule::Static {
                     name: "team_groups".to_owned(),
@@ -1406,6 +1589,7 @@ mod tests {
                 },
             ],
             &source(),
+            Destination::TwoTokens,
         )
         .expect("applies");
         assert_eq!(
@@ -1418,7 +1602,7 @@ mod tests {
     /// A renamed claim keeps where it was placed.
     #[test]
     fn placement_follows_a_rename() {
-        let mapped = apply(
+        let mapped = apply_for(
             &[
                 MappingRule::Place {
                     name: "groups".to_owned(),
@@ -1430,6 +1614,7 @@ mod tests {
                 },
             ],
             &source(),
+            Destination::TwoTokens,
         )
         .expect("applies");
         assert!(
@@ -1553,7 +1738,7 @@ pub fn filter_hook_claims(returned: &BTreeMap<String, serde_json::Value>) -> Hoo
 /// issuance.
 #[cfg(test)]
 mod wire_format_tests {
-    use super::{MappingRule, Placement, apply, parse};
+    use super::{Destination, MappingRule, Placement, apply_for, parse};
     use std::collections::BTreeMap;
 
     /// The EXACT documents already committed elsewhere in this repository parse.
@@ -1670,7 +1855,7 @@ mod wire_format_tests {
         source.insert("groups".to_owned(), serde_json::json!(["eng", "sales"]));
         source.insert("dept".to_owned(), serde_json::json!("platform"));
 
-        let mapped = apply(&rules, &source).expect("apply");
+        let mapped = apply_for(&rules, &source, Destination::TwoTokens).expect("apply");
         assert_eq!(
             mapped.id_token.get("groups"),
             Some(&serde_json::json!(["eng"])),
