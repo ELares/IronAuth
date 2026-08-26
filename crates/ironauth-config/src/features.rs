@@ -29,6 +29,9 @@ pub const GLOBAL_TOKEN_REVOCATION_DRAFT: &str = "draft-parecki-oauth-global-toke
 /// The registry name of the Global Token Revocation experimental feature (issue #36).
 pub const GLOBAL_TOKEN_REVOCATION_FEATURE: &str = "global-token-revocation";
 
+/// The WASM token hooks feature (issue #114), the flagship extension surface.
+pub const WASM_HOOKS_FEATURE: &str = "wasm-hooks";
+
 /// The registry name of the per-environment custom-domains-with-built-in-ACME
 /// experimental feature (issue #47).
 pub const CUSTOM_DOMAINS_ACME_FEATURE: &str = "custom-domains-acme";
@@ -278,6 +281,7 @@ impl FeatureRegistry {
         registry.register_signup_quarantine();
         registry.register_advanced_recovery();
         registry.register_first_party_challenge();
+        registry.register_wasm_hooks();
         registry
     }
 
@@ -320,6 +324,33 @@ impl FeatureRegistry {
              gates no behavior.",
             "0.1.0-exp.1",
             "crates/ironauth-config/CHANGELOG.md",
+        ));
+    }
+
+    /// Registers the WASM token hooks feature (issue #114 criterion 7).
+    ///
+    /// EXPERIMENTAL and ack-gated, and the criterion asks for exactly that: "hooks are gated
+    /// behind the experimental maturity flag with the acknowledgment gate at startup".
+    ///
+    /// The reason is not that the runtime is unproven -- the sandbox is adversarially tested and
+    /// the latency is benchmarked and gated. It is the ABI. A hook is a compiled artifact an
+    /// operator built against a WIT interface, and issue #114's whole differentiator is a
+    /// version-stable one ("Auth0's Rules to Hooks to Actions churn forced three customer
+    /// rewrites"). Promising decade stability for an interface with one implementation and no
+    /// external users is a promise made before the evidence, so the flag says the interface may
+    /// still move and an operator enabling it acknowledges which revision they built against.
+    ///
+    /// Off by default. A deployment that has not enabled it never reads `token_hooks`, never
+    /// compiles a component, and issues tokens byte-for-byte as it did before hooks existed.
+    pub fn register_wasm_hooks(&mut self) {
+        self.register(Feature::experimental(
+            WASM_HOOKS_FEATURE,
+            "In-process WASM component hooks that shape token claims (issue #114): a \
+             deny-by-default capability sandbox with fuel, memory, deadline and host-resource \
+             bounds. EXPERIMENTAL because the WIT interface may still move before the \
+             decade-ABI commitment; a hook is a compiled artifact built against it.",
+            "0.1.0-exp.1",
+            "crates/ironauth-hooks/CHANGELOG.md",
         ));
     }
 

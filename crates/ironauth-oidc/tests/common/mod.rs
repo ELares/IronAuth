@@ -281,7 +281,17 @@ impl Harness {
     /// Like [`Harness::start`] but with explicit OIDC settings (for the expiry
     /// test, which wants a short code lifetime).
     pub async fn start_with(config: OidcConfig) -> Self {
-        Self::start_inner(config, None, None, None).await
+        Self::start_inner(config, None, None, None, None).await
+    }
+
+    /// Like [`Harness::start`] but with the WASM hook engine installed (issue #114).
+    ///
+    /// On the SAME state the router is built from, for the reason `start_with_group_depth`
+    /// gives: the property under test is that a deployment which enables hooks reaches them
+    /// from a real request, and an engine probed on a throwaway clone proves the builder works
+    /// and says nothing about the wiring.
+    pub async fn start_with_hook_engine(engine: Arc<ironauth_hooks::HookEngine>) -> Self {
+        Self::start_inner(OidcConfig::default(), None, None, None, Some(engine)).await
     }
 
     /// Like [`Harness::start`] but with an explicit organization group nesting bound
@@ -304,6 +314,7 @@ impl Harness {
             None,
             None,
             Some(max_group_depth),
+            None,
         )
         .await
     }
@@ -312,7 +323,7 @@ impl Harness {
     /// resolver (issue #25), so a `jwks_uri` client's keys resolve through the
     /// fetcher. Confidential PKCE is relaxed via the passed config.
     pub async fn start_with_resolver(config: OidcConfig, resolver: Arc<ClientKeyResolver>) -> Self {
-        Self::start_inner(config, Some(resolver), None, None).await
+        Self::start_inner(config, Some(resolver), None, None, None).await
     }
 
     /// Like [`Harness::start_with`] but with the tenant/environment quota engine
@@ -320,7 +331,7 @@ impl Harness {
     /// harness's deterministic clock. Used to drive the real `/authorize` request
     /// path into a 429 and to prove tenant fairness end to end.
     pub async fn start_with_quota(config: OidcConfig, quota_config: QuotaConfig) -> Self {
-        Self::start_inner(config, None, Some(quota_config), None).await
+        Self::start_inner(config, None, Some(quota_config), None, None).await
     }
 
     async fn start_inner(
@@ -328,6 +339,7 @@ impl Harness {
         resolver: Option<Arc<ClientKeyResolver>>,
         quota_config: Option<QuotaConfig>,
         max_group_depth: Option<u32>,
+        hook_engine: Option<Arc<ironauth_hooks::HookEngine>>,
     ) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common().await;
 
@@ -390,6 +402,14 @@ impl Harness {
                 )
             }
             None => (state, None),
+        };
+        // The WASM hook engine (issue #114), installed on the SAME state the router is built
+        // from, exactly as the boot path does. Absent unless a test asked for it, which is what
+        // makes `a_deployment_with_no_engine_does_not_run_a_deployed_hook` a real control
+        // rather than a restatement of the default.
+        let state = match hook_engine {
+            Some(engine) => state.with_hook_engine(engine),
+            None => state,
         };
         let issuer = state.issuer_for(&scope);
         let router = oidc_router(state.clone());

@@ -181,6 +181,7 @@ mod token;
 mod token_credential;
 mod token_exchange;
 mod token_hash;
+pub mod token_hook;
 mod tokens;
 mod totp;
 mod trusted_device;

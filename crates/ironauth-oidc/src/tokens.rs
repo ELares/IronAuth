@@ -569,7 +569,7 @@ pub struct MintRequest<'a> {
     /// it: the hook's own fence in `claims_mapping` is the first line, and this one holds for
     /// any future writer that has not been invented yet.
     /// Typed, and that is the fence. A [`MappedAccessClaims`] can only come from
-    /// `claims_mapping_at_issuance::apply_to`, so a door that mints a token for a client cannot
+    /// `claims_mapping_at_issuance::apply_to_with_hook`, so a door that mints a token for a client cannot
     /// populate this field without resolving that client's mapping -- including a door nobody
     /// has written yet. Review measured why a plain map was not enough: emptying the resolver
     /// call at three of the six existing doors left the whole suite green.

@@ -183,46 +183,110 @@ pub fn as_claims(
     mapped.into_iter().collect()
 }
 
-/// Resolve and APPLY this client's mapping, in the shape every mint site wants.
+/// Resolve and apply this client's mapping, then run its deployed WASM hook (issue #114).
 ///
-/// Rewrites `extra_claims` into the ID-token set and returns the access-token set, because
+/// The one entry point every mint site calls. A thin `apply_to_with_hook` without the hook parameters
+/// existed for one commit and is gone: once every door passed an engine it had zero callers,
+/// and a public function nothing calls is the shape that lets the next door quietly use the
+/// weaker one.
+///
+/// Rewrites `extra_claims` into the ID-token set and RETURNS the access-token set, because
 /// deciding which token a claim goes in is part of what a mapping does (criterion 4:
 /// "ID-versus-access-token placement with no custom code").
 ///
-/// Every mint site calls THIS rather than [`resolve`], so the two things easy to get wrong are
-/// written once: that a client with no mapping passes its claims through untouched rather than
-/// having them replaced by an empty set, and that a fault stops the issuance.
+/// THE MAPPING FIRST, THEN THE HOOK, and the order is the decision. The mapping is configuration
+/// an operator writes as data; the hook is code. Code should see what configuration produced
+/// rather than race it, and an operator debugging a token can read the rules and then read the
+/// hook rather than having to hold both in mind at once.
+///
+/// `engine` absent means hooks are not enabled for this deployment: the mapping applies and
+/// `token_hooks` is never read, so a deployment that has not enabled hooks issues exactly what
+/// it did before they existed and pays nothing for them.
 ///
 /// # Errors
 ///
-/// [`MappingFault`], which each caller maps onto its own refusal. There is no fail-open path;
-/// see the module header.
-pub async fn apply_to(
+/// [`MappingFault`] from either half. A hook fault is not a separate outcome here because the
+/// caller does the same thing with both: refuse the issuance. See `token_hook`'s header for why
+/// a hook is fail-CLOSED where the enrichment beside it is fail-open.
+pub async fn apply_to_with_hook(
     store: &Store,
+    engine: Option<&std::sync::Arc<ironauth_hooks::HookEngine>>,
     scope: Scope,
     client_id: &str,
+    grant_type: &str,
+    subject: Option<&str>,
     extra_claims: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<MappedAccessClaims, MappingFault> {
     let source = as_source(extra_claims);
-    match resolve(store, scope, client_id, &source).await? {
+    let mut access = match resolve(store, scope, client_id, &source).await? {
         // Untouched. NOT "an empty mapping applied": a client with no mapping issues exactly
         // what it issued before this seam existed, and the two cases produce opposite results
         // for the same input.
-        Resolved::NoMapping => Ok(MappedAccessClaims(serde_json::Map::new())),
+        Resolved::NoMapping => serde_json::Map::new(),
         Resolved::Mapped(mapped) => {
             *extra_claims = as_claims(mapped.id_token);
-            Ok(MappedAccessClaims(as_claims(mapped.access_token)))
+            as_claims(mapped.access_token)
+        }
+    };
+
+    let Some(engine) = engine else {
+        return Ok(MappedAccessClaims(access));
+    };
+
+    let contributed = crate::token_hook::run(
+        store,
+        engine,
+        &crate::token_hook::Invocation {
+            scope,
+            client_id,
+            grant_type,
+            subject,
+            id_token_claims: extra_claims,
+            access_token_claims: &access,
+        },
+    )
+    .await
+    .map_err(|fault| {
+        // Folded onto ONE fault type, because every caller does the same thing with both and a
+        // second variant it never distinguishes is a distinction that exists only in the type.
+        // The hook's own reason is already logged where it happened, with the client and the
+        // bound it hit -- which is what an operator needs and what a client must not learn.
+        tracing::error!(
+            target: "ironauth.hooks",
+            tenant = %scope.tenant(),
+            client_id,
+            ?fault,
+            "refusing the issuance because the client's hook did not complete"
+        );
+        MappingFault::Refused
+    })?;
+
+    if let Some(contributed) = contributed {
+        // The hook's claims OVERWRITE the mapping's on a collision, and that is the only order
+        // that makes the two composable: an operator who deploys a hook to override something a
+        // rule sets has done it deliberately, and the reverse would make the hook silently
+        // ineffective on exactly the claims somebody cared enough to write a rule for.
+        //
+        // Both sides have already been through `filter_hook_claims`, so neither can carry a
+        // protected name whichever wins.
+        for (name, value) in contributed.id_token {
+            extra_claims.insert(name, value);
+        }
+        for (name, value) in contributed.access_token {
+            access.insert(name, value);
         }
     }
+
+    Ok(MappedAccessClaims(access))
 }
 
 /// The access-token claims a mapping produced, in a wrapper only this module can build.
 ///
 /// `MintRequest::access_extra_claims` takes one of these, so a door that mints a token for a
-/// client CANNOT do it without calling [`apply_to`] -- the field has no other source. That is
+/// client CANNOT do it without calling [`apply_to_with_hook`] -- the field has no other source. That is
 /// the point, and it is a repair rather than a flourish.
 ///
-/// Review measured the alternative: with the field taking a plain map, emptying the `apply_to`
+/// Review measured the alternative: with the field taking a plain map, emptying the `apply_to_with_hook`
 /// call at the FedCM, CIBA and front-channel-authorize doors each left the whole suite green,
 /// because those three are driven by no test that installs a mapping. A structural argument
 /// ("they all call the same function") is not a measurement, and structure cannot express
@@ -232,7 +296,7 @@ pub async fn apply_to(
 /// The wrapped map may be empty. That is `NoMapping`, and it is the common case: a client with
 /// no mapping contributes no access-token claims and issues exactly what it did before.
 // NO `Default`. The derive was a PUBLIC associated function, so any code in any crate could
-// build this without calling `apply_to` -- which is the entire fence, and the comments above
+// build this without calling `apply_to_with_hook` -- which is the entire fence, and the comments above
 // claimed it held. Measured: replacing the FedCM door's resolver call with
 // `MappedAccessClaims::default()` compiled clean with zero clippy warnings. A newtype whose
 // bypass is one derive away is not a fence, and the derive was the one thing nobody grepped for
@@ -263,7 +327,7 @@ impl MappedAccessClaims {
     ///
     /// Deliberately narrow, and deliberately not `Default`-by-accident: the only honest use is a
     /// mint that has no client id to look a mapping up by. A door that HAS one must call
-    /// [`apply_to`]; reaching for this instead is the bypass the wrapper exists to prevent, and
+    /// [`apply_to_with_hook`]; reaching for this instead is the bypass the wrapper exists to prevent, and
     /// it is greppable.
     #[must_use]
     pub fn none_for_a_clientless_mint() -> Self {

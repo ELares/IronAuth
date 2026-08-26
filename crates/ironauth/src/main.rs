@@ -25,7 +25,7 @@ use ironauth_config::{
     ADVANCED_RECOVERY_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
     FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, ORG_SCOPED_CLIENTS_FEATURE,
     OidcConfig, OutboxConfig, PasswordPolicyConfig, RISK_SIGNALS_FEATURE, ScreeningFailurePolicy,
-    ScreeningProvider, WebhooksConfig,
+    ScreeningProvider, WASM_HOOKS_FEATURE, WebhooksConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -589,6 +589,13 @@ struct DataPlaneSurfaces {
     flows: bool,
     /// The hosted-page render app cutover (issue #85), a plain operator toggle.
     hosted_pages: bool,
+    /// The experimental WASM token hooks (issue #114 criterion 7).
+    ///
+    /// Not a route, unlike its neighbours: it gates whether the ISSUANCE path carries a hook
+    /// engine at all. Resolved here anyway so every experimental verdict is read in one place
+    /// from the validated ladder -- a second place that asks the registry is a second place to
+    /// forget the acknowledgment gate.
+    wasm_hooks: bool,
 }
 
 impl DataPlaneSurfaces {
@@ -614,6 +621,7 @@ impl DataPlaneSurfaces {
             // builder enforces via `hosted_pages_cutover`. A config that arms the pages
             // without the flow engine is surfaced as a load-time warning.
             hosted_pages: config.hosted_pages.enabled,
+            wasm_hooks: features.is_enabled(config, WASM_HOOKS_FEATURE),
         }
     }
 }
@@ -1426,6 +1434,44 @@ async fn build_oidc_plane(
     let state = match &claims_enrichment_hook {
         Some(hook) => state.with_claims_enrichment_hook(std::sync::Arc::clone(hook)),
         None => state,
+    };
+    // The WASM hook engine (issue #114), behind the experimental maturity flag its criterion 7
+    // asks for. Off by default: without it the issuance path never reads `token_hooks`, never
+    // compiles a component, and issues tokens byte-for-byte as it did before hooks existed.
+    //
+    // ONE engine for the process, and that is not an optimization. A wasmtime `Engine` owns the
+    // compilation cache and the epoch counter, so a per-invocation one would recompile every
+    // time AND have an epoch nothing advances -- which is the deadline bound silently gone,
+    // exactly the failure `HookEngine::tick`'s own doc warns about.
+    //
+    // A failure to BUILD the engine is fatal rather than degraded. An operator who enabled
+    // hooks and got a server that quietly does not run them has a deployment whose tokens are
+    // not the shape they configured, and no signal saying so.
+    let state = if surfaces.wasm_hooks {
+        let engine = std::sync::Arc::new(match ironauth_hooks::HookEngine::new() {
+            Ok(engine) => engine,
+            Err(error) => {
+                tracing::error!(?error, "the WASM hook engine could not be built");
+                return None;
+            }
+        });
+        // THE EPOCH DRIVER. `Limits::claim_shaping` sets a deadline of one tick, and a tick is
+        // whatever the deployment makes it -- so without this the deadline never arrives and
+        // the backstop against a hook that blocks is gone while the config still claims it.
+        // Ten milliseconds: far longer than the benchmarked warm invocation (tens of
+        // microseconds) and far shorter than a login anyone would wait through.
+        let ticker = std::sync::Arc::clone(&engine);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                ticker.tick();
+            }
+        });
+        state.with_hook_engine(engine)
+    } else {
+        state
     };
     // The outbound client sync HTTP flow targets are called through (issue #112). Its
     // `total_timeout` is the flow-target ceiling EXACTLY, because a per-request timeout only

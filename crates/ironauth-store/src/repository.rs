@@ -123,6 +123,7 @@ use crate::scope::Scope;
 use crate::signup_form::{NewSignupForm, SignupFormRecord};
 use crate::sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 use crate::store::Store;
+use crate::token_hook_store::TokenHookRecord;
 use crate::trait_schema::{TraitSchema, TransformOp, ValidationFailure};
 
 /// A store bound to one `(tenant, environment)` scope. Hands out the per-kind
@@ -800,6 +801,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn locale_bundles(&self) -> LocaleBundleRepo<'a> {
         LocaleBundleRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The deployed WASM token hooks for this scope (issue #114), read-only.
+    #[must_use]
+    pub fn token_hooks(&self) -> TokenHookRepo<'a> {
+        TokenHookRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1906,6 +1916,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn claims_mappings(&self) -> ActingClaimsMappingRepo<'a> {
         ActingClaimsMappingRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The deployed WASM token hooks for this scope and actor (issue #114).
+    ///
+    /// The control plane's INSERT and UPDATE grants on `token_hooks` exist for THIS and nothing
+    /// else: deploying a hook is deploying code that runs inside the token mint.
+    #[must_use]
+    pub fn token_hooks(&self) -> ActingTokenHookRepo<'a> {
+        ActingTokenHookRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -32234,6 +32257,107 @@ impl ClaimsMappingRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(rows.iter().map(claims_mapping_from_row).collect())
+    }
+}
+
+/// The read-only deployed-hook repository for one scope (issue #114).
+///
+/// Read by the ISSUANCE path on every token it mints for a client, which is why the data plane
+/// holds SELECT here and nothing else: the plane that mints tokens must not be able to change
+/// the code that shapes them.
+pub struct TokenHookRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl TokenHookRepo<'_> {
+    /// This client's deployed hook, or [`None`] when it has none.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, client_id: &str) -> Result<Option<TokenHookRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT client_id, component, payload_version FROM token_hooks \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| TokenHookRecord {
+            client_id: row.get("client_id"),
+            component: row.get("component"),
+            payload_version: row.get("payload_version"),
+        }))
+    }
+}
+
+/// The mutating deployed-hook repository for one scope and actor (issue #114).
+pub struct ActingTokenHookRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingTokenHookRepo<'_> {
+    /// Deploy a client's hook (a first deploy or a replacement), audited as `token_hook.set`.
+    ///
+    /// One row per (scope, client), so a redeploy replaces in place. The audit TARGET is the
+    /// CLIENT: this table has no id of its own, and the client is the thing whose tokens the
+    /// deployed code now shapes.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure, which includes the table's own bounds on the component.
+    pub async fn set(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        component: &[u8],
+        payload_version: i32,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client_id = client.to_string();
+        let bytes = component.to_vec();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TokenHookSet,
+                target: client,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO token_hooks \
+                     (tenant_id, environment_id, client_id, component, payload_version) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE \
+                     SET component = EXCLUDED.component, \
+                         payload_version = EXCLUDED.payload_version, \
+                         updated_at = now()",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&bytes)
+                .bind(payload_version)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 }
 

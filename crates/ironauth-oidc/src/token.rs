@@ -408,8 +408,15 @@ async fn authorization_code_grant(
     //    deliberately: an operator who filters `groups` means the groups that reached the token,
     //    whichever layer contributed them, and a mapping that ran first would filter a set the
     //    enrichment then refilled.
-    let access_extra_claims =
-        apply_claims_mapping(state, scope, &bindings.client_id, &mut extra_claims).await?;
+    let access_extra_claims = apply_claims_mapping(
+        state,
+        scope,
+        &bindings.client_id,
+        "authorization_code",
+        Some(&bindings.subject),
+        &mut extra_claims,
+    )
+    .await?;
     let minted = mint_tokens(
         state,
         scope,
@@ -1697,11 +1704,21 @@ pub(crate) async fn apply_claims_mapping(
     state: &OidcState,
     scope: Scope,
     client_id: &str,
+    grant_type: &str,
+    subject: Option<&str>,
     extra_claims: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<crate::claims_mapping_at_issuance::MappedAccessClaims, TokenError> {
-    crate::claims_mapping_at_issuance::apply_to(state.store(), scope, client_id, extra_claims)
-        .await
-        .map_err(|_| TokenError::ServerError)
+    crate::claims_mapping_at_issuance::apply_to_with_hook(
+        state.store(),
+        state.hook_engine(),
+        scope,
+        client_id,
+        grant_type,
+        subject,
+        extra_claims,
+    )
+    .await
+    .map_err(|_| TokenError::ServerError)
 }
 
 /// Build the `200 OK` token response (RFC 6749 5.1) from the pre-minted tokens,
@@ -2507,8 +2524,15 @@ async fn mint_refresh_access(
     // token by refreshing, which is a documented way around the control rather than a gap in
     // it. A fault still fails the refresh, for the reason `claims_mapping_at_issuance` gives.
     let mut extra_claims = serde_json::Map::new();
-    let access_extra_claims =
-        apply_claims_mapping(state, scope, &resolution.client_id, &mut extra_claims).await?;
+    let access_extra_claims = apply_claims_mapping(
+        state,
+        scope,
+        &resolution.client_id,
+        "refresh_token",
+        Some(&resolution.subject),
+        &mut extra_claims,
+    )
+    .await?;
     let minted = tokens::mint_access_token(
         state,
         signer,

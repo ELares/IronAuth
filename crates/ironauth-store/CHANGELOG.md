@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`token_hooks`, the deployed-hook table (issue #114).** One row per (scope, client) holding
+  the WASM component and the payload version its guest was built against. The COMPONENT rather
+  than a precompiled artifact: `load_precompiled` is `unsafe` because nothing checks that machine
+  code matches the engine that will run it, so a precompiled artifact in a shared database is a
+  portability hazard with a memory-safety failure mode. The control plane deploys, the data plane
+  reads and cannot write -- the plane that mints tokens must not be able to change the code that
+  shapes them.
+
 - **`RateBudget` can count per KIND rather than across every kind (issue #111).** The default is
   unchanged and still cross-kind, which is the anti-flood bound the module argues for: a stranger
   typing a victim's address into a signup form is bounded by TOTAL volume. But for a message the

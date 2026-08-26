@@ -406,6 +406,13 @@ pub struct OidcState {
     // The claims-enrichment hook (issue #100): the seam an external PDP or FGA merges
     // extra claims through at issuance. `None` (the default) leaves issuance unchanged.
     claims_enrichment_hook: Option<Arc<crate::enrichment::ClaimsEnrichmentHook>>,
+    /// The WASM hook engine (issue #114), absent unless a deployment enables hooks.
+    ///
+    /// ONE engine for the process, held here rather than built per invocation: a wasmtime
+    /// `Engine` owns the compilation cache and the epoch counter, so a per-invocation one would
+    /// recompile every time and would have an epoch nothing advances -- which is the deadline
+    /// silently gone.
+    hook_engine: Option<Arc<ironauth_hooks::HookEngine>>,
     // The outbound client SYNC HTTP flow targets are called through (issue #112). `None`
     // (the default) is not "skip the targets": a registered target with no fetcher takes the
     // unavailable path and its failure policy, so a boot that forgot to install one cannot
@@ -1015,6 +1022,7 @@ impl OidcState {
             quota: None,
             migration_hook: None,
             claims_enrichment_hook: None,
+            hook_engine: None,
             flow_target_fetcher: None,
             hashing_pool: None,
             custom_journey_source: None,
@@ -1599,6 +1607,21 @@ impl OidcState {
     #[must_use]
     pub fn claims_enrichment_hook(&self) -> Option<&Arc<crate::enrichment::ClaimsEnrichmentHook>> {
         self.claims_enrichment_hook.as_ref()
+    }
+
+    /// Install the WASM hook engine (issue #114). Absent by default, which leaves token
+    /// issuance byte-for-byte as it was before hooks existed -- a deployment that has not
+    /// enabled them never reads `token_hooks` and never compiles anything.
+    #[must_use]
+    pub fn with_hook_engine(mut self, engine: Arc<ironauth_hooks::HookEngine>) -> Self {
+        self.hook_engine = Some(engine);
+        self
+    }
+
+    /// The installed WASM hook engine, if any (issue #114).
+    #[must_use]
+    pub fn hook_engine(&self) -> Option<&Arc<ironauth_hooks::HookEngine>> {
+        self.hook_engine.as_ref()
     }
 
     /// Install the outbound client sync HTTP flow targets are called through (issue #112).

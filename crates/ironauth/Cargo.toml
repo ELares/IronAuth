@@ -27,6 +27,8 @@ ironauth-admin.workspace = true
 # The OIDC provider (issue #12) is mounted on the PUBLIC plane when
 # oidc.enabled is set; the store provides the data-plane connection. rustls/ring
 # only, so the musl static lane holds.
+# The WASM hook engine (issue #114), installed behind the experimental maturity flag.
+ironauth-hooks.workspace = true
 ironauth-oidc.workspace = true
 # The admin console SPA (issue #90) is embedded and mounted on the PUBLIC plane
 # under /admin when admin_spa.enabled is set. It embeds its assets with

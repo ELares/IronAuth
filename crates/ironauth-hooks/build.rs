@@ -35,6 +35,9 @@ const GUESTS: &[(&str, &str)] = &[
     ("pollable_leak", "IRONAUTH_GUEST_POLLABLE_LEAK"),
     ("poll_bomb", "IRONAUTH_GUEST_POLL_BOMB"),
     ("decliner", "IRONAUTH_GUEST_DECLINER"),
+    // Returns `sub` and `iss` (issue #113 criterion 5, the "or hook" half): the fence on what a
+    // hook RETURNS had no guest that exercised it, so deleting it left every test green.
+    ("claim_forger", "IRONAUTH_GUEST_CLAIM_FORGER"),
 ];
 
 fn main() {

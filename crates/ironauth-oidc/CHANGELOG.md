@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A deployed WASM hook shapes a real token (issue #114, M11's exit criterion).** The new
+  `token_hook` module reads a client's deployed component, compiles it, runs it off the reactor
+  under `spawn_blocking` (wasmtime's `in_tokio` panics on a tokio worker), and puts everything it
+  returns through the protected-claim fence. Every failure -- an unreadable component, an
+  exhausted bound, a decline, a payload-version mismatch -- FAILS the issuance, deliberately
+  unlike the fail-open enrichment beside it: a hook can remove a claim as easily as add one, so
+  ignoring one that aborted issues a token whose shape nobody chose.
+
 - **The messaging ledger has a producer, and `VerificationSender::send` is async (issue #111).**
   `MessageRepo::enqueue` had ZERO production callers: the ledger, the collapse, the rate budget,
   the suppression check, the provider failover and both management endpoints were implemented,

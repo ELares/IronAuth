@@ -449,8 +449,9 @@ async fn the_mapping_applies_on_refresh_too() {
 ///
 /// The device flow is the one non-token-endpoint door driven end to end here. The remaining
 /// three (`authorize.rs`'s front channel, CIBA, FedCM) call the SAME single function,
-/// `claims_mapping_at_issuance::apply_to`, at the same point in the same way, and the mutation
-/// that empties that function fails every test in this file at once. What this test adds over
+/// `claims_mapping_at_issuance::apply_to_with_hook`, at the same point in the same way, and a
+/// door that skips it does not COMPILE -- `MintRequest::access_extra_claims` takes a type only
+/// that function can build. What this test adds over
 /// those is that the wiring at a door built by a different module, in a different flow, actually
 /// runs.
 #[tokio::test]

@@ -251,6 +251,12 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     // entity rather than a change to an account or an access grant (issue #113).
     "claims_mapping",
     "signup_form",
+    // A deployed WASM token hook is CODE an operator installs to shape a client's tokens
+    // (issue #114). Entity management for the same reason a claim mapping is: it configures
+    // what an entity's tokens carry rather than changing an account or an access grant. The
+    // event is high-value on a SIEM stream precisely because of what it installs, which is why
+    // it belongs on a classified stream rather than in none.
+    "token_hook",
     "sms_config",
     "sms_route",
     "tenant",

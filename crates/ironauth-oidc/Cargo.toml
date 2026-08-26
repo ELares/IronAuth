@@ -23,6 +23,11 @@ autotests = false
 async-trait = "0.1"
 ironauth-env.workspace = true
 ironauth-config.workspace = true
+# The WASM hook runtime (issue #114). The dependency runs THIS way -- `ironauth-hooks` knows
+# nothing about tokens, OIDC or the store; it takes claims as (name, JSON text) pairs and gives
+# them back. That is what lets the sandbox be reviewed on its own terms and what keeps the mint
+# from being able to weaken it.
+ironauth-hooks.workspace = true
 ironauth-store.workspace = true
 ironauth-jose.workspace = true
 # The declarative journey engine (issue #92): the pure artifact model, its load-time
@@ -140,6 +145,8 @@ ironauth-env = { workspace = true }
 # library does not depend on the management plane, and the cycle is one cargo permits
 # precisely because it never reaches the normal dependency graph.
 ironauth-admin = { workspace = true, features = ["testing"] }
+# The shipped guest fixtures, for the end-to-end hook test (issue #114).
+ironauth-hooks = { workspace = true, features = ["testing"] }
 # Base64 for building client_secret_basic Authorization headers in the tests.
 base64.workspace = true
 # SHA-256 lets the session-management test replicate the check_session_iframe's own
@@ -410,6 +417,15 @@ required-features = ["testing"]
 # `filter_list` act on a claim the SERVER contributed, a client with no mapping issues exactly
 # what it did before, the mapping applies on REFRESH as well as on the code exchange, and a
 # mapping that writes a protected claim or that cannot be read refuses the issuance.
+# A WASM HOOK CUSTOMIZES A REAL TOKEN (M11's exit criterion, issue #114): a deployed component
+# adds a claim to a token a real login returns; a client with no hook and a deployment with no
+# engine each issue exactly what they did before; a hook that exhausts its fuel, declines, or was
+# built against another payload version fails the issuance rather than minting a half-shaped one.
+[[test]]
+name = "token_hook_at_issuance"
+path = "tests/token_hook_at_issuance.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "claims_mapping_at_issuance"
 path = "tests/claims_mapping_at_issuance.rs"
