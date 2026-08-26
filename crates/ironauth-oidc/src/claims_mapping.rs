@@ -82,7 +82,32 @@ pub const MAX_HOOK_CLAIMS: usize = ironauth_config::OIDC_MAX_ENRICHED_CLAIMS;
 /// A name is a JWT object key that rides in every token and every log line that records the
 /// attempt. Nothing legitimate needs more than this; a hook that sends more is either broken or
 /// is using the audit trail as a write buffer.
+///
+/// BYTES, not characters, and the distinction is load-bearing: a cap counted in `char`s would
+/// admit four times its stated budget in UTF-8, so the limit would be a different number from
+/// the one its name promises.
 pub const MAX_CLAIM_NAME_BYTES: usize = 128;
+
+/// What is safe to put in an audit row for a claim named `name`.
+///
+/// The bound has to apply to BOTH outputs or it is not a bound. Refusing a ten-megabyte claim
+/// name and then copying it verbatim into the list a caller is documented to write into an
+/// audit row means the limit protects the token and hands the same bytes to the log instead: a
+/// hook returning many such names turns the audit sink into its write buffer, which is the
+/// exact thing this constant exists to prevent.
+///
+/// Truncation is on a CHARACTER boundary, because slicing a `String` mid-codepoint panics, and
+/// a panic here would be reached by exactly the input this function exists to survive.
+fn reportable(name: &str) -> String {
+    if name.len() <= MAX_CLAIM_NAME_BYTES {
+        return name.to_owned();
+    }
+    let mut end = MAX_CLAIM_NAME_BYTES;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &name[..end])
+}
 
 /// The one judgement both fences make about a claim name.
 ///
@@ -100,9 +125,13 @@ fn refuse_name(name: &str) -> Option<RefusalReason> {
     // Refused rather than trimmed, and the difference is the whole point. Trimming would make
     // `"sub "` into `sub`, so a padded name would either collide with a claim already present
     // or silently become the reserved one it was padded to evade. Refusing means the string
-    // this function judged and the string a caller stores are the same string, which is what
-    // stops a later "normalise the key" tidy-up from reopening the fence: there is no second
-    // form of the name for a normalisation to produce.
+    // this function judged and the string a caller stores are the same string, so there is no
+    // whitespace-padded second form of a name for a TRIMMING normalisation to collapse.
+    //
+    // Only trimming. Case is a separate axis this does not close: `"SUB"` is accepted, and is
+    // correct today because a JWT key is case-sensitive and `SUB` overrides nothing. A later
+    // `to_lowercase()` on accepted keys WOULD collapse it onto `sub`, so that normalisation is
+    // not safe to add without a case-folded membership test here first.
     if name != name.trim() {
         return Some(RefusalReason::Untrimmed);
     }
@@ -221,37 +250,47 @@ pub enum RefusalReason {
     TooManyClaims,
 }
 
+impl RefusalReason {
+    /// How this reason reads on its own, without a rule index.
+    ///
+    /// Separate from [`MappingRefusal`]'s `Display` because the two halves of the fence refuse
+    /// different shapes: a mapping refusal has a rule number an operator can look up, and a
+    /// hook refusal has only a claim name. A single `Display` covering both had to invent a
+    /// rule index for [`Self::TooManyClaims`], which no mapping can ever produce, and that arm
+    /// was unreachable text nobody could read.
+    fn describe(self, claim: &str) -> String {
+        match self {
+            Self::Reserved => {
+                format!("writes the reserved claim `{claim}`, which nothing may set")
+            }
+            Self::EmptyName => "writes a claim with an empty name".to_owned(),
+            Self::Untrimmed => {
+                format!("writes the claim `{claim}`, whose name has leading or trailing whitespace")
+            }
+            Self::NameTooLong => {
+                format!("writes a claim whose name is over the {MAX_CLAIM_NAME_BYTES} byte limit")
+            }
+            Self::TooManyClaims => {
+                format!("returns more than the {MAX_HOOK_CLAIMS} claim limit")
+            }
+        }
+    }
+}
+
+impl core::fmt::Display for RefusalReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.describe("<claim>"))
+    }
+}
+
 impl core::fmt::Display for MappingRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self.reason {
-            RefusalReason::Reserved => write!(
-                f,
-                "rule {} writes the reserved claim `{}`, which no mapping may set",
-                self.rule_index, self.claim
-            ),
-            RefusalReason::EmptyName => write!(
-                f,
-                "rule {} writes a claim with an empty name",
-                self.rule_index
-            ),
-            RefusalReason::Untrimmed => write!(
-                f,
-                "rule {} writes the claim `{}`, whose name has leading or trailing whitespace",
-                self.rule_index, self.claim
-            ),
-            RefusalReason::NameTooLong => write!(
-                f,
-                "rule {} writes a claim whose name is {} bytes, over the {} byte limit",
-                self.rule_index,
-                self.claim.len(),
-                MAX_CLAIM_NAME_BYTES
-            ),
-            RefusalReason::TooManyClaims => write!(
-                f,
-                "rule {} exceeds the {} claim limit",
-                self.rule_index, MAX_HOOK_CLAIMS
-            ),
-        }
+        write!(
+            f,
+            "rule {} {}",
+            self.rule_index,
+            self.reason.describe(&self.claim)
+        )
     }
 }
 
@@ -767,8 +806,15 @@ mod tests {
             );
             checked += 1;
         }
-        // The loop covering nothing would satisfy every assertion above it.
-        assert!(checked >= 25, "only {checked} names checked");
+        // The loop covering nothing would satisfy every assertion above it. Pinned to the
+        // EXACT count rather than a floor: at `>= 25` a whole chained list could be deleted
+        // and the assertion would still hold, which is how the only pin that
+        // RESERVED_ENRICHMENT_CLAIMS is covered by the mint fold could be removed with
+        // nothing red.
+        assert_eq!(
+            checked, 50,
+            "the three lists are 25 + 5 + 20; a link was dropped from the chain"
+        );
     }
 
     /// The names a hook must never set, written out by hand.
@@ -915,23 +961,162 @@ mod tests {
         );
     }
 
-    /// A claim name longer than the limit is refused.
+    /// A claim name longer than the limit is refused, and the limit counts BYTES.
+    ///
+    /// The multi-byte pair is what makes the constant's name true. `name.len()` and
+    /// `name.chars().count()` agree on every ASCII fixture, so an ASCII-only test admits a
+    /// character cap that lets four times the documented budget through.
     #[test]
     fn a_hook_cannot_set_an_unboundedly_long_claim_name() {
-        let name = "c".repeat(super::MAX_CLAIM_NAME_BYTES + 1);
+        let over = "c".repeat(super::MAX_CLAIM_NAME_BYTES + 1);
         let mut returned = BTreeMap::new();
-        returned.insert(name.clone(), serde_json::json!(1));
+        returned.insert(over, serde_json::json!(1));
         let outcome = super::filter_hook_claims(&returned);
         assert!(outcome.accepted.is_empty());
-        assert_eq!(outcome.refused, vec![(name, RefusalReason::NameTooLong)]);
+        assert_eq!(outcome.refused.len(), 1);
+        assert_eq!(outcome.refused[0].1, RefusalReason::NameTooLong);
 
         let at_limit = "c".repeat(super::MAX_CLAIM_NAME_BYTES);
         let mut ok = BTreeMap::new();
-        ok.insert(at_limit.clone(), serde_json::json!(1));
+        ok.insert(at_limit, serde_json::json!(1));
         assert_eq!(
             super::filter_hook_claims(&ok).accepted.len(),
             1,
             "the limit is inclusive, or the bound is off by one"
+        );
+
+        // 65 two-byte characters is 130 bytes: over the limit, under it by character count.
+        let multibyte_over = "\u{e9}".repeat(65);
+        let mut wide = BTreeMap::new();
+        wide.insert(multibyte_over, serde_json::json!(1));
+        assert!(
+            super::filter_hook_claims(&wide).accepted.is_empty(),
+            "the cap counts bytes, not characters"
+        );
+
+        // 64 of them is exactly 128 bytes, and must still be admitted.
+        let multibyte_at_limit = "\u{e9}".repeat(64);
+        let mut wide_ok = BTreeMap::new();
+        wide_ok.insert(multibyte_at_limit, serde_json::json!(1));
+        assert_eq!(
+            super::filter_hook_claims(&wide_ok).accepted.len(),
+            1,
+            "128 bytes of two-byte characters is at the limit, not over it"
+        );
+    }
+
+    /// An over-long name is TRUNCATED before it reaches the audit list.
+    ///
+    /// The bound has to apply to both outputs or it is not a bound: refusing a ten-megabyte
+    /// claim name and then copying it verbatim into the list a caller writes into an audit row
+    /// just redirects the same bytes from the token to the log.
+    #[test]
+    fn an_over_long_name_does_not_reach_the_audit_row_in_full() {
+        let huge = "c".repeat(1_000_000);
+        let mut returned = BTreeMap::new();
+        returned.insert(huge, serde_json::json!(1));
+        let outcome = super::filter_hook_claims(&returned);
+        assert!(outcome.accepted.is_empty());
+        assert_eq!(outcome.refused.len(), 1);
+        assert!(
+            outcome.refused[0].0.len() <= super::MAX_CLAIM_NAME_BYTES + 3,
+            "the audit row carried {} bytes",
+            outcome.refused[0].0.len()
+        );
+        assert!(
+            outcome.refused[0].0.ends_with("..."),
+            "a truncated name must say it was truncated"
+        );
+    }
+
+    /// Truncation never splits a character.
+    ///
+    /// Slicing a `String` mid-codepoint panics, and the input that would do it is exactly the
+    /// input the truncation exists to survive.
+    ///
+    /// THREE-byte characters, chosen deliberately. The limit is 128, which is divisible by
+    /// both 2 and 4, so a name of two-byte or four-byte characters happens to land on a
+    /// character boundary at exactly the cut point and would never exercise the walk at all. A
+    /// first version of this test used a four-byte emoji and passed with the boundary walk
+    /// deleted. 128 = 3 * 42 + 2, so a three-byte character puts the cut mid-codepoint.
+    #[test]
+    fn truncating_a_name_does_not_split_a_character() {
+        assert_ne!(
+            super::MAX_CLAIM_NAME_BYTES % 3,
+            0,
+            "this fixture only bites while the limit is not a multiple of three"
+        );
+        let wide = "\u{4e2d}".repeat(200);
+        let mut returned = BTreeMap::new();
+        returned.insert(wide, serde_json::json!(1));
+        let outcome = super::filter_hook_claims(&returned);
+        assert_eq!(outcome.refused.len(), 1);
+        assert!(outcome.refused[0].0.len() <= super::MAX_CLAIM_NAME_BYTES + 3);
+        assert!(
+            outcome.refused[0].0.ends_with("..."),
+            "a truncated name must say it was truncated"
+        );
+    }
+
+    /// A refused claim does not consume the accept budget.
+    ///
+    /// Without this, counting positions rather than accepted claims passes every other test in
+    /// the file while a conforming hook silently loses most of its output and the audit blames
+    /// a limit that was never reached.
+    #[test]
+    fn a_refused_claim_does_not_spend_the_budget_a_good_one_needs() {
+        let mut returned = BTreeMap::new();
+        for name in crate::tokens::PROTECTED_ACCESS_TOKEN_CLAIMS {
+            returned.insert((*name).to_owned(), serde_json::json!("forged"));
+        }
+        // Sort after every protected name, so under a positional count they would be the ones
+        // pushed out.
+        for index in 0..super::MAX_HOOK_CLAIMS {
+            returned.insert(format!("z{index:03}"), serde_json::json!(1));
+        }
+        let outcome = super::filter_hook_claims(&returned);
+        assert_eq!(
+            outcome.accepted.len(),
+            super::MAX_HOOK_CLAIMS,
+            "every writable claim must fit; a refused one costs nothing"
+        );
+        assert!(
+            !outcome
+                .refused
+                .iter()
+                .any(|(_, reason)| *reason == RefusalReason::TooManyClaims),
+            "the limit was never reached, so nothing may be blamed on it"
+        );
+    }
+
+    /// Every refusal reason renders something an operator can act on.
+    #[test]
+    fn every_refusal_reason_reads_as_something_actionable() {
+        for reason in [
+            RefusalReason::Reserved,
+            RefusalReason::EmptyName,
+            RefusalReason::Untrimmed,
+            RefusalReason::NameTooLong,
+            RefusalReason::TooManyClaims,
+        ] {
+            let rendered = reason.describe("tier");
+            assert!(!rendered.is_empty(), "{reason:?} renders nothing");
+            assert!(
+                rendered.len() > 20,
+                "{reason:?} renders too little to act on: {rendered}"
+            );
+        }
+        assert!(
+            RefusalReason::NameTooLong
+                .describe("x")
+                .contains(&super::MAX_CLAIM_NAME_BYTES.to_string()),
+            "the length refusal must name the limit"
+        );
+        assert!(
+            RefusalReason::TooManyClaims
+                .describe("x")
+                .contains(&super::MAX_HOOK_CLAIMS.to_string()),
+            "the count refusal must name the limit"
         );
     }
 
@@ -1077,7 +1262,7 @@ mod tests {
 
 /// What a hook returned, and what happened to it (issue #113 criterion 5, hook half).
 #[derive(Debug, Clone, PartialEq)]
-pub struct HookOutcome {
+pub struct HookClaimsOutcome {
     /// The claims that survived, ready to fold into the token being built.
     pub accepted: BTreeMap<String, serde_json::Value>,
     /// What was refused and why, sorted by claim name.
@@ -1128,14 +1313,14 @@ pub struct HookOutcome {
 /// Which claims overflow is decided in claim-name order, so it is the same set on every
 /// invocation given the same input rather than whichever ones happened to hash first.
 #[must_use]
-pub fn filter_hook_claims(returned: &BTreeMap<String, serde_json::Value>) -> HookOutcome {
-    let mut outcome = HookOutcome {
+pub fn filter_hook_claims(returned: &BTreeMap<String, serde_json::Value>) -> HookClaimsOutcome {
+    let mut outcome = HookClaimsOutcome {
         accepted: BTreeMap::new(),
         refused: Vec::new(),
     };
     for (name, value) in returned {
         if let Some(reason) = refuse_name(name) {
-            outcome.refused.push((name.clone(), reason));
+            outcome.refused.push((reportable(name), reason));
         } else if outcome.accepted.len() < MAX_HOOK_CLAIMS {
             outcome.accepted.insert(name.clone(), value.clone());
         } else {

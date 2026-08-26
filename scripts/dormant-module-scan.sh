@@ -52,6 +52,30 @@ allow() {
   allowlist_entries | grep -qxF "$1"
 }
 
+# How many places refer to a module, by name.
+#
+# ONE function, called by both loops below, so the two cannot drift into disagreeing about
+# what a reference is. That matters more than it looks: the main loop treats "zero refs" as
+# dormant and the staleness loop treats "more than zero" as an entry doing nothing, and those
+# are exact complements only while both count the same way. Two copies of this pipeline would
+# be a review obligation; one function is a structural guarantee.
+#
+# `|| true` wraps the WHOLE pipeline, not just the first grep: under `set -o pipefail` a
+# no-match grep exits 1 and kills the pipeline, which would make this script exit silently on
+# the FIRST module nobody references. That is the failure mode where a gate reports nothing
+# and looks like it passed.
+#
+# A rustdoc link counts, as does a mention in a test. That is deliberate and long-standing:
+# this scan asks "does anything in the tree name this module", not "is it on a request path",
+# and narrowing it to call sites would need a parser rather than a grep.
+refs_for() {
+  count="$( { grep -rn --include='*.rs' -e "${1}::" crates/ 2>/dev/null \
+    | grep -v "/${1}\.rs:" | wc -l; } || true )"
+  count="$(echo "$count" | tr -d ' ')"
+  [ -n "$count" ] || count=0
+  echo "$count"
+}
+
 # A module with a smaller surface than this is a helper, not a feature, and flagging every
 # two-function utility would bury the signal this exists to surface.
 min_public_items=3
@@ -69,14 +93,7 @@ for file in crates/*/src/*.rs; do
   [ "$public_items" -ge "$min_public_items" ] || continue
   checked=$((checked + 1))
 
-  # `|| true` on the whole pipeline, not just the first grep: under `set -o pipefail` a
-  # no-match grep exits 1 and kills the pipeline, which would make this script exit
-  # silently on the FIRST module nobody references. That is the failure mode where a gate
-  # reports nothing and looks like it passed.
-  refs="$( { grep -rn --include='*.rs' -e "${module}::" crates/ 2>/dev/null \
-    | grep -v "/${module}\.rs:" | wc -l; } || true )"
-  refs="$(echo "$refs" | tr -d ' ')"
-  [ -n "$refs" ] || refs=0
+  refs="$(refs_for "$module")"
   [ "$refs" -eq 0 ] || continue
 
   if allow "$crate/$module"; then
@@ -94,14 +111,25 @@ done
 stale=0
 while read -r entry; do
   [ -n "$entry" ] || continue
+  entry_crate="${entry%%/*}"
   entry_module="${entry#*/}"
-  entry_refs="$( { grep -rn --include='*.rs' -e "${entry_module}::" crates/ 2>/dev/null \
-    | grep -v "/${entry_module}\.rs:" | wc -l; } || true )"
-  entry_refs="$(echo "$entry_refs" | tr -d ' ')"
-  [ -n "$entry_refs" ] || entry_refs=0
+
+  # An entry naming a module that is gone is stale in the other direction, and nothing caught
+  # it: renaming a file leaves the allowlist asserting something about a path that does not
+  # exist, and the scan stays green forever because the loop above never sees the module
+  # either. This also catches a mistyped crate half, which nothing checked at all.
+  if [ ! -f "crates/${entry_crate}/src/${entry_module}.rs" ]; then
+    echo "dormant-module-scan: allowlist entry $entry names no module:" >&2
+    echo "  crates/${entry_crate}/src/${entry_module}.rs does not exist. Remove or fix the line." >&2
+    stale=$((stale + 1))
+    continue
+  fi
+
+  entry_refs="$(refs_for "$entry_module")"
   if [ "$entry_refs" -gt 0 ]; then
-    echo "dormant-module-scan: allowlist entry $entry is STALE: $entry_refs callers." >&2
-    echo "  It is wired now. Remove the line rather than leaving a claim nobody rechecks." >&2
+    echo "dormant-module-scan: allowlist entry $entry is INERT: $entry_refs references." >&2
+    echo "  The scan would not flag this module anyway, so the entry does nothing." >&2
+    echo "  Remove the line rather than leaving a claim nobody rechecks." >&2
     stale=$((stale + 1))
   fi
 done <<EOF
