@@ -936,12 +936,27 @@ pub struct ClientCredentialsMintRequest<'a> {
     pub client_id: &'a str,
     /// The granted OAuth `scope` value, echoed into the token when present.
     pub oauth_scope: Option<&'a str>,
-    /// The per-client STATIC custom claims to embed. A custom claim can never set a
-    /// reserved claim name (see [`PROTECTED_ACCESS_TOKEN_CLAIMS`]). Custom claims are
-    /// an at+jwt feature ONLY: an opaque access token carries no embedded claims by
-    /// design, so when the resolved format is opaque these claims are dropped (and the
-    /// mint warns), their metadata surfacing instead through #22 introspection.
-    pub custom_claims: &'a serde_json::Map<String, serde_json::Value>,
+    /// The custom claims to embed: the per-client static ones, AFTER this client's
+    /// declarative mapping and its deployed hook have shaped them (issue #113 criterion 1).
+    ///
+    /// A custom claim can never set a reserved claim name (see
+    /// [`PROTECTED_ACCESS_TOKEN_CLAIMS`]). Custom claims are an at+jwt feature ONLY: an opaque
+    /// access token carries no embedded claims by design, so when the resolved format is
+    /// opaque these claims are dropped (and the mint warns), their metadata surfacing instead
+    /// through #22 introspection.
+    ///
+    /// TYPED, for the same reason [`MintRequest::access_extra_claims`] is, and the type is
+    /// deliberately the SAME one. This field was a plain map until issue #113's criterion-1
+    /// audit, and that is how three grants -- `client_credentials`, `jwt:bearer` and token
+    /// exchange -- came to mint tokens that ran no mapping and no hook. The fence on the other
+    /// struct was sound and simply did not extend here, because a fence is a property of a
+    /// FIELD and these doors fill in a different one. Both structs now demand the same
+    /// evidence, so a door added to either is asked the question.
+    ///
+    /// Built by `claims_mapping_at_issuance::apply_to_machine_token`, which is
+    /// `apply_to_with_hook` with the ID-token half folded in, since these grants mint one
+    /// token and a placement rule has nowhere else to put a claim.
+    pub custom_claims: &'a crate::claims_mapping_at_issuance::MappedAccessClaims,
     /// The RFC 8693 section 4.1 `act` delegation chain, for a token issued by the
     /// token-exchange grant (issue #125). [`None`] for every other issuance, and the
     /// client-credentials grant always passes [`None`]: `act` asserts that somebody other
@@ -1017,7 +1032,7 @@ pub(crate) fn build_client_credentials_access_token_claims(
     // `{"sub":"attacker"}` never shadows the real subject even if it were written
     // straight into the store.
     if let serde_json::Value::Object(object) = &mut claims {
-        for (name, value) in request.custom_claims {
+        for (name, value) in request.custom_claims.as_map() {
             if PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name.as_str()) {
                 continue;
             }
@@ -1085,7 +1100,7 @@ pub fn mint_client_credentials_access_token(
         // is observable rather than a silent gap. Storing the claims in the opaque row
         // is deliberately out of scope here (cross-cutting with introspection, #22).
         TokenFormat::Opaque => {
-            if !request.custom_claims.is_empty() {
+            if !request.custom_claims.as_map().is_empty() {
                 tracing::warn!(
                     "client custom claims are configured but the resolved access-token \
                      format is opaque; custom claims are an at+jwt feature and are not \
@@ -2723,7 +2738,9 @@ mod tests {
             subject: "sva_machine",
             client_id: "cli_example",
             oauth_scope: None,
-            custom_claims: &hostile,
+            custom_claims: &crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(
+                hostile.clone(),
+            ),
             act: None,
         };
         let cc_claims = build_client_credentials_access_token_claims(
@@ -2793,7 +2810,7 @@ mod tests {
             subject: "sva_machine",
             client_id: "cli_example",
             oauth_scope: Some("api"),
-            custom_claims: empty_extra(),
+            custom_claims: empty_mapped_extra(),
             act: None,
         };
         let claims = build_client_credentials_access_token_claims(
@@ -2968,7 +2985,7 @@ mod tests {
     /// A minimal client-credentials mint request over a throwaway scope.
     fn cc_request<'a>(
         subject: &'a str,
-        custom: &'a serde_json::Map<String, serde_json::Value>,
+        custom: &'a crate::claims_mapping_at_issuance::MappedAccessClaims,
     ) -> ClientCredentialsMintRequest<'a> {
         let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 1);
         let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
@@ -2988,7 +3005,8 @@ mod tests {
         // Issue #23: the M2M token carries the RFC 9068 protocol claims, with sub the
         // service-account principal (DISTINCT from client_id) and NO acr / auth_time
         // (there was no user authentication event to derive them from).
-        let empty = serde_json::Map::new();
+        let empty =
+            crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(serde_json::Map::new());
         let mut req = cc_request("sva_principal", &empty);
         req.oauth_scope = Some("read write");
         let claims = build_client_credentials_access_token_claims(
@@ -3071,6 +3089,7 @@ mod tests {
         .as_object()
         .cloned()
         .expect("object");
+        let custom = crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(custom);
         let mut req = cc_request("sva_real", &custom);
         req.oauth_scope = Some("read");
         let claims = build_client_credentials_access_token_claims(
@@ -3129,7 +3148,7 @@ mod tests {
         for reserved in PROTECTED_ACCESS_TOKEN_CLAIMS {
             assert_ne!(
                 claims.get(*reserved),
-                custom.get(*reserved),
+                custom.as_map().get(*reserved),
                 "{reserved} must never carry the hostile custom value"
             );
         }

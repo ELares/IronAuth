@@ -3685,3 +3685,53 @@ async fn an_issuer_that_rotated_past_the_resolved_jwks_is_diagnosed_as_an_unknow
         "and NOT as the coarse bucket, which is what it recorded before this change: {reasons:?}"
     );
 }
+
+/// THE JWT BEARER GRANT runs the hook (issue #113 criterion 1, which names it explicitly).
+///
+/// It builds a `ClientCredentialsMintRequest`, so before the criterion-1 audit it reached
+/// neither the client's declarative mapping nor its deployed hook. The `MappedAccessClaims`
+/// fence lives on `MintRequest`'s field and could not ask this door the question.
+///
+/// The test is HERE rather than in `token_hook_at_issuance.rs` because the trusted-issuer and
+/// subject-mapping scaffolding this grant needs exists only in this file, and a hook test that
+/// reimplemented it would be measuring its own copy.
+#[cfg(feature = "wasm-hooks")]
+#[tokio::test]
+async fn the_jwt_bearer_grant_runs_the_hook() {
+    let h = Harness::start_with_hook_engine(std::sync::Arc::new(
+        ironauth_hooks::HookEngine::new().expect("build the engine"),
+    ))
+    .await;
+    let client_id = seed_trust(&h).await;
+    h.deploy_token_hook(h.client_id(), ironauth_hooks::fixtures::GOOD, 1)
+        .await;
+
+    let asrt = assertion(
+        &issuer_key(),
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-hook",
+    );
+    let (status, _headers, body) = present(&h, &client_id, &asrt).await;
+    assert_eq!(status, StatusCode::OK, "exchange: {body}");
+
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_owned();
+    let claims = jwt_payload(&access);
+    assert_eq!(
+        claims["tier"], "gold",
+        "a jwt:bearer access token carries the hook's claim, or a federated machine identity \
+         is a way around a deployed hook: {claims}"
+    );
+    // The mapped principal survived the seam. A hook returns BOTH claim lists and the mint
+    // rebuilds its protocol claims afterwards, so this is the assertion that catches a fold
+    // which replaced the token rather than added to it.
+    assert_eq!(
+        claims["sub"], MAPPED_PRINCIPAL,
+        "and the mapped identity is untouched: {claims}"
+    );
+}

@@ -856,3 +856,75 @@ async fn an_actor_token_and_its_type_must_travel_together() {
         assert_eq!(body["error"], "invalid_request", "{body}");
     }
 }
+
+/// TOKEN EXCHANGE runs the hook (issue #113 criterion 1, by extension).
+///
+/// The criterion names authorization code, refresh, `client_credentials`, device and JWT
+/// bearer.
+/// It does not name token exchange, and this door was wired anyway: it is the third builder of
+/// a `ClientCredentialsMintRequest`, and leaving one of the three unhooked would recreate the
+/// exact hole the criterion-1 audit found, in the door nobody thinks of as a grant.
+///
+/// Wiring it without measuring it would be worse than leaving it out, so this is the test.
+/// Confirmed: replacing `state.hook_engine()` with `None` in `token_exchange.rs` fails here
+/// and nowhere else in the suite.
+///
+/// Note what this means operationally: a hook shapes a token minted FOR ANOTHER SUBJECT. The
+/// per-client STATIC claims are still withheld from an exchanged token, because those describe
+/// the client rather than the subject it is speaking for; what a hook gets is the extension
+/// point, which is where downstream routing claims belong.
+#[cfg(feature = "wasm-hooks")]
+#[tokio::test]
+async fn the_token_exchange_grant_runs_the_hook() {
+    use base64::Engine as _;
+
+    let harness = Harness::start_with_hook_engine_and_config(
+        std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine")),
+        OidcConfig {
+            enforce_client_grant_types: true,
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        },
+    )
+    .await;
+    let (client, secret) = exchanging_client(&harness).await;
+    harness
+        .deploy_token_hook(&client, ironauth_hooks::fixtures::GOOD, 1)
+        .await;
+    let (subject, subject_token) = access_token_for_named_user(&harness, &client, &secret).await;
+
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &subject_token),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "exchange: {body}");
+
+    let access = body["access_token"].as_str().expect("access token");
+    let payload = access
+        .split('.')
+        .nth(1)
+        .expect("a JWT payload segment, so the exchanged token is an at+jwt");
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("base64url payload");
+    let claims: Value = serde_json::from_slice(&decoded).expect("claims json");
+
+    assert_eq!(
+        claims["tier"], "gold",
+        "an EXCHANGED token carries the hook's claim, or token exchange is a way around a \
+         deployed hook: {claims}"
+    );
+    // The exchange still speaks for the original subject. A fold that replaced the claim set
+    // rather than adding to it would satisfy the assertion above and quietly reissue the token
+    // under nobody.
+    assert_eq!(
+        claims["sub"], subject,
+        "and the token still names the subject it was exchanged for: {claims}"
+    );
+}

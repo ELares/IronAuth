@@ -247,6 +247,42 @@ pub async fn token_exchange_grant(
     .await
 }
 
+/// This client's mapping and hook, applied to an EMPTY source document.
+///
+/// Issue #113 criterion 1 does not name token exchange, and the per-client static claims stay
+/// out of an exchanged token for the reason given at the mint below. But leaving one of the
+/// three `ClientCredentialsMintRequest` doors unhooked would recreate the exact hole this
+/// change closes, and it would be the door hardest to notice, because it is the one nobody
+/// thinks of as a grant.
+///
+/// A hook here shapes a token minted FOR ANOTHER SUBJECT. That is a real capability and an
+/// operator should have it (an exchange is where downstream routing claims belong), but it is
+/// worth stating plainly rather than arriving at silently.
+///
+/// # Errors
+///
+/// [`TokenError::ServerError`] when the mapping cannot be read or the hook does not complete.
+/// Fail-closed, as at every other door: shaping that did not happen can mean an entitlement
+/// the operator meant to strip is still in the token.
+async fn shaped_claims(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &str,
+    subject: &str,
+) -> Result<crate::claims_mapping_at_issuance::MappedAccessClaims, TokenError> {
+    crate::claims_mapping_at_issuance::apply_to_machine_token(
+        state.store(),
+        state.hook_engine(),
+        scope,
+        client_id,
+        "urn:ietf:params:oauth:grant-type:token-exchange",
+        Some(subject),
+        &serde_json::Map::new(),
+    )
+    .await
+    .map_err(|_| TokenError::ServerError)
+}
+
 /// Mint, persist, and audit the exchanged token.
 ///
 /// The token goes through the SAME grant chain as every other issuance, which is what
@@ -307,6 +343,7 @@ async fn issue(
 
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
+    let custom_claims = shaped_claims(state, scope, client_id_str, &subject.subject).await?;
     let (minted, expires_in) = tokens::mint_client_credentials_access_token(
         state,
         signer,
@@ -319,11 +356,12 @@ async fn issue(
             subject: &subject.subject,
             client_id: client_id_str,
             oauth_scope: granted_scope,
-            // An exchange carries no per-client static custom claims. They are a property
+            // An exchange carries no per-client STATIC custom claims. They are a property
             // of a client minting its OWN machine token; attaching them to a token that
             // speaks for somebody else would let a client decorate another subject's
-            // identity with claims that subject never had.
-            custom_claims: &serde_json::Map::new(),
+            // identity with claims that subject never had. The mapping and the hook DO run
+            // (see above); what is withheld is the static blob, not the extension point.
+            custom_claims: &custom_claims,
             act: decision.act.as_ref(),
         },
         &target,

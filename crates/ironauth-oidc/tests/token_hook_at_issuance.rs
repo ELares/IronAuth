@@ -29,12 +29,27 @@ use common::{
     location_param,
 };
 use ironauth_config::OidcConfig;
+use ironauth_oidc::ClientAuthMethod;
 use ironauth_store::CorrelationId;
 use serde_json::Value;
 use std::sync::Arc;
 
 /// Deploy `component` as the harness client's hook, through the audited control-plane write.
 async fn deploy(harness: &Harness, component: &[u8], payload_version: i32) {
+    deploy_for(harness, harness.client_id(), component, payload_version).await;
+}
+
+/// The same, for a client the test made itself.
+///
+/// The machine grants (`client_credentials`, `jwt:bearer`) authenticate a CONFIDENTIAL client
+/// the test creates, not the harness's default one, so their hook has to be deployed against
+/// that id.
+async fn deploy_for(
+    harness: &Harness,
+    client: &ironauth_store::ClientId,
+    component: &[u8],
+    payload_version: i32,
+) {
     let env = harness.env().clone();
     harness
         .db()
@@ -42,7 +57,7 @@ async fn deploy(harness: &Harness, component: &[u8], payload_version: i32) {
         .scoped(harness.scope())
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
         .token_hooks()
-        .set(&env, harness.client_id(), component, payload_version)
+        .set(&env, client, component, payload_version)
         .await
         .expect("deploy the hook");
 }
@@ -717,5 +732,145 @@ async fn the_front_channel_authorize_door_runs_the_hook() {
     assert!(
         issued.get("sub").is_some_and(Value::is_string),
         "the echo kept the subject: {issued:?}"
+    );
+}
+
+/// THE CLIENT-CREDENTIALS GRANT runs the hook (issue #113 criterion 1).
+///
+/// This grant builds a `ClientCredentialsMintRequest`, not a `MintRequest`, and until this test
+/// existed it reached neither the mapping nor the hook. The `MappedAccessClaims` fence was
+/// sound and simply did not extend to a second struct: a fence is a property of a FIELD, and
+/// these doors fill in a different one.
+///
+/// Machine tokens are the ones an operator most wants to shape, and issue #113 names this exact
+/// gap as the thing to avoid:
+///
+/// > Auth0 covers machine-to-machine only through a separate credentials-exchange hook, an
+/// > inconsistency to avoid.
+///
+/// Asserts BOTH halves, because the interesting failure is not "the hook did not run": it is
+/// the hook running and the static claims disappearing, since a machine token has no ID token
+/// and the seam has to fold one bag into the other.
+#[tokio::test]
+async fn the_client_credentials_grant_runs_the_hook() {
+    let harness = harness_with_hooks().await;
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    deploy_for(&harness, &client, ironauth_hooks::fixtures::GOOD, 1).await;
+
+    // Through the DATA-PLANE store: `clients` is not a control-plane table, and reaching for
+    // `control_store()` here fails with `permission denied for table clients` rather than
+    // silently writing nothing.
+    let env = harness.env().clone();
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .clients()
+        .set_custom_token_claims(&env, &client, Some(r#"{"department":"payments"}"#))
+        .await
+        .expect("set the static claims");
+
+    let (status, _headers, body) = harness
+        .token_with_auth(
+            &form(&[("grant_type", "client_credentials")]),
+            Some(&format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"))
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "client_credentials: {body}");
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access")
+        .to_owned();
+    let issued = claims(&access);
+
+    assert_eq!(
+        issued.get("tier"),
+        Some(&Value::from("gold")),
+        "a machine token carries the hook's claim, or client_credentials is a grant with no \
+         extension point: {issued:?}"
+    );
+    assert_eq!(
+        issued.get("department"),
+        Some(&Value::from("payments")),
+        "and the client's STATIC claims survived the seam. A machine token has no ID token, so \
+         the mapping's id-token half is folded into the one token that exists; dropping it \
+         instead would silently empty every machine token the day a hook was deployed: \
+         {issued:?}"
+    );
+}
+
+/// THE REFRESH GRANT runs the hook (issue #113 criterion 1, which names it explicitly).
+///
+/// It always did -- `token.rs` resolves the mapping for both `authorization_code` and
+/// `refresh_token` -- but nothing measured the second one, and the criterion asks for a test
+/// per grant rather than for a shared call site.
+///
+/// A refresh is where a stale hook result would be least visible: the client already holds a
+/// working token, so a refresh that quietly stopped shaping would look like a working refresh.
+#[tokio::test]
+async fn the_refresh_grant_runs_the_hook() {
+    let harness = harness_with_hooks().await;
+    deploy(&harness, ironauth_hooks::fixtures::GOOD, 1).await;
+
+    let client_id = harness.client_id().to_string();
+    let subject = harness.seed_unique_user().await;
+    harness.grant_consent(&subject, &client_id).await;
+    let cookie = harness.session_cookie(&subject).await;
+    // NO `offline_access`. This deployment issues a refresh token on an ordinary code
+    // exchange, and asking for a scope the harness client is not allowed refuses the
+    // authorization outright -- which surfaces as "no code in redirect" and reads like the
+    // hook broke the flow.
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(REDIRECT_URI),
+        enc("openid email"),
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
+    let code = location_param(&headers, "code").expect("code in redirect");
+
+    let (status, _headers, body) = harness
+        .token(&form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", &client_id),
+            ("code_verifier", PKCE_VERIFIER),
+        ]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "code exchange: {body}");
+    let refresh_token = json(&body)["refresh_token"]
+        .as_str()
+        .expect("a refresh token")
+        .to_owned();
+
+    let (status, _headers, body) = harness
+        .token(&form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh_token),
+            ("client_id", &client_id),
+        ]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "refresh: {body}");
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access")
+        .to_owned();
+    assert_eq!(
+        claims(&access).get("tier"),
+        Some(&Value::from("gold")),
+        "a REFRESHED access token carries the hook's claim, or a client keeps an unshaped \
+         token alive indefinitely by refreshing it: {:?}",
+        claims(&access)
     );
 }

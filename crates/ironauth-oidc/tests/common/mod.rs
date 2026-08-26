@@ -324,10 +324,25 @@ impl Harness {
     /// does not spend a tenth of a second doing it. The RATIO is what the dispatch's two-tick
     /// delta is about, and the ratio is the same.
     #[cfg(feature = "wasm-hooks")]
+    /// Drive the epoch, at THE SAME RATE THE SERVER DOES.
+    ///
+    /// 10 ms, matching `ironauth/src/main.rs`. It was 1 ms, which was chosen to make a
+    /// deadline test finish quickly and turned out to be a flaky-test generator: an epoch
+    /// deadline bounds WALL time, not CPU time, so a hook the scheduler descheduled trips it
+    /// exactly as a runaway hook does. With `epoch_deadline: 2` at 1 ms a hook had between 1
+    /// and 2 ms of wall clock, and fourteen concurrent tests on a laptop routinely exceeded
+    /// that doing microseconds of work. Every trip fails the issuance, so it surfaced as an
+    /// occasional `server_error` from whichever grant lost the race.
+    ///
+    /// The distinction is worth carrying past this function: FUEL bounds instructions and is
+    /// deterministic, the DEADLINE bounds wall time and is not. A fail-closed hook plus a
+    /// wall-clock deadline converts CPU contention into failed logins, which is a real
+    /// production property and not a test artifact -- the test harness only reached it sooner
+    /// by ticking ten times faster than the server.
     fn spawn_epoch_driver(runtime: &Arc<ironauth_oidc::token_hook::HookRuntime>) {
         let ticker = Arc::clone(runtime.engine());
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(1));
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -895,6 +910,30 @@ impl Harness {
     #[must_use]
     pub fn hook_runtime(&self) -> Option<&Arc<ironauth_oidc::token_hook::HookRuntime>> {
         self.state.hook_engine()
+    }
+
+    /// Deploy `component` as `client`'s token hook, through the audited control-plane write.
+    ///
+    /// On the harness rather than in one test file because the grants that need it are spread
+    /// across suites: `jwt:bearer` has its trusted-issuer scaffolding in `jwt_bearer.rs` and
+    /// nowhere else, so a hook test for that grant has to live beside it. Copying the write
+    /// instead would let one copy drift from the schema the other checks.
+    #[cfg(feature = "wasm-hooks")]
+    pub async fn deploy_token_hook(
+        &self,
+        client: &ClientId,
+        component: &[u8],
+        payload_version: i32,
+    ) {
+        let env = self.env().clone();
+        self.db()
+            .control_store()
+            .scoped(self.scope())
+            .acting(self.db().test_actor(&env), CorrelationId::generate(&env))
+            .token_hooks()
+            .set(&env, client, component, payload_version)
+            .await
+            .expect("deploy the hook");
     }
 
     /// The seeded client identifier (its string is the `client_id`).

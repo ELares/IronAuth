@@ -814,7 +814,20 @@ async fn mint_and_persist(
     // mapped principal as `sub` and NO auth-context claims (there was no interactive
     // user authentication event to derive an acr/auth_time from), reusing the SAME
     // claim builder and signing core as the M2M grant. No per-issuer custom claims.
-    let no_custom = serde_json::Map::new();
+    // No per-issuer STATIC claims, but the client's mapping and hook still run (issue #113
+    // criterion 1 names `jwt:bearer` explicitly). The source document is empty, so with nothing
+    // configured this is the empty bag it always was.
+    let no_custom = crate::claims_mapping_at_issuance::apply_to_machine_token(
+        state.store(),
+        state.hook_engine(),
+        scope,
+        client_id_str,
+        "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        Some(principal),
+        &serde_json::Map::new(),
+    )
+    .await
+    .map_err(|_| TokenError::ServerError)?;
     let (minted, expires_in) = tokens::mint_client_credentials_access_token(
         state,
         signer,

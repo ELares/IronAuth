@@ -303,6 +303,59 @@ pub async fn apply_to_with_hook(
     }
 }
 
+/// Resolve and run the same mapping and hook for a token that has NO ID token.
+///
+/// `client_credentials`, `jwt:bearer` and token exchange mint one access token and nothing
+/// else, so they build a `ClientCredentialsMintRequest` rather than a [`MintRequest`]. Before
+/// this existed they reached NEITHER the mapping NOR the hook, and issue #113 names that exact
+/// shape as the thing to avoid:
+///
+/// > Auth0 covers machine-to-machine only through a separate credentials-exchange hook, an
+/// > inconsistency to avoid.
+///
+/// We had the inconsistency by accident rather than by design. `MintRequest::access_extra_claims`
+/// is fenced by [`MappedAccessClaims`], and that fence is a field on ONE struct: the three doors
+/// that build the other struct were never in a position to be asked. See that type's header.
+///
+/// # One token, so both placements land in it
+///
+/// [`apply_to_with_hook`] splits its output because a mapping decides which of two tokens a
+/// claim goes in. Here there is one token, so the ID-token half has nowhere else to go and is
+/// folded into the result rather than dropped. A placement rule on a machine client is
+/// therefore inert instead of lossy, which is the behaviour an operator writing one rule set
+/// for all their clients would expect. Where a claim lands in both, the access-token side wins.
+///
+/// With no mapping and no hook the result is `static_claims` unchanged, which is exactly what
+/// these three doors issued before, so wiring them up is not a behaviour change for anyone who
+/// has not configured one.
+///
+/// # Errors
+///
+/// [`MappingFault`], as [`apply_to_with_hook`].
+pub async fn apply_to_machine_token(
+    store: &Store,
+    runtime: Option<&std::sync::Arc<crate::token_hook::HookRuntime>>,
+    scope: Scope,
+    client_id: &str,
+    grant_type: &str,
+    subject: Option<&str>,
+    static_claims: &serde_json::Map<String, serde_json::Value>,
+) -> Result<MappedAccessClaims, MappingFault> {
+    let mut single = static_claims.clone();
+    let access = apply_to_with_hook(
+        store,
+        runtime,
+        scope,
+        client_id,
+        grant_type,
+        subject,
+        &mut single,
+    )
+    .await?;
+    single.extend(access.0);
+    Ok(MappedAccessClaims(single))
+}
+
 /// The access-token claims a mapping produced, in a wrapper only this module can build.
 ///
 /// `MintRequest::access_extra_claims` takes one of these, so a door that mints a token for a
@@ -315,8 +368,27 @@ pub async fn apply_to_with_hook(
 /// claim, because `runtime` is an ordinary parameter and `None` is a legitimate value for it --
 /// it is how a deployment with hooks disabled issues tokens. A door that hard-codes `None`
 /// instead of passing `state.hook_engine()` produces a perfectly well-typed
-/// `MappedAccessClaims` and no test fails. Measured: only the token endpoint and the device
-/// grant pin it; that mutation still survives at the authorize, CIBA and FedCM doors.
+/// `MappedAccessClaims` and no test fails.
+///
+/// So each door needs its own test, and each of those needs to be confirmed against exactly
+/// that mutation. Seven of the eight are:
+///
+/// | Door | Test |
+/// | --- | --- |
+/// | authorization code | `a_deployed_hook_customizes_a_real_access_token` |
+/// | refresh | `the_refresh_grant_runs_the_hook` |
+/// | device | `the_device_grant_runs_the_hook` |
+/// | implicit / front channel | `the_front_channel_authorize_door_runs_the_hook` |
+/// | CIBA | `the_ciba_grant_runs_the_hook` |
+/// | `client_credentials` | `the_client_credentials_grant_runs_the_hook` |
+/// | `jwt:bearer` | `the_jwt_bearer_grant_runs_the_hook` |
+/// | token exchange | `the_token_exchange_grant_runs_the_hook` |
+///
+/// **FEDCM IS NOT.** `fedcm.rs` passes `state.hook_engine()` and nothing measures that it does.
+/// No test in the suite drives the id-assertion endpoint to a minted token -- the flow needs
+/// the `Sec-Fetch-Dest: webidentity` posture, an account selection and RP metadata that no
+/// fixture builds today -- so writing that driver is its own piece of work rather than a line
+/// in this one. It is the last unmeasured door and it is named here so it stays visible.
 ///
 /// The measurement below was made against the mapping when this function was called `apply_to`,
 /// and it is about the mapping. The rename carried the sentence onto the hook, where it was
