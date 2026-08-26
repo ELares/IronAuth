@@ -33,6 +33,12 @@ allow() {
     #   dispatch and #114's WASM one), so neither inherits the other's shape. The seam it
     #   needs is recorded on #113: `tokens::mint` signs the ID token before `mint_access`
     #   builds its claims, so no point today holds both unsigned.
+    ironauth-oidc/claims_mapping) return 0 ;;            # issue #113: both halves of the
+    #   reserved-claim fence, the declarative one an operator configures and the one a hook's
+    #   returned claims pass through. It sits callerless for the same reason as
+    #   token_customize above: the mint seam that would call it is #113's remaining work, and
+    #   landing the fence first means the seam cannot be written without one. Both entries
+    #   come out together when that seam lands.
     *) return 1 ;;
   esac
 }

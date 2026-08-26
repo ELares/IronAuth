@@ -593,6 +593,96 @@ mod tests {
         );
     }
 
+    /// CRITERION 5, HOOK HALF. A hook cannot set a reserved claim, and what it tried is
+    /// REPORTED rather than swallowed.
+    ///
+    /// The criterion's sentence covers "any mapping OR HOOK", and the hook is the side with
+    /// the wider reach: its output arrives per token from code somebody else deployed.
+    #[test]
+    fn a_hook_cannot_set_a_reserved_claim_and_the_attempt_is_reported() {
+        let mut returned = BTreeMap::new();
+        // Two it may set.
+        returned.insert("tier".to_owned(), serde_json::json!("gold"));
+        returned.insert("region".to_owned(), serde_json::json!("eu"));
+        // And the ones it may not, spanning both halves of the fence.
+        for reserved in ["sub", "iss", "scope", "permissions", "cnf", "azp", "roles"] {
+            returned.insert(reserved.to_owned(), serde_json::json!("forged"));
+        }
+
+        let outcome = super::filter_hook_claims(&returned);
+        assert_eq!(
+            outcome.accepted.keys().collect::<Vec<_>>(),
+            vec!["region", "tier"],
+            "only the claims a hook may set survive"
+        );
+        for reserved in ["sub", "iss", "scope", "permissions", "cnf", "azp", "roles"] {
+            assert!(
+                outcome.refused.iter().any(|name| name == reserved),
+                "{reserved} must be reported so an auditor knows it was attempted"
+            );
+            assert!(
+                !outcome.accepted.contains_key(reserved),
+                "{reserved} must not survive"
+            );
+        }
+    }
+
+    /// A hook's reserved claim does not fail the whole invocation.
+    ///
+    /// A mapping is rejected because an operator is there to read the error. A hook's output
+    /// arrives per token, and failing the invocation would turn a bug in an integrator's code
+    /// into an outage in ours -- so the claim is dropped, reported, and the per-client failure
+    /// policy decides what that means.
+    #[test]
+    fn a_hooks_reserved_claim_does_not_discard_its_good_ones() {
+        let mut returned = BTreeMap::new();
+        returned.insert("sub".to_owned(), serde_json::json!("attacker"));
+        returned.insert("tier".to_owned(), serde_json::json!("gold"));
+
+        let outcome = super::filter_hook_claims(&returned);
+        assert_eq!(
+            outcome.accepted["tier"],
+            serde_json::json!("gold"),
+            "one bad claim must not take the good ones with it"
+        );
+        assert_eq!(outcome.refused, vec!["sub".to_owned()]);
+    }
+
+    /// The hook fence and the mapping fence are THE SAME fence.
+    ///
+    /// Two lists would drift, and the one that drifted narrower would be the hole. Asserted
+    /// over the whole reserved set rather than by sampling.
+    #[test]
+    fn the_hook_and_mapping_fences_admit_exactly_the_same_names() {
+        for name in crate::tokens::PROTECTED_ACCESS_TOKEN_CLAIMS
+            .iter()
+            .chain(crate::scope_claims::PROTECTED_CLAIMS.iter())
+        {
+            let mapping_refuses = validate(&[MappingRule::Static {
+                name: (*name).to_owned(),
+                value: serde_json::json!(1),
+            }])
+            .is_err();
+            let mut returned = BTreeMap::new();
+            returned.insert((*name).to_owned(), serde_json::json!(1));
+            let hook_refuses = !super::filter_hook_claims(&returned).refused.is_empty();
+            assert_eq!(
+                mapping_refuses, hook_refuses,
+                "{name}: the two fences must agree, or the narrower one is the hole"
+            );
+        }
+    }
+
+    /// An empty claim name is refused on the hook side too.
+    #[test]
+    fn a_hook_cannot_set_a_claim_with_no_name() {
+        let mut returned = BTreeMap::new();
+        returned.insert("   ".to_owned(), serde_json::json!(1));
+        let outcome = super::filter_hook_claims(&returned);
+        assert!(outcome.accepted.is_empty());
+        assert_eq!(outcome.refused.len(), 1);
+    }
+
     /// A refused mapping applies NOTHING, rather than the rules before the bad one.
     #[test]
     fn a_refused_mapping_does_not_half_apply() {
@@ -706,4 +796,53 @@ mod tests {
             mapped.access_token.keys().collect::<Vec<_>>()
         );
     }
+}
+
+/// What a hook returned, and what happened to it (issue #113 criterion 5, hook half).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookOutcome {
+    /// The claims that survived, ready to fold into the token being built.
+    pub accepted: BTreeMap<String, serde_json::Value>,
+    /// The reserved claims the hook tried to set, in the order it sent them.
+    ///
+    /// NOT an error and not silently discarded: a list. Criterion 5 says an attempt is
+    /// "rejected and AUDITED", and an auditor needs to know which claims were attempted by
+    /// whom. Returning them lets the caller write that row; dropping them would leave the
+    /// audit with nothing to say, and failing the whole invocation would let one bad claim
+    /// take down every login through a client whose hook is merely sloppy.
+    pub refused: Vec<String>,
+}
+
+/// Filter what a hook returned, refusing the claims no hook may set.
+///
+/// # Why a hook is filtered where a mapping is REJECTED
+///
+/// A mapping is configuration: it is written once, by an operator, and a refusal at write time
+/// is a message that person reads and acts on. A hook's output arrives per token, from code
+/// somebody else deployed, and there is nobody to show an error to at that instant. Rejecting
+/// the whole invocation would mean one reserved claim in a hook's response fails every login it
+/// touches, which converts a bug in an integrator's code into an outage in ours.
+///
+/// So the reserved names are dropped and REPORTED. The caller audits what was attempted, and
+/// the failure policy #113 requires per client decides whether a refusal is fatal -- which is
+/// where that decision belongs, since it is the thing configured per client.
+///
+/// The fence is the same one mappings get: the release floor UNION the mint fold, because
+/// criterion 5's sentence covers "any mapping OR HOOK" and a hook is the side with the wider
+/// reach. `scope` authorizes IronAuth's own management API and `cnf` drives `DPoP`; a hook that
+/// could set either would be choosing its own authorization.
+#[must_use]
+pub fn filter_hook_claims(returned: &BTreeMap<String, serde_json::Value>) -> HookOutcome {
+    let mut outcome = HookOutcome {
+        accepted: BTreeMap::new(),
+        refused: Vec::new(),
+    };
+    for (name, value) in returned {
+        if name.trim().is_empty() || !is_writable_by_a_mapping(name) {
+            outcome.refused.push(name.clone());
+        } else {
+            outcome.accepted.insert(name.clone(), value.clone());
+        }
+    }
+    outcome
 }
