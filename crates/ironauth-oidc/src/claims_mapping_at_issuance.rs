@@ -210,7 +210,7 @@ pub fn as_claims(
 /// a hook is fail-CLOSED where the enrichment beside it is fail-open.
 pub async fn apply_to_with_hook(
     store: &Store,
-    engine: Option<&std::sync::Arc<ironauth_hooks::HookEngine>>,
+    runtime: Option<&std::sync::Arc<crate::token_hook::HookRuntime>>,
     scope: Scope,
     client_id: &str,
     grant_type: &str,
@@ -229,55 +229,71 @@ pub async fn apply_to_with_hook(
         }
     };
 
-    let Some(engine) = engine else {
+    let Some(runtime) = runtime else {
         return Ok(MappedAccessClaims(access));
     };
 
-    let contributed = crate::token_hook::run(
-        store,
-        engine,
-        &crate::token_hook::Invocation {
-            scope,
-            client_id,
-            grant_type,
-            subject,
-            id_token_claims: extra_claims,
-            access_token_claims: &access,
-        },
-    )
-    .await
-    .map_err(|fault| {
-        // Folded onto ONE fault type, because every caller does the same thing with both and a
-        // second variant it never distinguishes is a distinction that exists only in the type.
-        // The hook's own reason is already logged where it happened, with the client and the
-        // bound it hit -- which is what an operator needs and what a client must not learn.
-        tracing::error!(
-            target: "ironauth.hooks",
-            tenant = %scope.tenant(),
-            client_id,
-            ?fault,
-            "refusing the issuance because the client's hook did not complete"
-        );
-        MappingFault::Refused
-    })?;
-
-    if let Some(contributed) = contributed {
-        // The hook's claims OVERWRITE the mapping's on a collision, and that is the only order
-        // that makes the two composable: an operator who deploys a hook to override something a
-        // rule sets has done it deliberately, and the reverse would make the hook silently
-        // ineffective on exactly the claims somebody cared enough to write a rule for.
-        //
-        // Both sides have already been through `filter_hook_claims`, so neither can carry a
-        // protected name whichever wins.
-        for (name, value) in contributed.id_token {
-            extra_claims.insert(name, value);
-        }
-        for (name, value) in contributed.access_token {
-            access.insert(name, value);
-        }
+    // Without the `wasm-hooks` feature `HookRuntime` is uninhabited, so `runtime` cannot be
+    // `Some` and the block below is unreachable -- proved by the compiler rather than asserted.
+    #[cfg(not(feature = "wasm-hooks"))]
+    {
+        runtime.unreachable()
     }
 
-    Ok(MappedAccessClaims(access))
+    #[cfg(feature = "wasm-hooks")]
+    {
+        let contributed = crate::token_hook::run(
+            store,
+            runtime,
+            &crate::token_hook::Invocation {
+                scope,
+                client_id,
+                grant_type,
+                subject,
+                id_token_claims: extra_claims,
+                access_token_claims: &access,
+            },
+        )
+        .await
+        .map_err(|fault| {
+            // Folded onto ONE fault type, because every caller does the same thing with both
+            // and a second variant it never distinguishes is a distinction that exists only in
+            // the type. The hook's own reason is already logged where it happened, with the
+            // client and the bound it hit -- which is what an operator needs and what a client
+            // must not learn.
+            tracing::error!(
+                target: "ironauth.hooks",
+                tenant = %scope.tenant(),
+                client_id,
+                ?fault,
+                "refusing the issuance because the client's hook did not complete"
+            );
+            MappingFault::Refused
+        })?;
+
+        if let Some(contributed) = contributed {
+            // THE HOOK'S ANSWER REPLACES the set, it does not merge into it. That is what the
+            // WIT contract means -- a hook receives both claim lists and returns both, and the
+            // shipped `good` guest echoes its input plus one addition precisely because echoing
+            // is how you keep a claim under a replace contract.
+            //
+            // The first version merged, and review caught what that costs: a hook deployed to
+            // STRIP a claim, by returning everything except `email`, produced a token that
+            // still carried it. Silently. And the fail-closed argument this module and its
+            // callers all rest on -- "a hook can REMOVE a claim as easily as add one, so
+            // ignoring one that failed issues more than the operator deployed" -- was false of
+            // the dispatch that stated it.
+            //
+            // Everything the hook returned has already been through `filter_hook_claims`, so a
+            // replace cannot smuggle a protected name in. What it CAN do is drop one the mint
+            // put there, which is the point: the mint rebuilds its own protocol claims after
+            // this, so what a hook can drop is exactly the enriched and mapped set it was
+            // handed.
+            *extra_claims = contributed.id_token.into_iter().collect();
+            access = contributed.access_token.into_iter().collect();
+        }
+        Ok(MappedAccessClaims(access))
+    }
 }
 
 /// The access-token claims a mapping produced, in a wrapper only this module can build.

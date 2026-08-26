@@ -28,6 +28,7 @@ use common::{
     Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, SEED_PASSWORD, enc, form, json,
     location_param,
 };
+use ironauth_config::OidcConfig;
 use ironauth_store::CorrelationId;
 use serde_json::Value;
 use std::sync::Arc;
@@ -82,6 +83,46 @@ async fn exchange(harness: &Harness) -> Result<(String, String), (StatusCode, St
     assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
     let code = location_param(&headers, "code").expect("code in redirect");
 
+    let (status, _, body) = harness
+        .token(&form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", &client_id),
+            ("code_verifier", PKCE_VERIFIER),
+        ]))
+        .await;
+    if status != StatusCode::OK {
+        return Err((status, body));
+    }
+    let value = json(&body);
+    Ok((
+        value["access_token"].as_str().expect("access").to_owned(),
+        value["id_token"].as_str().expect("id_token").to_owned(),
+    ))
+}
+
+/// A code exchange that requests `email`, so the server resolves a claim into the bag.
+async fn exchange_with_email(harness: &Harness) -> Result<(String, String), (StatusCode, String)> {
+    let client_id = harness.client_id().to_string();
+    let subject = harness
+        .seed_user_with_claims(
+            &unique_identifier(harness),
+            SEED_PASSWORD,
+            r#"{"email":"ada@example.test","email_verified":true}"#,
+        )
+        .await;
+    harness.grant_consent(&subject, &client_id).await;
+    let cookie = harness.session_cookie(&subject).await;
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(REDIRECT_URI),
+        enc("openid email"),
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
+    let code = location_param(&headers, "code").expect("code in redirect");
     let (status, _, body) = harness
         .token(&form(&[
             ("grant_type", "authorization_code"),
@@ -326,4 +367,121 @@ async fn a_hook_cannot_forge_the_subject_or_the_issuer() {
              every downstream parser: {claims:?}"
         );
     }
+}
+
+/// A HOOK CAN REMOVE A CLAIM, which the fail-closed argument everywhere in this dispatch assumes.
+///
+/// "A hook can REMOVE a claim as easily as add one, so ignoring one that failed issues more than
+/// the operator deployed" is the load-bearing reason every hook failure fails the issuance. It
+/// appears in this module's header, the dispatch's, the changelog and the PR body -- and it was
+/// FALSE of the first dispatch, which merged what a hook returned into what the mint had. A hook
+/// deployed to strip a claim produced a token that still carried it, silently.
+///
+/// Nothing measured it because no guest removed anything: every fixture echoed its input. The
+/// WIT contract is a replace -- a hook receives both claim lists and returns both, which is why
+/// the `good` guest echoes -- and the dispatch now implements that.
+///
+/// The marker claim is what separates "the hook removed it" from "the hook never ran".
+#[tokio::test]
+async fn a_hook_can_remove_a_claim_the_server_resolved() {
+    // The conform override is what puts a SERVER-resolved claim in the bag: without it the only
+    // claims present are ones a rule or a hook invented, and removing one of those would say
+    // nothing about whether a hook can drop what the mint produced.
+    let harness = Harness::start_with_hook_engine_and_config(
+        Arc::new(ironauth_hooks::HookEngine::new().expect("engine")),
+        OidcConfig {
+            conform_id_token_claims: true,
+            ..OidcConfig::default()
+        },
+    )
+    .await;
+
+    // Without the hook: the server's claim is in the ID token.
+    let (_access, id_token) = exchange_with_email(&harness).await.expect("exchange");
+    assert_eq!(
+        claims(&id_token).get("email"),
+        Some(&Value::from("ada@example.test")),
+        "the control: the server resolves this claim, so a removal below is a removal"
+    );
+
+    deploy(&harness, ironauth_hooks::fixtures::CLAIM_STRIPPER, 1).await;
+    let (_access, id_token) = exchange_with_email(&harness).await.expect("exchange");
+    let after = claims(&id_token);
+
+    assert_eq!(
+        after.get("stripper_ran"),
+        Some(&Value::from(true)),
+        "the hook ran, or the absence below proves nothing: {after:?}"
+    );
+    assert!(
+        !after.contains_key("email"),
+        "and the claim it dropped is GONE. A merge would leave it, which is what the first \
+         dispatch did while its own comments argued removal was the reason to fail closed: \
+         {after:?}"
+    );
+
+    // AND THE MINT'S OWN CLAIMS SURVIVE. A hook's answer replaces the extra-claims bag, not the
+    // token: `sub` and `iss` are built after this and are not a hook's to drop.
+    assert!(
+        after
+            .get("sub")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.starts_with("usr_")),
+        "a hook cannot drop the subject: {after:?}"
+    );
+    assert!(after.contains_key("iss"), "nor the issuer: {after:?}");
+}
+
+/// THE COMPILED COMPONENT IS CACHED, which is what makes "in microseconds" true of this path.
+///
+/// M11's exit criterion says microseconds. Compiling is not: measured on this fixture,
+/// `precompile_component` is a median of 34 ms and `Component::new` 33 ms. The first version of
+/// the dispatch compiled on every issuance -- so the shipped path cost 34 ms per login while the
+/// latency benchmark reported 128 microseconds, because that benchmark measures deserialize +
+/// instantiate + call and the dispatch took a different path.
+///
+/// This asserts the CACHE rather than a duration, deliberately. A wall-clock assertion on a
+/// shared machine is a flake generator, and the `hook_latency` benchmark already gates the
+/// per-invocation number on a pinned runner. What a test can pin here is the property the
+/// benchmark's number depends on: that a second issuance for the same client does not compile
+/// again.
+#[tokio::test]
+async fn a_second_issuance_reuses_the_compiled_component() {
+    let harness = harness_with_hooks().await;
+    deploy(&harness, ironauth_hooks::fixtures::GOOD, 1).await;
+
+    for _ in 0..3 {
+        let (access, _id) = exchange(&harness).await.expect("exchange");
+        assert_eq!(claims(&access).get("tier"), Some(&Value::from("gold")));
+    }
+
+    // ONE cached component after three issuances. `Debug` is what crosses the `Arc<dyn>`, and
+    // the count is the one field it carries for exactly this reason: without it the difference
+    // between compiling once and compiling three times is invisible from outside.
+    let runtime = format!(
+        "{:?}",
+        harness.hook_runtime().expect("a runtime is installed")
+    );
+    assert!(
+        runtime.contains("cached_components: Some(1)"),
+        "three issuances for one client must compile once, not three times: {runtime}"
+    );
+
+    // REDEPLOYING DIFFERENT BYTES is a second entry, because the DIGEST is in the key. Without
+    // this the count above reads as "the cache holds one thing forever", which is also what a
+    // cache that ignored its key would produce -- and that cache would run the old component
+    // after a redeploy, which is the worst failure this structure can have.
+    deploy(&harness, ironauth_hooks::fixtures::CLAIM_STRIPPER, 1).await;
+    let (access, _id) = exchange(&harness).await.expect("exchange");
+    assert!(
+        !claims(&access).contains_key("tier"),
+        "the redeployed component is the one that runs, not the cached one: {:?}",
+        claims(&access)
+    );
+    let runtime = format!("{:?}", harness.hook_runtime().expect("a runtime"));
+    assert!(
+        runtime.contains("cached_components: Some(2)"),
+        "different bytes are a different key, so the redeploy did not reuse the old entry: \
+         {runtime}"
+    );
 }

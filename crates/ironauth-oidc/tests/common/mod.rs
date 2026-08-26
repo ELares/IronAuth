@@ -291,7 +291,21 @@ impl Harness {
     /// from a real request, and an engine probed on a throwaway clone proves the builder works
     /// and says nothing about the wiring.
     pub async fn start_with_hook_engine(engine: Arc<ironauth_hooks::HookEngine>) -> Self {
-        Self::start_inner(OidcConfig::default(), None, None, None, Some(engine)).await
+        Self::start_with_hook_engine_and_config(engine, OidcConfig::default()).await
+    }
+
+    /// As [`Harness::start_with_hook_engine`], with an explicit config.
+    ///
+    /// The one test that needs it wants `conform_id_token_claims`, which is what puts a
+    /// SERVER-resolved claim in the bag a hook operates on: without it the only claims present
+    /// are ones a rule or the hook itself invented, and removing one of those would say nothing
+    /// about whether a hook can drop what the mint produced.
+    pub async fn start_with_hook_engine_and_config(
+        engine: Arc<ironauth_hooks::HookEngine>,
+        config: OidcConfig,
+    ) -> Self {
+        let runtime = Arc::new(ironauth_oidc::token_hook::HookRuntime::new(engine));
+        Self::start_inner(config, None, None, None, Some(runtime)).await
     }
 
     /// Like [`Harness::start`] but with an explicit organization group nesting bound
@@ -339,7 +353,7 @@ impl Harness {
         resolver: Option<Arc<ClientKeyResolver>>,
         quota_config: Option<QuotaConfig>,
         max_group_depth: Option<u32>,
-        hook_engine: Option<Arc<ironauth_hooks::HookEngine>>,
+        hook_runtime: Option<Arc<ironauth_oidc::token_hook::HookRuntime>>,
     ) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common().await;
 
@@ -407,8 +421,8 @@ impl Harness {
         // from, exactly as the boot path does. Absent unless a test asked for it, which is what
         // makes `a_deployment_with_no_engine_does_not_run_a_deployed_hook` a real control
         // rather than a restatement of the default.
-        let state = match hook_engine {
-            Some(engine) => state.with_hook_engine(engine),
+        let state = match hook_runtime {
+            Some(runtime) => state.with_hook_engine(runtime),
             None => state,
         };
         let issuer = state.issuer_for(&scope);
@@ -836,6 +850,17 @@ impl Harness {
     #[must_use]
     pub fn scope(&self) -> Scope {
         self.scope
+    }
+
+    /// The installed WASM hook runtime, if this harness has one (issue #114).
+    ///
+    /// Exposed so a test can read the COMPILED-COMPONENT COUNT, which is the only way from
+    /// outside to tell one compile from three -- and the difference between them is 34 ms per
+    /// login against tens of microseconds, which is M11's exit criterion.
+    #[cfg(feature = "wasm-hooks")]
+    #[must_use]
+    pub fn hook_runtime(&self) -> Option<&Arc<ironauth_oidc::token_hook::HookRuntime>> {
+        self.state.hook_engine()
     }
 
     /// The seeded client identifier (its string is the `client_id`).

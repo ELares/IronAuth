@@ -38,6 +38,10 @@ const GUESTS: &[(&str, &str)] = &[
     // Returns `sub` and `iss` (issue #113 criterion 5, the "or hook" half): the fence on what a
     // hook RETURNS had no guest that exercised it, so deleting it left every test green.
     ("claim_forger", "IRONAUTH_GUEST_CLAIM_FORGER"),
+    // REMOVES a claim (issue #114). The WIT contract is a replace, and the first dispatch merged
+    // -- so a hook deployed to strip a claim produced a token that still carried it, and nothing
+    // measured that because no guest removed anything.
+    ("claim_stripper", "IRONAUTH_GUEST_CLAIM_STRIPPER"),
 ];
 
 fn main() {

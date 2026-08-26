@@ -32,20 +32,43 @@
 //! passes its deadline is code behaving in a way its author did not intend. Continuing past that
 //! with a half-shaped token means issuing a credential whose shape nobody chose.
 //!
+//! # Compilation is CACHED, and that is what makes the criterion true
+//!
+//! M11's exit criterion says "in microseconds". Compiling a component is not microseconds:
+//! measured on the shipped fixture, `precompile_component` is a median of 34 ms and
+//! `Component::new` 33 ms. The first version of this module compiled on every issuance, on a
+//! reactor thread, so the shipped path cost 34 ms per login and the claim was false -- and the
+//! latency benchmark could not see it, because that benchmark measures deserialize + instantiate
+//! + call, which is the path the dispatch did not take.
+//!
+//! So a loaded component is held per (scope, client, component digest). A cache HIT is
+//! instantiate + call, which is what the benchmark measures and what the criterion means. The
+//! digest is in the key rather than a version counter: it is the artifact's own identity, so a
+//! redeploy of different bytes is a different key by construction and a redeploy of identical
+//! bytes correctly reuses the entry. Nothing has to remember to invalidate.
+//!
 //! # It is not on a tokio worker
 //!
 //! `LoadedHook::customize` blocks, and wasmtime's `in_tokio` PANICS on a tokio worker thread.
 //! Measured on this runtime: the same hook that returns in 1.16 ms under `spawn_blocking` panics
-//! when called directly. So the invocation goes through `spawn_blocking`, which also keeps a
-//! hook that spins for its whole fuel budget off the reactor.
+//! when called directly. So the invocation goes through `spawn_blocking`, and so does the
+//! COMPILE on a cache miss -- 33 ms of cranelift is not something to run on a reactor either,
+//! which the first version did.
+//!
+//! There is no `unsafe` here. It used the AOT pair -- `precompile_component` then the `unsafe`
+//! `Component::deserialize` -- on the reasoning that AOT is what a deployment pays at deploy
+//! time. Measured, that pair is 34.0 ms against 32.8 ms for the safe `Component::new`: it was
+//! SLOWER and it was the only `unsafe` block in this crate. The reason AOT exists is to move
+//! compilation off the request path, and a cache does that without machine code in a database
+//! or an `unsafe` deserialize of it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ironauth_hooks::{HookEngine, HookError, Limits, Request};
+use ironauth_hooks::{HookEngine, HookError, Limits, LoadedHook, Request};
 use ironauth_store::{Scope, Store};
 
-use crate::claims_mapping::{self, MAX_HOOK_CLAIMS};
+use crate::claims_mapping;
 
 /// Why an issuance could not run this client's hook.
 ///
@@ -79,25 +102,81 @@ pub enum HookFault {
 /// silently accepting either is how a field that moved gets read from the wrong place.
 pub const PAYLOAD_VERSION: u32 = 1;
 
-/// A compiled hook, ready to invoke.
+/// The loaded components this process holds, keyed by scope, client, and component DIGEST.
 ///
-/// Held so a caller can compile once and invoke many times. Compilation is the expensive half --
-/// the benchmark in `ironauth-hooks` measures the split -- and doing it per issuance would put
-/// the whole cost on every login rather than on deploy.
-pub struct CompiledHook {
+/// The digest and not a version counter, because it is the artifact's own identity: a redeploy
+/// of different bytes is a different key by construction, and a redeploy of identical bytes
+/// correctly reuses the entry. Nothing has to remember to invalidate, which is the failure mode
+/// a counter has.
+///
+/// A `Mutex` rather than an `RwLock`: the critical section is a hash lookup and an `Arc` clone,
+/// so the contention a reader-writer lock would relieve does not exist, and `RwLock` would add a
+/// second poisoning story for nothing. The COMPILE happens outside the lock -- two logins
+/// racing a cold client each compile and one insert wins, which costs one duplicate compile and
+/// is strictly better than holding a lock across 33 ms of cranelift.
+///
+/// BOUNDED, and the bound is not defensive. An entry is a compiled component: tens of megabytes
+/// of host memory for a large one, and the key space is (scope, client), which an operator with
+/// many clients can grow without limit. Past the bound the cache stops ADMITTING rather than
+/// evicting, because eviction under a login flood is a thundering-herd recompile and the honest
+/// answer is that a deployment past this many distinct hooks needs a real cache rather than a
+/// bigger map.
+type HookCache = std::sync::Mutex<std::collections::HashMap<HookKey, Arc<LoadedHook>>>;
+
+/// The engine and its compilation cache, as ONE installable thing.
+///
+/// Together rather than separately because they are only correct together: the cache's keys are
+/// meaningless against a different engine, and an engine without a cache compiles 33 ms on every
+/// issuance. Two `with_*` calls on the state would be two chances to install one and forget the
+/// other, and the failure that produces is a latency regression nothing red announces.
+pub struct HookRuntime {
     engine: Arc<HookEngine>,
-    artifact: Arc<Vec<u8>>,
-    payload_version: u32,
+    cache: Arc<HookCache>,
 }
 
-impl std::fmt::Debug for CompiledHook {
+/// Hand-written because `HookEngine` has no `Debug`, and because the CACHE SIZE is the field
+/// worth seeing: it is the difference between a deployment paying tens of microseconds per
+/// hooked login and one paying tens of milliseconds. The components themselves are machine code
+/// and would render as nothing useful.
+impl std::fmt::Debug for HookRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompiledHook")
-            .field("artifact_bytes", &self.artifact.len())
-            .field("payload_version", &self.payload_version)
+        let cached = self.cache.lock().ok().map(|map| map.len());
+        f.debug_struct("HookRuntime")
+            .field("cached_components", &cached)
             .finish_non_exhaustive()
     }
 }
+
+impl HookRuntime {
+    /// Build a runtime around `engine`, with an empty cache.
+    #[must_use]
+    pub fn new(engine: Arc<HookEngine>) -> Self {
+        Self {
+            engine,
+            cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// The engine, for the epoch driver.
+    ///
+    /// A deployment must advance the epoch or the deadline never arrives, which is the backstop
+    /// against a hook that blocks -- see `HookEngine::tick`.
+    #[must_use]
+    pub fn engine(&self) -> &Arc<HookEngine> {
+        &self.engine
+    }
+}
+
+/// (tenant, environment, client, component digest).
+type HookKey = (String, String, String, [u8; 32]);
+
+/// The most distinct hooks one process holds compiled at once.
+///
+/// Two hundred and fifty-six. A claim-shaping component compiles to a few tens of megabytes of
+/// host memory, so this is a bound in the low gigabytes at the extreme -- deliberately generous,
+/// because the cost of being too small is recompiling 33 ms on a login and the cost of being too
+/// large is memory a deployment can measure.
+const MAX_CACHED_HOOKS: usize = 256;
 
 /// What a hook contributed, after the fence.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -140,9 +219,10 @@ pub struct Invocation<'a> {
 /// [`HookFault`] on any failure. Every one fails the issuance; see the module header.
 pub async fn run(
     store: &Store,
-    engine: &Arc<HookEngine>,
+    runtime: &HookRuntime,
     invocation: &Invocation<'_>,
 ) -> Result<Option<HookClaims>, HookFault> {
+    let (engine, cache) = (&runtime.engine, &runtime.cache);
     let Invocation {
         scope,
         client_id,
@@ -186,16 +266,18 @@ pub async fn run(
         return Err(HookFault::PayloadVersion);
     }
 
-    let compiled = compile(engine, &record.component).map_err(|error| {
-        tracing::error!(
-            target: "ironauth.hooks",
-            tenant = %scope.tenant(),
-            client_id,
-            ?error,
-            "the deployed hook component could not be compiled"
-        );
-        HookFault::Unloadable
-    })?;
+    let loaded = loaded_hook(engine, cache, scope, client_id, &record.component)
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                target: "ironauth.hooks",
+                tenant = %scope.tenant(),
+                client_id,
+                ?error,
+                "the deployed hook component could not be compiled"
+            );
+            HookFault::Unloadable
+        })?;
 
     let request = Request {
         payload_version: PAYLOAD_VERSION,
@@ -206,16 +288,18 @@ pub async fn run(
         access_token_claims: as_pairs(access_token_claims),
     };
 
-    let customization = invoke(compiled, request).await.map_err(|error| {
-        tracing::error!(
-            target: "ironauth.hooks",
-            tenant = %scope.tenant(),
-            client_id,
-            ?error,
-            "the deployed hook did not complete"
-        );
-        HookFault::Aborted
-    })?;
+    let customization = invoke(Arc::clone(engine), loaded, request)
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                target: "ironauth.hooks",
+                tenant = %scope.tenant(),
+                client_id,
+                ?error,
+                "the deployed hook did not complete"
+            );
+            HookFault::Aborted
+        })?;
 
     Ok(Some(HookClaims {
         id_token: fence(&customization.id_token_claims, scope, client_id, "id_token"),
@@ -228,16 +312,77 @@ pub async fn run(
     }))
 }
 
-/// Compile a stored component into something invocable.
+/// The loaded component for this client's bytes, compiling it only on a miss.
 ///
-/// Separate so the expensive half is nameable: a caller that wants to compile at deploy time
-/// rather than at issuance calls this and holds the result.
-fn compile(engine: &Arc<HookEngine>, component: &[u8]) -> Result<CompiledHook, HookError> {
-    Ok(CompiledHook {
-        engine: Arc::clone(engine),
-        artifact: Arc::new(engine.compile(component)?),
-        payload_version: PAYLOAD_VERSION,
-    })
+/// The whole reason this function exists is that compiling is 33 ms and instantiating is tens of
+/// microseconds. A cache hit is what makes "in microseconds" true of the shipped path rather
+/// than of a benchmark measuring a different one.
+///
+/// The compile runs on `spawn_blocking` for the same reason the invocation does, and one more:
+/// 33 ms of cranelift on a reactor thread stalls every other request on that thread, and the
+/// first version of this module did exactly that on every issuance.
+async fn loaded_hook(
+    engine: &Arc<HookEngine>,
+    cache: &Arc<HookCache>,
+    scope: Scope,
+    client_id: &str,
+    component: &[u8],
+) -> Result<Arc<LoadedHook>, HookError> {
+    let key: HookKey = (
+        scope.tenant().to_string(),
+        scope.environment().to_string(),
+        client_id.to_owned(),
+        digest(component),
+    );
+
+    // The lock is held across a hash lookup and an `Arc` clone, and nothing else. Poisoning is
+    // treated as an empty cache rather than a panic: a poisoned cache is a correctness-neutral
+    // loss of a performance structure, and failing a login over it would turn one panicking
+    // request into an outage.
+    if let Some(hit) = cache.lock().ok().and_then(|map| map.get(&key).cloned()) {
+        return Ok(hit);
+    }
+
+    let compiling = Arc::clone(engine);
+    let bytes = component.to_vec();
+    let loaded = Arc::new(
+        tokio::task::spawn_blocking(move || compiling.load(&bytes))
+            .await
+            .unwrap_or_else(|join| {
+                Err(HookError::Declined(format!(
+                    "the compile task did not complete: {join}"
+                )))
+            })?,
+    );
+
+    if let Ok(mut map) = cache.lock() {
+        // STOPS ADMITTING at the bound rather than evicting. Eviction under a login flood is a
+        // thundering-herd recompile, and a deployment past this many distinct hooks needs a real
+        // cache rather than a bigger map. The already-loaded component is still returned, so the
+        // login succeeds; what is lost is the reuse.
+        if map.len() < MAX_CACHED_HOOKS {
+            map.insert(key, Arc::clone(&loaded));
+        } else {
+            tracing::warn!(
+                target: "ironauth.hooks",
+                cached = map.len(),
+                "the hook cache is full, so this component was compiled and not retained; \
+                 every issuance for it will recompile until a process restart"
+            );
+        }
+    }
+    Ok(loaded)
+}
+
+/// A component's identity, for the cache key.
+///
+/// SHA-256 rather than a cheaper hash, because a collision here would run one client's code for
+/// another's token. That is not a performance question.
+fn digest(component: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(component);
+    hasher.finalize().into()
 }
 
 /// Run the hook OFF the reactor.
@@ -247,30 +392,43 @@ fn compile(engine: &Arc<HookEngine>, component: &[u8]) -> Result<CompiledHook, H
 /// permitted to spin for its entire fuel budget, and that belongs on a blocking pool rather than
 /// on a reactor thread other requests are waiting on.
 async fn invoke(
-    compiled: CompiledHook,
+    engine: Arc<HookEngine>,
+    hook: Arc<LoadedHook>,
     request: Request,
 ) -> Result<ironauth_hooks::Customization, HookError> {
-    tokio::task::spawn_blocking(move || {
-        // SAFETY: `artifact` is the output of `engine.compile` on THIS engine, in this process,
-        // moments ago -- `compile` above produced both together and neither has left this
-        // function. That is exactly the provenance `load_precompiled` requires, and it is why
-        // the durable form in `token_hooks` is the portable component rather than this.
-        #[expect(
-            unsafe_code,
-            reason = "the artifact was produced by the same engine in this process; see above"
-        )]
-        let hook = unsafe { compiled.engine.load_precompiled(&compiled.artifact) }?;
-        hook.customize(&compiled.engine, &Limits::claim_shaping(), &request)
-    })
-    .await
-    .unwrap_or_else(|join| {
-        // A panic INSIDE the guest cannot reach here -- wasmtime turns a guest trap into an
-        // error -- so a join failure is the host panicking or the task being cancelled. Both
-        // are aborts as far as the issuance is concerned, and both must fail closed.
-        Err(HookError::Declined(format!(
-            "the hook task did not complete: {join}"
-        )))
-    })
+    tokio::task::spawn_blocking(move || hook.customize(&engine, &limits(), &request))
+        .await
+        .unwrap_or_else(|join| {
+            // A panic INSIDE the guest cannot reach here -- wasmtime turns a guest trap into an
+            // error -- so a join failure is the host panicking or the task being cancelled. Both
+            // are aborts as far as the issuance is concerned, and both must fail closed.
+            Err(HookError::Declined(format!(
+                "the hook task did not complete: {join}"
+            )))
+        })
+}
+
+/// The bounds one invocation runs under.
+///
+/// `Limits::claim_shaping` with the EPOCH DEADLINE RAISED FROM ONE TICK TO TWO, and the reason
+/// is arithmetic rather than generosity. wasmtime sets the deadline to `current_epoch + delta`,
+/// so with a free-running ticker and a delta of one, the time a hook actually gets is uniform in
+/// (0, one tick] -- it inherits however much of the current tick remains. Measured against a
+/// 10 ms ticker: a hook doing 78 microseconds of work trapped on 0.40% of invocations, and one
+/// doing 544 microseconds on 4.15%.
+///
+/// Every abort fails the issuance, so that is a random `server_error` on roughly one login in a
+/// hundred for a hooked client. A delta of two guarantees at least one WHOLE tick and at most
+/// two, which is a bound rather than a lottery.
+///
+/// `Limits::claim_shaping`'s own doc says a limit that trips during ordinary work teaches
+/// operators to raise it without reading it. A limit that trips at random is worse: there is
+/// nothing to read.
+fn limits() -> Limits {
+    Limits {
+        epoch_deadline: 2,
+        ..Limits::claim_shaping()
+    }
 }
 
 /// Put a hook's returned claims through the protected-claim fence, and log what it refused.
@@ -284,13 +442,25 @@ fn fence(
     client_id: &str,
     token: &'static str,
 ) -> BTreeMap<String, serde_json::Value> {
-    // Parsed here, and a claim whose value is not JSON is DROPPED rather than refused by name:
-    // the fence answers "may a hook write this NAME", and an unparseable value is a different
-    // failure. Bounded by the same `MAX_HOOK_CLAIMS` the fence applies, so a hook returning a
-    // million claims does not build a million-entry map before the fence sees it.
+    // EVERY returned claim is parsed and handed to the fence, and the reason is that truncating
+    // here defeats two things `filter_hook_claims` promises. Its doc says "which claims overflow
+    // is decided in claim-name order, so it is the same set on every invocation" and "the
+    // overflow is refused into `refused` rather than dropped, so the audit records that claims
+    // were lost". A `.take()` in wire order keeps whichever 64 the guest happened to emit first,
+    // with no log, no refusal, and no count -- so both promises were false while this function
+    // claimed to be applying them.
+    //
+    // The cost of not truncating is bounded by what already happened: `from_wit` in the engine
+    // has materialised the whole returned list before this function is called, so the map is
+    // the smaller allocation, not the larger one. Bounding the GUEST's output belongs at the
+    // ABI boundary where the list is built, and is filed rather than pretended at here.
+    //
+    // A claim whose value is not JSON is DROPPED rather than refused by name: the fence answers
+    // "may a hook write this NAME", and an unparseable value is a different failure with a
+    // different reason, counted separately below.
     let mut parsed: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut unparseable = 0_usize;
-    for (name, value_json) in returned.iter().take(MAX_HOOK_CLAIMS.saturating_mul(2)) {
+    for (name, value_json) in returned {
         match serde_json::from_str(value_json) {
             Ok(value) => {
                 parsed.insert(name.clone(), value);

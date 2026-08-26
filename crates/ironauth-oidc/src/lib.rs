@@ -181,7 +181,40 @@ mod token;
 mod token_credential;
 mod token_exchange;
 mod token_hash;
+/// The WASM token hook dispatch (issue #114).
+///
+/// Behind the `wasm-hooks` feature because `ironauth-hooks` pulls wasmtime and cranelift, whose
+/// MSRV is 1.95 against this crate's published 1.85. Without the feature there is no wasmtime,
+/// no cranelift, and no hook surface -- the default build is byte-for-byte what it was.
+#[cfg(feature = "wasm-hooks")]
 pub mod token_hook;
+
+/// The hook dispatch's SHAPE, with the feature off.
+///
+/// `HookRuntime` is UNINHABITED here, which is what lets the issuance seam keep one signature
+/// across both builds instead of two that can drift. A caller can hold an
+/// `Option<&Arc<HookRuntime>>`, it is always `None`, and the compiler proves the hook branch
+/// unreachable rather than the reader having to.
+///
+/// The alternative was `#[cfg]` on the seam's parameter list, which is two functions with one
+/// name -- and the one nobody builds is the one that rots.
+#[cfg(not(feature = "wasm-hooks"))]
+pub mod token_hook {
+    /// Uninhabited: without the `wasm-hooks` feature there is no engine to hold.
+    #[derive(Debug)]
+    pub enum HookRuntime {}
+
+    impl HookRuntime {
+        /// What the issuance seam would do with a runtime, if one could exist.
+        ///
+        /// It cannot: `HookRuntime` has no variants, so a `&Self` cannot be produced and this
+        /// body is unreachable by construction. Written as `match *self {}` rather than
+        /// `unreachable!()` because the compiler PROVES it rather than being told.
+        pub fn unreachable<T>(&self) -> T {
+            match *self {}
+        }
+    }
+}
 mod tokens;
 mod totp;
 mod trusted_device;

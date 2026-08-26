@@ -27,7 +27,19 @@ ironauth-config.workspace = true
 # nothing about tokens, OIDC or the store; it takes claims as (name, JSON text) pairs and gives
 # them back. That is what lets the sandbox be reviewed on its own terms and what keeps the mint
 # from being able to weaken it.
-ironauth-hooks.workspace = true
+#
+# OPTIONAL, and the reason is the MSRV. wasmtime 48 and cranelift declare `rust-version =
+# "1.95.0"`; `docs/COMPATIBILITY.md` publishes 1.85 for this library and for the binary, and
+# `scripts/msrv-audit.sh` fails the moment a 1.95 crate becomes reachable. A non-optional
+# dependency here raises the PRODUCT MSRV, which `ironauth-hooks`'s own Cargo.toml calls "an
+# owner decision about a published compatibility promise, not a side effect of a dependency
+# bump".
+#
+# So the default build is unchanged and still 1.85: no wasmtime, no cranelift, no hook surface.
+# A deployment that wants hooks builds with `--features wasm-hooks` and accepts 1.95 for that
+# artifact. That leaves the owner one line to change -- making the feature default-on -- rather
+# than a promise already broken in a diff about something else.
+ironauth-hooks = { workspace = true, optional = true }
 ironauth-store.workspace = true
 ironauth-jose.workspace = true
 # The declarative journey engine (issue #92): the pure artifact model, its load-time
@@ -113,6 +125,10 @@ tokio = { workspace = true, features = ["time"] }
 
 [features]
 default = []
+# The WASM token hooks dispatch (issue #114). OFF by default because `ironauth-hooks` pulls in
+# wasmtime and cranelift, whose MSRV is 1.95 against this crate's published 1.85. See the
+# dependency's own comment above.
+wasm-hooks = ["dep:ironauth-hooks"]
 # Enables the ironauth-store real-database harness for the DB-backed integration
 # tests (mirrors ironauth-admin's `testing` gate). Adds no runtime surface.
 testing = ["ironauth-store/testing"]
@@ -146,6 +162,11 @@ ironauth-env = { workspace = true }
 # precisely because it never reaches the normal dependency graph.
 ironauth-admin = { workspace = true, features = ["testing"] }
 # The shipped guest fixtures, for the end-to-end hook test (issue #114).
+#
+# A DEV dependency, so it is not in the shipped binary's graph -- but it IS in this crate's, and
+# `msrv-audit.sh` roots at workspace members. So `cargo metadata` reports wasmtime reachable from
+# `ironauth-oidc` even with the `wasm-hooks` feature off. The binary's own graph is clean, which
+# is what docs/COMPATIBILITY.md promises; see the PR for the decision this leaves open.
 ironauth-hooks = { workspace = true, features = ["testing"] }
 # Base64 for building client_secret_basic Authorization headers in the tests.
 base64.workspace = true
@@ -424,7 +445,7 @@ required-features = ["testing"]
 [[test]]
 name = "token_hook_at_issuance"
 path = "tests/token_hook_at_issuance.rs"
-required-features = ["testing"]
+required-features = ["testing", "wasm-hooks"]
 
 [[test]]
 name = "claims_mapping_at_issuance"

@@ -1444,33 +1444,57 @@ async fn build_oidc_plane(
     // time AND have an epoch nothing advances -- which is the deadline bound silently gone,
     // exactly the failure `HookEngine::tick`'s own doc warns about.
     //
-    // A failure to BUILD the engine is fatal rather than degraded. An operator who enabled
-    // hooks and got a server that quietly does not run them has a deployment whose tokens are
-    // not the shape they configured, and no signal saying so.
+    // A failure to BUILD the engine is REFUSED, and refused the way this file already decided
+    // such things are refused. The first version wrote `return None` here, which reads as "no
+    // hook engine" and means "no OIDC plane at all" -- the exact shape `connect_org_provisioning`
+    // was extracted to avoid, and whose doc says of it: "a deployment that turned this on and
+    // forgot the control DSN would have failed to serve ANY traffic, turning a configuration
+    // typo into an outage. That is how the first version of this was written." Twice, now.
+    //
+    // So the engine is built by a helper that returns `Option`, and a failure is a loud startup
+    // line plus hooks off -- not a server that answers health checks and serves no logins with
+    // no message saying why. An operator learns about it from a startup line, which is what the
+    // sibling seam's doc asks for.
+    #[cfg(feature = "wasm-hooks")]
     let state = if surfaces.wasm_hooks {
-        let engine = std::sync::Arc::new(match ironauth_hooks::HookEngine::new() {
-            Ok(engine) => engine,
-            Err(error) => {
-                tracing::error!(?error, "the WASM hook engine could not be built");
-                return None;
-            }
-        });
-        // THE EPOCH DRIVER. `Limits::claim_shaping` sets a deadline of one tick, and a tick is
-        // whatever the deployment makes it -- so without this the deadline never arrives and
+        let engine = build_hook_engine();
+        // THE EPOCH DRIVER. The dispatch's `limits()` sets a deadline of two ticks, and a tick
+        // is whatever the deployment makes it -- so without this the deadline never arrives and
         // the backstop against a hook that blocks is gone while the config still claims it.
-        // Ten milliseconds: far longer than the benchmarked warm invocation (tens of
-        // microseconds) and far shorter than a login anyone would wait through.
-        let ticker = std::sync::Arc::clone(&engine);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                ticker.tick();
+        // Ten milliseconds: two ticks is far longer than the benchmarked warm invocation (tens
+        // of microseconds) and far shorter than a login anyone would wait through.
+        match engine {
+            Some(engine) => {
+                let runtime =
+                    std::sync::Arc::new(ironauth_oidc::token_hook::HookRuntime::new(engine));
+                let ticker = std::sync::Arc::clone(runtime.engine());
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        interval.tick().await;
+                        ticker.tick();
+                    }
+                });
+                state.with_hook_engine(runtime)
             }
-        });
-        state.with_hook_engine(engine)
+            None => state,
+        }
     } else {
+        state
+    };
+    // Without the `wasm-hooks` feature there is no engine to build, and the verdict is already
+    // logged where it is resolved -- a build that cannot run hooks must say so if an operator
+    // enabled them, or "enabled and nothing happens" is indistinguishable from "enabled".
+    #[cfg(not(feature = "wasm-hooks"))]
+    let state = {
+        if surfaces.wasm_hooks {
+            tracing::error!(
+                "wasm-hooks is enabled in the config but this binary was built WITHOUT the \
+                 `wasm-hooks` cargo feature, so no hook will run. Rebuild with it, or turn the \
+                 feature off in config so the two agree."
+            );
+        }
         state
     };
     // The outbound client sync HTTP flow targets are called through (issue #112). Its
@@ -3107,6 +3131,41 @@ fn verification_sender(
         )
     } else {
         logging
+    }
+}
+
+/// Build the WASM hook engine, or [`None`] with a loud startup line (issue #114).
+///
+/// # Every failure here is `None`, never a refusal to boot
+///
+/// A separate function precisely so the early return means "no hook engine" rather than "no OIDC
+/// plane". Written inline in `build_oidc_plane`, which returns `Option<OidcPlane>`, a `return
+/// None` would abort the whole data plane: a deployment that enabled hooks on a build where
+/// wasmtime cannot configure itself would serve NO traffic at all, health checks and metrics
+/// only, with no message saying why.
+///
+/// That is the shape `connect_org_provisioning` was extracted to avoid, and its doc says of it:
+/// "a deployment that turned this on and forgot the control DSN would have failed to serve ANY
+/// traffic, turning a configuration typo into an outage. That is how the first version of this
+/// was written." It was how the first version of THIS was written too.
+///
+/// The trade is stated rather than assumed: a deployment that enabled hooks and gets none has
+/// tokens that are not the shape it configured, which is bad. A deployment that enabled hooks
+/// and gets no logins at all is worse, and the startup line is what makes the first one
+/// discoverable at the moment it happens.
+#[cfg(feature = "wasm-hooks")]
+fn build_hook_engine() -> Option<std::sync::Arc<ironauth_hooks::HookEngine>> {
+    match ironauth_hooks::HookEngine::new() {
+        Ok(engine) => Some(std::sync::Arc::new(engine)),
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                "WASM hooks are enabled but the engine could not be built, so NO hook will run \
+                 and every client with one deployed will issue tokens without it. The OIDC \
+                 plane is serving."
+            );
+            None
+        }
     }
 }
 

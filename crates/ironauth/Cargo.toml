@@ -28,7 +28,10 @@ ironauth-admin.workspace = true
 # oidc.enabled is set; the store provides the data-plane connection. rustls/ring
 # only, so the musl static lane holds.
 # The WASM hook engine (issue #114), installed behind the experimental maturity flag.
-ironauth-hooks.workspace = true
+#
+# OPTIONAL for the MSRV reason `ironauth-oidc`'s copy of this comment gives: wasmtime and
+# cranelift declare 1.95 and this binary publishes 1.85. The default artifact is unchanged.
+ironauth-hooks = { workspace = true, optional = true }
 ironauth-oidc.workspace = true
 # The admin console SPA (issue #90) is embedded and mounted on the PUBLIC plane
 # under /admin when admin_spa.enabled is set. It embeds its assets with
@@ -72,6 +75,13 @@ serde_json.workspace = true
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 
 [features]
+# The WASM token hooks dispatch (issue #114). OFF by default: it pulls wasmtime and cranelift,
+# whose MSRV is 1.95 against this binary's published 1.85 (docs/COMPATIBILITY.md). A deployment
+# that wants hooks builds with this and accepts 1.95 for that artifact.
+#
+# Making it default-on is the owner decision `ironauth-hooks`'s Cargo.toml describes, and it is
+# one line here plus the two rows in COMPATIBILITY.md.
+wasm-hooks = ["dep:ironauth-hooks", "ironauth-oidc/wasm-hooks"]
 # Passes the optional IronBus wake-up backbone through to ironauth-store (issue #104).
 ironbus = ["ironauth-store/ironbus"]
 # Forwarded to the server crate: OTLP trace export off by default so the

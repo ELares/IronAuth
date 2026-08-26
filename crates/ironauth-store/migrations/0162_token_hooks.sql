@@ -13,9 +13,11 @@
 -- hazard with a memory-safety failure mode: a replica on a different CPU, or one wasmtime
 -- version ahead, deserializes machine code built for something else.
 --
--- So the durable form is the PORTABLE one and each process compiles what it loads. That is a
--- deploy-time cost per process, which is what issue #114's "AOT precompilation at deploy time"
--- means when the deployment is more than one machine.
+-- So the durable form is the PORTABLE one and each process compiles what it loads. Compiling is
+-- ~33 ms, which is not something to pay per login, so the dispatch holds the loaded component in
+-- a per-process cache keyed on (scope, client, component digest). That is what "AOT
+-- precompilation at deploy time" amounts to when the deployment is more than one machine: the
+-- cost is paid once per process per artifact, not once per issuance.
 --
 -- # Why the bytes and not a URL
 --
@@ -25,10 +27,15 @@
 CREATE TABLE token_hooks (
     tenant_id       text        NOT NULL,
     environment_id  text        NOT NULL,
-    -- The OAuth client whose tokens this hook shapes. Not a foreign key to `clients`, for the
-    -- reason `claims_mappings` gives: a snapshot is imported into a target environment where
-    -- the client row may not exist yet, and ordering an import by referential dependency is a
-    -- second ordering to get wrong. The hook is inert until a client of that id issues a token.
+    -- The OAuth client whose tokens this hook shapes. Not a foreign key to `clients`, and the
+    -- reason is NOT the one `claims_mappings` gives -- no config snapshot carries this table, so
+    -- the import-ordering argument does not apply here and citing it would be borrowing a reason
+    -- that is not this table's.
+    --
+    -- The reason is that a hook is deployed against a client id an operator names, and the
+    -- window between deploying a hook and creating the client it shapes is one an operator may
+    -- legitimately want in either order. The hook is inert until a client of that id issues a
+    -- token, so an early deploy costs nothing and a foreign key would only force an ordering.
     client_id       text        NOT NULL,
     -- The WASM component, as bytes.
     component       bytea       NOT NULL,

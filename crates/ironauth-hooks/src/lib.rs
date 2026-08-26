@@ -78,4 +78,10 @@ pub mod fixtures {
     /// a test can tell "the fence dropped the forged claims" from "the hook never ran", which
     /// are the same observation without it.
     pub const CLAIM_FORGER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CLAIM_FORGER"));
+
+    /// A hook that REMOVES `email` and adds a marker.
+    ///
+    /// The WIT contract is a replace, so dropping a claim means not echoing it. The marker is
+    /// what lets a test tell a removal from a hook that never ran.
+    pub const CLAIM_STRIPPER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CLAIM_STRIPPER"));
 }
