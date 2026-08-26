@@ -1348,6 +1348,10 @@ async fn build_oidc_plane(
                 None
             }
         };
+    // Cloned BEFORE the state takes ownership: the messaging producer installed below needs its
+    // own handles, and both are cheap to clone (the store's pool is reference counted).
+    let messaging_store = store.clone();
+    let messaging_env = env.clone();
     let state = match client_key_resolver {
         Some(resolver) => OidcState::with_client_key_resolver(
             store,
@@ -1382,8 +1386,25 @@ async fn build_oidc_plane(
     // `None` and the logging transport is installed exactly as before.
     .with_verification_sender(DEV_CAPTURE.get().map_or_else(
         || {
-            std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender)
-                as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
+            // The messaging ledger's FIRST PRODUCER (issue #111). Until this, `enqueue` had no
+            // production caller at all: the ledger, the collapse, the rate limit, the
+            // suppression check, the failover and both management endpoints were implemented,
+            // tested, and fed by nothing.
+            //
+            // It WRAPS the logging transport rather than replacing it, and that is the
+            // load-bearing part of this wiring. The producer renders exactly two messages -- the
+            // coarse `account_linked` and `account_unlinked` alerts -- because a payload rides a
+            // durable queue every consumer worker reads and `DefaultComposer` refuses one with
+            // no body, so a message this cannot write the whole text of cannot use this path.
+            // Every other purpose and all four `deliver_*` methods pass straight through to the
+            // sender below. A wholesale swap would have moved four transports from "logged" to
+            // completely silent, because the trait's default bodies discard their argument.
+            //
+            // Gated on `messaging.delivery_enabled` alone, so a deployment that has not turned
+            // messaging on keeps the logging transport and behaves exactly as before. Turning it
+            // on is what makes an account-link alert a real queued message, and changes nothing
+            // else.
+            verification_sender(config, &messaging_store, &messaging_env)
         },
         |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>,
     ))
@@ -2986,21 +3007,119 @@ fn message_delivery_inputs(config: &Config, env: &Env) -> Option<MessageDelivery
         data_plane_dsn: config.database.url.expose().to_owned(),
         control_dsn: select_control_dsn(config),
         master: resolve_master_key(config),
-        // The right-hand side of every Message-ID this deployment stamps. RFC 5322 section
-        // 3.6.4 wants it globally unique, and the deployment's own public host is what makes
-        // it so rather than merely random. Falls back to a reserved name rather than to
-        // something that might belong to somebody else: `.invalid` is reserved by RFC 2606
-        // exactly so it can never resolve.
-        sender_domain: config
-            .server
-            .public_url
-            .as_deref()
-            .and_then(|url| url.parse::<http::Uri>().ok())
-            .and_then(|uri| uri.host().map(str::to_owned))
-            .filter(|host| !host.is_empty())
-            .unwrap_or_else(|| "ironauth.invalid".to_owned()),
+        sender_domain: sender_domain(config.server.public_url.as_deref()),
         env: env.clone(),
     })
+}
+
+/// How many notices one recipient may be sent in an hour.
+///
+/// Three, matching the shape the ledger's own tests use for a real budget. Named rather than
+/// written at the call site so the value a deployment runs is the value a test can name: every
+/// suite exercising this producer used `RateBudget::new(100, 3_600)`, so the SHIPPED budget was
+/// the one configuration nothing ever ran.
+/// (per-recipient sends, window seconds). Not a `const RateBudget` because `RateBudget::new` is
+/// not a `const fn`; the pair is what a test names and what the call site passes.
+const NOTICE_RATE_BUDGET: (u32, u64) = (3, 3_600);
+
+/// The verification sender this configuration installs.
+///
+/// A named function that RETURNS THE SENDER, rather than a predicate the boot path branches on.
+/// The difference is what the test can see, and it is the whole point: a previous version
+/// extracted `notice_producer_installs` and tested it, which caught an inverted PREDICATE and
+/// not an inverted BRANCH -- swapping the two arms of the `if`, and deleting the producer from
+/// it entirely, both left the whole `ironauth` suite green. A test of the answer is not a test
+/// of the wiring.
+///
+/// `Debug` is what the test reads, which is why `MessagingVerificationSender`'s implementation
+/// names the type it wraps: the composite's whole purpose is that it delegates, so "which
+/// sender is installed" and "what does it fall back to" are one question.
+fn verification_sender(
+    config: &Config,
+    store: &ironauth_store::Store,
+    env: &Env,
+) -> std::sync::Arc<dyn ironauth_oidc::VerificationSender> {
+    let logging: std::sync::Arc<dyn ironauth_oidc::VerificationSender> =
+        std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender);
+    if notice_producer_installs(config) {
+        std::sync::Arc::new(
+            ironauth_oidc::message_sender::MessagingVerificationSender::new(
+                logging,
+                store.clone(),
+                env.clone(),
+                // PER KIND, and that is the one place in the tree that asks for it. These
+                // alerts are triggered by an authenticated change to the recipient's own
+                // account, so the recipient wanted every one of them -- and cross-kind counting
+                // would let an attacker who controls the volume spend the budget on links and
+                // unlinks to silence the alert about the method they add last. See `RateScope`.
+                ironauth_store::message_rate::RateBudget::new(
+                    NOTICE_RATE_BUDGET.0,
+                    NOTICE_RATE_BUDGET.1,
+                )
+                .per_kind(),
+            ),
+        )
+    } else {
+        logging
+    }
+}
+
+/// Whether the messaging producer replaces the logging transport (issue #111).
+///
+/// Extracted for the reason the sibling `message_delivery_inputs` was, and stated there: "a
+/// feature that can be wired backwards with nothing going red is a feature nothing measures."
+/// This gate lived inline in a closure inside `build_oidc_plane`, which only the boot path
+/// calls; the integration tests set `DEV_CAPTURE` before boot and take the capture arm, so
+/// INVERTING this condition installed the producer exactly when the operator asked for silence
+/// and no test in the tree noticed.
+fn notice_producer_installs(config: &Config) -> bool {
+    config.messaging.delivery_enabled
+}
+
+/// The right-hand side of every `Message-ID` this deployment stamps.
+///
+/// RFC 5322 section 3.6.4 wants it globally unique, and the deployment's own public host is what
+/// makes it so rather than merely random. The fallback is a reserved name rather than something
+/// that might belong to somebody else: `.invalid` is reserved by RFC 2606 exactly so it can
+/// never resolve.
+///
+/// # Why a host without a dot falls back rather than being used
+///
+/// `message_mime::message_id` refuses a domain with no `.`, `prepare_message` maps that to
+/// `PrepareError::Mime`, `compose` returns `mime_failed`, and the delivery consumer resolves the
+/// row `Failed` with NO provider contacted and no retry. So a public URL of `http://localhost`
+/// or `https://op` does not degrade delivery -- it stops it, for every message, silently.
+///
+/// Both of those ship in this repository: `deploy/ironauth.toml` sets
+/// `public_url = "http://localhost:8443"` and `deploy/conformance/ironauth.toml` sets
+/// `https://op`. A configured host was therefore strictly WORSE than an unset one, because the
+/// unset case already fell back to a domain that works.
+///
+/// This is the second instance of the defect the `boundary_for` fix in this same change is
+/// about: a value that only ever met the composer once a real producer existed. So the filter is
+/// the composer's own rule rather than "non-empty", and the fallback covers both.
+fn sender_domain(public_url: Option<&str>) -> String {
+    let configured = public_url
+        .and_then(|url| url.parse::<http::Uri>().ok())
+        .and_then(|uri| uri.host().map(str::to_owned));
+    match configured {
+        // The composer's rule, not a weaker copy of it: a host it would refuse is one that
+        // stops delivery entirely, so it must not become the sender domain.
+        Some(host) if ironauth_store::message_mime::is_usable_message_id_domain(&host) => host,
+        // SUBSTITUTED, and said out loud. An operator who configured `https://op` and gets
+        // `ironauth.invalid` in every Message-ID has had a decision made for them; the sibling
+        // failure on this path (an absent master key) logs, and silence here would leave the
+        // substitution discoverable only by reading a delivered mail's headers.
+        Some(host) => {
+            tracing::warn!(
+                target: "ironauth.messaging",
+                configured_host = %host,
+                "the configured public host cannot stamp a Message-ID (RFC 5322 wants a                  dotted domain), so messages will carry the reserved ironauth.invalid instead"
+            );
+            "ironauth.invalid".to_owned()
+        }
+        None => "ironauth.invalid".to_owned(),
+    }
 }
 
 /// The configured providers as (name, endpoint), IN CONFIGURED ORDER.
@@ -6133,7 +6252,10 @@ mod tests {
 
 #[cfg(test)]
 mod message_delivery_wiring_tests {
-    use super::{message_delivery_inputs, provider_specs};
+    use super::{
+        NOTICE_RATE_BUDGET, message_delivery_inputs, notice_producer_installs, provider_specs,
+        sender_domain, verification_sender,
+    };
     use ironauth_config::{Config, MessageProviderConfig, MessagingConfig};
     use ironauth_env::Env;
 
@@ -6178,6 +6300,143 @@ mod message_delivery_wiring_tests {
             message_delivery_inputs(&on, &env).is_some(),
             "delivery on must start one; inverted, the worker runs exactly when the operator \
              asked for silence"
+        );
+    }
+
+    /// The SHIPPED notice budget is the one the producer is built with.
+    ///
+    /// The constant's own doc says it was named "so the value a deployment runs is the value a
+    /// test can name", and then no test named it -- changing it to `(1, 3_600)` and replacing it
+    /// at the call site with `(1, 1)` both left this suite green. A constant extracted for
+    /// testability and never tested is a comment.
+    ///
+    /// PER KIND is asserted here rather than only at the call site, because it is the property
+    /// review found missing: a cross-kind budget lets an attacker who chooses the volume spend
+    /// one alert kind's allowance to silence another's. `notice_enqueues.rs` measures what that
+    /// scope DOES to a real ledger; this measures that the shipped wiring asks for it.
+    #[tokio::test]
+    async fn the_shipped_notice_budget_is_what_the_producer_gets() {
+        use ironauth_store::message_rate::{RateBudget, RateScope};
+
+        let expected = RateBudget::new(NOTICE_RATE_BUDGET.0, NOTICE_RATE_BUDGET.1).per_kind();
+        assert_eq!(expected.limit, 3, "three notices per recipient per kind");
+        assert_eq!(expected.window_seconds, 3_600, "per hour");
+        assert_eq!(
+            expected.scope,
+            RateScope::SameKind,
+            "cross-kind counting turns this bound into a silencing primitive; see RateScope"
+        );
+
+        // And the WIRING asks for the same thing. `Debug` is what crosses the `Arc<dyn>`, so
+        // this is what the installed producer can be asked; without it the assertions above are
+        // about a value the boot path is free not to use.
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 33);
+        let store = ironauth_store::Store::disconnected();
+        let installed = format!(
+            "{:?}",
+            verification_sender(&config_with(messaging(true, &["primary"])), &store, &env)
+        );
+        assert!(
+            installed.contains(&format!("{expected:?}")),
+            "the installed producer must carry the shipped budget: {installed}"
+        );
+    }
+
+    /// The gate decides WHICH SENDER IS INSTALLED, not merely what a predicate answers.
+    ///
+    /// The sibling test below pins the predicate, and that is not enough: with only that test,
+    /// swapping the two arms of the `if` -- and deleting the producer from it entirely -- both
+    /// left this whole suite green. A test of the answer is not a test of the wiring, and the
+    /// wiring is where the defect would be.
+    ///
+    /// The `Debug` rendering is what distinguishes them, and it carries the WRAPPED sender as
+    /// well as the outer one. That matters here: the composite's entire purpose is that it
+    /// delegates what it cannot carry, so a producer installed with no fallback would be as
+    /// wrong as no producer at all, and only the inner name makes the two distinguishable.
+    ///
+    /// A LAZY pool, so this needs no database: nothing here connects. What is under test is a
+    /// branch on a config value, and giving it a real database would make a wiring test into an
+    /// integration test that a laptop without Postgres cannot run.
+    // A tokio context because `PgPoolOptions::connect_lazy` registers a reaper task on
+    // construction, even though nothing here ever opens a connection.
+    #[tokio::test]
+    async fn the_gate_decides_which_sender_is_installed() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 32);
+        let store = ironauth_store::Store::disconnected();
+
+        let off = format!(
+            "{:?}",
+            verification_sender(&config_with(messaging(false, &["primary"])), &store, &env)
+        );
+        assert_eq!(
+            off, "LoggingVerificationSender",
+            "delivery off installs the logging transport UNWRAPPED"
+        );
+
+        let on = format!(
+            "{:?}",
+            verification_sender(&config_with(messaging(true, &["primary"])), &store, &env)
+        );
+        assert!(
+            on.starts_with("MessagingVerificationSender"),
+            "delivery on installs the producer; with the arms swapped, an operator who turned \
+             messaging OFF is the one who gets real mail: {on}"
+        );
+        assert!(
+            on.contains("LoggingVerificationSender"),
+            "and it WRAPS the logging transport rather than replacing it -- everything this \
+             producer cannot carry is delegated there, so a producer with no fallback silently \
+             retires four transports: {on}"
+        );
+    }
+
+    /// The PRODUCER gate is the consumer gate, and it is not inverted.
+    ///
+    /// The sibling test above guards the consumer's gate and says why. This one exists because
+    /// the producer's gate had none: it sat inline in a closure inside `build_oidc_plane`, which
+    /// only the boot path calls, and every integration test sets `DEV_CAPTURE` first and takes
+    /// the capture arm. Inverting the condition installed the messaging producer precisely when
+    /// the operator asked for silence, with nothing red.
+    #[test]
+    fn the_notice_producer_installs_when_delivery_is_enabled_and_not_when_it_is_off() {
+        assert!(
+            !notice_producer_installs(&config_with(messaging(false, &["primary"]))),
+            "delivery off keeps the logging transport"
+        );
+        assert!(
+            notice_producer_installs(&config_with(messaging(true, &["primary"]))),
+            "delivery on installs the producer; inverted, an operator who turned messaging OFF \
+             is the one who gets real mail"
+        );
+    }
+
+    /// A public host the composer would refuse never becomes the sender domain.
+    ///
+    /// `message_id` refuses a domain with no dot, the composer turns that into `mime_failed`,
+    /// and the consumer resolves the row `Failed` with no provider contacted and no retry -- for
+    /// EVERY message. Both hosts asserted here ship in this repository's own deployment files,
+    /// so a configured public URL was strictly worse than an unset one.
+    #[test]
+    fn a_public_host_the_composer_would_refuse_falls_back() {
+        for refused in [
+            Some("http://localhost:8443"),
+            Some("https://op"),
+            Some("http://[::1]:8443"),
+            Some("not a url at all"),
+            None,
+        ] {
+            assert_eq!(
+                sender_domain(refused),
+                "ironauth.invalid",
+                "{refused:?} cannot stamp a Message-ID, so it must not be the sender domain"
+            );
+        }
+
+        // And a real host IS used, so the assertions above are not passing because everything
+        // falls back.
+        assert_eq!(
+            sender_domain(Some("https://auth.example.test:8443/base")),
+            "auth.example.test"
         );
     }
 

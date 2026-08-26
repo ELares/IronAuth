@@ -161,8 +161,14 @@ impl RecordingSender {
     }
 }
 
+#[async_trait::async_trait]
 impl VerificationSender for RecordingSender {
-    fn send(&self, _scope: ironauth_store::Scope, purpose: VerificationPurpose, recipient: &str) {
+    async fn send(
+        &self,
+        _scope: ironauth_store::Scope,
+        purpose: VerificationPurpose,
+        recipient: &str,
+    ) {
         match purpose {
             VerificationPurpose::AccountLinked => {
                 self.linked.lock().expect("lock").push(recipient.to_owned());

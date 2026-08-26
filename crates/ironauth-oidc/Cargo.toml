@@ -16,6 +16,11 @@ repository.workspace = true
 autotests = false
 
 [dependencies]
+# The delivery seam (`VerificationSender`) is held as `Arc<dyn ...>`, so it must stay
+# dyn-safe, and native `async fn` in traits is not. One method needs to await a
+# transactional write (issue #111); this is what makes that possible without giving up the
+# trait object. Already in the lock file transitively, so no new supply-chain surface.
+async-trait = "0.1"
 ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-store.workspace = true
@@ -108,6 +113,8 @@ default = []
 testing = ["ironauth-store/testing"]
 
 [dev-dependencies]
+# Test senders implement the same async seam the production one does.
+async-trait = "0.1"
 # net + io-util let the #25 client-assertion test stand up an in-process loopback
 # HTTP server that serves a client JWK Set through the fetcher's injected dialer.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
@@ -166,6 +173,17 @@ tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
 # drives the hook, and asserts the migrated counter, breaker gauge, and latency
 # histogram appear in the rendered exposition text.
 metrics-exporter-prometheus = { workspace = true }
+
+# The messaging ledger has a PRODUCER (issue #111): the two coarse account-link alerts,
+# delivered through the VerificationSender `send` seam, land a row and exactly one delivery job,
+# carry a payload with no secret whose two fields are the two the composer needs, and keep all
+# three dimensions of the dedup key apart (two purposes, two recipients, two windows). Every
+# purpose this producer does not render, and all four `deliver_*` methods, are asserted to reach
+# the wrapped transport instead.
+[[test]]
+name = "notice_enqueues"
+path = "tests/notice_enqueues.rs"
+required-features = ["testing"]
 
 # Metering stays OFF the issuance path (issue #107 acceptance criterion 5): a token
 # exchange under a tracing capture executes no query that READS the event feed.

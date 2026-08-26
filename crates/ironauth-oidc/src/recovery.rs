@@ -555,12 +555,9 @@ async fn notify_all_channels(
         if permitted.permits(identifier.identifier_type) {
             // The known-recipient path (a verified, resolved channel), so the send goes
             // out; anti-enumeration suppression is decided earlier, at existence lookup.
-            state.dispatch_verification(
-                scope,
-                VerificationPurpose::Recovery,
-                &identifier.raw,
-                true,
-            );
+            state
+                .dispatch_verification(scope, VerificationPurpose::Recovery, &identifier.raw, true)
+                .await;
             // The cancellation link rides to the SAME verified channels the coarse alert
             // went to, and only there. A channel good enough to be told a recovery started
             // is exactly the channel entitled to stop it, and one that is not verified is
@@ -789,7 +786,9 @@ pub async fn decoy_recovery_work(
         .user_identifiers()
         .list_for_user(&decoy_subject)
         .await;
-    state.dispatch_verification(scope, VerificationPurpose::Recovery, recipient, false);
+    state
+        .dispatch_verification(scope, VerificationPurpose::Recovery, recipient, false)
+        .await;
 }
 
 /// Whether `token` names a recovery that is still PENDING, without cancelling it.

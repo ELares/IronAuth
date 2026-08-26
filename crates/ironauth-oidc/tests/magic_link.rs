@@ -32,8 +32,9 @@ struct RecordingSender {
     magic: Mutex<Vec<(String, String, String)>>,
 }
 
+#[async_trait::async_trait]
 impl VerificationSender for RecordingSender {
-    fn send(
+    async fn send(
         &self,
         _scope: ironauth_store::Scope,
         _purpose: ironauth_oidc::VerificationPurpose,

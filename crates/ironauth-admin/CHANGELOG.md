@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Every message carrying a real `MessageId` failed to compose (issue #111).** `boundary_for`
+  built `ironauth-{message_id}`, which is 77 characters against RFC 2046's 70-character cap, so
+  `multipart_alternative` refused it and `compose` returned `mime_failed` -- for any message with
+  a real id. The delivery consumer resolves that to `Failed` with no provider contacted and no
+  retry. Nothing noticed because this module's tests used short synthetic ids and the consumer's
+  tests used a stub composer, so the first producer to hand the ledger a real id was the first
+  caller to reach it. The boundary is bounded to the id's tail now.
+
 - **An async flow-target delivery carries the subject's identifier and traits, resolved at
   DELIVERY time (issue #954).** A receiver previously got an opaque subject id, plus the
   `state`, `quarantined` and `origin` the envelope already carried, and had to call the

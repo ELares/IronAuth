@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **The messaging ledger has a producer, and `VerificationSender::send` is async (issue #111).**
+  `MessageRepo::enqueue` had ZERO production callers: the ledger, the collapse, the rate budget,
+  the suppression check, the provider failover and both management endpoints were implemented,
+  wired into the shipped binary, covered by passing tests, and fed by nothing. The new
+  `message_sender` module is the first producer. It renders the two coarse `account_*` security
+  alerts and DELEGATES everything else, unchanged, to the sender it wraps -- a payload rides a
+  durable queue every consumer worker reads, and `DefaultComposer` refuses one with no body, so
+  a message this producer cannot write the whole text of cannot use this path. `send` is `async`
+  as a consequence; the four `deliver_*` methods are unchanged.
+
 - **A federated assertion refusal is diagnosed by its actual cause, not the coarse catch-all
   (issue #126).** The `private_key_jwt` path has classified JOSE rejects into specific buckets
   since #91: bad signature, expired, clock skew, audience mismatch, unknown `kid`, algorithm

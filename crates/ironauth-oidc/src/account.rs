@@ -1631,7 +1631,9 @@ pub(crate) async fn notify_link_channels(
         if kind_allowed {
             // A verified, resolved channel (a known recipient), so the alert goes out;
             // anti-enumeration suppression is decided earlier at existence lookup.
-            state.dispatch_verification(scope, purpose, &identifier.raw, true);
+            state
+                .dispatch_verification(scope, purpose, &identifier.raw, true)
+                .await;
             count += 1;
         }
     }

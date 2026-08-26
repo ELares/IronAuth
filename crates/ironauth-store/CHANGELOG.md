@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`RateBudget` can count per KIND rather than across every kind (issue #111).** The default is
+  unchanged and still cross-kind, which is the anti-flood bound the module argues for: a stranger
+  typing a victim's address into a signup form is bounded by TOTAL volume. But for a message the
+  account owner needs about their own account, cross-kind counting is a silencing primitive --
+  an attacker who controls the volume spends one kind's allowance on link/unlink churn and the
+  alert about the method they add last is never delivered. `RateBudget::per_kind` narrows what
+  the count covers without removing the bound. Also `Store::disconnected`, a store whose pool
+  connects to nothing, so a test about wiring needs no database.
+
 - **`UserRepo::traits_user_visible` fails closed on a schema that will not compile.** It used
   to answer with the UNREDACTED document in that case. For a redaction that is the unsafe
   direction: the schema's annotations are what say which fields to withhold, so being unable to

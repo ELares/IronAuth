@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The dev capture sink implements the same async delivery seam the production sender does
+# (issue #111). Already in the lock file; no new supply-chain surface.
+async-trait = "0.1"
 # Parsing the deployment public URL to the host half of every Message-ID (issue #111).
 http.workspace = true
 ironauth-env.workspace = true

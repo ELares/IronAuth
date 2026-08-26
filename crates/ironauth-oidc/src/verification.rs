@@ -209,10 +209,53 @@ impl SmsSender for LoggingSmsSender {
 /// [`OidcState::dispatch_verification`](crate::state::OidcState). The default
 /// [`NullVerificationSender`] performs no delivery (no transport is wired yet), so a
 /// deployment without #68 behaves exactly as today.
+#[async_trait::async_trait]
 pub trait VerificationSender: Send + Sync + std::fmt::Debug {
     /// Deliver a verification message of `purpose` to `recipient` in `scope`. Called ONLY
     /// for a recipient a send is permitted to (never a suppressed one).
-    fn send(&self, scope: Scope, purpose: VerificationPurpose, recipient: &str);
+    ///
+    /// # Why THIS method is async and its siblings are not
+    ///
+    /// A real transport writes to the `messages` ledger, and that write is an async
+    /// transactional one; a synchronous method cannot await it. That is the mechanical reason
+    /// the whole messaging island -- the ledger, the collapse, the rate limit, the suppression
+    /// check, the failover, both management endpoints -- exists, is tested, and had no producer
+    /// (issue #111).
+    ///
+    /// This is the only door that may use that path AT ALL, and even here only for part of what
+    /// it carries. Two rules narrow it, and an earlier version of this paragraph stated the
+    /// first and missed the second -- which is worth recording, because this doc is the first
+    /// thing the next implementer of this seam reads, and it told them `send` was safe to route
+    /// onto the ledger wholesale.
+    ///
+    /// **A payload must be safe to write down.** `message_composer` states it: "A caller that
+    /// puts a live secret in it has put that secret on a durable queue every consumer worker
+    /// reads." That excludes the four `deliver_*` methods outright -- an OTP code, a magic link,
+    /// a disavowal link, a cancellation link.
+    ///
+    /// **And a message must carry its own body.** `DefaultComposer::compose` refuses a payload
+    /// with no `body` field and the consumer resolves that to `Failed` with no provider
+    /// contacted, so a producer must RENDER the message, which it can only do for one it knows
+    /// the whole text of.
+    ///
+    /// That second rule cuts INSIDE this method. It has five call sites carrying three purposes,
+    /// and only the two coarse `account_*` alerts have a body a producer can write:
+    /// `advanced_recovery.rs` says of the recovery notice that "the real transport embeds the
+    /// confirm link", and a registration verification exists to deliver a link that confirms a
+    /// newly claimed identifier. Mailing either without its link is not a degraded message; the
+    /// recipient has nothing to act on and the flow cannot complete.
+    ///
+    /// So an implementation that queues MUST delegate what it cannot render, on every axis:
+    /// by purpose, by recipient (these alerts go to every verified channel, and a verified phone
+    /// is not an email address), and by outcome (a ledger FAULT is not a decision). See
+    /// `message_sender::MessagingVerificationSender`, which returns a value forcing that choice
+    /// rather than promising it in a comment -- three review rounds each found the promise
+    /// broken on an axis nobody had enumerated.
+    ///
+    /// The others stay synchronous not because widening the seam is expensive, but because there
+    /// is nothing for them to widen it TOWARD: the ledger cannot carry what they deliver until
+    /// it has a sealed-payload mode, which migration 0154 says it "does not currently offer".
+    async fn send(&self, scope: Scope, purpose: VerificationPurpose, recipient: &str);
 
     /// Deliver an email-OTP code (issue #68). Called ONLY for a recipient a send is
     /// permitted to (never a suppressed one). The default is a no-op, so a deployment
@@ -249,8 +292,9 @@ pub trait VerificationSender: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct NullVerificationSender;
 
+#[async_trait::async_trait]
 impl VerificationSender for NullVerificationSender {
-    fn send(&self, _scope: Scope, _purpose: VerificationPurpose, _recipient: &str) {
+    async fn send(&self, _scope: Scope, _purpose: VerificationPurpose, _recipient: &str) {
         // No transport yet (issue #64). Intentionally does nothing.
     }
 }
@@ -265,8 +309,9 @@ impl VerificationSender for NullVerificationSender {
 #[derive(Debug, Default)]
 pub struct LoggingVerificationSender;
 
+#[async_trait::async_trait]
 impl VerificationSender for LoggingVerificationSender {
-    fn send(&self, scope: Scope, purpose: VerificationPurpose, _recipient: &str) {
+    async fn send(&self, scope: Scope, purpose: VerificationPurpose, _recipient: &str) {
         tracing::info!(
             target: "ironauth.verification",
             purpose = purpose.as_str(),

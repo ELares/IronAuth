@@ -43,8 +43,14 @@ struct NewDeviceRecord {
     disavowal_link: String,
 }
 
+#[async_trait::async_trait]
 impl VerificationSender for RecordingSender {
-    fn send(&self, _scope: ironauth_store::Scope, _purpose: VerificationPurpose, _recipient: &str) {
+    async fn send(
+        &self,
+        _scope: ironauth_store::Scope,
+        _purpose: VerificationPurpose,
+        _recipient: &str,
+    ) {
     }
 
     fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {

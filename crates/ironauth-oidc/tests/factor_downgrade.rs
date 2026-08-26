@@ -70,8 +70,14 @@ struct RecordingSender {
     magic: Mutex<Vec<(String, String, String)>>,
 }
 
+#[async_trait::async_trait]
 impl VerificationSender for RecordingSender {
-    fn send(&self, _scope: ironauth_store::Scope, _purpose: VerificationPurpose, _recipient: &str) {
+    async fn send(
+        &self,
+        _scope: ironauth_store::Scope,
+        _purpose: VerificationPurpose,
+        _recipient: &str,
+    ) {
     }
 
     fn deliver_email_otp(&self, message: &EmailOtpMessage<'_>) {

@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **A configured `server.public_url` with no dot in its host stopped ALL mail (issue #111).**
+  `sender_domain` took the host unvalidated, and `message_id` refuses a domain without a dot, so
+  `compose` returned `mime_failed` for every message. `deploy/ironauth.toml` ships
+  `http://localhost:8443` and `deploy/conformance/ironauth.toml` ships `https://op`: a configured
+  public URL was strictly worse than an unset one, which already fell back to the reserved
+  `ironauth.invalid`. The host is now checked against the composer's own predicate and the
+  substitution is logged rather than silent.
+
 - **`ironauth login` could not complete against an IronAuth issuer, in either flow (issue
   #120).** The CLI built its protocol endpoints by appending to `--issuer`:
   `/device_authorization` and `/token`. Both are served at the deployment ROOT while an

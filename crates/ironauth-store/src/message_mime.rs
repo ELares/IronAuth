@@ -126,17 +126,32 @@ pub fn message_id(local: &str, domain: &str) -> Result<String, MimeError> {
     {
         return Err(MimeError::InvalidMessageIdLocalPart);
     }
-    if domain.is_empty()
-        || domain.starts_with('.')
-        || domain.ends_with('.')
-        || domain.starts_with('-')
-        || domain.contains("..")
-        || !domain.contains('.')
-        || !domain.chars().all(domain_char_is_allowed)
-    {
+    if !is_usable_message_id_domain(domain) {
         return Err(MimeError::InvalidMessageIdDomain);
     }
     Ok(format!("<{local}@{domain}>"))
+}
+
+/// Whether `domain` may stand on the right of a `Message-ID`.
+///
+/// PUBLIC so a caller can ask BEFORE it becomes the deployment's sender domain. Refusing here is
+/// the last possible moment: `prepare_message` maps the refusal to `PrepareError::Mime`, the
+/// composer returns `mime_failed`, and the delivery consumer resolves the row `Failed` with no
+/// provider contacted and no retry -- for every message the deployment ever sends. A host that
+/// fails this is not a degraded configuration, it is a silent outage, and the only way to say so
+/// in time is to let the boot path ask the same question.
+///
+/// The dot is the load-bearing clause. `localhost` and `op` are the two hosts this repository's
+/// own deployment files configure, and neither has one.
+#[must_use]
+pub fn is_usable_message_id_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.starts_with('-')
+        && !domain.contains("..")
+        && domain.contains('.')
+        && domain.chars().all(domain_char_is_allowed)
 }
 
 /// Whether a boundary is well formed per RFC 2046 section 5.1.1.

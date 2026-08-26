@@ -1995,7 +1995,7 @@ impl OidcState {
     /// silently dropped (a suppressed send is an audited-by-tracing event), but the caller
     /// returns the SAME user-visible acknowledgment either way, so a probe cannot
     /// distinguish an existing account from an unknown one.
-    pub(crate) fn dispatch_verification(
+    pub(crate) async fn dispatch_verification(
         &self,
         scope: Scope,
         purpose: crate::verification::VerificationPurpose,
@@ -2003,7 +2003,9 @@ impl OidcState {
         recipient_known: bool,
     ) {
         if recipient_known {
-            self.verification_sender.send(scope, purpose, recipient);
+            self.verification_sender
+                .send(scope, purpose, recipient)
+                .await;
         } else {
             // Suppressed send (issue #64): no delivery to an unknown recipient. Recorded
             // on the observability plane (never a body difference), so the acknowledgment

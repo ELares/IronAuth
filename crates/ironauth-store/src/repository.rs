@@ -22835,17 +22835,31 @@ async fn hygiene_refusal(
     let cutoff =
         i64::try_from(now_epoch_seconds.saturating_sub(budget.window_seconds)).unwrap_or(i64::MAX);
     let ceiling = i64::try_from(now_epoch_seconds).unwrap_or(i64::MAX);
+    // ONE query with the kind predicate switched by the budget's scope, rather than two query
+    // strings: two would be two places for the window arithmetic above to be got wrong, and the
+    // arithmetic is what the paragraph above spends twelve lines on.
+    //
+    // `$6 IS NULL OR kind = $6` -- a NULL binding counts every kind, which is
+    // `RateScope::EveryKind` and the default. See `RateScope` for why a message the account
+    // owner needs about their own account counts per kind instead: cross-kind counting lets an
+    // attacker who chooses the volume spend one kind's budget to silence another's.
+    let same_kind = match budget.scope {
+        crate::message_rate::RateScope::EveryKind => None,
+        crate::message_rate::RateScope::SameKind => Some(kind),
+    };
     let counted: (i64, Option<i64>) = sqlx::query_as(
         "SELECT count(*)::bigint, EXTRACT(EPOCH FROM min(created_at))::bigint \
          FROM messages \
          WHERE tenant_id = $1 AND environment_id = $2 AND recipient_bidx = $3 \
-           AND created_at > to_timestamp($4) AND created_at <= to_timestamp($5)",
+           AND created_at > to_timestamp($4) AND created_at <= to_timestamp($5) \
+           AND ($6::text IS NULL OR kind = $6)",
     )
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
     .bind(bidx.as_bytes())
     .bind(cutoff)
     .bind(ceiling)
+    .bind(same_kind)
     .fetch_one(&mut **tx)
     .await?;
     let used = u32::try_from(counted.0).unwrap_or(u32::MAX);

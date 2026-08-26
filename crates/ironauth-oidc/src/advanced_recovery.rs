@@ -293,7 +293,9 @@ pub async fn initiate_trusted_contact(
             continue;
         }
         // Notify the contact out of band (the real transport embeds the confirm link).
-        state.dispatch_verification(scope, VerificationPurpose::Recovery, &contact.address, true);
+        state
+            .dispatch_verification(scope, VerificationPurpose::Recovery, &contact.address, true)
+            .await;
         tokens.push(token);
     }
     // Every designated contact was alerted; the account owner was already notified by the

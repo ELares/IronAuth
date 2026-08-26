@@ -140,8 +140,9 @@ impl CaptureSink {
     }
 }
 
+#[async_trait::async_trait]
 impl VerificationSender for CaptureSink {
-    fn send(&self, _scope: Scope, _purpose: VerificationPurpose, _recipient: &str) {
+    async fn send(&self, _scope: Scope, _purpose: VerificationPurpose, _recipient: &str) {
         // The generic notification carries no code, so there is nothing a test asserts
         // against. Deliberately not recorded: filling the bounded buffer with messages
         // nobody reads would evict the ones somebody does.
@@ -262,12 +263,18 @@ mod tests {
             ironauth_store::TenantId::generate(&env),
             ironauth_store::EnvironmentId::generate(&env),
         );
-        VerificationSender::send(
-            &sink,
-            scope,
-            VerificationPurpose::Registration,
-            "user@example.test",
-        );
+        // A dedicated runtime rather than an ambient one: this asserts the sink RECORDS
+        // nothing for the generic notice, and the sink is sync inside, so a single-threaded
+        // runtime is enough and cannot hit the `in_tokio` worker-thread panic.
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(VerificationSender::send(
+                &sink,
+                scope,
+                VerificationPurpose::Registration,
+                "user@example.test",
+            ));
         assert!(sink.snapshot().is_empty());
     }
 
