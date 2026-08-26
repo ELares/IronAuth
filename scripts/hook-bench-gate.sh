@@ -95,6 +95,13 @@ if min_cold < cold_floor:
     looser.append(f"samples.min_cold_iterations is {min_cold}, under {cold_floor}")
 if min_warm < warm_floor:
     looser.append(f"samples.min_warm_iterations is {min_warm}, under {warm_floor}")
+# The stated TARGET is reported and never enforced, so it loosens nothing -- and it is checked
+# anyway, because it is a number this gate PRINTS under a criterion about publishing numbers.
+# Set to 1e9 it printed "cold 420.500us against the 1000000000us stated target (under)", a
+# verdict that is false while the runtime sits several times over the real 120us figure. It was
+# the one config value the enumeration missed, which is this whole PR in miniature.
+if not 0 < target <= cold_ceiling:
+    looser.append(f"target.cold_p95_micros is {target:g}, outside (0, {cold_ceiling:g}]")
 if looser:
     print(f"hook-bench-gate: {path} asks this gate to enforce LESS than it may:", file=sys.stderr)
     for line in looser:
@@ -213,6 +220,12 @@ if [ "$ON_CI" = true ]; then
   #
   # `ImageVersion` and not only `ImageOS`: `ImageOS` is the OS major (`ubuntu24`) and does not
   # change when GitHub rotates the image, which is precisely the event this is here to catch.
+  #
+  # `ImageOS` and `ImageVersion` are set on GitHub-HOSTED runners only, so this makes a
+  # self-hosted runner permanently red. That is deliberate for this repository, which pins
+  # `ubuntu-latest`: a self-hosted machine has no image identity, so two different ones would
+  # compare equal. Moving to self-hosted means deciding what identifies THAT machine and
+  # editing this list, which is the conversation to have rather than a silent degrade.
   for required in RUNNER_OS RUNNER_ARCH ImageOS ImageVersion; do
     if [ -z "${!required:-}" ]; then
       echo "hook-bench-gate: ${required} is not set, so the machine cannot be identified." >&2
@@ -249,15 +262,28 @@ if [ -z "$MEASURED" ]; then
 fi
 echo "hook-bench-gate: measured ${MEASURED}"
 
-# The measurement, published for the release to pick up (criterion 4: "numbers are published per
-# release"). Written unconditionally on CI, so a run that PASSES publishes its numbers too -- the
-# baseline file only changes when somebody commits one, which is not often enough to be what a
-# release reads.
-MEASUREMENT_OUT="${HOOK_BENCH_MEASUREMENT_PATH:-target/hook-bench-measurement.json}"
+# This run's own measurement, uploaded by the CI job as an artifact so a bisect can read the
+# numbers of a specific run.
+#
+# NOT what the release publishes, and an earlier version of this comment said the opposite --
+# that the baseline "is not often enough to be what a release reads". It is exactly what
+# `release.yml` reads, deliberately: the baseline is the figure this gate ENFORCES against, so
+# it is the only number a release can honestly publish as what the code was held to. Nothing
+# downloads this artifact; it is for a human bisecting a specific run.
+#
+# A FIXED path, and that is a fix rather than a simplification. It was
+# `${HOOK_BENCH_MEASUREMENT_PATH:-...}`, and pointing that variable at the baseline file made the
+# gate write its own baseline and then compare itself against it: a 99x regression printed
+# "clean", and the committed baseline was overwritten in place with the regressed numbers, which
+# the release would then have published. One `env:` key on a workflow step, touching neither this
+# script nor the config -- which is exactly what the tighten-only rule below claims is
+# impossible. An input nobody enumerated is an input with no bound.
+MEASUREMENT_OUT="target/hook-bench-measurement.json"
 
 python3 - "$MEASURED" "$BASELINE" "$COLD_GATE" "$WARM_GATE" "$TOLERANCE" "$TARGET" \
-  "$RUNNER" "$ON_CI" "$MACHINE" "$MIN_COLD" "$MIN_WARM" "$MEASUREMENT_OUT" <<'PY'
-import json, os, pathlib, sys
+  "$RUNNER" "$ON_CI" "$MACHINE" "$MIN_COLD" "$MIN_WARM" "$MEASUREMENT_OUT" \
+  "$CRITERION_COLD_GATE_MICROS" "$CRITERION_WARM_GATE_MICROS" <<'PY'
+import json, math, os, pathlib, sys
 
 measured = json.loads(sys.argv[1])
 baseline_path = sys.argv[2]
@@ -267,8 +293,60 @@ on_ci = sys.argv[8] == "true"
 machine = sys.argv[9]
 min_cold, min_warm = int(sys.argv[10]), int(sys.argv[11])
 measurement_out = sys.argv[12]
+criterion_cold, criterion_warm = float(sys.argv[13]), float(sys.argv[14])
 
 failures = []
+
+
+def bounded_number(source, name, value, ceiling):
+    """Refuse a number that is missing, non-numeric, non-finite, negative, or over `ceiling`.
+
+    THE ENUMERATION IS THE MECHANISM. Three review rounds each bounded the inputs I had
+    listed, and each time the next round found one I had not: a config key, then a config key
+    bounding a config key, then the baseline's own numbers, then an environment variable. The
+    pattern was never "the bound is in the wrong file" -- it was that the set of things needing
+    a bound was carried in my head and kept being one short.
+
+    So every value that reaches a comparison in this gate goes through this function or through
+    an explicit check named beside it, and the header lists all of them. `inf` is the case that
+    makes this concrete: a baseline of `1e400` parses as `inf`, `allowed` becomes `inf`, and
+    every possible measurement is within tolerance. `nan` is worse -- every comparison against
+    it is False, so nothing ever exceeds anything.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        failures.append(f"{source}'s {name} is {value!r}, which is not a number")
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        failures.append(
+            f"{source}'s {name} is {number}, which is not finite. Every comparison against "
+            "a non-finite value is one that cannot fail."
+        )
+        return None
+    if number < 0:
+        failures.append(f"{source}'s {name} is {number:g}, which is negative")
+        return None
+    if number > ceiling:
+        failures.append(
+            f"{source}'s {name} is {number:g}, over {ceiling:g}. A value above the absolute "
+            "gate is incoherent: a run at it would itself have failed."
+        )
+        return None
+    return number
+
+
+# The MEASURED values, before anything compares against them. Unreachable from the real
+# benchmark, whose `micros()` returns a non-negative finite f64 -- and checked anyway, because
+# "unreachable" is the claim each of the three previous rounds turned out to be wrong about.
+# `NaN` here made every gate comparison False and the run printed "clean"; `-5.0` passed every
+# gate and was then offered as the baseline to commit.
+for name in ("cold_p95_micros", "warm_p95_micros"):
+    bounded_number("the measurement", name, measured.get(name), math.inf)
+if failures:
+    print("hook-bench-gate: FAILED")
+    for failure in failures:
+        print(f"  {failure}")
+    sys.exit(1)
 
 # THE SAMPLE COUNTS. The benchmark reports them and nothing read them, so `COLD_ITERATIONS`
 # could fall from 200 to 1 -- making the "p95" a single sample -- with the gate none the wiser
@@ -281,8 +359,11 @@ for name, floor in (("cold_iterations", min_cold), ("warm_iterations", min_warm)
 
 for name, gate in (("cold_p95_micros", cold_gate), ("warm_p95_micros", warm_gate)):
     value = measured[name]
-    if value > gate:
-        failures.append(f"{name} is {value:.3f}us, over the {gate:.0f}us gate")
+    # `>=`, not `>`. The criterion says "BELOW 1 ms" and "below 100 microseconds", and exactly
+    # 1000.000 is not below 1000. A one-character difference, but it is the difference between
+    # implementing the sentence and implementing something near it.
+    if value >= gate:
+        failures.append(f"{name} is {value:.3f}us, not below the {gate:.0f}us gate")
 
 # The stated TARGET is reported and never enforced, exactly as the issue asks.
 cold = measured["cold_p95_micros"]
@@ -306,12 +387,16 @@ def to_commit():
 
 
 if on_ci:
-    published = pathlib.Path(measurement_out)
-    published.parent.mkdir(parents=True, exist_ok=True)
-    published.write_text(to_commit() + "\n", encoding="utf-8")
-    print(f"hook-bench-gate: measurement written to {measurement_out}")
-
-    if os.path.exists(baseline_path):
+    # The baseline is READ FIRST and the measurement written after, so a path collision between
+    # the two cannot make this run its own baseline. The paths are fixed constants now, so the
+    # collision is unreachable; the ordering is kept because it was the mechanism, and an
+    # ordering that only works because of a constant elsewhere is one edit from working again.
+    if os.path.realpath(measurement_out) == os.path.realpath(baseline_path):
+        failures.append(
+            "the measurement and the baseline are the same file, so this run would record "
+            "itself as its own baseline and compare against it"
+        )
+    elif os.path.exists(baseline_path):
         with open(baseline_path, encoding="utf-8") as fh:
             baseline = json.load(fh)
         # The MEASURED identity, not the declared label. GitHub rotates what `ubuntu-latest`
@@ -330,20 +415,24 @@ if on_ci:
                 f"the baseline was recorded on {recorded_on!r}, this run is on {machine!r}. "
                 "Numbers from two machines are not comparable; re-record on this one."
             )
-        elif baseline.get("runner_class") != runner:
-            failures.append(
-                f"the baseline names runner class {baseline.get('runner_class')!r}, the "
-                f"config names {runner!r}."
-            )
         else:
-            for name in ("cold_p95_micros", "warm_p95_micros"):
-                before, after = baseline.get(name), measured[name]
-                if not isinstance(before, (int, float)) or before <= 0:
-                    failures.append(
-                        f"the baseline's {name} is {before!r}; a non-positive or missing "
-                        "baseline bounds nothing"
-                    )
+            # The BASELINE's numbers are inputs too, and they were the last unbounded ones. A
+            # baseline of `1e400` parses as `inf` and admits every measurement; `NaN` makes every
+            # comparison against it False, which admits every measurement for a different reason;
+            # `1e300` is finite and absurd. All three printed "clean" against a 999us run.
+            #
+            # The ceiling is the criterion's own gate: a baseline above it describes a run that
+            # would itself have failed, so there is no honest way to reach one.
+            for name, ceiling in (
+                ("cold_p95_micros", criterion_cold),
+                ("warm_p95_micros", criterion_warm),
+            ):
+                before = bounded_number("the baseline", name, baseline.get(name), ceiling)
+                if before is None or before <= 0:
+                    if before is not None:
+                        failures.append(f"the baseline's {name} is zero, which bounds nothing")
                     continue
+                after = measured[name]
                 allowed = before * (1.0 + tolerance / 100.0)
                 if after > allowed:
                     failures.append(
@@ -355,6 +444,10 @@ if on_ci:
             f"no baseline at {baseline_path}. A regression check with nothing to compare "
             "against cannot fail, so a missing baseline is a failure rather than a skip."
         )
+    published = pathlib.Path(measurement_out)
+    published.parent.mkdir(parents=True, exist_ok=True)
+    published.write_text(to_commit() + "\n", encoding="utf-8")
+    print(f"hook-bench-gate: measurement written to {measurement_out}")
     if failures:
         print("hook-bench-gate: commit this as " + baseline_path + " to record this run:")
         print(to_commit())

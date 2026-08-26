@@ -544,13 +544,21 @@ jobs:
       # committed baseline; this keeps the run's OWN measurement, which is what a bisect needs
       # and what the baseline is not (the baseline changes only when somebody commits one).
       - name: Publish this run's measurement
-        # `always()` so a FAILING gate still publishes what it measured -- that run's numbers are
-        # the ones somebody needs. `error` and not `ignore`: the gate writes this file on every
-        # CI path before it decides anything, so an absent one means it did not get that far, and
-        # a publish step that cannot fail is the same defect this whole gate is about. On an
-        # already-red job it adds a second red, which is the correct amount of noise for
-        # "the numbers were not published either".
-        if: always()
+        # A failing gate still publishes what it measured: that run's numbers are the ones
+        # somebody needs. `error` and not `ignore`, because a publish step that cannot fail is
+        # the same defect this whole gate is about -- on an already-red job it adds a second
+        # red, which is the right amount of noise for "and the numbers were not published".
+        #
+        # Several CI paths exit BEFORE the measurement is written -- a bench build failure, a
+        # wrong GITHUB_JOB, an out-of-range config, an unidentifiable machine. An earlier
+        # version of this comment claimed the file is written "on every CI path before it
+        # decides anything", which is false; the behaviour above is right anyway, and the
+        # reason is the one stated rather than the one that was.
+        #
+        # `success() || failure()` rather than `always()`: `always()` also fires on
+        # CANCELLATION, and this workflow sets cancel-in-progress for pull requests, so every
+        # superseded push would leave a failed upload step nobody should read as a signal.
+        if: success() || failure()
         uses: actions/upload-artifact@v7
         with:
           name: hook-latency-measurement

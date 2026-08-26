@@ -91,7 +91,7 @@ fn main() {
 
     let mut cold_samples = Vec::with_capacity(COLD_ITERATIONS);
     for _ in 0..COLD_ITERATIONS {
-        let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement: this benchmark's entire output is real elapsed time, and the Clock seam is a frozen ManualClock, so routing it through the seam would report zero
+        let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement: elapsed time is this benchmark's entire output, and a bench target is not protocol logic (it is not compiled into the server), which is what the rule protects
         // SAFETY: `artifact` is the output of `engine.compile` above, in this process, on this
         // engine. That is exactly the provenance `load_precompiled` requires.
         #[expect(

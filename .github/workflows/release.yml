@@ -37,15 +37,34 @@ jobs:
       # reaches the asset list, so a missing file there leaves a pushed tag and a published
       # attestation with no release behind it. A precondition of releasing belongs in the job
       # that runs before anything is signed.
-      - name: the hook latency baseline exists
+      - name: the hook latency baseline exists and says something
+        # `-s` alone was the first version, and a one-byte junk file satisfies it -- which would
+        # publish that byte as `hook-latency.json`, hash it into SHA256SUMS, and call the
+        # criterion met. The keys are checked because they are what makes the file an ANSWER to
+        # "what was this measured at, and on what".
         run: |
-          if [ ! -s crates/ironauth-hooks/bench-baseline.json ]; then
-            echo "crates/ironauth-hooks/bench-baseline.json is missing or empty." >&2
-            echo "It is a release asset (issue #114 criterion 4: numbers published per" >&2
-            echo "release). It is recorded by the hook-bench CI job, which prints the exact" >&2
-            echo "contents to commit on its first run against a given machine." >&2
-            exit 1
-          fi
+          python3 - <<'CHECK'
+          import json, pathlib, sys
+
+          path = pathlib.Path("crates/ironauth-hooks/bench-baseline.json")
+          if not path.is_file() or path.stat().st_size == 0:
+              print(f"{path} is missing or empty.", file=sys.stderr)
+              print("It is a release asset (issue #114 criterion 4: numbers published per", file=sys.stderr)
+              print("release). The hook-bench CI job prints the exact contents to commit on", file=sys.stderr)
+              print("its first run against a given machine.", file=sys.stderr)
+              sys.exit(1)
+          try:
+              baseline = json.loads(path.read_text(encoding="utf-8"))
+          except json.JSONDecodeError as error:
+              print(f"{path} is not JSON: {error}", file=sys.stderr)
+              sys.exit(1)
+          required = ("runner_class", "machine", "cold_p95_micros", "warm_p95_micros")
+          missing = [key for key in required if not baseline.get(key)]
+          if missing:
+              print(f"{path} is missing {missing}.", file=sys.stderr)
+              print("A published figure with no machine beside it is not a measurement.", file=sys.stderr)
+              sys.exit(1)
+          CHECK
 
   build:
     name: build, sbom, attest, release
