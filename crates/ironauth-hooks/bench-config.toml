@@ -18,6 +18,12 @@ class = "ubuntu-latest"
 
 [gates]
 # The criterion's two hard bounds. The job FAILS above either.
+#
+# These may be TIGHTENED here and never loosened. `scripts/hook-bench-gate.sh` carries the
+# criterion's own numbers as constants and refuses a config asking it to enforce less, because
+# these two lines ARE the criterion: as plain unbounded config they were one edit away from a
+# gate that admits a full second, and the run still printed "clean". Lowering them as the
+# runtime improves is exactly what this file is for; raising them is an edit to the script.
 cold_p95_micros = 1000
 warm_p95_micros = 100
 
@@ -34,17 +40,12 @@ cold_p95_micros = 120
 # gates above are the real bound, and this catches a step change rather than a drift.
 tolerance_percent = 50
 
-# The CEILING on the line above, and the reason it exists is the line above.
+# The ceiling on the line above lives in `scripts/hook-bench-gate.sh`, NOT here.
 #
-# `allowed = baseline * (1 + tolerance/100)`, so a large enough tolerance admits every possible
-# measurement and the regression arm stops being able to fail -- while the job still prints
-# "clean". One config line, no diff anyone would read twice. This is the same mechanism
-# `scripts/invariant-lints.sh` uses for its exemption ceiling, and the same rule applies: raising
-# it is a reviewable line in the change that needs it, with the reason attached.
-#
-# 100% is the most a noisy shared runner can justify: past a doubling, a "regression within
-# tolerance" is not variance.
-max_tolerance_percent = 100
+# It was here, as `max_tolerance_percent`, and that was the same defect one level out: two
+# adjacent lines in one file, both editable together, so setting both to 1e9 admitted a 12400%
+# regression and printed "clean". A bound in the same artifact as the thing it bounds is not a
+# bound. The script's `MAX_TOLERANCE_PERCENT` is what refuses a looser value.
 
 [samples]
 # The FLOORS on how many samples a published p95 may rest on.
@@ -53,5 +54,8 @@ max_tolerance_percent = 100
 # fall from 200 to 1 -- making the "p95" a single sample -- invisibly to the gate and to the
 # baseline it is compared against. A number is only comparable to another number taken the same
 # way, and the sample count is part of "the same way".
+#
+# Raisable here, never lowerable: as plain config these were floors that could themselves be set
+# to zero, which is a floor made of nothing.
 min_cold_iterations = 200
 min_warm_iterations = 5000

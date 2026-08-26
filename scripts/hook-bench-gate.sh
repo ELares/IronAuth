@@ -3,30 +3,22 @@
 #
 # The hook latency gate (issue #114, criterion 4).
 #
-# Runs the benchmark, compares it against the criterion's absolute bounds and against the
-# committed baseline, and fails on either. Three separate refusals, because they answer
-# different questions:
+# THE RULE THIS FILE IS ORGANIZED AROUND: config may make a bound STRICTER, never looser.
 #
-#   - the GATES are the criterion's absolute bounds. Crossing one is a failure whatever the
-#     baseline says, because a deployment feels the absolute number.
-#   - the REGRESSION tolerance catches a step change that is still inside the gates. Generous,
-#     because a shared runner is noisy and a benchmark that fails on ordinary variance teaches
-#     people to re-run it until it passes -- but BOUNDED, because an unbounded tolerance is a
-#     regression check that cannot fail.
-#   - the MACHINE must be the one the numbers are published against. A p95 is a property of the
-#     machine as much as of the code.
+# Two rounds of review found the same defect four times, each time one level further out. A
+# check was disarmed by a config value; the config value was bounded by another config value in
+# the same file; the sample floors that guarded the measurement were themselves unbounded; and
+# the criterion's own absolute gates -- the 1 ms and 100 us the issue names -- were plain
+# unbounded numbers a single edit could raise to a second. Every one printed "clean".
 #
-# A MISSING baseline is a FAILURE, not a skip. With nothing to compare against, every possible
-# measurement passes, so the criterion's "fails on regression" would be satisfied by a job that
-# cannot fail. The first run on a new machine is expected to fail and prints the line to commit.
+# The mistake was structural, not four separate oversights: the bounds lived in a data file the
+# gate merely read, so "the check" and "what the check permits" were the same editable thing.
 #
-# WHAT COUNTS AS "THE MACHINE", and why the first version got it wrong. That version wrote the
-# config's `runner.class` into the baseline and then compared the baseline's class against the
-# config's -- both sides read from one file, so the check could not fail for the reason it
-# existed. It happily stamped numbers taken on an arm64 laptop as `ubuntu-latest`. The identity
-# recorded now is MEASURED from the environment the job is actually running in (`RUNNER_OS`,
-# `RUNNER_ARCH`, `ImageOS`), so a rotated runner image refuses the comparison and asks for a
-# re-record -- which is precisely the event the "property of the machine" argument is about.
+# So the criterion's numbers are CONSTANTS HERE, in the enforcement code. `bench-config.toml`
+# can still set every one of them, and a stricter value is honoured -- an operator tightening
+# the gate as the runtime improves is the point of having the file. A LOOSER one is refused,
+# named, and the run fails. Raising what this gate permits is then an edit to this script, in a
+# diff a reviewer reads, which is the property the config file could never have.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -38,26 +30,89 @@ WORKFLOW=".github/workflows/ci.yml"
 # quietly run this script and be measured against the first job's machine.
 JOB="hook-bench"
 
+# THE CRITERION, verbatim:
+#
+#   "AOT cold start p95 is below 1 ms and warm invocation p95 below 100 microseconds... the job
+#    fails on regression beyond the configured threshold."
+#
+# These are the loosest values this gate will ever enforce. A config that asks for more is not
+# configuration, it is a repeal.
+CRITERION_COLD_GATE_MICROS=1000
+CRITERION_WARM_GATE_MICROS=100
+# A tolerance past a doubling is not variance on any runner, and a regression check that admits
+# a doubling admits nearly everything a real regression looks like.
+MAX_TOLERANCE_PERCENT=100
+# A p95 over a handful of samples is not a p95. These are the counts the benchmark was written
+# with; a config may ask for more.
+MIN_COLD_ITERATIONS=200
+MIN_WARM_ITERATIONS=5000
+
 # THE CONFIG, read in a way that cannot fail silently.
 #
 # A `python3 - <<PY` inside `$(...)` that exits non-zero leaves the shell continuing with EMPTY
 # variables: `set -e` does not see the failure, and every later comparison then fails for a
-# reason that has nothing to do with the real fault. Measured on the first version -- a missing
-# `[regression]` section reported "the job runs on 'ubuntu-latest', the config names ''". So the
-# read is checked on its own line, and its status is checked.
-if ! CONFIG_VALUES="$(python3 - "$CONFIG" <<'PY'
+# reason that has nothing to do with the real fault. Measured on an earlier version -- a missing
+# `[regression]` section reported "the job runs on 'ubuntu-latest', the config names ''".
+#
+# Every numeric value is parsed and range-checked HERE, before the benchmark runs, so a
+# malformed one costs a second rather than an hour.
+if ! CONFIG_VALUES="$(python3 - "$CONFIG" "$CRITERION_COLD_GATE_MICROS" \
+  "$CRITERION_WARM_GATE_MICROS" "$MAX_TOLERANCE_PERCENT" "$MIN_COLD_ITERATIONS" \
+  "$MIN_WARM_ITERATIONS" <<'PY'
 import sys, tomllib
-with open(sys.argv[1], "rb") as fh:
+
+path = sys.argv[1]
+cold_ceiling, warm_ceiling, tolerance_ceiling, cold_floor, warm_floor = (
+    float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+)
+
+with open(path, "rb") as fh:
     cfg = tomllib.load(fh)
-# Every value is required. `.get(...)` with a default would invent a bound nobody wrote.
-print(cfg["runner"]["class"])
-print(cfg["gates"]["cold_p95_micros"])
-print(cfg["gates"]["warm_p95_micros"])
-print(cfg["regression"]["tolerance_percent"])
-print(cfg["regression"]["max_tolerance_percent"])
-print(cfg["target"]["cold_p95_micros"])
-print(cfg["samples"]["min_cold_iterations"])
-print(cfg["samples"]["min_warm_iterations"])
+
+# Every value is REQUIRED. `.get(...)` with a default would invent a bound nobody wrote, and a
+# missing section would then read as a configured one.
+runner = cfg["runner"]["class"]
+cold_gate = float(cfg["gates"]["cold_p95_micros"])
+warm_gate = float(cfg["gates"]["warm_p95_micros"])
+tolerance = float(cfg["regression"]["tolerance_percent"])
+target = float(cfg["target"]["cold_p95_micros"])
+min_cold = int(cfg["samples"]["min_cold_iterations"])
+min_warm = int(cfg["samples"]["min_warm_iterations"])
+
+# CONFIG MAY TIGHTEN, NEVER LOOSEN. Each comparison names the constant it is measured against,
+# because "the config is wrong" is not actionable and "the config asks for 1e9, this gate
+# enforces at most 100" is.
+looser = []
+if not 0 < cold_gate <= cold_ceiling:
+    looser.append(f"gates.cold_p95_micros is {cold_gate:g}, outside (0, {cold_ceiling:g}]")
+if not 0 < warm_gate <= warm_ceiling:
+    looser.append(f"gates.warm_p95_micros is {warm_gate:g}, outside (0, {warm_ceiling:g}]")
+if not 0 < tolerance <= tolerance_ceiling:
+    looser.append(
+        f"regression.tolerance_percent is {tolerance:g}, outside (0, {tolerance_ceiling:g}]"
+    )
+if min_cold < cold_floor:
+    looser.append(f"samples.min_cold_iterations is {min_cold}, under {cold_floor}")
+if min_warm < warm_floor:
+    looser.append(f"samples.min_warm_iterations is {min_warm}, under {warm_floor}")
+if looser:
+    print(f"hook-bench-gate: {path} asks this gate to enforce LESS than it may:", file=sys.stderr)
+    for line in looser:
+        print(f"  {line}", file=sys.stderr)
+    print(
+        "            This file may only tighten a bound. Loosening one is an edit to\n"
+        "            scripts/hook-bench-gate.sh, where a reviewer sees it.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+# A value containing a newline would shift every field after it, so refuse rather than emit it.
+if "\n" in runner or not runner.strip():
+    print(f"hook-bench-gate: runner.class {runner!r} is empty or spans lines", file=sys.stderr)
+    sys.exit(1)
+
+for value in (runner, cold_gate, warm_gate, tolerance, target, min_cold, min_warm):
+    print(value)
 PY
 )"; then
   echo "hook-bench-gate: $CONFIG could not be read; the message above is the reason" >&2
@@ -70,10 +125,9 @@ fi
   IFS= read -r COLD_GATE
   IFS= read -r WARM_GATE
   IFS= read -r TOLERANCE
-  IFS= read -r MAX_TOLERANCE
   IFS= read -r TARGET
-  IFS= read -r MIN_COLD_ITERATIONS
-  IFS= read -r MIN_WARM_ITERATIONS
+  IFS= read -r MIN_COLD
+  IFS= read -r MIN_WARM
 } <<EOF
 $CONFIG_VALUES
 EOF
@@ -120,7 +174,7 @@ fi
 # a laptop. `GITHUB_ACTIONS` is set to the string "true" by Actions and by nothing else, so it is
 # the one fact here that is not self-referential.
 #
-# Any OTHER value is a FAILURE rather than a fall-through to the local path. The first version
+# Any OTHER value is a FAILURE rather than a fall-through to the local path. An earlier version
 # tested `== "true"` and treated everything else as local, so `GITHUB_ACTIONS=TRUE` -- or `1`, or
 # a typo -- silently took the branch that skips the baseline and exits 0. A check whose disarmed
 # state is green is not a check.
@@ -137,11 +191,40 @@ case "$GITHUB_ACTIONS_VALUE" in
     ;;
 esac
 
-if [ "$ON_CI" = true ] && [ "${GITHUB_JOB:-$JOB}" != "$JOB" ]; then
-  echo "hook-bench-gate: running as job '${GITHUB_JOB:-}', not '${JOB}'." >&2
-  echo "            The runner-class check above validates ${JOB}'s \`runs-on\`, so another" >&2
-  echo "            job running this script would be measured against a machine it is not on." >&2
-  exit 1
+if [ "$ON_CI" = true ]; then
+  # NOT `${GITHUB_JOB:-$JOB}`. That default supplied the expected value whenever the fact was
+  # absent, so the check passed in exactly the case where there was no job identity to check --
+  # the disarmed-state-is-green defect again, two lines below its own fix.
+  if [ "${GITHUB_JOB:-}" != "$JOB" ]; then
+    echo "hook-bench-gate: running as job '${GITHUB_JOB:-<unset>}', not '${JOB}'." >&2
+    echo "            The runner-class check above validates ${JOB}'s \`runs-on\`, so another" >&2
+    echo "            job running this script would be measured against a machine it is not" >&2
+    echo "            on, and an unset GITHUB_JOB means there is nothing to check at all." >&2
+    exit 1
+  fi
+
+  # THE MEASURED MACHINE, and every component required.
+  #
+  # An earlier version built this from three `${VAR:-}` defaults with nothing asserting the
+  # result was non-degenerate, so on a laptop with only GITHUB_ACTIONS=true it produced "//" --
+  # which then compared equal to a committed "//" and printed clean. Both sides of the check
+  # came from nothing, which is the same shape as the config-compared-to-itself defect it
+  # replaced.
+  #
+  # `ImageVersion` and not only `ImageOS`: `ImageOS` is the OS major (`ubuntu24`) and does not
+  # change when GitHub rotates the image, which is precisely the event this is here to catch.
+  for required in RUNNER_OS RUNNER_ARCH ImageOS ImageVersion; do
+    if [ -z "${!required:-}" ]; then
+      echo "hook-bench-gate: ${required} is not set, so the machine cannot be identified." >&2
+      echo "            A baseline records the machine it was measured on. An unidentified" >&2
+      echo "            one compares equal to every other unidentified one, which is a" >&2
+      echo "            comparison that cannot fail." >&2
+      exit 1
+    fi
+  done
+  MACHINE="${RUNNER_OS}/${RUNNER_ARCH}/${ImageOS}/${ImageVersion}"
+else
+  MACHINE=""
 fi
 
 echo "hook-bench-gate: runner class ${RUNNER}, gates cold<=${COLD_GATE}us warm<=${WARM_GATE}us, tolerance ${TOLERANCE}%"
@@ -166,19 +249,14 @@ if [ -z "$MEASURED" ]; then
 fi
 echo "hook-bench-gate: measured ${MEASURED}"
 
-# The MEASURED machine identity, from the environment rather than from a file in this repo.
-# Empty off CI, where the baseline arm does not run at all.
-MACHINE="${RUNNER_OS:-}/${RUNNER_ARCH:-}/${ImageOS:-}"
-
 # The measurement, published for the release to pick up (criterion 4: "numbers are published per
-# release"). Written unconditionally, so a run that PASSES publishes its numbers too -- the
+# release"). Written unconditionally on CI, so a run that PASSES publishes its numbers too -- the
 # baseline file only changes when somebody commits one, which is not often enough to be what a
 # release reads.
 MEASUREMENT_OUT="${HOOK_BENCH_MEASUREMENT_PATH:-target/hook-bench-measurement.json}"
 
 python3 - "$MEASURED" "$BASELINE" "$COLD_GATE" "$WARM_GATE" "$TOLERANCE" "$TARGET" \
-  "$RUNNER" "$ON_CI" "$MACHINE" "$MAX_TOLERANCE" "$MIN_COLD_ITERATIONS" \
-  "$MIN_WARM_ITERATIONS" "$MEASUREMENT_OUT" <<'PY'
+  "$RUNNER" "$ON_CI" "$MACHINE" "$MIN_COLD" "$MIN_WARM" "$MEASUREMENT_OUT" <<'PY'
 import json, os, pathlib, sys
 
 measured = json.loads(sys.argv[1])
@@ -187,30 +265,19 @@ cold_gate, warm_gate, tolerance, target = (float(sys.argv[i]) for i in (3, 4, 5,
 runner = sys.argv[7]
 on_ci = sys.argv[8] == "true"
 machine = sys.argv[9]
-max_tolerance = float(sys.argv[10])
-min_cold, min_warm = int(sys.argv[11]), int(sys.argv[12])
-measurement_out = sys.argv[13]
+min_cold, min_warm = int(sys.argv[10]), int(sys.argv[11])
+measurement_out = sys.argv[12]
 
 failures = []
 
-# THE TOLERANCE'S OWN BOUND. `allowed = before * (1 + tolerance/100)` with a large enough
-# tolerance admits any measurement, so one config line retires the regression arm while the run
-# still prints "clean". This is the same shape as `invariant-lints.sh`'s exemption ceiling, and
-# the same rule applies: raise the maximum in the change that needs it, where a reviewer sees it.
-if not 0 < tolerance <= max_tolerance:
-    failures.append(
-        f"regression.tolerance_percent is {tolerance:g}, outside (0, {max_tolerance:g}]. "
-        "A tolerance large enough to admit any measurement is a regression check that "
-        "cannot fail."
-    )
-
 # THE SAMPLE COUNTS. The benchmark reports them and nothing read them, so `COLD_ITERATIONS`
-# could fall to 1 -- making the "p95" a single sample -- with the gate none the wiser and the
-# baseline recording a number that means something different from the one it is compared to.
+# could fall from 200 to 1 -- making the "p95" a single sample -- with the gate none the wiser
+# and the baseline recording a number that means something different from the one it is
+# compared to. The floors themselves are bounded in the shell above.
 for name, floor in (("cold_iterations", min_cold), ("warm_iterations", min_warm)):
     taken = measured.get(name)
     if taken is None or taken < floor:
-        failures.append(f"{name} is {taken}, under the {floor} the config requires")
+        failures.append(f"{name} is {taken}, under the {floor} required")
 
 for name, gate in (("cold_p95_micros", cold_gate), ("warm_p95_micros", warm_gate)):
     value = measured[name]
@@ -249,9 +316,16 @@ if on_ci:
             baseline = json.load(fh)
         # The MEASURED identity, not the declared label. GitHub rotates what `ubuntu-latest`
         # points at; the label does not change when it does, and that rotation is exactly the
-        # event "a p95 is a property of the machine" is about.
+        # event "a p95 is a property of the machine" is about. The shell above has already
+        # refused an unidentifiable machine, so an empty value cannot reach here -- but a
+        # BASELINE carrying one can, and it must not be treated as a match.
         recorded_on = baseline.get("machine")
-        if recorded_on != machine:
+        if not recorded_on or not isinstance(recorded_on, str):
+            failures.append(
+                f"the baseline records no machine ({recorded_on!r}), so there is nothing to "
+                "compare against. Re-record it."
+            )
+        elif recorded_on != machine:
             failures.append(
                 f"the baseline was recorded on {recorded_on!r}, this run is on {machine!r}. "
                 "Numbers from two machines are not comparable; re-record on this one."
@@ -264,8 +338,11 @@ if on_ci:
         else:
             for name in ("cold_p95_micros", "warm_p95_micros"):
                 before, after = baseline.get(name), measured[name]
-                if before is None:
-                    failures.append(f"the baseline records no {name}, so nothing bounds it")
+                if not isinstance(before, (int, float)) or before <= 0:
+                    failures.append(
+                        f"the baseline's {name} is {before!r}; a non-positive or missing "
+                        "baseline bounds nothing"
+                    )
                     continue
                 allowed = before * (1.0 + tolerance / 100.0)
                 if after > allowed:

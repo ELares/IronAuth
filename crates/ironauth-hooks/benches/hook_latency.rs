@@ -118,6 +118,7 @@ fn main() {
         warm_samples.push(started.elapsed().as_nanos());
     }
 
+    let (cold_taken, warm_taken) = (cold_samples.len(), warm_samples.len());
     let cold_p95_ns = p95(cold_samples);
     let warm_p95_ns = p95(warm_samples);
     println!(
@@ -125,7 +126,11 @@ fn main() {
         micros(cold_p95_ns),
         micros(warm_p95_ns),
         artifact.len(),
-        COLD_ITERATIONS,
-        WARM_ITERATIONS
+        // The LENGTHS, not the constants. They agree today because the constants are the loop
+        // bounds, but the gate's sample floor would then be reading a claim about the data
+        // rather than the data -- and a loop that broke early would report the count it meant
+        // to take.
+        cold_taken,
+        warm_taken
     );
 }

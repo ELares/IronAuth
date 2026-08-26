@@ -31,6 +31,21 @@ jobs:
           crate_version=$(grep -m1 '^version' crates/ironauth/Cargo.toml | cut -d'"' -f2)
           echo "tag=$tag_version crate=$crate_version"
           test "$tag_version" = "$crate_version"
+      # Issue #114 criterion 4 asks for the hook latency numbers to be "published per release".
+      # Checked HERE rather than beside the asset copy, and the reason is what happens if it is
+      # not: the build job attests build provenance to a public transparency log BEFORE it
+      # reaches the asset list, so a missing file there leaves a pushed tag and a published
+      # attestation with no release behind it. A precondition of releasing belongs in the job
+      # that runs before anything is signed.
+      - name: the hook latency baseline exists
+        run: |
+          if [ ! -s crates/ironauth-hooks/bench-baseline.json ]; then
+            echo "crates/ironauth-hooks/bench-baseline.json is missing or empty." >&2
+            echo "It is a release asset (issue #114 criterion 4: numbers published per" >&2
+            echo "release). It is recorded by the hook-bench CI job, which prints the exact" >&2
+            echo "contents to commit on its first run against a given machine." >&2
+            exit 1
+          fi
 
   build:
     name: build, sbom, attest, release
@@ -63,6 +78,10 @@ jobs:
           # is freshness-checked in CI (scripts/config-schema.sh); ship it as a
           # release asset so it is downloadable per version alongside the binary.
           cp docs/config-schema.json dist/config-schema.json
+          # The hook latency numbers (issue #114 criterion 4). Staged BEFORE the manifest below,
+          # because an asset added after `sha256sum *` is the one asset a downloader cannot
+          # verify -- which is a worse outcome than not publishing it.
+          cp crates/ironauth-hooks/bench-baseline.json dist/hook-latency.json
           cd dist && sha256sum * > SHA256SUMS
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
@@ -73,16 +92,6 @@ jobs:
           version="${GITHUB_REF_NAME#ironauth-v}"
           awk -v ver="$version" '/^## /{p=($0 == "## " ver)} p' crates/ironauth/CHANGELOG.md > dist/RELEASE_NOTES.md
           test -s dist/RELEASE_NOTES.md || echo "See crates/ironauth/CHANGELOG.md" > dist/RELEASE_NOTES.md
-      # Issue #114 criterion 4 asks for the hook latency numbers to be "published per release",
-      # and until this they lived only in a CI job log. The baseline is the number the gate
-      # enforces against, so publishing IT is publishing what the release was measured to.
-      #
-      # `test -s` rather than a silent copy: a release whose asset list quietly lost a file
-      # publishes nothing and says nothing, which is the failure mode this criterion is about.
-      - name: Publish the hook latency numbers
-        run: |
-          test -s crates/ironauth-hooks/bench-baseline.json
-          cp crates/ironauth-hooks/bench-baseline.json dist/hook-latency.json
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -511,9 +511,10 @@ jobs:
     # A p95 is a property of the machine as much as of the code.
     #
     # The gate also refuses to run as any job but this one, and records the MEASURED machine
-    # (RUNNER_OS / RUNNER_ARCH / ImageOS) in the baseline rather than this label -- so a rotated
-    # runner image, which does not change the label, refuses the comparison instead of silently
-    # continuing it.
+    # (RUNNER_OS / RUNNER_ARCH / ImageOS / ImageVersion) in the baseline rather than this label.
+    # ImageVersion is the one that moves when GitHub rotates the image -- ImageOS is only the OS
+    # major -- so a rotation refuses the comparison instead of silently continuing it, which is
+    # precisely the "a p95 is a property of the machine" event.
     runs-on: ubuntu-latest
     # Generous because the run this job is DESIGNED to have -- the first one on a new machine,
     # which fails and prints the baseline to commit -- is also the one with a cold cache, and it
@@ -543,12 +544,18 @@ jobs:
       # committed baseline; this keeps the run's OWN measurement, which is what a bisect needs
       # and what the baseline is not (the baseline changes only when somebody commits one).
       - name: Publish this run's measurement
+        # `always()` so a FAILING gate still publishes what it measured -- that run's numbers are
+        # the ones somebody needs. `error` and not `ignore`: the gate writes this file on every
+        # CI path before it decides anything, so an absent one means it did not get that far, and
+        # a publish step that cannot fail is the same defect this whole gate is about. On an
+        # already-red job it adds a second red, which is the correct amount of noise for
+        # "the numbers were not published either".
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hook-latency-measurement
           path: target/hook-bench-measurement.json
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
