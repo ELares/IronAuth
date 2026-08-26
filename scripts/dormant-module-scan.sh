@@ -21,20 +21,59 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Modules that are deliberately callerless, each with the reason. Adding a line here is a
-# statement; leaving one stale is the thing review should catch.
+# statement; leaving one stale is the thing review should catch -- and, as of this change, the
+# thing the script itself catches. Two of the five entries that used to live here were stale:
+# `cimd` had 17 callers and `message_feedback` had 3, both wired long ago, and the scan said
+# nothing because a module with callers never reaches the allowlist at all. An allowlist that
+# only ever grows is a list of claims nobody rechecks.
+#
+# One entry per line, `crate/module`, with the reason in the comment above it.
+# Comment lines and blanks are stripped, so each entry can carry its reason next to it.
+allowlist_entries() {
+  sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' <<'ALLOWLIST'
+# untraced; see #774
+ironauth-oidc/mds3_sync
+
+# issue #113: the pre-token hook's contract, deliberately landed before either transport
+# that binds to it (#113's HTTP dispatch and #114's WASM one), so neither inherits the
+# other's shape. The seam it needs is recorded on #113: `tokens::mint` signs the ID token
+# before `mint_access` builds its claims, so no point today holds both unsigned.
+ironauth-store/token_customize
+
+# issue #113: both halves of the reserved-claim fence, the declarative one an operator
+# configures and the one a hook's returned claims pass through. Callerless for the same
+# reason as token_customize above: the mint seam that would call it is #113's remaining
+# work, and landing the fence first means the seam cannot be written without one.
+ironauth-oidc/claims_mapping
+ALLOWLIST
+}
+
 allow() {
-  case "$1" in
-    # Wiring is the remaining work of the issue that owns each, and #774 tracks them.
-    ironauth-oidc/cimd) return 0 ;;                      # issue #128
-    ironauth-oidc/mds3_sync) return 0 ;;                 # untraced; see #774
-    ironauth-store/message_feedback) return 0 ;;         # issue #111
-    ironauth-store/token_customize) return 0 ;;          # issue #113: the pre-token hook's
-    #   contract, deliberately landed before either transport that binds to it (#113's HTTP
-    #   dispatch and #114's WASM one), so neither inherits the other's shape. The seam it
-    #   needs is recorded on #113: `tokens::mint` signs the ID token before `mint_access`
-    #   builds its claims, so no point today holds both unsigned.
-    *) return 1 ;;
-  esac
+  allowlist_entries | grep -qxF "$1"
+}
+
+# How many places refer to a module, by name.
+#
+# ONE function, called by both loops below, so the two cannot drift into disagreeing about
+# what a reference is. That matters more than it looks: the main loop treats "zero refs" as
+# dormant and the staleness loop treats "more than zero" as an entry doing nothing, and those
+# are exact complements only while both count the same way. Two copies of this pipeline would
+# be a review obligation; one function is a structural guarantee.
+#
+# `|| true` wraps the WHOLE pipeline, not just the first grep: under `set -o pipefail` a
+# no-match grep exits 1 and kills the pipeline, which would make this script exit silently on
+# the FIRST module nobody references. That is the failure mode where a gate reports nothing
+# and looks like it passed.
+#
+# A rustdoc link counts, as does a mention in a test. That is deliberate and long-standing:
+# this scan asks "does anything in the tree name this module", not "is it on a request path",
+# and narrowing it to call sites would need a parser rather than a grep.
+refs_for() {
+  count="$( { grep -rn --include='*.rs' -e "${1}::" crates/ 2>/dev/null \
+    | grep -v "/${1}\.rs:" | wc -l; } || true )"
+  count="$(echo "$count" | tr -d ' ')"
+  [ -n "$count" ] || count=0
+  echo "$count"
 }
 
 # A module with a smaller surface than this is a helper, not a feature, and flagging every
@@ -54,14 +93,7 @@ for file in crates/*/src/*.rs; do
   [ "$public_items" -ge "$min_public_items" ] || continue
   checked=$((checked + 1))
 
-  # `|| true` on the whole pipeline, not just the first grep: under `set -o pipefail` a
-  # no-match grep exits 1 and kills the pipeline, which would make this script exit
-  # silently on the FIRST module nobody references. That is the failure mode where a gate
-  # reports nothing and looks like it passed.
-  refs="$( { grep -rn --include='*.rs' -e "${module}::" crates/ 2>/dev/null \
-    | grep -v "/${module}\.rs:" | wc -l; } || true )"
-  refs="$(echo "$refs" | tr -d ' ')"
-  [ -n "$refs" ] || refs=0
+  refs="$(refs_for "$module")"
   [ "$refs" -eq 0 ] || continue
 
   if allow "$crate/$module"; then
@@ -73,7 +105,76 @@ for file in crates/*/src/*.rs; do
   violations=$((violations + 1))
 done
 
-if [ "$violations" -gt 0 ]; then
+# An allowlist entry is a claim that a module has no caller TODAY. Once it acquires one the
+# entry is a stale statement about the tree, and the loop above can never notice: it skips a
+# module with callers before the allowlist is ever consulted. So check the entries directly.
+stale=0
+while read -r entry; do
+  [ -n "$entry" ] || continue
+  entry_crate="${entry%%/*}"
+  entry_module="${entry#*/}"
+
+  # A nested path can never be flagged in either direction: the main loop globs
+  # crates/*/src/*.rs so it never sees one, and a Rust path has no `/`, so `refs_for` on
+  # `flow/consent` matches nothing and the entry reads as permanently callerless. Rejected
+  # rather than tolerated, because the format comment above already calls it invalid.
+  case "$entry_module" in
+    */*)
+      echo "dormant-module-scan: allowlist entry $entry is not crate/module." >&2
+      echo "  The scan only sees crates/<crate>/src/<module>.rs; a nested path can never" >&2
+      echo "  be flagged, so an entry for one is unfalsifiable. Remove it." >&2
+      stale=$((stale + 1))
+      continue
+      ;;
+  esac
+
+  # An entry naming a module that is gone is stale in the other direction, and nothing caught
+  # it: renaming a file leaves the allowlist asserting something about a path that does not
+  # exist, and the scan stays green forever because the loop above never sees the module
+  # either. This also catches a mistyped crate half, which nothing checked at all.
+  #
+  # Both layouts count as existing. `foo/mod.rs` is a real module the tree already uses, and
+  # calling it missing would print a false statement and ask the author to delete a still-valid
+  # claim.
+  entry_file="crates/${entry_crate}/src/${entry_module}.rs"
+  if [ ! -f "$entry_file" ]; then
+    if [ -f "crates/${entry_crate}/src/${entry_module}/mod.rs" ]; then
+      entry_file="crates/${entry_crate}/src/${entry_module}/mod.rs"
+    else
+      echo "dormant-module-scan: allowlist entry $entry names no module:" >&2
+      echo "  $entry_file does not exist. Remove or fix the line." >&2
+      stale=$((stale + 1))
+      continue
+    fi
+  fi
+
+  # The main loop skips a module for TWO reasons, and until now this checked only one. A
+  # module under the public-surface floor is skipped before the allowlist is ever consulted, so
+  # its entry decides nothing -- and shrinking a module's surface, or raising the floor, made
+  # every entry below it silently inert while the gate stayed green.
+  entry_items="$(grep -cE '^pub (fn|struct|enum|trait|async fn|const)' "$entry_file" || true)"
+  entry_items="$(echo "$entry_items" | tr -d ' ')"
+  [ -n "$entry_items" ] || entry_items=0
+  if [ "$entry_items" -lt "$min_public_items" ]; then
+    echo "dormant-module-scan: allowlist entry $entry is INERT: $entry_items public items." >&2
+    echo "  The scan skips anything under $min_public_items, so this entry decides nothing." >&2
+    echo "  Remove the line rather than leaving a claim nobody rechecks." >&2
+    stale=$((stale + 1))
+    continue
+  fi
+
+  entry_refs="$(refs_for "$entry_module")"
+  if [ "$entry_refs" -gt 0 ]; then
+    echo "dormant-module-scan: allowlist entry $entry is INERT: $entry_refs references." >&2
+    echo "  The scan would not flag this module anyway, so the entry does nothing." >&2
+    echo "  Remove the line rather than leaving a claim nobody rechecks." >&2
+    stale=$((stale + 1))
+  fi
+done <<EOF
+$(allowlist_entries)
+EOF
+
+if [ "$violations" -gt 0 ] || [ "$stale" -gt 0 ]; then
   exit 1
 fi
 echo "dormant-module-scan: clean ($checked modules with a public surface, all reachable or allowlisted)"
