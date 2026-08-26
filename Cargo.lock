@@ -2052,6 +2052,7 @@ dependencies = [
 name = "ironauth-hooks"
 version = "0.1.0"
 dependencies = [
+ "tokio",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-io",

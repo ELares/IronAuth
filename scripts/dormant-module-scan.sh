@@ -69,28 +69,21 @@ allow() {
 # this scan asks "does anything in the tree name this module", not "is it on a request path",
 # and narrowing it to call sites would need a parser rather than a grep.
 #
-# `|| true` wraps the WHOLE pipeline, not just the first grep: under `set -o pipefail` a
-# no-match grep exits 1 and kills the pipeline, which would make this script exit silently on
-# the FIRST module nobody references. That is the failure mode where a gate reports nothing and
-# looks like it passed.
-#
-# A rustdoc link counts as a reference, and that is deliberate: this scan asks "does anything in
-# the tree NAME this module", not "is it on a request path", and narrowing it to call sites
-# would need a parser rather than a grep. The consequence is worth stating because it bit: a doc
-# comment written as `module::function` makes that module look wired. Write `module` alone, or
-# name the crate, rather than narrowing this filter to accommodate prose -- a detector loosened
-# to let one PR through stops holding for every module it checks.
-refs_for() {
-#
-# `guests/` is excluded, and this is a CONSISTENCY fix rather than a narrowing. The main loop
-# globs `crates/*/src/*.rs`, which never matches `crates/*/guests/*/src/lib.rs`, so a guest
-# fixture is not a module this scan can flag -- but the reference count was recursive over
+# Guest workspaces are excluded, and this is a CONSISTENCY fix rather than a narrowing. The main
+# loop globs `crates/*/src/*.rs`, which never matches `crates/<crate>/guests/*/src/lib.rs`, so a
+# guest fixture is not a module this scan can flag -- but the reference count was recursive over
 # `crates/`, so those same files counted as callers. One half of the scan could see them and the
-# other could not. They are a separate cargo workspace compiled to another target and they link
+# other could not. They are separate cargo workspaces compiled to another target and they link
 # into nothing here.
+#
+# ANCHORED to `crates/<crate>/guests/`, not a bare `/guests/` substring. Unanchored, a future
+# host module at `crates/<crate>/src/guests/handler.rs` -- exactly the wiring the allowlist
+# entries are waiting on -- would have its references swallowed and the entry would read as
+# callerless forever.
+refs_for() {
   count="$( { grep -rn --include='*.rs' -e "${1}::" crates/ 2>/dev/null \
     | grep -v "/${1}\.rs:" \
-    | grep -v '/guests/' | wc -l; } || true )"
+    | grep -vE '^crates/[^/]+/guests/' | wc -l; } || true )"
   count="$(echo "$count" | tr -d ' ')"
   [ -n "$count" ] || count=0
   echo "$count"

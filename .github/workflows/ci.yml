@@ -463,6 +463,22 @@ jobs:
       # requires a review but no CI job, so nothing surfaced it. Fixed here because a branch
       # cannot be green while it is not.
       - run: cargo check --workspace --all-features --all-targets --exclude ironauth-hooks --exclude ironauth-cel
+      # The two excluded crates are checked AT THEIR OWN declared MSRV, so the numbers
+      # docs/COMPATIBILITY.md publishes for them are compiled rather than asserted. Without this
+      # the exclusion above is the only thing anyone checks, and a crate could quietly need a
+      # newer compiler than its manifest claims while every lane stayed green.
+      - name: Install the toolchains the excluded crates declare
+        run: rustup toolchain install 1.95 --profile minimal && rustup toolchain install 1.86 --profile minimal
+      - name: Install the WASM target for 1.95
+        run: rustup target add wasm32-wasip2 --toolchain 1.95
+      - name: ironauth-hooks at its declared 1.95
+        env:
+          RUSTUP_TOOLCHAIN: "1.95"
+        run: cargo check -p ironauth-hooks --all-features --all-targets
+      - name: ironauth-cel at its declared 1.86
+        env:
+          RUSTUP_TOOLCHAIN: "1.86"
+        run: cargo check -p ironauth-cel --all-features --all-targets
 
   musl:
     name: musl static build
@@ -506,9 +522,10 @@ jobs:
         with:
           command: check
           manifest-path: crates/ironauth-hooks/guests/Cargo.toml
-          # Its OWN policy file. The root one carries advisory ignores whose justifications
-          # name crates absent from this workspace, and inheriting them would extend an
-          # exception to a graph nobody reasoned about. See that file's header.
+          # Its OWN advisory policy. The root file's ignores name crates absent from this
+          # workspace, so inheriting them would extend an exception to a graph nobody reasoned
+          # about. Licence and bans rules are the same; the advisory list is not. See that
+          # file's header.
           arguments: --config crates/ironauth-hooks/guests/deny.toml
 
   dev-boot-time:

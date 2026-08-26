@@ -46,4 +46,4 @@ mod sandbox;
 pub use engine::{Customization, HookEngine, LoadedHook, Request};
 pub use error::{AbortKind, HookError};
 pub use limits::Limits;
-pub use sandbox::{FROZEN_RESOLUTION_NS, Sandbox};
+pub use sandbox::{FROZEN_RESOLUTION_NS, Observed, Sandbox};

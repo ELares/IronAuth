@@ -133,6 +133,7 @@ impl Pollable for AlwaysReady {
 /// The host state backing the frozen `wasi:clocks/monotonic-clock`.
 struct FrozenClockView<'a> {
     table: &'a mut ResourceTable,
+    observed: &'a mut Observed,
 }
 
 /// Marker giving the frozen clock access to the resource table.
@@ -151,15 +152,90 @@ impl sync::clocks::monotonic_clock::Host for FrozenClockView<'_> {
         Ok(FROZEN_RESOLUTION_NS)
     }
 
-    fn subscribe_instant(&mut self, _when: u64) -> wasmtime::Result<Resource<DynPollable>> {
+    fn subscribe_instant(&mut self, when: u64) -> wasmtime::Result<Resource<DynPollable>> {
+        // The clock reads zero, so an absolute instant IS the duration from now.
+        self.observed.longest_requested_wait_ns = self.observed.longest_requested_wait_ns.max(when);
+        self.observed.host_resources_created += 1;
         let handle = self.table.push(AlwaysReady)?;
         subscribe(self.table, handle)
     }
 
-    fn subscribe_duration(&mut self, _duration: u64) -> wasmtime::Result<Resource<DynPollable>> {
+    fn subscribe_duration(&mut self, duration: u64) -> wasmtime::Result<Resource<DynPollable>> {
+        self.observed.longest_requested_wait_ns =
+            self.observed.longest_requested_wait_ns.max(duration);
+        self.observed.host_resources_created += 1;
         let handle = self.table.push(AlwaysReady)?;
         subscribe(self.table, handle)
     }
+}
+
+/// A `wasi:io/poll` whose list length is bounded.
+///
+/// The fourth host-cost multiplier, and none of the other bounds sees it. `poll` takes a LIST of
+/// pollable handles, and nothing stops the same handle appearing a million times: the resource
+/// table cap bounds distinct resources, not repeats. Measured before this: a guest holding one
+/// pollable and polling a list of a million references grew host RSS by 11.5 MiB per call and
+/// ran to completion under the shipped 16 MiB guest cap; sixty-four invocations took the host to
+/// 739 MiB, permanently.
+///
+/// Bounded by the same number that bounds the table, because a list longer than the number of
+/// resources a guest may hold is necessarily repeats, and a guest has no legitimate reason to
+/// wait on the same handle twice in one call.
+struct BoundedPoll<'a> {
+    table: &'a mut ResourceTable,
+    max_entries: usize,
+}
+
+/// Marker giving the bounded poll access to the table and the limit.
+struct BoundedPollData;
+
+impl HasData for BoundedPollData {
+    type Data<'a> = BoundedPoll<'a>;
+}
+
+impl sync::io::poll::Host for BoundedPoll<'_> {
+    fn poll(&mut self, pollables: Vec<Resource<DynPollable>>) -> wasmtime::Result<Vec<u32>> {
+        if pollables.len() > self.max_entries {
+            return Err(wasmtime::Error::msg(format!(
+                "a hook polled {} handles at once, over the {} limit",
+                pollables.len(),
+                self.max_entries
+            )));
+        }
+        sync::io::poll::Host::poll(self.table, pollables)
+    }
+}
+
+impl sync::io::poll::HostPollable for BoundedPoll<'_> {
+    fn ready(&mut self, pollable: Resource<DynPollable>) -> wasmtime::Result<bool> {
+        sync::io::poll::HostPollable::ready(self.table, pollable)
+    }
+
+    fn block(&mut self, pollable: Resource<DynPollable>) -> wasmtime::Result<()> {
+        sync::io::poll::HostPollable::block(self.table, pollable)
+    }
+
+    fn drop(&mut self, pollable: Resource<DynPollable>) -> wasmtime::Result<()> {
+        sync::io::poll::HostPollable::drop(self.table, pollable)
+    }
+}
+
+/// What the HOST observed a hook do, as opposed to what the hook reported.
+///
+/// A guest's own account of itself is not evidence: a test that asserts a hook did not wait,
+/// using a number the hook printed, passes when the hook stops waiting AND when the sandbox
+/// stops preventing it. These are recorded on the host side of the boundary, so they say what
+/// happened rather than what was claimed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Observed {
+    /// The longest wait, in nanoseconds, the hook ASKED for.
+    ///
+    /// Not the wait it got: the sandbox answers every wait immediately. This is the request,
+    /// which is what distinguishes a hook that tried to sleep for thirty seconds from one that
+    /// never tried at all.
+    pub longest_requested_wait_ns: u64,
+    /// How many host resources the hook created.
+    pub host_resources_created: usize,
 }
 
 /// The host state a hook instance runs against.
@@ -167,6 +243,8 @@ pub struct Sandbox {
     ctx: WasiCtx,
     table: ResourceTable,
     limits: wasmtime::StoreLimits,
+    max_host_resources: usize,
+    observed: Observed,
 }
 
 impl Sandbox {
@@ -198,6 +276,8 @@ impl Sandbox {
         Self {
             ctx: WasiCtxBuilder::new().build(),
             table,
+            max_host_resources: limits.max_host_resources,
+            observed: Observed::default(),
             // The memory cap alone bounds one linear memory, and a guest can multiply what it
             // costs the HOST without ever exceeding it: many memories, a growing table, or a
             // resource handle per host call. A measured example drove 137 MB of host heap under
@@ -216,6 +296,12 @@ impl Sandbox {
                 .instances(64)
                 .build(),
         }
+    }
+
+    /// What the host saw this hook do.
+    #[must_use]
+    pub fn observed(&self) -> Observed {
+        self.observed
     }
 
     /// Access the store limiter, for `Store::limiter`.
@@ -246,7 +332,12 @@ impl Sandbox {
             linker,
             |s: &mut Self| &mut s.table,
         )?;
-        sync::io::poll::add_to_linker::<Self, HasTable>(linker, |s: &mut Self| &mut s.table)?;
+        sync::io::poll::add_to_linker::<Self, BoundedPollData>(linker, |s: &mut Self| {
+            BoundedPoll {
+                table: &mut s.table,
+                max_entries: s.max_host_resources,
+            }
+        })?;
         sync::io::streams::add_to_linker::<Self, HasTable>(linker, |s: &mut Self| &mut s.table)?;
 
         // The single clock, frozen in all FOUR of its functions. wall-clock is NOT added.
@@ -260,6 +351,7 @@ impl Sandbox {
             linker,
             |s: &mut Self| FrozenClockView {
                 table: &mut s.table,
+                observed: &mut s.observed,
             },
         )?;
 

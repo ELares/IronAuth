@@ -24,6 +24,30 @@ const FS_ESCAPE: &str = env!("IRONAUTH_GUEST_FS_ESCAPE");
 const ECHO_REQUEST: &str = env!("IRONAUTH_GUEST_ECHO_REQUEST");
 const INSTANT_WAITER: &str = env!("IRONAUTH_GUEST_INSTANT_WAITER");
 const POLLABLE_LEAK: &str = env!("IRONAUTH_GUEST_POLLABLE_LEAK");
+const POLL_BOMB: &str = env!("IRONAUTH_GUEST_POLL_BOMB");
+
+/// Run a hook on its own thread with a deadline, so a regression FAILS rather than hangs.
+///
+/// The wait tests assert that a call returned promptly. If the mechanism they guard regresses so
+/// that the call never returns, measuring elapsed time inside the call cannot report it: the
+/// test hangs and CI reports a job timeout rather than the one-line failure. This bounds the
+/// call itself.
+fn bounded_customize(
+    hook: &ironauth_hooks::LoadedHook,
+    engine: &HookEngine,
+    limits: &Limits,
+    request: &Request,
+) -> Result<Result<ironauth_hooks::Customization, HookError>, &'static str> {
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = sender.send(hook.customize(engine, limits, request));
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|_| "the hook did not return within 10s")
+    })
+}
 
 fn request() -> Request {
     Request {
@@ -308,19 +332,40 @@ fn a_hook_cannot_wait() {
     // The bound is DERIVED from what the fixture asked for, not hard-coded. With a fixed five
     // seconds, deleting the sleep from the guest leaves this test green -- and it then passes
     // against a sandbox where waiting still works, which is the one thing it exists to catch.
-    let requested: u64 = outcome
-        .access_token_claims
-        .iter()
-        .find(|(name, _)| name == "requested_sleep_seconds")
-        .map(|(_, value)| value.parse().expect("a number"))
-        .expect("the fixture must report the wait it asked for");
+    // The HOST's observation, not the guest's report. Deriving the threshold from a number the
+    // guest prints is not a guard: deleting the sleep while keeping the report left the whole
+    // suite green against a sandbox with a live thirty-second hold. `longest_requested_wait_ns`
+    // is recorded on the host side of the boundary when the guest calls subscribe, so it says
+    // the wait was ATTEMPTED whatever the guest chooses to say about itself.
+    let requested_ns = outcome.observed.longest_requested_wait_ns;
     assert!(
-        requested >= 10,
-        "the fixture must ask for a wait long enough to be unmistakable, not {requested}s"
+        requested_ns >= 10_000_000_000,
+        "the host must have SEEN a long wait requested; it saw {requested_ns}ns, so this test \
+         is no longer exercising the sandbox"
     );
     assert!(
-        elapsed * 6 < std::time::Duration::from_secs(requested),
-        "a hook asked to wait {requested}s and the call took {elapsed:?}"
+        elapsed.as_nanos() * 6 < u128::from(requested_ns),
+        "a hook asked to wait {requested_ns}ns and the call took {elapsed:?}"
+    );
+}
+
+/// A hook cannot make the HOST allocate an unbounded poll list.
+///
+/// The fourth multiplier, and the other three cannot see it. The resource table bounds DISTINCT
+/// resources; a poll list is a list of handles and nothing stopped the same handle appearing a
+/// million times. Measured before this bound: 11.5 MiB of host heap per call, completing
+/// normally under a 16 MiB guest cap, reaching 739 MiB after sixty-four invocations.
+#[test]
+fn a_hook_cannot_poll_an_unbounded_list() {
+    let engine = HookEngine::new().expect("engine");
+    let hook = engine.load(&guest(POLL_BOMB)).expect("load");
+    let error = bounded_customize(&hook, &engine, &Limits::claim_shaping(), &request())
+        .expect("the call must not hang")
+        .expect_err("a million-entry poll list must be refused");
+    assert_ne!(
+        error.abort_kind(),
+        Some(AbortKind::Unlinkable),
+        "the guest must have RUN and been refused: {error}"
     );
 }
 
@@ -433,6 +478,53 @@ fn a_deadline_that_expires_during_instantiation_is_not_a_capability_refusal() {
         Some(AbortKind::DeadlineExceeded),
         "a deadline that fired during instantiation must not read as Unlinkable: {error}"
     );
+}
+
+/// Calling `customize` from a tokio worker thread PANICS, and this is the executable form of
+/// that warning.
+///
+/// The sandbox links `wasmtime-wasi`'s sync bindings, and every one enters the host through
+/// `in_tokio`, which panics when it is already on a worker. IronAuth's server is async, so a
+/// dispatch that calls this straight from a request handler panics the host mid-login.
+///
+/// The doc on `customize` used to say a `#[test]` fn could not observe this. That was wrong: a
+/// test can build its own runtime, and this one does. Written as a test rather than only a
+/// comment because if someone later swaps the sandbox to the async bindings, this goes red and
+/// the doc gets corrected with it, where a prose warning would simply become false.
+#[test]
+fn calling_a_hook_from_a_tokio_worker_panics_rather_than_working() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let joined = runtime.block_on(async {
+        tokio::task::spawn(async {
+            let engine = HookEngine::new().expect("engine");
+            let hook = engine.load(&guest(SLEEPER)).expect("load");
+            hook.customize(&engine, &Limits::claim_shaping(), &request())
+                .map(|_| ())
+        })
+        .await
+    });
+    let error = joined.expect_err("a hook that polls must not survive a worker thread");
+    assert!(
+        error.is_panic(),
+        "the failure must be the in_tokio panic the doc warns about, not an ordinary error"
+    );
+
+    // And the same hook under spawn_blocking is fine, which is what the doc tells a caller to do.
+    let ok = runtime.block_on(async {
+        tokio::task::spawn_blocking(|| {
+            let engine = HookEngine::new().expect("engine");
+            let hook = engine.load(&guest(SLEEPER)).expect("load");
+            hook.customize(&engine, &Limits::claim_shaping(), &request())
+                .map(|_| ())
+        })
+        .await
+        .expect("spawn_blocking must not panic")
+    });
+    assert!(ok.is_ok(), "under spawn_blocking the same hook completes");
 }
 
 /// A hook that spins is aborted by fuel.

@@ -8,7 +8,7 @@
 # workspace with its own target directory.
 [workspace]
 resolver = "2"
-members = ["good", "fuel-bomb", "memory-bomb", "net-escape", "random-escape", "fs-escape", "wall-clock-escape", "monotonic-reader", "sleeper", "decliner", "echo-request", "pollable-leak", "instant-waiter"]
+members = ["good", "fuel-bomb", "memory-bomb", "net-escape", "random-escape", "fs-escape", "wall-clock-escape", "monotonic-reader", "sleeper", "decliner", "echo-request", "pollable-leak", "poll-bomb", "instant-waiter"]
 
 [workspace.package]
 version = "0.0.0"

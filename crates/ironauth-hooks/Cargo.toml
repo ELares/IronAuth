@@ -45,5 +45,13 @@ wasmtime = { version = "48", default-features = false, features = [
 wasmtime-wasi = "48"
 wasmtime-wasi-io = "48"
 
+[dev-dependencies]
+# For ONE test: that calling `customize` from a tokio worker thread panics. That is a real
+# constraint on the dispatch and the doc comment used to say a `#[test]` fn could not observe
+# it, which was wrong -- a test can build its own runtime. An executable warning outlives a
+# written one: if someone swaps the sandbox to wasmtime-wasi's async bindings, this goes red and
+# the doc comment gets corrected with it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
 [lints]
 workspace = true

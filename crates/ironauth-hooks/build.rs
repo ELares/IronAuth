@@ -33,6 +33,7 @@ const GUESTS: &[(&str, &str)] = &[
     ("sleeper", "IRONAUTH_GUEST_SLEEPER"),
     ("instant_waiter", "IRONAUTH_GUEST_INSTANT_WAITER"),
     ("pollable_leak", "IRONAUTH_GUEST_POLLABLE_LEAK"),
+    ("poll_bomb", "IRONAUTH_GUEST_POLL_BOMB"),
     ("decliner", "IRONAUTH_GUEST_DECLINER"),
 ];
 

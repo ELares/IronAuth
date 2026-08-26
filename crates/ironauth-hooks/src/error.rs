@@ -164,3 +164,59 @@ impl std::error::Error for HookError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AbortKind, HookError};
+
+    /// Each constructor bins into its own kind.
+    ///
+    /// Unit tests rather than through the runtime, because `HookEngine::new` cannot be made to
+    /// fail on a supported platform: without these, reverting `from_engine` to `Invalid` --
+    /// exactly the defect the round-2 change fixed -- turns nothing red, and a failure policy
+    /// would disable a hook for "malformed bytes" when the runtime itself was unavailable.
+    #[test]
+    fn each_constructor_bins_into_its_own_kind() {
+        let message = || wasmtime::Error::msg("something went wrong");
+        assert_eq!(
+            HookError::from_engine(message()).abort_kind(),
+            Some(AbortKind::EngineUnavailable),
+            "a runtime that could not be built is not a hook outcome"
+        );
+        assert_eq!(
+            HookError::from_load(message()).abort_kind(),
+            Some(AbortKind::Invalid),
+            "bytes that are not a hook are not a capability refusal"
+        );
+        assert_eq!(
+            HookError::from_instantiate(message()).abort_kind(),
+            Some(AbortKind::Unlinkable),
+            "an instantiation failure with no trap is a capability refusal"
+        );
+        assert_eq!(
+            HookError::Declined("no".to_owned()).abort_kind(),
+            None,
+            "a decline is not an abort"
+        );
+    }
+
+    /// The three kinds render differently, so an audit line says which happened.
+    #[test]
+    fn the_kinds_do_not_read_alike() {
+        let message = || wasmtime::Error::msg("x");
+        let engine = HookError::from_engine(message()).to_string();
+        let load = HookError::from_load(message()).to_string();
+        let link = HookError::from_instantiate(message()).to_string();
+        assert_ne!(engine, load);
+        assert_ne!(load, link);
+        assert_ne!(engine, link);
+        assert!(
+            link.contains("capability"),
+            "a capability refusal must say so: {link}"
+        );
+        assert!(
+            !load.contains("capability"),
+            "a parse failure must NOT read as an attempted capability escape: {load}"
+        );
+    }
+}

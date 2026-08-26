@@ -168,6 +168,13 @@ pub struct Customization {
     pub id_token_claims: Vec<(String, String)>,
     /// The claims the hook wants in the access token.
     pub access_token_claims: Vec<(String, String)>,
+    /// What the HOST saw the hook do, as opposed to what the hook said about itself.
+    ///
+    /// Carried out of the invocation because a guest's own account of itself is not evidence: a
+    /// hook that reports it asked to sleep for thirty seconds and a hook that never asked are
+    /// indistinguishable from the claims alone. A failure policy that wants to disable a hook
+    /// which repeatedly tries to wait needs the host's number, not the guest's.
+    pub observed: crate::Observed,
 }
 
 impl LoadedHook {
@@ -182,9 +189,10 @@ impl LoadedHook {
     /// middle of a login.
     ///
     /// Measured: the same hook that returns in 1.16 ms under `spawn_blocking` panics at
-    /// `wasmtime-wasi/src/runtime.rs` and exits 101 when invoked from a `#[tokio::main]`
-    /// multi-thread main. A `#[test]` fn has no ambient runtime, so the suite in this crate
-    /// cannot see it, which is exactly why it is written here.
+    /// `wasmtime-wasi/src/runtime.rs` when invoked from a multi-thread runtime. It is not only
+    /// written here: `calling_a_hook_from_a_tokio_worker_panics_rather_than_working` builds a
+    /// runtime and asserts both halves, so this warning has an executable form that goes red if
+    /// the sandbox ever moves to the async bindings.
     ///
     /// **Call this from `tokio::task::spawn_blocking`** (or any thread with no ambient
     /// runtime). The dispatch that wires hooks into the token mint has to do that, and this is
@@ -237,6 +245,7 @@ impl LoadedHook {
             Ok(response) => Ok(Customization {
                 id_token_claims: from_wit(response.id_token_claims),
                 access_token_claims: from_wit(response.access_token_claims),
+                observed: store.data().observed(),
             }),
             Err(reason) => Err(HookError::Declined(reason)),
         }
