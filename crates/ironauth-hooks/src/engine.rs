@@ -62,7 +62,7 @@ impl HookEngine {
         config.consume_fuel(true);
         config.epoch_interruption(true);
         Ok(Self {
-            engine: Engine::new(&config).map_err(HookError::from_instantiate)?,
+            engine: Engine::new(&config).map_err(HookError::from_load)?,
         })
     }
 
@@ -77,7 +77,7 @@ impl HookEngine {
     pub fn compile(&self, wasm: &[u8]) -> Result<Vec<u8>, HookError> {
         self.engine
             .precompile_component(wasm)
-            .map_err(HookError::from_instantiate)
+            .map_err(HookError::from_load)
     }
 
     /// Load a hook straight from WebAssembly, compiling it now.
@@ -92,7 +92,7 @@ impl HookEngine {
     /// If the bytes are not a valid component, or if compilation fails.
     pub fn load(&self, wasm: &[u8]) -> Result<LoadedHook, HookError> {
         Ok(LoadedHook {
-            component: Component::new(&self.engine, wasm).map_err(HookError::from_instantiate)?,
+            component: Component::new(&self.engine, wasm).map_err(HookError::from_load)?,
         })
     }
 
@@ -119,7 +119,7 @@ impl HookEngine {
     pub unsafe fn load_precompiled(&self, artifact: &[u8]) -> Result<LoadedHook, HookError> {
         // SAFETY: delegated to this function's own contract, which the caller accepted.
         let component = unsafe { Component::deserialize(&self.engine, artifact) }
-            .map_err(HookError::from_instantiate)?;
+            .map_err(HookError::from_load)?;
         Ok(LoadedHook { component })
     }
 
@@ -145,6 +145,11 @@ impl HookEngine {
 }
 
 /// A hook that has been compiled and is ready to instantiate.
+///
+/// `Debug` is derived rather than omitted so a test can `expect_err` on a load, which is how
+/// the unloadable-bytes paths are covered at all. The component's own `Debug` is opaque, so
+/// this leaks nothing about a hook's contents.
+#[derive(Debug)]
 pub struct LoadedHook {
     component: Component,
 }
@@ -162,9 +167,11 @@ impl LoadedHook {
     /// Run the hook's `customize` export under `limits`.
     ///
     /// The returned claims have NOT been fenced. Every name here came from guest code and is
-    /// a request, not a decision; `ironauth-oidc::claims_mapping::filter_hook_claims` is what
-    /// turns it into one. Keeping those separate means the fence is a step somebody can see in
-    /// the caller rather than something this function is trusted to have remembered.
+    /// a request, not a decision. `ironauth_oidc::claims_mapping::filter_hook_claims` is what
+    /// turns it into one, and it refuses a reserved name, an untrimmed one, an over-long one,
+    /// and anything past its claim bound. Keeping the fence out of this crate is deliberate: it
+    /// makes filtering a step visible in the caller rather than something this function is
+    /// trusted to have done.
     ///
     /// # Errors
     ///

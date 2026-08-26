@@ -46,12 +46,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install musl target for the pinned toolchain
         run: rustup target add x86_64-unknown-linux-musl
-      - name: Install the WASM target for the pinned toolchain
-        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script, so
-        # any job that compiles the workspace needs the target. Added through rustup rather
-        # than the action's `targets:` input because rust-toolchain.toml pins the toolchain
-        # cargo actually uses, and the action only equips its own.
-        run: rustup target add wasm32-wasip2
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build static binary
@@ -103,12 +97,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install musl target for the pinned toolchain
         run: rustup target add x86_64-unknown-linux-musl
-      - name: Install the WASM target for the pinned toolchain
-        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script, so
-        # any job that compiles the workspace needs the target. Added through rustup rather
-        # than the action's `targets:` input because rust-toolchain.toml pins the toolchain
-        # cargo actually uses, and the action only equips its own.
-        run: rustup target add wasm32-wasip2
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build static binary

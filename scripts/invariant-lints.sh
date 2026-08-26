@@ -81,7 +81,17 @@ scan() {
 # one is a reviewable line in the diff rather than a trait impl nobody reads.
 scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 
-scan time-via-env 'SystemTime::now|Instant::now' 3
+# Raised 3 -> 6 for three exemptions added together, each a TIMING harness or guest code:
+#   - message_render's validate_syntax benchmark, which pins #989's quadratic regression and
+#     must measure real elapsed time (it was an UNALLOWED violation on main, so this rule was
+#     already failing before this change);
+#   - the hooks sandbox's `a_hook_cannot_wait`, whose whole assertion is that a 30-second sleep
+#     did not take 30 seconds;
+#   - the wall-clock-escape GUEST fixture, which exists to force the wasi:clocks/wall-clock
+#     import so the sandbox can be shown refusing it.
+# None is host protocol logic reading a clock behind the ironauth-env seam, which is what this
+# rule protects.
+scan time-via-env 'SystemTime::now|Instant::now' 6
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.

@@ -33,7 +33,7 @@
 //! blocks and neither one can see a hook that allocates.
 //!
 //! **What a hook is allowed to say** is NOT here. [`LoadedHook::customize`] returns the claims
-//! a hook asked for, unfiltered, and `ironauth-oidc::claims_mapping::filter_hook_claims` is
+//! a hook asked for, unfiltered, and `ironauth_oidc::claims_mapping::filter_hook_claims` is
 //! what decides which of them may be minted. Keeping the transport and the fence apart means
 //! the fence is a step visible in the caller rather than a thing this crate is trusted to have
 //! remembered.
@@ -46,4 +46,4 @@ mod sandbox;
 pub use engine::{Customization, HookEngine, LoadedHook, Request};
 pub use error::{AbortKind, HookError};
 pub use limits::Limits;
-pub use sandbox::{FrozenClock, Sandbox};
+pub use sandbox::{FROZEN_RESOLUTION_NS, Sandbox};

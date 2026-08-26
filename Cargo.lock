@@ -2052,8 +2052,6 @@ dependencies = [
 name = "ironauth-hooks"
 version = "0.1.0"
 dependencies = [
- "ironauth-store",
- "serde_json",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-io",

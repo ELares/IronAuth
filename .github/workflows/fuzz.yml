@@ -86,12 +86,6 @@ jobs:
       # sets RUSTUP_TOOLCHAIN to override the file (the same technique the msrv
       # lane uses); cargo-fuzz itself installs and builds fine on stable.
       - uses: dtolnay/rust-toolchain@nightly
-      - name: Install the WASM target for the pinned toolchain
-        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script, so
-        # any job that compiles the workspace needs the target. Added through rustup rather
-        # than the action's `targets:` input because rust-toolchain.toml pins the toolchain
-        # cargo actually uses, and the action only equips its own.
-        run: rustup target add wasm32-wasip2
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Run ${{ matrix.target }}

@@ -19,7 +19,7 @@
 //!
 //! # What is deliberately absent
 //!
-//! [`Sandbox::link`] adds thirteen WASI interfaces by hand rather than calling
+//! [`Sandbox::link`] adds fourteen WASI interfaces by hand rather than calling
 //! `wasmtime_wasi::p2::add_to_linker_sync`, and the reason is everything that call would have
 //! added. Absent, and absent on purpose:
 //!
@@ -67,11 +67,11 @@
 //! enforcement and is not. When a grant does arrive it belongs here, as an interface this
 //! function conditionally adds, so that the enforcement stays where the mechanism is.
 
-use wasmtime::component::{HasData, Linker, ResourceTable};
+use wasmtime::component::{HasData, Linker, Resource, ResourceTable};
 use wasmtime_wasi::cli::{WasiCli, WasiCliView as _};
-use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView as _};
 use wasmtime_wasi::p2::bindings::sync;
-use wasmtime_wasi::{HostMonotonicClock, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_io::poll::{DynPollable, Pollable, subscribe};
 
 /// Marker giving the `wasi:io` interfaces access to the resource table.
 ///
@@ -84,23 +84,73 @@ impl HasData for HasTable {
     type Data<'a> = &'a mut ResourceTable;
 }
 
-/// A monotonic clock that never advances.
+/// The resolution the frozen clock reports, in nanoseconds.
 ///
-/// See the module header: this is what `wasi:clocks/monotonic-clock` is bound to, because a
-/// std guest imports that interface unconditionally and cannot start without it.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FrozenClock;
+/// One nanosecond, the finest the interface can express. Reporting a coarse resolution would be
+/// a second, redundant story about why time is useless here; the honest statement is that the
+/// clock is fine-grained and simply never moves. It is deliberately NOT zero: a guest is free
+/// to divide by a resolution.
+pub const FROZEN_RESOLUTION_NS: u64 = 1;
 
-impl HostMonotonicClock for FrozenClock {
-    fn resolution(&self) -> u64 {
-        // One nanosecond, the finest the interface can express. Reporting a coarse resolution
-        // would be a second, redundant story about why time is useless here; the honest
-        // statement is that the clock is fine-grained and simply never moves.
-        1
+/// A pollable that is ready the moment it is asked.
+///
+/// This is what makes the frozen clock a real bound rather than a cosmetic one, and it closes
+/// what was a denial of service on the login path.
+///
+/// `wasi:clocks/monotonic-clock` has four functions, not two. `now` and `resolution` return
+/// numbers, and freezing those is easy. `subscribe-instant` and `subscribe-duration` return a
+/// POLLABLE, and `wasi:io/poll` blocks on it. Binding only the two number functions to a frozen
+/// clock leaves the other two backed by the host's real timer, and a guest whose body is
+/// `std::thread::sleep(Duration::from_secs(30))` then holds an IronAuth request thread for
+/// thirty seconds. None of the three bounds can stop it: fuel counts instructions and a
+/// sleeping guest executes none, the memory cap is irrelevant, and the epoch deadline is
+/// checked when wasm code runs, so it fires only once the host call returns, which is thirty
+/// seconds too late. A guest can do worse: `subscribe-duration(u64::MAX)` maps to a future that
+/// is never ready at all.
+///
+/// So the sandbox does not implement waiting. Both subscribe functions return this, and a hook
+/// that asks to wait is answered immediately. A guest that then busy-loops is executing
+/// instructions, which is precisely the thing fuel does bound.
+///
+/// The general rule this is one instance of: **no host function the sandbox links may block.**
+/// A blocking host function is invisible to all three limits, because all three are measured
+/// against a guest that is running.
+struct AlwaysReady;
+
+#[wasmtime_wasi::async_trait]
+impl Pollable for AlwaysReady {
+    async fn ready(&mut self) {}
+}
+
+/// The host state backing the frozen `wasi:clocks/monotonic-clock`.
+struct FrozenClockView<'a> {
+    table: &'a mut ResourceTable,
+}
+
+/// Marker giving the frozen clock access to the resource table.
+struct FrozenClocks;
+
+impl HasData for FrozenClocks {
+    type Data<'a> = FrozenClockView<'a>;
+}
+
+impl sync::clocks::monotonic_clock::Host for FrozenClockView<'_> {
+    fn now(&mut self) -> wasmtime::Result<u64> {
+        Ok(0)
     }
 
-    fn now(&self) -> u64 {
-        0
+    fn resolution(&mut self) -> wasmtime::Result<u64> {
+        Ok(FROZEN_RESOLUTION_NS)
+    }
+
+    fn subscribe_instant(&mut self, _when: u64) -> wasmtime::Result<Resource<DynPollable>> {
+        let handle = self.table.push(AlwaysReady)?;
+        subscribe(self.table, handle)
+    }
+
+    fn subscribe_duration(&mut self, _duration: u64) -> wasmtime::Result<Resource<DynPollable>> {
+        let handle = self.table.push(AlwaysReady)?;
+        subscribe(self.table, handle)
     }
 }
 
@@ -120,13 +170,28 @@ impl Sandbox {
     /// they are the second line and cost nothing.
     #[must_use]
     pub fn new(limits: &crate::Limits) -> Self {
-        let mut builder = WasiCtxBuilder::new();
-        builder.monotonic_clock(FrozenClock);
+        // Nothing is granted: no environment, no standard streams, no preopened directories,
+        // no network. The clock is not configured here either, because the sandbox's clock is
+        // not this context's clock: see `FrozenClockView`.
         Self {
-            ctx: builder.build(),
+            ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
+            // The memory cap alone bounds one linear memory, and a guest can multiply what it
+            // costs the HOST without ever exceeding it: many memories, a growing table, or a
+            // resource handle per host call. A measured example drove 137 MB of host heap under
+            // a 16 MiB ceiling by leaking pollables in a loop. Bounding the multipliers costs a
+            // single-module Rust hook nothing, because it needs exactly one of each.
             limits: wasmtime::StoreLimitsBuilder::new()
                 .memory_size(limits.memory_bytes)
+                // COUNTS are compilation details, not hook-facing limits: one component is
+                // several core instances and more than one table, so a count of 1 refuses an
+                // ordinary hook before it runs (measured: "table count too high at 2"). They
+                // are bounded generously, to stop a pathological module rather than to tune a
+                // hook. The SIZES below them are the levers that matter.
+                .memories(4)
+                .tables(8)
+                .table_elements(100_000)
+                .instances(64)
                 .build(),
         }
     }
@@ -141,7 +206,7 @@ impl Sandbox {
 
     /// Add exactly the host interfaces a hook may reach.
     ///
-    /// Thirteen `add_to_linker` calls, one per interface, rather than one call to
+    /// Fourteen `add_to_linker` calls, one per interface, rather than one call to
     /// `add_to_linker_sync`. The list is written out so that adding a capability is an edit
     /// somebody has to make and review, and so that the absence of sockets and filesystem is
     /// visible in the source rather than implied by a helper's contents.
@@ -163,7 +228,19 @@ impl Sandbox {
         sync::io::streams::add_to_linker::<Self, HasTable>(linker, |s: &mut Self| &mut s.table)?;
 
         // The single clock, frozen. wall-clock is NOT added.
-        sync::clocks::monotonic_clock::add_to_linker::<Self, WasiClocks>(linker, Self::clocks)?;
+        // The single clock, frozen in all FOUR of its functions. wall-clock is NOT added.
+        //
+        // Implemented here rather than routed to `wasmtime_wasi`'s, because that one builds its
+        // pollables from `tokio::time::Instant` and consults the configured
+        // `HostMonotonicClock` only for `now` and `resolution`. Handing it a frozen clock
+        // freezes the two functions that return numbers and leaves the two that return a
+        // pollable backed by real time, which is a sleep primitive. See `AlwaysReady`.
+        sync::clocks::monotonic_clock::add_to_linker::<Self, FrozenClocks>(
+            linker,
+            |s: &mut Self| FrozenClockView {
+                table: &mut s.table,
+            },
+        )?;
 
         // cli: exit, the environment (empty), the three standard streams (all closed), and
         // the terminal probes std calls during startup. None of them reaches anything.

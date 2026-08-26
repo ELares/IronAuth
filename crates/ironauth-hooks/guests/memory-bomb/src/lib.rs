@@ -14,23 +14,33 @@ struct Hook;
 /// observing a failure and pinning its cause.
 const APPETITE: usize = 32 << 20;
 
+/// Bytes per page touched, so the allocation is real rather than reserved.
+const PAGE: usize = 4096;
+
 impl Guest for Hook {
     fn customize(_req: Request) -> Result<Response, String> {
-        // Touched, not just reserved: an allocation the guest never writes to can be a
-        // bookkeeping entry that never grows linear memory, and would make the cap look
-        // enforced when nothing was allocated at all.
-        let mut held: Vec<u8> = Vec::with_capacity(APPETITE);
+        // `vec![0u8; APPETITE]` then a WRITE into each page. An earlier version of this fixture
+        // pushed one byte per page onto an empty Vec, which wrote 8 KiB at the head of the
+        // buffer and touched nothing else: deleting the loop entirely changed no test outcome,
+        // so the "touched, not just reserved" claim was a sentence with no mechanism under it.
+        //
+        // It matters because a reservation an allocator never writes to can be bookkeeping that
+        // never grows linear memory, which would make the cap look enforced while nothing was
+        // allocated at all.
+        let mut held: Vec<u8> = vec![0u8; APPETITE];
+        let mut touched: usize = 0;
         let mut index = 0;
         while index < APPETITE {
-            held.push((index % 251) as u8);
-            index += 4096;
+            held[index] = (index % 251) as u8;
+            touched += 1;
+            index += PAGE;
         }
         std::hint::black_box(&held);
         Ok(Response {
             id_token_claims: vec![],
             access_token_claims: vec![Claim {
-                name: "allocated".to_string(),
-                value_json: APPETITE.to_string(),
+                name: "pages_touched".to_string(),
+                value_json: touched.to_string(),
             }],
         })
     }

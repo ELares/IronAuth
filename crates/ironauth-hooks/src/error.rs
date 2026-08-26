@@ -39,6 +39,14 @@ pub enum AbortKind {
     /// a DEPLOYMENT error rather than a runtime one, and it is the same answer every time, so a
     /// failure policy that retries is retrying something that cannot change.
     Unlinkable,
+    /// The bytes are not a hook this deployment can run.
+    ///
+    /// A truncated upload, something that is not WebAssembly at all, or a precompiled artifact
+    /// from a different engine. Distinct from [`Self::Unlinkable`] because the two read very
+    /// differently in an audit log: "asked for a capability it was not granted" describes an
+    /// attempted capability escape, and reporting a mistyped upload that way would put an
+    /// accusation in the record where a parse error belongs.
+    Invalid,
     /// The hook exhausted its instruction budget.
     ///
     /// Deterministic: the same hook on the same input exhausts the same budget every time. A
@@ -75,12 +83,32 @@ impl HookError {
 
     /// Classify a wasmtime error from instantiation.
     ///
-    /// Everything that fails here failed before guest code ran, which is what
-    /// [`AbortKind::Unlinkable`] means. Decided by the call site rather than by inspecting the
-    /// message, so a change to wasmtime's wording cannot silently reclassify it.
+    /// The call site says the failure happened before guest code ran, but it does NOT say why,
+    /// and a deadline can expire during instantiation: a component that takes longer to
+    /// instantiate than its epoch allows raises `Trap::Interrupt` here, not on the call path.
+    /// Binning that as [`AbortKind::Unlinkable`] would tell a failure policy that a hook asked
+    /// for a capability it was not granted, which is both wrong and unfixable by the operator
+    /// it is reported to. So the trap is consulted first and the call site only decides what is
+    /// left.
     pub(crate) fn from_instantiate(error: wasmtime::Error) -> Self {
+        let kind = match error.downcast_ref::<wasmtime::Trap>() {
+            Some(wasmtime::Trap::OutOfFuel) => AbortKind::OutOfFuel,
+            Some(wasmtime::Trap::Interrupt) => AbortKind::DeadlineExceeded,
+            _ => AbortKind::Unlinkable,
+        };
         Self::Aborted {
-            kind: AbortKind::Unlinkable,
+            kind,
+            source: error,
+        }
+    }
+
+    /// Classify a wasmtime error from compiling or loading bytes.
+    ///
+    /// Separate from [`Self::from_instantiate`] because nothing on this path is about
+    /// capabilities: the bytes either are a component this engine can run or they are not.
+    pub(crate) fn from_load(error: wasmtime::Error) -> Self {
+        Self::Aborted {
+            kind: AbortKind::Invalid,
             source: error,
         }
     }
@@ -101,6 +129,7 @@ impl core::fmt::Display for HookError {
             Self::Aborted { kind, source } => {
                 let what = match kind {
                     AbortKind::Unlinkable => "asked for a capability it was not granted",
+                    AbortKind::Invalid => "could not be loaded",
                     AbortKind::OutOfFuel => "exhausted its fuel",
                     AbortKind::DeadlineExceeded => "passed its deadline",
                     AbortKind::Trapped => "trapped",

@@ -22,8 +22,9 @@ package ironauth:hooks@0.1.0;
 /// as text and is parsed on each side against the one schema that governs it.
 interface types {
   record claim {
-    /// The claim name. The host fences reserved names on the way back in; see
-    /// `ironauth-oidc::claims_mapping::filter_hook_claims`.
+    /// The claim name. The host fences reserved names on the way back in, in
+    /// `ironauth-oidc::claims_mapping::filter_hook_claims`. This crate carries the transport,
+    /// never the decision.
     name: string,
     /// The claim value, JSON-encoded. A hook that emits text which is not valid JSON has
     /// its claim refused rather than folded in as a string.

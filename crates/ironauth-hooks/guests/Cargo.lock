@@ -22,6 +22,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "echo-request"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -32,6 +39,13 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "fs-escape"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
 
 [[package]]
 name = "fuel-bomb"
@@ -261,6 +275,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "random-escape"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -313,6 +334,13 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "sleeper"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
 
 [[package]]
 name = "syn"

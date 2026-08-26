@@ -25,8 +25,12 @@ const GUESTS: &[(&str, &str)] = &[
     ("fuel_bomb", "IRONAUTH_GUEST_FUEL_BOMB"),
     ("memory_bomb", "IRONAUTH_GUEST_MEMORY_BOMB"),
     ("net_escape", "IRONAUTH_GUEST_NET_ESCAPE"),
+    ("random_escape", "IRONAUTH_GUEST_RANDOM_ESCAPE"),
+    ("fs_escape", "IRONAUTH_GUEST_FS_ESCAPE"),
+    ("echo_request", "IRONAUTH_GUEST_ECHO_REQUEST"),
     ("wall_clock_escape", "IRONAUTH_GUEST_WALL_CLOCK_ESCAPE"),
     ("monotonic_reader", "IRONAUTH_GUEST_MONOTONIC_READER"),
+    ("sleeper", "IRONAUTH_GUEST_SLEEPER"),
     ("decliner", "IRONAUTH_GUEST_DECLINER"),
 ];
 

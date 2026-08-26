@@ -68,9 +68,24 @@ allow() {
 # A rustdoc link counts, as does a mention in a test. That is deliberate and long-standing:
 # this scan asks "does anything in the tree name this module", not "is it on a request path",
 # and narrowing it to call sites would need a parser rather than a grep.
+#
+# Three kinds of match are excluded, each because it is not a reference to THIS module:
+#
+#   - a line whose match sits in a `//` comment. A doc comment naming a module is prose, and
+#     counting it means documenting a dormant module is what makes it look wired.
+#   - anything under a `guests/` directory. Those are separate cargo workspaces of WASM guest
+#     fixtures, compiled for another target and linked into nothing here.
+#   - a path rooted at `exports::`, which is wit-bindgen's generated namespace. This scan
+#     matches on a NAME, so `exports::ironauth::hooks::token_customize::Request` reads as a
+#     reference to `ironauth-store/token_customize`; they are unrelated modules that happen to
+#     share a word. A name-keyed scan cannot tell them apart, so the generated namespace is
+#     excluded by hand.
 refs_for() {
   count="$( { grep -rn --include='*.rs' -e "${1}::" crates/ 2>/dev/null \
-    | grep -v "/${1}\.rs:" | wc -l; } || true )"
+    | grep -v "/${1}\.rs:" \
+    | grep -v '/guests/' \
+    | grep -v 'exports::' \
+    | grep -vE '^[^:]*:[0-9]+:[[:space:]]*(//|/\*)' | wc -l; } || true )"
   count="$(echo "$count" | tr -d ' ')"
   [ -n "$count" ] || count=0
   echo "$count"
