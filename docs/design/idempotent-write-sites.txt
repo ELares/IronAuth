@@ -19,6 +19,7 @@ crates/ironauth-admin/src/bans.rs:lift_ban:1
 crates/ironauth-admin/src/bans.rs:resolve_scope:0
 crates/ironauth-admin/src/brand_assets.rs:resolve_scope:0
 crates/ironauth-admin/src/brands.rs:resolve_scope:0
+crates/ironauth-admin/src/claims_mappings.rs:resolve_scope:0
 crates/ironauth-admin/src/client_admin_grants.rs:resolve_scope:0
 crates/ironauth-admin/src/connectors.rs:create_connector:1
 crates/ironauth-admin/src/connectors.rs:refuse_admin_only_claim_mapping:0

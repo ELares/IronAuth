@@ -1804,6 +1804,270 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping": {
+      "get": {
+        "tags": [
+          "claims-mappings"
+        ],
+        "summary": "Get a per-environment, per-client declarative claim mapping.",
+        "operationId": "getClaimsMapping",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the rules shape",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The claim mapping",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaimsMappingView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, malformed client id, or no mapping installed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "claims-mappings"
+        ],
+        "summary": "Set (create or overwrite) a per-environment, per-client declarative claim mapping.",
+        "operationId": "setClaimsMapping",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the rules shape",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetClaimsMappingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaimsMappingView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A rule that is unreadable or that writes a protected claim",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or malformed client id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "claims-mappings"
+        ],
+        "summary": "Delete a per-environment, per-client declarative claim mapping.",
+        "operationId": "deleteClaimsMapping",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the rules shape",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, malformed client id, or no mapping installed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form": {
       "get": {
         "tags": [
@@ -24714,6 +24978,24 @@
           }
         }
       },
+      "ClaimsMappingView": {
+        "type": "object",
+        "description": "A per-environment, per-client declarative claim mapping, as returned by the management API\n(issue #113).\n\nNo secret SLOT: a rule names claim names, a static value, and a token placement, and none of\nthose is a credential field or a user reference.\n\nNot \"no secret is possible\", which an earlier version said. A `static` rule's value is\narbitrary operator-supplied JSON and this view returns it verbatim to any `management.read`\ncredential -- so an operator who puts a secret in one has put it somewhere a reader can see\nit. What the type guarantees is that nothing here is a secret by DESIGN; what an operator\nwrites into a free-form value is theirs.",
+        "required": [
+          "client_id",
+          "rules"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The authorize client id whose tokens these rules shape (the per-environment natural key)."
+          },
+          "rules": {
+            "type": "object",
+            "description": "The ordered rule list, as stored."
+          }
+        }
+      },
       "ClientAdminConsentView": {
         "type": "object",
         "description": "A per-environment, per-client admin consent pre-authorization, as returned by the management\nAPI (issue #88, PR 4).",
@@ -30117,6 +30399,19 @@
           "tokens_dark": {
             "type": "object",
             "description": "The TYPED dark-mode token variants, or absent to reuse the neutral built-in dark block."
+          }
+        }
+      },
+      "SetClaimsMappingRequest": {
+        "type": "object",
+        "description": "The body to set a per-environment, per-client declarative claim mapping (issue #113).\n\nThe `rules` document is the ordered rule list, exactly as `ironauth-oidc`'s\n`claims_mapping::MappingRule` defines it: an array of objects tagged by `kind`.\n\nCarried as a raw JSON value rather than a typed list, and that is deliberate rather than\nlaziness. `ironauth-admin` would otherwise need its own definition of a rule, which is a\nSECOND definition of one wire format -- the drift criterion 5 exists to prevent. The handler\nparses it against the one definition that governs it and refuses anything else with a loud\n400 naming what it could not read.",
+        "required": [
+          "rules"
+        ],
+        "properties": {
+          "rules": {
+            "type": "object",
+            "description": "The ordered rule list."
           }
         }
       },

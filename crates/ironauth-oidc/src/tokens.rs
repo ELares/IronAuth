@@ -568,7 +568,12 @@ pub struct MintRequest<'a> {
     /// [`Self::extra_claims`] is. The fence is at the CHANNEL, not only at whoever writes into
     /// it: the hook's own fence in `claims_mapping` is the first line, and this one holds for
     /// any future writer that has not been invented yet.
-    pub access_extra_claims: &'a serde_json::Map<String, serde_json::Value>,
+    /// Typed, and that is the fence. A [`MappedAccessClaims`] can only come from
+    /// `claims_mapping_at_issuance::apply_to`, so a door that mints a token for a client cannot
+    /// populate this field without resolving that client's mapping -- including a door nobody
+    /// has written yet. Review measured why a plain map was not enough: emptying the resolver
+    /// call at three of the six existing doors left the whole suite green.
+    pub access_extra_claims: &'a crate::claims_mapping_at_issuance::MappedAccessClaims,
     /// The per-client ID-token signing key (issue #30): the environment key of the
     /// algorithm this client negotiated as its `id_token_signed_response_alg` at
     /// dynamic registration. When [`Some`], the ID token (ONLY the ID token, never
@@ -901,7 +906,7 @@ pub(crate) fn build_access_token_claims(
     // thing standing between this bag and a protocol claim, and a fence plus an ordering is
     // two reasons where one would do.
     if let serde_json::Value::Object(object) = &mut claims {
-        for (name, value) in request.access_extra_claims {
+        for (name, value) in request.access_extra_claims.as_map() {
             if PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name.as_str()) {
                 continue;
             }
@@ -909,19 +914,6 @@ pub(crate) fn build_access_token_claims(
         }
     }
     claims
-}
-
-/// An empty claim bag, for a mint that contributes none.
-///
-/// A shared `'static` rather than a temporary at each call site, because
-/// [`MintRequest`] holds borrows and every site would otherwise need its own binding to keep
-/// alive. Every path but the pre-token hook's passes this for
-/// [`MintRequest::access_extra_claims`].
-#[must_use]
-pub fn no_extra_claims() -> &'static serde_json::Map<String, serde_json::Value> {
-    use std::sync::OnceLock;
-    static EMPTY: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
-    EMPTY.get_or_init(serde_json::Map::new)
 }
 
 /// Everything a client-credentials (M2M) access token needs (issue #23). Distinct
@@ -1565,7 +1557,9 @@ mod access_extra_claims_tests {
             ("region", json!("eu")),
         ]);
         let mut req = super::tests::request("usr_abc", "pwd");
-        req.access_extra_claims = &extra;
+        let extra_mapped =
+            crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(extra.clone());
+        req.access_extra_claims = &extra_mapped;
         let claims = build_access_token_claims(
             &req,
             1,
@@ -1596,7 +1590,9 @@ mod access_extra_claims_tests {
         let access_only = bag(&[("access_side", json!(1))]);
         let mut req = super::tests::request("usr_abc", "pwd");
         req.extra_claims = &id_only;
-        req.access_extra_claims = &access_only;
+        let access_only_mapped =
+            crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(access_only.clone());
+        req.access_extra_claims = &access_only_mapped;
 
         let id = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
         assert_eq!(id["id_side"], 1);
@@ -1632,7 +1628,9 @@ mod access_extra_claims_tests {
             let mut req = super::tests::request("usr_abc", "pwd");
             req.org_id = None;
             req.confirmation = None;
-            req.access_extra_claims = &extra;
+            let extra_mapped =
+                crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(extra.clone());
+            req.access_extra_claims = &extra_mapped;
             let claims = build_access_token_claims(
                 &req,
                 1,
@@ -1764,7 +1762,9 @@ mod access_extra_claims_tests {
             ("iss", json!("https://evil.test")),
         ]);
         let mut req = super::tests::request("usr_abc", "pwd");
-        req.access_extra_claims = &extra;
+        let extra_mapped =
+            crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(extra.clone());
+        req.access_extra_claims = &extra_mapped;
         let claims = build_access_token_claims(
             &req,
             1,
@@ -1836,7 +1836,9 @@ mod access_extra_claims_tests {
         let extra = bag(&[("account_tier", json!("g".repeat(64)))]);
         let mut with_extra = super::tests::request("usr_abc", "pwd");
         with_extra.permissions = Some(&permissions);
-        with_extra.access_extra_claims = &extra;
+        let extra_mapped =
+            crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(extra.clone());
+        with_extra.access_extra_claims = &extra_mapped;
         let build_extra = |permission: PermissionClaim<'_>| {
             build_access_token_claims(&with_extra, 1, 2, "tok", &audience, permission)
         };
@@ -1866,7 +1868,9 @@ mod access_extra_claims_tests {
         let extra = bag(&[("account_tier", json!("g".repeat(128)))]);
         let mut req = super::tests::request("usr_abc", "pwd");
         req.permissions = Some(&permissions);
-        req.access_extra_claims = &extra;
+        let extra_mapped =
+            crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(extra.clone());
+        req.access_extra_claims = &extra_mapped;
 
         let header = b"header";
         let signature_len = 64;
@@ -2022,7 +2026,9 @@ mod access_extra_claims_tests {
         let extra = bag(&[("account_tier", json!("gold"))]);
         let mut req = super::tests::request("usr_abc", "pwd");
         req.permissions = Some(&permissions);
-        req.access_extra_claims = &extra;
+        let extra_mapped =
+            crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(extra.clone());
+        req.access_extra_claims = &extra_mapped;
 
         let header = b"header";
         let signature_len = 64;
@@ -2063,6 +2069,17 @@ mod tests {
         EMPTY.get_or_init(serde_json::Map::new)
     }
 
+    /// The same, for the typed access-token channel. A shared `'static` for the same reason:
+    /// `MintRequest` holds borrows, so a temporary at each call site would not outlive it.
+    fn empty_mapped_extra() -> &'static crate::claims_mapping_at_issuance::MappedAccessClaims {
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<crate::claims_mapping_at_issuance::MappedAccessClaims> =
+            OnceLock::new();
+        EMPTY.get_or_init(|| {
+            crate::claims_mapping_at_issuance::MappedAccessClaims::for_test(serde_json::Map::new())
+        })
+    }
+
     /// A minimal request over a throwaway scope, for the pure claim builder.
     /// `pub(super)` so the sibling `access_extra_claims_tests` module can build the same
     /// request these tests do, rather than keeping a second copy that could drift from it.
@@ -2086,7 +2103,7 @@ mod tests {
             at_hash: None,
             c_hash: None,
             extra_claims: empty_extra(),
-            access_extra_claims: empty_extra(),
+            access_extra_claims: empty_mapped_extra(),
             id_token_signer: None,
             confirmation: None,
         }

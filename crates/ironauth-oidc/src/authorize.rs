@@ -1366,11 +1366,28 @@ async fn mint_front_channel_id_token(
     // so they MUST be emitted into the ID token itself. The HYBRID flow issues a
     // code (hence an access token at redemption), so its front-channel ID token
     // stays lean with the authoritative claims served from `UserInfo`.
-    let extra_claims = if response_type.issues_code() {
+    let mut extra_claims = if response_type.issues_code() {
         serde_json::Map::new()
     } else {
         front_channel_id_token_claims(state, scope, resolved).await
     };
+    // The client's declarative mapping (issue #113 criterion 4). It has to reach the FRONT
+    // CHANNEL too: an operator whose mapping filters `groups` means the ID token, and the
+    // implicit flow's ID token is the one that carries the scope-derived claims directly
+    // (OIDC Core 5.4) rather than deferring them to UserInfo. A mapping that shaped only the
+    // token endpoint would leave the flow that emits the most claims unshaped.
+    //
+    // A fault is `Err(())`, which this function's caller turns into a refused authorization.
+    // Failing closed here matches the token endpoint for the reason `claims_mapping_at_issuance`
+    // gives: a mapping can REMOVE a claim, so ignoring one over-claims.
+    let access_extra_claims = crate::claims_mapping_at_issuance::apply_to(
+        state.store(),
+        scope,
+        &client_id_str,
+        &mut extra_claims,
+    )
+    .await
+    .map_err(|_| ())?;
     let request = MintRequest {
         // From the SESSION, never the request (issue #101), so an implicit or hybrid ID
         // token names the impersonator exactly when the code-exchange path would.
@@ -1414,8 +1431,10 @@ async fn mint_front_channel_id_token(
         // The front-channel authorize response mints no DPoP-bound access token here
         // (DPoP binds at the token endpoint, issue #368): a plain token.
         confirmation: None,
-        // The pre-token hook is the only writer; every other path contributes none.
-        access_extra_claims: crate::tokens::no_extra_claims(),
+        // The client's declarative mapping (issue #113), resolved above. Inert on this path,
+        // which mints no access token, and passed anyway so the mapping's answer is not
+        // silently discarded by the one caller that happens not to need half of it.
+        access_extra_claims: &access_extra_claims,
     };
     tokens::mint_id_token(state, signer, entry.policy(), &request).map(|(id_token, _jti)| id_token)
 }

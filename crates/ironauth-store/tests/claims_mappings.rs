@@ -376,7 +376,7 @@ async fn the_row_level_policy_refuses_a_raw_read_from_another_scope() {
     );
 }
 
-/// The DATA plane cannot write a mapping, and the control plane cannot delete one.
+/// The DATA plane cannot write a mapping, and the CONTROL plane owns its whole lifecycle.
 ///
 /// Both are stated in the migration and neither was attempted by any test: widening the
 /// data-plane grant to INSERT and UPDATE -- letting the plane that mints tokens rewrite the
@@ -419,17 +419,15 @@ async fn the_grant_split_is_what_the_migration_says_it_is() {
             .await
             .expect("pin scope");
     }
-    let deleted = sqlx::query("DELETE FROM claims_mappings")
+    // The control plane MAY delete now: 0159 withheld the grant saying "the operation does not
+    // exist yet", and 0161 grants it because `ActingClaimsMappingRepo::delete` is that
+    // operation. Asserted rather than dropped, because the split is what is under test and
+    // "control may delete" is half of it -- the other half is the data plane, three statements
+    // above, which may not.
+    sqlx::query("DELETE FROM claims_mappings")
         .execute(&mut *control)
-        .await;
-    let message = deleted
-        .expect_err("no DELETE grant exists yet, by design")
-        .to_string();
-    assert!(
-        message.contains("permission denied"),
-        "removing a mapping is an operation that has no caller yet, so the privilege must not \
-         be held: {message}"
-    );
+        .await
+        .expect("the control plane owns this table's lifecycle, including removal");
 }
 
 /// A write is AUDITED, and the audit names the client whose tokens changed shape.
@@ -738,35 +736,80 @@ async fn the_write_policy_refuses_a_row_addressed_to_another_scope() {
     }
 }
 
-/// The data plane holds NO privilege on this table at all, not even SELECT.
+/// The data plane holds SELECT and NOTHING ELSE.
 ///
-/// The migration says the reader "arrives with the mint-side reader" and that "a privilege held
-/// by nobody is one an attacker inherits for free". The grant test above only attempts an
-/// INSERT, so ADDING `GRANT SELECT ... TO ironauth_app` -- handing the data plane the read this
-/// file explicitly withholds -- left the whole suite green. A withheld privilege that no test
-/// attempts is indistinguishable from one that was quietly granted.
+/// Migration 0159 withheld the read entirely, saying it "arrives with the mint-side reader".
+/// That reader is `claims_mapping_at_issuance::resolve`, and 0160 grants exactly the SELECT it
+/// needs -- so this test now asserts the grant that exists rather than the one that did not.
+///
+/// The half worth keeping is the WRITE half, and it is the half the original defect was about:
+/// the grant test above attempts only an INSERT on the data plane, so a widened grant elsewhere
+/// was invisible. A data plane that could INSERT or UPDATE here could write itself a mapping and
+/// then honour it, which is a privilege escalation with no audit trail -- `claims_mapping.set`
+/// is written by the control plane inside the audited transaction, and nothing on this side can
+/// reach it.
 #[tokio::test]
-async fn the_data_plane_cannot_even_read_a_mapping_yet() {
+async fn the_data_plane_may_read_a_mapping_and_may_not_change_one() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
+    let client = ClientId::generate(&env, &scope);
 
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .claims_mappings()
+        .set(&env, &client, RULES)
+        .await
+        .expect("write on the control plane");
+
+    // READ: the issuance path's grant, pinned to the scope the policy admits.
     let mut app = db.app_pool().acquire().await.expect("acquire app");
-    let refused = sqlx::query("SELECT client_id FROM claims_mappings")
+    for (setting, value) in [
+        ("ironauth.tenant_id", scope.tenant().to_string()),
+        ("ironauth.environment_id", scope.environment().to_string()),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, false)")
+            .bind(setting)
+            .bind(value)
+            .execute(&mut *app)
+            .await
+            .expect("pin scope");
+    }
+    let rows = sqlx::query("SELECT client_id FROM claims_mappings")
         .fetch_all(&mut *app)
-        .await;
-    let error = refused.expect_err("the data plane holds no SELECT on this table yet");
+        .await
+        .expect("the data plane reads mappings: every token issuance does");
     assert_eq!(
-        error
-            .as_database_error()
-            .and_then(sqlx::error::DatabaseError::code)
-            .as_deref(),
-        Some("42501"),
-        "the refusal must be a GRANT refusal (42501). An empty result set would ALSO look like \
-         isolation, and would still mean the privilege had been handed over: {error}"
+        rows.len(),
+        1,
+        "and it reads the one this scope holds, so the grant is exercised rather than merely \
+         present"
     );
-    // Named so the scope seed is not mistaken for decoration: the table exists and is empty for
-    // this scope, which is exactly the state where a missing grant and a working policy look
-    // the same from the outside.
-    let _ = scope;
+
+    // WRITE: refused, on every verb, by the GRANT rather than by the policy.
+    for statement in [
+        "INSERT INTO claims_mappings (tenant_id, environment_id, client_id, rules) \
+         VALUES ($1, $2, 'cli_x', '[]'::jsonb)",
+        "UPDATE claims_mappings SET rules = '[]'::jsonb \
+         WHERE tenant_id = $1 AND environment_id = $2",
+        "DELETE FROM claims_mappings WHERE tenant_id = $1 AND environment_id = $2",
+    ] {
+        let refused = sqlx::query(statement)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .execute(&mut *app)
+            .await;
+        let error = refused.expect_err("the data plane must not change a mapping");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("42501"),
+            "the refusal must be a GRANT refusal (42501), not a policy one: the plane that \
+             mints tokens must not be able to change the shape of the tokens it mints. \
+             Statement: {statement}, error: {error}"
+        );
+    }
 }

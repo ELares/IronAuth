@@ -32321,6 +32321,155 @@ impl ActingClaimsMappingRepo<'_> {
         )
         .await
     }
+
+    /// As [`Self::set`], additionally enqueueing `event` in the SAME transaction (issue #108).
+    ///
+    /// Separate rather than an extra parameter on `set`, matching `signup_forms`: the plain
+    /// form has callers that emit nothing, and threading `None` through them would make every
+    /// one of them state a decision it does not have.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        rules_json: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client_id = client.to_string();
+        let rules = rules_json.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClaimsMappingSet,
+                target: client,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO claims_mappings \
+                     (tenant_id, environment_id, client_id, rules) \
+                     VALUES ($1, $2, $3, $4::jsonb) \
+                     ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE \
+                     SET rules = EXCLUDED.rules, updated_at = now()",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&rules)
+                .execute(&mut **tx)
+                .await?;
+                // In the upsert's transaction: never tell a consumer to refetch a write that
+                // rolled back.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Delete this client's mapping and audit `claims_mapping.delete` in the same transaction.
+    ///
+    /// Deleting a mapping RESTORES THE UNMAPPED TOKEN, in both directions: claims the mapping
+    /// filtered out come back to the ID token, and a claim it had PLACED in the access token
+    /// stops reaching one. That is why it is audited, and why the audit is not optional.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope or has no mapping;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client_id = client.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClaimsMappingDelete,
+                target: client,
+            },
+            async move |tx| {
+                let removed = sqlx::query(
+                    "DELETE FROM claims_mappings \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .execute(&mut **tx)
+                .await?;
+                // NOT FOUND rather than a silent success. Reporting success for a client with no
+                // mapping tells an operator their change took effect when there was nothing to
+                // change, and it turns the endpoint into a probe for which clients have one.
+                if removed.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Audit `claims_mapping.refused` for a rule set the write path REJECTED.
+    ///
+    /// Issue #113 criterion 5 asks that attempts to override a protected claim are "rejected AND
+    /// AUDITED". The rejection happens before any write, so there is no transaction to ride and
+    /// this is an audit row on its own -- which is the point: a refusal nobody can see afterwards
+    /// is indistinguishable from an attempt that was never made.
+    ///
+    /// `reason` is a short machine-stable token, never the document. A refused rule set is
+    /// precisely the thing not to copy onto an audit stream.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn record_refusal(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let detail = serde_json::json!({ "reason": reason }).to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope: self.scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClaimsMappingRefused,
+                target: client,
+            },
+            async move |_tx| Ok(()),
+            false,
+            Some(detail.as_str()),
+        )
+        .await
+    }
 }
 
 /// The mutating per-environment, per-client signup form repository for one scope and actor (issue

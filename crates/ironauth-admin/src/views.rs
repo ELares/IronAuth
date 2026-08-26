@@ -1890,6 +1890,43 @@ pub struct SignupFormView {
     pub fields: Vec<SignupFormFieldView>,
 }
 
+/// The body to set a per-environment, per-client declarative claim mapping (issue #113).
+///
+/// The `rules` document is the ordered rule list, exactly as `ironauth-oidc`'s
+/// `claims_mapping::MappingRule` defines it: an array of objects tagged by `kind`.
+///
+/// Carried as a raw JSON value rather than a typed list, and that is deliberate rather than
+/// laziness. `ironauth-admin` would otherwise need its own definition of a rule, which is a
+/// SECOND definition of one wire format -- the drift criterion 5 exists to prevent. The handler
+/// parses it against the one definition that governs it and refuses anything else with a loud
+/// 400 naming what it could not read.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetClaimsMappingRequest {
+    /// The ordered rule list.
+    #[schema(value_type = Object)]
+    pub rules: serde_json::Value,
+}
+
+/// A per-environment, per-client declarative claim mapping, as returned by the management API
+/// (issue #113).
+///
+/// No secret SLOT: a rule names claim names, a static value, and a token placement, and none of
+/// those is a credential field or a user reference.
+///
+/// Not "no secret is possible", which an earlier version said. A `static` rule's value is
+/// arbitrary operator-supplied JSON and this view returns it verbatim to any `management.read`
+/// credential -- so an operator who puts a secret in one has put it somewhere a reader can see
+/// it. What the type guarantees is that nothing here is a secret by DESIGN; what an operator
+/// writes into a free-form value is theirs.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClaimsMappingView {
+    /// The authorize client id whose tokens these rules shape (the per-environment natural key).
+    pub client_id: String,
+    /// The ordered rule list, as stored.
+    #[schema(value_type = Object)]
+    pub rules: serde_json::Value,
+}
+
 /// The body to create a new version of a custom journey (issue #92, PR 5).
 ///
 /// The `artifact` is the canonical journey document. It is validated LOAD-VALID before the write

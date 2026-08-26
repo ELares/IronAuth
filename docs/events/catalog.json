@@ -313,6 +313,42 @@
       "type": "brand_asset.set"
     },
     {
+      "domain": "claims_mapping",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "claims_mapping.deleted"
+    },
+    {
+      "domain": "claims_mapping",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "claims_mapping.set"
+    },
+    {
       "domain": "client",
       "payload_schema": {
         "additionalProperties": false,

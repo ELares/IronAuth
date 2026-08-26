@@ -3388,3 +3388,124 @@ async fn a_resend_without_an_idempotency_key_is_refused() {
         "with a key it reaches the handler: {body}"
     );
 }
+
+/// `management.write_config` is required AND sufficient for a claim-mapping write (#113).
+///
+/// Both directions, for the reason the message-status test gives: refusal-only passes against an
+/// endpoint that refuses everybody, and success-only passes against one with no gate.
+///
+/// The allowed half lands on 404 because the client id names no client in this scope, and that
+/// is exactly what is wanted: the question here is WHICH permission reaches the handler, and 403
+/// versus 404 answers it. What the endpoint then does with a real client is covered by its own
+/// suite.
+#[tokio::test]
+async fn write_config_is_required_and_sufficient_for_a_claims_mapping_write() {
+    let h = Harness::start(63).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-mapping").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/claims-mapping"
+    );
+    let body = r#"{"rules":[]}"#;
+
+    // A credential restricted to a DIFFERENT permission, not to none: an empty set could be
+    // refused by an earlier check and would say nothing about which permission this requires.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.put_as(&path, &secret, body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not shape a client's tokens: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.put_as(&path, &secret, body).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_config credential must reach the handler, which then reports the absent \
+         client: {response}"
+    );
+}
+
+/// `management.write_config` is required AND sufficient for a claim-mapping DELETE (#113).
+///
+/// Classified the same as the write, and pinned separately, because the reason is easy to get
+/// wrong in both directions. Deleting a mapping RESTORES THE UNMAPPED TOKEN: claims the mapping
+/// filtered out come back to the ID token, and a claim it had PLACED in the access token stops
+/// reaching one. So a delete is not "a removal of authority" -- it is a change to the shape of
+/// every token this client is issued, which is the same thing the write is.
+#[tokio::test]
+async fn write_config_is_required_and_sufficient_for_a_claims_mapping_delete() {
+    let h = Harness::start(64).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-mapping-delete").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/claims-mapping"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.delete_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not remove a mapping: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.delete_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_config credential must reach the handler: {response}"
+    );
+}
+
+/// `management.read` is required AND sufficient for a claim-mapping read (#113).
+#[tokio::test]
+async fn read_is_required_and_sufficient_for_a_claims_mapping_read() {
+    let h = Harness::start(65).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-mapping-read").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/claims-mapping"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential must not read a mapping: {response}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a read credential must reach the handler, which then reports the absent client: \
+         {response}"
+    );
+}

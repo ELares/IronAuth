@@ -211,6 +211,16 @@ required-features = ["testing"]
 # Per-environment, per-client signup form management endpoint (issue #87): the operator
 # set / get / delete lifecycle, and the fail-fast write validation (an unknown step and a
 # field referencing a trait with no active schema are precise 400s). Needs a real database.
+# Declarative claim mappings over HTTP (issue #113): the set / get / delete lifecycle with a
+# REAL rule set, and the two things nothing else can measure -- the write is validated against
+# the protected-claim fence, and every refusal is AUDITED with a machine-stable reason and
+# without the refused document. Every prior test on this route posted an empty rule list, which
+# parses and validates, so both refusal branches were unreachable.
+[[test]]
+name = "claims_mappings"
+path = "tests/claims_mappings.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "signup_forms"
 path = "tests/signup_forms.rs"

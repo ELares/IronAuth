@@ -405,6 +405,16 @@ name = "trait_login"
 path = "tests/trait_login.rs"
 required-features = ["testing"]
 
+# A stored declarative claim mapping SHAPES A REAL TOKEN (issue #113 criterion 4): a static claim
+# reaches both tokens, `place` moves one into one token and out of the other, `rename` and
+# `filter_list` act on a claim the SERVER contributed, a client with no mapping issues exactly
+# what it did before, the mapping applies on REFRESH as well as on the code exchange, and a
+# mapping that writes a protected claim or that cannot be read refuses the issuance.
+[[test]]
+name = "claims_mapping_at_issuance"
+path = "tests/claims_mapping_at_issuance.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "claims_enrichment"
 path = "tests/claims_enrichment.rs"
