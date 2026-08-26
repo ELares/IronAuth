@@ -28,6 +28,11 @@ allow() {
     ironauth-oidc/cimd) return 0 ;;                      # issue #128
     ironauth-oidc/mds3_sync) return 0 ;;                 # untraced; see #774
     ironauth-store/message_feedback) return 0 ;;         # issue #111
+    ironauth-store/token_customize) return 0 ;;          # issue #113: the pre-token hook's
+    #   contract, deliberately landed before either transport that binds to it (#113's HTTP
+    #   dispatch and #114's WASM one), so neither inherits the other's shape. The seam it
+    #   needs is recorded on #113: `tokens::mint` signs the ID token before `mint_access`
+    #   builds its claims, so no point today holds both unsigned.
     *) return 1 ;;
   esac
 }

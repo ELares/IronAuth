@@ -17,7 +17,9 @@
 //! Because two issues bind to it. #113 dispatches `token.customize` through the HTTP target
 //! machinery, and #114's WASM transport carries "the same event contract ... so implementations
 //! can migrate transports unchanged". A contract defined inside whichever transport shipped
-//! first would be that transport's shape, and the second one would inherit an accident.
+//! first would be that transport's shape, and the second one would inherit an accident. (The
+//! migrate-transports-unchanged requirement is issue #113's own text, describing what #114 must
+//! honour.)
 //!
 //! # ONE invocation, BOTH tokens
 //!
@@ -40,33 +42,63 @@
 //! past-tense would have been worse than the rule it dodged, since the hook runs BEFORE the
 //! token exists and `token.customized` would name something that has not happened.
 //!
-//! So the schema lives here, beside the type it describes, and is enforced the same way: a
-//! payload that does not match it is refused before it is dispatched. Issue #113 asks for "an
-//! explicitly versioned event payload registered in the schema registry", and what that
-//! criterion is actually after -- an explicit version, a registered schema, and CI that fails
-//! on an unregistered one -- is satisfied without borrowing a vocabulary this does not belong
-//! to.
+//! So the schema lives here, beside the type it describes. WHAT THAT COSTS, stated rather than
+//! glossed, because it is not nothing:
+//!
+//! * `token.customize` appears in neither `docs/events/catalog.json` nor `docs/EVENTS.md`, so
+//!   an integrator implementing this hook has no published description of it. That is a real
+//!   gap, and it belongs with the dispatch, which is where such a doc has something to
+//!   describe.
+//! * `scripts/event-registry-compat.py` no longer covers it, so a BREAKING narrowing of this
+//!   schema under an unchanged version is not caught by that gate. The
+//!   `the_struct_and_the_schema_describe_the_same_fields` test and `REGISTERED_VERSIONS` are
+//!   what replace it here, and they are NARROWER: they catch a field appearing or disappearing
+//!   and an unregistered version, not every narrowing a field could suffer.
+//!
+//! The alternative was to take the naming argument to its conclusion and add an entry to the
+//! catalog's `IRREGULAR_PAST_FORMS`. That list is for past forms not ending in -ed;
+//! `customize` is not a past form at all, so using it would have been dodging the rule rather
+//! than satisfying it.
 //!
 //! # The version is a TYPE, not a literal at each call site
 //!
 //! Criterion 6 asks that the version be "explicit in every hook invocation" and that emitting
-//! an unregistered one fail CI. A `u32` written by hand at each dispatch site satisfies the
-//! letter and not the intent: the fifth site to be added is the one that writes `1` after the
-//! schema moved to `2`. [`TokenCustomizePayload`] carries it, so a site cannot spell it at all,
-//! and the registry is what decides which numbers exist.
+//! an unregistered one fail. A `u32` written by hand at each dispatch site satisfies the letter
+//! and not the intent: the fifth site to be added is the one that writes `1` after the schema
+//! moved to `2`. [`TokenCustomizePayload`] carries it, so a site cannot spell it at all.
+//!
+//! And the version is answered against [`REGISTERED_VERSIONS`], not a floor. The first version
+//! of this schema said `minimum: 1`, so bumping the constant to `2` validated happily and left
+//! every test, lint and gate green -- explicit and unchecked at the same time, which is the
+//! half of the criterion that matters.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The registered payload version of `token.customize`.
+/// Every version of this contract the registry knows.
 ///
-/// Bumping this without registering the new version in
-/// [`crate::event_catalog`] makes every emission fail validation, which is the
-/// intended direction: an unregistered version cannot be delivered rather than
-/// being delivered and misread.
+/// A LIST, not a floor. The schema emits it as an `enum`, so a payload claiming a version
+/// nobody registered does not validate -- which is criterion 6's second half, and it did not
+/// hold when the schema said `minimum: 1`: bumping the constant to 2 left every test, every
+/// lint and every gate green, so the version was explicit and unchecked at the same time.
+///
+/// A LIST rather than a single number because a contract that gains a version does not
+/// instantly lose the old one: a dispatcher on 2 and a hook still speaking 1 have to coexist
+/// through a rollout.
+pub const REGISTERED_VERSIONS: &[u32] = &[1];
+
+/// The version this build EMITS, which must be one of [`REGISTERED_VERSIONS`].
+///
+/// Bumping it without adding the new number to that list makes every payload fail validation
+/// immediately, in this module's own tests. That is the direction the criterion asks for: an
+/// unregistered version cannot be emitted rather than being emitted and misread.
 pub const TOKEN_CUSTOMIZE_VERSION: u32 = 1;
 
-/// The event type name.
+/// The request type name.
+///
+/// NOT carried in the payload today, so a receiver cannot discriminate on it: it exists for the
+/// dispatcher to route on and for the two transports to agree on a name. If it is still unread
+/// when the dispatch lands, it should either go into the payload as a fixed field or go away.
 pub const TOKEN_CUSTOMIZE_EVENT: &str = "token.customize";
 
 /// What one `token.customize` invocation carries.
@@ -115,7 +147,7 @@ pub fn payload_schema() -> serde_json::Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "payload_version": {"type": "integer", "minimum": 1},
+            "payload_version": {"enum": REGISTERED_VERSIONS},
             "grant_type": {"type": "string", "minLength": 1},
             "client_id": {"type": "string", "minLength": 1},
             "subject": {"type": ["string", "null"]},
@@ -224,6 +256,45 @@ mod tests {
         .expect("serializes")
     }
 
+    /// The struct's fields and the schema's properties are THE SAME SET.
+    ///
+    /// They are two descriptions of one contract and only one drift direction was bound: a
+    /// field added to the schema and not the struct was caught (the payload would lack a
+    /// required key), and a field added to the STRUCT and not the schema was not -- it would
+    /// simply never be described, and an integrator reading the schema would not know it
+    /// exists.
+    #[test]
+    fn the_struct_and_the_schema_describe_the_same_fields() {
+        let built = payload("authorization_code", Some("usr_ada"));
+        let from_struct: std::collections::BTreeSet<String> = built
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        let schema = super::payload_schema();
+        let from_schema: std::collections::BTreeSet<String> = schema["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            from_struct, from_schema,
+            "every field the type serializes must be described, and nothing else"
+        );
+        let required: std::collections::BTreeSet<String> = schema["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .map(|name| name.as_str().expect("a string").to_owned())
+            .collect();
+        assert_eq!(
+            required, from_schema,
+            "and every described field is required: this contract has no optional halves"
+        );
+    }
+
     /// CRITERION 6. What the builder produces satisfies the schema that describes it.
     ///
     /// The tie between the type and its contract. Without it the two are two descriptions of
@@ -260,10 +331,56 @@ mod tests {
             ),
             ("urn:openid:params:grant-type:ciba", Some("usr_ada")),
         ] {
-            validate_payload(&payload(grant, subject)).unwrap_or_else(|error| {
+            let built = payload(grant, subject);
+            validate_payload(&built).unwrap_or_else(|error| {
                 panic!("the {grant} grant must fit the one schema: {error}")
             });
+            // READ BACK, or the seven rows differ in what they feed and not in what they
+            // prove: a builder that ignored its `grant_type` argument entirely passed the
+            // validate-only version of this loop seven times over.
+            assert_eq!(
+                built["grant_type"],
+                serde_json::json!(grant),
+                "the payload must name the grant that fired"
+            );
+            assert_eq!(
+                built["subject"],
+                subject.map_or(serde_json::Value::Null, |s| serde_json::json!(s)),
+                "and carry the subject, or null where there is no human"
+            );
         }
+    }
+
+    /// Every argument lands in ITS OWN field.
+    ///
+    /// Swapping the two claim bags survived every other test here, because they all checked
+    /// that the payload was VALID and none checked that it was RIGHT. A hook handed the access
+    /// token's claims under `id_token_claims` would refine the wrong half of the login, and
+    /// the schema cannot tell: both are objects.
+    #[test]
+    fn each_argument_lands_in_its_own_field() {
+        let built = serde_json::to_value(TokenCustomizePayload::new(
+            "refresh_token",
+            "cli_distinct",
+            Some("usr_distinct"),
+            claims(&[("id_only", serde_json::json!(true))]),
+            claims(&[("access_only", serde_json::json!(true))]),
+        ))
+        .expect("serializes");
+
+        assert_eq!(built["grant_type"], serde_json::json!("refresh_token"));
+        assert_eq!(built["client_id"], serde_json::json!("cli_distinct"));
+        assert_eq!(built["subject"], serde_json::json!("usr_distinct"));
+        assert_eq!(
+            built["id_token_claims"],
+            serde_json::json!({"id_only": true}),
+            "the ID-token bag must be the ID-token bag"
+        );
+        assert_eq!(
+            built["access_token_claims"],
+            serde_json::json!({"access_only": true}),
+            "and the access-token bag must not be the other one"
+        );
     }
 
     /// The version is explicit IN THE PAYLOAD, and the builder is what sets it.
@@ -306,10 +423,17 @@ mod tests {
             .remove("payload_version");
         assert!(validate_payload(&versionless).is_err(), "version missing");
 
-        // A version below the registered floor.
-        let mut zero = payload("authorization_code", Some("usr_ada"));
-        zero["payload_version"] = serde_json::json!(0);
-        assert!(validate_payload(&zero).is_err(), "version 0");
+        // A version NOBODY REGISTERED. This is criterion 6's second half, and it did not hold
+        // when the schema said `minimum: 1`: 2 validated happily, so bumping the constant
+        // without registering the schema left every test, lint and gate green.
+        for version in [0, 2, 99] {
+            let mut wrong = payload("authorization_code", Some("usr_ada"));
+            wrong["payload_version"] = serde_json::json!(version);
+            assert!(
+                validate_payload(&wrong).is_err(),
+                "version {version} is not in REGISTERED_VERSIONS and must not validate"
+            );
+        }
 
         // An EMPTY grant type is not a grant type; without minLength a hook would branch on "".
         let mut blank = payload("authorization_code", Some("usr_ada"));
