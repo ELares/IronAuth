@@ -461,6 +461,22 @@ pub async fn apply_to_machine_token(
             // to put it. Dropping rather than erroring because the shipped `echo-request`
             // fixture fills it, and because a hook written once for every grant is the point of
             // the uniform contract.
+            //
+            // LOGGED, though. Every other discard in this family says what it refused and why,
+            // and a hook author whose ID-token claims vanish with no line anywhere has no way
+            // to learn that this grant has no ID token. Only when there is something to say:
+            // the common case is an empty list and a silent one.
+            if !contributed.id_token.is_empty() {
+                tracing::info!(
+                    target: "ironauth.hooks",
+                    tenant = %scope.tenant(),
+                    client_id,
+                    grant_type,
+                    discarded = contributed.id_token.len(),
+                    "the hook returned ID-token claims on a grant that mints no ID token; they \
+                     are dropped, and the access-token claims it returned were kept"
+                );
+            }
             single = contributed.access_token.into_iter().collect();
         }
         Ok(MappedAccessClaims(single))

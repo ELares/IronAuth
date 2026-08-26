@@ -56,7 +56,20 @@ impl Limits {
             // Enough for a hook to walk a large claim set and re-encode it many times over,
             // and far too little to spin.
             fuel: 50_000_000,
-            // One tick. What that is worth in milliseconds is the epoch driver's decision.
+            // ONE TICK, and this value is only correct for a caller that drives the epoch
+            // DELIBERATELY -- the sandbox suite ticks by hand, so one tick means one tick.
+            //
+            // Against a FREE-RUNNING ticker it is a lottery. wasmtime sets the deadline to
+            // `current_epoch + delta`, and a store created at an arbitrary point inside a tick
+            // inherits only what remains of it, so a delta of 1 grants a uniform slice of
+            // (0, T]. Measured on a 10 ms ticker: a guest doing 78 microseconds of work
+            // trapped on 0.40% of invocations. A server that fails an issuance on a trap gets a
+            // random 500 on roughly one hooked login in a hundred.
+            //
+            // A caller with a running driver must set its own, and must size it for the worst
+            // SCHEDULING delay rather than the work, because this bound counts wall clock while
+            // `fuel` counts instructions. `ironauth_oidc::token_hook::EPOCH_TICKS_PER_HOOK` is
+            // that number for the server and carries the reasoning.
             epoch_deadline: 1,
             // 16 MiB. A claim set that needs more than this is not a claim set.
             memory_bytes: 16 << 20,

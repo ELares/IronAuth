@@ -728,9 +728,14 @@ mod tests {
         assert_eq!(ours.fuel, shipped.fuel);
         assert_eq!(ours.memory_bytes, shipped.memory_bytes);
         assert_eq!(ours.max_host_resources, shipped.max_host_resources);
-        assert_ne!(
-            ours.epoch_deadline, shipped.epoch_deadline,
-            "and the deadline DOES depart, or the reason above has been reverted"
+        // The VALUE, not a difference from the preset. `assert_ne!` here would mean that
+        // fixing `claim_shaping`'s own deadline -- which is still the one-tick lottery value,
+        // correct only for a suite that ticks the epoch by hand -- turns this test red. A guard
+        // that punishes the fix is worse than no guard.
+        assert_eq!(
+            ours.epoch_deadline,
+            super::EPOCH_TICKS_PER_HOOK,
+            "the dispatch runs on its own deadline, for the reason on that constant"
         );
     }
 

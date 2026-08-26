@@ -86,10 +86,12 @@ async fn set_static_claims(harness: &Harness, client: &ironauth_store::ClientId,
 /// reaches the repository underneath that handler and skips the fence.
 ///
 /// That is safe here, and the reason is worth knowing rather than assuming: `apply_for`
-/// validates again at ISSUANCE, before applying anything, so a rule set that would be refused
-/// by the admin surface is refused at the mint too. What this helper actually differs from
-/// `install_unvalidated` in is the AUDIT TRAIL, not the validation: this write is `acting(...)`
-/// and recorded, the raw one is not.
+/// validates again at ISSUANCE, before applying anything, so a rule set the admin surface would
+/// refuse is refused at the mint too.
+///
+/// (The corrected text was pasted from `tests/claims_mapping_at_issuance.rs`, whose version
+/// contrasts this against an `install_unvalidated` helper. There is no such helper in this
+/// file and no raw-write path here, so that clause contrasted against nothing and is gone.)
 async fn install_mapping(harness: &Harness, client: &ironauth_store::ClientId, rules: &str) {
     let env = harness.env().clone();
     harness
@@ -706,9 +708,12 @@ async fn an_echoing_hook_does_not_lose_claims_past_the_contribution_cap() {
 /// including code deployed to REMOVE a claim, so the skipped door issues the wider token. And a
 /// door that silently skips is a door a client can choose.
 ///
-/// This drives the device grant end to end. The remaining three (authorize's front channel,
-/// CIBA, FedCM) are still covered only by the shared function; that is stated in the PR rather
-/// than papered over.
+/// This drives the device grant end to end. The sentence that used to follow -- that
+/// authorize's front channel, CIBA and FedCM were "still covered only by the shared function"
+/// -- was true when it was written and this PR falsified two thirds of it: both now have their
+/// own test and their own confirmed mutant. FedCM is the one that does not, and the door table
+/// on `MappedAccessClaims` is the single place that inventory lives, so this no longer keeps a
+/// second copy of it to drift.
 #[tokio::test]
 async fn the_device_grant_runs_the_hook() {
     let harness = harness_with_hooks().await;
