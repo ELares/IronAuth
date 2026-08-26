@@ -64,9 +64,22 @@ cold_p95_micros = 250000
 # function registrations that do not depend on the guest.
 #
 # The linker is now built once with the engine and each hook's imports are resolved once at load
-# (`Linker::instantiate_pre`), so an invocation builds only a `Store`. Measured on one machine,
-# same benchmark, before and after: 96.4 us -> 19.9 us, a 4.8x cut. The bound did not move; the
-# distance to it did.
+# (`Linker::instantiate_pre`), so an invocation builds only a `Store`.
+#
+# Measured on one machine, same benchmark, THREE runs each side, with the before taken by
+# checking out main's `engine.rs` rather than by stashing (stashing leaves the committed change
+# in place, which is how the first attempt at this number measured the new code twice):
+#
+#   before   36.3, 37.3, 40.8 us
+#   after    16.8, 17.0, 17.9 us
+#
+# So roughly 2.2x. An earlier version of this comment said "96.4 us -> 19.9 us, a 4.8x cut" and
+# that does not reproduce: the 96.4 came from a different tree state, and review measured
+# 35.2 -> 16.5 independently. A single-run figure written permanently into a config is a claim
+# the next person cannot check, which is why the spread is here instead.
+#
+# The bound did not move; the distance to it did. What decides whether the criterion holds is
+# the CI runner, not this machine.
 warm_p95_micros = 100
 
 [target]

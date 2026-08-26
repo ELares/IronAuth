@@ -150,7 +150,36 @@ pub const PAYLOAD_VERSION: u32 = ironauth_store::token_customize::TOKEN_CUSTOMIZ
 /// evicting, because eviction under a login flood is a thundering-herd recompile and the honest
 /// answer is that a deployment past this many distinct hooks needs a real cache rather than a
 /// bigger map.
-type HookCache = std::sync::Mutex<std::collections::HashMap<HookKey, Arc<LoadedHook>>>;
+type HookCache = std::sync::Mutex<std::collections::HashMap<HookKey, Cached>>;
+
+/// What the cache remembers about one component: that it loaded, or that it cannot.
+///
+/// REMEMBERING THE REFUSAL is the half that is easy to leave out, and leaving it out is a
+/// self-inflicted denial of service. Import resolution moved into `HookEngine::load`, so a
+/// component asking for a capability the sandbox does not grant now fails there -- and a cache
+/// that stores only successes would compile it again, from scratch, on EVERY token request for
+/// that client. Roughly 33 ms of cranelift per login, for a hook that can never run.
+///
+/// Before the move it failed later, at invocation, so the compile was cached and paid once. The
+/// refusal moving earlier is an improvement; the compile moving to every request would not be.
+#[derive(Clone)]
+enum Cached {
+    /// Compiled and linked. The common case.
+    Loaded(Arc<LoadedHook>),
+    /// Refused, and it will be refused identically next time.
+    ///
+    /// Only for refusals that are a property of the ARTIFACT -- unlinkable imports, bytes that
+    /// are not a component. Those are the same answer for the same bytes on the same engine, so
+    /// caching them is caching a fact. A transient failure is NOT cached: retrying that is
+    /// retrying something that can change, and a poisoned entry would refuse a client's hook
+    /// forever over one bad minute.
+    Refused {
+        /// Preserved so the dispatch still classifies the fault as it did.
+        kind: ironauth_hooks::AbortKind,
+        /// What the engine said, for the log the operator reads.
+        reason: String,
+    },
+}
 
 /// The engine and its compilation cache, as ONE installable thing.
 ///
@@ -377,21 +406,47 @@ async fn loaded_hook(
     // treated as an empty cache rather than a panic: a poisoned cache is a correctness-neutral
     // loss of a performance structure, and failing a login over it would turn one panicking
     // request into an outage.
-    if let Some(hit) = cache.lock().ok().and_then(|map| map.get(&key).cloned()) {
-        return Ok(hit);
+    match cache.lock().ok().and_then(|map| map.get(&key).cloned()) {
+        Some(Cached::Loaded(hit)) => return Ok(hit),
+        Some(Cached::Refused { kind, reason }) => {
+            return Err(HookError::recalled(kind, reason));
+        }
+        None => {}
     }
 
     let compiling = Arc::clone(engine);
     let bytes = component.to_vec();
-    let loaded = Arc::new(
-        tokio::task::spawn_blocking(move || compiling.load(&bytes))
-            .await
-            .unwrap_or_else(|join| {
-                Err(HookError::Declined(format!(
-                    "the compile task did not complete: {join}"
-                )))
-            })?,
-    );
+    let outcome = tokio::task::spawn_blocking(move || compiling.load(&bytes))
+        .await
+        .unwrap_or_else(|join| {
+            Err(HookError::Declined(format!(
+                "the compile task did not complete: {join}"
+            )))
+        });
+
+    let loaded = match outcome {
+        Ok(hook) => Arc::new(hook),
+        Err(error) => {
+            // Remember a refusal the ARTIFACT earns, so the next request is a map lookup rather
+            // than another 33 ms compile of something that cannot run. `abort_kind` is `Some`
+            // exactly for the deterministic refusals; a `Declined` (including the join failure
+            // above) is not cached, because it can change.
+            if let Some(kind) = error.abort_kind() {
+                if let Ok(mut map) = cache.lock() {
+                    if map.len() < MAX_CACHED_HOOKS {
+                        map.insert(
+                            key,
+                            Cached::Refused {
+                                kind,
+                                reason: error.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            return Err(error);
+        }
+    };
 
     if let Ok(mut map) = cache.lock() {
         // STOPS ADMITTING at the bound rather than evicting. Eviction under a login flood is a
@@ -399,7 +454,7 @@ async fn loaded_hook(
         // cache rather than a bigger map. The already-loaded component is still returned, so the
         // login succeeds; what is lost is the reuse.
         if map.len() < MAX_CACHED_HOOKS {
-            map.insert(key, Arc::clone(&loaded));
+            map.insert(key, Cached::Loaded(Arc::clone(&loaded)));
         } else {
             tracing::warn!(
                 target: "ironauth.hooks",

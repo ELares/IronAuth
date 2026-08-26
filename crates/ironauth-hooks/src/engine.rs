@@ -86,7 +86,12 @@ impl HookEngine {
         config.epoch_interruption(true);
         let engine = Engine::new(&config).map_err(HookError::from_engine)?;
         let mut linker: Linker<Sandbox> = Linker::new(&engine);
-        Sandbox::link(&mut linker).map_err(HookError::from_instantiate)?;
+        // NOT `from_instantiate`. That classifier answers "a hook asked for a capability it was
+        // not granted", which is a statement about a GUEST -- and there is no guest here. This
+        // is the host failing to register its own surface, which is a broken build or a
+        // wasmtime version skew, and reporting it as a capability refusal would send an
+        // operator looking at a hook that does not exist yet.
+        Sandbox::link(&mut linker).map_err(HookError::from_engine)?;
         Ok(Self {
             engine,
             linker: std::sync::Arc::new(linker),
@@ -116,7 +121,12 @@ impl HookEngine {
     ///
     /// # Errors
     ///
-    /// If the bytes are not a valid component, or if compilation fails.
+    /// If the bytes are not a valid component, or if compilation fails -- and now also if the
+    /// component imports something the host surface does not offer, which is
+    /// [`AbortKind::Unlinkable`](crate::AbortKind::Unlinkable) and used to surface at the first
+    /// invocation instead. That is a DEPLOY-time property of the artifact, so it belongs here;
+    /// a caller that caches loaded hooks should cache this refusal too, or it recompiles an
+    /// unloadable component on every request.
     pub fn load(&self, wasm: &[u8]) -> Result<LoadedHook, HookError> {
         let component = Component::new(&self.engine, wasm).map_err(HookError::from_load)?;
         self.prepare(&component)
@@ -188,11 +198,12 @@ impl HookEngine {
     }
 }
 
-/// A hook that has been compiled and is ready to instantiate.
+/// A hook that has been compiled AND had its imports resolved, ready to instantiate.
 ///
-/// `Debug` is derived rather than omitted so a test can `expect_err` on a load, which is how
-/// the unloadable-bytes paths are covered at all. The component's own `Debug` is opaque, so
-/// this leaks nothing about a hook's contents.
+/// `Debug` is HAND-WRITTEN, not derived: `InstancePre` has none, and the fact worth printing is
+/// not its contents (resolved import pointers) but that the hook reached the resolved state at
+/// all. A `LoadedHook` that exists has passed import resolution by construction. Tests still
+/// `expect_err` on a load, which is how the unloadable and unlinkable paths are covered.
 pub struct LoadedHook {
     /// The guest's imports already resolved against the host surface.
     ///
