@@ -1,11 +1,25 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Applying a stored declarative claim mapping when a token is minted (issue #113 criterion 4).
 //!
-//! `claims_mapping` defines and applies the rules; `claims_mappings` stores them; the config
-//! snapshot promotes them. This is the seam that made any of it reach a token. Before it, the
-//! rules had one production caller (the admin write, which validates) and zero readers, so a
-//! mapping an operator configured, promoted from dev to prod, and saw in a snapshot export
-//! changed nothing about any token ever issued.
+//! `claims_mapping` defines and applies the rules; `claims_mappings` stores them; a config
+//! snapshot EXPORTS them. This is the seam that made any of it reach a token. Before it the
+//! rules had ZERO production callers of any kind -- not one, as an earlier version of this
+//! paragraph said -- so a mapping an operator configured and saw in a snapshot export changed
+//! nothing about any token ever issued.
+//!
+//! Two things that paragraph also got wrong, corrected here because they are the kind of claim
+//! a reader budgets against:
+//!
+//! - **Promotion does not carry a mapping yet.** `promotion.rs` leaves `claims_mapping` empty,
+//!   blocked on the same missing primitive as `client` and `signup_form`. Criterion 4 ends with
+//!   "and promote via config snapshots"; that half is open.
+//! - **The write path validates because a later change made it so**, not because it always did.
+//!   When this module first said "the admin path validates before storing", there was no admin
+//!   path at all: `claims_mapping::validate` had no production caller, and
+//!   `ActingClaimsMappingRepo::set` stored the string verbatim and said so. The fail-closed
+//!   decision below rested on a fence that did not exist, and one ordinary write of a rule set
+//!   naming `sub` was a per-client login outage. The admin surface is what makes the sentence
+//!   true.
 //!
 //! # Where the claims come from
 //!
@@ -27,10 +41,14 @@
 //! nobody could evaluate. Under-claiming is the safe failure for an enrichment; over-claiming is
 //! not a safe failure for anything.
 //!
-//! The document cannot be unreadable by accident: the admin path validates before storing, the
-//! table constrains the shape, and the snapshot import validates on the way in. A parse failure
-//! here means a downgrade to a version that does not know a rule kind, a hand-edited row, or
-//! corruption. Each of those is a reason to stop.
+//! The document cannot be unreadable by accident ONCE the admin surface is the only writer: it
+//! validates before storing, the table constrains the shape, and the snapshot import validates
+//! on the way in. A parse failure here then means a downgrade to a version that does not know a
+//! rule kind, a hand-edited row, or corruption -- each a reason to stop.
+//!
+//! That conditional is load bearing and was missing. Fail-closed on a channel anything can write
+//! is not a safety property, it is a way to turn one bad write into a per-client login outage.
+//! The fence has to exist first.
 
 use std::collections::BTreeMap;
 
@@ -71,6 +89,20 @@ pub enum Resolved {
 }
 
 /// Read this client's mapping and apply it to `source`.
+///
+/// # The three doors this does NOT reach, and the honest reason
+///
+/// `client_credentials.rs`, `jwt_bearer.rs` and `token_exchange.rs` build a
+/// `ClientCredentialsMintRequest`, which has no extra-claims channel at all -- only
+/// `custom_claims`, the per-client static bag from issue #23.
+///
+/// "A machine token has no user claims" was the reason given, and it is right only for
+/// `client_credentials`. A token-exchange token carries the SUBJECT's subject and a JWT-bearer
+/// token carries a mapped federated principal; both are tokens about a person. The correct
+/// reason is narrower: those paths carry no user extra-claims bag to map, so reaching them means
+/// deciding what a mapping's SOURCE is on a grant that resolves no claims -- a question about
+/// those grants rather than about this seam. Issue #113 names both as first-class for the
+/// uniform contract, so it is work, not a decision already made.
 ///
 /// # Errors
 ///
@@ -170,16 +202,65 @@ pub async fn apply_to(
     scope: Scope,
     client_id: &str,
     extra_claims: &mut serde_json::Map<String, serde_json::Value>,
-) -> Result<serde_json::Map<String, serde_json::Value>, MappingFault> {
+) -> Result<MappedAccessClaims, MappingFault> {
     let source = as_source(extra_claims);
     match resolve(store, scope, client_id, &source).await? {
         // Untouched. NOT "an empty mapping applied": a client with no mapping issues exactly
         // what it issued before this seam existed, and the two cases produce opposite results
         // for the same input.
-        Resolved::NoMapping => Ok(serde_json::Map::new()),
+        Resolved::NoMapping => Ok(MappedAccessClaims(serde_json::Map::new())),
         Resolved::Mapped(mapped) => {
             *extra_claims = as_claims(mapped.id_token);
-            Ok(as_claims(mapped.access_token))
+            Ok(MappedAccessClaims(as_claims(mapped.access_token)))
         }
+    }
+}
+
+/// The access-token claims a mapping produced, in a wrapper only this module can build.
+///
+/// `MintRequest::access_extra_claims` takes one of these, so a door that mints a token for a
+/// client CANNOT do it without calling [`apply_to`] -- the field has no other source. That is
+/// the point, and it is a repair rather than a flourish.
+///
+/// Review measured the alternative: with the field taking a plain map, emptying the `apply_to`
+/// call at the FedCM, CIBA and front-channel-authorize doors each left the whole suite green,
+/// because those three are driven by no test that installs a mapping. A structural argument
+/// ("they all call the same function") is not a measurement, and structure cannot express
+/// reachability. Now the compiler asks the question at every door, including doors nobody has
+/// written yet.
+///
+/// The wrapped map may be empty. That is `NoMapping`, and it is the common case: a client with
+/// no mapping contributes no access-token claims and issues exactly what it did before.
+#[derive(Debug, Clone, Default)]
+pub struct MappedAccessClaims(serde_json::Map<String, serde_json::Value>);
+
+impl MappedAccessClaims {
+    /// The claims, for the mint to fold.
+    #[must_use]
+    pub fn as_map(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.0
+    }
+
+    /// Build one directly, FOR TESTS ONLY.
+    ///
+    /// `cfg(test)`-gated so it cannot become the bypass the wrapper exists to prevent: the
+    /// mint's own unit tests drive `access_extra_claims` with hand-built bags to exercise the
+    /// fold and the budget, which is a different question from whether a door resolved a
+    /// mapping, and neither test should need a database to ask it.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_test(claims: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self(claims)
+    }
+
+    /// No mapping applied, for a path that mints a token for NO client.
+    ///
+    /// Deliberately narrow, and deliberately not `Default`-by-accident: the only honest use is a
+    /// mint that has no client id to look a mapping up by. A door that HAS one must call
+    /// [`apply_to`]; reaching for this instead is the bypass the wrapper exists to prevent, and
+    /// it is greppable.
+    #[must_use]
+    pub fn none_for_a_clientless_mint() -> Self {
+        Self(serde_json::Map::new())
     }
 }

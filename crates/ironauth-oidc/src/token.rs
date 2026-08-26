@@ -1334,7 +1334,7 @@ async fn mint_tokens(
     scope: Scope,
     bindings: &CodeBindings,
     extra_claims: &serde_json::Map<String, serde_json::Value>,
-    access_extra_claims: &serde_json::Map<String, serde_json::Value>,
+    access_extra_claims: &crate::claims_mapping_at_issuance::MappedAccessClaims,
     target: &AccessTokenTarget,
     confirmation: Option<&Confirmation>,
 ) -> Result<IssuedTokens, TokenError> {
@@ -1698,7 +1698,7 @@ pub(crate) async fn apply_claims_mapping(
     scope: Scope,
     client_id: &str,
     extra_claims: &mut serde_json::Map<String, serde_json::Value>,
-) -> Result<serde_json::Map<String, serde_json::Value>, TokenError> {
+) -> Result<crate::claims_mapping_at_issuance::MappedAccessClaims, TokenError> {
     crate::claims_mapping_at_issuance::apply_to(state.store(), scope, client_id, extra_claims)
         .await
         .map_err(|_| TokenError::ServerError)
@@ -2487,11 +2487,25 @@ async fn mint_refresh_access(
     // any client that simply refreshes: an operator's `filter_list` on `groups` would hold for
     // one token and be gone for the rest of the family's life.
     //
-    // The source is EMPTY here because the refresh path mints no ID token and carries no
-    // request-parameter claims, so `static` and `place` rules are what can act; a `rename` or a
-    // `filter_list` has nothing to work on and produces nothing, which is the correct answer
-    // rather than a gap. A fault still fails the refresh, for the reason
-    // `claims_mapping_at_issuance` gives.
+    // The source is EMPTY here, and that is a KNOWN LIMITATION rather than the correct answer.
+    // An earlier version of this comment called it correct; review measured otherwise, and the
+    // measurement is worth writing down.
+    //
+    // `static` rules act. A `rename`, a `filter_list`, or a `place` naming a claim the SERVER
+    // resolved has nothing to work on, because the refresh path mints no ID token and replays
+    // no `claims` parameter -- so `place email -> access_token` puts `email` in the first
+    // access token and NOT in the refreshed one. A resource server authorizing on a mapped
+    // claim breaks on the client's first refresh, silently.
+    //
+    // Fixing it means re-resolving the user's scope-derived claims on refresh, which changes
+    // what a refreshed access token carries well beyond the mapping and is a decision about
+    // what refresh REPLAYS -- not one to make inside the change that adds a mapping reader.
+    // Filed on #113.
+    //
+    // The mapping is still applied here rather than skipped, and that is not for symmetry: a
+    // `static` rule works, and skipping the door entirely would let a client reach an unmapped
+    // token by refreshing, which is a documented way around the control rather than a gap in
+    // it. A fault still fails the refresh, for the reason `claims_mapping_at_issuance` gives.
     let mut extra_claims = serde_json::Map::new();
     let access_extra_claims =
         apply_claims_mapping(state, scope, &resolution.client_id, &mut extra_claims).await?;

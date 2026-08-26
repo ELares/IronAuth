@@ -174,8 +174,17 @@ fn claims(token: &str) -> serde_json::Map<String, Value> {
     serde_json::from_slice(&bytes).expect("claims json")
 }
 
+/// A `static` rule reaches the ID token, and reaches the ACCESS token only when placed.
+///
+/// The second half is the one review found backwards. The default placement was `Both`, on the
+/// stated grounds that both was "the behaviour before any mapping existed" -- and it was not:
+/// `MintRequest::access_extra_claims` had no writer before this seam, which is exactly why
+/// `tokens::no_extra_claims()` existed. So installing a mapping of ONE unrelated static rule
+/// copied every enriched and scope-derived claim into the access token of every resource server
+/// in the audience. An operator adding a claim would have disclosed several, and the feature
+/// would have been a widening.
 #[tokio::test]
-async fn a_static_rule_puts_a_claim_in_both_tokens() {
+async fn a_static_rule_reaches_the_id_token_and_the_access_token_only_when_placed() {
     let harness = harness().await;
     install(
         &harness,
@@ -187,8 +196,37 @@ async fn a_static_rule_puts_a_claim_in_both_tokens() {
     assert_eq!(
         claims(&id_token).get("tier"),
         Some(&Value::from("gold")),
-        "a claim no rule places goes in both tokens"
+        "a claim no rule places stays where the extra-claims bag already went"
     );
+    assert!(
+        !claims(&access).contains_key("tier"),
+        "and does NOT reach the access token unasked: {:?}",
+        claims(&access)
+    );
+
+    // The server's own claims are not dragged across either, which is the harm the default
+    // caused: `email` is in the ID token here through the conform override, and installing a
+    // mapping must not publish it to every resource server in the audience.
+    assert_eq!(
+        claims(&id_token).get("email"),
+        Some(&Value::from("ada@example.test"))
+    );
+    assert!(
+        !claims(&access).contains_key("email"),
+        "installing a mapping must not widen what the access token carries: {:?}",
+        claims(&access)
+    );
+
+    // And PLACING it is what puts it there, so the assertions above are not passing because
+    // nothing ever reaches an access token.
+    install(
+        &harness,
+        r#"[{"kind":"static","name":"tier","value":"gold"},
+            {"kind":"place","name":"tier","placement":"both"}]"#,
+    )
+    .await;
+    let (access, id_token) = exchange(&harness).await.expect("exchange");
+    assert_eq!(claims(&id_token).get("tier"), Some(&Value::from("gold")));
     assert_eq!(claims(&access).get("tier"), Some(&Value::from("gold")));
 }
 
@@ -495,4 +533,88 @@ async fn approve_device_flow(harness: &Harness, user_code: &str) {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "approve: {body}");
+}
+
+/// What the refresh grant can and CANNOT carry, asserted rather than described.
+///
+/// A `static` rule reaches a refreshed access token; a `place` naming a claim the SERVER
+/// resolved does not, because the refresh path mints no ID token and replays no `claims`
+/// parameter, so the source bag is empty.
+///
+/// This is a KNOWN LIMITATION, and it is pinned here for two reasons. A comment in `token.rs`
+/// called it "the correct answer rather than a gap" and review measured otherwise -- a
+/// resource server authorizing on a mapped claim breaks on the client's first refresh,
+/// silently. And the day somebody re-resolves the user's claims on refresh, this test fails,
+/// which is the notification that the limitation is gone and the comment describing it is now
+/// wrong.
+#[tokio::test]
+async fn a_refresh_carries_static_rules_and_not_ones_naming_a_server_claim() {
+    let harness = harness().await;
+    install(
+        &harness,
+        r#"[{"kind":"static","name":"tier","value":"gold"},
+            {"kind":"place","name":"tier","placement":"access_token"},
+            {"kind":"place","name":"email","placement":"access_token"}]"#,
+    )
+    .await;
+
+    let client_id = harness.client_id().to_string();
+    let subject = harness
+        .seed_user_with_claims(&unique_identifier(&harness), SEED_PASSWORD, CLAIMS_JSON)
+        .await;
+    harness.grant_consent(&subject, &client_id).await;
+    let cookie = harness.session_cookie(&subject).await;
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(REDIRECT_URI),
+        enc("openid email"),
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
+    let code = location_param(&headers, "code").expect("code in redirect");
+    let (status, _, body) = harness
+        .token(&form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", &client_id),
+            ("code_verifier", PKCE_VERIFIER),
+        ]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "exchange: {body}");
+    let first = json(&body);
+    let refresh = first["refresh_token"]
+        .as_str()
+        .expect("a refresh token")
+        .to_owned();
+    let first_access = claims(first["access_token"].as_str().expect("access"));
+    assert_eq!(
+        first_access.get("email"),
+        Some(&Value::from("ada@example.test")),
+        "the FIRST access token carries the placed server claim"
+    );
+
+    let (status, _, body) = harness
+        .token(&form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh),
+            ("client_id", &client_id),
+        ]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "refresh: {body}");
+    let rotated = claims(json(&body)["access_token"].as_str().expect("access"));
+
+    assert_eq!(
+        rotated.get("tier"),
+        Some(&Value::from("gold")),
+        "a static rule needs no source, so it survives the refresh"
+    );
+    assert!(
+        !rotated.contains_key("email"),
+        "and a placed SERVER claim does not: the refresh path replays no claims parameter and \
+         mints no ID token, so the source bag is empty. When this assertion starts failing, \
+         the limitation `token.rs` describes has been fixed and that comment needs deleting: \
+         {rotated:?}"
+    );
 }

@@ -156,7 +156,10 @@ pub enum Placement {
     /// The access token only. Authorization data for a resource server, which should not need
     /// the whole identity to make a decision.
     AccessToken,
-    /// Both, which is the default for a claim no rule places.
+    /// Both. Never the default: a claim no rule places stays in the ID token, where the
+    /// extra-claims bag went before this layer had a reader. Reaching an access token is a
+    /// thing a mapping must ASK for, because that token is read by every resource server in
+    /// the audience.
     Both,
 }
 
@@ -410,9 +413,19 @@ pub fn apply(
     validate(rules)?;
 
     let mut working = source.clone();
-    // Placement is decided per claim, and a claim nothing places goes in BOTH: that is the
-    // behaviour before any mapping existed, so a mapping that says nothing about a claim does
-    // not move it.
+    // Placement is decided per claim, and a claim nothing places goes where it went BEFORE any
+    // mapping existed: the ID token.
+    //
+    // This read `Both` at first, with a comment claiming that WAS the prior behaviour. It was
+    // not, and the mistake is worth keeping written down because it made the feature a
+    // WIDENING. `MintRequest::access_extra_claims` had no writer before this seam -- that is
+    // why `tokens::no_extra_claims()` existed -- so the extra-claims bag reached the ID token
+    // only. Measured: installing a mapping of one unrelated `static` rule put `email` and
+    // `email_verified` into the access token of every resource server in `aud`, for every
+    // client with a mapping. An operator who added a claim would have disclosed several.
+    //
+    // A mapping may still put a claim in the access token. It has to SAY so, which is what
+    // `place` is for and what criterion 4 asks for by name.
     let mut placements: BTreeMap<String, Placement> = BTreeMap::new();
 
     for rule in rules {
@@ -476,7 +489,7 @@ pub fn apply(
 
     let mut mapped = MappedClaims::default();
     for (name, value) in working {
-        match placements.get(&name).copied().unwrap_or(Placement::Both) {
+        match placements.get(&name).copied().unwrap_or(Placement::IdToken) {
             Placement::IdToken => {
                 mapped.id_token.insert(name, value);
             }
@@ -540,9 +553,14 @@ mod tests {
             allow: vec!["eng".to_owned(), "hr".to_owned()],
         });
         assert_eq!(
-            filtered.access_token["groups"],
+            filtered.id_token["groups"],
             serde_json::json!(["eng", "hr"]),
             "only the allowed members survive, in their original order"
+        );
+        assert!(
+            !filtered.access_token.contains_key("groups"),
+            "and an unplaced claim does not reach the access token: `filter_list` filters, it \
+             does not also publish"
         );
 
         // PLACEMENT.
@@ -559,13 +577,20 @@ mod tests {
 
     /// A claim no rule places goes in BOTH, which is what happened before mappings existed.
     #[test]
-    fn an_unplaced_claim_is_not_moved() {
+    fn an_unplaced_claim_stays_where_it_went_before_this_layer_existed() {
         let mapped = apply(&[], &source()).expect("applies");
         for name in ["groups", "email"] {
             assert!(mapped.id_token.contains_key(name), "{name} in the id token");
+            // NOT the access token, and this is the assertion the first version had backwards.
+            // It asserted BOTH, on the stated grounds that both "was the behaviour before any
+            // mapping existed" -- and it was not: `MintRequest::access_extra_claims` had no
+            // writer at all, so the extra-claims bag reached the ID token only. Installing one
+            // unrelated `static` rule therefore disclosed every enriched claim to every
+            // resource server in the audience. A test can assert a widening as confidently as
+            // it asserts anything; what makes this one right is the fact it is keyed to.
             assert!(
-                mapped.access_token.contains_key(name),
-                "{name} in the access token"
+                !mapped.access_token.contains_key(name),
+                "{name} must NOT reach the access token unless a rule places it there"
             );
         }
     }
@@ -639,7 +664,9 @@ mod tests {
             serde_json::json!("usr_ada"),
             "renaming FROM a protected claim must COPY, never move"
         );
-        assert_eq!(mapped.access_token["sub"], serde_json::json!("usr_ada"));
+        // Not asserted of the ACCESS token, because a claim no rule places does not reach one.
+        // The mint builds that token's own `sub` regardless; what this test is about is that
+        // the rename did not delete the source from the set it was in.
     }
 
     /// The refusal names the OFFENDING rule's position, not the first rule.
@@ -1659,11 +1686,11 @@ mod wire_format_tests {
         assert_eq!(
             mapped.id_token.get("tier"),
             Some(&serde_json::json!("gold")),
-            "a claim no rule places goes in both"
+            "a claim no rule places stays where the extra-claims bag already went"
         );
-        assert_eq!(
-            mapped.access_token.get("tier"),
-            Some(&serde_json::json!("gold"))
+        assert!(
+            !mapped.access_token.contains_key("tier"),
+            "and does not reach the access token, which a `place` rule is for"
         );
     }
 }
