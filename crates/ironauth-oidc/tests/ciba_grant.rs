@@ -891,7 +891,7 @@ async fn the_ciba_grant_runs_the_hook() {
         .await;
     let client_id = client.to_string();
     harness
-        .deploy_token_hook(&client, ironauth_hooks::fixtures::GOOD, 1)
+        .deploy_token_hook(&client, ironauth_hooks::fixtures::ECHO_REQUEST, 1)
         .await;
 
     let (auth_req_id, subject) = start_request(&harness, &client_id).await;
@@ -910,8 +910,8 @@ async fn the_ciba_grant_runs_the_hook() {
         .expect("base64url payload");
     let claims: Value = serde_json::from_slice(&decoded).expect("claims json");
     assert_eq!(
-        claims["tier"], "gold",
-        "a CIBA access token carries the hook's claim, or the backchannel is a way around a \
-         deployed hook: {claims}"
+        claims["echo_grant_type"], "urn:openid:params:grant-type:ciba",
+        "a CIBA access token ran the hook AND told it which grant this is, or the backchannel \
+         is a way around a deployed hook: {claims}"
     );
 }

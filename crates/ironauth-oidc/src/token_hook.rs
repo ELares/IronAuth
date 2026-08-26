@@ -115,7 +115,21 @@ pub enum HookFault {
 /// A hook's stored `payload_version` must equal it. Not "must be at most": a hook built against
 /// a LATER version than the server emits is as wrong as one built against an earlier one, and
 /// silently accepting either is how a field that moved gets read from the wrong place.
-pub const PAYLOAD_VERSION: u32 = 1;
+///
+/// AN ALIAS, not a copy. It read `= 1` and was a THIRD independent declaration of the version,
+/// beside `TOKEN_CUSTOMIZE_VERSION` and the migration's CHECK. Two of those three were tied
+/// (by `the_emitted_payload_version_is_the_one_the_table_admits` below) and the registry was
+/// not, so bumping the schema and registering version 2 would have left this dispatch emitting
+/// 1 with nothing red -- which is criterion 6's failure exactly:
+///
+/// > Event payload version is explicit in every hook invocation; emitting an unregistered
+/// > version fails CI.
+///
+/// `token_customize` already proves `TOKEN_CUSTOMIZE_VERSION` is in `REGISTERED_VERSIONS` and
+/// that an unregistered version cannot validate. Aliasing makes the emitted version THE
+/// registered one by construction, so "emitting an unregistered version" stops being a thing a
+/// gate has to catch.
+pub const PAYLOAD_VERSION: u32 = ironauth_store::token_customize::TOKEN_CUSTOMIZE_VERSION;
 
 /// The loaded components this process holds, keyed by scope, client, and component DIGEST.
 ///

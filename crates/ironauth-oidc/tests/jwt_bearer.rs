@@ -3703,7 +3703,7 @@ async fn the_jwt_bearer_grant_runs_the_hook() {
     ))
     .await;
     let client_id = seed_trust(&h).await;
-    h.deploy_token_hook(h.client_id(), ironauth_hooks::fixtures::GOOD, 1)
+    h.deploy_token_hook(h.client_id(), ironauth_hooks::fixtures::ECHO_REQUEST, 1)
         .await;
 
     let asrt = assertion(
@@ -3722,10 +3722,13 @@ async fn the_jwt_bearer_grant_runs_the_hook() {
         .expect("access token")
         .to_owned();
     let claims = jwt_payload(&access);
+    // ECHO_REQUEST rather than GOOD, and this asserts the VALUE. Criterion 1 asks that the
+    // grant be identified in the payload, and every door passes that string as a literal, so a
+    // door that copied its neighbour's would be invisible to a test that only asked whether a
+    // hook ran. A hook gating on the grant type is a first-class use of this contract.
     assert_eq!(
-        claims["tier"], "gold",
-        "a jwt:bearer access token carries the hook's claim, or a federated machine identity \
-         is a way around a deployed hook: {claims}"
+        claims["echo_grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "the guest was told which grant this is, or a hook cannot gate on it: {claims}"
     );
     // The mapped principal survived the seam. A hook returns BOTH claim lists and the mint
     // rebuilds its protocol claims afterwards, so this is the assertion that catches a fold

@@ -889,7 +889,7 @@ async fn the_token_exchange_grant_runs_the_hook() {
     .await;
     let (client, secret) = exchanging_client(&harness).await;
     harness
-        .deploy_token_hook(&client, ironauth_hooks::fixtures::GOOD, 1)
+        .deploy_token_hook(&client, ironauth_hooks::fixtures::ECHO_REQUEST, 1)
         .await;
     let (subject, subject_token) = access_token_for_named_user(&harness, &client, &secret).await;
 
@@ -915,10 +915,12 @@ async fn the_token_exchange_grant_runs_the_hook() {
         .expect("base64url payload");
     let claims: Value = serde_json::from_slice(&decoded).expect("claims json");
 
+    // The VALUE, not just the presence: see the jwt:bearer test for why the grant string is
+    // the thing worth asserting at a door.
     assert_eq!(
-        claims["tier"], "gold",
-        "an EXCHANGED token carries the hook's claim, or token exchange is a way around a \
-         deployed hook: {claims}"
+        claims["echo_grant_type"], "urn:ietf:params:oauth:grant-type:token-exchange",
+        "an EXCHANGED token ran the hook AND told it which grant this is, or token exchange \
+         is a way around a deployed hook: {claims}"
     );
     // The exchange still speaks for the original subject. A fold that replaced the claim set
     // rather than adding to it would satisfy the assertion above and quietly reissue the token

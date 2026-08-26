@@ -611,7 +611,7 @@ async fn an_echoing_hook_does_not_lose_claims_past_the_contribution_cap() {
 #[tokio::test]
 async fn the_device_grant_runs_the_hook() {
     let harness = harness_with_hooks().await;
-    deploy(&harness, ironauth_hooks::fixtures::GOOD, 1).await;
+    deploy(&harness, ironauth_hooks::fixtures::ECHO_REQUEST, 1).await;
 
     let client = *harness.client_id();
     harness
@@ -674,10 +674,10 @@ async fn the_device_grant_runs_the_hook() {
         .expect("access")
         .to_owned();
     assert_eq!(
-        claims(&access).get("tier"),
-        Some(&Value::from("gold")),
-        "a device-grant access token carries the hook's claim, or the device door is a way \
-         around a deployed hook: {:?}",
+        claims(&access).get("echo_grant_type"),
+        Some(&Value::from("urn:ietf:params:oauth:grant-type:device_code")),
+        "a device-grant access token ran the hook AND was identified as the device grant, or \
+         the device door is a way around a deployed hook: {:?}",
         claims(&access)
     );
 }
@@ -806,6 +806,70 @@ async fn the_client_credentials_grant_runs_the_hook() {
          instead would silently empty every machine token the day a hook was deployed: \
          {issued:?}"
     );
+
+    // A SECOND exchange, under a guest that reports what it was handed. Criterion 1 asks that
+    // the grant be identified in the payload, and the fold above cannot show that: `GOOD`
+    // echoes its input and would look identical whatever grant string reached it.
+    //
+    // Two exchanges rather than one guest doing both, because `ECHO_REQUEST` REPLACES the claim
+    // lists (that is the contract) and so cannot also demonstrate that static claims survive.
+    deploy_for(&harness, &client, ironauth_hooks::fixtures::ECHO_REQUEST, 1).await;
+    let (status, _headers, body) = harness
+        .token_with_auth(
+            &form(&[("grant_type", "client_credentials")]),
+            Some(&format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"))
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "second exchange: {body}");
+    let echoed = claims(json(&body)["access_token"].as_str().expect("access"));
+    assert_eq!(
+        echoed.get("echo_grant_type"),
+        Some(&Value::from("client_credentials")),
+        "the guest was told which grant this is: {echoed:?}"
+    );
+    assert_eq!(
+        echoed.get("echo_client_id"),
+        Some(&Value::from(client_id.clone())),
+        "and which client, since the two are both strings and a transport that swapped them \
+         would leave every assertion above green: {echoed:?}"
+    );
+}
+
+/// THE CODE EXCHANGE identifies itself as `authorization_code` (issue #113 criterion 1).
+///
+/// The exit-criterion test above uses `GOOD`, which proves a hook shaped a real token and says
+/// nothing about what the payload told it. Every door passes its grant as a LITERAL, so the
+/// failure this catches is a door copying its neighbour's string -- invisible to any test that
+/// only asks whether a hook ran, and wrong for any hook that gates on the grant.
+#[tokio::test]
+async fn the_code_exchange_tells_the_hook_which_grant_it_is() {
+    let harness = harness_with_hooks().await;
+    deploy(&harness, ironauth_hooks::fixtures::ECHO_REQUEST, 1).await;
+
+    let (access, id_token) = exchange(&harness).await.expect("the exchange succeeds");
+    let issued = claims(&access);
+    assert_eq!(
+        issued.get("echo_grant_type"),
+        Some(&Value::from("authorization_code")),
+        "the guest was told this is a code exchange: {issued:?}"
+    );
+    assert_eq!(
+        issued.get("echo_payload_version"),
+        Some(&Value::from(1)),
+        "and which payload version, which criterion 6 requires be explicit in EVERY \
+         invocation: {issued:?}"
+    );
+    // The ID-token half of the same invocation. `echo_subject` is the only claim that crosses
+    // in that direction, so a transport that dropped the id-token list entirely would leave
+    // every access-token assertion above green.
+    let id_claims = claims(&id_token);
+    assert!(
+        id_claims.get("echo_subject").is_some_and(Value::is_string),
+        "the hook shaped the ID token too, and knew whose token it was: {id_claims:?}"
+    );
 }
 
 /// THE REFRESH GRANT runs the hook (issue #113 criterion 1, which names it explicitly).
@@ -819,7 +883,7 @@ async fn the_client_credentials_grant_runs_the_hook() {
 #[tokio::test]
 async fn the_refresh_grant_runs_the_hook() {
     let harness = harness_with_hooks().await;
-    deploy(&harness, ironauth_hooks::fixtures::GOOD, 1).await;
+    deploy(&harness, ironauth_hooks::fixtures::ECHO_REQUEST, 1).await;
 
     let client_id = harness.client_id().to_string();
     let subject = harness.seed_unique_user().await;
@@ -866,11 +930,14 @@ async fn the_refresh_grant_runs_the_hook() {
         .as_str()
         .expect("access")
         .to_owned();
+    // The grant STRING, not just that a hook ran. A refresh reaching the same seam as the code
+    // exchange is the easy half; a refresh telling the hook it is an `authorization_code` is
+    // the failure a presence check cannot see, and a hook that gates on the grant would then
+    // shape a refresh as though it were a first issuance.
     assert_eq!(
-        claims(&access).get("tier"),
-        Some(&Value::from("gold")),
-        "a REFRESHED access token carries the hook's claim, or a client keeps an unshaped \
-         token alive indefinitely by refreshing it: {:?}",
+        claims(&access).get("echo_grant_type"),
+        Some(&Value::from("refresh_token")),
+        "a REFRESHED access token ran the hook AND was identified as a refresh: {:?}",
         claims(&access)
     );
 }
