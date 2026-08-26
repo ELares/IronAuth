@@ -961,11 +961,11 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     }
     locale_bundle.sort_by(|a, b| a.locale.cmp(&b.locale));
 
-    // Per-environment, per-client signup forms (issue #87): non-secret promotable config. The
-    // field list is embedded as PARSED JSON so it canonicalizes recursively (a decode fault here
-    // is a real persistence corruption, surfaced rather than swallowed). No secret and no PII
-    // travels (only trait pointers, bounded rules, and numeric ids). Ordered by the stable
-    // client-id natural key.
+    // Per-environment, per-client declarative claim mappings (issue #113): non-secret promotable
+    // config. The rule document is embedded as PARSED JSON so it canonicalizes recursively (a
+    // decode fault here is a real persistence corruption, surfaced rather than swallowed). No
+    // secret travels: a rule names claim names, a static value, and a token placement, never a
+    // credential. Ordered by the stable client-id natural key.
     let mut claims_mapping = Vec::new();
     for record in scoped.claims_mappings().list_all().await? {
         claims_mapping.push(ClaimsMappingSnapshot {
@@ -992,6 +992,11 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     // the_writes_arrived_in` pins the PROPERTY, and either mechanism alone satisfies it.
     claims_mapping.sort_by(|a, b| a.client_id.cmp(&b.client_id));
 
+    // Per-environment, per-client signup forms (issue #87): non-secret promotable config. The
+    // field list is embedded as PARSED JSON so it canonicalizes recursively (a decode fault here
+    // is a real persistence corruption, surfaced rather than swallowed). No secret and no PII
+    // travels (only trait pointers, bounded rules, and numeric ids). Ordered by the stable
+    // client-id natural key.
     let mut signup_form = Vec::new();
     for record in scoped.signup_forms().list_all().await? {
         let fields: serde_json::Value =

@@ -9,9 +9,11 @@
 //!
 //! What is proved here:
 //!
-//! - **Control-plane write, data-plane read.** A mapping is written on the role that owns the
-//!   lifecycle and read back on the role the issuance path uses; the data-plane role can read and
-//!   never write, which is the grant split the migration draws.
+//! - **The grant split, as the migration actually draws it today.** A mapping is written and
+//!   read back on the CONTROL plane, and the data plane holds nothing on this table at all --
+//!   not INSERT and not even SELECT. The read arrives with the mint-side reader, so the earlier
+//!   wording here ("read back on the role the issuance path uses") described a grant this
+//!   migration deliberately withholds.
 //! - **The promotable round trip.** A config-snapshot export carries the rules, and
 //!   `validate_document` accepts the exported bytes -- the binding between the export and the
 //!   import arm, which nothing exercised.
@@ -29,7 +31,7 @@ use sqlx::Row as _;
 const RULES: &str = r#"[{"kind":"rename","from":"dept","to":"department"},{"kind":"static","name":"tier","value":"gold"}]"#;
 
 #[tokio::test]
-async fn a_mapping_written_on_the_control_plane_reads_back_on_the_data_plane() {
+async fn a_mapping_written_on_the_control_plane_reads_back_on_the_control_plane() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -301,6 +303,27 @@ fn a_malformed_claims_mapping_document_is_refused_on_import() {
         );
     }
 
+    // The COUNT bound, which none of the cases above reach: raising
+    // `CLAIMS_MAPPING_MAX_RULES` from 32 to any larger number left this test green. The bound
+    // exists so an operator reads a violation naming the path rather than a constraint error
+    // from a transaction that already failed, so both halves are asserted -- the refusal, and
+    // the ceiling itself being importable.
+    let rule = r#"{"kind":"static","name":"tier"}"#;
+    let listing = |count: usize| {
+        document(&format!(
+            r#"{{"client_id":"cli_x","rules":[{}]}}"#,
+            vec![rule; count].join(",")
+        ))
+    };
+    let violations = validate_document(listing(33).as_bytes())
+        .expect_err("thirty-three rules must be refused on import");
+    assert!(
+        format!("{violations:?}").contains("at most 32 rules"),
+        "the refusal must NAME the bound, so an operator can act on it and so a document          refused for some other reason cannot pass this test: {violations:?}"
+    );
+    validate_document(listing(32).as_bytes())
+        .expect("thirty-two rules is the documented ceiling and must import");
+
     // And one that is well-formed is accepted, so the assertions above are not passing because
     // everything is refused.
     let ok = document(r#"{"client_id":"cli_x","rules":[{"kind":"static","name":"tier"}]}"#);
@@ -444,6 +467,42 @@ async fn a_write_records_an_audit_row_naming_the_client() {
         "the audit target is the CLIENT: this table has no id of its own, and the client is the \
          thing whose tokens changed shape"
     );
+
+    // SAME TRANSACTION, which is what the method's doc line claims and what makes the audit a
+    // record rather than a best effort. Asserting only that a row EXISTS passes for a write
+    // that commits the mapping and then writes the audit separately -- so a crash, a failed
+    // second statement, or a rolled-back audit leaves a changed token shape with no record of
+    // who changed it, and every assertion above still holds.
+    //
+    // `xmin` is the transaction that produced each row. Equal xmin is one transaction; it is
+    // the only evidence available after the fact, since both rows are simply present either
+    // way.
+    let mapping_xmin: u32 = sqlx::query_scalar(
+        "SELECT xmin::text::bigint::int8 FROM claims_mappings \
+         WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(client.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .map(|value: i64| u32::try_from(value).expect("xmin fits"))
+    .expect("the mapping row");
+    let audit_xmin: u32 = sqlx::query_scalar(
+        "SELECT xmin::text::bigint::int8 FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'claims_mapping.set'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .map(|value: i64| u32::try_from(value).expect("xmin fits"))
+    .expect("the audit row");
+    assert_eq!(
+        mapping_xmin, audit_xmin,
+        "the mapping and its audit row must be written by ONE transaction, so neither can \
+         survive without the other"
+    );
 }
 
 /// A write for a client of ANOTHER scope is a uniform not-found.
@@ -467,4 +526,247 @@ async fn a_write_for_a_client_of_another_scope_is_refused() {
         "a client id carries its scope, so one from elsewhere must not address this one: \
          {refused:?}"
     );
+}
+
+/// Pin a control-plane connection to a scope so the policy admits its writes.
+async fn pinned(
+    db: &TestDatabase,
+    scope: &ironauth_store::Scope,
+) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    let mut conn = db.control_pool().acquire().await.expect("acquire control");
+    for (setting, value) in [
+        ("ironauth.tenant_id", scope.tenant().to_string()),
+        ("ironauth.environment_id", scope.environment().to_string()),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, false)")
+            .bind(setting)
+            .bind(value)
+            .execute(&mut *conn)
+            .await
+            .expect("pin scope");
+    }
+    conn
+}
+
+/// Insert a `rules` document straight through SQL, bypassing every Rust fence.
+///
+/// The point of these cases is the DATABASE's answer. Going through the repository would
+/// measure `validate` instead, which is a different check of a different thing -- and, for the
+/// count, one that carries no bound at all.
+async fn raw_insert(
+    db: &TestDatabase,
+    scope: &ironauth_store::Scope,
+    client_id: &str,
+    rules: &str,
+) -> Result<(), sqlx::Error> {
+    let mut conn = pinned(db, scope).await;
+    sqlx::query(
+        "INSERT INTO claims_mappings (tenant_id, environment_id, client_id, rules) \
+         VALUES ($1, $2, $3, $4::jsonb)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(client_id)
+    .bind(rules)
+    .execute(&mut *conn)
+    .await
+    .map(|_| ())
+}
+
+/// The shape constraint DECIDES, for both of the things it is written to decide.
+///
+/// Round 2 renamed this constraint and rewrote it as a CASE, and the commit message listed
+/// "the shape constraint removed" among six mutants "all caught". It was not caught, and it
+/// could not have been: no test in the tree ever handed this table a document. `CHECK (true)`
+/// in place of the whole constraint left every test green, and so did deleting the constraint
+/// outright. That is what this test exists to make false.
+///
+/// Each case is a separate assertion about a separate half of the expression:
+///
+/// - a non-array is refused as a CHECK VIOLATION (SQLSTATE 23514) naming this constraint, not
+///   as SQLSTATE 22023 -- which is what a bare `jsonb_array_length(rules) <= 32` raises, and
+///   is the failure mode the CASE was written to remove. Asserting only "it was refused"
+///   would pass for the version this round replaced.
+/// - thirty-three elements is refused by the SAME constraint, so the count bound is live.
+/// - thirty-two is ACCEPTED, so the bound is the documented one rather than any smaller
+///   number, and the constraint is not simply refusing everything.
+#[tokio::test]
+async fn the_shape_constraint_decides_both_the_type_and_the_count() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // A rule the Rust validator would accept, so nothing here is refused for its CONTENT.
+    let rule = r#"{"kind":"static","name":"tier","value":"gold"}"#;
+
+    for (label, document) in [
+        ("an object", r#"{"kind":"static"}"#.to_string()),
+        ("a JSON null", "null".to_string()),
+        ("a bare string", r#""[]""#.to_string()),
+        ("a number", "7".to_string()),
+        (
+            "thirty-three rules",
+            format!("[{}]", vec![rule; 33].join(",")),
+        ),
+    ] {
+        let refused = raw_insert(&db, &scope, "cli_shape", &document).await;
+        let error = refused.expect_err(&format!("{label} must not be storable as a rule set"));
+        let database = error
+            .as_database_error()
+            .unwrap_or_else(|| panic!("{label} must be refused BY THE DATABASE: {error}"));
+        assert_eq!(
+            database.code().as_deref(),
+            Some("23514"),
+            "{label} must be a CHECK violation; 22023 means the length test ran on a non-array, \
+             which is the ordering bug this constraint was rewritten to remove: {error}"
+        );
+        assert_eq!(
+            database.constraint(),
+            Some("claims_mappings_rules_shape"),
+            "{label} must be refused by the shape constraint by NAME, so a rename that leaves \
+             the check unreachable fails here: {error}"
+        );
+    }
+
+    // The documented ceiling itself is storable. Without this the whole test passes for
+    // `CHECK (false)`, which refuses every document above for the wrong reason.
+    raw_insert(
+        &db,
+        &scope,
+        "cli_shape_max",
+        &format!("[{}]", vec![rule; 32].join(",")),
+    )
+    .await
+    .expect("thirty-two rules is the documented ceiling and must be storable");
+}
+
+/// Both halves of the RLS predicate decide, and the READ side is not carried by the tenant key.
+///
+/// The isolation test above seeds two scopes, and two seeded scopes are two TENANTS, so the
+/// tenant conjunct alone answers it: deleting `AND environment_id = ...` from the USING clause
+/// left the whole suite green. A mapping is per-ENVIRONMENT, and promoting dev to prod is the
+/// operation this table exists to serve, so the environment conjunct is the one that matters
+/// most and was the one nothing measured.
+#[tokio::test]
+async fn the_read_policy_separates_two_environments_of_one_tenant() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let dev = db.seed_scope(&env).await;
+    let staging = ironauth_store::Scope::new(
+        dev.tenant(),
+        db.seed_environment_with_kind(&env, dev.tenant(), "staging", None)
+            .await,
+    );
+    let client = ClientId::generate(&env, &dev);
+
+    db.control_store()
+        .scoped(dev)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .claims_mappings()
+        .set(&env, &client, RULES)
+        .await
+        .expect("write in dev");
+
+    // Same tenant, other environment, no WHERE clause: whatever comes back is the policy's
+    // answer and nothing else.
+    let mut conn = pinned(&db, &staging).await;
+    let rows = sqlx::query("SELECT client_id FROM claims_mappings")
+        .fetch_all(&mut *conn)
+        .await
+        .expect("raw read");
+    assert!(
+        rows.is_empty(),
+        "a dev mapping must not be visible from staging of the SAME tenant: the environment \
+         conjunct is what separates them, and the tenant key cannot stand in for it"
+    );
+}
+
+/// The WRITE side of the policy decides too, on each conjunct separately.
+///
+/// `WITH CHECK (true)` in place of the predicate left the suite green: a connection pinned to
+/// one scope could INSERT a row addressed to another. Reading is not what makes a policy safe
+/// when the plane that writes is the one being contained.
+///
+/// The two cases vary ONE dimension each. A single case differing in both tenant and
+/// environment would pass with either conjunct deleted.
+#[tokio::test]
+async fn the_write_policy_refuses_a_row_addressed_to_another_scope() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let here = db.seed_scope(&env).await;
+    let other_tenant = db.seed_scope(&env).await;
+    let sibling_environment = db
+        .seed_environment_with_kind(&env, here.tenant(), "staging", None)
+        .await;
+
+    let rule_set = "[]";
+    for (label, tenant, environment) in [
+        (
+            "another environment of the same tenant",
+            here.tenant().to_string(),
+            sibling_environment.to_string(),
+        ),
+        (
+            "another tenant entirely",
+            other_tenant.tenant().to_string(),
+            other_tenant.environment().to_string(),
+        ),
+    ] {
+        // Pinned HERE throughout: the row's addressing is the only thing that varies.
+        let mut conn = pinned(&db, &here).await;
+        let refused = sqlx::query(
+            "INSERT INTO claims_mappings (tenant_id, environment_id, client_id, rules) \
+             VALUES ($1, $2, 'cli_elsewhere', $3::jsonb)",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(rule_set)
+        .execute(&mut *conn)
+        .await;
+        let error = refused.expect_err(&format!(
+            "a connection pinned to one scope must not write a row addressed to {label}"
+        ));
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("42501"),
+            "{label} must be refused by the POLICY (42501), not by a constraint or a filter, \
+             which would leave the policy itself unmeasured: {error}"
+        );
+    }
+}
+
+/// The data plane holds NO privilege on this table at all, not even SELECT.
+///
+/// The migration says the reader "arrives with the mint-side reader" and that "a privilege held
+/// by nobody is one an attacker inherits for free". The grant test above only attempts an
+/// INSERT, so ADDING `GRANT SELECT ... TO ironauth_app` -- handing the data plane the read this
+/// file explicitly withholds -- left the whole suite green. A withheld privilege that no test
+/// attempts is indistinguishable from one that was quietly granted.
+#[tokio::test]
+async fn the_data_plane_cannot_even_read_a_mapping_yet() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let mut app = db.app_pool().acquire().await.expect("acquire app");
+    let refused = sqlx::query("SELECT client_id FROM claims_mappings")
+        .fetch_all(&mut *app)
+        .await;
+    let error = refused.expect_err("the data plane holds no SELECT on this table yet");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("42501"),
+        "the refusal must be a GRANT refusal (42501). An empty result set would ALSO look like \
+         isolation, and would still mean the privilege had been handed over: {error}"
+    );
+    // Named so the scope seed is not mistaken for decoration: the table exists and is empty for
+    // this scope, which is exactly the state where a missing grant and a working policy look
+    // the same from the outside.
+    let _ = scope;
 }

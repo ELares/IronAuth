@@ -74,19 +74,13 @@ CREATE TABLE claims_mappings (
     -- and catching that here means a malformed write cannot become a decode failure on the
     -- issuance path.
     --
-    -- NAMED to sort FIRST, deliberately. Postgres evaluates CHECK constraints in constraint-NAME
-    -- order, and the length check below RAISES 22023 on a non-array rather than returning false.
-    -- Named the obvious way, this constraint could never fire for any value: dropping it
-    -- entirely produced byte-identical errors. The `_a_`/`_b_` infixes are what make the
-    -- structural check the one that answers.
     -- ONE constraint for the whole document shape, not two ordered ones.
     --
     -- The first version had a separate array check and a separate length check, and the array
     -- check could never fire: Postgres evaluates CHECKs in constraint-NAME order, and
     -- `jsonb_array_length` RAISES 22023 on a non-array rather than returning false, so whichever
-    -- of the two sorted first decided every case. Renaming them with `_a_`/`_b_` infixes fixed
-    -- the ordering and left the fix resting on alphabetical luck, which nothing measures and the
-    -- next rename quietly breaks.
+    -- of the two sorted first decided every case. Renaming them to fix the ordering left the fix
+    -- resting on alphabetical luck, which nothing measures and the next rename quietly breaks.
     --
     -- A CASE removes the dependence: the type test guards the length test in one expression, so
     -- a non-array, a scalar and a JSON null are all plain check violations naming this

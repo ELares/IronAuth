@@ -32240,10 +32240,6 @@ fn signup_form_from_row(row: &sqlx::postgres::PgRow) -> SignupFormRecord {
     }
 }
 
-/// The mutating per-environment, per-client signup form repository for one scope and actor (issue
-/// #87): set (create or overwrite) a client's form, audited, and delete it, audited. The field
-/// list is stored verbatim as the caller's ALREADY fail-fast validated JSON string (the admin
-/// signup-forms path validates it against the scope's active trait schema before the write).
 /// The mutating declarative claim mapping repository for one scope and actor (issue #113).
 ///
 /// The rule document is stored VERBATIM as the caller's already-validated JSON string. This
@@ -32313,6 +32309,10 @@ impl ActingClaimsMappingRepo<'_> {
     }
 }
 
+/// The mutating per-environment, per-client signup form repository for one scope and actor (issue
+/// #87): set (create or overwrite) a client's form, audited, and delete it, audited. The field
+/// list is stored verbatim as the caller's ALREADY fail-fast validated JSON string (the admin
+/// signup-forms path validates it against the scope's active trait schema before the write).
 pub struct ActingSignupFormRepo<'a> {
     store: &'a Store,
     scope: Scope,
