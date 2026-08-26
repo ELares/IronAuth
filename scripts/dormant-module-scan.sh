@@ -30,7 +30,7 @@ cd "$(dirname "$0")/.."
 # One entry per line, `crate/module`, with the reason in the comment above it.
 # Comment lines and blanks are stripped, so each entry can carry its reason next to it.
 allowlist_entries() {
-  sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' <<'ALLOWLIST'
+  sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' <<'ALLOWLIST'
 # untraced; see #774
 ironauth-oidc/mds3_sync
 
@@ -114,13 +114,51 @@ while read -r entry; do
   entry_crate="${entry%%/*}"
   entry_module="${entry#*/}"
 
+  # A nested path can never be flagged in either direction: the main loop globs
+  # crates/*/src/*.rs so it never sees one, and a Rust path has no `/`, so `refs_for` on
+  # `flow/consent` matches nothing and the entry reads as permanently callerless. Rejected
+  # rather than tolerated, because the format comment above already calls it invalid.
+  case "$entry_module" in
+    */*)
+      echo "dormant-module-scan: allowlist entry $entry is not crate/module." >&2
+      echo "  The scan only sees crates/<crate>/src/<module>.rs; a nested path can never" >&2
+      echo "  be flagged, so an entry for one is unfalsifiable. Remove it." >&2
+      stale=$((stale + 1))
+      continue
+      ;;
+  esac
+
   # An entry naming a module that is gone is stale in the other direction, and nothing caught
   # it: renaming a file leaves the allowlist asserting something about a path that does not
   # exist, and the scan stays green forever because the loop above never sees the module
   # either. This also catches a mistyped crate half, which nothing checked at all.
-  if [ ! -f "crates/${entry_crate}/src/${entry_module}.rs" ]; then
-    echo "dormant-module-scan: allowlist entry $entry names no module:" >&2
-    echo "  crates/${entry_crate}/src/${entry_module}.rs does not exist. Remove or fix the line." >&2
+  #
+  # Both layouts count as existing. `foo/mod.rs` is a real module the tree already uses, and
+  # calling it missing would print a false statement and ask the author to delete a still-valid
+  # claim.
+  entry_file="crates/${entry_crate}/src/${entry_module}.rs"
+  if [ ! -f "$entry_file" ]; then
+    if [ -f "crates/${entry_crate}/src/${entry_module}/mod.rs" ]; then
+      entry_file="crates/${entry_crate}/src/${entry_module}/mod.rs"
+    else
+      echo "dormant-module-scan: allowlist entry $entry names no module:" >&2
+      echo "  $entry_file does not exist. Remove or fix the line." >&2
+      stale=$((stale + 1))
+      continue
+    fi
+  fi
+
+  # The main loop skips a module for TWO reasons, and until now this checked only one. A
+  # module under the public-surface floor is skipped before the allowlist is ever consulted, so
+  # its entry decides nothing -- and shrinking a module's surface, or raising the floor, made
+  # every entry below it silently inert while the gate stayed green.
+  entry_items="$(grep -cE '^pub (fn|struct|enum|trait|async fn|const)' "$entry_file" || true)"
+  entry_items="$(echo "$entry_items" | tr -d ' ')"
+  [ -n "$entry_items" ] || entry_items=0
+  if [ "$entry_items" -lt "$min_public_items" ]; then
+    echo "dormant-module-scan: allowlist entry $entry is INERT: $entry_items public items." >&2
+    echo "  The scan skips anything under $min_public_items, so this entry decides nothing." >&2
+    echo "  Remove the line rather than leaving a claim nobody rechecks." >&2
     stale=$((stale + 1))
     continue
   fi

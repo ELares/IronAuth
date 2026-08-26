@@ -258,7 +258,7 @@ impl RefusalReason {
     /// hook refusal has only a claim name. A single `Display` covering both had to invent a
     /// rule index for [`Self::TooManyClaims`], which no mapping can ever produce, and that arm
     /// was unreachable text nobody could read.
-    fn describe(self, claim: &str) -> String {
+    pub(crate) fn describe(self, claim: &str) -> String {
         match self {
             Self::Reserved => {
                 format!("writes the reserved claim `{claim}`, which nothing may set")
@@ -278,8 +278,21 @@ impl RefusalReason {
 }
 
 impl core::fmt::Display for RefusalReason {
+    /// Renders WITHOUT a claim name, because this impl does not have one.
+    ///
+    /// The obvious implementation delegates to [`Self::describe`] with a placeholder, and that
+    /// is a trap: `format!("{reason}")` would then print a literal `<claim>` into an audit row
+    /// where an operator expects the claim that was refused. A caller holding the name should
+    /// call `describe` with it; this is what is honest to say when nobody does.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.describe("<claim>"))
+        let text = match self {
+            Self::Reserved => "a reserved claim, which nothing may set",
+            Self::EmptyName => "a claim with an empty name",
+            Self::Untrimmed => "a claim name with leading or trailing whitespace",
+            Self::NameTooLong => "a claim name over the byte limit",
+            Self::TooManyClaims => "more claims than the limit allows",
+        };
+        f.write_str(text)
     }
 }
 
@@ -939,6 +952,67 @@ mod tests {
         );
     }
 
+    /// The refusal ROW COUNT is bounded, and what did not fit is counted.
+    ///
+    /// Truncating each name bounds one dimension and leaves the other open: a million refused
+    /// claims is a million rows, so the audit sink is still usable as a write buffer with
+    /// shorter strings in it.
+    #[test]
+    fn the_number_of_reported_refusals_is_bounded() {
+        let mut returned = BTreeMap::new();
+        for index in 0..10_000 {
+            returned.insert(format!("tier{index:05} "), serde_json::json!(1));
+        }
+        let outcome = super::filter_hook_claims(&returned);
+        assert!(
+            outcome.accepted.is_empty(),
+            "every name here has a trailing space, so every one is refused"
+        );
+        assert_eq!(outcome.refused.len(), super::MAX_REFUSALS_REPORTED);
+        assert_eq!(
+            outcome.refused.len() + outcome.refusals_not_reported,
+            10_000,
+            "the count of refusals must stay true even when the rows are a sample"
+        );
+    }
+
+    /// An ordinary response reports every refusal and counts none as dropped.
+    #[test]
+    fn an_ordinary_response_reports_every_refusal() {
+        let mut returned = BTreeMap::new();
+        returned.insert("sub".to_owned(), serde_json::json!(1));
+        returned.insert("tier".to_owned(), serde_json::json!(1));
+        let outcome = super::filter_hook_claims(&returned);
+        assert_eq!(outcome.refused.len(), 1);
+        assert_eq!(
+            outcome.refusals_not_reported, 0,
+            "nothing was dropped, so nothing may be counted as dropped"
+        );
+    }
+
+    /// `refused` is sorted by the name AS REPORTED, including truncated ones.
+    #[test]
+    fn refusals_are_sorted_by_the_name_they_report() {
+        let mut returned = BTreeMap::new();
+        returned.insert("a".repeat(200), serde_json::json!(1));
+        returned.insert(
+            format!("{}\u{4e2d}{}", "a".repeat(126), "a".repeat(100)),
+            serde_json::json!(1),
+        );
+        let outcome = super::filter_hook_claims(&returned);
+        let reported: Vec<&str> = outcome
+            .refused
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let mut sorted = reported.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            reported, sorted,
+            "the emitted order must match the names emitted, not the names received"
+        );
+    }
+
     /// A hook cannot contribute more than `MAX_HOOK_CLAIMS`, and the overflow is audited.
     #[test]
     fn a_hook_cannot_return_unboundedly_many_claims() {
@@ -948,10 +1022,14 @@ mod tests {
         }
         let outcome = super::filter_hook_claims(&returned);
         assert_eq!(outcome.accepted.len(), super::MAX_HOOK_CLAIMS);
+        // 4N returned, N accepted, 3N refused as overflow -- but only MAX_REFUSALS_REPORTED
+        // rows are transcribed and the rest are counted, so the two numbers must still sum to
+        // the overflow.
+        assert_eq!(outcome.refused.len(), super::MAX_REFUSALS_REPORTED);
         assert_eq!(
-            outcome.refused.len(),
+            outcome.refused.len() + outcome.refusals_not_reported,
             super::MAX_HOOK_CLAIMS * 3,
-            "the overflow must be reported, not dropped"
+            "every overflowing claim must be reported or counted, never dropped"
         );
         assert!(
             outcome
@@ -1027,6 +1105,16 @@ mod tests {
             outcome.refused[0].0.ends_with("..."),
             "a truncated name must say it was truncated"
         );
+        // The CONTENT, not just the ceiling. Truncating to zero bytes satisfies every length
+        // assertion above and reports every over-long claim as the bare string "...", which
+        // tells an auditor nothing about which claim was attempted.
+        assert!(
+            outcome.refused[0]
+                .0
+                .starts_with(&"c".repeat(super::MAX_CLAIM_NAME_BYTES)),
+            "the reported name must keep the claim's prefix: {}",
+            outcome.refused[0].0
+        );
     }
 
     /// Truncation never splits a character.
@@ -1055,6 +1143,14 @@ mod tests {
         assert!(
             outcome.refused[0].0.ends_with("..."),
             "a truncated name must say it was truncated"
+        );
+        // 42 whole three-byte characters is 126 bytes, the most that fits under 128 without
+        // splitting the 43rd. Pins that the walk kept a prefix rather than collapsing to
+        // nothing.
+        assert!(
+            outcome.refused[0].0.starts_with(&"\u{4e2d}".repeat(42)),
+            "the reported name must keep whole characters from the prefix: {}",
+            outcome.refused[0].0
         );
     }
 
@@ -1276,13 +1372,32 @@ pub struct HookClaimsOutcome {
     /// The reason travels with the name because the two refusals need different fixes, and an
     /// audit row that says only "refused" cannot tell an integrator which one they hit.
     ///
+    /// Bounded at [`MAX_REFUSALS_REPORTED`] rows. Truncating each NAME bounded one dimension
+    /// and left the other open: a hook returning a million claims produced a million rows, so
+    /// the audit sink was still usable as a write buffer with shorter strings.
+    /// [`Self::refusals_not_reported`] carries what did not fit, so the row count is bounded
+    /// without the count of refusals becoming a lie.
+    ///
     /// NOT an error and not silently discarded: a list. Criterion 5 says an attempt is
     /// "rejected and AUDITED", and an auditor needs to know which claims were attempted by
     /// whom. Returning them lets the caller write that row; dropping them would leave the
     /// audit with nothing to say, and failing the whole invocation would let one bad claim
     /// take down every login through a client whose hook is merely sloppy.
     pub refused: Vec<(String, RefusalReason)>,
+    /// How many refusals did not fit in [`Self::refused`].
+    ///
+    /// Zero on every ordinary response. Non-zero says the audit row is a sample rather than the
+    /// whole story, which is a thing an auditor must be told rather than left to infer from a
+    /// suspiciously round row count.
+    pub refusals_not_reported: usize,
 }
+
+/// The most refusal rows one response reports.
+///
+/// Twice [`MAX_HOOK_CLAIMS`], so a hook that misnames every claim it was entitled to send still
+/// has every one of them named, and a hook returning orders of magnitude more is summarised
+/// rather than transcribed.
+pub const MAX_REFUSALS_REPORTED: usize = MAX_HOOK_CLAIMS * 2;
 
 /// Filter what a hook returned, refusing the claims no hook may set.
 ///
@@ -1317,17 +1432,28 @@ pub fn filter_hook_claims(returned: &BTreeMap<String, serde_json::Value>) -> Hoo
     let mut outcome = HookClaimsOutcome {
         accepted: BTreeMap::new(),
         refused: Vec::new(),
+        refusals_not_reported: 0,
+    };
+    let record = |name: String, reason: RefusalReason, outcome: &mut HookClaimsOutcome| {
+        if outcome.refused.len() < MAX_REFUSALS_REPORTED {
+            outcome.refused.push((name, reason));
+        } else {
+            outcome.refusals_not_reported += 1;
+        }
     };
     for (name, value) in returned {
         if let Some(reason) = refuse_name(name) {
-            outcome.refused.push((reportable(name), reason));
+            record(reportable(name), reason, &mut outcome);
         } else if outcome.accepted.len() < MAX_HOOK_CLAIMS {
             outcome.accepted.insert(name.clone(), value.clone());
         } else {
-            outcome
-                .refused
-                .push((name.clone(), RefusalReason::TooManyClaims));
+            record(name.clone(), RefusalReason::TooManyClaims, &mut outcome);
         }
     }
+    // Sorted by the name AS REPORTED, which is what the field doc promises. Input order is
+    // claim-name order because the parameter is a BTreeMap, but truncation breaks it: a
+    // truncated name ends in `...`, and `.` sorts below every letter, so two names differing
+    // only past the limit come out in the opposite order from the one they went in.
+    outcome.refused.sort_by(|left, right| left.0.cmp(&right.0));
     outcome
 }
