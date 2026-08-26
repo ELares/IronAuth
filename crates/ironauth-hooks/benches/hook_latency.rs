@@ -36,21 +36,28 @@ const WARM_ITERATIONS: usize = 5_000;
 /// One sample's elapsed nanoseconds, as a number the JSON line can carry exactly.
 ///
 /// `Instant::elapsed().as_nanos()` is a `u128`, and casting one to `f64` loses precision above
-/// 2^53 nanoseconds -- about 104 days. Every sample here is a single hook invocation bounded by
-/// an epoch deadline measured in milliseconds, so the value is representable exactly; the
-/// conversion is done once, here, with that reasoning attached, rather than at the print site
-/// where it reads as an unexamined cast.
+/// 2^53 nanoseconds -- about 104 days.
+///
+/// The first version guarded that with a `debug_assert!`. `cargo bench` builds on the bench
+/// profile, which inherits release, and the target is `test = false`, so the assertion could not
+/// execute anywhere -- and the `#[expect]` beside it cited a guard that never runs. A bound
+/// nothing evaluates is not a bound, so the value is CLAMPED instead: a sample past the exactly
+/// representable range is reported at that range rather than silently rounded, and the reported
+/// number stays one the JSON line carries exactly.
+///
+/// In practice the clamp is unreachable -- an invocation is bounded by an epoch deadline
+/// measured in milliseconds -- but "unreachable" is the claim the first version made and could
+/// not support.
+const EXACT_NANOS: u128 = 1 << 53;
+
 fn micros(nanos: u128) -> f64 {
-    debug_assert!(
-        nanos < (1_u128 << 53),
-        "a single hook invocation cannot take 104 days; the exactness argument for this cast \
-         rests on that"
-    );
+    let bounded = nanos.min(EXACT_NANOS);
+    // Every value reaching this point is at most 2^53, which `f64` represents exactly.
     #[expect(
         clippy::cast_precision_loss,
-        reason = "bounded above by the debug assertion: a hook invocation is microsecond-scale"
+        reason = "clamped to 2^53 on the line above, which is exactly representable"
     )]
-    let nanos = nanos as f64;
+    let nanos = bounded as f64;
     nanos / 1000.0
 }
 

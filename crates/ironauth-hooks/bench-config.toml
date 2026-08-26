@@ -33,3 +33,25 @@ cold_p95_micros = 120
 # variance teaches people to re-run it until it passes, which is worse than no benchmark: the
 # gates above are the real bound, and this catches a step change rather than a drift.
 tolerance_percent = 50
+
+# The CEILING on the line above, and the reason it exists is the line above.
+#
+# `allowed = baseline * (1 + tolerance/100)`, so a large enough tolerance admits every possible
+# measurement and the regression arm stops being able to fail -- while the job still prints
+# "clean". One config line, no diff anyone would read twice. This is the same mechanism
+# `scripts/invariant-lints.sh` uses for its exemption ceiling, and the same rule applies: raising
+# it is a reviewable line in the change that needs it, with the reason attached.
+#
+# 100% is the most a noisy shared runner can justify: past a doubling, a "regression within
+# tolerance" is not variance.
+max_tolerance_percent = 100
+
+[samples]
+# The FLOORS on how many samples a published p95 may rest on.
+#
+# The benchmark reports its iteration counts and nothing read them, so `COLD_ITERATIONS` could
+# fall from 200 to 1 -- making the "p95" a single sample -- invisibly to the gate and to the
+# baseline it is compared against. A number is only comparable to another number taken the same
+# way, and the sample count is part of "the same way".
+min_cold_iterations = 200
+min_warm_iterations = 5000

@@ -73,6 +73,16 @@ jobs:
           version="${GITHUB_REF_NAME#ironauth-v}"
           awk -v ver="$version" '/^## /{p=($0 == "## " ver)} p' crates/ironauth/CHANGELOG.md > dist/RELEASE_NOTES.md
           test -s dist/RELEASE_NOTES.md || echo "See crates/ironauth/CHANGELOG.md" > dist/RELEASE_NOTES.md
+      # Issue #114 criterion 4 asks for the hook latency numbers to be "published per release",
+      # and until this they lived only in a CI job log. The baseline is the number the gate
+      # enforces against, so publishing IT is publishing what the release was measured to.
+      #
+      # `test -s` rather than a silent copy: a release whose asset list quietly lost a file
+      # publishes nothing and says nothing, which is the failure mode this criterion is about.
+      - name: Publish the hook latency numbers
+        run: |
+          test -s crates/ironauth-hooks/bench-baseline.json
+          cp crates/ironauth-hooks/bench-baseline.json dist/hook-latency.json
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -80,7 +90,8 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes-file dist/RELEASE_NOTES.md \
-            dist/ironauth-x86_64-linux-musl dist/SHA256SUMS dist/config-schema.json dist/*.cdx.json
+            dist/ironauth-x86_64-linux-musl dist/SHA256SUMS dist/config-schema.json dist/*.cdx.json \
+            dist/hook-latency.json
 
   image:
     name: container image, signed
