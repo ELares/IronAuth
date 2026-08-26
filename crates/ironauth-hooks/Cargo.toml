@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-hooks"
+version = "0.1.0"
+description = "In-process WASM component hooks for IronAuth: a deny-by-default capability sandbox with fuel, deadline, and memory bounds"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The WASM runtime (issue #114). Apache-2.0 WITH LLVM-exception, and its MSRV is 1.85,
+# which is this workspace's promise exactly.
+#
+# `cranelift` is the compiling backend and is what makes AOT precompilation possible; the
+# runtime never compiles a hook on the request path, only deserializes what deployment
+# already compiled. See `engine.rs` for why that distinction is a security boundary and
+# not just a latency one.
+wasmtime = { version = "48", default-features = false, features = [
+    "component-model",
+    "cranelift",
+    "runtime",
+    "std",
+] }
+# The WASI host implementations. Only thirteen of its interfaces are ever added to a
+# linker; see `sandbox.rs` for the list and for what is deliberately left out.
+wasmtime-wasi = "48"
+wasmtime-wasi-io = "48"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+ironauth-store = { workspace = true }
+
+[lints]
+workspace = true

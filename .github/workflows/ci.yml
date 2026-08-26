@@ -38,6 +38,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       - run: cargo fmt --all --check
 
   clippy:
@@ -49,6 +60,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -283,6 +305,17 @@ jobs:
             exit 1
           fi
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - name: tests (workspace, all features)
         run: cargo test --workspace --all-features
@@ -370,6 +403,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       # Built from git rather than crates.io: `ironbus-cli` (which carries the broker
       # binary) is not published, only the CLIENT is. Pinned to an exact COMMIT rather
@@ -416,6 +460,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-features --all-targets
 
@@ -426,6 +481,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       - name: Install musl target for the pinned toolchain
         # rust-toolchain.toml pins the toolchain cargo actually uses, so the
         # target must be added through rustup (which honors the pin), not via
@@ -459,6 +525,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       # The emulator brings up its OWN throwaway cluster, so this job needs the Postgres
       # BINARIES but no Postgres service: `initdb` and `pg_ctl`, which is exactly what
@@ -542,6 +619,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
 
       # Linux has no keychain until something provides the Secret Service over D-Bus. macOS
@@ -588,6 +676,17 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
+        # so every job that compiles the workspace needs the target. Added through rustup
+        # rather than the action's `targets:` input for the reason the musl job records:
+        # rust-toolchain.toml pins the toolchain cargo actually uses, and the action only
+        # equips its own.
+        #
+        # The fixtures are not optional and are deliberately not skippable. They are the
+        # hooks that spin, allocate, and try to open a socket, and without them the sandbox
+        # tests verify nothing while still reporting green.
+        run: rustup target add wasm32-wasip2
       # This job compiles ironauth-admin and ironauth-config through the
       # openapi-check / config-schema freshness steps; cache the build so those
       # do not pay a cold compile on every run.

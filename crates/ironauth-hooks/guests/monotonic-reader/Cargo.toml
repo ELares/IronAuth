@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "monotonic-reader"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+# The generated WASI bindings, used INSTEAD of `std::time`. std::time pulls
+# `wasi:clocks/wall-clock` as well as the monotonic one, and the sandbox does not link
+# wall-clock, so a std-time guest never instantiates. Calling the monotonic interface directly
+# keeps this fixture's import list to the same fifteen every other guest has, which is what
+# lets it reach the frozen clock and observe it.
+wasi = "0.14"

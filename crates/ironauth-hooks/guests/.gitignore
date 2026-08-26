@@ -1,0 +1,3 @@
+# The guest fixtures are built into the host crate's OUT_DIR by build.rs, but a direct
+# `cargo build` here (which is how you debug a fixture) writes a local target/ instead.
+target/

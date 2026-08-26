@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The guest fixtures, as their own workspace.
+#
+# Excluded from the main workspace on purpose: these compile to wasm32-wasip2, and a member of
+# the host workspace would be built for the host target by every `cargo build --workspace`,
+# where they do not link and have no meaning. `crates/ironauth-hooks/build.rs` drives this
+# workspace with its own target directory.
+[workspace]
+resolver = "2"
+members = ["good", "fuel-bomb", "memory-bomb", "net-escape", "wall-clock-escape", "monotonic-reader", "decliner"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+wit-bindgen = "0.46"
+
+# Small and fast: these are test fixtures, and a 2 MB fixture would make the cold-start
+# measurement a measurement of debug symbols.
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
