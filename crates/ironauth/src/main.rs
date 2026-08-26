@@ -1348,6 +1348,10 @@ async fn build_oidc_plane(
                 None
             }
         };
+    // Cloned BEFORE the state takes ownership: the messaging producer installed below needs its
+    // own handles, and both are cheap to clone (the store's pool is reference counted).
+    let messaging_store = store.clone();
+    let messaging_env = env.clone();
     let state = match client_key_resolver {
         Some(resolver) => OidcState::with_client_key_resolver(
             store,
@@ -1382,8 +1386,26 @@ async fn build_oidc_plane(
     // `None` and the logging transport is installed exactly as before.
     .with_verification_sender(DEV_CAPTURE.get().map_or_else(
         || {
-            std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender)
-                as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
+            // The messaging ledger's FIRST PRODUCER (issue #111). Until this, `enqueue` had no
+            // production caller at all: the ledger, the collapse, the rate limit, the
+            // suppression check, the failover and both management endpoints were implemented,
+            // tested, and fed by nothing.
+            //
+            // Gated on `messaging.delivery_enabled` alone, so a deployment that has not turned
+            // messaging on keeps the logging transport and behaves exactly as before. Turning it
+            // on is what makes a new-device notice a real queued message.
+            if config.messaging.delivery_enabled {
+                std::sync::Arc::new(
+                    ironauth_oidc::message_sender::MessagingVerificationSender::new(
+                        messaging_store.clone(),
+                        messaging_env.clone(),
+                        ironauth_store::message_rate::RateBudget::new(3, 3_600),
+                    ),
+                ) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
+            } else {
+                std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender)
+                    as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
+            }
         },
         |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>,
     ))

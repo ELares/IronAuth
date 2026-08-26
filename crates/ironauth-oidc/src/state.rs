@@ -3490,11 +3490,13 @@ impl OidcState {
     /// single-use "this wasn't me" link. Delivery reuses the #68 `VerificationSender`
     /// stub (the default sender performs no delivery; the full messaging platform is M11),
     /// so a deployment with no transport wired behaves exactly as before.
-    pub(crate) fn deliver_new_device_notice(
+    pub(crate) async fn deliver_new_device_notice(
         &self,
         message: &crate::verification::NewDeviceNotice<'_>,
     ) {
-        self.verification_sender.deliver_new_device_notice(message);
+        self.verification_sender
+            .deliver_new_device_notice(message)
+            .await;
     }
 
     /// Deliver an account-recovery cancellation notice through the verification seam

@@ -129,6 +129,7 @@ mod login;
 mod logout;
 mod magic_link;
 pub mod mds3_sync;
+pub mod message_sender;
 mod migration;
 mod pages;
 mod par;
