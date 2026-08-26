@@ -3006,6 +3006,7 @@ mod tests {
         "step_up_policy.set",
         // `withdrawn` (withdraw/withdrew/withdrawn) and `resent` (resend/resent/resent).
         "invitation.resent",
+        "message.resent",
         "project_grant.withdrawn",
         // Compounds whose PAST form is the head verb, followed by the preposition or particle
         // the fact needs: `assigned to`, not `assignment`; `signed in`, not `signin`.
