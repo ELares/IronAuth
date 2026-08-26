@@ -18,12 +18,20 @@
 //! would not be a degraded message, it would be a broken flow.
 //!
 //! Everything this producer does not render is DELEGATED, unchanged, to the sender it wraps --
-//! and that is true on THREE axes, because review found it broken on two of them in turn. By
-//! METHOD (`the_four_token_carrying_methods_are_delegated`), by PURPOSE
-//! (`the_link_carrying_purposes_are_delegated_not_queued`), and by RECIPIENT
-//! (`a_recipient_this_ledger_cannot_address_is_delegated`) -- the last because these alerts go
-//! to every verified channel, a verified phone has no `@`, and dropping it moved every
-//! phone-channel alert from "logged" to nothing.
+//! on FOUR axes, because three review rounds each found it broken on an axis nobody had
+//! enumerated:
+//!
+//! | axis | test |
+//! |---|---|
+//! | method | `the_four_token_carrying_methods_are_delegated` |
+//! | purpose | `the_link_carrying_purposes_are_delegated_not_queued` |
+//! | recipient | `a_recipient_this_ledger_cannot_address_is_delegated` |
+//! | outcome | `a_ledger_fault_delegates_and_a_ledger_decision_does_not` |
+//!
+//! Each round fixed the named axis and added a sentence promising there were no others. The
+//! sentence was wrong twice. It is not a sentence now: `enqueue_notice` returns a `Handled` the
+//! caller must match on, so a new early return has to CHOOSE -- a question a compiler asks and
+//! a doc comment cannot.
 
 use ironauth_env::Env;
 use ironauth_oidc::message_sender::{MessagingVerificationSender, notice_body};
@@ -282,6 +290,23 @@ async fn the_payload_carries_no_secret_and_nothing_the_composer_cannot_use() {
     );
 }
 
+/// Whether `text` contains something a mail client would render as a link.
+///
+/// Not `contains("http")`. That predicate was the first version, and it passes for
+/// `auth.example.test/disavow?t=9f3c` -- a scheme-less link carrying a live token, which is
+/// exactly the shape somebody adds when they want the alert to be actionable. What makes a link
+/// a link here is a DOTTED LABEL followed by a slash with no space between them.
+fn looks_like_a_url(text: &str) -> bool {
+    if text.contains("://") {
+        return true;
+    }
+    text.split_whitespace().any(|word| {
+        word.split_once('/').is_some_and(|(host, _)| {
+            host.contains('.') && host.split('.').all(|label| !label.is_empty())
+        })
+    })
+}
+
 /// The two rendered bodies say different things, and neither may carry a link.
 ///
 /// Kept as one test over BOTH purposes rather than an assertion inside each purpose's test,
@@ -298,15 +323,42 @@ fn every_rendered_body_is_distinct_non_empty_and_link_free() {
     .map(|purpose| notice_body(purpose).expect("this producer renders both alerts"))
     .collect();
 
+    // THE FULL LITERAL, for BOTH purposes. A substring pin was the previous version and it is
+    // the same defect this test is named for: replacing everything after the matched thirty
+    // characters -- with a recovery code and a password-reset PIN, say -- survived. And a
+    // substring says nothing about what ELSE the body carries.
+    assert_eq!(
+        bodies,
+        vec![
+            concat!(
+                "A new sign-in method was linked to your account. ",
+                "If this was you, no action is needed. ",
+                "If it was not, change your password and review your sign-in methods."
+            ),
+            concat!(
+                "A sign-in method was removed from your account. ",
+                "If this was you, no action is needed. ",
+                "If it was not, change your password and review your sign-in methods."
+            ),
+        ],
+        "the rendered text of a security alert is not something to change without reading \
+         what it now says to a person"
+    );
+
     for body in &bodies {
         assert!(
             !body.trim().is_empty(),
             "an empty body walks around the composer's `missing_body` refusal and ships a \
              blank mail, which its own doc calls worse than composing nothing"
         );
+        // A URL, not the string "http". `contains("http")` was the previous predicate and it
+        // is blind to the shape somebody would actually paste --
+        // `auth.example.test/disavow?t=9f3c` -- which is a live token on a durable jsonb
+        // queue and survived. A `/` after a dotted label with no whitespace between them is
+        // what a link looks like; scheme or not.
         assert!(
-            !body.contains("http") && !body.contains("://"),
-            "a coarse alert carries no link. A body with one is a token on a durable jsonb \
+            !looks_like_a_url(body),
+            "a coarse alert carries no link. A body with one puts a token on a durable jsonb \
              queue every consumer worker reads: {body}"
         );
     }
@@ -855,5 +907,179 @@ async fn the_rate_budget_refuses_the_second_notice_within_the_hour() {
         count(&db, scope, None).await,
         2,
         "and the budget is a WINDOW: past it the same notice sends again"
+    );
+}
+
+/// A ledger FAULT delegates; a ledger DECISION does not.
+///
+/// The fourth axis on which delegation was found broken, and the one nobody had enumerated: a
+/// store error, a rate-limit refusal and a suppression all logged and returned, reaching neither
+/// the ledger nor the transport this producer wraps.
+///
+/// The fault case is a real production configuration rather than a contrived one.
+/// `database.master_key` is optional and absent by default and `validate_messaging` requires
+/// only a non-empty provider list, so `delivery_enabled = true` with no master key BOOTS -- and
+/// then every `enqueue` is `StoreError::Encryption`. That deployment dropped one hundred percent
+/// of account-link alerts on every channel, while the only boot message said the delivery
+/// consumer had not started.
+///
+/// The rate-limit case is the control, and it is the half that says the rule is a rule rather
+/// than "delegate whenever nothing was queued". A rate limit is the ledger deciding this person
+/// has had enough mail; routing round it to a transport that mails defeats the bound instead of
+/// honouring it.
+#[tokio::test]
+async fn a_ledger_fault_delegates_and_a_ledger_decision_does_not() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // NO `provision`: without a KEK and DEK, `enqueue` fails with `StoreError::Encryption`
+    // before writing anything, which is exactly the master-key-absent deployment above.
+    let (sender, delegate) = sender(&db, &env);
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "user@example.test",
+        )
+        .await;
+    assert_eq!(
+        count(&db, scope, None).await,
+        0,
+        "the ledger could not take it"
+    );
+    assert_eq!(
+        delegate.calls(),
+        vec!["send:account_linked".to_owned()],
+        "so the transport that was carrying these alerts must still get it"
+    );
+
+    // And the CONTROL: a rate-limit refusal is a decision, so it is NOT delegated.
+    let scope = db.seed_scope(&env).await;
+    provision(&db, &env, scope).await;
+    let (env, clock) = Env::deterministic(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+        1,
+    );
+    let (sender, delegate) = sender_with(&db, &env, RateBudget::new(1, 3_600));
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "user@example.test",
+        )
+        .await;
+    clock.advance(std::time::Duration::from_secs(901));
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "user@example.test",
+        )
+        .await;
+    assert_eq!(
+        count(&db, scope, None).await,
+        1,
+        "the second was refused by the budget"
+    );
+    assert!(
+        delegate.calls().is_empty(),
+        "and a refusal is the ledger's ANSWER, not a reason to mail through another \
+         transport: {:?}",
+        delegate.calls()
+    );
+}
+
+/// A flood of ONE alert kind does not silence the other.
+///
+/// The attack review found, run here in the shipped budget's shape: an attacker holding a
+/// session links a sign-in method, unlinks it, links it again -- three real state changes, each
+/// a real alert -- and with a cross-kind budget the recipient's hourly allowance is spent. The
+/// fourth action, linking the attacker's own passkey, is rate limited and the alert about it
+/// never reaches the victim on any channel. Seventeen minutes of churn buys forty-three of
+/// silence, and the attacker chooses the volume.
+///
+/// The budget is not removed: `account_linked` is still capped for this recipient, which the
+/// second half asserts. What is removed is the attacker's ability to spend one kind's budget to
+/// suppress another's.
+#[tokio::test]
+async fn a_flood_of_one_alert_kind_does_not_silence_the_other() {
+    let db = TestDatabase::start().await;
+    let system = Env::system();
+    let scope = db.seed_scope(&system).await;
+    provision(&db, &system, scope).await;
+
+    let (env, clock) = Env::deterministic(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+        1,
+    );
+    // The SHIPPED shape: two per hour, per kind. Two rather than production's three only so the
+    // budget is reachable inside a test; the scope is what is under test.
+    let (sender, _delegate) = sender_with(&db, &env, RateBudget::new(2, 3_600).per_kind());
+
+    // The attacker's churn: two `account_unlinked` alerts, in different collapse windows so the
+    // dedup key cannot be what stops the second.
+    for _ in 0..2 {
+        sender
+            .send(
+                scope,
+                VerificationPurpose::AccountUnlinked,
+                "victim@example.test",
+            )
+            .await;
+        clock.advance(std::time::Duration::from_secs(901));
+    }
+    assert_eq!(
+        count(
+            &db,
+            scope,
+            Some(VerificationPurpose::AccountUnlinked.as_str())
+        )
+        .await,
+        2,
+        "the churn itself is delivered"
+    );
+
+    // The alert that matters, of the OTHER kind, with the unlink budget spent.
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "victim@example.test",
+        )
+        .await;
+    assert_eq!(
+        count(
+            &db,
+            scope,
+            Some(VerificationPurpose::AccountLinked.as_str())
+        )
+        .await,
+        1,
+        "the victim IS told a sign-in method was linked; a cross-kind budget spent on unlinks \
+         would have swallowed exactly this alert"
+    );
+
+    // And the CONTROL: the bound is still a bound. A third alert of the SAME kind, in a new
+    // collapse window and inside the same hour, is refused. Without this the test above passes
+    // for a producer with no rate limit at all.
+    clock.advance(std::time::Duration::from_secs(901));
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountUnlinked,
+            "victim@example.test",
+        )
+        .await;
+    assert_eq!(
+        count(
+            &db,
+            scope,
+            Some(VerificationPurpose::AccountUnlinked.as_str())
+        )
+        .await,
+        2,
+        "a third unlink alert inside the hour is still refused: per-kind narrows what the \
+         budget counts, it does not remove the budget"
     );
 }

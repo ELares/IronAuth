@@ -222,18 +222,39 @@ pub trait VerificationSender: Send + Sync + std::fmt::Debug {
     /// check, the failover, both management endpoints -- exists, is tested, and had no producer
     /// (issue #111).
     ///
-    /// This is the ONLY door that may use that path, and the reason is not the seam, it is the
-    /// payload. `message_composer` states the rule: "A caller that puts a live secret in it has
-    /// put that secret on a durable queue every consumer worker reads... This path is for
-    /// messages whose variables are safe to write down." Four of the five delivery methods carry
-    /// a token in their body -- an OTP code, a magic link, a disavowal link, a cancellation link
-    /// -- and are excluded by that rule. This one carries NO body variables at all: a scope, a
-    /// purpose, and a recipient. The body comes from a template.
+    /// This is the only door that may use that path AT ALL, and even here only for part of what
+    /// it carries. Two rules narrow it, and an earlier version of this paragraph stated the
+    /// first and missed the second -- which is worth recording, because this doc is the first
+    /// thing the next implementer of this seam reads, and it told them `send` was safe to route
+    /// onto the ledger wholesale.
     ///
-    /// So the others stay synchronous not because widening the seam is expensive, but because
-    /// there is nothing for them to widen it TOWARD: the ledger cannot carry what they deliver
-    /// until it has a sealed-payload mode, which migration 0154 says it "does not currently
-    /// offer".
+    /// **A payload must be safe to write down.** `message_composer` states it: "A caller that
+    /// puts a live secret in it has put that secret on a durable queue every consumer worker
+    /// reads." That excludes the four `deliver_*` methods outright -- an OTP code, a magic link,
+    /// a disavowal link, a cancellation link.
+    ///
+    /// **And a message must carry its own body.** `DefaultComposer::compose` refuses a payload
+    /// with no `body` field and the consumer resolves that to `Failed` with no provider
+    /// contacted, so a producer must RENDER the message, which it can only do for one it knows
+    /// the whole text of.
+    ///
+    /// That second rule cuts INSIDE this method. It has five call sites carrying three purposes,
+    /// and only the two coarse `account_*` alerts have a body a producer can write:
+    /// `advanced_recovery.rs` says of the recovery notice that "the real transport embeds the
+    /// confirm link", and a registration verification exists to deliver a link that confirms a
+    /// newly claimed identifier. Mailing either without its link is not a degraded message; the
+    /// recipient has nothing to act on and the flow cannot complete.
+    ///
+    /// So an implementation that queues MUST delegate what it cannot render, on every axis:
+    /// by purpose, by recipient (these alerts go to every verified channel, and a verified phone
+    /// is not an email address), and by outcome (a ledger FAULT is not a decision). See
+    /// `message_sender::MessagingVerificationSender`, which returns a value forcing that choice
+    /// rather than promising it in a comment -- three review rounds each found the promise
+    /// broken on an axis nobody had enumerated.
+    ///
+    /// The others stay synchronous not because widening the seam is expensive, but because there
+    /// is nothing for them to widen it TOWARD: the ledger cannot carry what they deliver until
+    /// it has a sealed-payload mode, which migration 0154 says it "does not currently offer".
     async fn send(&self, scope: Scope, purpose: VerificationPurpose, recipient: &str);
 
     /// Deliver an email-OTP code (issue #68). Called ONLY for a recipient a send is

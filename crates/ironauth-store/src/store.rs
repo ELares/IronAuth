@@ -73,6 +73,30 @@ impl Store {
         })
     }
 
+    /// A store whose pool CONNECTS TO NOTHING, for a test about wiring rather than data.
+    ///
+    /// `sqlx`'s lazy pool opens no connection until one is used, so this constructs a real
+    /// `Store` with no database anywhere. It exists because the alternative was worse: the
+    /// binary's sender-wiring test asks which sender a config installs, a `Store` is one of the
+    /// constructor's arguments, and requiring a live database to answer a question about a
+    /// branch on a config value turns a unit test into one a laptop without Postgres skips --
+    /// which is how a wiring defect stays invisible.
+    ///
+    /// Any query through this store fails to connect. That is the point: a test that reached
+    /// one would be measuring something this is not for.
+    ///
+    /// # Panics
+    ///
+    /// If the fixed URL above stops parsing, which would be an edit to this function.
+    #[must_use]
+    pub fn disconnected() -> Self {
+        Self::from_pool(
+            PgPoolOptions::new()
+                .connect_lazy("postgres://ironauth:unused@127.0.0.1:1/unused")
+                .expect("a lazy pool parses its url and connects to nothing"),
+        )
+    }
+
     /// Build a store from a pool the caller already configured (for example a
     /// pool shared with other subsystems, or the low-privilege pool the test
     /// harness injects). The pool stays private after construction; this does

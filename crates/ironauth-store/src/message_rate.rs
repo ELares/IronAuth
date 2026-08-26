@@ -53,6 +53,40 @@ pub enum RateDecision {
     },
 }
 
+/// WHAT the budget counts: every send to this recipient, or only sends of the same kind.
+///
+/// The distinction exists because two message classes want opposite things from the same
+/// mechanism, and the module header above only argues one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateScope {
+    /// Every send to this recipient, whatever kind. The DEFAULT, and correct for anything an
+    /// unauthenticated stranger can trigger.
+    ///
+    /// This is the anti-flood bound the module header describes: someone types a victim's
+    /// address into a signup form repeatedly, and what the victim experiences is the TOTAL
+    /// volume, not a per-kind breakdown. Counting per kind here would multiply the bound by the
+    /// number of kinds and let the same attacker send three times as much by alternating.
+    EveryKind,
+    /// Only sends of the same kind. For a message the ACCOUNT OWNER needs to receive about
+    /// their own account.
+    ///
+    /// Review found the case: an attacker with a session links a sign-in method, unlinks it,
+    /// links it again -- three real state changes, each a real alert -- and the recipient's
+    /// hourly budget is spent. The fourth action, linking the attacker's own passkey, is
+    /// rate limited, and the alert about it is never delivered on any channel. Seventeen
+    /// minutes of churn buys forty-three of silence.
+    ///
+    /// Cross-kind counting turns a volume control into a silencing primitive there, because the
+    /// attacker CHOOSES the volume. Per-kind does not remove the bound -- an alert kind is still
+    /// capped for that recipient -- it removes the attacker's ability to spend one kind's budget
+    /// to suppress another's.
+    ///
+    /// Not the default, and it must not become one: it is only sound where the sends are
+    /// triggered by an authenticated change to the recipient's OWN account, so the recipient
+    /// wanted every one of them.
+    SameKind,
+}
+
 /// The budget for one recipient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateBudget {
@@ -60,6 +94,8 @@ pub struct RateBudget {
     pub limit: u32,
     /// The window length in seconds.
     pub window_seconds: u64,
+    /// What the count covers. See [`RateScope`].
+    pub scope: RateScope,
 }
 
 impl RateBudget {
@@ -74,6 +110,21 @@ impl RateBudget {
         Self {
             limit: limit.max(1),
             window_seconds: window_seconds.max(1),
+            scope: RateScope::EveryKind,
+        }
+    }
+
+    /// The same budget, counting only sends of the SAME KIND.
+    ///
+    /// A separate constructor rather than a parameter on [`Self::new`], so every existing caller
+    /// keeps the cross-kind bound the module header argues for and a caller wanting the other
+    /// has to say so at the call site. See [`RateScope::SameKind`] for when that is sound; it is
+    /// a narrow case.
+    #[must_use]
+    pub fn per_kind(self) -> Self {
+        Self {
+            scope: RateScope::SameKind,
+            ..self
         }
     }
 }

@@ -1404,23 +1404,7 @@ async fn build_oidc_plane(
             // messaging on keeps the logging transport and behaves exactly as before. Turning it
             // on is what makes an account-link alert a real queued message, and changes nothing
             // else.
-            let logging: std::sync::Arc<dyn ironauth_oidc::VerificationSender> =
-                std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender);
-            if notice_producer_installs(config) {
-                std::sync::Arc::new(
-                    ironauth_oidc::message_sender::MessagingVerificationSender::new(
-                        logging,
-                        messaging_store.clone(),
-                        messaging_env.clone(),
-                        ironauth_store::message_rate::RateBudget::new(
-                            NOTICE_RATE_BUDGET.0,
-                            NOTICE_RATE_BUDGET.1,
-                        ),
-                    ),
-                ) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
-            } else {
-                logging
-            }
+            verification_sender(config, &messaging_store, &messaging_env)
         },
         |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>,
     ))
@@ -3038,6 +3022,48 @@ fn message_delivery_inputs(config: &Config, env: &Env) -> Option<MessageDelivery
 /// not a `const fn`; the pair is what a test names and what the call site passes.
 const NOTICE_RATE_BUDGET: (u32, u64) = (3, 3_600);
 
+/// The verification sender this configuration installs.
+///
+/// A named function that RETURNS THE SENDER, rather than a predicate the boot path branches on.
+/// The difference is what the test can see, and it is the whole point: a previous version
+/// extracted `notice_producer_installs` and tested it, which caught an inverted PREDICATE and
+/// not an inverted BRANCH -- swapping the two arms of the `if`, and deleting the producer from
+/// it entirely, both left the whole `ironauth` suite green. A test of the answer is not a test
+/// of the wiring.
+///
+/// `Debug` is what the test reads, which is why `MessagingVerificationSender`'s implementation
+/// names the type it wraps: the composite's whole purpose is that it delegates, so "which
+/// sender is installed" and "what does it fall back to" are one question.
+fn verification_sender(
+    config: &Config,
+    store: &ironauth_store::Store,
+    env: &Env,
+) -> std::sync::Arc<dyn ironauth_oidc::VerificationSender> {
+    let logging: std::sync::Arc<dyn ironauth_oidc::VerificationSender> =
+        std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender);
+    if notice_producer_installs(config) {
+        std::sync::Arc::new(
+            ironauth_oidc::message_sender::MessagingVerificationSender::new(
+                logging,
+                store.clone(),
+                env.clone(),
+                // PER KIND, and that is the one place in the tree that asks for it. These
+                // alerts are triggered by an authenticated change to the recipient's own
+                // account, so the recipient wanted every one of them -- and cross-kind counting
+                // would let an attacker who controls the volume spend the budget on links and
+                // unlinks to silence the alert about the method they add last. See `RateScope`.
+                ironauth_store::message_rate::RateBudget::new(
+                    NOTICE_RATE_BUDGET.0,
+                    NOTICE_RATE_BUDGET.1,
+                )
+                .per_kind(),
+            ),
+        )
+    } else {
+        logging
+    }
+}
+
 /// Whether the messaging producer replaces the logging transport (issue #111).
 ///
 /// Extracted for the reason the sibling `message_delivery_inputs` was, and stated there: "a
@@ -3073,13 +3099,27 @@ fn notice_producer_installs(config: &Config) -> bool {
 /// about: a value that only ever met the composer once a real producer existed. So the filter is
 /// the composer's own rule rather than "non-empty", and the fallback covers both.
 fn sender_domain(public_url: Option<&str>) -> String {
-    public_url
+    let configured = public_url
         .and_then(|url| url.parse::<http::Uri>().ok())
-        .and_then(|uri| uri.host().map(str::to_owned))
+        .and_then(|uri| uri.host().map(str::to_owned));
+    match configured {
         // The composer's rule, not a weaker copy of it: a host it would refuse is one that
         // stops delivery entirely, so it must not become the sender domain.
-        .filter(|host| ironauth_store::message_mime::is_usable_message_id_domain(host))
-        .unwrap_or_else(|| "ironauth.invalid".to_owned())
+        Some(host) if ironauth_store::message_mime::is_usable_message_id_domain(&host) => host,
+        // SUBSTITUTED, and said out loud. An operator who configured `https://op` and gets
+        // `ironauth.invalid` in every Message-ID has had a decision made for them; the sibling
+        // failure on this path (an absent master key) logs, and silence here would leave the
+        // substitution discoverable only by reading a delivered mail's headers.
+        Some(host) => {
+            tracing::warn!(
+                target: "ironauth.messaging",
+                configured_host = %host,
+                "the configured public host cannot stamp a Message-ID (RFC 5322 wants a                  dotted domain), so messages will carry the reserved ironauth.invalid instead"
+            );
+            "ironauth.invalid".to_owned()
+        }
+        None => "ironauth.invalid".to_owned(),
+    }
 }
 
 /// The configured providers as (name, endpoint), IN CONFIGURED ORDER.
@@ -6212,7 +6252,10 @@ mod tests {
 
 #[cfg(test)]
 mod message_delivery_wiring_tests {
-    use super::{message_delivery_inputs, notice_producer_installs, provider_specs, sender_domain};
+    use super::{
+        NOTICE_RATE_BUDGET, message_delivery_inputs, notice_producer_installs, provider_specs,
+        sender_domain, verification_sender,
+    };
     use ironauth_config::{Config, MessageProviderConfig, MessagingConfig};
     use ironauth_env::Env;
 
@@ -6257,6 +6300,93 @@ mod message_delivery_wiring_tests {
             message_delivery_inputs(&on, &env).is_some(),
             "delivery on must start one; inverted, the worker runs exactly when the operator \
              asked for silence"
+        );
+    }
+
+    /// The SHIPPED notice budget is the one the producer is built with.
+    ///
+    /// The constant's own doc says it was named "so the value a deployment runs is the value a
+    /// test can name", and then no test named it -- changing it to `(1, 3_600)` and replacing it
+    /// at the call site with `(1, 1)` both left this suite green. A constant extracted for
+    /// testability and never tested is a comment.
+    ///
+    /// PER KIND is asserted here rather than only at the call site, because it is the property
+    /// review found missing: a cross-kind budget lets an attacker who chooses the volume spend
+    /// one alert kind's allowance to silence another's. `notice_enqueues.rs` measures what that
+    /// scope DOES to a real ledger; this measures that the shipped wiring asks for it.
+    #[tokio::test]
+    async fn the_shipped_notice_budget_is_what_the_producer_gets() {
+        use ironauth_store::message_rate::{RateBudget, RateScope};
+
+        let expected = RateBudget::new(NOTICE_RATE_BUDGET.0, NOTICE_RATE_BUDGET.1).per_kind();
+        assert_eq!(expected.limit, 3, "three notices per recipient per kind");
+        assert_eq!(expected.window_seconds, 3_600, "per hour");
+        assert_eq!(
+            expected.scope,
+            RateScope::SameKind,
+            "cross-kind counting turns this bound into a silencing primitive; see RateScope"
+        );
+
+        // And the WIRING asks for the same thing. `Debug` is what crosses the `Arc<dyn>`, so
+        // this is what the installed producer can be asked; without it the assertions above are
+        // about a value the boot path is free not to use.
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 33);
+        let store = ironauth_store::Store::disconnected();
+        let installed = format!(
+            "{:?}",
+            verification_sender(&config_with(messaging(true, &["primary"])), &store, &env)
+        );
+        assert!(
+            installed.contains(&format!("{expected:?}")),
+            "the installed producer must carry the shipped budget: {installed}"
+        );
+    }
+
+    /// The gate decides WHICH SENDER IS INSTALLED, not merely what a predicate answers.
+    ///
+    /// The sibling test below pins the predicate, and that is not enough: with only that test,
+    /// swapping the two arms of the `if` -- and deleting the producer from it entirely -- both
+    /// left this whole suite green. A test of the answer is not a test of the wiring, and the
+    /// wiring is where the defect would be.
+    ///
+    /// The `Debug` rendering is what distinguishes them, and it carries the WRAPPED sender as
+    /// well as the outer one. That matters here: the composite's entire purpose is that it
+    /// delegates what it cannot carry, so a producer installed with no fallback would be as
+    /// wrong as no producer at all, and only the inner name makes the two distinguishable.
+    ///
+    /// A LAZY pool, so this needs no database: nothing here connects. What is under test is a
+    /// branch on a config value, and giving it a real database would make a wiring test into an
+    /// integration test that a laptop without Postgres cannot run.
+    // A tokio context because `PgPoolOptions::connect_lazy` registers a reaper task on
+    // construction, even though nothing here ever opens a connection.
+    #[tokio::test]
+    async fn the_gate_decides_which_sender_is_installed() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 32);
+        let store = ironauth_store::Store::disconnected();
+
+        let off = format!(
+            "{:?}",
+            verification_sender(&config_with(messaging(false, &["primary"])), &store, &env)
+        );
+        assert_eq!(
+            off, "LoggingVerificationSender",
+            "delivery off installs the logging transport UNWRAPPED"
+        );
+
+        let on = format!(
+            "{:?}",
+            verification_sender(&config_with(messaging(true, &["primary"])), &store, &env)
+        );
+        assert!(
+            on.starts_with("MessagingVerificationSender"),
+            "delivery on installs the producer; with the arms swapped, an operator who turned \
+             messaging OFF is the one who gets real mail: {on}"
+        );
+        assert!(
+            on.contains("LoggingVerificationSender"),
+            "and it WRAPS the logging transport rather than replacing it -- everything this \
+             producer cannot carry is delegated there, so a producer with no fallback silently \
+             retires four transports: {on}"
         );
     }
 

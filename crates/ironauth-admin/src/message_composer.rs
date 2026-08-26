@@ -281,10 +281,21 @@ const _: () = assert!(BOUNDARY_LOCAL_BYTES > 0);
 /// own tests use short synthetic ids and the consumer's tests use a stub composer, so the first
 /// producer to hand the ledger a real message id was the first caller to reach it.
 ///
-/// The TAIL rather than the head. A `MessageId` renders as `msg_` and then its random part, so
-/// truncating from the front would spend nine of the sixty-one available characters on a
-/// constant. Every character `message_id_local` admits is ASCII, so a byte slice here is always
-/// on a character boundary.
+/// The TAIL rather than the head, and the reason is which END carries the entropy. A
+/// `MessageId` renders as `msg_` followed by base64url of tenant, environment, and a random
+/// component in that order -- so the LEADING characters are the scope, constant for every
+/// message a deployment sends, and the trailing ones are what distinguishes two messages.
+/// Truncating from the front discards `msg_` plus part of the tenant id; truncating from the
+/// back would discard the only part that differs.
+///
+/// (An earlier version of this paragraph said the prefix was nine characters and that the rest
+/// was "its random part". Nine is `ironauth-`, which is not part of `local` at all, and most of
+/// `local` is scope rather than entropy. The conclusion was right and both of its reasons were
+/// wrong, which is worse than no reason: the next person to change the id format would have
+/// checked the wrong property.)
+///
+/// Every character `message_id_local` admits is ASCII, so a byte slice here is always on a
+/// character boundary.
 fn boundary_for(local: &str) -> String {
     let tail = &local[local.len().saturating_sub(BOUNDARY_LOCAL_BYTES)..];
     format!("{BOUNDARY_PREFIX}{tail}")
@@ -371,9 +382,15 @@ mod tests {
             .compose(scope, purpose.as_str(), "ada@example.test", &payload, &[])
             .expect("the producer's payload must compose, or every notice it writes fails");
 
+        // The FULL text, not a prefix. A thirty-character substring pin was the first version
+        // and it is the shape this test exists to rule out: replacing everything after the
+        // match -- with a recovery code and a password-reset PIN, say -- survived it. What a
+        // security alert says to a person is not something to change without reading it.
         assert!(
-            prepared.body.contains("A new sign-in method was linked"),
-            "the rendered text is the producer's body: {:?}",
+            prepared
+                .body
+                .contains(ironauth_oidc::message_sender::LINKED_NOTICE_BODY),
+            "the rendered text is the producer's body, whole: {:?}",
             prepared.body
         );
         assert!(
