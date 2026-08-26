@@ -210,6 +210,7 @@ pub mod token_hook {
         /// It cannot: `HookRuntime` has no variants, so a `&Self` cannot be produced and this
         /// body is unreachable by construction. Written as `match *self {}` rather than
         /// `unreachable!()` because the compiler PROVES it rather than being told.
+        #[must_use]
         pub fn unreachable<T>(&self) -> T {
             match *self {}
         }

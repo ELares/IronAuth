@@ -41,11 +41,26 @@
 //! latency benchmark could not see it, because that benchmark measures deserialize + instantiate
 //! + call, which is the path the dispatch did not take.
 //!
-//! So a loaded component is held per (scope, client, component digest). A cache HIT is
-//! instantiate + call, which is what the benchmark measures and what the criterion means. The
-//! digest is in the key rather than a version counter: it is the artifact's own identity, so a
-//! redeploy of different bytes is a different key by construction and a redeploy of identical
-//! bytes correctly reuses the entry. Nothing has to remember to invalidate.
+//! So a loaded component is held per (scope, client, component digest). The digest is in the
+//! key rather than a version counter: it is the artifact's own identity, so a redeploy of
+//! different bytes is a different key by construction and a redeploy of identical bytes
+//! correctly reuses the entry. Nothing has to remember to invalidate.
+//!
+//! # WHAT A CACHE HIT ACTUALLY COSTS, which is more than the wasm
+//!
+//! Saying "a cache hit is instantiate + call" would be the same error this module was built to
+//! fix, one layer up. A hit is:
+//!
+//! 1. a STORE READ of the `token_hooks` row, ~378 microseconds, paid on EVERY hooked login
+//!    because that read is how the server learns a hook is deployed at all
+//! 2. SHA-256 over the bytes it returned, which the 8 MiB `token_hooks_component_bounded` CHECK
+//!    is what keeps finite
+//! 3. a hash lookup, then instantiate + call -- the tens of microseconds the benchmark measures
+//!
+//! Step 3 is the part "in microseconds" is a claim about, and it holds. Steps 1 and 2 dominate
+//! it, and the honest statement of the criterion is that the HOOK is microseconds while the
+//! dispatch around it is a database round trip. Cutting that would mean keying the cache on a
+//! version column so a hit never reads the bytes, which is a schema change and not this issue.
 //!
 //! # It is not on a tokio worker
 //!
@@ -135,8 +150,8 @@ pub struct HookRuntime {
 }
 
 /// Hand-written because `HookEngine` has no `Debug`, and because the CACHE SIZE is the field
-/// worth seeing: it is the difference between a deployment paying tens of microseconds per
-/// hooked login and one paying tens of milliseconds. The components themselves are machine code
+/// worth seeing: it is the difference between a deployment paying tens of microseconds of wasm
+/// per hooked login and one paying tens of milliseconds of cranelift. The components themselves are machine code
 /// and would render as nothing useful.
 impl std::fmt::Debug for HookRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -302,9 +317,16 @@ pub async fn run(
         })?;
 
     Ok(Some(HookClaims {
-        id_token: fence(&customization.id_token_claims, scope, client_id, "id_token"),
+        id_token: fence(
+            &customization.id_token_claims,
+            id_token_claims,
+            scope,
+            client_id,
+            "id_token",
+        ),
         access_token: fence(
             &customization.access_token_claims,
+            access_token_claims,
             scope,
             client_id,
             "access_token",
@@ -315,8 +337,10 @@ pub async fn run(
 /// The loaded component for this client's bytes, compiling it only on a miss.
 ///
 /// The whole reason this function exists is that compiling is 33 ms and instantiating is tens of
-/// microseconds. A cache hit is what makes "in microseconds" true of the shipped path rather
-/// than of a benchmark measuring a different one.
+/// microseconds. A cache hit is what makes "in microseconds" true of the WASM WORK on the
+/// shipped path rather than of a benchmark measuring a different one. It does not make the
+/// dispatch microseconds: the caller has already paid a store read to get `component` here, and
+/// the digest below hashes it. See the module header for the full cost of a hit.
 ///
 /// The compile runs on `spawn_blocking` for the same reason the invocation does, and one more:
 /// 33 ms of cranelift on a reactor thread stalls every other request on that thread, and the
@@ -438,6 +462,7 @@ fn limits() -> Limits {
 /// is why it names the claim and the reason.
 fn fence(
     returned: &[(String, String)],
+    handed: &serde_json::Map<String, serde_json::Value>,
     scope: Scope,
     client_id: &str,
     token: &'static str,
@@ -479,7 +504,25 @@ fn fence(
         );
     }
 
-    let outcome = claims_mapping::filter_hook_claims(&parsed);
+    // THE CAP BOUNDS WHAT A HOOK CONTRIBUTES, NOT WHAT THE TOKEN CARRIES, and separating the
+    // two is not a refinement -- it is a data-loss bug review found in the round-2 fix.
+    //
+    // `MAX_HOOK_CLAIMS` is 32 and exists so "a hook returning a hundred thousand claims" cannot
+    // fold them all into a token. Under the MERGE this dispatch used to do, the mint's own
+    // claims survived that cap because they were never in the hook's output. Under REPLACE they
+    // are: the shipped `good` guest ECHOES its input, so a deployment with more than 32 extra
+    // claims -- `conform_id_token_claims` plus issue #100 enrichment reaches that -- would
+    // deploy the documented well-behaved hook and get a token silently missing everything past
+    // the alphabetically-first 32. The issuance would SUCCEED.
+    //
+    // So the fence sees the DELTA: a claim the hook handed back unchanged is not something it
+    // contributed, it is something it kept, and keeping is how a replace contract expresses "do
+    // not touch this". What the cap still bounds is exactly what it was written for -- names
+    // the hook ADDED or CHANGED.
+    let (echoed, contributed): (BTreeMap<_, _>, BTreeMap<_, _>) = parsed
+        .into_iter()
+        .partition(|(name, value)| handed.get(name) == Some(value));
+    let outcome = claims_mapping::filter_hook_claims(&contributed);
     for (name, reason) in &outcome.refused {
         tracing::warn!(
             target: "ironauth.hooks",
@@ -501,7 +544,12 @@ fn fence(
             "and further refusals were not reported individually"
         );
     }
-    outcome.accepted
+    // Echoes first, then the accepted contributions, so a hook that both echoes a name and
+    // changes it -- which it cannot, since a list has one entry per name after parsing -- could
+    // not use the ordering to smuggle anything past the fence.
+    let mut kept = echoed;
+    kept.extend(outcome.accepted);
+    kept
 }
 
 /// The wire shape the guest ABI takes: a name and its value as JSON TEXT.
@@ -510,4 +558,144 @@ fn as_pairs(claims: &serde_json::Map<String, serde_json::Value>) -> Vec<(String,
         .iter()
         .map(|(name, value)| (name.clone(), value.to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PAYLOAD_VERSION, limits, loaded_hook};
+
+    /// The epoch deadline is at least TWO ticks, and the reason is arithmetic.
+    ///
+    /// wasmtime sets `deadline = current_epoch + delta`, and a store is created at an arbitrary
+    /// point inside a tick, so `delta = 1` grants whatever remains of the current one -- uniform
+    /// in (0, T]. Measured against a 10 ms ticker: a hook doing 78 microseconds of work trapped
+    /// on 0.40% of invocations and one doing 544 microseconds on 4.15%. Every abort fails the
+    /// issuance, so that is a random `server_error` on roughly one hooked login in a hundred.
+    ///
+    /// `delta = 2` guarantees at least one WHOLE tick, so the bound becomes [T, 2T].
+    ///
+    /// # Why this is a unit test and not an integration one
+    ///
+    /// The behavioural difference cannot be made deterministic. `delta = 1` traps only when the
+    /// remaining slice is shorter than the work, so a guest that ALWAYS trips it needs work
+    /// longer than a whole tick -- and that work also trips `delta = 2`. There is no guest that
+    /// distinguishes the two every time, which is the finding restated: at `delta = 1` the bound
+    /// is a lottery, and a lottery is exactly what a test cannot pin.
+    ///
+    /// So the pin is on the value, and it stops a silent revert. What it cannot do is notice
+    /// somebody removing the ticker, which is why the harness now runs one.
+    #[test]
+    fn the_epoch_deadline_spans_at_least_one_whole_tick() {
+        assert!(
+            limits().epoch_deadline >= 2,
+            "a deadline of one tick is whatever remains of the current one, which fails a \
+             fraction of ordinary logins at random"
+        );
+    }
+
+    /// The dispatch's limits are `claim_shaping`'s EXCEPT the deadline.
+    ///
+    /// Without this the assertion above passes for a `limits()` that invented every bound from
+    /// nothing -- fuel, memory and the host-resource cap included -- which would silently
+    /// unbound the three things the sandbox suite is written against.
+    #[test]
+    fn only_the_deadline_departs_from_the_shipped_preset() {
+        let shipped = ironauth_hooks::Limits::claim_shaping();
+        let ours = limits();
+        assert_eq!(ours.fuel, shipped.fuel);
+        assert_eq!(ours.memory_bytes, shipped.memory_bytes);
+        assert_eq!(ours.max_host_resources, shipped.max_host_resources);
+        assert_ne!(
+            ours.epoch_deadline, shipped.epoch_deadline,
+            "and the deadline DOES depart, or the reason above has been reverted"
+        );
+    }
+
+    /// The payload version this server emits is the one the table admits.
+    ///
+    /// Two constants in two artifacts -- `PAYLOAD_VERSION` here and
+    /// `token_hooks_payload_version_known` in migration 0162 -- and the dispatch's version check
+    /// can only fire when they disagree. Pinned so the pair moves together: a migration that
+    /// admitted 2 while this emitted 1 would deploy hooks the dispatch then refuses at every
+    /// login.
+    #[test]
+    fn the_emitted_payload_version_is_the_one_the_table_admits() {
+        let migration = include_str!("../../ironauth-store/migrations/0162_token_hooks.sql");
+        assert!(
+            migration.contains(&format!("payload_version = {PAYLOAD_VERSION}")),
+            "migration 0162 must admit exactly the version this server emits"
+        );
+    }
+
+    /// COMPILING A HOOK MUST NOT RUN ON THE REACTOR, and this measures it rather than saying it.
+    ///
+    /// `Component::new` is cranelift: 33 ms of pure CPU on the release build, and seconds on a
+    /// debug one. Run inline on an async task it holds a runtime worker for that whole time, so
+    /// every other request assigned to that worker waits -- one client's first login after a
+    /// deploy stalling other tenants' logins, which is the thing `spawn_blocking` exists to stop.
+    ///
+    /// Nothing pinned it: the 12 integration tests all pass with the `spawn_blocking` removed,
+    /// because a multi-worker runtime with an idle worker beside it looks identical from the
+    /// outside.
+    ///
+    /// # Why a CURRENT-THREAD runtime is the discriminator
+    ///
+    /// It has exactly ONE task-running thread, so "held the reactor" and "nothing else ran" are
+    /// the same statement, and it needs no timing margin to tell them apart: an inline compile
+    /// leaves the ticker below at ZERO. `spawn_blocking` moves the work to the blocking pool,
+    /// which is a different thread on any flavor, so the reactor keeps driving the timer.
+    ///
+    /// The assertion is `> 0` and not a tick count, because the count is a function of how slow
+    /// the compile is on this machine and that is not what is being pinned.
+    #[test]
+    fn compiling_a_hook_does_not_hold_the_reactor() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+
+        runtime.block_on(async {
+            let ticks = std::sync::Arc::new(AtomicU64::new(0));
+            let counting = std::sync::Arc::clone(&ticks);
+            let ticker = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    counting.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            // Let the ticker reach its first await, so a zero below means blocked and not
+            // never-scheduled.
+            tokio::task::yield_now().await;
+
+            let engine =
+                std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine"));
+            let cache: std::sync::Arc<super::HookCache> =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let scope = ironauth_store::Scope::new(
+                ironauth_store::TenantId::from_seed_bytes([7_u8; 16]),
+                ironauth_store::EnvironmentId::from_seed_bytes([9_u8; 16]),
+            );
+
+            loaded_hook(
+                &engine,
+                &cache,
+                scope,
+                "a-client",
+                ironauth_hooks::fixtures::GOOD,
+            )
+            .await
+            .expect("the shipped fixture compiles");
+
+            let observed = ticks.load(Ordering::Relaxed);
+            ticker.abort();
+            assert!(
+                observed > 0,
+                "the reactor drove another task while the hook compiled; zero means the compile \
+                 ran inline on the only thread this runtime has, which is a stall every other \
+                 request on that worker pays"
+            );
+        });
+    }
 }

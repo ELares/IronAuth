@@ -185,10 +185,12 @@ pub fn as_claims(
 
 /// Resolve and apply this client's mapping, then run its deployed WASM hook (issue #114).
 ///
-/// The one entry point every mint site calls. A thin `apply_to_with_hook` without the hook parameters
+/// The one entry point every mint site calls. A thin `apply_to`, WITHOUT the hook parameters,
 /// existed for one commit and is gone: once every door passed an engine it had zero callers,
 /// and a public function nothing calls is the shape that lets the next door quietly use the
-/// weaker one.
+/// weaker one. (That old name is the one in the paragraph above; a blanket rename put the NEW
+/// name into a sentence whose whole subject was the old one, and the result read as a function
+/// describing its own deletion.)
 ///
 /// Rewrites `extra_claims` into the ID-token set and RETURNS the access-token set, because
 /// deciding which token a claim goes in is part of what a mapping does (criterion 4:
@@ -237,6 +239,11 @@ pub async fn apply_to_with_hook(
     // `Some` and the block below is unreachable -- proved by the compiler rather than asserted.
     #[cfg(not(feature = "wasm-hooks"))]
     {
+        // Named so this build does not warn them unused. They are read by the block below,
+        // which this build does not compile; underscore-prefixing the PARAMETERS instead would
+        // silence the warning in the build that does compile it, which is the build where an
+        // unused hook input would be a real defect worth hearing about.
+        let _ = (grant_type, subject, &mut access);
         runtime.unreachable()
     }
 
@@ -302,7 +309,20 @@ pub async fn apply_to_with_hook(
 /// client CANNOT do it without calling [`apply_to_with_hook`] -- the field has no other source. That is
 /// the point, and it is a repair rather than a flourish.
 ///
-/// Review measured the alternative: with the field taking a plain map, emptying the `apply_to_with_hook`
+/// # WHAT THIS FENCE DOES NOT PROVE
+///
+/// That the door ran the HOOK. It proves the door resolved the MAPPING, which is a different
+/// claim, because `runtime` is an ordinary parameter and `None` is a legitimate value for it --
+/// it is how a deployment with hooks disabled issues tokens. A door that hard-codes `None`
+/// instead of passing `state.hook_engine()` produces a perfectly well-typed
+/// `MappedAccessClaims` and no test fails. Measured: only the token endpoint and the device
+/// grant pin it; that mutation still survives at the authorize, CIBA and FedCM doors.
+///
+/// The measurement below was made against the mapping when this function was called `apply_to`,
+/// and it is about the mapping. The rename carried the sentence onto the hook, where it was
+/// never true.
+///
+/// Review measured the alternative: with the field taking a plain map, emptying the mapping
 /// call at the FedCM, CIBA and front-channel-authorize doors each left the whole suite green,
 /// because those three are driven by no test that installs a mapping. A structural argument
 /// ("they all call the same function") is not a measurement, and structure cannot express
@@ -312,7 +332,7 @@ pub async fn apply_to_with_hook(
 /// The wrapped map may be empty. That is `NoMapping`, and it is the common case: a client with
 /// no mapping contributes no access-token claims and issues exactly what it did before.
 // NO `Default`. The derive was a PUBLIC associated function, so any code in any crate could
-// build this without calling `apply_to_with_hook` -- which is the entire fence, and the comments above
+// build this without resolving a mapping at all -- which is the entire fence, and the comments above
 // claimed it held. Measured: replacing the FedCM door's resolver call with
 // `MappedAccessClaims::default()` compiled clean with zero clippy warnings. A newtype whose
 // bypass is one derive away is not a fence, and the derive was the one thing nobody grepped for

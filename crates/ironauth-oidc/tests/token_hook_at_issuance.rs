@@ -485,3 +485,237 @@ async fn a_second_issuance_reuses_the_compiled_component() {
          {runtime}"
     );
 }
+
+/// AN ECHOING HOOK LOSES NOTHING, past the hook-contribution cap.
+///
+/// `filter_hook_claims` caps a hook at 32 claims, which exists so "a hook returning a hundred
+/// thousand claims" cannot fold them all into a token. Under the MERGE this dispatch first used,
+/// the mint's own claims were never in the hook's output and so never met that cap. Under
+/// REPLACE they are -- and the shipped `good` guest ECHOES its input, which is how a replace
+/// contract spells "leave this alone".
+///
+/// So the round-2 fix introduced a silent loss: a deployment past 32 extra claims deploying a
+/// well-behaved do-nothing hook got a token missing everything beyond the alphabetically-first
+/// 32, and the issuance SUCCEEDED. No fixture echoed enough claims to reach it.
+///
+/// # Why more than 32 is reachable, since every source is itself capped
+///
+/// They SUM. A mapping may carry 32 rules (the table's own CHECK), the enrichment hook may
+/// contribute 32 (`OIDC_MAX_ENRICHED_CLAIMS`), and the scope-derived claims are on top of both.
+/// This uses the mapping plus the conform override, which is the cheapest pair that clears the
+/// bound with shipped machinery rather than an injection somewhere the cap does not sit.
+///
+/// The fence sees the DELTA now: a claim handed back unchanged is not a contribution.
+#[tokio::test]
+async fn an_echoing_hook_does_not_lose_claims_past_the_contribution_cap() {
+    let harness = Harness::start_with_hook_engine_and_config(
+        Arc::new(ironauth_hooks::HookEngine::new().expect("engine")),
+        OidcConfig {
+            conform_id_token_claims: true,
+            ..OidcConfig::default()
+        },
+    )
+    .await;
+
+    // THIRTY-TWO static rules, the most the table admits, plus whatever the conform override
+    // resolves from the user's claim document. Together they clear the 32-claim cap.
+    let rules = {
+        let listed: Vec<String> = (0..32)
+            .map(|index| {
+                format!(r#"{{"kind":"static","name":"mapped_{index:02}","value":{index}}}"#)
+            })
+            .collect();
+        format!("[{}]", listed.join(","))
+    };
+    let env = harness.env().clone();
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .claims_mappings()
+        .set(&env, harness.client_id(), &rules)
+        .await
+        .expect("install the mapping");
+
+    // The CONTROL, with no hook: this is what the token carries before a hook touches it.
+    let (_access, id_token) = exchange_with_email(&harness).await.expect("exchange");
+    let before = claims(&id_token);
+    let mapped_before = (0..32)
+        .filter(|index| before.contains_key(&format!("mapped_{index:02}")))
+        .count();
+    assert_eq!(
+        mapped_before, 32,
+        "the mapping puts 32 claims in the bag, or this test is not past the cap: {before:?}"
+    );
+    assert!(
+        before.contains_key("email"),
+        "and the conform override adds at least one more on top: {before:?}"
+    );
+
+    // Now the do-nothing hook.
+    deploy(&harness, ironauth_hooks::fixtures::ECHO_ONLY, 1).await;
+    let (_access, id_token) = exchange_with_email(&harness).await.expect("exchange");
+    let after = claims(&id_token);
+
+    assert_eq!(
+        after.get("echo_only_ran"),
+        Some(&Value::from(true)),
+        "the hook ran, or nothing below is about echoing: {after:?}"
+    );
+    let mapped_after = (0..32)
+        .filter(|index| after.contains_key(&format!("mapped_{index:02}")))
+        .count();
+    assert_eq!(
+        mapped_after, 32,
+        "every echoed claim must survive. A cap on what a hook CONTRIBUTES is not a cap on what \
+         the token carries, and applying it to the whole echoed list silently shortens the \
+         token of any deployment past the bound: {after:?}"
+    );
+    assert!(
+        after.contains_key("email"),
+        "including the one that pushed it past the cap: {after:?}"
+    );
+}
+
+/// THE DEVICE GRANT RUNS THE HOOK, which is a door the token endpoint does not cover.
+///
+/// The type fence forces every door to call `apply_to_with_hook`; it does NOT force one to pass
+/// the engine. Review measured the gap: changing `state.hook_engine()` to `None` at the
+/// authorize, CIBA, device and FedCM doors left the whole suite green, because only
+/// `authorization_code` was driven with a hook deployed.
+///
+/// That matters more for a hook than it did for a mapping. A mapping a door skips means a token
+/// the operator did not shape; a HOOK a door skips means the operator's own code did not run --
+/// including code deployed to REMOVE a claim, so the skipped door issues the wider token. And a
+/// door that silently skips is a door a client can choose.
+///
+/// This drives the device grant end to end. The remaining three (authorize's front channel,
+/// CIBA, FedCM) are still covered only by the shared function; that is stated in the PR rather
+/// than papered over.
+#[tokio::test]
+async fn the_device_grant_runs_the_hook() {
+    let harness = harness_with_hooks().await;
+    deploy(&harness, ironauth_hooks::fixtures::GOOD, 1).await;
+
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(
+            &client,
+            "authorization_code urn:ietf:params:oauth:grant-type:device_code",
+            Some("https://example.test/logo.png"),
+        )
+        .await;
+    let client_str = client.to_string();
+
+    let start = harness
+        .post_form(
+            "/device_authorization",
+            &form(&[("client_id", &client_str), ("scope", "openid")]),
+            None,
+        )
+        .await;
+    assert_eq!(start.0, StatusCode::OK, "device authorization: {}", start.2);
+    let start = json(&start.2);
+    let device_code = start["device_code"]
+        .as_str()
+        .expect("device_code")
+        .to_owned();
+    let user_code = start["user_code"].as_str().expect("user_code").to_owned();
+
+    let scope = harness.scope();
+    let path = format!("/t/{}/e/{}/device", scope.tenant(), scope.environment());
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let (status, _headers, html) = harness
+        .post_form(&path, &form(&[("user_code", &user_code)]), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK, "confirm page: {html}");
+    let device_code_id =
+        common::form_field(&html, "device_code_id").expect("the confirm page carries the handle");
+    let (status, _headers, body) = harness
+        .post_form(
+            &path,
+            &form(&[
+                ("decision", "allow"),
+                ("device_code_id", &device_code_id),
+                ("user_code", &user_code),
+            ]),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "approve: {body}");
+
+    let (status, _headers, body) = harness
+        .token(&form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", &device_code),
+            ("client_id", &client_str),
+        ]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "device token: {body}");
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access")
+        .to_owned();
+    assert_eq!(
+        claims(&access).get("tier"),
+        Some(&Value::from("gold")),
+        "a device-grant access token carries the hook's claim, or the device door is a way \
+         around a deployed hook: {:?}",
+        claims(&access)
+    );
+}
+
+/// THE FRONT-CHANNEL DOOR runs the hook (issue #114).
+///
+/// `/authorize` mints its own ID token in the implicit flow -- it does not go through the token
+/// endpoint -- so it is a SIXTH place a token is built, and `MappedAccessClaims` cannot fence
+/// it into running a hook: passing `None` for the runtime is a legal call that yields a legal
+/// value of that type. Measured before this test existed: replacing `state.hook_engine()` with
+/// `None` at `authorize.rs` left the entire suite green.
+///
+/// The fixture is `ECHO_ONLY` rather than `GOOD`, because `GOOD` adds to the ACCESS token and
+/// this flow issues no access token (OIDC Core 3.2.2.5: `/authorize` here returns an ID token
+/// and nothing else). A hook that ran and a hook that never ran would produce byte-identical
+/// output under `GOOD`, so it would pass with the door unwired -- which is the shape of test
+/// this file exists to not write.
+#[tokio::test]
+async fn the_front_channel_authorize_door_runs_the_hook() {
+    let harness = Harness::start_with_hook_engine_and_config(
+        Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine")),
+        OidcConfig {
+            enable_response_type_id_token: true,
+            ..OidcConfig::default()
+        },
+    )
+    .await;
+    deploy(&harness, ironauth_hooks::fixtures::ECHO_ONLY, 1).await;
+
+    let client_id = harness.client_id().to_string();
+    let cookie = harness.authenticated_cookie().await;
+    let query = format!(
+        "response_type=id_token&client_id={client_id}&redirect_uri={}&nonce=n-hook&state=s-hook&\
+         scope={}",
+        enc(REDIRECT_URI),
+        enc("openid profile email"),
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "implicit authorize: {body}");
+
+    let id_token = common::location_fragment_param(&headers, "id_token")
+        .expect("the implicit flow returns an id_token in the fragment");
+    let issued = claims(&id_token);
+    assert_eq!(
+        issued.get("echo_only_ran"),
+        Some(&Value::from(true)),
+        "the front-channel ID token carries the hook's marker, or /authorize is a way around a \
+         deployed hook: {issued:?}"
+    );
+    // The echo half. A hook that replaced the set with only its marker would satisfy the
+    // assertion above while destroying the token, and `sub` is the claim whose loss is loudest.
+    assert!(
+        issued.get("sub").is_some_and(Value::is_string),
+        "the echo kept the subject: {issued:?}"
+    );
+}

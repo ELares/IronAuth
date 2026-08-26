@@ -570,9 +570,13 @@ pub struct MintRequest<'a> {
     /// any future writer that has not been invented yet.
     /// Typed, and that is the fence. A [`MappedAccessClaims`] can only come from
     /// `claims_mapping_at_issuance::apply_to_with_hook`, so a door that mints a token for a client cannot
-    /// populate this field without resolving that client's mapping -- including a door nobody
+    /// populate this field without resolving that client's MAPPING -- including a door nobody
     /// has written yet. Review measured why a plain map was not enough: emptying the resolver
     /// call at three of the six existing doors left the whole suite green.
+    ///
+    /// It does NOT fence the HOOK. Passing `None` for the runtime is a legal call that yields a
+    /// legal value of this type, so the type cannot ask whether a door enabled hooks. See
+    /// [`MappedAccessClaims`] for which doors are pinned by a test and which are not.
     pub access_extra_claims: &'a crate::claims_mapping_at_issuance::MappedAccessClaims,
     /// The per-client ID-token signing key (issue #30): the environment key of the
     /// algorithm this client negotiated as its `id_token_signed_response_alg` at

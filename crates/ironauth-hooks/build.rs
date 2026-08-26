@@ -42,6 +42,10 @@ const GUESTS: &[(&str, &str)] = &[
     // -- so a hook deployed to strip a claim produced a token that still carried it, and nothing
     // measured that because no guest removed anything.
     ("claim_stripper", "IRONAUTH_GUEST_CLAIM_STRIPPER"),
+    // Echoes both lists unchanged (issue #114). Echoing is where a cap on hook OUTPUT silently
+    // becomes a cap on the TOKEN, and no fixture echoed enough claims to reach the 32-claim
+    // bound.
+    ("echo_only", "IRONAUTH_GUEST_ECHO_ONLY"),
 ];
 
 fn main() {

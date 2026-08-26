@@ -84,4 +84,11 @@ pub mod fixtures {
     /// The WIT contract is a replace, so dropping a claim means not echoing it. The marker is
     /// what lets a test tell a removal from a hook that never ran.
     pub const CLAIM_STRIPPER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CLAIM_STRIPPER"));
+
+    /// A hook that echoes both claim lists unchanged, plus a marker.
+    ///
+    /// The identity under the replace contract, and the shape that exposes a cap on hook OUTPUT
+    /// silently capping the TOKEN: a deployment with more than 32 extra claims deploying a
+    /// do-nothing hook must not lose any of them.
+    pub const ECHO_ONLY: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_ECHO_ONLY"));
 }

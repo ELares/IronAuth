@@ -36,6 +36,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "echo-only"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "echo-request"
 version = "0.0.0"
 dependencies = [

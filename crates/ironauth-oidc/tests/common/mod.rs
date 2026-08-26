@@ -307,7 +307,33 @@ impl Harness {
         config: OidcConfig,
     ) -> Self {
         let runtime = Arc::new(ironauth_oidc::token_hook::HookRuntime::new(engine));
+        Self::spawn_epoch_driver(&runtime);
         Self::start_inner(config, None, None, None, Some(runtime)).await
+    }
+
+    /// Advance the hook engine's epoch, as the boot path does.
+    ///
+    /// WITHOUT THIS THE DEADLINE NEVER ARRIVES. A hook's `epoch_deadline` counts ticks, so a
+    /// harness that installs an engine and no driver leaves the epoch frozen -- the deadline is
+    /// never reached, the only bound actually exercised is fuel, and a test suite in that state
+    /// cannot see a deadline regression at all. Review found exactly that: the fix that changed
+    /// the deadline from one tick to two was asserted by nothing, because nothing could assert
+    /// it.
+    ///
+    /// ONE MILLISECOND rather than production's ten, so a test that means to hit the deadline
+    /// does not spend a tenth of a second doing it. The RATIO is what the dispatch's two-tick
+    /// delta is about, and the ratio is the same.
+    #[cfg(feature = "wasm-hooks")]
+    fn spawn_epoch_driver(runtime: &Arc<ironauth_oidc::token_hook::HookRuntime>) {
+        let ticker = Arc::clone(runtime.engine());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                ticker.tick();
+            }
+        });
     }
 
     /// Like [`Harness::start`] but with an explicit organization group nesting bound
