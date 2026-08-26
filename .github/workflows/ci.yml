@@ -503,6 +503,26 @@ jobs:
             echo "binary is not static" && exit 1
           fi
 
+  hook-bench:
+    name: hook latency (issue #114 criterion 4)
+    # PINNED, and the class is named in crates/ironauth-hooks/bench-config.toml as well.
+    # `scripts/hook-bench-gate.sh` reads both and refuses to run when they disagree, so this
+    # line cannot drift to a different machine while the config keeps publishing the old class.
+    # A p95 is a property of the machine as much as of the code.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # The benchmark runs a real guest component, so the fixtures have to build. Added
+        # through rustup rather than the action's `targets:` input because rust-toolchain.toml
+        # pins the toolchain cargo actually uses.
+        run: rustup target add wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure and gate
+        run: ./scripts/hook-bench-gate.sh
+
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
     runs-on: ubuntu-latest

@@ -584,6 +584,17 @@ else
   skipped "outbox ironbus lane" "set IRONBUS_ADDR to a broker"
 fi
 
+# The hook latency job (issue #114, criterion 4) is DELIBERATELY not run here, and the exclusion
+# is recorded rather than left to the `comm -23` above to rediscover as a gap.
+#
+# It is not a static check. It takes a measurement, and the question it answers -- "is the p95 on
+# the pinned runner class within its bounds and not a step change against that class's baseline"
+# -- is one a laptop cannot answer at all: `hook-bench-gate.sh` refuses to record or compare a
+# baseline anywhere except on that class, precisely so a local number cannot be published as one.
+# Running it here would add minutes to every gate to print numbers that are, by the script's own
+# rule, not comparable to anything.
+skipped "hook latency (issue #114 criterion 4)" "a measurement on a pinned runner class; run scripts/hook-bench-gate.sh directly for a local signal"
+
 # THE LAST STATEMENT, and it has to stay last.
 #
 # This is what tells the trap the difference between a run that finished and one that was

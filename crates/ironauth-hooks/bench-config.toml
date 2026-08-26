@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The hook latency benchmark's configuration (issue #114, criterion 4).
+#
+# The criterion asks for cold and warm p95 "measured by the CI benchmark job on the pinned
+# runner class named in the benchmark config". This file IS that config: the runner class is
+# named here rather than only in the workflow, so the number a release publishes can be read
+# together with the machine it was taken on.
+#
+# The binding is not prose. `scripts/hook-bench-gate.sh` reads BOTH this file and the workflow
+# and refuses to run if the job's `runs-on` is not the class named here, so a workflow edited to
+# a different machine fails instead of silently publishing numbers from somewhere else.
+
+[runner]
+# The pinned runner class. Every published number is taken on this and comparing across classes
+# is meaningless: a p95 is a property of the measurement, not only of the code.
+class = "ubuntu-latest"
+
+[gates]
+# The criterion's two hard bounds. The job FAILS above either.
+cold_p95_micros = 1000
+warm_p95_micros = 100
+
+[target]
+# The 120-microsecond cold start the issue keeps as "a stated target, not a gate". Reported
+# alongside the gate so a release can see how far from it the runtime is; never enforced.
+cold_p95_micros = 120
+
+[regression]
+# How much worse than the committed baseline a run may be before the job fails.
+#
+# Generous on purpose. A shared CI runner is noisy and a benchmark that fails on ordinary
+# variance teaches people to re-run it until it passes, which is worse than no benchmark: the
+# gates above are the real bound, and this catches a step change rather than a drift.
+tolerance_percent = 50
