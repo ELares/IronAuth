@@ -403,11 +403,19 @@ async fn authorization_code_grant(
     //    OPERATOR's configuration, not the client's request, and a client that asks for
     //    nothing must still receive them.
     merge_enriched_claims(state, scope, &bindings, &mut extra_claims).await;
+    //    Then the client's DECLARATIVE MAPPING (issue #113 criterion 4), which is the last thing
+    //    to touch these claims and the only one that may REMOVE any. It runs after enrichment
+    //    deliberately: an operator who filters `groups` means the groups that reached the token,
+    //    whichever layer contributed them, and a mapping that ran first would filter a set the
+    //    enrichment then refilled.
+    let access_extra_claims =
+        apply_claims_mapping(state, scope, &bindings.client_id, &mut extra_claims).await?;
     let minted = mint_tokens(
         state,
         scope,
         &bindings,
         &extra_claims,
+        &access_extra_claims,
         &target,
         dpop_confirmation.as_ref(),
     )
@@ -1326,6 +1334,7 @@ async fn mint_tokens(
     scope: Scope,
     bindings: &CodeBindings,
     extra_claims: &serde_json::Map<String, serde_json::Value>,
+    access_extra_claims: &serde_json::Map<String, serde_json::Value>,
     target: &AccessTokenTarget,
     confirmation: Option<&Confirmation>,
 ) -> Result<IssuedTokens, TokenError> {
@@ -1432,8 +1441,11 @@ async fn mint_tokens(
             // (issue #368): the `cnf` claim is issuer-set only, so a client cannot
             // self-assert it. None leaves a plain bearer access token.
             confirmation,
-            // The pre-token hook is the only writer; every other path contributes none.
-            access_extra_claims: crate::tokens::no_extra_claims(),
+            // The client's declarative mapping (issue #113), resolved by the caller. Empty
+            // when no mapping is configured, which is every client until an operator writes
+            // one. Fenced by the CHANNEL: `MintRequest::access_extra_claims` drops a protected
+            // name whatever writes into it.
+            access_extra_claims,
         },
         target,
     )
@@ -1659,6 +1671,37 @@ async fn merge_enriched_claims(
         }
         extra_claims.insert(name, value);
     }
+}
+
+/// Apply this client's stored declarative mapping to the claims about to be minted.
+///
+/// Rewrites `extra_claims` into the ID-token set and RETURNS the access-token set, because a
+/// mapping's whole job includes deciding which token a claim goes in (issue #113 criterion 4:
+/// "ID-versus-access-token placement with no custom code"). Before this seam existed the access
+/// token had no configured claims at all and `MintRequest::access_extra_claims` had no
+/// production writer.
+///
+/// # Why a fault here fails the whole issuance
+///
+/// Unlike `merge_enriched_claims` above, which is deliberately fail-open, a mapping is as likely
+/// to REMOVE a claim as to add one: `filter_list` exists so a token does not carry three thousand
+/// group names. Ignoring a mapping that could not be read would issue the UNFILTERED set, which
+/// is MORE than the operator configured. See `claims_mapping_at_issuance`'s header.
+///
+/// # Errors
+///
+/// [`TokenError::ServerError`] when the mapping cannot be read or applied. The reason is logged;
+/// a client is told nothing beyond the failure, because which mapping a client has is not
+/// something a client gets to probe.
+pub(crate) async fn apply_claims_mapping(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &str,
+    extra_claims: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, TokenError> {
+    crate::claims_mapping_at_issuance::apply_to(state.store(), scope, client_id, extra_claims)
+        .await
+        .map_err(|_| TokenError::ServerError)
 }
 
 /// Build the `200 OK` token response (RFC 6749 5.1) from the pre-minted tokens,
@@ -2438,7 +2481,20 @@ async fn mint_refresh_access(
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
     let subject = state.resolve_public_subject(&resolution.subject);
-    let extra_claims = serde_json::Map::new();
+    // The client's declarative mapping (issue #113 criterion 4), applied on REFRESH as well as
+    // on the code exchange, and that is not symmetry for its own sake. Refresh is the
+    // highest-volume grant, so a mapping that only shaped the code exchange would be bypassed by
+    // any client that simply refreshes: an operator's `filter_list` on `groups` would hold for
+    // one token and be gone for the rest of the family's life.
+    //
+    // The source is EMPTY here because the refresh path mints no ID token and carries no
+    // request-parameter claims, so `static` and `place` rules are what can act; a `rename` or a
+    // `filter_list` has nothing to work on and produces nothing, which is the correct answer
+    // rather than a gap. A fault still fails the refresh, for the reason
+    // `claims_mapping_at_issuance` gives.
+    let mut extra_claims = serde_json::Map::new();
+    let access_extra_claims =
+        apply_claims_mapping(state, scope, &resolution.client_id, &mut extra_claims).await?;
     let minted = tokens::mint_access_token(
         state,
         signer,
@@ -2490,8 +2546,10 @@ async fn mint_refresh_access(
             // proof was presented (enforced in [`enforce_refresh_dpop`]); [`None`]
             // leaves an unbound family's rotated token bearer, byte identical.
             confirmation,
-            // The pre-token hook is the only writer; every other path contributes none.
-            access_extra_claims: crate::tokens::no_extra_claims(),
+            // The client's declarative mapping (issue #113), resolved above. Empty when no
+            // mapping is configured. Fenced by the CHANNEL, so a protected name is dropped
+            // whatever writes into it.
+            access_extra_claims: &access_extra_claims,
         },
         target,
     )

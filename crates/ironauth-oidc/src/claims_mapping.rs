@@ -145,7 +145,11 @@ fn refuse_name(name: &str) -> Option<RefusalReason> {
 }
 
 /// Which token a claim is written into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The wire names are `id_token`, `access_token` and `both`, which is how an operator writes
+/// them in a stored rule document and how a config snapshot carries them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Placement {
     /// The ID token only. Identity for the client's own use.
     IdToken,
@@ -157,7 +161,28 @@ pub enum Placement {
 }
 
 /// One declarative operation.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// # The stored wire format
+///
+/// A rule is an object tagged by `kind`, which is the shape `claims_mappings.rules` holds and
+/// the shape a config snapshot carries:
+///
+/// ```json
+/// [
+///   {"kind": "rename", "from": "dept", "to": "department"},
+///   {"kind": "static", "name": "tier", "value": "gold"},
+///   {"kind": "filter_list", "name": "groups", "allow": ["eng", "sre"]},
+///   {"kind": "place", "name": "department", "placement": "access_token"}
+/// ]
+/// ```
+///
+/// `deny_unknown_fields`, deliberately. A rule with a field this version does not know is a
+/// rule this version cannot carry out, and the unknown field is as likely to be the part that
+/// RESTRICTS something as the part that adds it -- an `except` on a filter, a condition on a
+/// static. Ignoring it would apply a weaker rule than the operator wrote while reporting
+/// success. See [`parse`] for what happens to such a document at issuance.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MappingRule {
     /// Rename a claim. The source is removed and its value written under the new name.
     Rename {
@@ -316,6 +341,34 @@ pub struct MappedClaims {
     pub id_token: BTreeMap<String, serde_json::Value>,
     /// Claims for the access token.
     pub access_token: BTreeMap<String, serde_json::Value>,
+}
+
+/// Parse a stored rule document into rules that can be applied.
+///
+/// The store carries `claims_mappings.rules` as a JSON string on purpose: `ironauth-store`
+/// cannot depend on this crate, so a second definition of the rule shape there would be two
+/// definitions of one wire format. This is the single place that turns the document back into
+/// rules, against the one definition that governs it.
+///
+/// # What a failure here means, and why the caller must fail CLOSED
+///
+/// The admin write path validates before storing and the table constrains the document's shape,
+/// so a stored document that does not parse is a downgrade, a hand-edited row, or corruption.
+/// It is tempting to treat that as "no mapping" and issue the token unmapped. That is the wrong
+/// direction and it is worth being explicit about why: a mapping is as likely to REMOVE a claim
+/// as to add one. `filter_list` on `groups` exists precisely so a token does not carry three
+/// thousand group names, and `place` exists so a claim stays out of the access token. Falling
+/// back to "unmapped" on a document nobody could read would emit the UNFILTERED claim set --
+/// more than the operator configured, from a rule set nobody could evaluate.
+///
+/// So the caller fails the issuance. Under-claiming is the safe failure for an enrichment; this
+/// is not an enrichment.
+///
+/// # Errors
+///
+/// [`serde_json::Error`] if the document is not a JSON array of rules this version understands.
+pub fn parse(rules_json: &str) -> Result<Vec<MappingRule>, serde_json::Error> {
+    serde_json::from_str(rules_json)
 }
 
 /// Check a mapping without applying it.
@@ -1456,4 +1509,161 @@ pub fn filter_hook_claims(returned: &BTreeMap<String, serde_json::Value>) -> Hoo
     // only past the limit come out in the opposite order from the one they went in.
     outcome.refused.sort_by(|left, right| left.0.cmp(&right.0));
     outcome
+}
+
+/// The stored wire format, which is a contract with rows this crate did not write.
+///
+/// `claims_mappings.rules` documents are produced by the admin write path, by config-snapshot
+/// imports, and by whatever an operator hand-edits. This crate is the only reader. So the tag
+/// names and field names are not an implementation detail of `parse`; they are the format, and
+/// a rename that compiled here would make every stored document unreadable at the next
+/// issuance.
+#[cfg(test)]
+mod wire_format_tests {
+    use super::{MappingRule, Placement, apply, parse};
+    use std::collections::BTreeMap;
+
+    /// The EXACT documents already committed elsewhere in this repository parse.
+    ///
+    /// These strings are copied verbatim from `crates/ironauth-store/tests/claims_mappings.rs`
+    /// and `crates/ironauth-store/src/promotion.rs`, which wrote them before any parser existed.
+    /// A test that builds its own fixture proves the parser is self-consistent and nothing else:
+    /// the question is whether it can read what the tree already stores.
+    #[test]
+    fn the_documents_already_in_the_tree_parse() {
+        let store_test_fixture = r#"[{"kind":"rename","from":"dept","to":"department"},{"kind":"static","name":"tier","value":"gold"}]"#;
+        assert_eq!(
+            parse(store_test_fixture).expect("the store suite's fixture must parse"),
+            vec![
+                MappingRule::Rename {
+                    from: "dept".to_owned(),
+                    to: "department".to_owned(),
+                },
+                MappingRule::Static {
+                    name: "tier".to_owned(),
+                    value: serde_json::json!("gold"),
+                },
+            ]
+        );
+
+        let promotion_fixture = r#"[{"kind": "static", "name": "tier", "value": "gold"}]"#;
+        assert_eq!(
+            parse(promotion_fixture).expect("the promotion fixture must parse"),
+            vec![MappingRule::Static {
+                name: "tier".to_owned(),
+                value: serde_json::json!("gold"),
+            }]
+        );
+    }
+
+    /// Every variant round-trips, so nothing is writable-but-unreadable.
+    ///
+    /// The `place` rule is the one worth naming: it is the only rule whose payload is an enum,
+    /// and a `Placement` serialized as `IdToken` rather than `id_token` would still round-trip
+    /// through itself while being unreadable to anyone reading the column.
+    #[test]
+    fn every_rule_round_trips_through_the_stored_shape() {
+        let rules = vec![
+            MappingRule::Rename {
+                from: "dept".to_owned(),
+                to: "department".to_owned(),
+            },
+            MappingRule::Static {
+                name: "tier".to_owned(),
+                value: serde_json::json!({"level": 2}),
+            },
+            MappingRule::FilterList {
+                name: "groups".to_owned(),
+                allow: vec!["eng".to_owned(), "sre".to_owned()],
+            },
+            MappingRule::Place {
+                name: "department".to_owned(),
+                placement: Placement::AccessToken,
+            },
+        ];
+        let document = serde_json::to_string(&rules).expect("serialize");
+        assert!(
+            document.contains(r#""kind":"filter_list""#)
+                && document.contains(r#""placement":"access_token""#),
+            "the wire names are snake_case and an operator reads them in the column: {document}"
+        );
+        assert_eq!(parse(&document).expect("round trip"), rules);
+    }
+
+    /// A field this version does not know is a REFUSAL, not a shrug.
+    ///
+    /// An unknown field is as likely to be the part that restricts as the part that adds. If
+    /// `serde` ignored it, a future `{"kind":"filter_list","name":"groups","allow":[...],
+    /// "except":[...]}` written by a newer node would apply here WITHOUT the exception list --
+    /// a weaker rule than the operator wrote, reported as success.
+    #[test]
+    fn an_unknown_field_is_refused_rather_than_ignored() {
+        let newer =
+            r#"[{"kind":"filter_list","name":"groups","allow":["eng"],"except":["contractors"]}]"#;
+        let refused = parse(newer).expect_err("a rule carrying an unknown field must not parse");
+        assert!(
+            refused.to_string().contains("except"),
+            "the refusal must NAME the field, or an operator cannot act on it: {refused}"
+        );
+
+        // And the same document without the unknown field parses, so the case above is
+        // failing for the field and not for something else in the string.
+        let known = r#"[{"kind":"filter_list","name":"groups","allow":["eng"]}]"#;
+        parse(known).expect("the same rule without the unknown field must parse");
+    }
+
+    /// An unknown KIND is refused too, and separately: a new rule type is not a new field.
+    #[test]
+    fn an_unknown_kind_is_refused() {
+        let refused = parse(r#"[{"kind":"redact","name":"groups"}]"#)
+            .expect_err("a rule kind this version cannot carry out must not parse");
+        assert!(
+            refused.to_string().contains("redact"),
+            "the refusal must name the kind: {refused}"
+        );
+    }
+
+    /// The parsed rules ACT. A parser that produces a `Vec` nothing applies is a decoder test.
+    #[test]
+    fn a_parsed_document_maps_claims() {
+        let rules = parse(
+            r#"[{"kind":"filter_list","name":"groups","allow":["eng"]},
+                {"kind":"rename","from":"dept","to":"department"},
+                {"kind":"place","name":"department","placement":"access_token"},
+                {"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .expect("parse");
+        let mut source = BTreeMap::new();
+        source.insert("groups".to_owned(), serde_json::json!(["eng", "sales"]));
+        source.insert("dept".to_owned(), serde_json::json!("platform"));
+
+        let mapped = apply(&rules, &source).expect("apply");
+        assert_eq!(
+            mapped.id_token.get("groups"),
+            Some(&serde_json::json!(["eng"])),
+            "the filter kept only the allowed member: {:?}",
+            mapped.id_token
+        );
+        assert_eq!(
+            mapped.access_token.get("department"),
+            Some(&serde_json::json!("platform")),
+            "the rename landed and the placement moved it: {:?}",
+            mapped.access_token
+        );
+        assert!(
+            !mapped.id_token.contains_key("department") && !mapped.id_token.contains_key("dept"),
+            "a claim placed in the access token is not ALSO in the ID token, and the rename \
+             removed the source: {:?}",
+            mapped.id_token
+        );
+        assert_eq!(
+            mapped.id_token.get("tier"),
+            Some(&serde_json::json!("gold")),
+            "a claim no rule places goes in both"
+        );
+        assert_eq!(
+            mapped.access_token.get("tier"),
+            Some(&serde_json::json!("gold"))
+        );
+    }
 }

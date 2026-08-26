@@ -1250,6 +1250,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0159_claims_mappings.sql"),
         },
+        Migration {
+            version: 160,
+            name: "claims_mappings_data_plane_read",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0160_claims_mappings_data_plane_read.sql"),
+        },
     ]
 }
 

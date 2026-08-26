@@ -669,7 +669,23 @@ async fn mint_assertion(
     let auth_time_unix_micros = client
         .require_auth_time
         .then_some(session.auth_time_unix_micros);
-    let extra_claims = serde_json::Map::new();
+    let mut extra_claims = serde_json::Map::new();
+    // The client's declarative mapping (issue #113 criterion 4), applied on EVERY door that
+    // mints a token for this client, not only the ones an operator is likely to test. A mapping
+    // can REMOVE a claim -- `filter_list` exists so a token does not carry three thousand group
+    // names -- so a door that skipped it would issue MORE than the operator configured, and
+    // whichever door that is becomes the one to use. A fault fails the issuance, for the reason
+    // `claims_mapping_at_issuance`'s header gives.
+    //
+    // This function returns `Option<String>`, so a fault is `None` and the assertion is refused.
+    let access_extra_claims = crate::claims_mapping_at_issuance::apply_to(
+        state.store(),
+        scope,
+        &client_id_str,
+        &mut extra_claims,
+    )
+    .await
+    .ok()?;
     // The impersonation this session was started under (issue #101). A FedCM assertion is an
     // ID token going straight to a relying party, so omitting `act` here would be the same
     // audit hole as omitting it at the token endpoint.
@@ -706,8 +722,10 @@ async fn mint_assertion(
         id_token_signer: None,
         // FedCM mints an ID token only, never a DPoP-bound access token (issue #368).
         confirmation: None,
-        // The pre-token hook is the only writer; every other path contributes none.
-        access_extra_claims: crate::tokens::no_extra_claims(),
+        // The client's declarative mapping (issue #113), resolved above. Empty when no
+        // mapping is configured. Fenced by the CHANNEL, so a protected name is dropped
+        // whatever writes into it.
+        access_extra_claims: &access_extra_claims,
     };
     tokens::mint_id_token(state, signer, entry.policy(), &request)
         .ok()

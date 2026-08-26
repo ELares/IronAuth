@@ -1,0 +1,22 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The data plane's READ on claims_mappings (issue #113 criterion 4).
+--
+-- 0159 created the table and deliberately withheld this grant, saying so in the file:
+--
+--     NO data-plane grant yet. The issuance path WILL read these on every token it mints, and
+--     that reader does not exist: its only exerciser today would be a test... It arrives with
+--     the mint-side reader.
+--
+-- This is that change. The reader is `claims_mapping_at_issuance::resolve`, called from the
+-- token endpoint on the authorization-code exchange and on every refresh.
+--
+-- SELECT AND NOTHING MORE, which is the split 0159 argued for and the reason the grant waited:
+-- the plane that mints tokens must not be able to change the shape of the tokens it mints. A
+-- data plane holding INSERT or UPDATE here could write itself a mapping and then honour it,
+-- which is a privilege escalation with no audit trail -- `claims_mapping.set` is written by the
+-- control plane inside the audited transaction, and nothing on this side can reach it.
+--
+-- Row-level security still applies: 0159 set both ENABLE and FORCE, and the policy predicate is
+-- unchanged. This grant lets the data plane ask; the policy decides what it may see.
+GRANT SELECT ON claims_mappings TO ironauth_app;

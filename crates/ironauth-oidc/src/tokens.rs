@@ -911,19 +911,6 @@ pub(crate) fn build_access_token_claims(
     claims
 }
 
-/// An empty claim bag, for a mint that contributes none.
-///
-/// A shared `'static` rather than a temporary at each call site, because
-/// [`MintRequest`] holds borrows and every site would otherwise need its own binding to keep
-/// alive. Every path but the pre-token hook's passes this for
-/// [`MintRequest::access_extra_claims`].
-#[must_use]
-pub fn no_extra_claims() -> &'static serde_json::Map<String, serde_json::Value> {
-    use std::sync::OnceLock;
-    static EMPTY: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
-    EMPTY.get_or_init(serde_json::Map::new)
-}
-
 /// Everything a client-credentials (M2M) access token needs (issue #23). Distinct
 /// from [`MintRequest`] because a machine token has no user, no nonce, no
 /// authentication event, and no ID token: only the RFC 9068 protocol claims, the

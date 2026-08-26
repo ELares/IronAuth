@@ -86,6 +86,7 @@ mod ciba;
 mod ciba_grant;
 pub mod cimd;
 pub mod claims_mapping;
+pub mod claims_mapping_at_issuance;
 mod claims_request;
 mod client_auth;
 mod client_credentials;

@@ -40,11 +40,6 @@ ironauth-oidc/mds3_sync
 # before `mint_access` builds its claims, so no point today holds both unsigned.
 ironauth-store/token_customize
 
-# issue #113: both halves of the reserved-claim fence, the declarative one an operator
-# configures and the one a hook's returned claims pass through. Callerless for the same
-# reason as token_customize above: the mint seam that would call it is #113's remaining
-# work, and landing the fence first means the seam cannot be written without one.
-ironauth-oidc/claims_mapping
 ALLOWLIST
 }
 
