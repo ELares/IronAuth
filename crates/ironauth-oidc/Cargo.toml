@@ -174,21 +174,22 @@ tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
 # histogram appear in the rendered exposition text.
 metrics-exporter-prometheus = { workspace = true }
 
-# Metering stays OFF the issuance path (issue #107 acceptance criterion 5): a token
-# exchange under a tracing capture executes no query that READS the event feed.
-# ALONE in its binary by necessity, not by preference: it installs a global tracing
-# subscriber, and `tracing` caches callsite interest process-wide, so a sibling test
-# reaching sqlx's callsite first would silence the capture for the whole process.
-# The messaging ledger has a PRODUCER (issue #111): a coarse notice delivered through the
-# VerificationSender `send` seam lands a row and its delivery job, carries a payload with no
-# secret that still composes, keeps two purposes from collapsing onto each other, collapses a
-# repeat inside the window, queues nothing for an unaddressable recipient, and stores the
-# recipient blind-indexed.
+# The messaging ledger has a PRODUCER (issue #111): the two coarse account-link alerts,
+# delivered through the VerificationSender `send` seam, land a row and exactly one delivery job,
+# carry a payload with no secret whose two fields are the two the composer needs, and keep all
+# three dimensions of the dedup key apart (two purposes, two recipients, two windows). Every
+# purpose this producer does not render, and all four `deliver_*` methods, are asserted to reach
+# the wrapped transport instead.
 [[test]]
 name = "notice_enqueues"
 path = "tests/notice_enqueues.rs"
 required-features = ["testing"]
 
+# Metering stays OFF the issuance path (issue #107 acceptance criterion 5): a token
+# exchange under a tracing capture executes no query that READS the event feed.
+# ALONE in its binary by necessity, not by preference: it installs a global tracing
+# subscriber, and `tracing` caches callsite interest process-wide, so a sibling test
+# reaching sqlx's callsite first would silence the capture for the whole process.
 [[test]]
 name = "metering_inline_queries"
 path = "tests/metering_inline_queries.rs"

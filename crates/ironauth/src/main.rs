@@ -1391,25 +1391,32 @@ async fn build_oidc_plane(
             // suppression check, the failover and both management endpoints were implemented,
             // tested, and fed by nothing.
             //
-            // It feeds the ONE door whose variables are safe to write down. A payload rides a
-            // durable queue every consumer worker reads, so a door carrying a token in its body
-            // -- an OTP code, a magic link, a disavowal link, a cancellation link -- cannot use
-            // this path at all until the ledger has a sealed-payload mode.
+            // It WRAPS the logging transport rather than replacing it, and that is the
+            // load-bearing part of this wiring. The producer renders exactly two messages -- the
+            // coarse `account_linked` and `account_unlinked` alerts -- because a payload rides a
+            // durable queue every consumer worker reads and `DefaultComposer` refuses one with
+            // no body, so a message this cannot write the whole text of cannot use this path.
+            // Every other purpose and all four `deliver_*` methods pass straight through to the
+            // sender below. A wholesale swap would have moved four transports from "logged" to
+            // completely silent, because the trait's default bodies discard their argument.
             //
             // Gated on `messaging.delivery_enabled` alone, so a deployment that has not turned
             // messaging on keeps the logging transport and behaves exactly as before. Turning it
-            // on is what makes a new-device notice a real queued message.
+            // on is what makes an account-link alert a real queued message, and changes nothing
+            // else.
+            let logging: std::sync::Arc<dyn ironauth_oidc::VerificationSender> =
+                std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender);
             if config.messaging.delivery_enabled {
                 std::sync::Arc::new(
                     ironauth_oidc::message_sender::MessagingVerificationSender::new(
+                        logging,
                         messaging_store.clone(),
                         messaging_env.clone(),
                         ironauth_store::message_rate::RateBudget::new(3, 3_600),
                     ),
                 ) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
             } else {
-                std::sync::Arc::new(ironauth_oidc::LoggingVerificationSender)
-                    as std::sync::Arc<dyn ironauth_oidc::VerificationSender>
+                logging
             }
         },
         |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::VerificationSender>,

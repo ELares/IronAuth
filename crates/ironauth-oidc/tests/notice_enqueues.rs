@@ -7,18 +7,78 @@
 //! implemented, wired into the shipped binary, and covered by passing tests, and nothing ever
 //! handed them a message.
 //!
-//! The door is `VerificationSender::send`, the one delivery method whose variables are safe to
-//! write down: a scope, a coarse purpose, and a recipient, with the body coming from a template.
-//! The other four carry a token -- an OTP code, a magic link, a disavowal link, a cancellation
-//! link -- and `message_composer` excludes them from this path in as many words.
+//! The door is PART of `VerificationSender::send`: the two coarse `account_*` alerts, which are
+//! the only messages this producer knows the whole text of. Two rules narrow it there.
+//!
+//! A payload rides a durable queue every consumer worker reads and the management events API
+//! serves it, so a message carrying a token cannot use this path -- that excludes the four
+//! `deliver_*` methods outright. And `DefaultComposer::compose` refuses a payload with no
+//! `body`, so the producer must RENDER the message, which it can only do for one whose whole
+//! text it knows. `Recovery` and `Registration` carry a confirm link; mailing them without it
+//! would not be a degraded message, it would be a broken flow.
+//!
+//! Everything this producer does not render is DELEGATED, unchanged, to the sender it wraps.
+//! `the_link_carrying_purposes_are_delegated_not_queued` and
+//! `the_four_token_carrying_methods_are_delegated` are what make that true rather than
+//! intended.
 
 use ironauth_env::Env;
-use ironauth_oidc::message_sender::{MessagingVerificationSender, NOTICE_WINDOW_SECS};
-use ironauth_oidc::{VerificationPurpose, VerificationSender};
-use ironauth_store::CorrelationId;
+use ironauth_oidc::message_sender::{MessagingVerificationSender, notice_body};
+use ironauth_oidc::{
+    EmailOtpMessage, MagicLinkMessage, NewDeviceNotice, RecoveryCancelNotice, VerificationPurpose,
+    VerificationSender,
+};
 use ironauth_store::message_rate::RateBudget;
 use ironauth_store::test_support::TestDatabase;
+use ironauth_store::{CorrelationId, MESSAGE_DELIVERY_CONSUMER};
 use sqlx::Row as _;
+use std::sync::{Arc, Mutex};
+
+/// The sender under test wraps another one, so what it DELEGATES is observable.
+///
+/// Recording rather than counting: a test that only counts cannot tell "delegated the right
+/// call" from "delegated some call", and the delegation is the half of this type that keeps
+/// four transports alive.
+#[derive(Debug, Default)]
+struct Recorder {
+    calls: Mutex<Vec<String>>,
+}
+
+impl Recorder {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().expect("not poisoned").clone()
+    }
+
+    fn record(&self, call: &str) {
+        self.calls
+            .lock()
+            .expect("not poisoned")
+            .push(call.to_owned());
+    }
+}
+
+#[async_trait::async_trait]
+impl VerificationSender for Recorder {
+    async fn send(&self, _scope: ironauth_store::Scope, purpose: VerificationPurpose, _to: &str) {
+        self.record(&format!("send:{}", purpose.as_str()));
+    }
+
+    fn deliver_email_otp(&self, _message: &EmailOtpMessage<'_>) {
+        self.record("deliver_email_otp");
+    }
+
+    fn deliver_magic_link(&self, _message: &MagicLinkMessage<'_>) {
+        self.record("deliver_magic_link");
+    }
+
+    fn deliver_new_device_notice(&self, _message: &NewDeviceNotice<'_>) {
+        self.record("deliver_new_device_notice");
+    }
+
+    fn deliver_recovery_cancel_notice(&self, _message: &RecoveryCancelNotice<'_>) {
+        self.record("deliver_recovery_cancel_notice");
+    }
+}
 
 /// Provision the envelope keys the ledger seals a recipient with.
 ///
@@ -42,8 +102,28 @@ async fn provision(db: &TestDatabase, env: &Env, scope: ironauth_store::Scope) {
         .expect("provision dek");
 }
 
-fn sender(db: &TestDatabase, env: &Env) -> MessagingVerificationSender {
-    MessagingVerificationSender::new(db.store().clone(), env.clone(), RateBudget::new(100, 3_600))
+/// A sender whose delegation target is observable, with a budget high enough not to interfere.
+///
+/// The budget is named at every call site rather than defaulted, because the SHIPPED budget is
+/// `RateBudget::new(3, 3_600)` and a helper that hid a generous one would mean the configuration
+/// production runs is the only one no test ever exercises.
+fn sender(db: &TestDatabase, env: &Env) -> (MessagingVerificationSender, Arc<Recorder>) {
+    sender_with(db, env, RateBudget::new(100, 3_600))
+}
+
+fn sender_with(
+    db: &TestDatabase,
+    env: &Env,
+    budget: RateBudget,
+) -> (MessagingVerificationSender, Arc<Recorder>) {
+    let recorder = Arc::new(Recorder::default());
+    let sender = MessagingVerificationSender::new(
+        Arc::clone(&recorder) as Arc<dyn VerificationSender>,
+        db.store().clone(),
+        env.clone(),
+        budget,
+    );
+    (sender, recorder)
 }
 
 async fn count(db: &TestDatabase, scope: ironauth_store::Scope, kind: Option<&str>) -> i64 {
@@ -74,6 +154,7 @@ async fn a_notice_lands_in_the_ledger_with_a_delivery_job() {
     provision(&db, &env, scope).await;
 
     sender(&db, &env)
+        .0
         .send(
             scope,
             VerificationPurpose::AccountLinked,
@@ -94,32 +175,48 @@ async fn a_notice_lands_in_the_ledger_with_a_delivery_job() {
 
     // The delivery job rides the SAME transaction as the row, which is why the outbox exists:
     // a message recorded without a job never sends.
+    // EXACTLY one, and filtered to the DELIVERY consumer. `>= 1` over every consumer was the
+    // first version and it cannot fail for the right reason: the rate-limited path writes an
+    // outbox row too (the `message.rate_limited` domain event), so a run that queued no
+    // delivery job at all would still have satisfied it.
     let jobs: i64 = sqlx::query(
-        "SELECT COUNT(*) AS n FROM outbox_messages WHERE tenant_id = $1 AND environment_id = $2",
+        "SELECT COUNT(*) AS n FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3",
     )
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
+    .bind(MESSAGE_DELIVERY_CONSUMER)
     .fetch_one(db.owner_pool())
     .await
     .expect("count jobs")
     .get("n");
-    assert!(jobs >= 1, "a queued message must have a delivery job");
+    assert_eq!(
+        jobs, 1,
+        "a queued message must have exactly one delivery job"
+    );
 }
 
-/// The payload carries NO secret, and it composes.
+/// The payload carries NO secret, and its two fields are the two the composer needs.
 ///
-/// Both halves matter and each was a separate blocker in review. A payload with a live token in
-/// it publishes that token to anything reading the outbox; a payload with no `message_id`
-/// composes to `Err("no_message_id")`, which the consumer marks Failed, so every notice
-/// terminates without a provider ever being contacted.
+/// Whether it COMPOSES is asserted in `ironauth-admin`, against the real `DefaultComposer`, by
+/// `the_notice_payload_composes`. It has to live there because the dependency runs that way, and
+/// the reason it is a separate test rather than an assertion here is a defect review found: the
+/// first version checked composability by hand-copying `message_id_local`'s charset predicate.
+/// That predicate is one of TWO refusals in `compose`, and the version it could not see --
+/// `missing_body` -- fired for every payload this producer wrote. The test was green and every
+/// notice would have terminated `Failed` with no provider contacted.
+///
+/// A copied predicate is not the code it copies. What this test asserts is the payload's
+/// CONTENT; what the admin-side test asserts is that the composer accepts it.
 #[tokio::test]
-async fn the_payload_carries_no_secret_and_still_composes() {
+async fn the_payload_carries_no_secret_and_nothing_the_composer_cannot_use() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     provision(&db, &env, scope).await;
 
     sender(&db, &env)
+        .0
         .send(
             scope,
             VerificationPurpose::AccountUnlinked,
@@ -147,19 +244,39 @@ async fn the_payload_carries_no_secret_and_still_composes() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        vec!["message_id", "purpose"],
+        vec!["body", "message_id"],
         "the payload rides a durable queue every consumer worker reads, so it carries only \
          variables that are safe to write down"
     );
+
+    // The message id is the LEDGER ROW'S id, not merely a well-shaped string. Asserting only
+    // that it looks like an id passes for a constant, and a constant here means every message
+    // the deployment ever sends shares one `Message-ID` and one MIME boundary -- which is the
+    // bug `message_id_local`'s own doc records as already having been fixed once.
+    let row_id: String = sqlx::query("SELECT id::text AS id FROM messages WHERE tenant_id = $1")
+        .bind(scope.tenant().to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("read the row")
+        .get("id");
+    assert_eq!(
+        object["message_id"].as_str(),
+        Some(row_id.as_str()),
+        "the payload's message id is the row's own: {payload}"
+    );
+
+    // And the body is the rendered notice, which is what makes the message composable at all.
+    assert_eq!(
+        object["body"].as_str(),
+        notice_body(VerificationPurpose::AccountUnlinked),
+        "the body is the rendered text for THIS purpose: {payload}"
+    );
     assert!(
-        object["message_id"].as_str().is_some_and(|id| {
-            !id.is_empty()
-                && id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        }),
-        "the composer refuses a payload whose message_id is missing or not id-safe, and the \
-         consumer marks that job Failed: {payload}"
+        !object["body"]
+            .as_str()
+            .expect("a string body")
+            .contains("http"),
+        "a coarse alert carries no link; a body with one would be a token on a durable queue"
     );
 }
 
@@ -174,7 +291,7 @@ async fn two_purposes_to_one_recipient_do_not_collapse() {
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     provision(&db, &env, scope).await;
-    let sender = sender(&db, &env);
+    let (sender, _delegate) = sender(&db, &env);
 
     sender
         .send(
@@ -223,7 +340,7 @@ async fn a_repeat_inside_the_window_collapses() {
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     provision(&db, &env, scope).await;
-    let sender = sender(&db, &env);
+    let (sender, _delegate) = sender(&db, &env);
 
     for _ in 0..3 {
         sender
@@ -257,6 +374,7 @@ async fn an_undeliverable_recipient_queues_nothing() {
     provision(&db, &env, scope).await;
 
     sender(&db, &env)
+        .0
         .send(scope, VerificationPurpose::AccountLinked, "not-an-address")
         .await;
 
@@ -272,6 +390,7 @@ async fn the_recipient_is_not_stored_in_plaintext() {
     provision(&db, &env, scope).await;
 
     sender(&db, &env)
+        .0
         .send(
             scope,
             VerificationPurpose::AccountLinked,
@@ -324,11 +443,7 @@ async fn a_notice_in_a_later_window_is_a_new_send() {
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
         1,
     );
-    let sender = MessagingVerificationSender::new(
-        db.store().clone(),
-        env.clone(),
-        RateBudget::new(100, 3_600),
-    );
+    let (sender, _delegate) = sender_with(&db, &env, RateBudget::new(100, 3_600));
 
     sender
         .send(
@@ -339,8 +454,33 @@ async fn a_notice_in_a_later_window_is_a_new_send() {
         .await;
     assert_eq!(count(&db, scope, None).await, 1);
 
-    // Same purpose, same recipient, one whole window later.
-    clock.advance(std::time::Duration::from_secs(NOTICE_WINDOW_SECS + 1));
+    // 899 seconds later: still INSIDE the window, so still one message.
+    //
+    // This is the half that pins the window's WIDTH, and it is why the advances below are
+    // literals rather than `NOTICE_WINDOW_SECS + 1`. An advance computed from the constant
+    // under test tracks whatever value it takes, so shrinking the window to 61 seconds -- which
+    // would mail a person sixteen times an hour -- left the "later window" assertion green.
+    //
+    // `window_index` is `epoch / width`, a BUCKET rather than a sliding window, so two sends
+    // 899 seconds apart land in one bucket only if they do not straddle a boundary. The base
+    // instant is chosen for that: 1_800_000_000 is exactly 2_000_000 * 900, so the first send
+    // sits on a boundary and the arithmetic below is about the width and nothing else.
+    clock.advance(std::time::Duration::from_secs(899));
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "user@example.test",
+        )
+        .await;
+    assert_eq!(
+        count(&db, scope, None).await,
+        1,
+        "899 seconds is inside a 900-second window: a narrower window would send again here"
+    );
+
+    // And two seconds after that, 901 from the first: a new bucket, a new send.
+    clock.advance(std::time::Duration::from_secs(2));
     sender
         .send(
             scope,
@@ -376,11 +516,7 @@ async fn a_differently_cased_address_lands_the_same_blind_index() {
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
         1,
     );
-    let sender = MessagingVerificationSender::new(
-        db.store().clone(),
-        env.clone(),
-        RateBudget::new(100, 3_600),
-    );
+    let (sender, _delegate) = sender_with(&db, &env, RateBudget::new(100, 3_600));
 
     sender
         .send(
@@ -389,7 +525,7 @@ async fn a_differently_cased_address_lands_the_same_blind_index() {
             "User@Example.Test",
         )
         .await;
-    clock.advance(std::time::Duration::from_secs(NOTICE_WINDOW_SECS + 1));
+    clock.advance(std::time::Duration::from_secs(901));
     sender
         .send(
             scope,
@@ -414,5 +550,237 @@ async fn a_differently_cased_address_lands_the_same_blind_index() {
         first, second,
         "one mailbox is one recipient however it was typed; differing indexes would make a \
          suppression keyed on one miss the other"
+    );
+}
+
+/// Two DIFFERENT recipients in one window do not collapse onto each other.
+///
+/// The third dimension of the dedup key, and the one nothing measured: every other test in this
+/// file used a single mailbox, so replacing the recipient with a constant inside `dedup_key`
+/// left all of them green. The consequence is not a missed duplicate. Alice and Bob both have a
+/// sign-in method linked in the same fifteen minutes, the keys are equal, Bob's notice is
+/// collapsed, and Bob is never told his account changed.
+///
+/// One dimension varies: same purpose, same window, different address.
+#[tokio::test]
+async fn two_recipients_in_one_window_do_not_collapse() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    provision(&db, &env, scope).await;
+    let (sender, _delegate) = sender(&db, &env);
+
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "alice@example.test",
+        )
+        .await;
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "bob@example.test",
+        )
+        .await;
+
+    assert_eq!(
+        count(&db, scope, None).await,
+        2,
+        "two mailboxes are two recipients; collapsing them tells one person about the other's \
+         account and tells the second person nothing"
+    );
+    let indexes: Vec<Vec<u8>> =
+        sqlx::query("SELECT recipient_bidx FROM messages WHERE tenant_id = $1")
+            .bind(scope.tenant().to_string())
+            .fetch_all(db.owner_pool())
+            .await
+            .expect("read the rows")
+            .iter()
+            .map(|row| row.get("recipient_bidx"))
+            .collect();
+    assert_ne!(
+        indexes[0], indexes[1],
+        "and they are recorded as two recipients, not one"
+    );
+}
+
+/// A purpose whose real message carries a LINK is delegated, not queued.
+///
+/// `Recovery` and `Registration` both reach `send`. `advanced_recovery.rs` says the real
+/// transport "embeds the confirm link"; a registration verification exists to deliver one. This
+/// producer renders neither, and a mail with no link is not a degraded message -- the recipient
+/// has nothing to act on and the flow cannot complete.
+///
+/// The delegation also preserves the registration path's TIMING shape. `flow/registration.rs`
+/// relies on the known and unknown branches doing the same work, so routing one of them through
+/// a transactional write that takes a per-recipient advisory lock would turn "does this
+/// identifier exist" into a latency measurement.
+#[tokio::test]
+async fn the_link_carrying_purposes_are_delegated_not_queued() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    provision(&db, &env, scope).await;
+    let (sender, delegate) = sender(&db, &env);
+
+    for purpose in [
+        VerificationPurpose::Registration,
+        VerificationPurpose::Recovery,
+    ] {
+        sender.send(scope, purpose, "user@example.test").await;
+    }
+
+    assert_eq!(
+        count(&db, scope, None).await,
+        0,
+        "neither purpose may reach the ledger: this producer cannot render either message"
+    );
+    assert_eq!(
+        delegate.calls(),
+        vec!["send:registration".to_owned(), "send:recovery".to_owned()],
+        "and both must reach the wrapped transport, in order, unchanged"
+    );
+
+    // The control: the purpose this DOES render takes the other branch. Without it, a sender
+    // that delegated everything and queued nothing would pass the two assertions above.
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "user@example.test",
+        )
+        .await;
+    assert_eq!(count(&db, scope, None).await, 1);
+    assert_eq!(
+        delegate.calls().len(),
+        2,
+        "a rendered purpose is queued INSTEAD of delegated, not as well as"
+    );
+}
+
+/// The four token-carrying methods still reach the transport they always did.
+///
+/// This type is installed by REPLACING the sender the binary was using. Overriding only `send`
+/// and inheriting the trait's defaults for the rest would move `deliver_email_otp`,
+/// `deliver_magic_link`, `deliver_new_device_notice` and `deliver_recovery_cancel_notice` from
+/// "logged on the observability plane" to completely silent -- the trait's default bodies
+/// discard their argument. Turning messaging ON would have turned four transports OFF.
+#[tokio::test]
+async fn the_four_token_carrying_methods_are_delegated() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (sender, delegate) = sender(&db, &env);
+
+    sender.deliver_email_otp(&EmailOtpMessage {
+        scope,
+        purpose: ironauth_store::EmailFactorPurpose::Login,
+        recipient: "user@example.test",
+        code: "123456",
+        ttl_secs: 300,
+    });
+    sender.deliver_magic_link(&MagicLinkMessage {
+        scope,
+        purpose: ironauth_store::EmailFactorPurpose::Login,
+        recipient: "user@example.test",
+        link: "https://example.test/magic?token=secret",
+        short_code: "ABCD",
+        ttl_secs: 300,
+    });
+    sender.deliver_new_device_notice(&NewDeviceNotice {
+        scope,
+        recipient: "user@example.test",
+        user_agent: "a new laptop",
+        location_hint: "somewhere",
+        disavowal_link: "https://example.test/disavow?token=secret",
+    });
+    sender.deliver_recovery_cancel_notice(&RecoveryCancelNotice {
+        scope,
+        recipient: "user@example.test",
+        cancel_link: "https://example.test/cancel?token=secret",
+    });
+
+    assert_eq!(
+        delegate.calls(),
+        vec![
+            "deliver_email_otp".to_owned(),
+            "deliver_magic_link".to_owned(),
+            "deliver_new_device_notice".to_owned(),
+            "deliver_recovery_cancel_notice".to_owned(),
+        ],
+        "every method this producer does not implement must pass through, or enabling \
+         messaging silently retires four transports"
+    );
+    assert_eq!(
+        count(&db, scope, None).await,
+        0,
+        "and none of them reaches the ledger: each carries a token in its body"
+    );
+}
+
+/// The per-recipient rate budget this sender was built with is the one the ledger applies.
+///
+/// Nothing pinned it. `enqueue(..., self.budget, epoch_seconds)` with `epoch_seconds` replaced
+/// by `0` stamps every row at 1970, which makes `hygiene_refusal`'s window predicate false
+/// forever and retires the rate limit entirely -- and every test passed. The budget is the
+/// mechanism that stops one event from mailing a person repeatedly, so a producer that passes
+/// it and a ledger that ignores it look identical from outside without this.
+///
+/// Deliberately the SHIPPED shape: a budget of one per hour, two sends in different collapse
+/// windows so the dedup key cannot be what refuses the second.
+#[tokio::test]
+async fn the_rate_budget_refuses_the_second_notice_within_the_hour() {
+    let db = TestDatabase::start().await;
+    let system = Env::system();
+    let scope = db.seed_scope(&system).await;
+    provision(&db, &system, scope).await;
+
+    let (env, clock) = Env::deterministic(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+        1,
+    );
+    let (sender, _delegate) = sender_with(&db, &env, RateBudget::new(1, 3_600));
+
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "user@example.test",
+        )
+        .await;
+    assert_eq!(count(&db, scope, None).await, 1);
+
+    // A new collapse window, so the dedup key differs, but still inside the budget's hour.
+    clock.advance(std::time::Duration::from_secs(901));
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "user@example.test",
+        )
+        .await;
+    assert_eq!(
+        count(&db, scope, None).await,
+        1,
+        "the second is refused by the BUDGET: a different window means the collapse cannot be \
+         what stopped it"
+    );
+
+    // Past the budget's window, the same send is accepted again -- so the assertion above is
+    // failing on the budget rather than on anything permanently broken.
+    clock.advance(std::time::Duration::from_secs(3_601));
+    sender
+        .send(
+            scope,
+            VerificationPurpose::AccountLinked,
+            "user@example.test",
+        )
+        .await;
+    assert_eq!(
+        count(&db, scope, None).await,
+        2,
+        "and the budget is a WINDOW: past it the same notice sends again"
     );
 }

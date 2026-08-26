@@ -253,7 +253,6 @@ pub trait VerificationSender: Send + Sync + std::fmt::Debug {
     /// device context and the single-use "this wasn't me" link. The default is a no-op, so
     /// a deployment with no transport wired behaves as before; a real transport (M11)
     /// overrides it.
-    ///
     fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
         let _ = message;
     }

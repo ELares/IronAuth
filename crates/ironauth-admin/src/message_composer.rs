@@ -264,9 +264,30 @@ fn message_id_local(payload: &serde_json::Value) -> Option<String> {
     Some(raw.to_owned())
 }
 
+/// The prefix every boundary carries, so one is recognizable in a raw message.
+const BOUNDARY_PREFIX: &str = "ironauth-";
+
+/// How many characters of the message id the boundary may carry.
+///
+/// RFC 2046 caps a boundary at 70 characters and `multipart_alternative` enforces it.
+const BOUNDARY_LOCAL_BYTES: usize = 70 - BOUNDARY_PREFIX.len();
+const _: () = assert!(BOUNDARY_LOCAL_BYTES > 0);
+
 /// A MIME boundary that cannot appear in the body it delimits.
+///
+/// BOUNDED, and that bound is not defensive: `ironauth-` plus a whole `MessageId` is 77
+/// characters, over RFC 2046's 70, so `multipart_alternative` refused it and `compose` returned
+/// `mime_failed` -- for every message carrying a REAL id. Nothing noticed because this module's
+/// own tests use short synthetic ids and the consumer's tests use a stub composer, so the first
+/// producer to hand the ledger a real message id was the first caller to reach it.
+///
+/// The TAIL rather than the head. A `MessageId` renders as `msg_` and then its random part, so
+/// truncating from the front would spend nine of the sixty-one available characters on a
+/// constant. Every character `message_id_local` admits is ASCII, so a byte slice here is always
+/// on a character boundary.
 fn boundary_for(local: &str) -> String {
-    format!("ironauth-{local}")
+    let tail = &local[local.len().saturating_sub(BOUNDARY_LOCAL_BYTES)..];
+    format!("{BOUNDARY_PREFIX}{tail}")
 }
 
 #[cfg(test)]
@@ -288,6 +309,96 @@ mod tests {
             payload,
             &[],
         )
+    }
+
+    /// A REAL message id produces a boundary RFC 2046 accepts.
+    ///
+    /// `ironauth-` plus a whole `MessageId` is 77 characters against a 70-character cap, so
+    /// every message carrying a real id composed to `mime_failed`. The bound is asserted here
+    /// against a GENERATED id rather than a literal, because a literal is a second copy of the
+    /// id format and would keep passing after the format grew.
+    #[test]
+    fn a_real_message_id_produces_a_boundary_within_the_rfc_2046_cap() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 23);
+        let scope = scope();
+        let id = ironauth_store::MessageId::generate(&env, &scope).to_string();
+        assert!(
+            id.len() + BOUNDARY_PREFIX.len() > 70,
+            "if an id ever gets short enough to fit unbounded, this test stops measuring \
+             anything and the truncation below is what must be re-justified: {}",
+            id.len()
+        );
+
+        let boundary = boundary_for(&id);
+        assert!(
+            boundary.len() <= 70,
+            "RFC 2046 caps a boundary at 70 characters: {} ({boundary})",
+            boundary.len()
+        );
+        assert!(boundary.starts_with(BOUNDARY_PREFIX));
+
+        // Two ids give two boundaries, so the truncation did not throw away what distinguishes
+        // them. Concurrent messages sharing a boundary would be a real defect, not a cosmetic
+        // one: a receiver splits parts on it.
+        let other = ironauth_store::MessageId::generate(&env, &scope).to_string();
+        assert_ne!(boundary_for(&other), boundary);
+    }
+
+    /// THE PRODUCER'S PAYLOAD COMPOSES.
+    ///
+    /// This is the test that would have caught a shipped defect and did not exist. PR #1000
+    /// gives the ledger its first producer, and its own suite asserted the payload "still
+    /// composes" by hand-copying `message_id_local`'s charset predicate. That is one of TWO
+    /// refusals in `compose`, and the one it could not see -- `missing_body`, four lines above
+    /// the template resolution -- fired for every payload the producer wrote. Eight tests were
+    /// green and every notice would have terminated `Failed` with no provider ever contacted.
+    ///
+    /// The producer and the composer were each tested from their own side with their own
+    /// fixture, and the fixtures were incompatible. So this calls `notice_payload` -- the exact
+    /// function the producer calls -- rather than restating its shape here. A fixture that
+    /// merely LOOKS like the payload would reintroduce the same gap on the next field.
+    #[test]
+    fn the_notice_payload_composes() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 22);
+        let scope = scope();
+        let id = ironauth_store::MessageId::generate(&env, &scope);
+        let purpose = ironauth_oidc::VerificationPurpose::AccountLinked;
+        let body = ironauth_oidc::message_sender::notice_body(purpose)
+            .expect("the producer renders this purpose");
+
+        let payload = ironauth_oidc::message_sender::notice_payload(&id, body);
+        let prepared = DefaultComposer::new("mail.example.test")
+            .compose(scope, purpose.as_str(), "ada@example.test", &payload, &[])
+            .expect("the producer's payload must compose, or every notice it writes fails");
+
+        assert!(
+            prepared.body.contains("A new sign-in method was linked"),
+            "the rendered text is the producer's body: {:?}",
+            prepared.body
+        );
+        assert!(
+            prepared.message_id.contains(&id.to_string()),
+            "and the Message-ID is derived from the ledger row's id, so two notices are two \
+             messages to a receiver deduplicating on it: {:?}",
+            prepared.message_id
+        );
+    }
+
+    /// The same payload with `body` removed does NOT compose.
+    ///
+    /// The control for the test above. Without it that test passes for a composer that accepts
+    /// anything, which is the state it was written to rule out.
+    #[test]
+    fn the_notice_payload_without_a_body_does_not_compose() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 22);
+        let scope = scope();
+        let id = ironauth_store::MessageId::generate(&env, &scope);
+        let refused = compose_kind(
+            "account_linked",
+            &serde_json::json!({ "message_id": id.to_string() }),
+        )
+        .expect_err("a payload with no body must be refused");
+        assert_eq!(refused, "missing_body");
     }
 
     /// A configured template at one level, for the resolution-order tests.
