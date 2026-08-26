@@ -61,11 +61,19 @@ async fn harness() -> Harness {
     .await
 }
 
-/// Store `rules` as the harness client's mapping, through the audited admin write.
+/// Store `rules` as the harness client's declarative mapping, through the AUDITED store write.
 ///
-/// Not a raw INSERT: the write path is where `validate` runs, so a test that inserted directly
-/// could store a rule set the admin surface would have refused and then assert on how issuance
-/// handled it -- measuring a state the system cannot reach.
+/// It does NOT validate. This doc used to say "the write path is where `validate` runs", and
+/// that is false of this call: `claims_mapping::validate` runs in the admin HANDLER
+/// (`ironauth-admin/src/claims_mappings.rs`), and `claims_mapping_store`'s own header says so
+/// -- "the fence is at the WRITE, in the admin path that validates before storing". This
+/// reaches the repository underneath that handler and skips the fence.
+///
+/// That is safe here, and the reason is worth knowing rather than assuming: `apply_for`
+/// validates again at ISSUANCE, before applying anything, so a rule set that would be refused
+/// by the admin surface is refused at the mint too. What this helper actually differs from
+/// `install_unvalidated` in is the AUDIT TRAIL, not the validation: this write is `acting(...)`
+/// and recorded, the raw one is not.
 async fn install(harness: &Harness, rules: &str) {
     let env = harness.env().clone();
     let scope = harness.scope();

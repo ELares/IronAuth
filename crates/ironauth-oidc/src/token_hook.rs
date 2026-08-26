@@ -477,14 +477,32 @@ pub const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10)
 /// full runs of the hook suite failed with `server_error` from a guest doing microseconds of
 /// work. A CI runner with 2 vCPUs, or a host under a traffic spike, is that machine.
 ///
-/// One second cannot be reached by scheduling delay on a machine that is serving requests at
-/// all, and it is still a hard stop: fuel already bounds CPU, so what remains for the deadline
-/// to catch is a guest that executes without burning fuel, which no shipped hook does. A login
-/// tolerates a second far better than it tolerates a random 500.
+/// # FUEL IS THE BINDING BOUND, and this is the backstop
+///
+/// Saying "still a hard stop" of a bound this long would overstate it. What actually stops a
+/// runaway guest is FUEL: 50M instructions, which a spinner burns in milliseconds, measured by
+/// `a_hook_that_exhausts_its_fuel_fails_the_issuance` -- a test that now TIMES the abort
+/// precisely so it cannot silently start passing on this deadline instead.
+///
+/// So what is left for the deadline is a guest that consumes wall clock without burning fuel.
+/// The one way that happened before was a HOST call that blocked: a guest whose body was a
+/// 30-second sleep held a request thread for the full 30 seconds, because fuel counts
+/// instructions a sleeping guest is not executing and the deadline is only checked while wasm
+/// runs. That class is closed -- no host function this sandbox links may block, and
+/// `a_hook_cannot_wait` holds it closed -- which is exactly why the deadline can afford to be a
+/// second: it is the second line, not the first.
+///
+/// # The cost, stated rather than papered over
+///
+/// A hook that hangs for a reason nobody predicted now holds its request for up to a second
+/// instead of up to 20 ms. That is a real availability cost on a fail-closed path, and it is
+/// the trade being made: a bound that fires on a busy machine costs a random `server_error` on
+/// every hooked login, and a bound that fires a second late costs one slow request on the rare
+/// occasion anything reaches it.
 ///
 /// # What this is NOT
 ///
-/// A guarantee. It is a bound sized so that tripping it means something is genuinely wrong,
+/// A guarantee. It is a bound sized so that tripping it means something is genuinely wrong
 /// rather than that the machine was busy. Making it configurable is the honest end state (the
 /// tunability rule: an environment-dependent tradeoff belongs in settings with a safe default),
 /// and it is not in this change.
@@ -622,26 +640,33 @@ fn as_pairs(claims: &serde_json::Map<String, serde_json::Value>) -> Vec<(String,
 mod tests {
     use super::{PAYLOAD_VERSION, limits, loaded_hook};
 
-    /// The epoch deadline is at least TWO ticks, and the reason is arithmetic.
+    /// The deadline clears any plausible scheduling delay, and is still short enough to bound.
     ///
-    /// wasmtime sets `deadline = current_epoch + delta`, and a store is created at an arbitrary
-    /// point inside a tick, so `delta = 1` grants whatever remains of the current one -- uniform
-    /// in (0, T]. Measured against a 10 ms ticker: a hook doing 78 microseconds of work trapped
-    /// on 0.40% of invocations and one doing 544 microseconds on 4.15%. Every abort fails the
-    /// issuance, so that is a random `server_error` on roughly one hooked login in a hundred.
+    /// The arithmetic half first, because it is why the number can never be 1. wasmtime sets
+    /// `deadline = current_epoch + delta`, and a store is created at an arbitrary point inside
+    /// a tick, so `delta = 1` grants whatever remains of the current one -- uniform in (0, T].
+    /// Measured against a 10 ms ticker: a hook doing 78 microseconds of work trapped on 0.40%
+    /// of invocations and one doing 544 microseconds on 4.15%. Any delta of 2 or more
+    /// guarantees at least `delta - 1` WHOLE ticks, which is a bound rather than a lottery.
     ///
-    /// `delta = 2` guarantees at least one WHOLE tick, so the bound becomes [T, 2T].
+    /// `delta = 2` was where that reasoning stopped, and it was not enough. The quantity being
+    /// bounded is WALL CLOCK, not work, so the number has to clear the worst SCHEDULING delay:
+    /// review measured 2 of 6 suite runs failing with `server_error` at a 20 ms ceiling under
+    /// 24 spinners on 14 cores, from guests doing microseconds of work. See
+    /// [`EPOCH_TICKS_PER_HOOK`] for the full reasoning and for why fuel, not this, is the bound
+    /// that actually stops a runaway.
     ///
     /// # Why this is a unit test and not an integration one
     ///
-    /// The behavioural difference cannot be made deterministic. `delta = 1` traps only when the
-    /// remaining slice is shorter than the work, so a guest that ALWAYS trips it needs work
-    /// longer than a whole tick -- and that work also trips `delta = 2`. There is no guest that
-    /// distinguishes the two every time, which is the finding restated: at `delta = 1` the bound
-    /// is a lottery, and a lottery is exactly what a test cannot pin.
+    /// The behavioural difference cannot be made deterministic. A guest that ALWAYS trips a
+    /// short deadline needs work longer than a whole tick -- and that work trips a long
+    /// deadline too. There is no guest that distinguishes the two every time, which is the
+    /// finding restated: a wall-clock bound on a shared machine is probabilistic, and a
+    /// probability is exactly what a test cannot pin.
     ///
-    /// So the pin is on the value, and it stops a silent revert. What it cannot do is notice
-    /// somebody removing the ticker, which is why the harness now runs one.
+    /// So the pin is on the DURATION, computed from the tick rather than restated, and bounded
+    /// in both directions -- because review demonstrated that a floor alone lets the constant
+    /// grow to 1000 seconds with 824 tests green.
     #[test]
     fn the_epoch_deadline_clears_any_plausible_scheduling_delay() {
         // COMPUTED from the tick interval, not restated. A test asserting `== 101` would pass

@@ -933,9 +933,15 @@ async fn the_token_exchange_grant_runs_the_hook() {
     // more times on the way back in (mapping `validate`, `filter_hook_claims`, and the mint's
     // own `PROTECTED_ACCESS_TOKEN_CLAIMS` skip). "The fold did nothing at all" satisfies it.
     //
-    // What CAN move is the subject the hook was TOLD, which is the input the WIT contract
-    // carries and the thing a hook branching on identity would read. `echo_subject` crosses in
-    // the ID-token list, which this grant discards, so it is read from the hook's own report.
+    // What CAN move is the CLIENT the hook was told, which crosses in the access list and so
+    // survives this grant's discard of the id-token list.
+    //
+    // The subject the hook was told is NOT read here, and this comment used to say it was.
+    // `echo-request` reports the subject only into the id-token list, which this grant
+    // discards, so no assertion in this file can see it. `echo-access-only` reports it into the
+    // access list and `a_machine_clients_static_claims_survive_a_hook_that_ignores_them` is
+    // where that is measured -- on `client_credentials`, which passes the subject through the
+    // same seam this door does.
     assert_eq!(
         claims["sub"], exchanged_for,
         "the fixture exchanged the token it meant to, so the assertions below describe the \

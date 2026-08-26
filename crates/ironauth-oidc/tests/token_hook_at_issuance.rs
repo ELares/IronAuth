@@ -77,11 +77,19 @@ async fn set_static_claims(harness: &Harness, client: &ironauth_store::ClientId,
         .expect("set the static claims");
 }
 
-/// Store `rules` as `client`'s declarative mapping, through the audited admin write.
+/// Store `rules` as `client`'s declarative mapping, through the AUDITED store write.
 ///
-/// Not a raw INSERT: the write path is where `validate` runs, so a test that inserted directly
-/// could store a rule set the admin surface would refuse and then assert on how issuance
-/// handled it, which measures a state the system cannot reach.
+/// It does NOT validate. This doc used to say "the write path is where `validate` runs", and
+/// that is false of this call: `claims_mapping::validate` runs in the admin HANDLER
+/// (`ironauth-admin/src/claims_mappings.rs`), and `claims_mapping_store`'s own header says so
+/// -- "the fence is at the WRITE, in the admin path that validates before storing". This
+/// reaches the repository underneath that handler and skips the fence.
+///
+/// That is safe here, and the reason is worth knowing rather than assuming: `apply_for`
+/// validates again at ISSUANCE, before applying anything, so a rule set that would be refused
+/// by the admin surface is refused at the mint too. What this helper actually differs from
+/// `install_unvalidated` in is the AUDIT TRAIL, not the validation: this write is `acting(...)`
+/// and recorded, the raw one is not.
 async fn install_mapping(harness: &Harness, client: &ironauth_store::ClientId, rules: &str) {
     let env = harness.env().clone();
     harness
@@ -286,20 +294,39 @@ async fn a_deployment_with_no_engine_does_not_run_a_deployed_hook() {
 /// milliseconds; the deadline cannot fire before a full second. So a failure that arrives
 /// quickly is a FUEL failure, and one that takes a second is the backstop firing instead --
 /// which would mean fuel had stopped bounding the thing this test is named for.
+///
+/// The SECOND attempt is the one timed, and that is not incidental. The first pays a cranelift
+/// compile, which is tens of milliseconds when the machine is idle and over a second when it is
+/// not -- so timing the first conflates "the deadline fired" with "the build was busy". This
+/// failed exactly that way when three test binaries ran at once. The dispatch caches the
+/// compiled component per (scope, client, digest), so by the second attempt the only thing left
+/// between the request and the abort is the guest burning its fuel.
 #[tokio::test]
 async fn a_hook_that_exhausts_its_fuel_fails_the_issuance() {
     let harness = harness_with_hooks().await;
     deploy(&harness, ironauth_hooks::fixtures::FUEL_BOMB, 1).await;
 
-    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement. The rule keeps protocol logic on the Env clock so issuance is deterministic; here real elapsed time IS the observation, because it is the only thing that distinguishes a fuel abort from a deadline abort, and routing it through a frozen clock would make the distinction unmeasurable by construction
+    // First attempt: pays the compile, and its cost says nothing about which bound fired.
     let (status, body) = exchange(&harness)
         .await
         .expect_err("the exchange must fail");
-    let elapsed = started.elapsed();
     assert_eq!(
         status,
         StatusCode::INTERNAL_SERVER_ERROR,
         "a hook that ran away is a server fault, not a client one: {body}"
+    );
+
+    // Second attempt: the component is cached, so this is the guest burning its fuel and
+    // nothing else.
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement. The rule keeps protocol logic on the Env clock so issuance is deterministic; here real elapsed time IS the observation, because it is the only thing that distinguishes a fuel abort from a deadline abort, and routing it through a frozen clock would make the distinction unmeasurable by construction
+    let (status, body) = exchange(&harness)
+        .await
+        .expect_err("the cached hook must fail the same way");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a cached runaway hook is still a server fault: {body}"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(1),
@@ -823,8 +850,10 @@ async fn the_front_channel_authorize_door_runs_the_hook() {
 /// > inconsistency to avoid.
 ///
 /// Asserts BOTH halves, because the interesting failure is not "the hook did not run": it is
-/// the hook running and the static claims disappearing, since a machine token has no ID token
-/// and the seam has to fold one bag into the other.
+/// the hook running and the static claims disappearing. A machine token has no ID token, so
+/// the mapping is resolved under `Destination::OneAccessToken` and the claims are handed to the
+/// guest as its ACCESS-token list -- and getting either of those wrong empties the token
+/// silently.
 #[tokio::test]
 async fn the_client_credentials_grant_runs_the_hook() {
     let harness = harness_with_hooks().await;
@@ -834,37 +863,9 @@ async fn the_client_credentials_grant_runs_the_hook() {
     let client_id = client.to_string();
     deploy_for(&harness, &client, ironauth_hooks::fixtures::GOOD, 1).await;
 
-    // Through the DATA-PLANE store: `clients` is not a control-plane table, and reaching for
-    // `control_store()` here fails with `permission denied for table clients` rather than
-    // silently writing nothing.
-    let env = harness.env().clone();
-    harness
-        .store()
-        .scoped(harness.scope())
-        .acting(
-            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
-            CorrelationId::generate(&env),
-        )
-        .clients()
-        .set_custom_token_claims(&env, &client, Some(r#"{"department":"payments"}"#))
-        .await
-        .expect("set the static claims");
+    set_static_claims(&harness, &client, r#"{"department":"payments"}"#).await;
 
-    let (status, _headers, body) = harness
-        .token_with_auth(
-            &form(&[("grant_type", "client_credentials")]),
-            Some(&format!(
-                "Basic {}",
-                base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"))
-            )),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "client_credentials: {body}");
-    let access = json(&body)["access_token"]
-        .as_str()
-        .expect("access")
-        .to_owned();
-    let issued = claims(&access);
+    let issued = machine_claims(&harness, &client_id, &secret).await;
 
     assert_eq!(
         issued.get("tier"),
@@ -876,29 +877,18 @@ async fn the_client_credentials_grant_runs_the_hook() {
         issued.get("department"),
         Some(&Value::from("payments")),
         "and the client's STATIC claims survived the seam. A machine token has no ID token, so \
-         the mapping's id-token half is folded into the one token that exists; dropping it \
-         instead would silently empty every machine token the day a hook was deployed: \
-         {issued:?}"
+         an UNPLACED claim goes to the one token that exists; dropping it instead would \
+         silently empty every machine token the day anyone installed a mapping: {issued:?}"
     );
 
     // A SECOND exchange, under a guest that reports what it was handed. Criterion 1 asks that
-    // the grant be identified in the payload, and the fold above cannot show that: `GOOD`
+    // the grant be identified in the payload, and the assertions above cannot show that: `GOOD`
     // echoes its input and would look identical whatever grant string reached it.
     //
     // Two exchanges rather than one guest doing both, because `ECHO_REQUEST` REPLACES the claim
     // lists (that is the contract) and so cannot also demonstrate that static claims survive.
     deploy_for(&harness, &client, ironauth_hooks::fixtures::ECHO_REQUEST, 1).await;
-    let (status, _headers, body) = harness
-        .token_with_auth(
-            &form(&[("grant_type", "client_credentials")]),
-            Some(&format!(
-                "Basic {}",
-                base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"))
-            )),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "second exchange: {body}");
-    let echoed = claims(json(&body)["access_token"].as_str().expect("access"));
+    let echoed = machine_claims(&harness, &client_id, &secret).await;
     assert_eq!(
         echoed.get("echo_grant_type"),
         Some(&Value::from("client_credentials")),

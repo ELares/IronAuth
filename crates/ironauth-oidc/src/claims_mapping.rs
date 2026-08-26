@@ -424,23 +424,25 @@ pub enum Destination {
     ///
     /// A claim placed `id_token` is NOT EMITTED. That rule exists to keep a claim away from the
     /// resource servers in `aud`, which is exactly who reads this token, so honouring it means
-    /// leaving the claim out. `place: access_token` and `place: both` are emitted.
+    /// leaving the claim out. `place: access_token` and `place: both` are emitted -- `both`
+    /// names two tokens and one of them is this one.
+    ///
+    /// # A rule ORDER that reads differently under the two destinations
+    ///
+    /// `place` is keyed on a NAME, and `rename` carries a placement across with the value. So
+    /// `place: a -> id_token` followed by `rename: b -> a` leaves `a` placed, while the reverse
+    /// order leaves the renamed `a` UNPLACED, because the `place` matched a name that did not
+    /// exist yet.
+    ///
+    /// Under `TwoTokens` that difference is invisible in the disclosure direction: unplaced
+    /// defaults to the ID token, which is where an `id_token` placement would have put it
+    /// anyway. Under `OneAccessToken` the two orders are OPPOSITE -- placed means not emitted,
+    /// unplaced means emitted into the token the resource servers read.
+    ///
+    /// Both behaviours are coherent (the operator who writes `place` before the claim exists
+    /// has not placed anything), and neither is a defect. It is recorded because the rule order
+    /// stops being cosmetic on a machine client, and nothing about writing the rules says so.
     OneAccessToken,
-}
-
-/// Apply `rules` to `source` for a caller minting two tokens.
-///
-/// Validates first, so an unvalidated mapping cannot half-apply: a refusal leaves the caller
-/// with no claims rather than with the claims the rules before the bad one produced.
-///
-/// # Errors
-///
-/// [`MappingRefusal`], exactly as [`validate`].
-pub fn apply(
-    rules: &[MappingRule],
-    source: &BTreeMap<String, serde_json::Value>,
-) -> Result<MappedClaims, MappingRefusal> {
-    apply_for(rules, source, Destination::TwoTokens)
 }
 
 /// Apply `rules` to `source`, projecting onto `destination`.
@@ -566,7 +568,9 @@ pub fn apply_for(
 
 #[cfg(test)]
 mod tests {
-    use super::{MappedClaims, MappingRule, Placement, RefusalReason, apply, validate};
+    use super::{
+        Destination, MappedClaims, MappingRule, Placement, RefusalReason, apply_for, validate,
+    };
     use std::collections::BTreeMap;
 
     fn source() -> BTreeMap<String, serde_json::Value> {
@@ -577,7 +581,7 @@ mod tests {
     }
 
     fn only(rule: MappingRule) -> MappedClaims {
-        apply(&[rule], &source()).expect("applies")
+        apply_for(&[rule], &source(), Destination::TwoTokens).expect("applies")
     }
 
     /// CRITERION 4, all four operations, with no custom code.
@@ -638,7 +642,7 @@ mod tests {
     /// before this layer had a reader.
     #[test]
     fn an_unplaced_claim_stays_where_it_went_before_this_layer_existed() {
-        let mapped = apply(&[], &source()).expect("applies");
+        let mapped = apply_for(&[], &source(), Destination::TwoTokens).expect("applies");
         for name in ["groups", "email"] {
             assert!(mapped.id_token.contains_key(name), "{name} in the id token");
             // NOT the access token, and this is the assertion the first version had backwards.
@@ -693,7 +697,10 @@ mod tests {
             );
             // And `apply` refuses the same thing, so validating on write and applying at
             // issuance cannot disagree.
-            assert!(apply(&[rule], &source()).is_err(), "case {index}");
+            assert!(
+                apply_for(&[rule], &source(), Destination::TwoTokens).is_err(),
+                "case {index}"
+            );
         }
     }
 
@@ -706,12 +713,13 @@ mod tests {
     fn reading_a_protected_claim_is_allowed_and_only_writing_is_refused() {
         let mut claims = source();
         claims.insert("sub".to_owned(), serde_json::json!("usr_ada"));
-        let mapped = apply(
+        let mapped = apply_for(
             &[MappingRule::Rename {
                 from: "sub".to_owned(),
                 to: "subject".to_owned(),
             }],
             &claims,
+            Destination::TwoTokens,
         )
         .expect("renaming FROM a protected claim is allowed");
         assert_eq!(mapped.id_token["subject"], serde_json::json!("usr_ada"));
@@ -825,12 +833,13 @@ mod tests {
         ] {
             let mut claims = BTreeMap::new();
             claims.insert("things".to_owned(), value.clone());
-            let mapped = apply(
+            let mapped = apply_for(
                 &[MappingRule::FilterList {
                     name: "things".to_owned(),
                     allow: vec!["ok".to_owned()],
                 }],
                 &claims,
+                Destination::TwoTokens,
             )
             .expect("applies");
             assert_eq!(
@@ -1384,7 +1393,7 @@ mod tests {
     /// A refused mapping applies NOTHING, rather than the rules before the bad one.
     #[test]
     fn a_refused_mapping_does_not_half_apply() {
-        let outcome = apply(
+        let outcome = apply_for(
             &[
                 MappingRule::Static {
                     name: "tier".to_owned(),
@@ -1396,6 +1405,7 @@ mod tests {
                 },
             ],
             &source(),
+            Destination::TwoTokens,
         );
         assert!(
             outcome.is_err(),
@@ -1428,7 +1438,7 @@ mod tests {
     /// Rules apply IN ORDER, and the order is observable.
     #[test]
     fn rules_apply_in_the_order_given() {
-        let rename_then_static = apply(
+        let rename_then_static = apply_for(
             &[
                 MappingRule::Rename {
                     from: "groups".to_owned(),
@@ -1440,6 +1450,7 @@ mod tests {
                 },
             ],
             &source(),
+            Destination::TwoTokens,
         )
         .expect("applies");
         assert_eq!(
@@ -1448,7 +1459,7 @@ mod tests {
             "the later static wins"
         );
 
-        let static_then_rename = apply(
+        let static_then_rename = apply_for(
             &[
                 MappingRule::Static {
                     name: "team_groups".to_owned(),
@@ -1460,6 +1471,7 @@ mod tests {
                 },
             ],
             &source(),
+            Destination::TwoTokens,
         )
         .expect("applies");
         assert_eq!(
@@ -1472,7 +1484,7 @@ mod tests {
     /// A renamed claim keeps where it was placed.
     #[test]
     fn placement_follows_a_rename() {
-        let mapped = apply(
+        let mapped = apply_for(
             &[
                 MappingRule::Place {
                     name: "groups".to_owned(),
@@ -1484,6 +1496,7 @@ mod tests {
                 },
             ],
             &source(),
+            Destination::TwoTokens,
         )
         .expect("applies");
         assert!(
@@ -1607,7 +1620,7 @@ pub fn filter_hook_claims(returned: &BTreeMap<String, serde_json::Value>) -> Hoo
 /// issuance.
 #[cfg(test)]
 mod wire_format_tests {
-    use super::{MappingRule, Placement, apply, parse};
+    use super::{Destination, MappingRule, Placement, apply_for, parse};
     use std::collections::BTreeMap;
 
     /// The EXACT documents already committed elsewhere in this repository parse.
@@ -1724,7 +1737,7 @@ mod wire_format_tests {
         source.insert("groups".to_owned(), serde_json::json!(["eng", "sales"]));
         source.insert("dept".to_owned(), serde_json::json!("platform"));
 
-        let mapped = apply(&rules, &source).expect("apply");
+        let mapped = apply_for(&rules, &source, Destination::TwoTokens).expect("apply");
         assert_eq!(
             mapped.id_token.get("groups"),
             Some(&serde_json::json!(["eng"])),

@@ -1458,11 +1458,16 @@ async fn build_oidc_plane(
     #[cfg(feature = "wasm-hooks")]
     let state = if surfaces.wasm_hooks {
         let engine = build_hook_engine();
-        // THE EPOCH DRIVER. The dispatch's `limits()` sets a deadline of two ticks, and a tick
-        // is whatever the deployment makes it -- so without this the deadline never arrives and
-        // the backstop against a hook that blocks is gone while the config still claims it.
-        // Ten milliseconds: two ticks is far longer than the benchmarked warm invocation (tens
-        // of microseconds) and far shorter than a login anyone would wait through.
+        // THE EPOCH DRIVER. A deadline is a count of TICKS, so without something advancing the
+        // epoch it never arrives and the backstop against a hook that blocks is gone while the
+        // config still claims it.
+        //
+        // The interval is `token_hook::EPOCH_TICK` and is NOT restated here. It was a
+        // `from_millis(10)` literal in this file and another in the test harness -- where it
+        // was 1 ms, ten times harsher than production -- and that divergence failed issuances
+        // the server would not have. `EPOCH_TICKS_PER_HOOK` is chosen against this interval, so
+        // the two are one constant now; a number repeated in a comment here is the same
+        // third-declaration problem wearing prose.
         match engine {
             Some(engine) => {
                 let runtime =

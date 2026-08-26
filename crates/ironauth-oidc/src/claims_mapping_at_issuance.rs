@@ -90,11 +90,15 @@ pub enum Resolved {
 
 /// Read this client's mapping and apply it to `source`.
 ///
-/// # The three doors this does NOT reach, and the honest reason
+/// # The three doors this does not reach DIRECTLY, and where they went
 ///
 /// `client_credentials.rs`, `jwt_bearer.rs` and `token_exchange.rs` build a
-/// `ClientCredentialsMintRequest`, which has no extra-claims channel at all -- only
-/// `custom_claims`, the per-client static bag from issue #23.
+/// `ClientCredentialsMintRequest`, so they call [`apply_to_machine_token`] rather than this
+/// function. They are no longer unreached: `custom_claims` is now a [`MappedAccessClaims`] and
+/// all three resolve a mapping and run a hook.
+///
+/// The paragraphs below are kept because they record WHY it took a criterion audit to notice,
+/// and the reasoning is still the reasoning. What has changed is only the last line of it.
 ///
 /// "A machine token has no user claims" was the reason given, and it is right only for
 /// `client_credentials`. A token-exchange token carries the SUBJECT's subject and a JWT-bearer
@@ -103,6 +107,9 @@ pub enum Resolved {
 /// deciding what a mapping's SOURCE is on a grant that resolves no claims -- a question about
 /// those grants rather than about this seam. Issue #113 names both as first-class for the
 /// uniform contract, so it is work, not a decision already made.
+///
+/// It is now done. The source is the client's static bag for `client_credentials` and an empty
+/// document for the other two, and [`apply_to_machine_token`] says why those two differ.
 ///
 /// # Errors
 ///
@@ -126,10 +133,15 @@ pub async fn resolve(
 
 /// As [`resolve`], projecting the mapping onto `destination`.
 ///
+/// PRIVATE. It has no caller outside this module, and a public function nothing calls is the
+/// shape this module already deleted once for cause -- it is how the next door quietly picks
+/// the wrong `Destination` for the mint it is doing. `resolve` stays public because the two
+/// ID-token-only doors read it.
+///
 /// # Errors
 ///
 /// [`MappingFault`], as [`resolve`].
-pub async fn resolve_for(
+async fn resolve_for(
     store: &Store,
     scope: Scope,
     client_id: &str,
@@ -181,7 +193,7 @@ pub async fn resolve_for(
         })
 }
 
-/// Turn a [`serde_json::Map`] into the shape [`claims_mapping::apply`] takes.
+/// Turn a [`serde_json::Map`] into the shape [`claims_mapping::apply_for`] takes.
 ///
 /// The two are both string-keyed JSON maps and the conversion is mechanical; it lives here so
 /// the direction is stated once. `serde_json::Map` is what the token endpoint assembles and what
@@ -483,9 +495,14 @@ pub async fn apply_to_machine_token(
 /// `MappedAccessClaims` and no test fails.
 ///
 /// So each door needs its own test, and each of those needs to be confirmed against exactly
-/// that mutation. There are NINE production mint doors -- every caller of `tokens::mint*`, which
-/// is `authorize`, `ciba_grant`, `client_credentials`, `device`, `fedcm`, `jwt_bearer`,
-/// `token_exchange` and two in `token` -- and eight of the nine are covered:
+/// that mutation. There are NINE production doors that mint a CLAIM-BEARING token --
+/// `authorize`, `ciba_grant`, `client_credentials`, `device`, `fedcm`, `jwt_bearer`,
+/// `token_exchange`, and two in `token` -- and eight of the nine are covered.
+///
+/// "Every caller of `tokens::mint*`" is NOT the rule that produces those nine, and saying so
+/// would be a derivation that does not derive its own number: there are twelve such callers,
+/// and three of them are `mint_refresh_token`, which mints an opaque handle with no claims in
+/// it for a mapping or a hook to shape. The rule is the claim-bearing mint, and the table is:
 ///
 /// | Door | Test |
 /// | --- | --- |
@@ -501,7 +518,10 @@ pub async fn apply_to_machine_token(
 /// The first two rows are ONE call site, `token.rs`'s `apply_claims_mapping`, so the table's
 /// per-row independence is real for the other six and not for those. Mutating that single line
 /// takes down ten tests at once, which is coverage but not per-door coverage: what distinguishes
-/// the two rows is the grant string each asserts, not a separate wiring.
+/// the two rows is the grant string each asserts, not a separate wiring. Row 1 is also served by
+/// a second test, `the_code_exchange_tells_the_hook_which_grant_it_is`, which is the one that
+/// reads that string back; the exit-criterion test named in the table proves a hook shaped a
+/// real token and says nothing about the payload.
 ///
 /// **FEDCM IS NOT.** `fedcm.rs` passes `state.hook_engine()` and nothing measures that it does.
 /// No test in the suite drives the id-assertion endpoint to a minted token -- the flow needs

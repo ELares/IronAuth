@@ -953,9 +953,15 @@ pub struct ClientCredentialsMintRequest<'a> {
     /// FIELD and these doors fill in a different one. Both structs now demand the same
     /// evidence, so a door added to either is asked the question.
     ///
-    /// Built by `claims_mapping_at_issuance::apply_to_machine_token`, which is
-    /// `apply_to_with_hook` with the ID-token half folded in, since these grants mint one
-    /// token and a placement rule has nowhere else to put a claim.
+    /// Built by `claims_mapping_at_issuance::apply_to_machine_token`, which resolves the
+    /// mapping under `claims_mapping::Destination::OneAccessToken` and runs the hook with this
+    /// bag as its ACCESS-token list.
+    ///
+    /// It is NOT the two-token answer with its halves merged. That was the first version and it
+    /// inverted `place: id_token`, the rule whose whole meaning is "keep this out of an access
+    /// token", by folding an explicitly-excluded claim into the only token there is. A claim
+    /// the operator placed in the ID token is not emitted here; an UNPLACED one is, because
+    /// nothing was expressed and this is the one token that exists.
     pub custom_claims: &'a crate::claims_mapping_at_issuance::MappedAccessClaims,
     /// The RFC 8693 section 4.1 `act` delegation chain, for a token issued by the
     /// token-exchange grant (issue #125). [`None`] for every other issuance, and the

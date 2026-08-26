@@ -3730,11 +3730,18 @@ async fn the_jwt_bearer_grant_runs_the_hook() {
         claims["echo_grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer",
         "the guest was told which grant this is, or a hook cannot gate on it: {claims}"
     );
-    // The mapped principal survived the seam. A hook returns BOTH claim lists and the mint
-    // rebuilds its protocol claims afterwards, so this is the assertion that catches a fold
-    // which replaced the token rather than added to it.
+    // `sub` is asserted as a FIXTURE check, not as a property of the seam. Review pointed out
+    // that it cannot fail: the mint writes `sub` into its own JSON literal from a separate
+    // struct field, and it is then refused three more times on the way back in (mapping
+    // `validate`, `filter_hook_claims`, and the mint's own protected-name skip). "The fold did
+    // nothing at all" satisfies it.
+    //
+    // The identical assertion in `token_exchange.rs` was rewritten to say so and this one was
+    // not, which is the same fix-one-site-and-leave-the-sibling this whole issue keeps
+    // producing. What it is good for is confirming the exchange resolved the principal it
+    // meant to, so the grant assertion above describes the right token.
     assert_eq!(
         claims["sub"], MAPPED_PRINCIPAL,
-        "and the mapped identity is untouched: {claims}"
+        "the assertion above describes a token for the mapped principal: {claims}"
     );
 }
