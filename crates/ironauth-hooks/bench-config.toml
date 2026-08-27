@@ -60,7 +60,8 @@ class = "ubuntu-latest"
 # this absolute number is the backstop for a collapse, not the regression detector. Saying
 # otherwise was arithmetic contradicted by the same sentence's own figure.
 cold_p95_micros = 250000
-# UNCHANGED at the criterion's own number, and now met with room rather than by luck.
+# UNCHANGED at the criterion's own number, and now MET on the enforcing runner -- but read the
+# margin below before calling it comfortable.
 #
 # Four CI runs measured 83.7, 135.8, 169.9 and 168.2 us against this 100 us bound: a healthy
 # system passing one run in four, which is a coin flip rather than a regression detector. The
@@ -69,6 +70,18 @@ cold_p95_micros = 250000
 #
 # The linker is now built once with the engine and each hook's imports are resolved once at load
 # (`Linker::instantiate_pre`), so an invocation builds only a `Store`.
+#
+# ON THE RUNNER THAT ENFORCES IT, which is the only measurement that decides the criterion:
+# 155.3 us before, 87.4 us after. That clears the 100 us gate, by 13%.
+#
+# 13% IS NOT MUCH, and an earlier version of this comment predicted better: it reasoned that the
+# local 2.2x would put the whole historical CI spread (83.7 to 169.9 us) at "roughly 17 to 35
+# us, entirely below the bound". The runner delivered 1.8x and 87.4 us. Scaling one machine's
+# ratio onto another machine's numbers is a guess wearing a calculation, and the spread on that
+# runner has been wide enough in the past to reach 100 from here.
+#
+# So: the criterion holds today and the RELATIVE check below is what will say whether it keeps
+# holding. That is the arm this file's baseline exists for.
 #
 # Measured on one machine, same benchmark, THREE runs each side, with the before taken by
 # checking out main's `engine.rs` rather than by stashing (stashing leaves the committed change
