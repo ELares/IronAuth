@@ -123,6 +123,7 @@ use crate::scope::Scope;
 use crate::signup_form::{NewSignupForm, SignupFormRecord};
 use crate::sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 use crate::store::Store;
+use crate::token_hook_store::HookFailurePolicy;
 use crate::token_hook_store::TokenHookMetadata;
 use crate::token_hook_store::TokenHookRecord;
 use crate::trait_schema::{TraitSchema, TransformOp, ValidationFailure};
@@ -32329,7 +32330,7 @@ impl TokenHookRepo<'_> {
     pub async fn get(&self, client_id: &str) -> Result<Option<TokenHookRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT client_id, component, payload_version FROM token_hooks \
+            "SELECT client_id, component, payload_version, failure_policy FROM token_hooks \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
         )
         .bind(self.scope.tenant().to_string())
@@ -32338,11 +32339,15 @@ impl TokenHookRepo<'_> {
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(row.map(|row| TokenHookRecord {
-            client_id: row.get("client_id"),
-            component: row.get("component"),
-            payload_version: row.get("payload_version"),
-        }))
+        row.map(|row| {
+            Ok(TokenHookRecord {
+                client_id: row.get("client_id"),
+                component: row.get("component"),
+                payload_version: row.get("payload_version"),
+                failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+            })
+        })
+        .transpose()
     }
 
     /// The deployed hook's METADATA, without reading the component.
@@ -32359,7 +32364,8 @@ impl TokenHookRepo<'_> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
-            "SELECT client_id, octet_length(component) AS component_bytes, payload_version \
+            "SELECT client_id, octet_length(component) AS component_bytes, payload_version, \
+             failure_policy \
              FROM token_hooks \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
         )
@@ -32369,11 +32375,15 @@ impl TokenHookRepo<'_> {
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(row.map(|row| TokenHookMetadata {
-            client_id: row.get("client_id"),
-            component_bytes: row.get::<i32, _>("component_bytes"),
-            payload_version: row.get("payload_version"),
-        }))
+        row.map(|row| {
+            Ok(TokenHookMetadata {
+                client_id: row.get("client_id"),
+                component_bytes: row.get::<i32, _>("component_bytes"),
+                payload_version: row.get("payload_version"),
+                failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+            })
+        })
+        .transpose()
     }
 }
 
@@ -32402,8 +32412,15 @@ impl ActingTokenHookRepo<'_> {
         component: &[u8],
         payload_version: i32,
     ) -> Result<(), StoreError> {
-        self.set_with_event(env, client, component, payload_version, None)
-            .await
+        self.set_with_event(
+            env,
+            client,
+            component,
+            payload_version,
+            HookFailurePolicy::FailClosed,
+            None,
+        )
+        .await
     }
 
     /// [`Self::set`], additionally emitting `token_hook.deployed` (issue #108).
@@ -32421,6 +32438,7 @@ impl ActingTokenHookRepo<'_> {
         client: &ClientId,
         component: &[u8],
         payload_version: i32,
+        failure_policy: HookFailurePolicy,
         event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if client.scope() != self.scope {
@@ -32441,11 +32459,13 @@ impl ActingTokenHookRepo<'_> {
             async move |tx| {
                 sqlx::query(
                     "INSERT INTO token_hooks \
-                     (tenant_id, environment_id, client_id, component, payload_version) \
-                     VALUES ($1, $2, $3, $4, $5) \
+                     (tenant_id, environment_id, client_id, component, payload_version, \
+                      failure_policy) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
                      ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE \
                      SET component = EXCLUDED.component, \
                          payload_version = EXCLUDED.payload_version, \
+                         failure_policy = EXCLUDED.failure_policy, \
                          updated_at = now()",
                 )
                 .bind(scope.tenant().to_string())
@@ -32453,6 +32473,7 @@ impl ActingTokenHookRepo<'_> {
                 .bind(&client_id)
                 .bind(&bytes)
                 .bind(payload_version)
+                .bind(failure_policy.as_str())
                 .execute(&mut **tx)
                 .await?;
                 enqueue_domain_event(tx, env, scope, event).await?;
@@ -32527,6 +32548,25 @@ impl ActingTokenHookRepo<'_> {
         )
         .await
     }
+}
+
+/// Read a stored `failure_policy`, refusing a value no dispatch could honour.
+///
+/// NOT defaulted to fail-closed. A row naming an unknown policy means a migration or an API
+/// started writing a third value, and reading it as the default would hide that behind the
+/// safest-looking behaviour -- which is exactly the shape that makes a widened policy
+/// invisible. The CHECK constraint makes this unreachable; this is what happens if it is ever
+/// dropped.
+fn failure_policy_from_row(raw: &str) -> Result<HookFailurePolicy, StoreError> {
+    // `decode_error`, NOT `InvalidName`. The flow-target reader decodes the identical
+    // `failure_policy` column shape this way, and the difference is what reaches the operator:
+    // `InvalidName` is documented as a SUBMITTED environment secret or variable name
+    // "rejected before it is written", renders as "invalid secret or variable name", and
+    // classifies as a 400 -- so a corrupt stored row would tell an operator their request was
+    // malformed, about a subsystem unrelated to token hooks. A row this server wrote and
+    // cannot read back is an Internal fault, which is what `decode_error` produces, and it
+    // names the column and the value.
+    HookFailurePolicy::parse(raw).ok_or_else(|| decode_error("token hook failure policy", raw))
 }
 
 /// Build a [`ClaimsMappingRecord`] from a `claims_mappings` row.

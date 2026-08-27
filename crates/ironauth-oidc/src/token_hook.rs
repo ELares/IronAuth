@@ -21,7 +21,7 @@
 //! It runs on the hook's output and not on its input, which is the direction that matters:
 //! what a hook READS is the mint's business, what it WRITES is the token's.
 //!
-//! # Every failure is fail-CLOSED, and that is the opposite of the enrichment beside it
+//! # Failure is fail-CLOSED BY DEFAULT, and that is the opposite of the enrichment beside it
 //!
 //! `merge_enriched_claims` is deliberately fail-open: an FGA that is down costs a deployment
 //! some claims and never a login. A hook is not an enrichment for the same reason a mapping is
@@ -31,6 +31,16 @@
 //! And there is a second reason that applies only here. A hook that traps, exhausts its fuel or
 //! passes its deadline is code behaving in a way its author did not intend. Continuing past that
 //! with a half-shaped token means issuing a credential whose shape nobody chose.
+//!
+//! Both of those are why fail-closed is the DEFAULT. They are not why it is the only option:
+//! issue #114 criterion 3 asks that an abort apply "the configured failure policy", and
+//! `token_hooks.failure_policy` is that configuration. An operator who knows their hook only
+//! ADDS claims can select `fail_open` per client, and the two arguments above are exactly what
+//! they are taking responsibility for -- which is why the dangerous setting is the one they
+//! have to type, and why the absence of a policy means the safe one.
+//!
+//! An earlier version of this section stated fail-closed as an invariant rather than a
+//! default, and it stayed that way through the change that made it configurable.
 //!
 //! # Compilation is CACHED, and that is what makes the criterion true
 //!
@@ -291,25 +301,35 @@ pub struct Invocation<'a> {
 
 /// Read, compile and run this client's hook, returning what it contributed.
 ///
-/// [`None`] when the client has no hook deployed, which is every client until an operator
-/// deploys one. That is distinct from a hook that ran and returned nothing.
+/// [`None`] carries THREE meanings, and a caller that needs to tell them apart cannot:
+///
+/// - the client has no hook deployed, which is every client until an operator deploys one;
+/// - a hook ran and contributed nothing;
+/// - a hook FAULTED and the client's policy is `fail_open`, so the token is minted without it.
+///
+/// The third is new, and it is the one worth naming: the caller at
+/// `claims_mapping_at_issuance` collapses all three into the same branch, which is correct --
+/// it has nothing to add in any of them -- but it means "the token was issued" is not evidence
+/// the hook ran. The fault is logged at ERROR where it happened, which is where an operator
+/// finds out.
 ///
 /// # Errors
 ///
-/// [`HookFault`] on any failure. Every one fails the issuance; see the module header.
+/// [`HookFault`] when the client's policy is `fail_closed` (the default), which refuses the
+/// issuance. Under `fail_open` the same faults return `Ok(None)` instead. A failure to READ
+/// the hook row is unconditionally an error, because the policy is a column on the row that
+/// did not load.
 pub async fn run(
     store: &Store,
     runtime: &HookRuntime,
     invocation: &Invocation<'_>,
 ) -> Result<Option<HookClaims>, HookFault> {
     let (engine, cache) = (&runtime.engine, &runtime.cache);
+    // ONLY what this half needs. The claim lists and the grant belong to
+    // `run_deployed_hook`, which is where the hook is actually invoked; naming them here as
+    // well would be two destructures of one struct that have to agree about nothing.
     let Invocation {
-        scope,
-        client_id,
-        grant_type,
-        subject,
-        id_token_claims,
-        access_token_claims,
+        scope, client_id, ..
     } = *invocation;
     let record = store
         .scoped(scope)
@@ -329,6 +349,54 @@ pub async fn run(
     let Some(record) = record else {
         return Ok(None);
     };
+
+    // THE POLICY IS THE RECORD'S, so it is only knowable once the record is read -- which is
+    // why a failure to READ one is unconditionally fail-closed below and cannot be otherwise:
+    // there is no policy to consult when the thing carrying it is what did not load.
+    let failure_policy = record.failure_policy;
+    match run_deployed_hook(engine, cache, invocation, &record).await {
+        Ok(claims) => Ok(claims),
+        Err(fault) => match failure_policy {
+            ironauth_store::HookFailurePolicy::FailClosed => Err(fault),
+            ironauth_store::HookFailurePolicy::FailOpen => {
+                // LOUD, and at error rather than warn. Fail-open means a token is being minted
+                // that the operator's own hook did not shape, which is the situation they most
+                // need to know about and the one that is otherwise invisible: the request
+                // succeeds, the client is happy, and the claim the hook was deployed to add or
+                // REMOVE is simply not applied.
+                tracing::error!(
+                    target: "ironauth.hooks",
+                    tenant = %scope.tenant(),
+                    client_id,
+                    ?fault,
+                    "the client's hook did not complete and its policy is fail-open, so the \
+                     token is being minted WITHOUT the hook's contribution"
+                );
+                Ok(None)
+            }
+        },
+    }
+}
+
+/// Run the deployed hook, with every fault reported as one.
+///
+/// Split out of [`run`] so the failure policy is applied in ONE place: every `?` in here is a
+/// fault the policy decides the meaning of, and threading that decision through each of them
+/// individually is how one of them ends up deciding differently.
+async fn run_deployed_hook(
+    engine: &Arc<HookEngine>,
+    cache: &Arc<HookCache>,
+    invocation: &Invocation<'_>,
+    record: &ironauth_store::token_hook_store::TokenHookRecord,
+) -> Result<Option<HookClaims>, HookFault> {
+    let Invocation {
+        scope,
+        client_id,
+        grant_type,
+        subject,
+        id_token_claims,
+        access_token_claims,
+    } = *invocation;
 
     // THE VERSION, before the component is even compiled. Refusing here rather than after means
     // a mismatched hook costs nothing and, more importantly, is never INVOKED with a payload it
@@ -525,7 +593,9 @@ async fn invoke(
         .unwrap_or_else(|join| {
             // A panic INSIDE the guest cannot reach here -- wasmtime turns a guest trap into an
             // error -- so a join failure is the host panicking or the task being cancelled. Both
-            // are aborts as far as the issuance is concerned, and both must fail closed.
+            // are aborts as far as the issuance is concerned, so both are faults the client's
+            // failure policy decides the meaning of -- not unconditional refusals, which is
+            // what this said before that policy existed.
             Err(HookError::Declined(format!(
                 "the hook task did not complete: {join}"
             )))
@@ -596,7 +666,8 @@ pub const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10)
 /// # The cost, stated rather than papered over
 ///
 /// A hook that hangs for a reason nobody predicted now holds its request for up to a second
-/// instead of up to 20 ms. That is a real availability cost on a fail-closed path, and it is
+/// instead of up to 20 ms. That is a real availability cost on a path that is fail-closed by
+/// default, and it is
 /// the trade being made: a bound that fires on a busy machine costs a random `server_error` on
 /// every hooked login, and a bound that fires a second late costs one slow request on the rare
 /// occasion anything reaches it.

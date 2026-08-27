@@ -2166,6 +2166,29 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // which is strictly more than a claim mapping does. It belongs on the stream a SIEM
         // watches for the same reason, with more force.
         //
+        // NO `failure_policy` ON THIS EVENT, and the reason is worth the paragraph because two
+        // successive attempts to add it were both wrong.
+        //
+        // Review asked for it so a redeploy changing only the policy is distinguishable from
+        // the one before. Added as REQUIRED, it is a breaking change under an unchanged version
+        // and `scripts/event-registry-compat.py` goes red: during a rolling upgrade an OLD pod
+        // emits the three-field payload and a NEW pod's fan-out, which validates on CONSUME,
+        // refuses it permanently as `event_failed_catalog_validation`.
+        //
+        // Added as OPTIONAL, the gate passes and the SAME failure happens in the other
+        // direction. This schema is `additionalProperties: false`, so a NEW pod emitting the
+        // field and an OLD pod's outbox worker claiming that row -- nothing binds a message to
+        // the pod that produced it -- yields "additional field is not permitted", another
+        // permanent dead-letter, and explode fails before any per-endpoint delivery row exists
+        // so there is nothing for the replay endpoint to replay.
+        //
+        // Adding ANY property to a closed schema is therefore breaking for a consumer running
+        // the older registry, whatever the `required` list says. Doing it safely needs the
+        // consumer to tolerate unknown fields first, which is a change to every registered
+        // type rather than to this one. So the policy is not on the event: a consumer that
+        // needs it reads it from the management API, and losing every deploy notification
+        // during an upgrade window is a worse trade than a redeploy that looks identical.
+        //
         // THE CLIENT AND THE SHAPE, never the component. An event is a notification, not a
         // binary store: the bytes are already durable in the row this points at, and putting
         // megabytes of WASM on every subscriber's stream would be a denial of service dressed

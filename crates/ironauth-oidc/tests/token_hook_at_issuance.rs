@@ -1191,3 +1191,93 @@ async fn an_unlinkable_hook_is_refused_once_and_then_remembered() {
          that can never run. {runtime}"
     );
 }
+
+/// FAIL-OPEN: the same declining hook is SKIPPED and the token is minted without it.
+///
+/// Issue #114 criterion 3 asks that an abort applies "the configured failure policy". Until
+/// this existed there was no policy to configure -- every fault refused the issuance
+/// unconditionally, and `a_hook_that_declines_fails_the_issuance` above pins that as the
+/// DEFAULT rather than as the only behaviour.
+///
+/// The pair is what makes either meaningful. A refusal-only test passes against a dispatch
+/// that refuses everything, and a success-only test passes against one with no hook at all;
+/// only running the same component under both policies shows the policy is being read.
+#[tokio::test]
+async fn a_declining_hook_is_skipped_when_the_policy_is_fail_open() {
+    let harness = harness_with_hooks().await;
+    harness
+        .deploy_token_hook_with_policy(
+            harness.client_id(),
+            ironauth_hooks::fixtures::DECLINER,
+            1,
+            ironauth_store::HookFailurePolicy::FailOpen,
+        )
+        .await;
+
+    let (access, _id) = exchange(&harness)
+        .await
+        .expect("fail-open mints the token even though the hook declined");
+
+    // COMPARED AGAINST AN UNHOOKED ISSUANCE, because asserting the absence of `tier` alone is
+    // vacuous: DECLINER never produces one, so that assertion passes whatever the dispatch
+    // does. What fail-open actually promises is that the token is the one the client would
+    // have got with no hook at all, and that is only checkable against that token.
+    let unhooked = harness_with_hooks().await;
+    let (baseline, _) = exchange(&unhooked)
+        .await
+        .expect("an unhooked client issues normally");
+
+    let shaped = claims(&access);
+    let plain = claims(&baseline);
+    let shaped_names: std::collections::BTreeSet<&String> = shaped.keys().collect();
+    let plain_names: std::collections::BTreeSet<&String> = plain.keys().collect();
+    assert_eq!(
+        shaped_names, plain_names,
+        "fail-open must mint the token the client would have got with NO hook deployed; a \
+         difference here means the failed hook shaped it anyway"
+    );
+}
+
+/// A row written WITHOUT the column reads back as fail-closed.
+///
+/// The COLUMN default, not the Rust one. An earlier version of this test deployed through
+/// `set`, which binds `FailClosed` explicitly, so it re-read a value its own write path had
+/// just supplied and would have passed with the column defaulted to `fail_open`.
+///
+/// The column default is what governs rows an OLD binary writes during a rolling upgrade --
+/// 0164 is `Phase::Expand` precisely so one can -- and an old binary names no policy at all.
+/// That is the case this pins, by inserting the way an old binary would.
+#[tokio::test]
+async fn a_row_written_without_the_column_reads_back_fail_closed() {
+    let harness = harness_with_hooks().await;
+    let client = harness.client_id().to_string();
+
+    // The INSERT an old binary emits: no `failure_policy` anywhere in it.
+    sqlx::query(
+        "INSERT INTO token_hooks (tenant_id, environment_id, client_id, component, \
+         payload_version) VALUES ($1, $2, $3, $4, 1)",
+    )
+    .bind(harness.scope().tenant().to_string())
+    .bind(harness.scope().environment().to_string())
+    .bind(&client)
+    .bind(ironauth_hooks::fixtures::GOOD)
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("insert the way a binary predating the column would");
+
+    let record = harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .token_hooks()
+        .get(&client)
+        .await
+        .expect("read the hook")
+        .expect("a hook is deployed");
+    assert_eq!(
+        record.failure_policy,
+        ironauth_store::HookFailurePolicy::FailClosed,
+        "a row that names no policy must read as the safe one, or a rolling upgrade silently \
+         opts every pre-existing hook into fail-open"
+    );
+}

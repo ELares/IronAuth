@@ -9,10 +9,18 @@ range per docs/RELEASING.md.
 - **A deployed WASM hook shapes a real token (issue #114, M11's exit criterion).** The new
   `token_hook` module reads a client's deployed component, compiles it, runs it off the reactor
   under `spawn_blocking` (wasmtime's `in_tokio` panics on a tokio worker), and puts everything it
-  returns through the protected-claim fence. Every failure -- an unreadable component, an
-  exhausted bound, a decline, a payload-version mismatch -- FAILS the issuance, deliberately
+  returns through the protected-claim fence. A failure -- an unreadable component, an exhausted
+  bound, a decline, a payload-version mismatch -- fails the issuance BY DEFAULT, deliberately
   unlike the fail-open enrichment beside it: a hook can remove a claim as easily as add one, so
   ignoring one that aborted issues a token whose shape nobody chose.
+
+- **A hook's failure policy is per client (issue #114 criterion 3).** `token_hooks.failure_policy`
+  selects `fail_closed` (the default, and the behaviour above) or `fail_open`, which mints the
+  token without the hook's contribution and logs at ERROR. Fail-open is opt-in for the reason
+  the default exists: because a hook's answer REPLACES the claim set, skipping a failed hook can
+  issue a token still carrying a claim the operator deployed it to remove. It governs a hook
+  that did not COMPLETE; a hook that tries to write a PROTECTED claim is still dropped, reported
+  and issued, whatever the policy says.
 
 - **The messaging ledger has a producer, and `VerificationSender::send` is async (issue #111).**
   `MessageRepo::enqueue` had ZERO production callers: the ledger, the collapse, the rate budget,

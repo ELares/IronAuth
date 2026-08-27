@@ -166,12 +166,13 @@ fn validate_component(component: &[u8]) -> Result<(), ApiError> {
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
         ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
-        ("payload_version" = u32, Query, description = "The token-customize payload version the guest was built against")
+        ("payload_version" = u32, Query, description = "The token-customize payload version the guest was built against"),
+        ("failure_policy" = Option<String>, Query, description = "What the dispatch does when this hook does not complete: `fail_closed` (the default) or `fail_open`")
     ),
     security(("bearer" = [])),
     responses(
         (status = 200, description = "Deployed", body = TokenHookView),
-        (status = 400, description = "An unknown payload version, or bytes that are not a component", body = ErrorBody),
+        (status = 400, description = "An unknown or absent payload version, an unknown failure policy, or bytes that are not a WebAssembly component", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Environment not found or malformed client id", body = ErrorBody)
@@ -213,6 +214,19 @@ pub async fn deploy_token_hook(
     if payload_version != ironauth_store::token_customize::TOKEN_CUSTOMIZE_VERSION {
         return Err(ApiError::BadRequest("unknown_payload_version: this build cannot honour that token-customize payload version".to_owned()));
     }
+    // ABSENT MEANS FAIL-CLOSED. The dangerous setting is the one an operator has to type, and
+    // an unrecognised spelling is refused rather than read as the default -- a typo that
+    // silently selected the safe answer would be indistinguishable from asking for it, and the
+    // operator would never learn their `fail-open` did nothing.
+    let failure_policy = match query.failure_policy.as_deref() {
+        None => ironauth_store::HookFailurePolicy::FailClosed,
+        Some(raw) => ironauth_store::HookFailurePolicy::parse(raw).ok_or_else(|| {
+            ApiError::BadRequest(
+                "unknown_failure_policy: failure_policy must be `fail_closed` or `fail_open`"
+                    .to_owned(),
+            )
+        })?,
+    };
     validate_component(&body)?;
 
     state
@@ -225,6 +239,7 @@ pub async fn deploy_token_hook(
             &client,
             &body,
             i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,
+            failure_policy,
             deployed_event(
                 &state,
                 scope,
@@ -242,6 +257,7 @@ pub async fn deploy_token_hook(
         client_id: client.to_string(),
         component_bytes: body.len(),
         payload_version,
+        failure_policy: failure_policy.as_str().to_owned(),
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
@@ -290,6 +306,7 @@ pub async fn get_token_hook(
         client_id: record.client_id,
         component_bytes: usize::try_from(record.component_bytes).map_err(|_| ApiError::Internal)?,
         payload_version: u32::try_from(record.payload_version).map_err(|_| ApiError::Internal)?,
+        failure_policy: record.failure_policy.as_str().to_owned(),
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
@@ -373,6 +390,11 @@ fn deployed_event(
             "client_id": client_id,
             "component_bytes": component_bytes,
             "payload_version": payload_version,
+            // NO POLICY HERE. A redeploy that changes only it therefore emits an event
+            // identical to the one before, which is a real gap -- and the smaller one. See
+            // `token_hook.deployed` in the event catalog: adding any property to a closed
+            // schema dead-letters the event on a consumer running the older registry, in one
+            // direction if it is required and the other if it is optional.
         }),
     )?;
     Some(crate::events::PendingEvent {

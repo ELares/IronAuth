@@ -1276,6 +1276,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0163_token_hooks_delete_grant.sql"),
         },
+        Migration {
+            version: 164,
+            name: "token_hook_failure_policy",
+            // EXPAND: the column carries a default, so an old binary that never names it is
+            // unaffected and every existing row reads as the behaviour that shipped.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0164_token_hook_failure_policy.sql"),
+        },
     ]
 }
 
