@@ -123,6 +123,7 @@ use crate::scope::Scope;
 use crate::signup_form::{NewSignupForm, SignupFormRecord};
 use crate::sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 use crate::store::Store;
+use crate::token_hook_store::TokenHookMetadata;
 use crate::token_hook_store::TokenHookRecord;
 use crate::trait_schema::{TraitSchema, TransformOp, ValidationFailure};
 
@@ -32343,6 +32344,37 @@ impl TokenHookRepo<'_> {
             payload_version: row.get("payload_version"),
         }))
     }
+
+    /// The deployed hook's METADATA, without reading the component.
+    ///
+    /// `get` SELECTs the component, which is up to eight megabytes, and the management read
+    /// only reports its LENGTH. Hauling the bytes out of Postgres, across the wire and into a
+    /// buffer to call `.len()` on them is work proportional to a thing nobody looks at, so the
+    /// length is computed where the bytes already are.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn metadata(&self, client_id: &str) -> Result<Option<TokenHookMetadata>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT client_id, octet_length(component) AS component_bytes, payload_version \
+             FROM token_hooks \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| TokenHookMetadata {
+            client_id: row.get("client_id"),
+            component_bytes: row.get::<i32, _>("component_bytes"),
+            payload_version: row.get("payload_version"),
+        }))
+    }
 }
 
 /// The mutating deployed-hook repository for one scope and actor (issue #114).
@@ -32369,6 +32401,27 @@ impl ActingTokenHookRepo<'_> {
         client: &ClientId,
         component: &[u8],
         payload_version: i32,
+    ) -> Result<(), StoreError> {
+        self.set_with_event(env, client, component, payload_version, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally emitting `token_hook.deployed` (issue #108).
+    ///
+    /// In the SAME transaction as the deploy, which is the whole point of the outbox: a hook
+    /// that is installed but unannounced, or announced but not installed, are both states a
+    /// consumer cannot recover from.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        component: &[u8],
+        payload_version: i32,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if client.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -32402,6 +32455,7 @@ impl ActingTokenHookRepo<'_> {
                 .bind(payload_version)
                 .execute(&mut **tx)
                 .await?;
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -32421,6 +32475,20 @@ impl ActingTokenHookRepo<'_> {
     /// [`StoreError::NotFound`] if `client` is out of scope or has no hook;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, client: &ClientId) -> Result<(), StoreError> {
+        self.delete_with_event(env, client, None).await
+    }
+
+    /// [`Self::delete`], additionally emitting `token_hook.deleted` (issue #108).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete`].
+    pub async fn delete_with_event(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if client.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -32452,6 +32520,7 @@ impl ActingTokenHookRepo<'_> {
                 if removed.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

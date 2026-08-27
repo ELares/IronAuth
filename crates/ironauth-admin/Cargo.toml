@@ -222,6 +222,11 @@ path = "tests/claims_mappings.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "token_hooks"
+path = "tests/token_hooks.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "signup_forms"
 path = "tests/signup_forms.rs"
 required-features = ["testing"]

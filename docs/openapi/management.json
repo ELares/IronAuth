@@ -25256,7 +25256,7 @@
       },
       "ClaimsMappingView": {
         "type": "object",
-        "description": "writes into a free-form value is theirs.",
+        "description": "A per-environment, per-client declarative claim mapping, as returned by the management API\n(issue #113).\n\nNo secret SLOT: a rule names claim names, a static value, and a token placement, and none of\nthose is a credential field or a user reference.\n\nNot \"no secret is possible\", which an earlier version said. A `static` rule's value is\narbitrary operator-supplied JSON and this view returns it verbatim to any `management.read`\ncredential -- so an operator who puts a secret in one has put it somewhere a reader can see\nit. What the type guarantees is that nothing here is a secret by DESIGN; what an operator\nwrites into a free-form value is theirs.",
         "required": [
           "client_id",
           "rules"
@@ -31604,7 +31604,7 @@
       },
       "TokenHookView": {
         "type": "object",
-        "description": "A per-environment, per-client declarative claim mapping, as returned by the management API\n(issue #113).\n\nNo secret SLOT: a rule names claim names, a static value, and a token placement, and none of\nthose is a credential field or a user reference.\n\nNot \"no secret is possible\", which an earlier version said. A `static` rule's value is\narbitrary operator-supplied JSON and this view returns it verbatim to any `management.read`\ncredential -- so an operator who puts a secret in one has put it somewhere a reader can see\nit. What the type guarantees is that nothing here is a secret by DESIGN; what an operator\nA deployed WASM token hook, as an operator reads it back (issue #114).\n\nMETADATA, not the component. \"What is deployed\" is answered by which client, how many bytes\nand which payload version; streaming the component back would make every read a\nmulti-megabyte body and answers a question nobody asked.",
+        "description": "A deployed WASM token hook, as an operator reads it back (issue #114).\n\nMETADATA, not the component. \"What is deployed\" is answered by which client, how many bytes\nand which payload version; streaming the component back would make every read a\nmulti-megabyte body and answers a question nobody asked.",
         "required": [
           "client_id",
           "component_bytes",

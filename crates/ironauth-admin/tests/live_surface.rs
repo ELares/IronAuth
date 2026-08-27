@@ -1721,11 +1721,6 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/applications/{client}/claims-mapping"),
             &serde_json::json!({ "rules": [] }),
         ),
-        // WASM token hooks (issue #114), the same per-client shape. The body is not a component
-        // and does not need to be: the environment check runs before the component is looked at,
-        // which is the whole question these sweeps ask. `payload_version` is in the query
-        // because the extractor requires it, and an extractor rejection would answer a
-        // different question than the environment one.
         // WASM token hooks (issue #114), the same per-client shape. The body is a REAL
         // component preamble rather than a placeholder, and it has to be: the deploy runs
         // before the delete in this sweep, so a body the deploy refuses leaves nothing to

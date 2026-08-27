@@ -62,9 +62,14 @@ use crate::views::{DeployTokenHookQuery, TokenHookView};
 ///
 /// Duplicated deliberately rather than imported: the database bound is the one that must hold,
 /// and this one exists so an oversized deploy is a 400 naming the limit instead of a constraint
-/// violation surfacing as a 500. `an_oversized_component_is_refused_before_the_database_sees_it`
-/// pins that they agree.
-const MAX_COMPONENT_BYTES: usize = 8 * 1024 * 1024;
+/// violation surfacing as a 500.
+///
+/// NOTHING HERE PROVES THE TWO AGREE. An earlier version of this comment claimed the unit test
+/// below pins it; that test reads this constant and never reads the migration, so it would pass
+/// with both numbers wrong in the same direction. `a_component_at_the_documented_bound_is_stored`
+/// is what actually crosses the two: it deploys exactly this many bytes through the real
+/// handler into the real table, so a disagreement is a failed insert rather than a comment.
+pub(crate) const MAX_COMPONENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// The eight-byte preamble every WebAssembly component starts with.
 ///
@@ -181,7 +186,16 @@ pub async fn deploy_token_hook(
     // THE VERSION FIRST, because it is the cheapest refusal and the one whose message is most
     // actionable: a guest built against another revision of the WIT interface cannot be run by
     // this build at all, and saying so beats letting it deploy and fail at the first login.
-    if query.payload_version != ironauth_store::token_customize::TOKEN_CUSTOMIZE_VERSION {
+    // PARSED HERE rather than by the extractor, so a malformed value is this API's 400 with an
+    // `ErrorBody` instead of axum's plain-text one -- and so it happens AFTER the permission
+    // check rather than before it, which is what stops it being an unauthenticated probe for
+    // the parameter's type.
+    let payload_version: u32 = query.payload_version.parse().map_err(|_| {
+        ApiError::BadRequest(
+            "unknown_payload_version: payload_version must be a non-negative integer".to_owned(),
+        )
+    })?;
+    if payload_version != ironauth_store::token_customize::TOKEN_CUSTOMIZE_VERSION {
         return Err(ApiError::BadRequest("unknown_payload_version: this build cannot honour that token-customize payload version".to_owned()));
     }
     validate_component(&body)?;
@@ -191,18 +205,28 @@ pub async fn deploy_token_hook(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .token_hooks()
-        .set(
+        .set_with_event(
             state.env(),
             &client,
             &body,
-            i32::try_from(query.payload_version).map_err(|_| ApiError::Internal)?,
+            i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,
+            deployed_event(
+                &state,
+                scope,
+                &client.to_string(),
+                body.len(),
+                payload_version,
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
         )
         .await?;
 
     let view = TokenHookView {
         client_id: client.to_string(),
         component_bytes: body.len(),
-        payload_version: query.payload_version,
+        payload_version,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
@@ -237,16 +261,19 @@ pub async fn get_token_hook(
     principal.require_permission(ManagementPermission::Read)?;
     let client = parse_client_id(&client_id, scope)?;
 
+    // `metadata`, not `get`: the component is up to eight megabytes and this reports its
+    // LENGTH, so the length is computed where the bytes already are rather than by hauling
+    // them across the wire to call `.len()`.
     let record = state
         .store()
         .scoped(scope)
         .token_hooks()
-        .get(&client.to_string())
+        .metadata(&client.to_string())
         .await?
         .ok_or(ApiError::NotFound)?;
     let view = TokenHookView {
         client_id: record.client_id,
-        component_bytes: record.component.len(),
+        component_bytes: usize::try_from(record.component_bytes).map_err(|_| ApiError::Internal)?,
         payload_version: u32::try_from(record.payload_version).map_err(|_| ApiError::Internal)?,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
@@ -294,9 +321,76 @@ pub async fn delete_token_hook(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .token_hooks()
-        .delete(state.env(), &client)
+        .delete_with_event(
+            state.env(),
+            &client,
+            deleted_event(&state, scope, &client.to_string())
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The event a hook deploy emits (issue #108).
+///
+/// The client, the byte count and the payload version -- never the component. An event is a
+/// notification, not a binary store: the bytes are durable in the row this points at, and
+/// putting megabytes of WASM on every subscriber's stream would be a denial of service dressed
+/// as an announcement. The count and the version are what let a consumer tell one deploy from
+/// another without refetching.
+fn deployed_event(
+    state: &AdminState,
+    scope: Scope,
+    client_id: &str,
+    component_bytes: usize,
+    payload_version: u32,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "token_hook.deployed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "client_id": client_id,
+            "component_bytes": component_bytes,
+            "payload_version": payload_version,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        // The stable address is the subject, so two events about one hook stay ordered.
+        subject: client_id.to_owned(),
+        envelope,
+    })
+}
+
+/// The event a hook removal emits (issue #108).
+///
+/// A removal restores the UNSHAPED token, so a claim the hook computed stops being minted and a
+/// resource server authorizing on it starts refusing. A consumer cannot tell that from silence.
+fn deleted_event(
+    state: &AdminState,
+    scope: Scope,
+    client_id: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "token_hook.deleted",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "client_id": client_id }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: client_id.to_owned(),
+        envelope,
+    })
 }
 
 #[cfg(test)]

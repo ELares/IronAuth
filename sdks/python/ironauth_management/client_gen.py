@@ -311,6 +311,10 @@ class Client:
         """Deactivate a tenant (soft delete; idempotent). DELETE /v1/tenants/{tenant_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}", query, None)
 
+    def delete_token_hook(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Remove a client's WASM token hook. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook", query, None)
+
     def delete_user(self, tenant_id: str, environment_id: str, user_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Delete a user (a soft-delete offboarding that cascades sessions). DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/users/{urllib.parse.quote(user_id)}", query, None)
@@ -326,6 +330,10 @@ class Client:
     def deny_sms_country(self, tenant_id: str, environment_id: str, country_code: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Stop allowing SMS to a country calling code. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist/{country_code}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/sms-otp/allowlist/{urllib.parse.quote(country_code)}", query, None)
+
+    def deploy_token_hook(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Deploy (create or replace) a client's WASM token hook. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook", query, body)
 
     def disable_organization(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Disable an organization (issue #94). The organization stays readable (this is not a soft delete) but is marked disabled; the login-time enforcement is a later PR. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable."""
@@ -518,6 +526,10 @@ class Client:
     def get_tenant(self, tenant_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Get one tenant. GET /v1/tenants/{tenant_id}."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}", query, None)
+
+    def get_token_hook(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Describe a client's deployed token hook. GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook", query, None)
 
     def get_trait_migration_job(self, tenant_id: str, environment_id: str, job_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Read a trait migration job's progress and failure report. GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations/{job_id}."""

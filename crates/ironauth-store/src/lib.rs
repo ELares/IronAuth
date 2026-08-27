@@ -382,3 +382,5 @@ pub use trait_schema::{
     TraitSchema, TransformOp, ValidationFailure, Visibility, apply_transform, narrows,
     parse_transform,
 };
+
+pub use token_hook_store::TokenHookMetadata;

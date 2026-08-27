@@ -2698,6 +2698,52 @@
       "type": "token.issued"
     },
     {
+      "domain": "token_hook",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "token_hook.deleted"
+    },
+    {
+      "domain": "token_hook",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "component_bytes": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "payload_version": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "client_id",
+          "component_bytes",
+          "payload_version"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "token_hook.deployed"
+    },
+    {
       "domain": "trait_migration_job",
       "payload_schema": {
         "additionalProperties": false,

@@ -311,6 +311,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Describe a client's deployed token hook. */
+        get: operations["getTokenHook"];
+        /** Deploy (create or replace) a client's WASM token hook. */
+        put: operations["deployTokenHook"];
+        post?: never;
+        /** Remove a client's WASM token hook. */
+        delete: operations["deleteTokenHook"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture": {
         parameters: {
             query?: never;
@@ -7582,6 +7601,27 @@ export interface components {
             status: string;
         };
         /**
+         * @description A deployed WASM token hook, as an operator reads it back (issue #114).
+         *
+         *     METADATA, not the component. "What is deployed" is answered by which client, how many bytes
+         *     and which payload version; streaming the component back would make every read a
+         *     multi-megabyte body and answers a question nobody asked.
+         */
+        TokenHookView: {
+            /** @description The authorize client id whose tokens this hook shapes (the per-environment natural key). */
+            client_id: string;
+            /**
+             * @description How many bytes the deployed component is, so an operator can tell whether the thing
+             *     running is the thing they pushed.
+             */
+            component_bytes: number;
+            /**
+             * Format: int32
+             * @description The token-customize payload version the guest was built against.
+             */
+            payload_version: number;
+        };
+        /**
          * @description The IronAuth behavior vocabulary a trait schema declares (issue #53), parsed off
          *     its top-level properties and served with every version so a form generator, a login
          *     surface, or a recovery surface reads the contract from one place.
@@ -9814,6 +9854,183 @@ export interface operations {
                 };
             };
             /** @description Not found (absent or in another scope). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getTokenHook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The deployed hook's metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed client id, or no hook deployed */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deployTokenHook: {
+        parameters: {
+            query: {
+                /** @description The token-customize payload version the guest was built against */
+                payload_version: number;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description The WebAssembly component bytes */
+        requestBody: {
+            content: {
+                "application/wasm": string;
+            };
+        };
+        responses: {
+            /** @description Deployed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookView"];
+                };
+            };
+            /** @description An unknown payload version, or bytes that are not a component */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or malformed client id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteTokenHook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed client id, or no hook deployed */
             404: {
                 headers: {
                     [name: string]: unknown;

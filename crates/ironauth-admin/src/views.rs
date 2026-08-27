@@ -1917,6 +1917,16 @@ pub struct SetClaimsMappingRequest {
 /// arbitrary operator-supplied JSON and this view returns it verbatim to any `management.read`
 /// credential -- so an operator who puts a secret in one has put it somewhere a reader can see
 /// it. What the type guarantees is that nothing here is a secret by DESIGN; what an operator
+/// writes into a free-form value is theirs.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClaimsMappingView {
+    /// The authorize client id whose tokens these rules shape (the per-environment natural key).
+    pub client_id: String,
+    /// The ordered rule list, as stored.
+    #[schema(value_type = Object)]
+    pub rules: serde_json::Value,
+}
+
 /// A deployed WASM token hook, as an operator reads it back (issue #114).
 ///
 /// METADATA, not the component. "What is deployed" is answered by which client, how many bytes
@@ -1938,20 +1948,18 @@ pub struct TokenHookView {
 /// The version is REQUIRED rather than defaulted. A default would silently accept a guest built
 /// against another revision of the WIT interface and fail it at the first login instead, which
 /// is the failure this parameter exists to move to deploy time.
+///
+/// # Why it is a `String` and not a `u32`
+///
+/// Typed as `u32`, `?payload_version=banana` is an axum EXTRACTOR rejection: a plain-text 400
+/// that does not carry `ErrorBody`, does not name the parameter in this API's vocabulary, and
+/// is produced before the handler -- so it is also before the permission check, which makes it
+/// an unauthenticated probe for the parameter's type. Parsing it in the handler makes every
+/// refusal on this route one shape.
 #[derive(Debug, Clone, serde::Deserialize, utoipa::IntoParams)]
 pub struct DeployTokenHookQuery {
     /// The token-customize payload version the guest was built against.
-    pub payload_version: u32,
-}
-
-/// writes into a free-form value is theirs.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ClaimsMappingView {
-    /// The authorize client id whose tokens these rules shape (the per-environment natural key).
-    pub client_id: String,
-    /// The ordered rule list, as stored.
-    #[schema(value_type = Object)]
-    pub rules: serde_json::Value,
+    pub payload_version: String,
 }
 
 /// The body to create a new version of a custom journey (issue #92, PR 5).
