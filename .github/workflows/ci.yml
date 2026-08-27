@@ -446,18 +446,23 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      # TWO crates are excluded, under one rule: a workspace member whose DEPENDENCY declares
+      # ONE crate is excluded, under this rule: a workspace member whose DEPENDENCY declares
       # an MSRV above the workspace promise, and which nothing in the shipped binary's graph
       # depends on, is checked at its own MSRV instead of blocking this lane.
       #
-      #   ironauth-cel   -- `cel` 0.14 declares rust-version 1.86
       #   ironauth-hooks -- wasmtime/cranelift 48 declare rust-version 1.95
       #
-      # Neither is reachable from `ironauth`, so the SHIPPED binary's MSRV is still 1.85 and the
+      # It is not reachable from `ironauth`, so the SHIPPED binary's MSRV is still 1.85 and the
       # promise in docs/COMPATIBILITY.md is intact. This is not a way to make the number look
-      # good: the moment either crate is wired into the binary, the product MSRV becomes that
-      # crate's, and raising a published compatibility promise is an owner decision rather than
-      # a side effect. The exclusion is what has to come out at that point.
+      # good: the moment that crate is wired into the binary, the product MSRV becomes its
+      # dependency's, and raising a published compatibility promise is an owner decision rather
+      # than a side effect. The exclusion is what has to come out at that point.
+      #
+      # IRONAUTH-CEL WAS THE SECOND, AND IT CAME OUT (issue #113 criterion 2), which is what
+      # that sentence looks like when it is honoured. Wiring the CEL cost budget into issuance
+      # made the crate reachable, so rather than move the promise, `cel` is pinned to 0.12,
+      # which declares 1.82. The pin's cost is one scoped advisory ignore, recorded in
+      # deny.toml. The crate is now checked by the workspace line below like any other.
       #
       # This lane has been RED on main since ironauth-cel landed (#993); branch protection
       # requires a review but no CI job, so nothing surfaced it. Fixed here because a branch
@@ -478,11 +483,11 @@ jobs:
       # Installed here rather than lower down because the all-features check below runs under
       # 1.95, not only the two per-crate checks that used to be the sole users.
       - name: Install the toolchains the excluded crates declare
-        run: rustup toolchain install 1.95 --profile minimal && rustup toolchain install 1.86 --profile minimal
+        run: rustup toolchain install 1.95 --profile minimal
       - name: Install the WASM target for 1.95
         run: rustup target add wasm32-wasip2 --toolchain 1.95
       - name: The shipped graph, at the promised MSRV
-        run: cargo check --workspace --exclude ironauth-hooks --exclude ironauth-cel
+        run: cargo check --workspace --exclude ironauth-hooks
       # Everything the default graph does not reach is still checked, at the toolchain the
       # highest-declaring member names. Without this the feature combinations behind an
       # optional dependency would be compiled by no lane at all, which is how `wasm-hooks`
@@ -491,7 +496,7 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: "1.95"
         run: cargo check --workspace --all-features --all-targets
-      # The two excluded crates are checked AT THEIR OWN declared MSRV, so the numbers
+      # The excluded crate is checked AT ITS OWN declared MSRV, so the numbers
       # docs/COMPATIBILITY.md publishes for them are compiled rather than asserted. Without this
       # the exclusion above is the only thing anyone checks, and a crate could quietly need a
       # newer compiler than its manifest claims while every lane stayed green.
@@ -499,10 +504,6 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: "1.95"
         run: cargo check -p ironauth-hooks --all-features --all-targets
-      - name: ironauth-cel at its declared 1.86
-        env:
-          RUSTUP_TOOLCHAIN: "1.86"
-        run: cargo check -p ironauth-cel --all-features --all-targets
 
   musl:
     name: musl static build

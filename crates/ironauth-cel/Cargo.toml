@@ -4,11 +4,12 @@ name = "ironauth-cel"
 version = "0.1.0"
 description = "Cost-bounded CEL evaluation for IronAuth: a deterministic budget refused before evaluation, never a wall clock"
 edition.workspace = true
-# NOT the workspace MSRV: `cel` 0.14 declares rust-version 1.86. Nothing depends on this
-# crate yet, so the shipped binary's MSRV is unaffected and the 1.85 promise in
-# docs/COMPATIBILITY.md holds; the CI msrv lane excludes this crate for exactly as long as
-# that is true. See the comment on that lane for the rule both exclusions follow.
-rust-version = "1.86"
+# THE WORKSPACE MSRV, inherited, and that is the point of the `cel` pin below. This crate
+# used to declare 1.86 because `cel` 0.14 does, and the CI msrv lane excluded it on the rule
+# that an unreachable crate is checked at its own MSRV instead of blocking the lane. Wiring
+# it into the issuance path retires that exemption -- the rule says so -- and the pin is what
+# makes the promise survive the wiring rather than the wiring move the promise.
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
@@ -21,7 +22,24 @@ repository.workspace = true
 # `json` is enabled for `Value::json()`, the result half of this crate's boundary. The
 # binding half is hand-written (`to_cel`) because it enforces the declared cardinality while
 # it converts, which a general-purpose converter has no reason to do.
-cel = { version = "0.14", features = ["json"] }
+#
+# PINNED TO 0.12, DELIBERATELY BELOW THE LATEST, and the reason is a published promise.
+# `cel` 0.13 and 0.14 declare `rust-version = "1.86.0"`; 0.12 declares 1.82.0. This crate is
+# now reachable from the shipped binary, so ITS dependency's MSRV becomes the PRODUCT's, and
+# docs/COMPATIBILITY.md promises 1.85. Taking 0.14 would raise a published compatibility
+# promise as a side effect of shipping a feature, which is an owner decision rather than
+# something a mapping rule gets to do.
+#
+# The cost of the pin, stated plainly: 0.12 pulls `paste`, which is unmaintained
+# (RUSTSEC-2024-0436), where 0.14 moved to `pastey`, the maintained fork of the same macro.
+# That advisory is an unmaintained notice rather than a vulnerability, against a COMPILE-TIME
+# proc macro that expands identifiers and contributes no runtime code, and `deny.toml`
+# carries a scoped ignore saying so. The tree already resolves one MSRV-versus-advisory
+# conflict this way, for `time`.
+#
+# Measured before pinning: the crate's source compiles against 0.12 UNCHANGED and all of its
+# tests pass, so nothing here is written around an older API.
+cel = { version = "0.12", features = ["json"] }
 # The wire form on this crate's own boundary. Bindings arrive as `serde_json::Value` and
 # results leave as one, so a caller never needs `cel` in its manifest and `cel::Program`
 # never escapes -- which is what makes the cost budget unavoidable rather than optional.
