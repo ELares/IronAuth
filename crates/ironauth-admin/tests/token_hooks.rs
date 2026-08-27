@@ -712,10 +712,21 @@ fn the_published_version_cap_matches_the_retention_the_prune_enforces() {
         .expect("listTokenHookVersions must be in the published document");
 
     let retention = ironauth_store::TOKEN_HOOK_VERSION_RETENTION;
+    // THE NUMBER MUST END WHERE THE RETENTION ENDS. `contains("At most 20")` was the first
+    // version of this and it is satisfied by "At most 200" and "At most 2000" -- so the
+    // document could drift an order of magnitude upward while the test reported agreement,
+    // which is the exact direction the doc comment above claims to catch.
+    let phrase = format!("At most {retention}");
+    let Some((_, after)) = description.split_once(&phrase) else {
+        panic!(
+            "the published cap and the retention the prune enforces disagree. The prune \
+             keeps {retention}; the document says: {description}"
+        )
+    };
     assert!(
-        description.contains(&format!("At most {retention}")),
-        "the published cap and the retention the prune enforces disagree. The prune keeps \
-         {retention}; the document says: {description}"
+        !after.starts_with(|c: char| c.is_ascii_digit()),
+        "the document says a LONGER number than the retention: the prune keeps {retention} \
+         and the description reads: {description}"
     );
 }
 
@@ -789,6 +800,188 @@ async fn a_repeated_rollback_writes_no_second_version() {
     assert_eq!(
         listed[0]["version"], 3,
         "and it did not renumber anything either: {body}"
+    );
+}
+
+/// 0165'S BACKFILL COPIES A LIVE HOOK INTO THE HISTORY, WITH ITS POLICY.
+///
+/// The migration creates `token_hook_versions` and every test database applies it to an EMPTY
+/// schema, so the backfill runs against no rows in every other test in this file. On a real
+/// upgrade it runs against every hook already in service, and getting it wrong is invisible
+/// here: an empty `INSERT ... SELECT` succeeds whatever its column list says.
+///
+/// So this drives the real statement, read out of the migration file rather than retyped, over
+/// a real deployed hook. The setup deletes the history the deploy wrote, which is exactly the
+/// state an upgraded install is in: a live `token_hooks` row and no history beside it.
+#[tokio::test]
+async fn the_migration_backfill_copies_a_live_hook_into_the_history() {
+    let harness = Harness::start(233).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // A hook deployed with a NON-DEFAULT policy, because the backfill copies every column and
+    // a version that lost the policy would restore bytes without the configuration.
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&failure_policy=fail_open"),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy: {body}");
+
+    // Now make it look pre-migration: the active row stays, its history goes.
+    sqlx::query("DELETE FROM token_hook_versions WHERE client_id = $1")
+        .bind(client.clone())
+        .execute(harness.db().owner_pool())
+        .await
+        .expect("clear the history");
+    let (_, _, body) = harness.get(&format!("{base}/versions")).await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body)
+            .expect("parse")
+            .as_array()
+            .expect("array")
+            .len(),
+        0,
+        "the fixture must start with no history, or the backfill below proves nothing: {body}"
+    );
+
+    // THE REAL STATEMENT, taken from the migration. Retyping it here would let the two drift
+    // and this test would then pass against a backfill that no longer exists.
+    let migration = include_str!("../../ironauth-store/migrations/0165_token_hook_versions.sql");
+    let backfill = migration
+        .split_once("INSERT INTO token_hook_versions")
+        .map(|(_, rest)| format!("INSERT INTO token_hook_versions{rest}"))
+        .expect("0165 must carry a backfill INSERT");
+    sqlx::raw_sql(&backfill)
+        .execute(harness.db().owner_pool())
+        .await
+        .expect("run the backfill");
+
+    let (status, _, body) = harness.get(&format!("{base}/versions")).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let listed = listed.as_array().expect("array");
+    assert_eq!(
+        listed.len(),
+        1,
+        "the live hook must appear in the history exactly once: {body}"
+    );
+    assert_eq!(
+        listed[0]["version"], 1,
+        "the backfilled row is version 1, so the first post-upgrade deploy is 2: {body}"
+    );
+    assert_eq!(
+        listed[0]["component_bytes"],
+        COMPONENT.len(),
+        "with the live component's bytes: {body}"
+    );
+    assert_eq!(
+        listed[0]["failure_policy"], "fail_open",
+        "and the policy it was running WITH, or a rollback restores bytes without the \
+         configuration: {body}"
+    );
+
+    // AND IT IS ROLLABLE-BACK, which is the point of backfilling at all.
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/rollback"),
+            "k-backfill",
+            r#"{"version":1}"#,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the backfilled version must be a valid rollback target: {body}"
+    );
+}
+
+/// THE NO-OP COMPARES THE COMPONENT, NOT ITS LENGTH, AND IT COMPARES THE POLICY TOO.
+///
+/// `a_repeated_rollback_writes_no_second_version` pins that an identical rollback is inert,
+/// which is the bytes-versus-nothing axis. It cannot see the other two clauses of the guard:
+/// every other rollback fixture in this file targets a version differing from the active row
+/// in BOTH bytes and length, so a guard comparing only `component.len()` would pass all of
+/// them, and so would one that ignored `failure_policy` entirely.
+///
+/// Two rollbacks here, each varying ONE dimension:
+///
+/// - EQUAL LENGTH, different bytes. A length comparison calls these the same and skips the
+///   write, so the rollback silently does nothing and the operator's hook never changes.
+/// - IDENTICAL bytes, different policy. A guard that compared only the component calls these
+///   the same, so rolling back to recover a `fail_closed` setting leaves `fail_open` running --
+///   which is the configuration half this file already claims a rollback restores.
+#[tokio::test]
+async fn the_rollback_no_op_compares_the_component_and_the_policy_not_the_length() {
+    let harness = Harness::start(232).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+
+    // EQUAL LENGTH, DIFFERENT BYTES.
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+    let mut first = COMPONENT.to_vec();
+    first.extend_from_slice(b"AAAA");
+    let mut second = COMPONENT.to_vec();
+    second.extend_from_slice(b"BBBB");
+    assert_eq!(
+        first.len(),
+        second.len(),
+        "the fixture must vary ONE dimension"
+    );
+    for component in [first.as_slice(), second.as_slice()] {
+        let (status, _, body) = harness
+            .put_bytes(&format!("{base}?payload_version=1"), component)
+            .await;
+        assert_eq!(status, StatusCode::OK, "deploy: {body}");
+    }
+    let (status, _, body) = harness
+        .post(&format!("{base}/rollback"), "k-len", r#"{"version":1}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK, "rollback: {body}");
+    let (_, _, body) = harness.get(&format!("{base}/versions")).await;
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        listed.as_array().expect("array").len(),
+        3,
+        "the rollback must WRITE: v1 and v2 are the same length and different components, so \
+         a no-op comparing lengths would skip it and leave v2 running: {body}"
+    );
+
+    // IDENTICAL BYTES, DIFFERENT POLICY.
+    let policy_client = Harness::fresh_client_id(scope);
+    let policy_base = hook_path(&tenant, &env, &policy_client);
+    for policy in ["fail_closed", "fail_open"] {
+        let (status, _, body) = harness
+            .put_bytes(
+                &format!("{policy_base}?payload_version=1&failure_policy={policy}"),
+                COMPONENT,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "deploy {policy}: {body}");
+    }
+    let (status, _, body) = harness
+        .post(
+            &format!("{policy_base}/rollback"),
+            "k-pol",
+            r#"{"version":1}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "rollback: {body}");
+    assert!(
+        body.contains("\"failure_policy\":\"fail_closed\""),
+        "rolling back must restore the POLICY, and the two versions have identical bytes -- so \
+         a no-op comparing only the component would skip the write and leave fail_open: {body}"
+    );
+    let (_, _, body) = harness.get(&format!("{policy_base}/versions")).await;
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        listed.as_array().expect("array").len(),
+        3,
+        "and it must have appended a version: {body}"
     );
 }
 
@@ -921,30 +1114,60 @@ async fn the_version_history_is_pruned_to_the_retention_bound() {
         "and the window is the newest N, so the oldest survivor is deploys - N + 1: {body}"
     );
 
-    // THE NEIGHBOUR IS UNTOUCHED. One version, numbered 1, with its own bytes.
+    // A SECOND NEIGHBOUR DEPLOY, now that the environment holds twenty-two other versions.
     //
-    // Each clause pins a different predicate: `len() == 1` fails without the PRUNE's client
-    // predicate (this client's twenty-two deploys would have taken the neighbour's only row)
-    // and without the LIST's; `version == 1` fails without the NUMBERING's, because the
-    // neighbour would have been numbered after whatever else the environment held; and the
-    // byte count fails if the list crossed clients and returned this client's rows instead.
+    // This is what makes the neighbour's version number able to fail. The first neighbour
+    // deploy went into an EMPTY environment, where `COALESCE(MAX(version), 0) + 1` is 1 with
+    // or without the client predicate -- so asserting it is 1 pinned nothing about numbering,
+    // and an earlier version of this comment credited it with doing so. This one lands after
+    // the loop, so environment-wide numbering would give it 23 rather than 2.
+    let mut neighbour_second = COMPONENT.to_vec();
+    neighbour_second.extend_from_slice(b"the neighbour again");
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{neighbour_base}?payload_version=1"),
+            &neighbour_second,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the neighbour's second deploy: {body}"
+    );
+
+    // THE NEIGHBOUR IS UNTOUCHED, and each assertion pins a different predicate.
+    //
+    // `len() == 2` fails without the PRUNE's client predicate -- this client's twenty-two
+    // deploys would have taken the neighbour's first row -- and without the LIST's, which
+    // would return this client's rows as well. `version == 2` fails without the NUMBERING's,
+    // because the deploy above lands into an environment holding twenty-two other versions.
+    // The byte counts fail if the list crossed clients.
     let (status, _, body) = harness.get(&format!("{neighbour_base}/versions")).await;
     assert_eq!(status, StatusCode::OK);
     let neighbour_listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
     let neighbour_listed = neighbour_listed.as_array().expect("array");
     assert_eq!(
         neighbour_listed.len(),
-        1,
-        "the neighbour deployed once and this client's twenty-two deploys must not have \
+        2,
+        "the neighbour deployed twice and this client's twenty-two deploys must not have \
          numbered, listed or pruned across the client boundary: {body}"
     );
     assert_eq!(
-        neighbour_listed[0]["version"], 1,
-        "version numbering is per CLIENT, not per environment: {body}"
+        neighbour_listed[0]["version"], 2,
+        "version numbering is per CLIENT, not per environment: this deploy followed \
+         twenty-two of another client's, and it is the neighbour's second: {body}"
     );
     assert_eq!(
         neighbour_listed[0]["component_bytes"],
-        neighbour_component.len(),
-        "and the row listed is the neighbour's own: {body}"
+        neighbour_second.len(),
+        "and the rows listed are the neighbour's own: {body}"
+    );
+    assert_eq!(
+        neighbour_listed[1]["version"], 1,
+        "its first deploy survived the other client's pruning: {body}"
+    );
+    assert_eq!(
+        neighbour_listed[1]["component_bytes"],
+        neighbour_component.len()
     );
 }

@@ -32608,9 +32608,25 @@ impl ActingTokenHookRepo<'_> {
     ///
     /// The history is APPEND-ON-DEPLOY AND PRUNED, not append-only: this appends, and the
     /// prune in [`Self::set_with_event`] then drops anything past
-    /// [`TOKEN_HOOK_VERSION_RETENTION`]. A rollback therefore consumes a retention slot, and
-    /// rolling back to the OLDEST surviving version can be the write that prunes it -- see the
-    /// no-op below, which is what keeps a repeated rollback from spending the history.
+    /// [`TOKEN_HOOK_VERSION_RETENTION`]. A rollback therefore consumes a retention slot.
+    ///
+    /// # Two consequences of that, and the no-op below covers only one
+    ///
+    /// A REPEATED rollback is inert. The target already equals the active row, so the no-op
+    /// returns before writing and twenty retries cost nothing. That is what makes this
+    /// endpoint safe without an `Idempotency-Key`.
+    ///
+    /// A FIRST rollback TO THE OLDEST SURVIVING VERSION prunes its own target, and the no-op
+    /// cannot help: it fires only when the target is already running, and the whole reason to
+    /// roll back is that it is not. So the write succeeds, the component is restored, the
+    /// version it came from is gone, and a retry of that exact request answers 404. The
+    /// component is still reachable -- it is the newest version now -- under its new number.
+    ///
+    /// This is stated rather than fixed. Keeping the target would mean the prune spares a row
+    /// the retention says to drop, so the bound would hold for deploys and not for rollbacks,
+    /// and "twenty" would silently mean twenty-one for some clients. An earlier version of
+    /// this paragraph pointed at the no-op as though it covered this case; it does not, and
+    /// naming the wrong mechanism is what round 2 of this PR was fixing one comment above.
     ///
     /// # Errors
     ///

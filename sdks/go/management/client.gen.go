@@ -528,7 +528,7 @@ func (c *Client) DeleteTenant(tenant_id string, query url.Values) (*http.Respons
 
 // DeleteTokenHook performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook.
 //
-// Remove a client's WASM token hook.
+// Take a client's WASM token hook out of service.
 func (c *Client) DeleteTokenHook(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook", query, nil)
 }

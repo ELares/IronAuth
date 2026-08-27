@@ -314,7 +314,24 @@ pub async fn get_token_hook(
     Ok(json(StatusCode::OK, body_string))
 }
 
-/// Remove a client's WASM token hook.
+/// Take a client's WASM token hook out of service.
+///
+/// # It is no longer a deletion, and this PR is what changed that
+///
+/// Before the version history, removing the row destroyed the component: there was one copy
+/// and this deleted it. Now the deploy that installed it also wrote a history row, and nothing
+/// here touches that table -- the prune runs on a DEPLOY, so a client that never deploys again
+/// keeps the withdrawn bytes indefinitely.
+///
+/// So the surface answers three things about the same client, and they are all true:
+/// `getTokenHook` is 404, `listTokenHookVersions` lists the withdrawn hook, and
+/// `rollbackTokenHook` re-installs its exact bytes. No endpoint erases the history.
+///
+/// That is the right default -- the break-glass case is "this hook is failing logins, take it
+/// out", and an operator doing that at 3am should not also be discarding the ability to put it
+/// back -- but it means this is a WITHDRAWAL rather than an erasure, and an operator removing a
+/// hook because its bytes should not exist any more is not served by it. Said here and in the
+/// 204's description because the old name promised something this no longer does.
 #[utoipa::path(
     delete,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook",
@@ -327,7 +344,7 @@ pub async fn get_token_hook(
     ),
     security(("bearer" = [])),
     responses(
-        (status = 204, description = "Removed"),
+        (status = 204, description = "Removed from service. The version HISTORY is kept, so the withdrawn component is still listed by listTokenHookVersions and can be re-installed by rollbackTokenHook; no endpoint erases it"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Environment not found, malformed client id, or no hook deployed", body = ErrorBody)

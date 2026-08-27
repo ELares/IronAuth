@@ -100,3 +100,28 @@ CREATE POLICY token_hook_versions_scope ON token_hook_versions
 -- inherit, and this is the rare case where the honest answer is no grant rather than a narrow
 -- one.
 GRANT SELECT, INSERT, DELETE ON token_hook_versions TO ironauth_control;
+
+-- BACKFILL, because an empty history and "never deployed a hook" are not the same thing.
+--
+-- Without this, every hook already running on an upgraded install gets a table that does not
+-- mention it. `listTokenHookVersions` would answer 200 with an empty list -- which the surface
+-- documents as "this client has never had a hook" -- for a client whose hook is shaping tokens
+-- right now, and `rollbackTokenHook` would have no target at all for exactly the components
+-- most likely to need one: the ones deployed before anybody could roll back.
+--
+-- Version 1, because it is the first version this table knows about and the numbering is
+-- per client. It is NOT a claim that the running component was that client's first deploy;
+-- the deploys before this migration were not recorded, and no backfill can invent them. What
+-- it does mean is precise and useful: the component running at upgrade time is in the history,
+-- so the first post-upgrade deploy is version 2 and rolling back to 1 restores what was there
+-- before the upgrade.
+--
+-- Every column is copied from the live row rather than defaulted, `failure_policy` included,
+-- so a rollback to version 1 restores the CONFIGURATION that was running and not merely its
+-- bytes. `created_at` is deliberately left to the column default -- the moment of the
+-- migration -- because the real deploy time was never recorded and inventing an earlier one
+-- would put a timestamp in the history that nothing measured.
+INSERT INTO token_hook_versions
+    (tenant_id, environment_id, client_id, version, component, payload_version, failure_policy)
+SELECT tenant_id, environment_id, client_id, 1, component, payload_version, failure_policy
+FROM token_hooks;

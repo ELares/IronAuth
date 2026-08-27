@@ -312,7 +312,7 @@ class Client:
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}", query, None)
 
     def delete_token_hook(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
-        """Remove a client's WASM token hook. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook."""
+        """Take a client's WASM token hook out of service. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook", query, None)
 
     def delete_user(self, tenant_id: str, environment_id: str, user_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
