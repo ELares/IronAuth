@@ -353,11 +353,32 @@ fn cardinality_bound(expression: &Expr, shape: InputShape) -> u64 {
         // A binding, or a field of one: whatever the input document declared. This is the
         // case the original model handled, and it is still the common one.
         Expr::Ident(_) | Expr::Select(_) => shape.max_collection_size,
-        // A literal: exactly what is written. Its ELEMENTS' cardinalities are not added here;
-        // a nested collection is bounded where it is itself iterated.
-        Expr::List(list) => list.elements.len() as u64,
-        Expr::Map(map) => map.entries.len() as u64,
-        Expr::Struct(structure) => structure.entries.len() as u64,
+        // A literal: its own length, OR the largest collection it contains, whichever is
+        // bigger.
+        //
+        // The recursion is the load-bearing half and this file deleted it once. The previous
+        // model had it, with the comment "THE COUNT and the recursion, because a large literal
+        // can hold a larger one"; the first version of `cardinality_bound` replaced that with
+        // the count alone and defended it as "a nested collection is bounded where it is
+        // itself iterated". That defence is wrong, because the `_[_]` index that descends from
+        // a container to its member is an ordinary call and inherits the CONTAINER's bound.
+        //
+        // Measured by review: a bare 40,000-element literal scores 1,600,000,000 and is
+        // refused, and the SAME literal wrapped as `[ ... ][0]` -- five more characters --
+        // scored 1, was admitted, and ran 20.76 seconds. `{'k': ...}['k']` does the same. The
+        // test directly below this fix says "a bound a rewrite can step around is not a
+        // bound", and five characters stepped around it.
+        Expr::List(list) => (list.elements.len() as u64).max(
+            list.elements
+                .iter()
+                .map(|element| cardinality_bound(&element.expr, shape))
+                .max()
+                .unwrap_or(0),
+        ),
+        Expr::Map(map) => (map.entries.len() as u64).max(entries_cardinality(&map.entries, shape)),
+        Expr::Struct(structure) => {
+            (structure.entries.len() as u64).max(entries_cardinality(&structure.entries, shape))
+        }
         Expr::Call(call) => {
             if call.func_name == "_+_" {
                 // CONCATENATION SUMS. Saturating, because an estimate that wrapped to a small
@@ -389,6 +410,19 @@ fn cardinality_bound(expression: &Expr, shape: InputShape) -> u64 {
         // A scalar is not a collection.
         Expr::Literal(_) | Expr::Unspecified => 0,
     }
+}
+
+/// The largest collection inside a map or struct literal's entries, both arms.
+fn entries_cardinality(entries: &[IdedEntryExpr], shape: InputShape) -> u64 {
+    entries
+        .iter()
+        .map(|entry| match &entry.expr {
+            EntryExpr::StructField(field) => cardinality_bound(&field.value.expr, shape),
+            EntryExpr::MapEntry(entry) => cardinality_bound(&entry.key.expr, shape)
+                .max(cardinality_bound(&entry.value.expr, shape)),
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The largest cardinality any comprehension in the expression actually iterates.
@@ -484,10 +518,23 @@ pub fn estimate_parsed_cost(expression: &Expr, shape: InputShape) -> u64 {
         return 1;
     }
 
-    // WHAT IS ACTUALLY ITERATED. See `cardinality_bound`: a maximum over source nodes was
-    // walked around by `groups + groups + ...`, which concatenates, so 40 copies of a
-    // declared 1,000 iterated 40,000 while the estimate said 1,000.
-    let n = largest_iterated_cardinality(expression, shape);
+    // THE DECLARED SHAPE IS A FLOOR, and dropping it was a regression this file introduced.
+    //
+    // `largest_iterated_cardinality` is a STRUCTURAL bound, and a structural bound can be
+    // driven DOWN by an indirection the walk does not follow. Measured by review:
+    // `[groups][0].all(a, [groups][0].all(b, [groups][0].all(c, c >= 0)))` is 66 characters,
+    // scored 1, was ADMITTED, and ran 153.65 SECONDS over an honest 1,000-element binding --
+    // while the same expression without the five added characters scored 10^12 and was
+    // refused. `[groups]` is a one-element list, and the `_[_]` index that pulls `groups` back
+    // out is an ordinary call, so the bound came out as 1.
+    //
+    // Taking the maximum with what the document DECLARED restores the property that no
+    // rewrite can push `n` below the input's own promise, while keeping everything the
+    // structural walk adds above it: `(groups + groups)` is max(1000, 2000) = 2000, and a
+    // 40,000-element literal under a declared 10 is max(10, 40000) = 40000.
+    let n = shape
+        .max_collection_size
+        .max(largest_iterated_cardinality(expression, shape));
     n.checked_pow(depth.saturating_add(1)).unwrap_or(u64::MAX)
 }
 
@@ -1291,6 +1338,81 @@ mod evaluation_tests {
             matches!(error, CostError::OverBudget { estimated, .. } if estimated == 40_000_u64.pow(2)),
             "spelling the same data as a concatenation must not lower the estimate: {error}"
         );
+    }
+
+    /// AN INDIRECTION MUST NOT LOWER THE ESTIMATE, which is the same property as the loop
+    /// test below, on the other axis.
+    ///
+    /// Measured by review against the version that dropped the declared floor:
+    /// `[groups][0].all(a, [groups][0].all(b, [groups][0].all(c, c >= 0)))` is 66 characters,
+    /// scored 1, was ADMITTED, and ran 153.65 seconds over a binding holding exactly the
+    /// declared 1,000. Removing the five added characters per reference scored 10^12 and was
+    /// refused. Five characters must not be worth twelve orders of magnitude.
+    #[test]
+    fn an_indirection_cannot_lower_the_estimate() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        let direct = estimate("groups.filter(g, g > 0).size()", shape);
+        for indirect in [
+            "[groups][0].filter(g, g > 0).size()",
+            "{'k': groups}['k'].filter(g, g > 0).size()",
+            "[[groups][0]][0].filter(g, g > 0).size()",
+            // THE ONE THAT NEEDS THE FLOOR, and the reason it is listed separately.
+            //
+            // The three above are all caught by the container recursion alone: the walk
+            // descends into the literal and finds `groups`. This one it cannot, because the
+            // container's members are the comprehension's OUTPUT rather than a literal, and
+            // `cardinality_bound(Comprehension)` reads only the iter_range -- which is
+            // `[1, 2, 3]`, three elements. Without the declared floor it scores single digits.
+            //
+            // Measured: mutating the floor away leaves the other three passing and only this
+            // one failing, which is why a fix needs a fixture the OTHER fix does not cover.
+            "[1, 2, 3].map(x, groups)[0].filter(g, g > 0).size()",
+        ] {
+            assert!(
+                estimate(indirect, shape) >= direct,
+                "`{indirect}` estimated below the direct form ({direct}); an indirection the \
+                 walk does not follow must not push the bound under what the input declared"
+            );
+        }
+    }
+
+    /// A LARGE LITERAL INSIDE A CONTAINER is still counted.
+    ///
+    /// The previous model recursed into container literals, with the comment "THE COUNT and
+    /// the recursion, because a large literal can hold a larger one". `cardinality_bound`'s
+    /// first version replaced that with the count alone and argued a nested collection is
+    /// bounded where it is iterated -- which is wrong, because the `_[_]` that descends from a
+    /// container to its member is an ordinary call and inherits the CONTAINER's bound.
+    ///
+    /// Measured: the bare 40,000-element literal was refused at 1,600,000,000, and the same
+    /// literal wrapped as `[ ... ][0]` scored 1, was admitted, and ran 20.76 seconds.
+    #[test]
+    fn a_large_literal_inside_a_container_is_still_counted() {
+        let literal = format!(
+            "[{}]",
+            (0..40_000)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let shape = InputShape {
+            max_collection_size: 10,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        for wrapped in [
+            format!("[{literal}][0].filter(g, g > 0).size()"),
+            format!("{{'k': {literal}}}['k'].filter(g, g > 0).size()"),
+        ] {
+            let error = compile_within_budget(&wrapped, shape, DEFAULT_COST_BUDGET)
+                .expect_err("40,000 elements, however they are wrapped");
+            assert!(
+                matches!(error, CostError::OverBudget { estimated, .. } if estimated == 40_000_u64.pow(2)),
+                "wrapping the literal in a container must not hide it: {error}"
+            );
+        }
     }
 
     /// Adding a loop around an expression must never LOWER its estimate.
