@@ -958,11 +958,32 @@ mod tests {
 
     /// Issue #114 criterion 7: hooks ship behind the maturity ladder's acknowledgment gate.
     ///
-    /// Eight sibling features each had one of these and `wasm-hooks` did not, which is the shape
-    /// this repository keeps producing: the mechanism is tested generically, so the specific
-    /// flag looks covered while nothing pins it. The generic tests would still pass if
-    /// `register_wasm_hooks` were changed to `Feature::supported`, which would turn every hook
-    /// route on by default in a deployment that never asked for an experiment.
+    /// Eight sibling features each had one of these and `wasm-hooks` did not.
+    ///
+    /// # What already pinned it, because "nothing pins it" would be false
+    ///
+    /// `docs/CONFIG.md`'s generated maturity ladder carries a `wasm-hooks` row naming its
+    /// maturity, its default and its ack version, and `scripts/config-schema.sh` fails the
+    /// gate when that file drifts from the registry. So a downgrade WOULD have been caught,
+    /// by regenerating the doc and failing a freshness check.
+    ///
+    /// What this adds is a different instrument rather than a missing one. The ladder row
+    /// pins three PROPERTIES of the registration; this pins the BEHAVIOUR they are supposed
+    /// to produce -- that boot refuses an enable carrying no ack, refuses one carrying the
+    /// wrong ack, and succeeds only on the exact revision read back out of the maturity
+    /// variant. A table cannot express "refuses to boot", and a doc-freshness failure tells
+    /// an author their documentation is stale, not that they removed a safety gate.
+    ///
+    /// # What it catches
+    ///
+    /// Measured: `Feature::preview(WASM_HOOKS_FEATURE, ..)` compiles cleanly and drops the
+    /// acknowledgment requirement entirely, and this test refuses it.
+    ///
+    /// `Feature::supported` is worth naming precisely, because an earlier version of this
+    /// comment said it "would turn every hook route on by default" and that is not what it
+    /// does: it takes `on_by_default` as an argument, so `supported(.., false)` drops only the
+    /// ack while `supported(.., true)` also flips the default. Both are refused here, for
+    /// different assertions.
     ///
     /// The ack matters more here than for most: a hook is a COMPILED ARTIFACT built against a
     /// WIT interface that may still move, so an operator enabling this is acknowledging which
