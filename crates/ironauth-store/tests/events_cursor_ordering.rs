@@ -1206,8 +1206,6 @@ async fn a_rotation_waiting_on_a_row_does_not_hold_the_append_lock() {
     let rotating = tokio::spawn({
         let store = store.clone();
         let env = env.clone();
-        let prior = prior.clone();
-        let actor = actor.clone();
         async move {
             store
                 .scoped(scope)
@@ -1255,4 +1253,104 @@ async fn a_rotation_waiting_on_a_row_does_not_hold_the_append_lock() {
         .await
         .expect("the rotation task finishes")
         .expect("the rotation succeeds once unblocked");
+}
+
+/// AN EVENT INSERT WAITING ON ITS FK PARENT MUST NOT BE HOLDING THE APPEND LOCK.
+///
+/// The invariant is that the append lock is the last lock a transaction takes, and the first
+/// version of it rested on a sentence that is false for any table with a foreign key: "an
+/// INSERT of a new row takes only that row's lock". `outbox_messages` references `tenants` and
+/// `environments`, so the very insert the lock guards fires an RI check taking `FOR KEY SHARE`
+/// on two EXISTING parent rows -- while the lock is already held. `audit_log` names the same
+/// pair, so the audit row appended after the closure does it too.
+///
+/// Review reproduced the cycle against a real migrated cluster:
+/// `ActingTenantRepo::delete_with_event` holds `FOR UPDATE` on every environment row of a
+/// tenant and reaches its own enqueue only afterwards, while a concurrent producer holds the
+/// advisory lock and blocks on the RI check. `ERROR: deadlock detected`.
+///
+/// # IGNORED, because it reproduces an OPEN defect rather than guarding a fixed one
+///
+/// The fix is to take the parents' KEY SHARE locks BEFORE the advisory one, and this role
+/// cannot: `tenants` and `environments` are granted to `ironauth_control` alone
+/// (`0003_management_api.sql:52-53`), so `SELECT ... FOR KEY SHARE` from the data plane is
+/// `permission denied for table tenants` -- measured, by writing exactly that fix and running
+/// this file. The RI check succeeds only because a referential-integrity trigger runs with the
+/// constraint owner's privileges rather than the caller's.
+///
+/// So closing it here means granting the internet-facing plane access to the tenant tables,
+/// which is the widening the plane split exists to prevent. It is left as a RUNNABLE
+/// reproduction rather than deleted: whoever implements the lock-free alternative on #1009
+/// should be able to un-ignore this and watch it pass, and until then it is the cheapest
+/// available demonstration that the current design has a cycle in it.
+///
+/// It fails today. That is the point.
+#[tokio::test]
+#[ignore = "reproduces #1009's open FK-ordering deadlock; the fix needs grants the data plane             deliberately lacks -- see the doc comment and the issue"]
+async fn an_event_insert_waiting_on_its_environment_row_does_not_hold_the_append_lock() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let key = appender_lock_key(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    );
+    let store = db.store().clone();
+
+    // Another session holds the ENVIRONMENT row in a mode that conflicts with the RI check's
+    // KEY SHARE, which is what `delete_with_event` does to every environment of a tenant.
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT id FROM environments WHERE id = $1 AND tenant_id = $2 FOR UPDATE")
+        .bind(scope.environment().to_string())
+        .bind(scope.tenant().to_string())
+        .fetch_one(&mut *holder)
+        .await
+        .expect("hold the environment row");
+
+    let envelope = valid_event_envelope(scope, "evt_fk_order");
+    let enqueue_env = env.clone();
+    let enqueueing = tokio::spawn(async move {
+        store
+            .scoped(scope)
+            .outbox()
+            .enqueue(
+                &enqueue_env,
+                &NewOutboxMessage {
+                    consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                    idempotency_key: "evt_fk_order",
+                    ordering_key: "k",
+                    payload: envelope,
+                },
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !enqueueing.is_finished(),
+        "the event insert must be BLOCKED on the environment row; if it finished, this test \
+         proves nothing about what it holds while waiting"
+    );
+
+    let mut probe = pool.begin().await.expect("begin probe");
+    let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *probe)
+        .await
+        .expect("probe the append lock");
+    assert!(
+        free,
+        "the event insert is holding the per-scope append lock while waiting for its own \
+         foreign-key parent. Any transaction that locks an environment row and then enqueues \
+         -- `delete_with_event` does exactly that -- now has a cycle with it. The parents' KEY \
+         SHARE locks must be taken BEFORE the advisory lock."
+    );
+    probe.rollback().await.expect("release the probe");
+
+    holder.commit().await.expect("release the environment row");
+    enqueueing
+        .await
+        .expect("the enqueue task finishes")
+        .expect("the enqueue succeeds once unblocked");
 }

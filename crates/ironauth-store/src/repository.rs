@@ -8412,6 +8412,18 @@ impl ActingUsageRepo<'_> {
         write_audited(
             spec,
             async |tx: &mut Transaction<'_, Postgres>| {
+                // THE IDEMPOTENCY WRITE FIRST, because it takes row locks and the append lock
+                // must be the last lock this transaction acquires.
+                //
+                // `insert_idempotency`'s first statement is an UNSCOPED prune --
+                // `DELETE FROM idempotency_keys WHERE expires_at <= now() ORDER BY expires_at
+                // LIMIT 100` -- so every concurrent idempotent writer in the deployment
+                // targets the same oldest rows. Running it while already holding the append
+                // lock is an ABBA cycle against any other idempotent write in the scope that
+                // pruned first and then wants the lock; review reproduced it. Moving it above
+                // the lock costs nothing: the prune and the key row are unrelated to the
+                // ordering the lock exists for.
+                insert_idempotency(tx, idempotency).await?;
                 // The same per-scope append lock `OutboxRepo::append_event` takes, so a
                 // publish orders against ordinary producers rather than racing them.
                 //
@@ -8430,7 +8442,6 @@ impl ActingUsageRepo<'_> {
                     .execute(&mut **tx)
                     .await?;
                 let id = enqueue_outbox_in_tx(tx, env, scope, message).await?;
-                insert_idempotency(tx, idempotency).await?;
                 Ok(id.to_string())
             },
             poison_after_audit,
@@ -22627,6 +22638,29 @@ async fn take_event_append_lock(
     if consumer != WEBHOOK_EVENT_CONSUMER {
         return Ok(());
     }
+    // THE FK PARENTS CANNOT BE PRE-LOCKED FROM HERE, and that is the finding rather than an
+    // omission.
+    //
+    // The invariant this lock needs is that it is the last lock the transaction takes, and an
+    // earlier version of that argument rested on a sentence which is false for any table with
+    // a foreign key: "an INSERT of a new row takes only that row's lock". `outbox_messages`
+    // references `tenants` and `environments`, so the insert this guards fires an RI check
+    // taking `FOR KEY SHARE` on two EXISTING parent rows while the advisory lock is held.
+    // `audit_log` names the same pair. Review reproduced the resulting cycle against a real
+    // migrated cluster: `ActingTenantRepo::delete_with_event` holds `FOR UPDATE` on every
+    // environment of a tenant and enqueues only afterwards.
+    //
+    // The fix for that ordering is to take the parents' KEY SHARE locks BEFORE the advisory
+    // one. THIS ROLE CANNOT: `tenants` and `environments` are granted to `ironauth_control`
+    // alone (0003:52-53), so a `SELECT ... FOR KEY SHARE` from the data plane is
+    // `permission denied for table tenants` -- measured, not predicted. The RI check itself
+    // succeeds only because a referential-integrity trigger runs with the constraint owner's
+    // privileges rather than the caller's.
+    //
+    // So the deadlock cannot be closed from here without granting the internet-facing plane
+    // access to the tenant tables, which is the widening the plane split exists to prevent.
+    // That is why #1009 stops at this design rather than patching it again: see the issue for
+    // the lock-free alternative.
     // Held until this transaction ends, by `pg_advisory_xact_lock`'s definition, so there is
     // no unlock path to leak on an error return.
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
