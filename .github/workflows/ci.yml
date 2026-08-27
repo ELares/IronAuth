@@ -589,6 +589,36 @@ jobs:
           path: target/hook-bench-measurement.json
           if-no-files-found: error
 
+  ts-hook-freshness:
+    name: TypeScript hook freshness (issue #114 criterion 1)
+    # The TypeScript sample's component is COMMITTED, not built by build.rs: building it needs
+    # Node and an npm install, and a build script has no business fetching from the network.
+    # The price of committing a build output is that it can drift from the source beside it,
+    # and this job is what stops that. It rebuilds from `src/` and runs the same integration
+    # tests against the rebuilt component, so a source change that was never rebuilt fails here
+    # rather than shipping a sample whose code and artifact disagree.
+    #
+    # A separate job rather than a step in the main suite because it is the only thing in this
+    # repository that needs Node, and putting a JavaScript toolchain in the critical path of
+    # the Rust tests would slow every run for a check that changes on the rare commits that
+    # touch this one directory.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # The tests load real components, so this crate's Rust guest fixtures must build too.
+        run: rustup target add wasm32-wasip2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+      - name: Rebuild the TypeScript hook and check it still behaves
+        # The script SKIPS with exit 0 when npm is absent, and says what it did not verify.
+        # Here npm is always present, so a skip on this runner would itself be the anomaly.
+        run: ./scripts/ts-hook-freshness.sh
+
   deny:
     name: cargo-deny (advisories, licenses, bans, sources)
     runs-on: ubuntu-latest

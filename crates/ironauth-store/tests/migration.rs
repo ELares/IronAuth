@@ -74,7 +74,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      backchannel approved requires grant, backchannel approved grant validated, \
      external issuer control grants, outbound messages, sealed message recipient, \
      message sending state, message suppressions, message resend count, \
-     declarative claim mappings, claim mappings data plane read, claim mapping delete grant, token hooks, token hooks delete grant, token hook failure policy, token hook versions.";
+     declarative claim mappings, claim mappings data plane read, claim mapping delete grant, token hooks, token hooks delete grant, token hook failure policy, token hook versions, \
+     token hook component bound.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {

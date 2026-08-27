@@ -1,0 +1,14 @@
+{
+  "name": "ironauth-hook-samples-ts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The TypeScript token.customize hook sample, issue #114 criterion 1.",
+  "scripts": {
+    "build": "tsc && node build.mjs"
+  },
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "0.18.5",
+    "typescript": "5.9.3"
+  }
+}
