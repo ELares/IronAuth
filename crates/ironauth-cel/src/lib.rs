@@ -365,6 +365,13 @@ fn cardinality_bound(expression: &Expr, shape: InputShape) -> u64 {
     let children = child_bounds(expression, shape);
     let within = children.iter().copied().max().unwrap_or(0);
     let own = match expression {
+        // THE MACRO'S OWN ACCUMULATOR IS NOT A BINDING. Every cel expander injects
+        // `@result` (`parser/macros.rs:76,127,174,232,292`), and scoring it as a declared
+        // collection makes the `@result + [x]` append SUM it once per part -- so counting all
+        // five comprehension parts above would over-refuse ordinary expressions on a name the
+        // author never wrote. No source identifier can begin with `@`, so this is exact
+        // rather than a heuristic.
+        Expr::Ident(name) if name.starts_with('@') => 0,
         // A binding, or a field read: whatever the input document declared.
         Expr::Ident(_) | Expr::Select(_) => shape.max_collection_size,
         // A literal: exactly what is written at this level.
@@ -439,10 +446,34 @@ fn entries_bounds(entries: &[IdedEntryExpr], shape: InputShape) -> Vec<u64> {
 /// Every comprehension is visited, not only the deepest, because the expensive one is not
 /// necessarily the most nested.
 fn largest_iterated_cardinality(expression: &Expr, shape: InputShape) -> u64 {
+    // EVERY PART, not just the iter_range.
+    //
+    // A comprehension re-materialises its body once per iteration, so a collection built in
+    // `loop_step` costs the same as one iterated directly -- and scored ZERO here, because
+    // this sampled `iter_range` alone. Measured: `groups.all(g, (groups + ... 40 copies)
+    // .size() > 0)` is 385 bytes, no literal anywhere, `groups` bound to exactly the declared
+    // 1,000, estimate 1,000,000 (0.1% of budget), ADMITTED, and it ran 24.15 SECONDS. The
+    // SAME concatenation moved into iter_range position is refused at 1,600,000,000.
+    //
+    // Forced through with an unlimited budget, the two invert: the refused spelling runs in
+    // 48.8 ms and the admitted one in 23.98 s. A model that refuses the cheap expression and
+    // admits the one 491x more expensive is not loose, it is backwards.
+    //
+    // This was also a REGRESSION rather than an unfixed gap. `origin/main` derived its
+    // cardinality from a whole-tree literal walk, so a 50,000-element literal in body position
+    // scored 2,500,000,000 and was refused there while scoring 1,000,000 here.
     let here = match expression {
-        Expr::Comprehension(comprehension) => {
-            cardinality_bound(&comprehension.iter_range.expr, shape)
-        }
+        Expr::Comprehension(comprehension) => [
+            &comprehension.iter_range,
+            &comprehension.accu_init,
+            &comprehension.loop_cond,
+            &comprehension.loop_step,
+            &comprehension.result,
+        ]
+        .into_iter()
+        .map(|part| cardinality_bound(&part.expr, shape))
+        .max()
+        .unwrap_or(0),
         _ => 0,
     };
     let within = match expression {
@@ -1474,6 +1505,53 @@ mod evaluation_tests {
             "doubling the map BODY's cardinality must raise the estimate ({plain} -> \
              {doubled}); the model read only the iter_range, which is unchanged at 1"
         );
+    }
+
+    /// A COLLECTION IN THE BODY costs what one in the `iter_range` costs.
+    ///
+    /// A comprehension re-materialises its body once per iteration, and this scored zero
+    /// because the walk sampled `iter_range` alone. Measured: `groups.all(g, (groups + ... 40
+    /// copies).size() > 0)` is 385 bytes with no literal anywhere, estimated 1,000,000, was
+    /// ADMITTED, and ran 24.15 seconds -- while the same concatenation in `iter_range` position
+    /// is refused at 1,600,000,000. Forced through with an unlimited budget the two invert:
+    /// the REFUSED spelling runs in 48.8 ms and the ADMITTED one in 23.98 s.
+    ///
+    /// Every other fixture in this file puts its collection in an `iter_range` or in a container
+    /// the `iter_range` walk descends into, which is why all 31 passed with this open.
+    #[test]
+    fn a_collection_in_a_comprehension_body_is_counted_like_one_it_iterates() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        let in_iter_range = estimate("(groups + groups).all(g, g != '')", shape);
+        let in_body = estimate("groups.all(g, (groups + groups).size() > 0)", shape);
+        assert!(
+            in_body >= in_iter_range,
+            "a concatenation in the BODY is rebuilt per iteration, so it cannot be cheaper \
+             than the same concatenation iterated directly ({in_body} < {in_iter_range})"
+        );
+    }
+
+    /// And the fix must not refuse ordinary expressions.
+    ///
+    /// Counting every comprehension part means the walk now meets the macro's own `@result`
+    /// accumulator, which every cel expander injects. Scoring that as a declared collection
+    /// would make the `@result + [x]` append SUM it and over-refuse a plain filter on a name
+    /// the author never wrote. This is the control for that.
+    #[test]
+    fn an_ordinary_comprehension_is_unaffected_by_the_body_walk() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        assert_eq!(
+            estimate("groups.filter(g, g != '').size()", shape),
+            1_000_u64.pow(2),
+            "a plain filter must still score n^2 on the declared size, not a multiple of it"
+        );
+        compile_within_budget("groups.all(g, g != '')", shape, DEFAULT_COST_BUDGET)
+            .expect("an ordinary all() stays admitted");
     }
 
     /// Adding a loop around an expression must never LOWER its estimate.
