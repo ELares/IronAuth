@@ -126,6 +126,22 @@ async fn deploy_read_delete_lifecycle_actually_persists() {
         "the removal announces itself too: {removed:?}"
     );
     assert_eq!(removed[0]["payload"]["client_id"], client);
+
+    // THE THIRD durable write, and the one nothing looked at. Swapping
+    // `Action::TokenHookDelete` for `TokenHookSet` in the store leaves the entire suite green,
+    // because the action reaches only the `audit_log` row and no test read it -- so an auditor
+    // asking "whose tokens STOPPED being shaped by code" would get the wrong answer and
+    // nothing would say so.
+    assert_eq!(
+        audit_targets(&harness, &tenant, &env, "token_hook.set").await,
+        vec![client.clone()],
+        "the deploy writes one audit row naming the client"
+    );
+    assert_eq!(
+        audit_targets(&harness, &tenant, &env, "token_hook.delete").await,
+        vec![client.clone()],
+        "and the removal writes its OWN action, not the deploy's"
+    );
 }
 
 /// The DATA plane can read a hook and cannot write or remove one.
@@ -164,11 +180,26 @@ async fn the_data_plane_reads_a_hook_and_cannot_change_one() {
     // And CANNOT change one. Raw statements on the data plane's pool, because the point is the
     // GRANT: privileges are checked before row-level security, so a missing grant is an ERROR
     // rather than an empty result, and only the error proves the split.
+    //
+    // ALL THREE WRITE VERBS. The doc above says "installing", which is INSERT, and the first
+    // version of this loop drove only DELETE and UPDATE -- so the one verb the prose named was
+    // the one verb nothing checked. The sibling grant test on `claims_mappings` records
+    // exactly that partial-verb gap as its own prior defect.
+    //
+    // Matched on SQLSTATE 42501 rather than on the message, because a widened INSERT grant
+    // would then be refused by row-level security instead ("new row violates row-level
+    // security policy"), and a substring match on "permission denied" would report the wrong
+    // reason for a real regression.
     for (what, sql) in [
         ("delete", "DELETE FROM token_hooks WHERE client_id = $1"),
         (
             "update",
             "UPDATE token_hooks SET payload_version = 99 WHERE client_id = $1",
+        ),
+        (
+            "insert",
+            "INSERT INTO token_hooks (tenant_id, environment_id, client_id, component, \
+             payload_version) VALUES ('t', 'e', $1, '\\x0061736d0d000100'::bytea, 1)",
         ),
     ] {
         let error = sqlx::query(sql)
@@ -176,11 +207,16 @@ async fn the_data_plane_reads_a_hook_and_cannot_change_one() {
             .execute(harness.db().app_pool())
             .await
             .expect_err("the data plane must not change a hook");
-        assert!(
-            error.to_string().contains("permission denied"),
-            "the {what} must be refused by the GRANT, not filtered by row-level security: a \
-             plane that could change the code shaping its own tokens could strip a \
-             security-relevant claim from every token it issues. Got: {error}"
+        let code = error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_default();
+        assert_eq!(
+            code, "42501",
+            "the {what} must be refused by the GRANT (SQLSTATE 42501), not by row-level \
+             security: a plane that could change the code shaping its own tokens could strip \
+             a security-relevant claim from every token it issues. Got: {error}"
         );
     }
 }
@@ -307,6 +343,14 @@ async fn an_absent_payload_version_is_this_apis_refusal() {
 
     // And at an ABSENT environment the same request is the uniform not-found, which is the
     // contract the extractor rejection was breaking.
+    //
+    // GENERATED, not a hand-written literal. The first version used
+    // `env_00000000000000000000000000`, whose body is 26 characters and therefore not a
+    // 16-byte id at all: it died in `parse_id` one line before `exists_in_any_state`, so the
+    // branch this comment names was never driven. A well-formed id that names nothing is what
+    // reaches the existence check.
+    let absent_environment =
+        ironauth_store::EnvironmentId::generate(&ironauth_env::Env::system()).to_string();
     let (status, _, body) = harness
         .put_bytes(
             &hook_path(&tenant, "env_00000000000000000000000000", &client),
@@ -365,4 +409,61 @@ async fn a_bad_payload_version_is_this_apis_refusal() {
         );
         assert_eq!(stored(&harness, &tenant, &env, &client).await, None);
     }
+}
+
+/// The audit targets this scope holds for `action`, oldest first.
+async fn audit_targets(
+    harness: &Harness,
+    tenant: &str,
+    environment: &str,
+    action: &str,
+) -> Vec<String> {
+    sqlx::query(
+        "SELECT target_id FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = $3 ORDER BY id",
+    )
+    .bind(tenant)
+    .bind(environment)
+    .bind(action)
+    .fetch_all(harness.db().owner_pool())
+    .await
+    .expect("read the audit log")
+    .iter()
+    .map(|row| row.get::<String, _>("target_id"))
+    .collect()
+}
+
+/// A REAL component, built by a compiler, is accepted -- and its first eight bytes are the
+/// preamble this crate hard-codes.
+///
+/// Everything else about that constant is self-referential: `COMPONENT_PREAMBLE` is checked
+/// against test inputs written by copying it, so a wrong constant would be a feature that
+/// rejects every genuine deploy while the whole suite stayed green. This is the only assertion
+/// in the tree that crosses it with an artifact a compiler actually produced --
+/// `ironauth_hooks::fixtures::GOOD` comes out of that crate's `build.rs`.
+#[tokio::test]
+async fn a_real_compiled_component_is_accepted() {
+    let component = ironauth_hooks::fixtures::GOOD;
+    assert!(
+        component.len() > 8,
+        "the fixture must be a real artifact, not a stub"
+    );
+
+    let harness = Harness::start(222).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let path = format!("{}?payload_version=1", hook_path(&tenant, &env, &client));
+
+    let (status, _, body) = harness.put_bytes(&path, component).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a component this project's own build produced must deploy; a 400 here means the \
+         hard-coded preamble is wrong and every real deploy is refused: {body}"
+    );
+    assert_eq!(
+        stored(&harness, &tenant, &env, &client).await,
+        Some((i32::try_from(component.len()).expect("fits"), 1))
+    );
 }

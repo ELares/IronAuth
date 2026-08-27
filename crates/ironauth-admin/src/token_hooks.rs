@@ -27,10 +27,16 @@
 //!
 //! Refused at the door: a payload version this build cannot honour, an empty or oversized
 //! component, and bytes that are not a WebAssembly COMPONENT. That last one earns its place --
-//! `cargo build --target wasm32-wasip2` and `cargo component build` produce artifacts that look
-//! equally like "a .wasm file", and a core module deployed by mistake is the most likely first
-//! failure. The preamble distinguishes them exactly: a core module's version word is
-//! `01 00 00 00` and a component's layer is `0d 00 01 00`.
+//! a core module and a component are both "a .wasm file" and neither the name nor the size
+//! tells them apart, so a module built for the wrong target or against the wrong world is the
+//! most likely first failure. The preamble distinguishes them exactly: a core module's version
+//! word is `01 00 00 00` and a component's layer is `0d 00 01 00`.
+//!
+//! An earlier version of the refusal told operators to use `cargo component build` instead of
+//! `cargo build`. That is WRONG in this repository: `crates/ironauth-hooks/build.rs` builds
+//! every shipped guest with plain `cargo build --target wasm32-wasip2` and gets components,
+//! because that target emits one for a crate with a WIT world. Advice contradicting the build
+//! the project actually runs sends an operator to change the thing that was already right.
 //!
 //! NOT validated here: that the component LINKS -- that its imports resolve against the host
 //! surface the sandbox offers. That needs a `wasmtime` engine, and this crate does not have one;
@@ -135,8 +141,13 @@ fn validate_component(component: &[u8]) -> Result<(), ApiError> {
         // NAMED SPECIFICALLY, because it is the mistake this check exists to catch and the two
         // artifacts are indistinguishable by filename. An operator who reads "not a component"
         // checks their bytes; one who reads "that is a core module" checks their build command.
-        return Err(ApiError::BadRequest("core_module_not_component: these bytes are a core WebAssembly module, not a component; build with \
-             `cargo component build --target wasm32-wasip2` rather than a plain cargo build".to_owned()));
+        return Err(ApiError::BadRequest(
+            "core_module_not_component: these bytes are a core WebAssembly module, not a \
+             component. A guest built against the hook WIT world compiles to one with \
+             `cargo build --target wasm32-wasip2`; a module means the target or the world is \
+             not what this expects."
+                .to_owned(),
+        ));
     }
     Err(ApiError::BadRequest(
         "invalid_component: these bytes are not WebAssembly: the component preamble is missing"
