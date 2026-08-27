@@ -7,11 +7,13 @@
 --
 -- # What this does NOT cover, said here because the obvious reading is wrong
 --
--- #113's `filter_hook_claims` says the per-client failure policy decides "whether a refusal is
--- fatal", meaning a hook that tried to write a PROTECTED claim. This column does not decide
--- that and cannot: the fence drops such a claim and reports it, `fence` has no error channel
--- back to the dispatch, and the invocation succeeds. So a protected-claim attempt is neither
--- fail-open nor fail-closed today -- it is dropped-and-logged, whatever this column says.
+-- A reader might expect this to govern a hook that tried to write a PROTECTED claim, because
+-- `filter_hook_claims` used to say a per-client failure policy decides "whether a refusal is
+-- fatal". It does not and cannot: the fence drops such a claim and reports it, `fence` has no
+-- error channel back to the dispatch, and the invocation succeeds. A protected-claim attempt
+-- is neither fail-open nor fail-closed -- it is dropped-and-logged, whatever this column says.
+-- That sentence has been corrected at its own site in the same change as this migration, so
+-- this paragraph describes a reading that is no longer written down anywhere.
 --
 -- This governs a hook that DID NOT COMPLETE: a trap, exhausted fuel, a passed deadline, a
 -- decline, or a component that will not load. Wiring the refusal path to it is a separate

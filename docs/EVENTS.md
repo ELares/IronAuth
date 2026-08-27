@@ -4359,13 +4359,6 @@ as a sentinel, so an absent one means absent.
       "minimum": 1,
       "type": "integer"
     },
-    "failure_policy": {
-      "enum": [
-        "fail_closed",
-        "fail_open"
-      ],
-      "type": "string"
-    },
     "payload_version": {
       "minimum": 0,
       "type": "integer"

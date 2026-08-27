@@ -2166,24 +2166,28 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // which is strictly more than a claim mapping does. It belongs on the stream a SIEM
         // watches for the same reason, with more force.
         //
-        // `failure_policy` IS PRESENT BUT NOT REQUIRED, and that is not an oversight.
+        // NO `failure_policy` ON THIS EVENT, and the reason is worth the paragraph because two
+        // successive attempts to add it were both wrong.
         //
-        // Making it required under an unchanged version is a BREAKING payload change, and
-        // `scripts/event-registry-compat.py` says exactly that: the first version of this
-        // change did, and the gate went red. The consequence is worse than a red build.
-        // Migration 0164 is `Phase::Expand` so a rolling upgrade can run, an OLD pod's
-        // `deployed_event` emits three fields, and a NEW pod's fan-out validates the envelope
-        // on CONSUME -- so every in-flight deploy event from the old pod would be refused
-        // permanently as `event_failed_catalog_validation`, with no retry and no delivery. The
-        // operator installs code into the token mint and every subscriber hears nothing.
+        // Review asked for it so a redeploy changing only the policy is distinguishable from
+        // the one before. Added as REQUIRED, it is a breaking change under an unchanged version
+        // and `scripts/event-registry-compat.py` goes red: during a rolling upgrade an OLD pod
+        // emits the three-field payload and a NEW pod's fan-out, which validates on CONSUME,
+        // refuses it permanently as `event_failed_catalog_validation`.
         //
-        // Bumping to version 2 does not help: `validate_event` keeps ONE live version per type
-        // and compares `declared != entry.payload_version`, so the same old envelopes become
-        // `VersionMismatch` instead -- equally permanent.
+        // Added as OPTIONAL, the gate passes and the SAME failure happens in the other
+        // direction. This schema is `additionalProperties: false`, so a NEW pod emitting the
+        // field and an OLD pod's outbox worker claiming that row -- nothing binds a message to
+        // the pod that produced it -- yields "additional field is not permitted", another
+        // permanent dead-letter, and explode fails before any per-endpoint delivery row exists
+        // so there is nothing for the replay endpoint to replay.
         //
-        // Optional-but-present is the additive shape. The producer always sets it, so every
-        // event a binary carrying this change mints has it, and `additionalProperties: false`
-        // still validates its value when it is there.
+        // Adding ANY property to a closed schema is therefore breaking for a consumer running
+        // the older registry, whatever the `required` list says. Doing it safely needs the
+        // consumer to tolerate unknown fields first, which is a change to every registered
+        // type rather than to this one. So the policy is not on the event: a consumer that
+        // needs it reads it from the management API, and losing every deploy notification
+        // during an upgrade window is a worse trade than a redeploy that looks identical.
         //
         // THE CLIENT AND THE SHAPE, never the component. An event is a notification, not a
         // binary store: the bytes are already durable in the row this points at, and putting
@@ -2198,8 +2202,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
             "properties": {
                 "client_id": {"type": "string", "minLength": 1},
                 "component_bytes": {"type": "integer", "minimum": 1},
-                "payload_version": {"type": "integer", "minimum": 0},
-                "failure_policy": {"type": "string", "enum": ["fail_closed", "fail_open"]}
+                "payload_version": {"type": "integer", "minimum": 0}
             },
             "required": ["client_id", "component_bytes", "payload_version"]
         }"#,

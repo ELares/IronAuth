@@ -246,7 +246,6 @@ pub async fn deploy_token_hook(
                 &client.to_string(),
                 body.len(),
                 payload_version,
-                failure_policy,
             )
             .as_ref()
             .map(crate::events::PendingEvent::domain_event)
@@ -379,7 +378,6 @@ fn deployed_event(
     client_id: &str,
     component_bytes: usize,
     payload_version: u32,
-    failure_policy: ironauth_store::HookFailurePolicy,
 ) -> Option<crate::events::PendingEvent> {
     let id = format!("evt_{}", CorrelationId::generate(state.env()));
     let envelope = ironauth_store::event_catalog::envelope(
@@ -392,10 +390,11 @@ fn deployed_event(
             "client_id": client_id,
             "component_bytes": component_bytes,
             "payload_version": payload_version,
-            // THE POLICY RIDES ALONG, because a redeploy that changes only it would otherwise
-            // emit an event byte-identical to the one before -- and flipping a client to
-            // fail-open is the change on this surface a consumer most needs to see.
-            "failure_policy": failure_policy.as_str(),
+            // NO POLICY HERE. A redeploy that changes only it therefore emits an event
+            // identical to the one before, which is a real gap -- and the smaller one. See
+            // `token_hook.deployed` in the event catalog: adding any property to a closed
+            // schema dead-letters the event on a consumer running the older registry, in one
+            // direction if it is required and the other if it is optional.
         }),
     )?;
     Some(crate::events::PendingEvent {

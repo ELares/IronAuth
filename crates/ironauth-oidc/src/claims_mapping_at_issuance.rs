@@ -223,9 +223,18 @@ pub fn as_claims(
 ///
 /// # Errors
 ///
-/// [`MappingFault`] from either half. A hook fault is not a separate outcome here because the
-/// caller does the same thing with both: refuse the issuance. See `token_hook`'s header for why
-/// a hook is fail-CLOSED where the enrichment beside it is fail-open.
+/// [`MappingFault`] from the mapping half always, and from the hook half only when the client's
+/// policy is `fail_closed` -- which is the default. Under `fail_open` a hook fault returns
+/// `Ok` with the hook's contribution simply absent.
+///
+/// So a successful return is NOT evidence the hook ran, and that matters more than it sounds:
+/// a hook's answer REPLACES the claim set, so one deployed to STRIP a claim, failing open,
+/// yields a token that still carries it. See `token_hook`'s header for why fail-closed is the
+/// default and what opting out means.
+///
+/// This contract said hook faults refuse unconditionally through the change that made them
+/// configurable. It is the seam every mint door reads, which is why the staleness is recorded
+/// rather than quietly overwritten.
 pub async fn apply_to_with_hook(
     store: &Store,
     runtime: Option<&std::sync::Arc<crate::token_hook::HookRuntime>>,
