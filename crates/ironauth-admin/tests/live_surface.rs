@@ -1808,6 +1808,21 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/applications/{client}/token-hook"),
         ),
+        // Hook VERSIONS (issue #114 criterion 5). The list is a read and answers an empty
+        // array for a client with no history, which is a complete answer rather than a
+        // not-found -- so unlike `getTokenHook` it needs no seeded row to be comparable.
+        Case::empty(
+            "token_hooks.listTokenHookVersions",
+            "GET",
+            format!("{base}/applications/{client}/token-hook/versions"),
+        ),
+        // The rollback names version 1, which the seeded hook in `Fixture::seed` created.
+        Case::json(
+            "token_hooks.rollbackTokenHook",
+            "POST",
+            format!("{base}/applications/{client}/token-hook/rollback"),
+            &serde_json::json!({ "version": 1 }),
+        ),
         Case::empty(
             "token_hooks.deleteTokenHook",
             "DELETE",

@@ -101,3 +101,22 @@ pub struct TokenHookMetadata {
     /// What the dispatch does when this hook does not complete.
     pub failure_policy: HookFailurePolicy,
 }
+
+/// One historical deploy of a client's hook (issue #114 criterion 5).
+///
+/// METADATA, never the component. A version list answers "what did I deploy and when", which a
+/// length and a timestamp answer; returning the bytes would make listing five versions a
+/// forty-megabyte response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenHookVersion {
+    /// Monotonic per client, starting at 1.
+    pub version: i32,
+    /// How many bytes that deploy's component was.
+    pub component_bytes: i32,
+    /// The payload version its guest was built against.
+    pub payload_version: i32,
+    /// The failure policy it was deployed with.
+    pub failure_policy: HookFailurePolicy,
+    /// When it was deployed, as epoch microseconds.
+    pub created_at_unix_micros: i64,
+}

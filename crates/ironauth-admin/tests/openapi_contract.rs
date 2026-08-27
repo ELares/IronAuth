@@ -254,6 +254,7 @@ fn operation_ids_are_the_stable_set() {
             "listStepUpPolicies",
             "listSubjectMappings",
             "listTenants",
+            "listTokenHookVersions",
             "listTraitSchemaVersions",
             "listUserConsents",
             "listUserIdentifiers",
@@ -293,6 +294,7 @@ fn operation_ids_are_the_stable_set() {
             "revokeUserConsent",
             "revokeUserPersonalAccessToken",
             "revokeUserSessions",
+            "rollbackTokenHook",
             "rotateOrganizationApiKey",
             "rotateServiceAccountApiKey",
             "rotateUserPersonalAccessToken",
@@ -558,6 +560,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
@@ -660,6 +663,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluation",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/admin/sudo/elevate",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/apply",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/plan",
@@ -846,7 +850,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        250,
+        252,
         "the documented route count is pinned"
     );
 

@@ -312,7 +312,7 @@ class Client:
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}", query, None)
 
     def delete_token_hook(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
-        """Remove a client's WASM token hook. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook."""
+        """Take a client's WASM token hook out of service. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook", query, None)
 
     def delete_user(self, tenant_id: str, environment_id: str, user_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
@@ -727,6 +727,10 @@ class Client:
         """List tenants (cursor paginated). GET /v1/tenants."""
         return self._do("GET", f"/v1/tenants", query, None)
 
+    def list_token_hook_versions(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List a client's most recent token-hook deploys, newest first. GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/versions", query, None)
+
     def list_trait_schema_versions(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List every trait-schema version of an environment (ascending by version). GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/trait-schemas", query, None)
@@ -882,6 +886,10 @@ class Client:
     def revoke_user_sessions(self, tenant_id: str, environment_id: str, user_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Revoke EVERYTHING for one user: every session, cascading to the user's refresh-token families in the SAME transaction. The `offline_access` families SURVIVE (issue #21's offline-survives-logout semantic) unless the explicit `hard_kill` flag is passed, which also revokes their grants so every already-issued access token dies immediately. POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/users/{urllib.parse.quote(user_id)}/sessions/revoke", query, body)
+
+    def rollback_token_hook(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Roll a client's token hook back to an earlier version. POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/rollback", query, body)
 
     def rotate_organization_api_key(self, tenant_id: str, environment_id: str, organization_id: str, key_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """rotateOrganizationApiKey. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate."""

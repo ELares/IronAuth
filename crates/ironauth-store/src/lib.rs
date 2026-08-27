@@ -324,15 +324,15 @@ pub use repository::{
     SessionRecord, SessionRepo, SessionRevocation, SessionSummary, SigningKeyMaterial,
     SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo, SignupQuarantineReason,
     SignupQuarantineRepo, SignupQuarantineState, SignupQuarantineView, SmsOtpRepo,
-    StoredIdempotentResponse, TenantRecord, TenantRepo, TenantStatus, TokenFormat, TokenKind,
-    TokenSizeEventRecord, TokenSizeEventsRepo, TokenSizeKind, TokenSizeReason, TokenStatus,
-    TotpActivateOutcome, TotpCredentialRepo, TotpCredentialSummary, TotpMaterial,
-    TotpVerifyOutcome, TraitJobKind, TraitJobStatus, TraitMigrationJob, TraitMigrationJobRepo,
-    TraitSchemaRepo, TraitSchemaVersion, TraitWriteVisibility, TrustedDeviceRepo,
-    TrustedDeviceRevokeReason, TrustedDeviceSummary, UnlinkOutcome, UpstreamToken,
-    UpstreamTokenGrantRecord, UpstreamTokenGrantRepo, UpstreamTokenMaterial, UsageTally,
-    UserAdminRecord, UserExportRecord, UserIdentifierRecord, UserIdentifierRepo, UserListFilter,
-    UserRecord, UserRepo, UserRevocation, UserState, WEBAUTHN_CHALLENGE_TTL_SECS,
+    StoredIdempotentResponse, TOKEN_HOOK_VERSION_RETENTION, TenantRecord, TenantRepo, TenantStatus,
+    TokenFormat, TokenKind, TokenSizeEventRecord, TokenSizeEventsRepo, TokenSizeKind,
+    TokenSizeReason, TokenStatus, TotpActivateOutcome, TotpCredentialRepo, TotpCredentialSummary,
+    TotpMaterial, TotpVerifyOutcome, TraitJobKind, TraitJobStatus, TraitMigrationJob,
+    TraitMigrationJobRepo, TraitSchemaRepo, TraitSchemaVersion, TraitWriteVisibility,
+    TrustedDeviceRepo, TrustedDeviceRevokeReason, TrustedDeviceSummary, UnlinkOutcome,
+    UpstreamToken, UpstreamTokenGrantRecord, UpstreamTokenGrantRepo, UpstreamTokenMaterial,
+    UsageTally, UserAdminRecord, UserExportRecord, UserIdentifierRecord, UserIdentifierRepo,
+    UserListFilter, UserRecord, UserRepo, UserRevocation, UserState, WEBAUTHN_CHALLENGE_TTL_SECS,
     WebauthnAssertionTarget, WebauthnCeremony, WebauthnChallengeRepo, WebauthnCredentialDescriptor,
     WebauthnCredentialOutcome, WebauthnCredentialRecord, WebauthnCredentialRepo,
     WebauthnFactorStrength, device_code_digest, invitation_token_digest, magic_link_binding_digest,
@@ -383,4 +383,4 @@ pub use trait_schema::{
     parse_transform,
 };
 
-pub use token_hook_store::{HookFailurePolicy, TokenHookMetadata};
+pub use token_hook_store::{HookFailurePolicy, TokenHookMetadata, TokenHookVersion};

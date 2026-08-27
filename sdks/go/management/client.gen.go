@@ -528,7 +528,7 @@ func (c *Client) DeleteTenant(tenant_id string, query url.Values) (*http.Respons
 
 // DeleteTokenHook performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook.
 //
-// Remove a client's WASM token hook.
+// Take a client's WASM token hook out of service.
 func (c *Client) DeleteTokenHook(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook", query, nil)
 }
@@ -1254,6 +1254,13 @@ func (c *Client) ListTenants(query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants", query, nil)
 }
 
+// ListTokenHookVersions performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions.
+//
+// List a client's most recent token-hook deploys, newest first.
+func (c *Client) ListTokenHookVersions(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/versions", query, nil)
+}
+
 // ListTraitSchemaVersions performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas.
 //
 // List every trait-schema version of an environment (ascending by version).
@@ -1525,6 +1532,13 @@ func (c *Client) RevokeUserPersonalAccessToken(tenant_id string, environment_id 
 // Revoke EVERYTHING for one user: every session, cascading to the user's refresh-token families in the SAME transaction. The `offline_access` families SURVIVE (issue #21's offline-survives-logout semantic) unless the explicit `hard_kill` flag is passed, which also revokes their grants so every already-issued access token dies immediately.
 func (c *Client) RevokeUserSessions(tenant_id string, environment_id string, user_id string, query url.Values, body any) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/users/" + escape(user_id) + "/sessions/revoke", query, body)
+}
+
+// RollbackTokenHook performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback.
+//
+// Roll a client's token hook back to an earlier version.
+func (c *Client) RollbackTokenHook(tenant_id string, environment_id string, client_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/rollback", query, body)
 }
 
 // RotateOrganizationApiKey performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate.

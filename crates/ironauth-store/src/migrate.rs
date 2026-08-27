@@ -1284,6 +1284,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0164_token_hook_failure_policy.sql"),
         },
+        Migration {
+            version: 165,
+            name: "token_hook_versions",
+            // EXPAND: a new table nothing older reads or writes.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0165_token_hook_versions.sql"),
+        },
     ]
 }
 

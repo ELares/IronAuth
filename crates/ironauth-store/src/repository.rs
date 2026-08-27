@@ -126,6 +126,7 @@ use crate::store::Store;
 use crate::token_hook_store::HookFailurePolicy;
 use crate::token_hook_store::TokenHookMetadata;
 use crate::token_hook_store::TokenHookRecord;
+use crate::token_hook_store::TokenHookVersion;
 use crate::trait_schema::{TraitSchema, TransformOp, ValidationFailure};
 
 /// A store bound to one `(tenant, environment)` scope. Hands out the per-kind
@@ -32476,10 +32477,238 @@ impl ActingTokenHookRepo<'_> {
                 .bind(failure_policy.as_str())
                 .execute(&mut **tx)
                 .await?;
+                // THE HISTORY ROW, in the SAME transaction as the active one. A deploy that
+                // landed without its version, or a version without its deploy, is a rollback
+                // target that never ran or a running hook nobody can roll back from.
+                //
+                // The number is `MAX(version) + 1` for this client, read inside the
+                // transaction, and what serialises it is the UPSERT ABOVE.
+                //
+                // That upsert takes the row lock on (tenant, environment, client), so a second
+                // deploy of the same client blocks there; `begin_scoped` pins READ COMMITTED,
+                // so when it proceeds its next statement takes a fresh snapshot that already
+                // sees the winner's committed history row and computes the next number.
+                // Review ran the race on a real cluster: two staggered deploys produced 1 and
+                // 2, then 3 and 4, with no duplicate-key error in either round.
+                //
+                // SO THE INVARIANT IS THAT THE UPSERT STAYS FIRST IN THIS CLOSURE. An earlier
+                // version of this comment credited a per-scope append lock -- which
+                // `write_audited` does not take; that term means the advisory lock, and only
+                // `publish_snapshot_inner` and `append_event` take it -- and credited the
+                // PRIMARY KEY, which is a backstop the race never reaches. Naming the wrong
+                // mechanism is how a later reorder ships believing it is covered.
+                sqlx::query(
+                    "INSERT INTO token_hook_versions \
+                     (tenant_id, environment_id, client_id, version, component, \
+                      payload_version, failure_policy) \
+                     SELECT $1, $2, $3, \
+                            COALESCE(MAX(version), 0) + 1, $4, $5, $6 \
+                     FROM token_hook_versions \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&bytes)
+                .bind(payload_version)
+                .bind(failure_policy.as_str())
+                .execute(&mut **tx)
+                .await?;
+                // PRUNE TO THE NEWEST FEW, in the same transaction as the insert that grew it.
+                //
+                // A component may be eight megabytes and nothing else deletes these rows, so a
+                // client redeployed a thousand times would hold eight gigabytes of history --
+                // and a rollback target a hundred deploys back is not one anybody reaches for.
+                //
+                // Keyed on the VERSION NUMBER rather than on age: "the last twenty deploys" is
+                // what an operator rolling back is thinking about, and a time window would
+                // discard the whole history of a client that had not deployed in a while,
+                // which is exactly the client whose last-known-good matters most.
+                sqlx::query(
+                    "DELETE FROM token_hook_versions \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                       AND version <= ( \
+                           SELECT MAX(version) FROM token_hook_versions \
+                           WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                       ) - $4",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(TOKEN_HOOK_VERSION_RETENTION)
+                .execute(&mut **tx)
+                .await?;
                 enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
+        )
+        .await
+    }
+
+    /// This client's most recent hook deploys, newest first (issue #114 criterion 5).
+    ///
+    /// NOT every deploy, and this is the sentence the retraction in the admin handler came
+    /// from: the prune below caps the history at [`TOKEN_HOOK_VERSION_RETENTION`], so an older
+    /// version may have existed and been discarded. Correcting the claim at the HTTP layer and
+    /// leaving it standing here is how the next caller of this method re-publishes it.
+    ///
+    /// METADATA only: `octet_length` rather than the component, because a version list answers
+    /// "what did I deploy and when" and returning five components would be a forty-megabyte
+    /// response to that question.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope; [`StoreError::Database`] on a
+    /// persistence fault.
+    pub async fn versions(
+        &self,
+        env: &Env,
+        client: &ClientId,
+    ) -> Result<Vec<TokenHookVersion>, StoreError> {
+        let _ = env;
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT version, octet_length(component) AS component_bytes, payload_version, \
+             failure_policy, (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM token_hook_versions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+             ORDER BY version DESC",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                Ok(TokenHookVersion {
+                    version: row.get("version"),
+                    component_bytes: row.get::<i32, _>("component_bytes"),
+                    payload_version: row.get("payload_version"),
+                    failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                    created_at_unix_micros: row.get("created_us"),
+                })
+            })
+            .collect()
+    }
+
+    /// Roll a client's hook back to an earlier version, audited as `token_hook.set`.
+    ///
+    /// A rollback is a DEPLOY of an older component, which is why it takes the ordinary write
+    /// path and appends a new version of its own rather than rewinding a pointer. Two
+    /// consequences worth stating: the dispatch needs no second code path -- it reads the
+    /// active row it always read -- and a version number never means two different components,
+    /// so rolling back to v2 and then forward again leaves v4 and v5 recording both.
+    ///
+    /// The history is APPEND-ON-DEPLOY AND PRUNED, not append-only: this appends, and the
+    /// prune in [`Self::set_with_event`] then drops anything past
+    /// [`TOKEN_HOOK_VERSION_RETENTION`]. A rollback therefore consumes a retention slot.
+    ///
+    /// # Two consequences of that, and the no-op below covers only one
+    ///
+    /// A REPEATED rollback is inert. The target already equals the active row, so the no-op
+    /// returns before writing and twenty retries cost nothing. That is what makes this
+    /// endpoint safe without an `Idempotency-Key`.
+    ///
+    /// A FIRST rollback TO THE OLDEST SURVIVING VERSION prunes its own target, and the no-op
+    /// cannot help: it fires only when the target is already running, and the whole reason to
+    /// roll back is that it is not. So the write succeeds, the component is restored, the
+    /// version it came from is gone, and a retry of that exact request answers 404. The
+    /// component is still reachable -- it is the newest version now -- under its new number.
+    ///
+    /// This is stated rather than fixed. Keeping the target would mean the prune spares a row
+    /// the retention says to drop, so the bound would hold for deploys and not for rollbacks,
+    /// and "twenty" would silently mean twenty-one for some clients. An earlier version of
+    /// this paragraph pointed at the no-op as though it covered this case; it does not, and
+    /// naming the wrong mechanism is what round 2 of this PR was fixing one comment above.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope or `version` is not one this
+    /// client has; [`StoreError::Database`] on a persistence fault.
+    pub async fn rollback_to(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        version: i32,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut read = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT component, payload_version, failure_policy FROM token_hook_versions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND version = $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client.to_string())
+        .bind(version)
+        .fetch_optional(&mut *read)
+        .await?;
+        // THE ACTIVE ROW, read in the SAME transaction as the target, so the comparison below
+        // is against one consistent picture rather than two reads a concurrent deploy can slip
+        // between.
+        let active = sqlx::query(
+            "SELECT component, payload_version, failure_policy FROM token_hooks \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client.to_string())
+        .fetch_optional(&mut *read)
+        .await?;
+        read.commit().await?;
+        // NOT FOUND rather than a silent no-op, for the reason the delete gives: reporting
+        // success for a version this client never had tells an operator their rollback took
+        // effect, and turns the endpoint into a probe for how many versions exist.
+        let Some(row) = row else {
+            return Err(StoreError::NotFound);
+        };
+        let component: Vec<u8> = row.get("component");
+        let payload_version: i32 = row.get("payload_version");
+        let failure_policy = failure_policy_from_row(row.get("failure_policy"))?;
+
+        // A ROLLBACK THAT CHANGES NOTHING WRITES NOTHING.
+        //
+        // Without this, rolling back to the version that is already running still appends a
+        // version and still prunes -- so a client retrying a rollback it already completed
+        // (a timeout, a lost response, an operator clicking twice) SPENDS THE HISTORY: twenty
+        // retries of a successful rollback leave twenty identical versions and delete every
+        // real one. This endpoint takes no `Idempotency-Key`, unlike the create-shaped POSTs
+        // on this surface, and the reason is that a rollback names a version rather than
+        // minting an identity; that only holds if replaying one is genuinely inert, which is
+        // what this makes true.
+        //
+        // Compared on the FULL COMPONENT, not on its length: two different hooks of equal size
+        // are the case a byte count cannot tell apart, and it is the case that matters.
+        if let Some(active) = active {
+            let active_component: Vec<u8> = active.get("component");
+            let active_payload_version: i32 = active.get("payload_version");
+            let active_failure_policy = failure_policy_from_row(active.get("failure_policy"))?;
+            if active_component == component
+                && active_payload_version == payload_version
+                && active_failure_policy == failure_policy
+            {
+                return Ok(());
+            }
+        }
+
+        self.set_with_event(
+            env,
+            client,
+            &component,
+            payload_version,
+            failure_policy,
+            event,
         )
         .await
     }
@@ -32549,6 +32778,18 @@ impl ActingTokenHookRepo<'_> {
         .await
     }
 }
+
+/// How many deploys of one client's hook are kept.
+///
+/// Twenty, which is a policy number rather than a derived one, so here is the reasoning: a
+/// rollback answers "what did this look like before the change that broke it", and the change
+/// that broke it is one of the last few. Twenty covers a bad week of iteration and bounds the
+/// storage at twenty times the eight-megabyte component ceiling per client.
+///
+/// The pruning is by version number, not by age. A time window would discard the entire history
+/// of a client that had not deployed in months -- which is precisely the client whose
+/// last-known-good version matters most when something finally does change.
+pub const TOKEN_HOOK_VERSION_RETENTION: i32 = 20;
 
 /// Read a stored `failure_policy`, refusing a value no dispatch could honour.
 ///

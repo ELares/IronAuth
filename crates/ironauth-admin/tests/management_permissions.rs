@@ -186,6 +186,8 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("deployTokenHook", ManagementPermission::WriteConfig),
     ("deleteTokenHook", ManagementPermission::WriteConfig),
     ("getTokenHook", ManagementPermission::Read),
+    ("listTokenHookVersions", ManagementPermission::Read),
+    ("rollbackTokenHook", ManagementPermission::WriteConfig),
     // User sub-surfaces: identifiers, trait schemas, signup quarantine and recovery
     // approvals. Identifier UNIQUENESS and trait schemas are config rather than user
     // authority, because each changes a rule the whole environment obeys.
@@ -621,6 +623,12 @@ const PERMISSION_PROVEN: &[&str] = &[
     "deployTokenHook",
     "deleteTokenHook",
     "getTokenHook",
+    // Proven in `read_is_required_and_sufficient_for_listing_token_hook_versions` and
+    // `write_config_is_required_and_sufficient_for_a_token_hook_rollback`, both directions
+    // each. The rollback is classified with the DEPLOY rather than the read because it is one:
+    // it changes what every token this client is issued carries.
+    "listTokenHookVersions",
+    "rollbackTokenHook",
     // Proven in `read_is_required_and_sufficient_for_the_event_feed_and_usage_export`, in
     // BOTH directions: a `write_config` credential is refused and a `read` one is allowed,
     // so neither a blanket refusal nor a missing gate would pass it.
@@ -769,12 +777,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        189,
+        191,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        45,
+        47,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

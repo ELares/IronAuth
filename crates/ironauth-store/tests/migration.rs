@@ -74,7 +74,7 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      backchannel approved requires grant, backchannel approved grant validated, \
      external issuer control grants, outbound messages, sealed message recipient, \
      message sending state, message suppressions, message resend count, \
-     declarative claim mappings, claim mappings data plane read, claim mapping delete grant, token hooks, token hooks delete grant, token hook failure policy.";
+     declarative claim mappings, claim mappings data plane read, claim mapping delete grant, token hooks, token hooks delete grant, token hook failure policy, token hook versions.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -705,7 +705,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        164,
+        165,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -745,7 +745,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
             126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
             143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
-            160, 161, 162, 163, 164
+            160, 161, 162, 163, 164, 165
         ]
     );
     let phase_of = |version: i64| async move {
@@ -8372,4 +8372,66 @@ async fn the_control_plane_holds_exactly_the_federation_grants_0153_adds() {
              result cannot be what satisfied the control-plane assertion above"
         );
     }
+}
+
+/// THE VERSION HISTORY'S TIMESTAMP IS READ AT THE INSERT, NOT AT THE TRANSACTION'S START.
+///
+/// Migration 0165 spends nine lines justifying `clock_timestamp()` over `now()`: the version
+/// NUMBERS are ordered by the `token_hooks` row lock, so a losing transaction gets a higher
+/// number while it BEGAN earlier, and `now()` is `transaction_timestamp()`. With `now()` the
+/// history publishes a higher version carrying an earlier timestamp, and
+/// `created_at_unix_micros` is what an operator reads to choose a rollback target.
+///
+/// Nothing observed that. The only timestamp assertion in the feature is a 2020-2100 window,
+/// which both functions satisfy, so the fix could be reverted with the whole suite green --
+/// and a fix is the least-reviewed code in any change.
+///
+/// This reads the DEFAULT OFF THE REAL COLUMN and then evaluates it twice inside ONE
+/// transaction. That is the discriminator and it is exact: `now()` is defined to return the
+/// same value for every call in a transaction, and `clock_timestamp()` is defined not to. The
+/// expression comes from the catalog rather than from a literal here, so the test cannot pass
+/// against a default that is no longer the column's.
+#[tokio::test]
+async fn the_version_timestamp_advances_within_a_transaction() {
+    let db = TestDatabase::start().await;
+
+    let default_expression: String = sqlx::query_scalar(
+        "SELECT pg_get_expr(d.adbin, d.adrelid) \
+         FROM pg_attrdef d \
+         JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
+         WHERE d.adrelid = 'token_hook_versions'::regclass AND a.attname = 'created_at'",
+    )
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("token_hook_versions.created_at must have a default");
+
+    // Two evaluations of the column's own default, in one transaction, with a real pause
+    // between them. `pg_sleep` rather than two adjacent calls, because two calls a microsecond
+    // apart can land on the same clock tick and the difference this asserts would then be a
+    // race rather than a property.
+    // As an epoch float, so the test needs no date type and the comparison is a number.
+    let sample = format!("SELECT EXTRACT(EPOCH FROM ({default_expression}))::float8");
+    let mut tx = db.owner_pool().begin().await.expect("begin");
+    let first: f64 = sqlx::query_scalar(&sample)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("first");
+    sqlx::query("SELECT pg_sleep(0.05)")
+        .execute(&mut *tx)
+        .await
+        .expect("pause");
+    let second: f64 = sqlx::query_scalar(&sample)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("second");
+    tx.commit().await.expect("commit");
+
+    assert!(
+        second > first,
+        "`token_hook_versions.created_at` defaults to `{default_expression}`, which returned \
+         the SAME instant twice in one transaction ({first} then {second}). That is `now()` \
+         behaviour: it stamps when the transaction began, so the losing side of the deploy \
+         race gets the higher version number and the earlier timestamp. 0165 requires \
+         clock_timestamp()."
+    );
 }

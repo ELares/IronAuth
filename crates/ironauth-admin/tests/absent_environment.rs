@@ -603,6 +603,12 @@ fn claims_mapping_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/applications/{client}/token-hook"),
             body: None,
         },
+        Case {
+            label: "token_hooks.rollbackTokenHook",
+            method: "POST",
+            path: format!("{base}/applications/{client}/token-hook/rollback"),
+            body: Some(body_of(&serde_json::json!({ "version": 1 }))),
+        },
     ]
 }
 

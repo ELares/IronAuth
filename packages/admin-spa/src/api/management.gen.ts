@@ -323,8 +323,79 @@ export interface paths {
         /** Deploy (create or replace) a client's WASM token hook. */
         put: operations["deployTokenHook"];
         post?: never;
-        /** Remove a client's WASM token hook. */
+        /**
+         * Take a client's WASM token hook out of service.
+         * @description # It is no longer a deletion, and this PR is what changed that
+         *
+         *     Before the version history, removing the row destroyed the component: there was one copy
+         *     and this deleted it. Now the deploy that installed it also wrote a history row, and nothing
+         *     here touches that table -- the prune runs on a DEPLOY, so a client that never deploys again
+         *     keeps the withdrawn bytes indefinitely.
+         *
+         *     So the surface answers three things about the same client, and they are all true:
+         *     `getTokenHook` is 404, `listTokenHookVersions` lists the withdrawn hook, and
+         *     `rollbackTokenHook` re-installs its exact bytes. No endpoint erases the history.
+         *
+         *     That is the right default -- the break-glass case is "this hook is failing logins, take it
+         *     out", and an operator doing that at 3am should not also be discarding the ability to put it
+         *     back -- but it means this is a WITHDRAWAL rather than an erasure, and an operator removing a
+         *     hook because its bytes should not exist any more is not served by it. Said here and in the
+         *     204's description because the old name promised something this no longer does.
+         */
         delete: operations["deleteTokenHook"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Roll a client's token hook back to an earlier version.
+         * @description A rollback is a DEPLOY of an older component, not a rewind: it appends a new version whose
+         *     bytes are the named one's. So the number an operator asked for is not the number that ends
+         *     up active, and the response reports what is RUNNING rather than echoing the request.
+         *
+         *     # Why it takes no `Idempotency-Key`
+         *
+         *     Unlike the create-shaped POSTs on this surface, which mint an identity a replay must not
+         *     mint twice. This names an existing version, and the store makes a rollback to what is
+         *     already running write nothing -- so a retry after a lost response is inert rather than a
+         *     second deploy that spends a slot of the capped history. That inertness is the whole
+         *     justification, and it is asserted in `a_repeated_rollback_writes_no_second_version`.
+         */
+        post: operations["rollbackTokenHook"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a client's most recent token-hook deploys, newest first.
+         * @description NOT every deploy. The history is pruned to `TOKEN_HOOK_VERSION_RETENTION` on each write,
+         *     so this returns at most that many and an older version may have existed and been discarded.
+         *     Said here because "every deploy" is what this used to claim, and an operator who reads a
+         *     list of twenty as complete will conclude a version they remember was never deployed.
+         */
+        get: operations["listTokenHookVersions"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -6831,6 +6902,22 @@ export interface components {
             /** @description The signal name. */
             name: string;
         };
+        /** @description The body of a token-hook rollback (issue #114 criterion 5). */
+        RollbackTokenHookRequest: {
+            /**
+             * Format: int32
+             * @description The version whose component to deploy again.
+             *
+             *     It must be one still IN THE HISTORY, which is not the same as one this client has
+             *     deployed: the history is capped, so a number read from an older listing may since have
+             *     been pruned and now answers 404. List the versions and take the number from that
+             *     response rather than from a record of what was deployed.
+             *
+             *     Note that the version that becomes active is a NEW one carrying this version's
+             *     component, not this number: a rollback is a deploy, not a rewind.
+             */
+            version: number;
+        };
         /** @description A page of routing rules. */
         RoutingRuleListView: {
             /** @description Every rule in this environment, by evaluation priority. */
@@ -7599,6 +7686,36 @@ export interface components {
              *     here.
              */
             status: string;
+        };
+        /**
+         * @description One historical deploy of a client's hook (issue #114 criterion 5).
+         *
+         *     METADATA, never the component -- the same reason `TokenHookView` withholds it, multiplied
+         *     by however many versions exist.
+         */
+        TokenHookVersionView: {
+            /**
+             * Format: int32
+             * @description How many bytes that deploy's component was.
+             */
+            component_bytes: number;
+            /**
+             * Format: int64
+             * @description When it was deployed, as epoch microseconds.
+             */
+            created_at_unix_micros: number;
+            /** @description The failure policy it was deployed with. */
+            failure_policy: string;
+            /**
+             * Format: int32
+             * @description The payload version its guest was built against.
+             */
+            payload_version: number;
+            /**
+             * Format: int32
+             * @description Monotonic per client, starting at 1.
+             */
+            version: number;
         };
         /**
          * @description A deployed WASM token hook, as an operator reads it back (issue #114).
@@ -10009,7 +10126,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Removed */
+            /** @description Removed from service. The version HISTORY is kept, so the withdrawn component is still listed by listTokenHookVersions and can be re-installed by rollbackTokenHook; no endpoint erases it */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -10035,6 +10152,127 @@ export interface operations {
                 };
             };
             /** @description Environment not found, malformed client id, or no hook deployed */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    rollbackTokenHook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RollbackTokenHookRequest"];
+            };
+        };
+        responses: {
+            /** @description Rolled back. A NEW version carrying that component is now active, because a rollback is a deploy of an older component rather than a rewind; the response reports what is running. Rolling back to what is already running writes nothing and is safe to retry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookView"];
+                };
+            };
+            /** @description An unreadable body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed client id, or no such version. A version that existed can become no-such-version: the history is capped, so a number read from an older listing may since have been pruned */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listTokenHookVersions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The most recent deploys, newest first. At most 20: the history is capped, so an older version may have existed and been pruned */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookVersionView"][];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or malformed client id */
             404: {
                 headers: {
                     [name: string]: unknown;
