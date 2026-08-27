@@ -1721,13 +1721,18 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/applications/{client}/claims-mapping"),
             &serde_json::json!({ "rules": [] }),
         ),
-        // WASM token hooks (issue #114), the same per-client shape. The body is a REAL
-        // component preamble rather than a placeholder, and it has to be: the deploy runs
-        // before the delete in this sweep, so a body the deploy refuses leaves nothing to
-        // remove and `deleteTokenHook` answers the uniform not-found at a LIVE environment --
-        // which makes driving it at a soft-deleted one measure nothing. `payload_version` is
-        // in the query because the extractor requires it, and an extractor rejection would
-        // answer a different question than the environment one.
+        // WASM token hooks (issue #114), the same per-client shape.
+        //
+        // The body is a REAL component preamble. It is no longer load-bearing for the DELETE --
+        // `Fixture::seed` writes a hook into both environments, for the reason the claim
+        // mapping's seed gives -- but a body the deploy refuses would make this case measure
+        // the component check rather than the environment fence, which is not what the sweep
+        // asks. An earlier version of this comment claimed the seed's job as its own.
+        //
+        // `payload_version` rides in the query because the deploy takes one. It no longer has
+        // to: the parameter is `Option`al precisely so an absent one is refused behind the
+        // gates rather than by the extractor. Kept because a case should send a well-formed
+        // request, and `a_bad_payload_version_is_this_apis_refusal` covers the other side.
         Case {
             label: "token_hooks.deployTokenHook",
             method: "PUT",

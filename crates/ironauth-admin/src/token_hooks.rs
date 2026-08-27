@@ -186,11 +186,15 @@ pub async fn deploy_token_hook(
     // THE VERSION FIRST, because it is the cheapest refusal and the one whose message is most
     // actionable: a guest built against another revision of the WIT interface cannot be run by
     // this build at all, and saying so beats letting it deploy and fail at the first login.
-    // PARSED HERE rather than by the extractor, so a malformed value is this API's 400 with an
-    // `ErrorBody` instead of axum's plain-text one -- and so it happens AFTER the permission
-    // check rather than before it, which is what stops it being an unauthenticated probe for
-    // the parameter's type.
-    let payload_version: u32 = query.payload_version.parse().map_err(|_| {
+    // BOTH the absent and the malformed case, parsed here rather than by the extractor, so
+    // each is this API's 400 with an `ErrorBody` instead of axum's plain-text one and each
+    // happens AFTER the permission, privilege and environment gates. Typing the field
+    // `Option<String>` is what makes the absent case reachable at all: as a bare `String` it
+    // failed inside `Query<T>`, before any of them.
+    let raw = query.payload_version.as_deref().ok_or_else(|| {
+        ApiError::BadRequest("unknown_payload_version: payload_version is required".to_owned())
+    })?;
+    let payload_version: u32 = raw.parse().map_err(|_| {
         ApiError::BadRequest(
             "unknown_payload_version: payload_version must be a non-negative integer".to_owned(),
         )
@@ -431,18 +435,32 @@ mod tests {
         );
     }
 
-    /// Empty is refused before the database's own non-empty CHECK sees it.
+    /// Empty is refused before the database's own non-empty CHECK sees it, WITH the message
+    /// that names the mistake.
+    ///
+    /// Asserting only `is_err()` was vacuous: `<[u8]>::starts_with` is false whenever the
+    /// needle is longer than the slice, so deleting the empty-body branch entirely leaves an
+    /// empty body falling through both preamble arms to the generic "not WebAssembly" error --
+    /// still an `Err`, still green, and the operator is told their bytes are malformed rather
+    /// than that they sent none. Naming the branch is what makes the test able to fail.
     #[test]
-    fn an_empty_body_is_refused() {
-        assert!(validate_component(b"").is_err());
+    fn an_empty_body_is_refused_as_an_empty_body() {
+        let error = validate_component(b"").expect_err("an empty body is not a component");
+        assert!(
+            format!("{error:?}").contains("the request body is empty"),
+            "the refusal must name the empty body, not report it as malformed wasm: {error:?}"
+        );
     }
 
-    /// The size bound agrees with the table's CHECK, and is exclusive at the boundary in the
-    /// same direction.
+    /// The bound is INCLUSIVE at the boundary and exclusive one byte past it.
+    ///
+    /// That is all this test establishes. It reads `MAX_COMPONENT_BYTES` and never reads the
+    /// migration, so it would pass with this constant and the table's CHECK both wrong in the
+    /// same direction; the cross-check is `a_component_at_the_documented_bound_is_stored` in
+    /// `tests/token_hooks.rs`, which puts exactly this many bytes through the real handler
+    /// into the real table.
     #[test]
-    fn an_oversized_component_is_refused_before_the_database_sees_it() {
-        // 8388608 is what `token_hooks_component_bounded` permits, so the same size must pass
-        // here or the two disagree and a legal deploy becomes a 400.
+    fn the_size_bound_is_inclusive_at_the_boundary() {
         let mut at_bound = vec![0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
         at_bound.resize(MAX_COMPONENT_BYTES, 0);
         assert!(

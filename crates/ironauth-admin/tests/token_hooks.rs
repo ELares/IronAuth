@@ -82,6 +82,26 @@ async fn deploy_read_delete_lifecycle_actually_persists() {
         "the deploy must store the component it was given"
     );
 
+    // THE SECOND durable write. `set_with_event` takes `Option<&DomainEvent>` and silently
+    // does nothing when the builder returns `None` -- which it does for any type the catalog
+    // does not know -- so a deploy that announces nothing is indistinguishable from one that
+    // announces correctly unless the outbox is read.
+    let announced = events_of(&harness, &tenant, &env, "token_hook.deployed").await;
+    assert_eq!(
+        announced.len(),
+        1,
+        "the deploy announces itself once: {announced:?}"
+    );
+    assert_eq!(
+        announced[0]["payload"]["client_id"], client,
+        "the event names the client whose tokens are now shaped by code"
+    );
+    assert_eq!(announced[0]["payload"]["component_bytes"], 8);
+    assert!(
+        announced[0]["payload"].get("component").is_none(),
+        "the component must never ride on the event: {announced:?}"
+    );
+
     let (status, _, body) = harness.get(&path).await;
     assert_eq!(status, StatusCode::OK, "get: {body}");
     assert!(
@@ -98,6 +118,94 @@ async fn deploy_read_delete_lifecycle_actually_persists() {
     );
     let (status, _, _) = harness.get(&path).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "the hook is gone");
+
+    let removed = events_of(&harness, &tenant, &env, "token_hook.deleted").await;
+    assert_eq!(
+        removed.len(),
+        1,
+        "the removal announces itself too: {removed:?}"
+    );
+    assert_eq!(removed[0]["payload"]["client_id"], client);
+}
+
+/// The DATA plane can read a hook and cannot write or remove one.
+///
+/// Migration 0163 widens `ironauth_control` and argues at length for the split it preserves,
+/// and nothing tested it: `token_hooks` is named in zero store tests, so the grant that keeps
+/// the token-minting plane from installing the code that shapes its own tokens rested entirely
+/// on the migration being read correctly. A grant is exactly the kind of thing a later
+/// migration widens by accident.
+#[tokio::test]
+async fn the_data_plane_reads_a_hook_and_cannot_change_one() {
+    let harness = Harness::start(221).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let path = format!("{}?payload_version=1", hook_path(&tenant, &env, &client));
+    let (status, _, _) = harness.put_bytes(&path, COMPONENT).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // READS, through the data plane's own store -- the path the issuance dispatch takes. It
+    // goes through `begin_scoped`, which sets the scope GUCs the row-level-security policy
+    // reads; a raw pool query returns nothing for want of them, which would look like a
+    // refused grant and is a different fact entirely.
+    let readable = harness
+        .store()
+        .scoped(scope)
+        .token_hooks()
+        .get(&client)
+        .await
+        .expect("the data plane may read a hook");
+    assert!(
+        readable.is_some(),
+        "the issuance path must be able to read the hook it is going to run"
+    );
+
+    // And CANNOT change one. Raw statements on the data plane's pool, because the point is the
+    // GRANT: privileges are checked before row-level security, so a missing grant is an ERROR
+    // rather than an empty result, and only the error proves the split.
+    for (what, sql) in [
+        ("delete", "DELETE FROM token_hooks WHERE client_id = $1"),
+        (
+            "update",
+            "UPDATE token_hooks SET payload_version = 99 WHERE client_id = $1",
+        ),
+    ] {
+        let error = sqlx::query(sql)
+            .bind(&client)
+            .execute(harness.db().app_pool())
+            .await
+            .expect_err("the data plane must not change a hook");
+        assert!(
+            error.to_string().contains("permission denied"),
+            "the {what} must be refused by the GRANT, not filtered by row-level security: a \
+             plane that could change the code shaping its own tokens could strip a \
+             security-relevant claim from every token it issues. Got: {error}"
+        );
+    }
+}
+
+/// Every event this surface emits, newest last, as parsed envelopes.
+async fn events_of(
+    harness: &Harness,
+    tenant: &str,
+    environment: &str,
+    event_type: &str,
+) -> Vec<serde_json::Value> {
+    sqlx::query(
+        "SELECT payload FROM outbox_messages \
+         WHERE tenant_id = $1 AND environment_id = $2 AND payload->>'type' = $3 \
+         ORDER BY sequence",
+    )
+    .bind(tenant)
+    .bind(environment)
+    .bind(event_type)
+    .fetch_all(harness.db().owner_pool())
+    .await
+    .expect("read the outbox")
+    .iter()
+    .map(|row| row.get::<serde_json::Value, _>("payload"))
+    .collect()
 }
 
 /// A REDEPLOY replaces in place rather than accumulating rows.
@@ -167,6 +275,48 @@ async fn a_component_at_the_documented_bound_is_stored() {
     assert!(
         body.contains("component_too_large"),
         "named refusal: {body}"
+    );
+}
+
+/// An ABSENT `payload_version` is this API's refusal too, not the framework's.
+///
+/// This is the half a bare `String` left behind. A malformed value was parsed in the handler
+/// and refused properly, but an absent one still failed inside `Query<T>` -- axum's plain-text
+/// 400, no `ErrorBody`, raised before `require_permission`, `require_fresh_privilege` and
+/// `require_live_environment`, so a request with no query string answered that instead of the
+/// uniform not-found this surface owes at an absent environment. The field is an `Option` now.
+///
+/// It lives here rather than in `absent_environment.rs` because that sweep permits exactly one
+/// case per documented operation, and the shape of the refusal is what matters anyway.
+#[tokio::test]
+async fn an_absent_payload_version_is_this_apis_refusal() {
+    let harness = Harness::start(220).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+
+    let (status, _, body) = harness
+        .put_bytes(&hook_path(&tenant, &env, &client), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no query string: {body}");
+    assert!(
+        body.contains("unknown_payload_version"),
+        "an absent version must be this API's named refusal with an ErrorBody, not axum's \
+         plain-text extractor rejection: {body}"
+    );
+
+    // And at an ABSENT environment the same request is the uniform not-found, which is the
+    // contract the extractor rejection was breaking.
+    let (status, _, body) = harness
+        .put_bytes(
+            &hook_path(&tenant, "env_00000000000000000000000000", &client),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an absent environment answers the uniform not-found even with no query string: {body}"
     );
 }
 

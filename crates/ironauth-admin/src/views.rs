@@ -1949,17 +1949,25 @@ pub struct TokenHookView {
 /// against another revision of the WIT interface and fail it at the first login instead, which
 /// is the failure this parameter exists to move to deploy time.
 ///
-/// # Why it is a `String` and not a `u32`
+/// # Why it is an `Option<String>` and not a `u32`
 ///
-/// Typed as `u32`, `?payload_version=banana` is an axum EXTRACTOR rejection: a plain-text 400
-/// that does not carry `ErrorBody`, does not name the parameter in this API's vocabulary, and
-/// is produced before the handler -- so it is also before the permission check, which makes it
-/// an unauthenticated probe for the parameter's type. Parsing it in the handler makes every
-/// refusal on this route one shape.
+/// So that EVERY refusal on this route has one shape. Typed `u32`, `?payload_version=banana`
+/// is an axum extractor rejection: a plain-text 400 carrying no `ErrorBody`, produced before
+/// the handler and therefore before `require_permission`, `require_fresh_privilege` and
+/// `require_live_environment`. A bare `String` fixed the malformed case and left the ABSENT
+/// one, which fails inside `Query<T>` exactly the same way -- so a request with no query
+/// string answered a plain-text 400 where the surface's uniform not-found was owed. The
+/// `Option` is what moves both behind the gates; the parameter is still required on the wire
+/// and still `required: true` in the published document.
+///
+/// NOT an authorization concern, and an earlier version of this comment said it was. `Principal`
+/// is a `FromRequestParts` extractor declared before `Query`, so a credential-less request is
+/// refused 401 before either -- which `served_routes_match_documented_routes` proves for every
+/// documented route, this one included.
 #[derive(Debug, Clone, serde::Deserialize, utoipa::IntoParams)]
 pub struct DeployTokenHookQuery {
     /// The token-customize payload version the guest was built against.
-    pub payload_version: String,
+    pub payload_version: Option<String>,
 }
 
 /// The body to create a new version of a custom journey (issue #92, PR 5).

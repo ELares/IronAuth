@@ -736,7 +736,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 186 operations declare a required permission and 42 have that permission proven. The other
+/// 189 operations declare a required permission and 45 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -751,7 +751,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// without somebody editing this assertion and noticing what they are doing.
 ///
 /// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 186 minus 42 is always 144. (It read "166 minus 22", then "171 minus 27", while
+/// its own: 189 minus 45 is always 144. (It read "166 minus 22", then "171 minus 27", while
 /// the pins above it moved twice without it, which is the hazard of writing an arithmetic
 /// identity beside the numbers it derives from rather than deriving it. Both operands are
 /// pinned by the two `assert_eq!`s in the test below; if you change either, change this
