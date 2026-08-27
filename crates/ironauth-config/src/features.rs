@@ -956,6 +956,76 @@ mod tests {
         );
     }
 
+    /// Issue #114 criterion 7: hooks ship behind the maturity ladder's acknowledgment gate.
+    ///
+    /// Eight sibling features each had one of these and `wasm-hooks` did not.
+    ///
+    /// # What already pinned it, because "nothing pins it" would be false
+    ///
+    /// `docs/CONFIG.md`'s generated maturity ladder carries a `wasm-hooks` row naming its
+    /// maturity, its default and its ack version, and `scripts/config-schema.sh` fails the
+    /// gate when that file drifts from the registry. So a downgrade WOULD have been caught,
+    /// by regenerating the doc and failing a freshness check.
+    ///
+    /// What this adds is a different instrument rather than a missing one. The ladder row
+    /// pins three PROPERTIES of the registration; this pins the BEHAVIOUR they are supposed
+    /// to produce -- that boot refuses an enable carrying no ack, refuses one carrying the
+    /// wrong ack, and succeeds only on the exact revision read back out of the maturity
+    /// variant. A table cannot express "refuses to boot", and a doc-freshness failure tells
+    /// an author their documentation is stale, not that they removed a safety gate.
+    ///
+    /// # What it catches
+    ///
+    /// Measured: `Feature::preview(WASM_HOOKS_FEATURE, ..)` compiles cleanly and drops the
+    /// acknowledgment requirement entirely, and this test refuses it.
+    ///
+    /// `Feature::supported` is worth naming precisely, because an earlier version of this
+    /// comment said it "would turn every hook route on by default" and that is not what it
+    /// does: it takes `on_by_default` as an argument, so `supported(.., false)` drops only the
+    /// ack while `supported(.., true)` also flips the default. Both are refused here, for
+    /// different assertions.
+    ///
+    /// The ack matters more here than for most: a hook is a COMPILED ARTIFACT built against a
+    /// WIT interface that may still move, so an operator enabling this is acknowledging which
+    /// revision their guests were compiled for.
+    #[test]
+    fn wasm_hooks_is_experimental_and_off_by_default() {
+        let registry = FeatureRegistry::builtin();
+        let feature = registry
+            .get(WASM_HOOKS_FEATURE)
+            .expect("wasm-hooks is registered");
+        assert!(matches!(feature.maturity(), Maturity::Experimental { .. }));
+        assert!(!feature.default_enabled());
+
+        let absent = config_with_features("");
+        registry.validate(&absent).expect("absent is fine");
+        assert!(
+            !registry.is_enabled(&absent, WASM_HOOKS_FEATURE),
+            "a deployment that has not asked for hooks never reads `token_hooks`"
+        );
+
+        let no_ack = config_with_features("\"wasm-hooks\" = { enabled = true }");
+        registry
+            .validate(&no_ack)
+            .expect_err("an experimental feature enabled without an ack must refuse to boot");
+
+        let wrong_ack =
+            config_with_features("\"wasm-hooks\" = { enabled = true, ack = \"0.0.0\" }");
+        registry.validate(&wrong_ack).expect_err(
+            "a mismatched ack must refuse to boot: the guest was built against one \
+                         revision of the WIT interface and the ack names which",
+        );
+
+        let Maturity::Experimental { version, .. } = feature.maturity() else {
+            panic!("asserted experimental above")
+        };
+        let acked = config_with_features(&format!(
+            "\"wasm-hooks\" = {{ enabled = true, ack = \"{version}\" }}"
+        ));
+        registry.validate(&acked).expect("the exact ack boots");
+        assert!(registry.is_enabled(&acked, WASM_HOOKS_FEATURE));
+    }
+
     #[test]
     fn fedcm_is_experimental_and_off_by_default() {
         // Issue #83 ships the FedCM surface behind a default-off experimental flag:
