@@ -4359,6 +4359,13 @@ as a sentinel, so an absent one means absent.
       "minimum": 1,
       "type": "integer"
     },
+    "failure_policy": {
+      "enum": [
+        "fail_closed",
+        "fail_open"
+      ],
+      "type": "string"
+    },
     "payload_version": {
       "minimum": 0,
       "type": "integer"
@@ -4367,7 +4374,8 @@ as a sentinel, so an absent one means absent.
   "required": [
     "client_id",
     "component_bytes",
-    "payload_version"
+    "payload_version",
+    "failure_policy"
   ],
   "type": "object"
 }
@@ -4381,7 +4389,8 @@ as a sentinel, so an absent one means absent.
 {
   "client_id": "client_id_example",
   "component_bytes": 1,
-  "payload_version": 1
+  "payload_version": 1,
+  "failure_policy": "failure_policy_example"
 }
 ```
 

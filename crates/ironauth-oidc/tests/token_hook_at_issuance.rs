@@ -1218,39 +1218,66 @@ async fn a_declining_hook_is_skipped_when_the_policy_is_fail_open() {
         .await
         .expect("fail-open mints the token even though the hook declined");
 
-    // AND THE HOOK'S CONTRIBUTION IS ABSENT, which is the half that matters. A token that
-    // succeeded but silently carried the hook's claims anyway would mean the dispatch ran it
-    // after all, and a token is not evidence of a policy unless what it lacks is checked.
-    let claims = claims(&access);
-    assert!(
-        claims.get("tier").is_none(),
-        "fail-open mints WITHOUT the hook's contribution; a `tier` here means the hook ran: \
-         {claims:?}"
+    // COMPARED AGAINST AN UNHOOKED ISSUANCE, because asserting the absence of `tier` alone is
+    // vacuous: DECLINER never produces one, so that assertion passes whatever the dispatch
+    // does. What fail-open actually promises is that the token is the one the client would
+    // have got with no hook at all, and that is only checkable against that token.
+    let unhooked = harness_with_hooks().await;
+    let (baseline, _) = exchange(&unhooked)
+        .await
+        .expect("an unhooked client issues normally");
+
+    let shaped = claims(&access);
+    let plain = claims(&baseline);
+    let shaped_names: std::collections::BTreeSet<&String> = shaped.keys().collect();
+    let plain_names: std::collections::BTreeSet<&String> = plain.keys().collect();
+    assert_eq!(
+        shaped_names, plain_names,
+        "fail-open must mint the token the client would have got with NO hook deployed; a \
+         difference here means the failed hook shaped it anyway"
     );
 }
 
-/// The DEFAULT is fail-closed, and it is the stored default rather than a handler's choice.
+/// A row written WITHOUT the column reads back as fail-closed.
 ///
-/// `a_hook_that_declines_fails_the_issuance` proves the behaviour; this proves nobody has to
-/// ask for it. A deploy that names no policy must read back as fail-closed, because the
-/// dangerous setting is the one an operator should have to type.
+/// The COLUMN default, not the Rust one. An earlier version of this test deployed through
+/// `set`, which binds `FailClosed` explicitly, so it re-read a value its own write path had
+/// just supplied and would have passed with the column defaulted to `fail_open`.
+///
+/// The column default is what governs rows an OLD binary writes during a rolling upgrade --
+/// 0164 is `Phase::Expand` precisely so one can -- and an old binary names no policy at all.
+/// That is the case this pins, by inserting the way an old binary would.
 #[tokio::test]
-async fn a_deploy_that_names_no_policy_is_fail_closed() {
+async fn a_row_written_without_the_column_reads_back_fail_closed() {
     let harness = harness_with_hooks().await;
-    deploy(&harness, ironauth_hooks::fixtures::GOOD, 1).await;
+    let client = harness.client_id().to_string();
+
+    // The INSERT an old binary emits: no `failure_policy` anywhere in it.
+    sqlx::query(
+        "INSERT INTO token_hooks (tenant_id, environment_id, client_id, component, \
+         payload_version) VALUES ($1, $2, $3, $4, 1)",
+    )
+    .bind(harness.scope().tenant().to_string())
+    .bind(harness.scope().environment().to_string())
+    .bind(&client)
+    .bind(ironauth_hooks::fixtures::GOOD)
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("insert the way a binary predating the column would");
 
     let record = harness
         .db()
         .store()
         .scoped(harness.scope())
         .token_hooks()
-        .get(&harness.client_id().to_string())
+        .get(&client)
         .await
         .expect("read the hook")
         .expect("a hook is deployed");
     assert_eq!(
         record.failure_policy,
         ironauth_store::HookFailurePolicy::FailClosed,
-        "a deploy that names no policy must store the safe one"
+        "a row that names no policy must read as the safe one, or a rolling upgrade silently \
+         opts every pre-existing hook into fail-open"
     );
 }

@@ -21,7 +21,7 @@
 //! It runs on the hook's output and not on its input, which is the direction that matters:
 //! what a hook READS is the mint's business, what it WRITES is the token's.
 //!
-//! # Every failure is fail-CLOSED, and that is the opposite of the enrichment beside it
+//! # Failure is fail-CLOSED BY DEFAULT, and that is the opposite of the enrichment beside it
 //!
 //! `merge_enriched_claims` is deliberately fail-open: an FGA that is down costs a deployment
 //! some claims and never a login. A hook is not an enrichment for the same reason a mapping is
@@ -31,6 +31,16 @@
 //! And there is a second reason that applies only here. A hook that traps, exhausts its fuel or
 //! passes its deadline is code behaving in a way its author did not intend. Continuing past that
 //! with a half-shaped token means issuing a credential whose shape nobody chose.
+//!
+//! Both of those are why fail-closed is the DEFAULT. They are not why it is the only option:
+//! issue #114 criterion 3 asks that an abort apply "the configured failure policy", and
+//! `token_hooks.failure_policy` is that configuration. An operator who knows their hook only
+//! ADDS claims can select `fail_open` per client, and the two arguments above are exactly what
+//! they are taking responsibility for -- which is why the dangerous setting is the one they
+//! have to type, and why the absence of a policy means the safe one.
+//!
+//! An earlier version of this section stated fail-closed as an invariant rather than a
+//! default, and it stayed that way through the change that made it configurable.
 //!
 //! # Compilation is CACHED, and that is what makes the criterion true
 //!
@@ -291,12 +301,24 @@ pub struct Invocation<'a> {
 
 /// Read, compile and run this client's hook, returning what it contributed.
 ///
-/// [`None`] when the client has no hook deployed, which is every client until an operator
-/// deploys one. That is distinct from a hook that ran and returned nothing.
+/// [`None`] carries THREE meanings, and a caller that needs to tell them apart cannot:
+///
+/// - the client has no hook deployed, which is every client until an operator deploys one;
+/// - a hook ran and contributed nothing;
+/// - a hook FAULTED and the client's policy is `fail_open`, so the token is minted without it.
+///
+/// The third is new, and it is the one worth naming: the caller at
+/// `claims_mapping_at_issuance` collapses all three into the same branch, which is correct --
+/// it has nothing to add in any of them -- but it means "the token was issued" is not evidence
+/// the hook ran. The fault is logged at ERROR where it happened, which is where an operator
+/// finds out.
 ///
 /// # Errors
 ///
-/// [`HookFault`] on any failure. Every one fails the issuance; see the module header.
+/// [`HookFault`] when the client's policy is `fail_closed` (the default), which refuses the
+/// issuance. Under `fail_open` the same faults return `Ok(None)` instead. A failure to READ
+/// the hook row is unconditionally an error, because the policy is a column on the row that
+/// did not load.
 pub async fn run(
     store: &Store,
     runtime: &HookRuntime,

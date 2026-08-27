@@ -1,10 +1,21 @@
 -- SPDX-License-Identifier: MIT OR Apache-2.0
 --
--- The per-client hook FAILURE POLICY (issue #114 criterion 3, and the policy #113's
--- `filter_hook_claims` already documents itself as deferring to).
+-- The per-client hook FAILURE POLICY (issue #114 criterion 3).
 --
 -- Criterion 3 asks that a fuel or deadline abort applies "the configured failure policy". The
 -- dispatch had no policy to configure: every fault refused the issuance, unconditionally.
+--
+-- # What this does NOT cover, said here because the obvious reading is wrong
+--
+-- #113's `filter_hook_claims` says the per-client failure policy decides "whether a refusal is
+-- fatal", meaning a hook that tried to write a PROTECTED claim. This column does not decide
+-- that and cannot: the fence drops such a claim and reports it, `fence` has no error channel
+-- back to the dispatch, and the invocation succeeds. So a protected-claim attempt is neither
+-- fail-open nor fail-closed today -- it is dropped-and-logged, whatever this column says.
+--
+-- This governs a hook that DID NOT COMPLETE: a trap, exhausted fuel, a passed deadline, a
+-- decline, or a component that will not load. Wiring the refusal path to it is a separate
+-- change, because it needs an error channel out of the fence that does not exist yet.
 --
 -- # Why the default is fail-closed, and why fail-open has to be opt-in per client
 --

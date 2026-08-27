@@ -2728,6 +2728,13 @@
             "minimum": 1,
             "type": "integer"
           },
+          "failure_policy": {
+            "enum": [
+              "fail_closed",
+              "fail_open"
+            ],
+            "type": "string"
+          },
           "payload_version": {
             "minimum": 0,
             "type": "integer"
@@ -2736,7 +2743,8 @@
         "required": [
           "client_id",
           "component_bytes",
-          "payload_version"
+          "payload_version",
+          "failure_policy"
         ],
         "type": "object"
       },

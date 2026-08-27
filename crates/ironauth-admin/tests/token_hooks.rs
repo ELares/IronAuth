@@ -97,6 +97,10 @@ async fn deploy_read_delete_lifecycle_actually_persists() {
         "the event names the client whose tokens are now shaped by code"
     );
     assert_eq!(announced[0]["payload"]["component_bytes"], 8);
+    // THE POLICY IS ON THE EVENT, so a redeploy that changes only it is distinguishable from
+    // the deploy before. Flipping a client to fail-open is the change on this surface a
+    // consumer most needs to see, and without this the two events are byte-identical.
+    assert_eq!(announced[0]["payload"]["failure_policy"], "fail_closed");
     assert!(
         announced[0]["payload"].get("component").is_none(),
         "the component must never ride on the event: {announced:?}"

@@ -2179,9 +2179,12 @@ const REGISTERED: &[(&str, u32, &str)] = &[
             "properties": {
                 "client_id": {"type": "string", "minLength": 1},
                 "component_bytes": {"type": "integer", "minimum": 1},
-                "payload_version": {"type": "integer", "minimum": 0}
+                "payload_version": {"type": "integer", "minimum": 0},
+                "failure_policy": {"type": "string", "enum": ["fail_closed", "fail_open"]}
             },
-            "required": ["client_id", "component_bytes", "payload_version"]
+            "required": [
+                "client_id", "component_bytes", "payload_version", "failure_policy"
+            ]
         }"#,
     ),
     (
