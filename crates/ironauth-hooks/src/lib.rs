@@ -66,6 +66,14 @@ pub mod fixtures {
     /// means the dispatch did not run, rather than that the fence did its job.
     pub const GOOD: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_GOOD"));
 
+    /// A hook that imports `wasi:sockets`, which the sandbox does not link.
+    ///
+    /// The sandbox suite runs it directly to show the capability being refused. It is exported
+    /// here so the DISPATCH can be tested against an unloadable component too: a refusal that
+    /// the dispatch does not remember is one it pays a full cranelift compile for on every
+    /// request, which is a different defect from the sandbox failing to refuse.
+    pub const NET_ESCAPE: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_NET_ESCAPE"));
+
     /// A hook that spins until its fuel runs out.
     pub const FUEL_BOMB: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_FUEL_BOMB"));
 

@@ -113,7 +113,13 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 # logic cannot read a clock outside the seam that makes it testable, and a benchmark target is
 # not protocol logic -- it is not compiled into the server, and threading an `Env` into it would
 # add a dependency for no property gained. Still zero exemptions on a request path.
-scan time-via-env 'SystemTime::now|Instant::now' 11
+# 11 -> 12: `token_hook.rs`'s `a_remembered_refusal_is_recalled_rather_than_recompiled`.
+# Whether the second load RECOMPILED or read the cache is a claim about elapsed time and
+# nothing else -- a compile is tens of milliseconds, a map lookup is microseconds, and the
+# assertion sits two orders of magnitude between them. Reading the frozen Clock seam there
+# would report zero for both and make the distinction unmeasurable, which is the one case
+# this rule is not protecting. It is a unit test in the lib, not a request path.
+scan time-via-env 'SystemTime::now|Instant::now' 12
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.

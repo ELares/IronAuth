@@ -29,7 +29,7 @@
 //! Sharing a store between two token issuances would let one hook's consumption bound the
 //! other's, which is a cross-tenant coupling disguised as an optimization.
 
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, InstancePre, Linker};
 use wasmtime::{Config, Engine, Store};
 
 use crate::{HookError, Limits, Sandbox};
@@ -46,10 +46,26 @@ wasmtime::component::bindgen!({
 // the collision to a single line that a reader can see for what it is.
 use exports::ironauth::hooks::token_customize as wit_hook;
 
-/// A compiled-code cache and the configuration every hook runs under.
+/// A compiled-code cache, the configuration every hook runs under, and the linked host surface.
+///
+/// # The linker is built ONCE, and that is the warm-path budget
+///
+/// `Sandbox::link` registers the whole host surface a guest may import: the io resource
+/// plumbing, the bounded poll, the streams, and the frozen monotonic clock in all four of its
+/// functions. That is dozens of host function registrations and it does not depend on the guest.
+///
+/// It used to run inside `customize`, so EVERY invocation rebuilt the entire linker before
+/// instantiating. Criterion 4 bounds a warm invocation at 100 microseconds and CI measured 83.7,
+/// 135.8, 169.9 and 168.2 across four runs -- a bound the system passed one run in four. Most of
+/// that was this.
 #[derive(Clone)]
 pub struct HookEngine {
     engine: Engine,
+    /// Shared because `HookEngine` is `Clone` and a `Linker` is not cheap to duplicate. It is
+    /// immutable after construction: nothing adds to the host surface at runtime, which is what
+    /// makes sharing it safe and what makes `deny by default` a property of this type rather
+    /// than of each call.
+    linker: std::sync::Arc<Linker<Sandbox>>,
 }
 
 impl HookEngine {
@@ -68,8 +84,17 @@ impl HookEngine {
         // hooks can be stopped is not something to leave to a deployment to remember.
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        let engine = Engine::new(&config).map_err(HookError::from_engine)?;
+        let mut linker: Linker<Sandbox> = Linker::new(&engine);
+        // NOT `from_instantiate`. That classifier answers "a hook asked for a capability it was
+        // not granted", which is a statement about a GUEST -- and there is no guest here. This
+        // is the host failing to register its own surface, which is a broken build or a
+        // wasmtime version skew, and reporting it as a capability refusal would send an
+        // operator looking at a hook that does not exist yet.
+        Sandbox::link(&mut linker).map_err(HookError::from_engine)?;
         Ok(Self {
-            engine: Engine::new(&config).map_err(HookError::from_engine)?,
+            engine,
+            linker: std::sync::Arc::new(linker),
         })
     }
 
@@ -96,10 +121,32 @@ impl HookEngine {
     ///
     /// # Errors
     ///
-    /// If the bytes are not a valid component, or if compilation fails.
+    /// If the bytes are not a valid component, or if compilation fails -- and now also if the
+    /// component imports something the host surface does not offer, which is
+    /// [`AbortKind::Unlinkable`](crate::AbortKind::Unlinkable) and used to surface at the first
+    /// invocation instead. That is a DEPLOY-time property of the artifact, so it belongs here;
+    /// a caller that caches loaded hooks should cache this refusal too, or it recompiles an
+    /// unloadable component on every request.
     pub fn load(&self, wasm: &[u8]) -> Result<LoadedHook, HookError> {
+        let component = Component::new(&self.engine, wasm).map_err(HookError::from_load)?;
+        self.prepare(&component)
+    }
+
+    /// Resolve a compiled component's imports against the host surface.
+    ///
+    /// The shared half of [`Self::load`] and [`Self::load_precompiled`], so both produce a hook
+    /// whose imports are already matched and neither can accidentally skip it.
+    ///
+    /// # Errors
+    ///
+    /// If the component imports something the sandbox does not offer. That is a DEPLOY-time
+    /// error now, where it used to surface on the first login that ran the hook.
+    fn prepare(&self, component: &Component) -> Result<LoadedHook, HookError> {
         Ok(LoadedHook {
-            component: Component::new(&self.engine, wasm).map_err(HookError::from_load)?,
+            pre: self
+                .linker
+                .instantiate_pre(component)
+                .map_err(HookError::from_instantiate)?,
         })
     }
 
@@ -127,7 +174,7 @@ impl HookEngine {
         // SAFETY: delegated to this function's own contract, which the caller accepted.
         let component = unsafe { Component::deserialize(&self.engine, artifact) }
             .map_err(HookError::from_load)?;
-        Ok(LoadedHook { component })
+        self.prepare(&component)
     }
 
     /// Advance the epoch by one tick.
@@ -151,14 +198,35 @@ impl HookEngine {
     }
 }
 
-/// A hook that has been compiled and is ready to instantiate.
+/// A hook that has been compiled AND had its imports resolved, ready to instantiate.
 ///
-/// `Debug` is derived rather than omitted so a test can `expect_err` on a load, which is how
-/// the unloadable-bytes paths are covered at all. The component's own `Debug` is opaque, so
-/// this leaks nothing about a hook's contents.
-#[derive(Debug)]
+/// `Debug` is HAND-WRITTEN, not derived: `InstancePre` has none, and the fact worth printing is
+/// not its contents (resolved import pointers) but that the hook reached the resolved state at
+/// all. A `LoadedHook` that exists has passed import resolution by construction. Tests still
+/// `expect_err` on a load, which is how the unloadable and unlinkable paths are covered.
 pub struct LoadedHook {
-    component: Component,
+    /// The guest's imports already resolved against the host surface.
+    ///
+    /// `Linker::instantiate_pre` does the matching of what the component imports to what the
+    /// host offers, once, at load time. `customize` then only has to build a `Store` and
+    /// instantiate, which is the irreducible per-invocation work: a store is per-call state
+    /// (its fuel, its epoch deadline, its resource table) and cannot be shared.
+    ///
+    /// This also moves a whole class of failure from the request path to the deploy path. A
+    /// component importing something the sandbox does not grant now fails when it is LOADED,
+    /// with a clear error, rather than on the first login that reaches it.
+    pre: InstancePre<Sandbox>,
+}
+
+/// Hand-written because `InstancePre` has no `Debug`, and because the fact worth printing is
+/// not its contents (resolved import pointers) but that the hook reached the resolved state at
+/// all. A `LoadedHook` that exists has passed import resolution by construction.
+impl std::fmt::Debug for LoadedHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedHook")
+            .field("imports", &"resolved")
+            .finish()
+    }
 }
 
 /// What one hook invocation produced.
@@ -216,17 +284,22 @@ impl LoadedHook {
         limits: &Limits,
         request: &Request,
     ) -> Result<Customization, HookError> {
-        let mut linker: Linker<Sandbox> = Linker::new(engine.inner());
-        Sandbox::link(&mut linker).map_err(HookError::from_instantiate)?;
-
+        // A STORE and nothing else. The linker was built when the engine was, and this hook's
+        // imports were resolved against it when the hook was loaded; what is left is the state
+        // that genuinely cannot be shared between two concurrent invocations -- this call's
+        // fuel, its epoch deadline, and its resource table.
         let sandbox = Sandbox::new(limits);
         let mut store = Store::new(engine.inner(), sandbox);
         store.limiter(|s: &mut Sandbox| s.limits());
         store.set_fuel(limits.fuel).map_err(HookError::from_call)?;
         store.set_epoch_deadline(limits.epoch_deadline);
 
-        let hook = TokenCustomizeHook::instantiate(&mut store, &self.component, &linker)
+        let instance = self
+            .pre
+            .instantiate(&mut store)
             .map_err(HookError::from_instantiate)?;
+        let hook =
+            TokenCustomizeHook::new(&mut store, &instance).map_err(HookError::from_instantiate)?;
         let wit_request = wit_hook::Request {
             payload_version: request.payload_version,
             grant_type: request.grant_type.clone(),

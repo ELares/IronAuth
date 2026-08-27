@@ -1,0 +1,8 @@
+{
+  "runner_class": "ubuntu-latest",
+  "machine": "Linux/X64/ubuntu24/20260816.277.1",
+  "cold_p95_micros": 93849.515,
+  "warm_p95_micros": 87.439,
+  "cold_iterations": 200,
+  "warm_iterations": 5000
+}

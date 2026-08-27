@@ -1151,3 +1151,43 @@ async fn a_machine_token_honours_a_claim_placed_in_the_id_token() {
          it would empty it from every machine token with nothing red: {issued:?}"
     );
 }
+
+/// AN UNLINKABLE HOOK IS REFUSED ONCE AND REMEMBERED, not recompiled on every request.
+///
+/// Import resolution moved into `HookEngine::load`, which is where a capability refusal belongs
+/// -- wanting `wasi:sockets` is a property of the artifact, not of a request. But it moved the
+/// refusal OUTSIDE a cache that stored only successes, so the dispatch recompiled the component
+/// on every token request for that client: roughly 33 ms of cranelift per login, for a hook
+/// that can never run. A client with one bad hook could spend a server's CPU by logging in.
+///
+/// Before the move, the refusal happened later, at invocation, so the compile was cached and
+/// paid once. The refusal moving earlier is an improvement; the compile moving to every request
+/// would not have been.
+///
+/// The cache's own `Debug` is the observation, as it is for the success case: `cached_components`
+/// counts entries, and a refusal that is remembered is an entry.
+#[tokio::test]
+async fn an_unlinkable_hook_is_refused_once_and_then_remembered() {
+    let harness = harness_with_hooks().await;
+    // NET_ESCAPE imports `wasi:sockets`, which the sandbox does not link, so it cannot resolve.
+    deploy(&harness, ironauth_hooks::fixtures::NET_ESCAPE, 1).await;
+
+    for attempt in 1..=3 {
+        let refused = exchange(&harness).await;
+        assert!(
+            refused.is_err(),
+            "attempt {attempt}: a hook that cannot link must fail the issuance, closed"
+        );
+    }
+
+    let runtime = format!(
+        "{:?}",
+        harness.hook_runtime().expect("a runtime is installed")
+    );
+    assert!(
+        runtime.contains("cached_components: Some(1)"),
+        "three refused issuances leave ONE cache entry: the refusal is remembered, so the \
+         second and third were a map lookup rather than another cranelift compile of something \
+         that can never run. {runtime}"
+    );
+}

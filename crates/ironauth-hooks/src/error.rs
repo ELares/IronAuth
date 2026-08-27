@@ -127,7 +127,32 @@ impl HookError {
         }
     }
 
-    /// What stopped the hook, or [`None`] if it declined.
+    /// Rebuild an abort that was already decided, from its kind and its message.
+    ///
+    /// For a CACHED refusal. A component that fails import resolution fails it identically
+    /// every time -- same bytes, same engine, same missing capability -- so a dispatch that
+    /// remembers the answer avoids recompiling something that can never run. Remembering it
+    /// means storing the classification and the text, because [`wasmtime::Error`] is not
+    /// `Clone`, and handing them back means this.
+    ///
+    /// NOT a way to invent an abort. The kind must be one this crate already returned for these
+    /// bytes; a caller that guesses is asserting a classification it did not measure.
+    ///
+    /// WHAT IS LOST, stated because a recalled error is not the original: `wasmtime::Error`
+    /// carries a `Caused by:` chain and a downcastable source, and a caller that stored
+    /// `to_string()` has kept only the rendered text. The classification survives, which is
+    /// what a failure policy acts on, and the text survives, which is what an operator reads.
+    /// The chain does not. Pass the message you got from `Display`, not one you compose, or the
+    /// kind phrase ends up in the string twice.
+    #[must_use]
+    pub fn recalled(kind: AbortKind, reason: String) -> Self {
+        Self::Aborted {
+            kind,
+            source: wasmtime::Error::msg(reason),
+        }
+    }
+
+    /// Why the hook did not complete, if it was an abort rather than a decline.
     #[must_use]
     pub fn abort_kind(&self) -> Option<AbortKind> {
         match self {
