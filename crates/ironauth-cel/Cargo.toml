@@ -18,7 +18,14 @@ repository.workspace = true
 #
 # It provides no cost accounting of any kind, which is why this crate exists: see the module
 # header for the measurement that rules out the two obvious substitutes.
-cel = "0.14"
+# `json` is enabled for `Value::json()`, the result half of this crate's boundary. The
+# binding half is hand-written (`to_cel`) because it enforces the declared cardinality while
+# it converts, which a general-purpose converter has no reason to do.
+cel = { version = "0.14", features = ["json"] }
+# The wire form on this crate's own boundary. Bindings arrive as `serde_json::Value` and
+# results leave as one, so a caller never needs `cel` in its manifest and `cel::Program`
+# never escapes -- which is what makes the cost budget unavoidable rather than optional.
+serde_json.workspace = true
 
 [lints]
 workspace = true
