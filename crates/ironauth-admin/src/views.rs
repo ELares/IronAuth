@@ -1917,6 +1917,33 @@ pub struct SetClaimsMappingRequest {
 /// arbitrary operator-supplied JSON and this view returns it verbatim to any `management.read`
 /// credential -- so an operator who puts a secret in one has put it somewhere a reader can see
 /// it. What the type guarantees is that nothing here is a secret by DESIGN; what an operator
+/// A deployed WASM token hook, as an operator reads it back (issue #114).
+///
+/// METADATA, not the component. "What is deployed" is answered by which client, how many bytes
+/// and which payload version; streaming the component back would make every read a
+/// multi-megabyte body and answers a question nobody asked.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct TokenHookView {
+    /// The authorize client id whose tokens this hook shapes (the per-environment natural key).
+    pub client_id: String,
+    /// How many bytes the deployed component is, so an operator can tell whether the thing
+    /// running is the thing they pushed.
+    pub component_bytes: usize,
+    /// The token-customize payload version the guest was built against.
+    pub payload_version: u32,
+}
+
+/// The query parameters a token-hook deploy carries (issue #114).
+///
+/// The version is REQUIRED rather than defaulted. A default would silently accept a guest built
+/// against another revision of the WIT interface and fail it at the first login instead, which
+/// is the failure this parameter exists to move to deploy time.
+#[derive(Debug, Clone, serde::Deserialize, utoipa::IntoParams)]
+pub struct DeployTokenHookQuery {
+    /// The token-customize payload version the guest was built against.
+    pub payload_version: u32,
+}
+
 /// writes into a free-form value is theirs.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClaimsMappingView {

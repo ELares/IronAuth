@@ -32408,6 +32408,56 @@ impl ActingTokenHookRepo<'_> {
         )
         .await
     }
+
+    /// Remove a client's hook, audited as `token_hook.delete`.
+    ///
+    /// Removing the row restores the UNSHAPED token for that client: the dispatch reads the
+    /// row per issuance, so the next token is minted without the hook and no restart is
+    /// needed. That is what makes this the remediation for a misbehaving hook rather than a
+    /// deployment step.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope or has no hook;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, client: &ClientId) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client_id = client.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TokenHookDelete,
+                target: client,
+            },
+            async move |tx| {
+                let removed = sqlx::query(
+                    "DELETE FROM token_hooks \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .execute(&mut **tx)
+                .await?;
+                // NOT FOUND rather than a silent success, the same reasoning the claim-mapping
+                // delete records: reporting success for a client with no hook tells an operator
+                // their removal took effect when there was nothing to remove, and it turns the
+                // endpoint into a probe for which clients run one.
+                if removed.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
 }
 
 /// Build a [`ClaimsMappingRecord`] from a `claims_mappings` row.

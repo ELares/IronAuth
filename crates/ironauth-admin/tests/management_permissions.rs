@@ -183,6 +183,9 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("setClaimsMapping", ManagementPermission::WriteConfig),
     ("deleteClaimsMapping", ManagementPermission::WriteConfig),
     ("getClaimsMapping", ManagementPermission::Read),
+    ("deployTokenHook", ManagementPermission::WriteConfig),
+    ("deleteTokenHook", ManagementPermission::WriteConfig),
+    ("getTokenHook", ManagementPermission::Read),
     // User sub-surfaces: identifiers, trait schemas, signup quarantine and recovery
     // approvals. Identifier UNIQUENESS and trait schemas are config rather than user
     // authority, because each changes a rule the whole environment obeys.
@@ -610,6 +613,14 @@ const PERMISSION_PROVEN: &[&str] = &[
     "setClaimsMapping",
     "deleteClaimsMapping",
     "getClaimsMapping",
+    // Proven in `write_config_is_required_and_sufficient_for_a_token_hook_deploy`, its removal
+    // sibling, and `read_is_required_and_sufficient_for_a_token_hook_read`, each in BOTH
+    // directions. The removal is pinned separately from the deploy because its reason is the
+    // one that is easy to get wrong: removing a hook restores the UNSHAPED token, so it is a
+    // change to every token's shape rather than a tidy-up.
+    "deployTokenHook",
+    "deleteTokenHook",
+    "getTokenHook",
     // Proven in `read_is_required_and_sufficient_for_the_event_feed_and_usage_export`, in
     // BOTH directions: a `write_config` credential is refused and a `read` one is allowed,
     // so neither a blanket refusal nor a missing gate would pass it.
@@ -758,12 +769,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        186,
+        189,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        42,
+        45,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -781,6 +792,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
         "claims_mappings.rs",
         include_str!("../src/claims_mappings.rs"),
     ),
+    ("token_hooks.rs", include_str!("../src/token_hooks.rs")),
     ("messages.rs", include_str!("../src/messages.rs")),
     (
         "service_account_keys.rs",

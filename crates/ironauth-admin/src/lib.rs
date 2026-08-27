@@ -132,6 +132,7 @@ mod state;
 mod step_up_policies;
 mod sudo;
 mod tenants;
+mod token_hooks;
 pub mod trait_migration_worker;
 mod trait_schemas;
 mod users;
@@ -810,6 +811,12 @@ pub fn management_router(state: AdminState) -> Router {
             put(claims_mappings::set_claims_mapping)
                 .get(claims_mappings::get_claims_mapping)
                 .delete(claims_mappings::delete_claims_mapping),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook",
+            put(token_hooks::deploy_token_hook)
+                .get(token_hooks::get_token_hook)
+                .delete(token_hooks::delete_token_hook),
         )
         // Per-environment, per-client signup forms as data (issue #87): set (fail-fast validated
         // against the active trait schema), get, and delete a form keyed on the authorize client

@@ -150,10 +150,12 @@ fn operation_ids_are_the_stable_set() {
             "deleteSignupForm",
             "deleteSubjectMapping",
             "deleteTenant",
+            "deleteTokenHook",
             "deleteUser",
             "deleteVariable",
             "deleteWebhookEndpoint",
             "denySmsCountry",
+            "deployTokenHook",
             "disableOrganization",
             "elevateAdminSudo",
             "enableOrganization",
@@ -202,6 +204,7 @@ fn operation_ids_are_the_stable_set() {
             "getSignupForm",
             "getSmsOtpConfig",
             "getTenant",
+            "getTokenHook",
             "getTraitMigrationJob",
             "getTraitSchemaVersion",
             "getUser",
@@ -507,6 +510,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
@@ -553,6 +557,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
@@ -731,6 +736,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
@@ -840,7 +846,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        247,
+        250,
         "the documented route count is pinned"
     );
 

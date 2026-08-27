@@ -121,6 +121,14 @@ const OUTBOUND_TOKEN: &str = "outbound-sweep-token-of-at-least-32-bytes";
 /// container tagged WEBP. The sniff reads the BYTES and never the declared header.
 const RASTER_UPLOAD: &str = "RIFF\0\0\0\0WEBP";
 
+/// The eight-byte preamble of a WebAssembly COMPONENT.
+///
+/// Enough to satisfy the deploy's structural check, which is all this sweep needs: it asks
+/// whether the ENVIRONMENT is fenced, not whether the component links. Valid UTF-8 by luck of
+/// the encoding -- `\0asm` then the layer word `0d 00 01 00` -- so it fits the `String` body
+/// every other case uses.
+const COMPONENT_UPLOAD: &str = "\u{0}asm\u{d}\u{0}\u{1}\u{0}";
+
 /// A fixed, plausible instant for every seeded row, in Unix microseconds.
 const SEED_MICROS: i64 = 1_700_000_000_000_000;
 
@@ -887,6 +895,32 @@ impl Fixture {
             )
             .await
             .expect("seed a claim mapping");
+
+        // A WASM token hook (issue #114), seeded for exactly the reason the claim mapping above
+        // is: `getTokenHook` is 404 when no hook is deployed, so a GET that depended on the PUT
+        // beside it would answer 200 at the live control and 404 at the doomed environment,
+        // where the PUT was correctly refused -- and that difference is the fixture, not the
+        // fence. Seeding both environments is the only condition under which the comparison
+        // measures anything.
+        //
+        // Eight bytes: a component preamble and nothing else. The sweep asks whether the
+        // ENVIRONMENT is fenced, and a component that could be refused on its own contents
+        // would answer a different question.
+        //
+        // The CONTROL store again, because `token_hooks` grants the data plane SELECT and
+        // nothing more.
+        h.control_store()
+            .scoped(scope)
+            .acting(actor, CorrelationId::generate(&env))
+            .token_hooks()
+            .set(
+                &env,
+                &ironauth_store::ClientId::parse_in_scope(&client, &scope).expect("client id"),
+                b"\0asm\x0d\0\x01\0",
+                1,
+            )
+            .await
+            .expect("seed a token hook");
 
         // A quarantined signup for the fraud-review queue.
         let quarantined_user = h
@@ -1687,6 +1721,26 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/applications/{client}/claims-mapping"),
             &serde_json::json!({ "rules": [] }),
         ),
+        // WASM token hooks (issue #114), the same per-client shape. The body is not a component
+        // and does not need to be: the environment check runs before the component is looked at,
+        // which is the whole question these sweeps ask. `payload_version` is in the query
+        // because the extractor requires it, and an extractor rejection would answer a
+        // different question than the environment one.
+        // WASM token hooks (issue #114), the same per-client shape. The body is a REAL
+        // component preamble rather than a placeholder, and it has to be: the deploy runs
+        // before the delete in this sweep, so a body the deploy refuses leaves nothing to
+        // remove and `deleteTokenHook` answers the uniform not-found at a LIVE environment --
+        // which makes driving it at a soft-deleted one measure nothing. `payload_version` is
+        // in the query because the extractor requires it, and an extractor rejection would
+        // answer a different question than the environment one.
+        Case {
+            label: "token_hooks.deployTokenHook",
+            method: "PUT",
+            path: format!("{base}/applications/{client}/token-hook?payload_version=1"),
+            body: Some(COMPONENT_UPLOAD.to_owned()),
+            content_type: "application/wasm",
+            token: OPERATOR_TOKEN,
+        },
         // Environment VARIABLE management (issue #235). All four operations are environment
         // scoped and take no parent beyond the environment, so a soft-deleted environment must
         // refuse the two writes and the two reads must read exactly like an absent one.
@@ -1748,6 +1802,16 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "claims_mappings.deleteClaimsMapping",
             "DELETE",
             format!("{base}/applications/{client}/claims-mapping"),
+        ),
+        Case::empty(
+            "token_hooks.getTokenHook",
+            "GET",
+            format!("{base}/applications/{client}/token-hook"),
+        ),
+        Case::empty(
+            "token_hooks.deleteTokenHook",
+            "DELETE",
+            format!("{base}/applications/{client}/token-hook"),
         ),
         // ---- brands (issue #475) ----
         // A slug of its OWN, so the set/get/delete lifecycle below cannot disturb the seeded

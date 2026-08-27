@@ -2332,6 +2332,282 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook": {
+      "get": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "Describe a client's deployed token hook.",
+        "operationId": "getTokenHook",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hook shapes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The deployed hook's metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenHookView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, malformed client id, or no hook deployed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "Deploy (create or replace) a client's WASM token hook.",
+        "operationId": "deployTokenHook",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hook shapes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "payload_version",
+            "in": "query",
+            "description": "The token-customize payload version the guest was built against",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The WebAssembly component bytes",
+          "content": {
+            "application/wasm": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Deployed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenHookView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An unknown payload version, or bytes that are not a component",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or malformed client id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "Remove a client's WASM token hook.",
+        "operationId": "deleteTokenHook",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hook shapes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, malformed client id, or no hook deployed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture": {
       "put": {
         "tags": [
@@ -24980,7 +25256,7 @@
       },
       "ClaimsMappingView": {
         "type": "object",
-        "description": "A per-environment, per-client declarative claim mapping, as returned by the management API\n(issue #113).\n\nNo secret SLOT: a rule names claim names, a static value, and a token placement, and none of\nthose is a credential field or a user reference.\n\nNot \"no secret is possible\", which an earlier version said. A `static` rule's value is\narbitrary operator-supplied JSON and this view returns it verbatim to any `management.read`\ncredential -- so an operator who puts a secret in one has put it somewhere a reader can see\nit. What the type guarantees is that nothing here is a secret by DESIGN; what an operator\nwrites into a free-form value is theirs.",
+        "description": "writes into a free-form value is theirs.",
         "required": [
           "client_id",
           "rules"
@@ -31323,6 +31599,32 @@
           "status": {
             "type": "string",
             "description": "The lifecycle status: `active` or `suspended` (issue #46). A suspended\ntenant is fenced off the data plane but keeps all its data and stays visible\nhere."
+          }
+        }
+      },
+      "TokenHookView": {
+        "type": "object",
+        "description": "A per-environment, per-client declarative claim mapping, as returned by the management API\n(issue #113).\n\nNo secret SLOT: a rule names claim names, a static value, and a token placement, and none of\nthose is a credential field or a user reference.\n\nNot \"no secret is possible\", which an earlier version said. A `static` rule's value is\narbitrary operator-supplied JSON and this view returns it verbatim to any `management.read`\ncredential -- so an operator who puts a secret in one has put it somewhere a reader can see\nit. What the type guarantees is that nothing here is a secret by DESIGN; what an operator\nA deployed WASM token hook, as an operator reads it back (issue #114).\n\nMETADATA, not the component. \"What is deployed\" is answered by which client, how many bytes\nand which payload version; streaming the component back would make every read a\nmulti-megabyte body and answers a question nobody asked.",
+        "required": [
+          "client_id",
+          "component_bytes",
+          "payload_version"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The authorize client id whose tokens this hook shapes (the per-environment natural key)."
+          },
+          "component_bytes": {
+            "type": "integer",
+            "description": "How many bytes the deployed component is, so an operator can tell whether the thing\nrunning is the thing they pushed.",
+            "minimum": 0
+          },
+          "payload_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The token-customize payload version the guest was built against.",
+            "minimum": 0
           }
         }
       },

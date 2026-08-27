@@ -591,6 +591,18 @@ fn claims_mapping_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/applications/{client}/claims-mapping"),
             body: None,
         },
+        Case {
+            label: "token_hooks.deployTokenHook",
+            method: "PUT",
+            path: format!("{base}/applications/{client}/token-hook?payload_version=1"),
+            body: Some(body_of(&serde_json::json!({}))),
+        },
+        Case {
+            label: "token_hooks.deleteTokenHook",
+            method: "DELETE",
+            path: format!("{base}/applications/{client}/token-hook"),
+            body: None,
+        },
     ]
 }
 

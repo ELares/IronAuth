@@ -922,6 +922,14 @@ pub enum Action {
     /// installs here. The component itself is not recorded: an audit stream is not a binary
     /// store, and the bytes are already durable in the row the audit points at.
     TokenHookSet,
+    /// A WASM TOKEN HOOK was REMOVED (issue #114), restoring the unshaped token for that
+    /// client. The audit row names the CLIENT, for the same reason `TokenHookSet` does.
+    ///
+    /// Its own action rather than a detail on the set row, because the two answer different
+    /// questions for an auditor: "whose tokens started being shaped by code" and "whose
+    /// stopped". A removal is also the remediation an operator reaches for when a hook is
+    /// misbehaving, so it is the row an incident review looks for.
+    TokenHookDelete,
     /// A per-environment, per-client DECLARATIVE CLAIM MAPPING was written or overwritten
     /// (issue #113): a first write or an overwrite of the already-validated rule set. The audit
     /// row names the CLIENT, because this table has no id of its own and the client is the thing
@@ -1582,6 +1590,7 @@ impl Action {
             Action::FlowTargetReplayDeadLetters => "flow_target.replay_dead_letters",
             Action::MessageTemplateDelete => "message_template.delete",
             Action::TokenHookSet => "token_hook.set",
+            Action::TokenHookDelete => "token_hook.delete",
             Action::ClaimsMappingSet => "claims_mapping.set",
             Action::ClaimsMappingRefused => "claims_mapping.refused",
             Action::ClaimsMappingDelete => "claims_mapping.delete",

@@ -1268,6 +1268,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0162_token_hooks.sql"),
         },
+        Migration {
+            version: 163,
+            name: "token_hooks_delete_grant",
+            // EXPAND: a GRANT adds a privilege and removes none, so an old binary that never
+            // issues a DELETE is unaffected by it.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0163_token_hooks_delete_grant.sql"),
+        },
     ]
 }
 
