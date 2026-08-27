@@ -750,6 +750,19 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script, and
+      # that script PANICS rather than skipping when the target is missing, on purpose: the
+      # fixtures are the hooks that spin, allocate and try to open a socket, so a suite that
+      # silently skipped them would be green while testing no sandbox at all.
+      #
+      # This lane did not need the target until issue #114 wired `ironauth-hooks` into
+      # `ironauth-oidc`. No step here compiles the whole workspace -- the invariant scripts build
+      # named packages -- but `ironauth-oidc` now DEV-depends on `ironauth-hooks` for its guest
+      # fixtures, so any of them that links `ironauth-oidc`'s test targets runs that crate's
+      # build script. It failed as `can't find crate for core` while compiling `futures-sink`,
+      # which names neither the crate at fault nor the cause.
+      - name: Install the WASM target the hook fixtures build for
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       # The conformance static checks parse the profile matrix and RENDER the
       # runner's plan config, so they need PyYAML. Pin the interpreter (the

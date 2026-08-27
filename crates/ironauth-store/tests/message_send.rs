@@ -2417,3 +2417,264 @@ async fn concurrent_resends_of_one_message_queue_one_job() {
         "and exactly one extra job exists"
     );
 }
+
+/// Each re-queue emits `message.resent` carrying ITS OWN attempt number.
+///
+/// Issue #108 criterion 6: every management write announces itself. A resend is the one write
+/// on this surface that causes mail, and it announced nothing -- `scripts/producer-coverage.py`
+/// named it, and a write no event describes is invisible to every integrator watching the feed.
+/// For a resend that is the difference between "an operator re-sent it" and "our provider
+/// double-delivered".
+///
+/// The negative half lives in `a_resend_refused_by_suppression_announces_nothing`, which this
+/// function used to contain before it was split for length.
+#[tokio::test]
+async fn each_requeue_announces_its_own_attempt_number() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x1_6e);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let id = send_with_payload(
+        &db,
+        &env,
+        scope,
+        "resent@example.test",
+        1_000,
+        &serde_json::json!({ "kind": "email_otp", "code": "hunter2" }),
+    )
+    .await;
+    db.store()
+        .scoped(scope)
+        .messages()
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed {
+                reason: "all_providers_unavailable",
+            },
+        )
+        .await
+        .expect("resolve failed");
+
+    // THE BUILDER, which is what the production handler passes. It reads the attempt off the
+    // outcome the store hands it, so this test cannot supply a number of its own -- which is
+    // the point: the first version wrote `attempt: 1` into its own fixture and asserted only
+    // `message_id`, so a hard-coded 1 in the production builder was invisible to it.
+    //
+    // A DISTINCT event id per resend, as the production builder produces. Reusing one trips the
+    // outbox's per-consumer idempotency constraint on the second enqueue.
+    let subject = id.to_string();
+    let build_event = |outcome: &Resent| {
+        let Resent::Requeued { attempt } = outcome else {
+            return None;
+        };
+        let event_id = format!("evt_message_resent_{attempt}");
+        let envelope = ironauth_store::event_catalog::envelope(
+            &event_id,
+            "message.resent",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            1,
+            &serde_json::json!({ "message_id": subject, "attempt": attempt }),
+        )?;
+        Some(ironauth_store::OwnedDomainEvent {
+            id: event_id,
+            subject: subject.clone(),
+            envelope,
+        })
+    };
+
+    let resent = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .messages()
+        .resend_with_event(&env, &id, Some(&build_event))
+        .await
+        .expect("resend");
+    assert_eq!(resent, Resent::Requeued { attempt: 1 });
+
+    // A SECOND re-queue must announce attempt 2. Review measured what its absence hid: the
+    // production builder wrote a literal 1 into every event forever, so a subscriber reading 1
+    // four times concluded four FIRST resends -- the provider-double-delivery story this event
+    // exists to rule out.
+    //
+    // BOTH are drained together, AFTER both resends, so the in-order `(1, 2)` assertion below
+    // is a single observation of the feed rather than two readings stitched together.
+    //
+    // NOT because draining in between would hide anything. An earlier version of this comment
+    // said it "reports zero", and that is false of `drain_message_events`, which COMPLETES what
+    // it claims and so releases the ordering group -- measured: draining between the resends
+    // returns 1 then 1, both correct. It is true only of a claim-only drain, which is what the
+    // helper's own doc explains it is not.
+    db.store()
+        .scoped(scope)
+        .messages()
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed {
+                reason: "all_providers_unavailable",
+            },
+        )
+        .await
+        .expect("resolve failed a second time");
+    let second = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .messages()
+        .resend_with_event(&env, &id, Some(&build_event))
+        .await
+        .expect("second resend");
+    assert_eq!(second, Resent::Requeued { attempt: 2 });
+
+    let events = drain_message_events(&db, scope).await;
+    assert_eq!(events.len(), 2, "one event per re-queue: {events:?}");
+    for event in &events {
+        assert_eq!(event["type"], "message.resent");
+        assert_eq!(event["payload"]["message_id"], subject);
+        ironauth_store::event_catalog::validate_event(event)
+            .expect("the envelope validates against the registry the fan-out enforces");
+    }
+    assert_eq!(
+        (
+            events[0]["payload"]["attempt"].as_i64(),
+            events[1]["payload"]["attempt"].as_i64()
+        ),
+        (Some(1), Some(2)),
+        "the attempts are the store's own, in order. A builder handed in from outside can only \
+         guess: {events:?}"
+    );
+}
+
+/// The webhook-bound events for `scope`, claimed AND COMPLETED until the feed is empty.
+///
+/// Both halves matter. COMPLETING matters because the outbox refuses to hand out an event while
+/// an earlier one for the same subject is incomplete, so a helper that only claimed would leave
+/// every drained event blocking its successors -- and a later "nothing was announced" assertion
+/// would then pass because the feed was BLOCKED rather than because nothing was written.
+///
+/// LOOPING matters for the same reason from the other side: one claim returns at most one event
+/// per subject however large the batch, because inside a single statement the earlier event is
+/// still incomplete. Draining N events about one message takes N rounds, and a single-shot
+/// helper reports 1 and reads as "only one was written".
+async fn drain_message_events(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    let env = Env::system();
+    let mut payloads = Vec::new();
+    loop {
+        let claimed = db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim webhook events");
+        if claimed.is_empty() {
+            return payloads;
+        }
+        for message in claimed {
+            db.store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, &message)
+                .await
+                .expect("complete the claimed event");
+            payloads.push(message.payload);
+        }
+    }
+}
+
+/// A resend refused by SUPPRESSION announces nothing.
+///
+/// The negative half of `each_requeue_announces_its_own_attempt_number`, and it is the guard
+/// rather than a second spelling of it. A suppressed recipient is a hard bounce or a complaint,
+/// and the store refuses the resend on the recipient's behalf: no mail is queued, so no event
+/// may claim any was. A subscriber that counted a suppressed resend as a delivery would be
+/// counting mail that does not exist.
+#[tokio::test]
+async fn a_resend_refused_by_suppression_announces_nothing() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x1_6f);
+    let scope = db.seed_scope(&env).await;
+    provision_keys(&db, &env, scope).await;
+
+    let id = send_with_payload(
+        &db,
+        &env,
+        scope,
+        "suppressed@example.test",
+        1_000,
+        &serde_json::json!({ "kind": "email_otp", "code": "hunter2" }),
+    )
+    .await;
+    let subject = id.to_string();
+    let build_event = |outcome: &Resent| {
+        let Resent::Requeued { attempt } = outcome else {
+            return None;
+        };
+        let event_id = format!("evt_message_resent_{attempt}");
+        let envelope = ironauth_store::event_catalog::envelope(
+            &event_id,
+            "message.resent",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            1,
+            &serde_json::json!({ "message_id": subject, "attempt": attempt }),
+        )?;
+        Some(ironauth_store::OwnedDomainEvent {
+            id: event_id,
+            subject: subject.clone(),
+            envelope,
+        })
+    };
+    // Suppress the recipient before the resend.
+    // Read the blind index off the row rather than recomputing it: the point is to suppress
+    // THIS message's recipient, and a recomputation that drifted from what `enqueue` stored
+    // would suppress nobody while the test still read as a suppression case.
+    let bidx: Vec<u8> =
+        sqlx::query_scalar("SELECT recipient_bidx FROM messages WHERE id = $1 AND tenant_id = $2")
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("read the recipient blind index");
+    suppress(&db, scope, &bidx, "hard_bounce").await;
+    db.store()
+        .scoped(scope)
+        .messages()
+        .resolve(
+            &id,
+            generation_of(&db, scope, &id).await,
+            Resolution::Failed {
+                reason: "all_providers_unavailable",
+            },
+        )
+        .await
+        .expect("resolve failed again");
+
+    let refused = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .messages()
+        .resend_with_event(&env, &id, Some(&build_event))
+        .await
+        .expect("the refusal is an outcome, not an error");
+    assert!(
+        matches!(refused, Resent::Suppressed { .. }),
+        "the recipient is suppressed: {refused:?}"
+    );
+    assert!(
+        drain_message_events(&db, scope).await.is_empty(),
+        "a resend that queued no mail must announce nothing. Nothing was ever enqueued in this \
+         scope -- this test has its own database and its only resend is the refused one -- so \
+         an empty answer means nothing was written rather than that a read was blocked."
+    );
+}

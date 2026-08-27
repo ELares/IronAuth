@@ -34,11 +34,13 @@ allowlist_entries() {
 # untraced; see #774
 ironauth-oidc/mds3_sync
 
-# issue #113: the pre-token hook's contract, deliberately landed before either transport
-# that binds to it (#113's HTTP dispatch and #114's WASM one), so neither inherits the
-# other's shape. The seam it needs is recorded on #113: `tokens::mint` signs the ID token
-# before `mint_access` builds its claims, so no point today holds both unsigned.
-ironauth-store/token_customize
+# `ironauth-store/token_customize` was allowlisted here as a contract landed before either
+# transport bound to it. #1005 bound one: `token_hook::PAYLOAD_VERSION` is now an alias of
+# `TOKEN_CUSTOMIZE_VERSION`, so the module has a real caller and the entry went INERT --
+# which this scan refuses, because an exemption nobody rechecks is a claim nobody rechecks.
+# Removed rather than reworded. That is the scan doing its job: it noticed the day the
+# reason stopped being true, and it failed at the FIRST step of the lane, so nothing after
+# it ran.
 
 ALLOWLIST
 }

@@ -235,6 +235,10 @@ class Client:
         """Delete a brand's logo. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/brands/{urllib.parse.quote(slug)}/logo", query, None)
 
+    def delete_claims_mapping(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Delete a per-environment, per-client declarative claim mapping. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/claims-mapping", query, None)
+
     def delete_client_admin_consent(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Delete (revoke) a per-environment, per-client admin consent pre-authorization. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/admin-consent", query, None)
@@ -362,6 +366,10 @@ class Client:
     def get_brand(self, tenant_id: str, environment_id: str, slug: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Get a per-environment brand by slug. GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/brands/{urllib.parse.quote(slug)}", query, None)
+
+    def get_claims_mapping(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Get a per-environment, per-client declarative claim mapping. GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/claims-mapping", query, None)
 
     def get_client_admin_consent(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Get a per-environment, per-client admin consent pre-authorization. GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent."""
@@ -894,6 +902,10 @@ class Client:
     def set_brand_logo(self, tenant_id: str, environment_id: str, slug: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Upload (create or overwrite) a brand's logo. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/brands/{urllib.parse.quote(slug)}/logo", query, body)
+
+    def set_claims_mapping(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Set (create or overwrite) a per-environment, per-client declarative claim mapping. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/claims-mapping", query, body)
 
     def set_client_admin_consent(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Set (create or overwrite) a per-environment, per-client admin consent pre-authorization. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/admin-consent."""

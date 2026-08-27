@@ -258,11 +258,28 @@ pub async fn resend_message(
         ));
     };
 
+    // A BUILDER, not a built event, and the store calls it with what the write actually did.
+    // Only the write knows the attempt number -- `resend_in_tx` reads and increments
+    // `resend_count` under the row lock -- so an event built out here could only carry a guess,
+    // and the first version of this carried the literal 1 forever.
+    //
+    // Returning `None` is how the outcomes that queued no mail announce nothing.
+    //
+    // An unregistered event type also produces `None`, and here that is a DEPARTURE from the
+    // convention `event_catalog::envelope` states beside itself -- "the producer gets `None`
+    // and the write never happens". This write happens anyway. The reason is what the write
+    // does: it causes MAIL. Refusing to re-send a message because its event could not be built
+    // would make the feed a dependency of delivery, and an operator retrying a failed send
+    // would be blocked by a schema registry. Elsewhere the producer bails because the write is
+    // the record and an unannounced record is the harm; here the mail is the point.
+    //
+    // Named as a departure rather than left as two comments that disagree.
+    let build_event = |outcome: &ironauth_store::Resent| resent_event(&state, scope, &id, outcome);
     let outcome = data_store
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .messages()
-        .resend(state.env(), &id)
+        .resend_with_event(state.env(), &id, Some(&build_event))
         .await
         .map_err(|error| match error {
             ironauth_store::StoreError::NotFound => ApiError::NotFound,
@@ -290,6 +307,64 @@ pub async fn resend_message(
         .map_err(|_| ApiError::Internal)?;
 
     Ok(json(StatusCode::OK, body))
+}
+
+/// The `message.resent` event for one re-queue (issue #111, issue #108 criterion 6).
+///
+/// CALLED BY THE STORE, inside the transaction, with the outcome of the write. That is the only
+/// place the attempt number exists: `resend_in_tx` reads and increments `resend_count` under
+/// the row lock, so a caller building this beforehand can only guess. The first version did
+/// exactly that -- a literal 1 -- and review measured a second resend announcing `attempt: 1`
+/// while the HTTP body correctly said 2. A subscriber reading 1 four times concludes four
+/// FIRST resends, which is the provider-double-delivery story this event exists to rule out.
+///
+/// `None` for every outcome that queued no mail: a suppressed recipient, a message in a state a
+/// resend cannot act on, and a payload the retention sweep already reaped. An event for any of
+/// them would say mail went out when none did.
+///
+/// NO ADDRESS and no body. The event feed is the artifact a tenant hands to third-party sync
+/// targets, and a resend event is by construction about somebody being mailed right now, so the
+/// payload carries the ledger id and the attempt and nothing usable as a directory.
+/// `message.rate_limited` withholds the recipient for the same reason.
+fn resent_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    message_id: &MessageId,
+    outcome: &ironauth_store::Resent,
+) -> Option<ironauth_store::OwnedDomainEvent> {
+    let subject = message_id.to_string();
+    let payload = resent_payload(&subject, outcome)?;
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "message.resent",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(ironauth_store::OwnedDomainEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The decision and the payload, with no state around them.
+///
+/// SEPARATE so it can be tested. Review measured that the wrapper above is executed by no test
+/// in the repo: the only admin test that seeds a message gets `payload_expired`, so the
+/// `Requeued` arm -- the one arm that builds anything -- never ran. The mutation that
+/// "confirmed" the attempt fix was applied to a COPY of this logic living in the store's test,
+/// which proved the store hands an outcome to a builder and nothing about the shipped one.
+///
+/// Everything worth getting wrong is here: which outcomes announce, and where the attempt
+/// number comes from.
+fn resent_payload(message_id: &str, outcome: &ironauth_store::Resent) -> Option<serde_json::Value> {
+    let ironauth_store::Resent::Requeued { attempt } = outcome else {
+        return None;
+    };
+    Some(serde_json::json!({ "message_id": message_id, "attempt": attempt }))
 }
 
 /// The response body for a resend outcome.
@@ -321,4 +396,53 @@ fn render_resend(outcome: &Resent) -> Result<String, serde_json::Error> {
         },
     };
     serde_json::to_string(&view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resent_payload;
+    use ironauth_store::Resent;
+
+    /// The SHIPPED builder reports the store's attempt number, not a constant.
+    ///
+    /// This is the defect round 1 measured -- a literal `1` in every event forever, so a
+    /// subscriber reading 1 four times concluded four FIRST resends -- and round 2 found that
+    /// the fix was measured only in a duplicate of this logic inside the store's test. That
+    /// proved the store hands an outcome to a builder; it could not prove the builder reads it.
+    ///
+    /// A magic number the fixture could not produce by accident: nothing in the resend path
+    /// yields 7 on its own.
+    #[test]
+    fn the_payload_carries_the_attempt_the_store_reported() {
+        let payload = resent_payload("msg_example", &Resent::Requeued { attempt: 7 })
+            .expect("a re-queue announces");
+        assert_eq!(payload["attempt"], 7, "{payload}");
+        assert_eq!(payload["message_id"], "msg_example", "{payload}");
+    }
+
+    /// EVERY outcome that queued no mail announces nothing, and there are THREE of them.
+    ///
+    /// Enumerated one by one rather than as "the others", because the doc that justified this
+    /// guard said "the other two" and left `PayloadExpired` out of its own case analysis --
+    /// the retention-expiry path, which is the one whose behaviour is least obvious.
+    ///
+    /// A `match` on the outcome would make this exhaustive by construction; a `let else` does
+    /// not, so the enumeration is the test.
+    #[test]
+    fn no_outcome_that_queued_nothing_announces() {
+        for outcome in [
+            Resent::Suppressed {
+                reason: "hard_bounce".to_owned(),
+            },
+            Resent::NotResendable {
+                state: "sent".to_owned(),
+            },
+            Resent::PayloadExpired,
+        ] {
+            assert!(
+                resent_payload("msg_example", &outcome).is_none(),
+                "{outcome:?} queued no mail, so it must announce nothing"
+            );
+        }
+    }
 }

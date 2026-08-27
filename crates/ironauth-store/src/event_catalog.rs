@@ -1004,6 +1004,42 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A RESEND, the one management write on the messaging surface that causes mail.
+        // `producer-coverage.py` found it announcing NOTHING, and a write that emits nothing is
+        // invisible to every integrator watching the feed. For a resend that is the difference
+        // between "an operator re-sent it" and "our provider double-delivered".
+        //
+        // NO ADDRESS and no body, for the reason `message.rate_limited` gives below: the feed is
+        // the artifact a tenant hands to third-party sync targets, and a resend event is by
+        // construction about somebody being mailed right now. `message_id` names the ledger row,
+        // which is where a holder of the tenant's key looks up the rest.
+        //
+        // `attempt` is the durable answer to "why did this person get four copies", so it rides
+        // the event rather than needing a follow-up read.
+        //
+        // EMITTED ONLY WHEN A RESEND ACTUALLY RE-QUEUED. `Resent` has FOUR variants and the
+        // other THREE all wrote no mail: a SUPPRESSED recipient is a hard bounce or a complaint
+        // the store refuses on the recipient's behalf, a message in a state a resend cannot act
+        // on is a no-op, and a PAYLOAD the diagnostics retention sweep already reaped cannot be
+        // re-queued at all. An event for any of them would tell a subscriber that mail went out
+        // when none did, which is worse than the silence this replaces.
+        //
+        // The count is written out because an earlier version of this comment said "the other
+        // two" and enumerated two, leaving the retention-expiry path -- the one whose behaviour
+        // is least obvious -- unmentioned in the case analysis that justifies the guard.
+        "message.resent",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "message_id": {"type": "string", "minLength": 1},
+                "attempt": {"type": "integer", "minimum": 1}
+            },
+            "required": ["message_id", "attempt"]
+        }"#,
+    ),
+    (
         // A send REFUSED by the per-recipient rate limit (issue #111 criterion 5), which asks
         // that exceeding the limit both block the send and emit this.
         //
@@ -2970,6 +3006,7 @@ mod tests {
         "step_up_policy.set",
         // `withdrawn` (withdraw/withdrew/withdrawn) and `resent` (resend/resent/resent).
         "invitation.resent",
+        "message.resent",
         "project_grant.withdrawn",
         // Compounds whose PAST form is the head verb, followed by the preposition or particle
         // the fact needs: `assigned to`, not `assignment`; `signed in`, not `signin`.

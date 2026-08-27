@@ -31690,6 +31690,52 @@ impl ActingMessageRepo<'_> {
     /// Carries no idempotency write: that row is control-plane and this transaction is
     /// data-plane. See [`Store::record_cross_plane_idempotency`].
     pub async fn resend(&self, env: &Env, id: &MessageId) -> Result<Resent, StoreError> {
+        // DELEGATES, as `ActingInvitationRepo::resend` does to its own `_with_event` sibling.
+        // It was a full copy of the audited write, which is two places for one transaction to
+        // drift -- and it has no caller now that the handler emits, so the copy was carrying no
+        // weight at all. Kept rather than deleted because "resend without announcing" is a
+        // legitimate thing for a future caller to want; what is not legitimate is a second
+        // implementation of it.
+        self.resend_with_event(env, id, None).await
+    }
+
+    /// [`Self::resend`], additionally emitting `message.resent` (issue #111, issue #108
+    /// criterion 6).
+    ///
+    /// A resend is the one management write on this surface that CAUSES MAIL, and it announced
+    /// nothing: `scripts/producer-coverage.py` names it, and a write no event describes is
+    /// invisible to every integrator watching the feed. For this write that is the difference
+    /// between "an operator re-sent it" and "our provider double-delivered".
+    ///
+    /// THE EVENT IS APPENDED IN THE SAME TRANSACTION as the re-queue, so a subscriber cannot
+    /// see a resend that did not happen and cannot miss one that did. That is possible here
+    /// only because `outbox_messages` grants INSERT to the data-plane role -- the idempotency
+    /// row above cannot join this transaction for exactly the opposite reason.
+    ///
+    /// THE EVENT IS BUILT FROM THE OUTCOME, not handed in ready-made, and that is the whole
+    /// reason this takes a [`ResolvedEventBuilder`] rather than a [`DomainEvent`].
+    ///
+    /// The attempt number is the durable answer to "why did this person get four copies", and
+    /// only this write knows it: `resend_in_tx` reads and increments `resend_count` inside the
+    /// transaction. An event built by the caller beforehand can only carry a guess, and the
+    /// first version of this carried the literal 1 forever -- review measured a second resend
+    /// announcing `attempt: 1` while the HTTP body correctly said 2, which is exactly the
+    /// provider-double-delivery story the event exists to distinguish from an operator resend.
+    ///
+    /// The builder also decides WHETHER to emit, by returning `None`. All THREE of the other
+    /// [`Resent`] variants queue no mail -- a suppressed recipient, a message in a state a
+    /// resend cannot act on, and a payload the retention sweep has already reaped -- and
+    /// announcing any of them would tell a subscriber mail went out when none did.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resend`].
+    pub async fn resend_with_event(
+        &self,
+        env: &Env,
+        id: &MessageId,
+        event: Option<ResolvedEventBuilder<'_, Resent>>,
+    ) -> Result<Resent, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -31705,11 +31751,14 @@ impl ActingMessageRepo<'_> {
                 target: &target,
             },
             async move |tx| {
-                // No idempotency row here: `idempotency_keys` is a CONTROL-plane table and
-                // this write is on the data plane, so the app role has no grant on it and the
-                // two cannot share a transaction. The caller records it separately through
-                // `Store::record_cross_plane_idempotency`, which documents why that is safe.
-                resend_in_tx(tx, env, scope, &target).await
+                let outcome = resend_in_tx(tx, env, scope, &target).await?;
+                // Built HERE, from what the write actually did, and enqueued in the same
+                // transaction. `None` from the builder is the no-mail outcomes announcing
+                // nothing.
+                let resolved = event.and_then(|build| build(&outcome));
+                let borrowed = resolved.as_ref().map(OwnedDomainEvent::borrowed);
+                enqueue_domain_event(tx, env, scope, borrowed.as_ref()).await?;
+                Ok(outcome)
             },
             false,
         )
