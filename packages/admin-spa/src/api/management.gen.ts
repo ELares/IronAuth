@@ -354,7 +354,13 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List every deploy of a client's token hook, newest first. */
+        /**
+         * List a client's most recent token-hook deploys, newest first.
+         * @description NOT every deploy. The history is pruned to `TOKEN_HOOK_VERSION_RETENTION` on each write,
+         *     so this returns at most that many and an older version may have existed and been discarded.
+         *     Said here because "every deploy" is what this used to claim, and an operator who reads a
+         *     list of twenty as complete will conclude a version they remember was never deployed.
+         */
         get: operations["listTokenHookVersions"];
         put?: never;
         post?: never;
@@ -10200,7 +10206,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Every deploy, newest first */
+            /** @description The most recent deploys, newest first. The history is capped, so an older version may have been pruned */
             200: {
                 headers: {
                     [name: string]: unknown;

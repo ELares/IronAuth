@@ -1256,7 +1256,7 @@ func (c *Client) ListTenants(query url.Values) (*http.Response, error) {
 
 // ListTokenHookVersions performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions.
 //
-// List every deploy of a client's token hook, newest first.
+// List a client's most recent token-hook deploys, newest first.
 func (c *Client) ListTokenHookVersions(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/versions", query, nil)
 }

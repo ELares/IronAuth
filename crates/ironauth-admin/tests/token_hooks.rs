@@ -177,9 +177,31 @@ async fn the_data_plane_reads_a_hook_and_cannot_change_one() {
         "the issuance path must be able to read the hook it is going to run"
     );
 
-    // And CANNOT change one. Raw statements on the data plane's pool, because the point is the
-    // GRANT: privileges are checked before row-level security, so a missing grant is an ERROR
-    // rather than an empty result, and only the error proves the split.
+    // THE HISTORY TABLE IS INVISIBLE TO IT ENTIRELY -- not even SELECT.
+    //
+    // 0165 grants `token_hook_versions` to the control plane alone and says so, and nothing
+    // tested it: the table was named in zero tests, so a later `GRANT SELECT ... TO
+    // ironauth_app` would leave every test passing while handing the data plane the component
+    // bytes of up to twenty historical hooks per client -- including ones deliberately
+    // withdrawn. Nothing on the issuance path reads history, so the honest grant is none.
+    let history = sqlx::query("SELECT 1 FROM token_hook_versions WHERE client_id = $1")
+        .bind(&client)
+        .fetch_optional(harness.db().app_pool())
+        .await
+        .expect_err("the data plane must not read hook history");
+    assert_eq!(
+        history
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_default(),
+        "42501",
+        "refused by the GRANT, not by row-level security: {history}"
+    );
+
+    // And CANNOT change the ACTIVE hook either. Raw statements on the data plane's pool,
+    // because the point is the GRANT: privileges are checked before row-level security, so a
+    // missing grant is an ERROR rather than an empty result, and only the error proves it.
     //
     // ALL THREE WRITE VERBS. The doc above says "installing", which is INSERT, and the first
     // version of this loop drove only DELETE and UPDATE -- so the one verb the prose named was

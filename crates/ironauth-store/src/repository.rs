@@ -32482,11 +32482,21 @@ impl ActingTokenHookRepo<'_> {
                 // target that never ran or a running hook nobody can roll back from.
                 //
                 // The number is `MAX(version) + 1` for this client, read inside the
-                // transaction. `write_audited` already holds the per-scope append lock by the
-                // time the enqueue below runs, but this statement does not depend on that:
-                // the PRIMARY KEY on (scope, client, version) is what makes two concurrent
-                // deploys of one client resolve to a conflict rather than to two rows sharing
-                // a number.
+                // transaction, and what serialises it is the UPSERT ABOVE.
+                //
+                // That upsert takes the row lock on (tenant, environment, client), so a second
+                // deploy of the same client blocks there; `begin_scoped` pins READ COMMITTED,
+                // so when it proceeds its next statement takes a fresh snapshot that already
+                // sees the winner's committed history row and computes the next number.
+                // Review ran the race on a real cluster: two staggered deploys produced 1 and
+                // 2, then 3 and 4, with no duplicate-key error in either round.
+                //
+                // SO THE INVARIANT IS THAT THE UPSERT STAYS FIRST IN THIS CLOSURE. An earlier
+                // version of this comment credited a per-scope append lock -- which
+                // `write_audited` does not take; that term means the advisory lock, and only
+                // `publish_snapshot_inner` and `append_event` take it -- and credited the
+                // PRIMARY KEY, which is a backstop the race never reaches. Naming the wrong
+                // mechanism is how a later reorder ships believing it is covered.
                 sqlx::query(
                     "INSERT INTO token_hook_versions \
                      (tenant_id, environment_id, client_id, version, component, \

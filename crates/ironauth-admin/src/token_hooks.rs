@@ -510,7 +510,12 @@ mod tests {
     }
 }
 
-/// List every deploy of a client's token hook, newest first.
+/// List a client's most recent token-hook deploys, newest first.
+///
+/// NOT every deploy. The history is pruned to `TOKEN_HOOK_VERSION_RETENTION` on each write,
+/// so this returns at most that many and an older version may have existed and been discarded.
+/// Said here because "every deploy" is what this used to claim, and an operator who reads a
+/// list of twenty as complete will conclude a version they remember was never deployed.
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions",
@@ -523,7 +528,7 @@ mod tests {
     ),
     security(("bearer" = [])),
     responses(
-        (status = 200, description = "Every deploy, newest first", body = Vec<TokenHookVersionView>),
+        (status = 200, description = "The most recent deploys, newest first. The history is capped, so an older version may have been pruned", body = Vec<TokenHookVersionView>),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Environment not found or malformed client id", body = ErrorBody)
@@ -542,6 +547,9 @@ pub async fn list_token_hook_versions(
     // AN EMPTY LIST, not a 404, when the client has never had a hook. "No versions" is a
     // complete and common answer to "what have I deployed", unlike `getTokenHook`, where
     // "no hook" and "an empty hook" would be opposite tokens.
+    //
+    // The list is CAPPED by the store's retention, not paginated. A cursor would imply the
+    // older pages exist; they do not, because the prune deleted them.
     let versions = state
         .store()
         .scoped(scope)

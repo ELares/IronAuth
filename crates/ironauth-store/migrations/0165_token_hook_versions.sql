@@ -13,7 +13,8 @@
 -- benefit of a management operation nobody performs during a login.
 --
 -- So `token_hooks` stays exactly what it was -- one row, the ACTIVE hook, read unchanged -- and
--- this table is the append-only history beside it. A deploy writes both. A rollback copies a
+-- this table is the history beside it: append-on-deploy, pruned to a retention bound, and
+-- never updated in place. A deploy writes both. A rollback copies a
 -- historical row back over the active one, which means rollback is a deploy of an older
 -- component and needs no second code path in the dispatch at all.
 --

@@ -728,7 +728,7 @@ class Client:
         return self._do("GET", f"/v1/tenants", query, None)
 
     def list_token_hook_versions(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
-        """List every deploy of a client's token hook, newest first. GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions."""
+        """List a client's most recent token-hook deploys, newest first. GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/versions", query, None)
 
     def list_trait_schema_versions(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
