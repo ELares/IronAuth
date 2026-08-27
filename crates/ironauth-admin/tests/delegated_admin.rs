@@ -3665,12 +3665,18 @@ async fn read_is_required_and_sufficient_for_listing_token_hook_versions() {
 
     restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
     let (status, _, response) = h.get_as(&path, &secret).await;
+    // THE 404 IS THE MALFORMED CLIENT ID, not an absent client, and the distinction matters
+    // because this endpoint cannot report an absent client: a well-formed one with no hook
+    // gets 200 and an empty list. `cli_absentclient` is not a well-formed identifier, so it
+    // fails `parse_client_id` -- which is exactly what makes it the right probe here. It is
+    // the only input that produces a non-200 past the permission gate without first deploying
+    // a hook, so 403 versus 404 still separates the gate from the handler.
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
-        "a read credential must reach the handler, which then reports the absent client. 403 \
-         versus 404 is what distinguishes the permission gate from the handler here, exactly \
-         as it does for every sibling on this surface: {response}"
+        "a read credential must reach the handler, which then refuses the malformed client \
+         id. 403 versus 404 is what distinguishes the permission gate from the handler here: \
+         {response}"
     );
 }
 

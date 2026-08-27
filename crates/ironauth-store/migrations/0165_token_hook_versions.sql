@@ -35,9 +35,21 @@ CREATE TABLE token_hook_versions (
     component       bytea       NOT NULL,
     payload_version integer     NOT NULL,
     failure_policy  text        NOT NULL,
-    -- WHO and WHEN, because the question a rollback is answering is "what did it look like
-    -- before the change that broke it", and that is a question about time.
-    created_at      timestamptz NOT NULL DEFAULT now(),
+    -- WHEN, AND ONLY WHEN. The question a rollback answers is "what did it look like before
+    -- the change that broke it", which is a question about time. There is deliberately no WHO
+    -- here: the actor is on the audit record for `token_hook.set`, which is the artifact that
+    -- exists to answer who, and duplicating it into a table with different retention would let
+    -- the two disagree about the same deploy.
+    --
+    -- `clock_timestamp()`, NOT `now()`. `now()` is `transaction_timestamp()` -- when the
+    -- transaction BEGAN -- and the serialisation this table depends on is precisely the case
+    -- where that is wrong: two concurrent deploys are ordered by the `token_hooks` row lock,
+    -- so the loser's version number is higher while its transaction started EARLIER. With
+    -- `now()` the history publishes a higher version carrying an earlier timestamp, and
+    -- `created_at_unix_micros` is what an operator reads to pick a rollback target.
+    -- `clock_timestamp()` is read at the moment of the INSERT, which is after the lock was
+    -- won, so it agrees with the version order.
+    created_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
 
     PRIMARY KEY (tenant_id, environment_id, client_id, version),
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
@@ -60,9 +72,12 @@ CREATE TABLE token_hook_versions (
         CHECK (failure_policy IN ('fail_closed', 'fail_open'))
 );
 
--- Newest first per client, which is the only order the surface lists them in.
-CREATE INDEX token_hook_versions_by_client
-    ON token_hook_versions (tenant_id, environment_id, client_id, version DESC);
+-- NO SECOND INDEX. An earlier revision added
+-- `(tenant_id, environment_id, client_id, version DESC)` for the newest-first listing, which is
+-- the PRIMARY KEY's own columns with the last one reversed -- and Postgres scans a btree
+-- backwards at the same cost, so it served no query the primary key did not already serve. It
+-- cost a second index to maintain on every deploy and a second set of pages on a table whose
+-- rows are megabytes each.
 
 ALTER TABLE token_hook_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE token_hook_versions FORCE ROW LEVEL SECURITY;

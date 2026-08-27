@@ -22,6 +22,15 @@ use sqlx::Row as _;
 /// The eight-byte preamble of a WebAssembly component: `\0asm` then the layer word.
 const COMPONENT: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
 
+/// Epoch MICROSECONDS at 2020-01-01 and 2100-01-01.
+///
+/// A window, not a floor, and in the unit the field is documented in. `created_at_unix_micros`
+/// was asserted only as `> 0`, which every wrong unit satisfies: seconds since the epoch is
+/// about 1.7e9 and milliseconds about 1.7e12, three and six orders of magnitude below a
+/// microsecond value. Bounding both sides in micros is what makes the unit observable.
+const MICROS_2020: i64 = 1_577_836_800_000_000;
+const MICROS_2100: i64 = 4_102_444_800_000_000;
+
 /// What `token_hooks.component_bounded` permits, and what the handler's own constant says.
 const MAX_COMPONENT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -605,10 +614,20 @@ async fn deploys_are_versioned_and_a_rollback_restores_an_earlier_one() {
     assert_eq!(listed[2]["version"], 1);
     assert_eq!(listed[2]["component_bytes"], COMPONENT.len());
     assert_eq!(listed[2]["failure_policy"], "fail_closed");
+    // A version records WHEN, because "what did it look like before" is a question about time.
+    //
+    // BOUNDED ON BOTH SIDES AND IN THE RIGHT UNIT. `> 0` was the assertion here, and every
+    // wrong unit satisfies it: seconds since the epoch is about 1.7e9, milliseconds about
+    // 1.7e12, and the field is documented as MICROSECONDS, about 1.7e15. The floor is
+    // 2020-01-01 in micros and the ceiling is 2100-01-01, so a seconds or millisecond value
+    // lands three orders of magnitude below the floor and fails.
+    let recorded = listed[0]["created_at_unix_micros"]
+        .as_i64()
+        .expect("an integer timestamp");
     assert!(
-        listed[0]["created_at_unix_micros"].as_i64().unwrap_or(0) > 0,
-        "a version records WHEN, because 'what did it look like before' is a question about \
-         time: {body}"
+        (MICROS_2020..MICROS_2100).contains(&recorded),
+        "created_at_unix_micros must be epoch MICROSECONDS, and {recorded} is not in \
+         [{MICROS_2020}, {MICROS_2100}): {body}"
     );
     assert!(
         listed.iter().all(|v| v.get("component").is_none()),
@@ -641,8 +660,13 @@ async fn deploys_are_versioned_and_a_rollback_restores_an_earlier_one() {
     );
 
     // AND THE HISTORY GREW. A rollback is a deploy of an older component, so it appends rather
-    // than rewinding: v1, v2, v3 -- where v3 is v1's bytes. Rewinding a pointer instead would
-    // make "version 1" mean two different things depending on when you asked.
+    // than rewinding: three deploys then a rollback to v2 leaves FOUR versions, where v4
+    // carries v2's bytes. Rewinding a pointer instead would make "version 2" mean two
+    // different components depending on when you asked.
+    //
+    // (This comment said "v1, v2, v3 -- where v3 is v1's bytes", which contradicted both
+    // assertions immediately below it: the count is four and the newest carries v2's bytes,
+    // not v1's.)
     let (_, _, body) = harness.get(&format!("{base}/versions")).await;
     let listed: serde_json::Value = serde_json::from_str(&body).expect("versions parse");
     let listed = listed.as_array().expect("an array");
@@ -653,6 +677,118 @@ async fn deploys_are_versioned_and_a_rollback_restores_an_earlier_one() {
         second.len(),
         "v4 is v2's bytes, recorded as its own deploy rather than rewinding v2 -- so a version \
          number never means two different components: {body}"
+    );
+}
+
+/// THE PUBLISHED CAP IS THE REAL CAP.
+///
+/// `listTokenHookVersions`'s 200 description says "At most 20", because an API consumer cannot
+/// resolve a Rust constant name and the previous wording ("the history is capped") told them
+/// nothing they could plan against. A number written into a doc attribute is a number that
+/// will disagree with the constant beside it, so this reads BOTH: the constant that the prune
+/// actually binds, and the description in the committed OpenAPI document that clients read.
+///
+/// It fails if either moves without the other. Changing `TOKEN_HOOK_VERSION_RETENTION` and
+/// regenerating leaves the description saying 20; changing the description alone leaves it
+/// disagreeing with the prune.
+#[test]
+fn the_published_version_cap_matches_the_retention_the_prune_enforces() {
+    let document = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/openapi/management.json"
+    ))
+    .expect("the committed OpenAPI document");
+    let document: serde_json::Value = serde_json::from_str(&document).expect("parse");
+
+    // Located by OPERATION ID rather than by path, so a route move does not silently turn this
+    // into a test of nothing.
+    let description = document["paths"]
+        .as_object()
+        .expect("paths")
+        .values()
+        .filter_map(|item| item.get("get"))
+        .find(|op| op["operationId"] == "listTokenHookVersions")
+        .map(|op| op["responses"]["200"]["description"].to_string())
+        .expect("listTokenHookVersions must be in the published document");
+
+    let retention = ironauth_store::TOKEN_HOOK_VERSION_RETENTION;
+    assert!(
+        description.contains(&format!("At most {retention}")),
+        "the published cap and the retention the prune enforces disagree. The prune keeps \
+         {retention}; the document says: {description}"
+    );
+}
+
+/// A ROLLBACK THAT CHANGES NOTHING WRITES NOTHING, which is what makes retrying one safe.
+///
+/// This endpoint takes no `Idempotency-Key`, unlike the create-shaped POSTs on this surface.
+/// The justification is that a rollback names an existing version rather than minting an
+/// identity, so replaying it is inert -- and that is only true if a rollback to what is
+/// already running appends no version. Without this the history is SPENDABLE: a client
+/// retrying a rollback it already completed (a timeout, a lost response, a doubled click)
+/// writes a fresh identical version each time, and `RETENTION` retries delete every real one.
+///
+/// The retry here is byte-identical, which is what a retry is. The FIRST rollback must still
+/// append, or this test would pass against a rollback that never wrote anything at all.
+#[tokio::test]
+async fn a_repeated_rollback_writes_no_second_version() {
+    let harness = Harness::start(231).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    let mut second = COMPONENT.to_vec();
+    second.extend_from_slice(b"the second deploy");
+    for component in [COMPONENT, second.as_slice()] {
+        let (status, _, body) = harness
+            .put_bytes(&format!("{base}?payload_version=1"), component)
+            .await;
+        assert_eq!(status, StatusCode::OK, "deploy: {body}");
+    }
+
+    // Back to v1. This one DOES change the active row, so it appends: two deploys plus one
+    // rollback is three versions.
+    let (status, _, body) = harness
+        .post(&format!("{base}/rollback"), "k-rb-1", r#"{"version":1}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK, "the first rollback: {body}");
+    let (_, _, body) = harness.get(&format!("{base}/versions")).await;
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        listed.as_array().expect("array").len(),
+        3,
+        "a rollback that changes the active row appends, or the retry below proves nothing: \
+         {body}"
+    );
+
+    // THE RETRY. Same version, same bytes, and v1 is still in the history -- so this is a
+    // successful 200 that must nevertheless write nothing.
+    let (status, _, body) = harness
+        .post(&format!("{base}/rollback"), "k-rb-2", r#"{"version":1}"#)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a retry reports the state it found, not an error: {body}"
+    );
+    assert!(
+        body.contains(&format!("\"component_bytes\":{}", COMPONENT.len())),
+        "and it reports what is running, which is still v1's component: {body}"
+    );
+
+    let (_, _, body) = harness.get(&format!("{base}/versions")).await;
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let listed = listed.as_array().expect("array");
+    assert_eq!(
+        listed.len(),
+        3,
+        "the retry appended nothing: a rollback to what is already running is inert, which is \
+         the entire reason this endpoint needs no Idempotency-Key: {body}"
+    );
+    assert_eq!(
+        listed[0]["version"], 3,
+        "and it did not renumber anything either: {body}"
     );
 }
 
@@ -722,6 +858,32 @@ async fn the_version_history_is_pruned_to_the_retention_bound() {
     let client = Harness::fresh_client_id(scope);
     let base = hook_path(&tenant, &env, &client);
 
+    // A SECOND CLIENT IN THE SAME ENVIRONMENT, deployed once BEFORE the loop below.
+    //
+    // Row-level security on `token_hook_versions` scopes tenant and environment and NOT client,
+    // so the only thing holding two clients' histories apart is a hand-written
+    // `AND client_id = $3` in three statements: the version numbering, the prune, and the list.
+    // Every test in this file used exactly one client per environment, and all three predicates
+    // could be deleted with the whole file still green -- measured, one mutant each. Without
+    // the numbering predicate this client's first deploy is numbered 2; without the list
+    // predicate the listing below returns the neighbour's row too; without the prune predicate
+    // the loop deletes the neighbour's only version.
+    let neighbour = Harness::fresh_client_id(scope);
+    let neighbour_base = hook_path(&tenant, &env, &neighbour);
+    let mut neighbour_component = COMPONENT.to_vec();
+    neighbour_component.extend_from_slice(b"the neighbour");
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{neighbour_base}?payload_version=1"),
+            &neighbour_component,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the neighbour's only deploy: {body}"
+    );
+
     // Two past the bound, so the assertion is about the BOUND and not about "some pruning
     // happened": exactly `RETENTION` must survive and exactly the newest ones.
     let deploys = usize::try_from(ironauth_store::TOKEN_HOOK_VERSION_RETENTION).expect("fits") + 2;
@@ -757,5 +919,32 @@ async fn the_version_history_is_pruned_to_the_retention_bound() {
         listed[listed.len() - 1]["version"],
         i32::try_from(oldest_kept).expect("fits"),
         "and the window is the newest N, so the oldest survivor is deploys - N + 1: {body}"
+    );
+
+    // THE NEIGHBOUR IS UNTOUCHED. One version, numbered 1, with its own bytes.
+    //
+    // Each clause pins a different predicate: `len() == 1` fails without the PRUNE's client
+    // predicate (this client's twenty-two deploys would have taken the neighbour's only row)
+    // and without the LIST's; `version == 1` fails without the NUMBERING's, because the
+    // neighbour would have been numbered after whatever else the environment held; and the
+    // byte count fails if the list crossed clients and returned this client's rows instead.
+    let (status, _, body) = harness.get(&format!("{neighbour_base}/versions")).await;
+    assert_eq!(status, StatusCode::OK);
+    let neighbour_listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let neighbour_listed = neighbour_listed.as_array().expect("array");
+    assert_eq!(
+        neighbour_listed.len(),
+        1,
+        "the neighbour deployed once and this client's twenty-two deploys must not have \
+         numbered, listed or pruned across the client boundary: {body}"
+    );
+    assert_eq!(
+        neighbour_listed[0]["version"], 1,
+        "version numbering is per CLIENT, not per environment: {body}"
+    );
+    assert_eq!(
+        neighbour_listed[0]["component_bytes"],
+        neighbour_component.len(),
+        "and the row listed is the neighbour's own: {body}"
     );
 }

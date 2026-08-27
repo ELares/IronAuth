@@ -528,7 +528,7 @@ mod tests {
     ),
     security(("bearer" = [])),
     responses(
-        (status = 200, description = "The most recent deploys, newest first. The history is capped, so an older version may have been pruned", body = Vec<TokenHookVersionView>),
+        (status = 200, description = "The most recent deploys, newest first. At most 20: the history is capped, so an older version may have existed and been pruned", body = Vec<TokenHookVersionView>),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Environment not found or malformed client id", body = ErrorBody)
@@ -572,6 +572,18 @@ pub async fn list_token_hook_versions(
 }
 
 /// Roll a client's token hook back to an earlier version.
+///
+/// A rollback is a DEPLOY of an older component, not a rewind: it appends a new version whose
+/// bytes are the named one's. So the number an operator asked for is not the number that ends
+/// up active, and the response reports what is RUNNING rather than echoing the request.
+///
+/// # Why it takes no `Idempotency-Key`
+///
+/// Unlike the create-shaped POSTs on this surface, which mint an identity a replay must not
+/// mint twice. This names an existing version, and the store makes a rollback to what is
+/// already running write nothing -- so a retry after a lost response is inert rather than a
+/// second deploy that spends a slot of the capped history. That inertness is the whole
+/// justification, and it is asserted in `a_repeated_rollback_writes_no_second_version`.
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback",
@@ -585,11 +597,11 @@ pub async fn list_token_hook_versions(
     ),
     security(("bearer" = [])),
     responses(
-        (status = 200, description = "Rolled back; the named version is active again", body = TokenHookView),
+        (status = 200, description = "Rolled back. A NEW version carrying that component is now active, because a rollback is a deploy of an older component rather than a rewind; the response reports what is running. Rolling back to what is already running writes nothing and is safe to retry", body = TokenHookView),
         (status = 400, description = "An unreadable body", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Environment not found, malformed client id, or no such version", body = ErrorBody)
+        (status = 404, description = "Environment not found, malformed client id, or no such version. A version that existed can become no-such-version: the history is capped, so a number read from an older listing may since have been pruned", body = ErrorBody)
     )
 )]
 pub async fn rollback_token_hook(

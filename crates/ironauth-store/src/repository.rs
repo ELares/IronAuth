@@ -32546,7 +32546,12 @@ impl ActingTokenHookRepo<'_> {
         .await
     }
 
-    /// Every deploy of this client's hook, newest first (issue #114 criterion 5).
+    /// This client's most recent hook deploys, newest first (issue #114 criterion 5).
+    ///
+    /// NOT every deploy, and this is the sentence the retraction in the admin handler came
+    /// from: the prune below caps the history at [`TOKEN_HOOK_VERSION_RETENTION`], so an older
+    /// version may have existed and been discarded. Correcting the claim at the HTTP layer and
+    /// leaving it standing here is how the next caller of this method re-publishes it.
     ///
     /// METADATA only: `octet_length` rather than the component, because a version list answers
     /// "what did I deploy and when" and returning five components would be a forty-megabyte
@@ -32598,9 +32603,14 @@ impl ActingTokenHookRepo<'_> {
     /// A rollback is a DEPLOY of an older component, which is why it takes the ordinary write
     /// path and appends a new version of its own rather than rewinding a pointer. Two
     /// consequences worth stating: the dispatch needs no second code path -- it reads the
-    /// active row it always read -- and the history stays append-only, so rolling back to v2
-    /// and then forward again leaves v4 and v5 recording both, rather than a version number
-    /// that means two different components.
+    /// active row it always read -- and a version number never means two different components,
+    /// so rolling back to v2 and then forward again leaves v4 and v5 recording both.
+    ///
+    /// The history is APPEND-ON-DEPLOY AND PRUNED, not append-only: this appends, and the
+    /// prune in [`Self::set_with_event`] then drops anything past
+    /// [`TOKEN_HOOK_VERSION_RETENTION`]. A rollback therefore consumes a retention slot, and
+    /// rolling back to the OLDEST surviving version can be the write that prunes it -- see the
+    /// no-op below, which is what keeps a repeated rollback from spending the history.
     ///
     /// # Errors
     ///
@@ -32628,6 +32638,18 @@ impl ActingTokenHookRepo<'_> {
         .bind(version)
         .fetch_optional(&mut *read)
         .await?;
+        // THE ACTIVE ROW, read in the SAME transaction as the target, so the comparison below
+        // is against one consistent picture rather than two reads a concurrent deploy can slip
+        // between.
+        let active = sqlx::query(
+            "SELECT component, payload_version, failure_policy FROM token_hooks \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client.to_string())
+        .fetch_optional(&mut *read)
+        .await?;
         read.commit().await?;
         // NOT FOUND rather than a silent no-op, for the reason the delete gives: reporting
         // success for a version this client never had tells an operator their rollback took
@@ -32638,6 +32660,32 @@ impl ActingTokenHookRepo<'_> {
         let component: Vec<u8> = row.get("component");
         let payload_version: i32 = row.get("payload_version");
         let failure_policy = failure_policy_from_row(row.get("failure_policy"))?;
+
+        // A ROLLBACK THAT CHANGES NOTHING WRITES NOTHING.
+        //
+        // Without this, rolling back to the version that is already running still appends a
+        // version and still prunes -- so a client retrying a rollback it already completed
+        // (a timeout, a lost response, an operator clicking twice) SPENDS THE HISTORY: twenty
+        // retries of a successful rollback leave twenty identical versions and delete every
+        // real one. This endpoint takes no `Idempotency-Key`, unlike the create-shaped POSTs
+        // on this surface, and the reason is that a rollback names a version rather than
+        // minting an identity; that only holds if replaying one is genuinely inert, which is
+        // what this makes true.
+        //
+        // Compared on the FULL COMPONENT, not on its length: two different hooks of equal size
+        // are the case a byte count cannot tell apart, and it is the case that matters.
+        if let Some(active) = active {
+            let active_component: Vec<u8> = active.get("component");
+            let active_payload_version: i32 = active.get("payload_version");
+            let active_failure_policy = failure_policy_from_row(active.get("failure_policy"))?;
+            if active_component == component
+                && active_payload_version == payload_version
+                && active_failure_policy == failure_policy
+            {
+                return Ok(());
+            }
+        }
+
         self.set_with_event(
             env,
             client,

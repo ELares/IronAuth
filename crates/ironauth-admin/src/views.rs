@@ -1966,7 +1966,15 @@ pub struct TokenHookVersionView {
 /// The body of a token-hook rollback (issue #114 criterion 5).
 #[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
 pub struct RollbackTokenHookRequest {
-    /// The version to make active again. It must be one this client has deployed.
+    /// The version whose component to deploy again.
+    ///
+    /// It must be one still IN THE HISTORY, which is not the same as one this client has
+    /// deployed: the history is capped, so a number read from an older listing may since have
+    /// been pruned and now answers 404. List the versions and take the number from that
+    /// response rather than from a record of what was deployed.
+    ///
+    /// Note that the version that becomes active is a NEW one carrying this version's
+    /// component, not this number: a rollback is a deploy, not a rewind.
     pub version: i32,
 }
 

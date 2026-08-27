@@ -339,7 +339,20 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Roll a client's token hook back to an earlier version. */
+        /**
+         * Roll a client's token hook back to an earlier version.
+         * @description A rollback is a DEPLOY of an older component, not a rewind: it appends a new version whose
+         *     bytes are the named one's. So the number an operator asked for is not the number that ends
+         *     up active, and the response reports what is RUNNING rather than echoing the request.
+         *
+         *     # Why it takes no `Idempotency-Key`
+         *
+         *     Unlike the create-shaped POSTs on this surface, which mint an identity a replay must not
+         *     mint twice. This names an existing version, and the store makes a rollback to what is
+         *     already running write nothing -- so a retry after a lost response is inert rather than a
+         *     second deploy that spends a slot of the capped history. That inertness is the whole
+         *     justification, and it is asserted in `a_repeated_rollback_writes_no_second_version`.
+         */
         post: operations["rollbackTokenHook"];
         delete?: never;
         options?: never;
@@ -6875,7 +6888,15 @@ export interface components {
         RollbackTokenHookRequest: {
             /**
              * Format: int32
-             * @description The version to make active again. It must be one this client has deployed.
+             * @description The version whose component to deploy again.
+             *
+             *     It must be one still IN THE HISTORY, which is not the same as one this client has
+             *     deployed: the history is capped, so a number read from an older listing may since have
+             *     been pruned and now answers 404. List the versions and take the number from that
+             *     response rather than from a record of what was deployed.
+             *
+             *     Note that the version that becomes active is a NEW one carrying this version's
+             *     component, not this number: a rollback is a deploy, not a rewind.
              */
             version: number;
         };
@@ -10143,7 +10164,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Rolled back; the named version is active again */
+            /** @description Rolled back. A NEW version carrying that component is now active, because a rollback is a deploy of an older component rather than a rewind; the response reports what is running. Rolling back to what is already running writes nothing and is safe to retry */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -10179,7 +10200,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Environment not found, malformed client id, or no such version */
+            /** @description Environment not found, malformed client id, or no such version. A version that existed can become no-such-version: the history is capped, so a number read from an older listing may since have been pruned */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -10206,7 +10227,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The most recent deploys, newest first. The history is capped, so an older version may have been pruned */
+            /** @description The most recent deploys, newest first. At most 20: the history is capped, so an older version may have existed and been pruned */
             200: {
                 headers: {
                     [name: string]: unknown;
