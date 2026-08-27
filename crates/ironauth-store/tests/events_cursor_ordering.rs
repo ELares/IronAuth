@@ -438,6 +438,13 @@ async fn the_feed_orders_by_sequence_which_is_not_commit_order() {
     // them in the opposite order to the order they became visible. Criterion 2 therefore
     // needs a commit-ordered appender, not this. Recorded as a measurement rather than an
     // opinion, because the two criteria look adjacent and are satisfied by different things.
+    //
+    // STILL TRUE, and still passing, after the production insert started taking the append
+    // lock. This test inserts with `insert_returning_sequence`, which is hand-written SQL
+    // that goes nowhere near `enqueue_outbox_in_tx`, so it measures the RAW table and shows
+    // what the table does without the lock. That is what makes it the control for
+    // `an_event_enqueue_blocks_on_the_per_scope_append_lock` below: same two-overlapping-
+    // writers shape, one through raw SQL and one through the shipped path, opposite results.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -476,13 +483,11 @@ async fn the_feed_orders_by_sequence_which_is_not_commit_order() {
 /// The per-scope lock key a serialized appender takes. Derived from the scope so two
 /// environments never serialise against each other.
 fn appender_lock_key(tenant: &str, environment: &str) -> i64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    tenant.hash(&mut hasher);
-    environment.hash(&mut hasher);
-    // Postgres advisory locks take a signed 64-bit key.
-    i64::from_ne_bytes(hasher.finish().to_ne_bytes())
+    // THE PRODUCTION DERIVATION, not a copy of it. This was a hand-written duplicate of the
+    // hashing in `repository.rs`, which is a copy that cannot fail loudly: change one side
+    // and the tests take a DIFFERENT lock from the code, two writers on two keys never
+    // contend, and every ordering test here passes while measuring nothing at all.
+    ironauth_store::append_lock_key_from_parts(tenant, environment)
 }
 
 #[tokio::test]
@@ -933,4 +938,199 @@ async fn a_second_scopes_feed_is_readable_from_the_beginning() {
         seen, 3,
         "a beginning cursor must be handed this scope's OWN events, and only those"
     );
+}
+
+/// The exact key a given scope derives, pinned.
+///
+/// This is here because of what the derivation USED to be. `DefaultHasher` is deterministic
+/// within one Rust release and explicitly not guaranteed across releases, and the old
+/// `to_ne_bytes` was not guaranteed across architectures. Neither could be caught by any
+/// test that derives the expected value the same way the code does, because both sides move
+/// together: the only thing that catches it is a literal, written down once.
+///
+/// It matters because of WHEN it would break. Two nodes built on different toolchains derive
+/// two different keys for one scope, take two different locks, and stop serialising against
+/// each other. The feed quietly stops being commit-ordered for the length of a rolling
+/// upgrade and silently starts again at the end of it, leaving nothing behind to find.
+///
+/// If this fails, the derivation changed. That is allowed, but it is a coordinated upgrade:
+/// every node must agree on the key, so a change has to ship behind a version the whole
+/// fleet moves through, not in the same release as the code that depends on it.
+#[test]
+fn the_append_lock_key_is_pinned() {
+    assert_eq!(
+        ironauth_store::append_lock_key_from_parts(
+            "tnt_pinned_for_the_key_test",
+            "env_pinned_for_the_key_test",
+        ),
+        -7_666_221_150_003_507_989,
+        "the append lock key derivation changed; see this test's doc comment before \
+         updating the constant"
+    );
+}
+
+/// Two scopes that concatenate to the same bytes must NOT share a lock.
+///
+/// The derivation is length-delimited specifically to prevent this. Without the delimiters
+/// ("ab", "c") and ("a", "bc") hash identically, and two unrelated environments serialise
+/// every event write against each other: a throughput fault with no error, no log line, and
+/// nothing that would ever point at a hash function.
+#[test]
+fn scopes_that_concatenate_alike_get_different_keys() {
+    assert_ne!(
+        ironauth_store::append_lock_key_from_parts("ab", "c"),
+        ironauth_store::append_lock_key_from_parts("a", "bc"),
+        "the length delimiters are what separate these two scopes"
+    );
+}
+
+/// A valid `ban.created` envelope, so the emit-time catalog guard admits it.
+fn valid_event_envelope(scope: ironauth_store::Scope, id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "type": "ban.created",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        "payload": {
+            "ban_id": "ban_ordering_probe",
+            "subject_kind": "identifier",
+            "auth_path": "password",
+        },
+    })
+}
+
+/// #107 CRITERION 2, on the path a deployment actually takes.
+///
+/// `append_event` has taken the append lock since #805 and
+/// `append_event_serialises_so_the_repo_feed_is_in_commit_order` proves it. But that method
+/// has zero production callers: every real event reaches the table through
+/// `enqueue_domain_event` -> `enqueue_outbox_in_tx`, which took no lock at all. So the
+/// criterion was proven for a path nothing exercises and false for the one everything uses,
+/// and no test could notice, because the test that proves it calls the method directly.
+///
+/// This drives the shipped `OutboxRepo::enqueue` instead, which is the same insert every
+/// domain producer reaches, and asserts it BLOCKS on the lock. Blocking is the whole
+/// mechanism: a writer that cannot reach its insert cannot be handed a sequence, so
+/// sequences are handed out in commit order necessarily rather than usually.
+///
+/// It asserts blocking rather than racing two writers and checking who won. Who wins is a
+/// race and would be a flake; whether this path takes the lock at all is a fact, and holding
+/// the lock from another session makes it observable.
+#[tokio::test]
+async fn an_event_enqueue_blocks_on_the_per_scope_append_lock() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let key = appender_lock_key(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    );
+
+    // An unrelated session holds the scope's append lock and does not let go.
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *holder)
+        .await
+        .expect("holder takes the lock");
+
+    let store = db.store().clone();
+    let envelope = valid_event_envelope(scope, "evt_prod_path_blocks");
+    let enqueue_env = env.clone();
+    let enqueueing = tokio::spawn(async move {
+        store
+            .scoped(scope)
+            .outbox()
+            .enqueue(
+                &enqueue_env,
+                &NewOutboxMessage {
+                    consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                    idempotency_key: "evt_prod_path_blocks",
+                    ordering_key: "k",
+                    payload: envelope,
+                },
+            )
+            .await
+            .expect("enqueue completes once the lock is free")
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !enqueueing.is_finished(),
+        "the ordinary event insert must BLOCK on the per-scope append lock. If it finished \
+         while another session held the lock, this path does not take the lock, and #107 \
+         criterion 2 holds only for `append_event`, which nothing calls."
+    );
+
+    holder.commit().await.expect("holder releases the lock");
+    enqueueing
+        .await
+        .expect("the enqueue finishes once unblocked");
+}
+
+/// The NEGATIVE, varying exactly one thing: the consumer.
+///
+/// Same scope, same envelope, same idempotency key, same held lock. Only `consumer` differs,
+/// so a pass here cannot be explained by anything except the consumer check inside
+/// `take_event_append_lock`.
+///
+/// It matters because the cheapest wrong way to write the lock -- take it on every insert --
+/// passes the test above and serialises webhook fan-out against event production for no
+/// benefit. `events_after` serves every row in the scope regardless of consumer, which makes
+/// "lock everything" look correct until you notice that interleaving a delivery row between
+/// two events changes the sequences the events get and not their order relative to each
+/// other, which is all criterion 2 asks for.
+#[tokio::test]
+async fn a_delivery_enqueue_does_not_block_on_the_append_lock() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let key = appender_lock_key(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    );
+
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *holder)
+        .await
+        .expect("holder takes the lock");
+
+    let store = db.store().clone();
+    let envelope = valid_event_envelope(scope, "evt_prod_path_blocks");
+    let enqueue_env = env.clone();
+    let enqueueing = tokio::spawn(async move {
+        store
+            .scoped(scope)
+            .outbox()
+            .enqueue(
+                &enqueue_env,
+                &NewOutboxMessage {
+                    consumer: ironauth_store::WEBHOOK_DELIVERY_CONSUMER,
+                    idempotency_key: "evt_prod_path_blocks",
+                    ordering_key: "k",
+                    payload: envelope,
+                },
+            )
+            .await
+            .expect("a delivery message never waits on the event append lock")
+    });
+
+    // Long enough that a blocked task would still be blocked: the positive test above proves
+    // 300ms is not enough for a blocked one to finish.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        enqueueing.is_finished(),
+        "a delivery message must NOT take the event append lock. If it blocked here, the \
+         lock is unconditional, and every webhook fan-out now serialises against event \
+         production for a guarantee that only applies to events."
+    );
+
+    enqueueing.await.expect("the delivery enqueue succeeded");
+    holder.commit().await.expect("holder releases the lock");
 }

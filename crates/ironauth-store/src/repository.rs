@@ -22128,6 +22128,9 @@ async fn enqueue_outbox_in_tx_at_inner(
             );
         }
     }
+    // BEFORE the insert, so the sequence this row is handed cannot be handed out until the
+    // previous event producer in this scope has committed. See `take_event_append_lock`.
+    take_event_append_lock(tx, scope, message.consumer).await?;
     let id = OutboxMessageId::generate(env, &scope);
     let now_micros = epoch_micros(env.clock().now_utc());
     let due_micros = not_before_unix_micros.unwrap_or(now_micros);
@@ -22219,6 +22222,10 @@ async fn enqueue_outbox_in_tx_ignoring_conflict(
             );
         }
     }
+    // THE SECOND insert into `outbox_messages`, and so the second place this lock has to be
+    // taken. The emit-time assertion above was missed here once for exactly this reason: a
+    // rule enforced at "the insert" has to be enforced at BOTH of them.
+    take_event_append_lock(tx, scope, message.consumer).await?;
     let id = OutboxMessageId::generate(env, &scope);
     let now_micros = epoch_micros(env.clock().now_utc());
     let inserted = sqlx::query(
@@ -22536,17 +22543,113 @@ pub enum EventPage {
 /// Per SCOPE rather than global, so one tenant's append rate never gates another's. The
 /// hash is not a security boundary and does not need to be: a collision between two scopes
 /// costs unnecessary serialisation, never a wrong order.
-fn append_lock_key(scope: Scope) -> i64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+/// Take the per-scope append lock when the row being inserted is an EVENT, so the feed's
+/// sequence order is the order the producing transactions COMMITTED (issue #107 criterion 2).
+///
+/// # Why the insert and not the producer
+///
+/// [`OutboxRepo::append_event`] has taken this lock since #805 and is correct, but it has
+/// zero production callers: every real event reaches the table through
+/// [`enqueue_domain_event`] instead. So the criterion was proven for a path no deployment
+/// exercises and false for every path one does, which is invisible precisely because the
+/// test that proves it passes. Putting the lock at the INSERT means a producer cannot get
+/// this wrong by choosing the wrong entry point.
+///
+/// # Why only event rows
+///
+/// [`OutboxRepo::events_after`] does NOT filter by consumer: it serves every row in the
+/// scope and its readers filter afterwards (`ironauth_admin::usage` does exactly that). It
+/// would be easy to read that as "every insert must take the lock", and it is worth saying
+/// why it does not. Interleaving a delivery row between two event rows changes the
+/// SEQUENCES the events get, but not their ORDER relative to each other, and their relative
+/// order is the whole of what criterion 2 asks for. Locking delivery rows too would
+/// serialise webhook fan-out against event production and buy nothing.
+///
+/// This keeps the property [`OutboxRepo::append_event`]'s doc argues for -- "ordinary
+/// enqueue is unchanged and should not pay for it" -- while making it true of the path that
+/// actually needed it.
+///
+/// # What it costs
+///
+/// Event writes to ONE scope serialise from here to COMMIT. The lock is taken immediately
+/// before the insert, which in a domain write is the last statement, so the serialised
+/// window is an insert plus a commit rather than the whole transaction. It is per scope, so
+/// one tenant's write rate does not gate another's.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a persistence fault.
+async fn take_event_append_lock(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    consumer: &str,
+) -> Result<(), StoreError> {
+    if consumer != WEBHOOK_EVENT_CONSUMER {
+        return Ok(());
+    }
+    // Held until this transaction ends, by `pg_advisory_xact_lock`'s definition, so there is
+    // no unlock path to leak on an error return.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(append_lock_key(scope))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
 
-    let mut hasher = DefaultHasher::new();
-    scope.tenant().to_string().hash(&mut hasher);
-    scope.environment().to_string().hash(&mut hasher);
+/// The per-scope advisory lock key the commit-ordered appender takes.
+///
+/// # Why this is not `DefaultHasher`
+///
+/// It was, and that was safe only by accident. `DefaultHasher`'s output is explicitly not
+/// guaranteed stable across Rust releases, and `to_ne_bytes` is not stable across
+/// architectures. Nothing PERSISTS this key, so both looked harmless -- and both were,
+/// while the only caller was [`OutboxRepo::append_event`], which no production path calls.
+///
+/// Putting the lock on the ordinary event insert makes it load-bearing. Two nodes built with
+/// different toolchains would derive DIFFERENT keys for the same scope, take two different
+/// locks, and therefore not serialise against each other at all. The feed would quietly stop
+/// being commit-ordered for exactly as long as a rolling upgrade lasted, and would start
+/// again when it finished, leaving nothing behind to find.
+///
+/// SHA-256 over a length-delimited `(tenant, environment)` is stable across toolchains, and
+/// big-endian truncation is stable across architectures. `the_append_lock_key_is_pinned`
+/// fails if either changes.
+pub(crate) fn append_lock_key(scope: Scope) -> i64 {
+    append_lock_key_from_parts(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    )
+}
+
+/// [`append_lock_key`] over the raw scope parts.
+///
+/// Split out for two reasons, both of which are about keeping the derivation in ONE place.
+/// A `TenantId` can only be generated, never built from a literal, so a test that pins the
+/// derived constant needs this entry point. And `events_cursor_ordering.rs` used to carry
+/// its own hand-written copy of the derivation, which would take a DIFFERENT lock the moment
+/// this one changed: the tests would keep passing while measuring nothing, because two
+/// writers on two different keys never contend. It now calls this.
+#[must_use]
+pub fn append_lock_key_from_parts(tenant: &str, environment: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ironauth.outbox.append.v1\0");
+    // LENGTH-DELIMITED, so ("ab", "c") and ("a", "bc") cannot hash to one key. Concatenating
+    // them raw would let two unrelated environments serialise against each other, which is a
+    // throughput fault nothing would ever attribute to a hash.
+    hasher.update((tenant.len() as u64).to_be_bytes());
+    hasher.update(tenant.as_bytes());
+    hasher.update((environment.len() as u64).to_be_bytes());
+    hasher.update(environment.as_bytes());
+
+    let digest = hasher.finalize();
+    let mut key = [0u8; 8];
+    key.copy_from_slice(&digest[..8]);
     // Postgres advisory locks take a SIGNED 64-bit key. Reinterpreting the bits rather
     // than casting says that explicitly: every bit pattern is a valid key, so this is a
     // reinterpretation and not a narrowing that could lose one.
-    i64::from_ne_bytes(hasher.finish().to_ne_bytes())
+    i64::from_be_bytes(key)
 }
 /// One enqueued outbound message, as an operator reads it back (issue #111).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23609,6 +23712,12 @@ impl OutboxRepo<'_> {
         // Held until this transaction ends, by `pg_advisory_xact_lock`'s definition. That
         // is the property the ordering rests on: releasing it before commit would let the
         // next appender take a sequence while this one is still uncommitted.
+        //
+        // The insert underneath now takes this same lock too (`take_event_append_lock`), so
+        // this line is redundant for an event message and is NOT dead: it is what makes the
+        // guarantee unconditional for this entry point, whatever consumer a caller names.
+        // Advisory locks are re-entrant within a transaction, so taking it twice costs a
+        // round trip and nothing else.
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(append_lock_key(scope))
             .execute(&mut *tx)

@@ -124,6 +124,12 @@ pub mod idor_harness;
 #[cfg(feature = "testing")]
 pub mod test_support;
 
+/// The per-scope append lock key, so an ordering test takes the SAME lock the production
+/// insert takes rather than a hand-written copy of it. Present only under the `testing`
+/// feature: nothing outside the store has any business deriving this.
+#[cfg(feature = "testing")]
+pub use repository::append_lock_key_from_parts;
+
 pub use abuse::{AbuseBanView, AbuseSubject, AbuseSubjectKind, AuthPath, NewBan};
 pub use audit::{ActingContext, Action, ActorRef};
 pub use brand::{
