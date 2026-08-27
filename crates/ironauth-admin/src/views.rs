@@ -1945,6 +1945,31 @@ pub struct TokenHookView {
     pub failure_policy: String,
 }
 
+/// One historical deploy of a client's hook (issue #114 criterion 5).
+///
+/// METADATA, never the component -- the same reason `TokenHookView` withholds it, multiplied
+/// by however many versions exist.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct TokenHookVersionView {
+    /// Monotonic per client, starting at 1.
+    pub version: i32,
+    /// How many bytes that deploy's component was.
+    pub component_bytes: i32,
+    /// The payload version its guest was built against.
+    pub payload_version: i32,
+    /// The failure policy it was deployed with.
+    pub failure_policy: String,
+    /// When it was deployed, as epoch microseconds.
+    pub created_at_unix_micros: i64,
+}
+
+/// The body of a token-hook rollback (issue #114 criterion 5).
+#[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
+pub struct RollbackTokenHookRequest {
+    /// The version to make active again. It must be one this client has deployed.
+    pub version: i32,
+}
+
 /// The query parameters a token-hook deploy carries (issue #114).
 ///
 /// The version is REQUIRED rather than defaulted. A default would silently accept a guest built

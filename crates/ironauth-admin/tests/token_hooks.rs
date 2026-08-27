@@ -528,3 +528,160 @@ async fn a_real_compiled_component_is_accepted() {
         Some((i32::try_from(component.len()).expect("fits"), 1))
     );
 }
+
+/// Every deploy appends a VERSION, and a rollback makes an earlier one active again.
+///
+/// Issue #114 criterion 5's versioned-deploy and rollback halves. `token_hooks` holds one row
+/// and a redeploy overwrites it, so before the history table there was nothing to roll back TO
+/// -- the previous component was gone the moment the next one landed.
+#[tokio::test]
+async fn deploys_are_versioned_and_a_rollback_restores_an_earlier_one() {
+    let harness = Harness::start(226).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // v1: the bare preamble. v2: something longer, so the two are distinguishable by LENGTH
+    // rather than by a number this test also supplies.
+    let mut second = COMPONENT.to_vec();
+    second.extend_from_slice(b"the second deploy");
+    let mut third = COMPONENT.to_vec();
+    third.extend_from_slice(b"the third deploy, which is longer still");
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK, "v1: {body}");
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&failure_policy=fail_open"),
+            &second,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "v2: {body}");
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1"), &third)
+        .await;
+    assert_eq!(status, StatusCode::OK, "v3: {body}");
+
+    // TWO VERSIONS, newest first, and each remembers what it was deployed WITH -- the policy
+    // included, which is what makes a rollback restore a configuration rather than just bytes.
+    let (status, _, body) = harness.get(&format!("{base}/versions")).await;
+    assert_eq!(status, StatusCode::OK, "versions: {body}");
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("versions parse");
+    let listed = listed.as_array().expect("an array");
+    assert_eq!(listed.len(), 3, "one version per deploy: {body}");
+    assert_eq!(listed[0]["version"], 3, "newest first");
+    assert_eq!(listed[0]["component_bytes"], third.len());
+    assert_eq!(listed[1]["version"], 2);
+    assert_eq!(listed[1]["component_bytes"], second.len());
+    assert_eq!(
+        listed[1]["failure_policy"], "fail_open",
+        "each version remembers the policy it was deployed WITH, which is what makes a \
+         rollback restore a configuration rather than just bytes: {body}"
+    );
+    assert_eq!(listed[2]["version"], 1);
+    assert_eq!(listed[2]["component_bytes"], COMPONENT.len());
+    assert_eq!(listed[2]["failure_policy"], "fail_closed");
+    assert!(
+        listed[0]["created_at_unix_micros"].as_i64().unwrap_or(0) > 0,
+        "a version records WHEN, because 'what did it look like before' is a question about \
+         time: {body}"
+    );
+    assert!(
+        listed.iter().all(|v| v.get("component").is_none()),
+        "the list must not carry components; five versions would be a forty-megabyte answer"
+    );
+
+    // ROLL BACK to v2 -- the MIDDLE version. The active row becomes v2's component AND v2's
+    // policy, which is `fail_open`: a rollback restores the configuration, not just the bytes.
+    //
+    // Targeting the middle one is what makes this able to fail. Mutation hardcoded the lookup
+    // to version 1 and the test stayed green, because it only ever rolled back to v1.
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/rollback"),
+            "k-rollback-2",
+            r#"{"version":2}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "rollback: {body}");
+    assert!(
+        body.contains(&format!("\"component_bytes\":{}", second.len()))
+            && body.contains("\"failure_policy\":\"fail_open\""),
+        "the response reports what is NOW RUNNING, read back from the row rather than echoed \
+         from the request -- which carried neither of these numbers: {body}"
+    );
+    assert_eq!(
+        stored(&harness, &tenant, &env, &client).await,
+        Some((i32::try_from(second.len()).expect("fits"), 1)),
+        "the ACTIVE row is v2's component"
+    );
+
+    // AND THE HISTORY GREW. A rollback is a deploy of an older component, so it appends rather
+    // than rewinding: v1, v2, v3 -- where v3 is v1's bytes. Rewinding a pointer instead would
+    // make "version 1" mean two different things depending on when you asked.
+    let (_, _, body) = harness.get(&format!("{base}/versions")).await;
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("versions parse");
+    let listed = listed.as_array().expect("an array");
+    assert_eq!(listed.len(), 4, "the rollback appended: {body}");
+    assert_eq!(listed[0]["version"], 4);
+    assert_eq!(
+        listed[0]["component_bytes"],
+        second.len(),
+        "v4 is v2's bytes, recorded as its own deploy rather than rewinding v2 -- so a version \
+         number never means two different components: {body}"
+    );
+}
+
+/// Rolling back to a version this client never had is the uniform not-found, and changes
+/// nothing.
+#[tokio::test]
+async fn a_rollback_to_an_unknown_version_is_not_found_and_changes_nothing() {
+    let harness = Harness::start(227).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+    let (status, _, _) = harness
+        .put_bytes(&format!("{base}?payload_version=1"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/rollback"),
+            "k-rollback-99",
+            r#"{"version":99}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no such version: {body}");
+
+    // NOT a silent success: reporting one would tell an operator their rollback took effect
+    // and turn the endpoint into a probe for how many versions exist.
+    let (_, _, body) = harness.get(&format!("{base}/versions")).await;
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        listed.as_array().expect("array").len(),
+        1,
+        "a refused rollback appends nothing: {body}"
+    );
+}
+
+/// A client with no hook lists an EMPTY history rather than a not-found.
+///
+/// Deliberately unlike `getTokenHook`, where "no hook" and "an empty hook" would be opposite
+/// tokens. "Nothing deployed yet" is a complete and common answer to "what have I deployed".
+#[tokio::test]
+async fn a_client_with_no_hook_lists_no_versions() {
+    let harness = Harness::start(228).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+
+    let (status, _, body) = harness
+        .get(&format!("{}/versions", hook_path(&tenant, &env, &client)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "an empty history is a 200: {body}");
+    assert_eq!(body.trim(), "[]");
+}

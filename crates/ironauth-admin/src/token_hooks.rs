@@ -62,7 +62,9 @@ use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
-use crate::views::{DeployTokenHookQuery, TokenHookView};
+use crate::views::{
+    DeployTokenHookQuery, RollbackTokenHookRequest, TokenHookVersionView, TokenHookView,
+};
 
 /// The largest component this surface accepts, matching `token_hooks`' own CHECK.
 ///
@@ -506,4 +508,159 @@ mod tests {
         let error = validate_component(&over).expect_err("one byte over is refused");
         assert!(format!("{error:?}").contains("component_too_large"));
     }
+}
+
+/// List every deploy of a client's token hook, newest first.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions",
+    operation_id = "listTokenHookVersions",
+    tag = "token-hooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "Every deploy, newest first", body = Vec<TokenHookVersionView>),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found or malformed client id", body = ErrorBody)
+    )
+)]
+pub async fn list_token_hook_versions(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`.
+    principal.require_permission(ManagementPermission::Read)?;
+    let client = parse_client_id(&client_id, scope)?;
+
+    // AN EMPTY LIST, not a 404, when the client has never had a hook. "No versions" is a
+    // complete and common answer to "what have I deployed", unlike `getTokenHook`, where
+    // "no hook" and "an empty hook" would be opposite tokens.
+    let versions = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .token_hooks()
+        .versions(state.env(), &client)
+        .await?;
+    let view: Vec<TokenHookVersionView> = versions
+        .into_iter()
+        .map(|version| TokenHookVersionView {
+            version: version.version,
+            component_bytes: version.component_bytes,
+            payload_version: version.payload_version,
+            failure_policy: version.failure_policy.as_str().to_owned(),
+            created_at_unix_micros: version.created_at_unix_micros,
+        })
+        .collect();
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// Roll a client's token hook back to an earlier version.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback",
+    operation_id = "rollbackTokenHook",
+    tag = "token-hooks",
+    request_body = RollbackTokenHookRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "Rolled back; the named version is active again", body = TokenHookView),
+        (status = 400, description = "An unreadable body", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found, malformed client id, or no such version", body = ErrorBody)
+    )
+)]
+pub async fn rollback_token_hook(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    // A ROLLBACK IS A DEPLOY of an older component, so it demands exactly what the deploy
+    // does. It is also the break-glass path when a hook is failing logins, and that is an
+    // argument for the operation existing rather than for making it cheaper to reach: an
+    // attacker who can roll a client back to a hook that lacked a security-relevant claim has
+    // stripped it from every token that client is issued.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    let client = parse_client_id(&client_id, scope)?;
+    crate::org_context::require_live_environment(&state, &scope).await?;
+
+    let request: RollbackTokenHookRequest = crate::input::parse_json(&body)?;
+
+    // THE TARGET'S METADATA FIRST, because the event describes what will be RUNNING and this
+    // handler does not otherwise know: a rollback restores a component it never saw, so its
+    // byte count and payload version belong to the version, not to the request.
+    //
+    // It also turns "no such version" into a 404 before anything is written. The store checks
+    // again -- a concurrent delete between these two statements is real -- so this is the
+    // better error rather than the only one.
+    let target = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .token_hooks()
+        .versions(state.env(), &client)
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.version == request.version)
+        .ok_or(ApiError::NotFound)?;
+
+    let announced = deployed_event(
+        &state,
+        scope,
+        &client.to_string(),
+        usize::try_from(target.component_bytes).map_err(|_| ApiError::Internal)?,
+        u32::try_from(target.payload_version).map_err(|_| ApiError::Internal)?,
+    );
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .token_hooks()
+        .rollback_to(
+            state.env(),
+            &client,
+            request.version,
+            announced
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
+        .await?;
+
+    // READ BACK rather than echoing the request. A rollback restores a component this handler
+    // never saw, so its byte count and payload version come from the row, and reporting the
+    // request's own numbers would report what was asked for rather than what is now running.
+    let record = state
+        .store()
+        .scoped(scope)
+        .token_hooks()
+        .metadata(&client.to_string())
+        .await?
+        .ok_or(ApiError::Internal)?;
+    let view = TokenHookView {
+        client_id: record.client_id,
+        component_bytes: usize::try_from(record.component_bytes).map_err(|_| ApiError::Internal)?,
+        payload_version: u32::try_from(record.payload_version).map_err(|_| ApiError::Internal)?,
+        failure_policy: record.failure_policy.as_str().to_owned(),
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
 }

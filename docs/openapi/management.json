@@ -2617,6 +2617,199 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback": {
+      "post": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "Roll a client's token hook back to an earlier version.",
+        "operationId": "rollbackTokenHook",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hook shapes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RollbackTokenHookRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Rolled back; the named version is active again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenHookView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An unreadable body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, malformed client id, or no such version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions": {
+      "get": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "List every deploy of a client's token hook, newest first.",
+        "operationId": "listTokenHookVersions",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hook shapes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every deploy, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TokenHookVersionView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or malformed client id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture": {
       "put": {
         "tags": [
@@ -30328,6 +30521,20 @@
           }
         }
       },
+      "RollbackTokenHookRequest": {
+        "type": "object",
+        "description": "The body of a token-hook rollback (issue #114 criterion 5).",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The version to make active again. It must be one this client has deployed."
+          }
+        }
+      },
       "RoutingRuleListView": {
         "type": "object",
         "description": "A page of routing rules.",
@@ -31608,6 +31815,43 @@
           "status": {
             "type": "string",
             "description": "The lifecycle status: `active` or `suspended` (issue #46). A suspended\ntenant is fenced off the data plane but keeps all its data and stays visible\nhere."
+          }
+        }
+      },
+      "TokenHookVersionView": {
+        "type": "object",
+        "description": "One historical deploy of a client's hook (issue #114 criterion 5).\n\nMETADATA, never the component -- the same reason `TokenHookView` withholds it, multiplied\nby however many versions exist.",
+        "required": [
+          "version",
+          "component_bytes",
+          "payload_version",
+          "failure_policy",
+          "created_at_unix_micros"
+        ],
+        "properties": {
+          "component_bytes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many bytes that deploy's component was."
+          },
+          "created_at_unix_micros": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was deployed, as epoch microseconds."
+          },
+          "failure_policy": {
+            "type": "string",
+            "description": "The failure policy it was deployed with."
+          },
+          "payload_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The payload version its guest was built against."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Monotonic per client, starting at 1."
           }
         }
       },

@@ -3637,3 +3637,80 @@ async fn read_is_required_and_sufficient_for_a_token_hook_read() {
          {response}"
     );
 }
+
+/// `management.read` is required AND sufficient for listing a token hook's versions (#114).
+#[tokio::test]
+async fn read_is_required_and_sufficient_for_listing_token_hook_versions() {
+    let h = Harness::start(224).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-hook-versions").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/token-hook/versions"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential must not read a hook's history: {response}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a read credential must reach the handler, which then reports the absent client. 403 \
+         versus 404 is what distinguishes the permission gate from the handler here, exactly \
+         as it does for every sibling on this surface: {response}"
+    );
+}
+
+/// `management.write_config` is required AND sufficient for a token-hook ROLLBACK (#114).
+///
+/// Classified with the deploy rather than with the read, and pinned separately, because a
+/// rollback is a DEPLOY of an older component: it changes what every token this client is
+/// issued carries. An operator who can roll a client back to a hook that lacked a
+/// security-relevant claim has stripped that claim from every token.
+#[tokio::test]
+async fn write_config_is_required_and_sufficient_for_a_token_hook_rollback() {
+    let h = Harness::start(225).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-hook-rollback").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/token-hook/rollback"
+    );
+    let body = r#"{"version":1}"#;
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.post_as(&path, &secret, "k-rollback-denied", body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not roll a hook back: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.post_as(&path, &secret, "k-rollback-allowed", body).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_config credential reaches the handler, which reports the absent client: \
+         {response}"
+    );
+}

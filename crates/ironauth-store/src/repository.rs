@@ -126,6 +126,7 @@ use crate::store::Store;
 use crate::token_hook_store::HookFailurePolicy;
 use crate::token_hook_store::TokenHookMetadata;
 use crate::token_hook_store::TokenHookRecord;
+use crate::token_hook_store::TokenHookVersion;
 use crate::trait_schema::{TraitSchema, TransformOp, ValidationFailure};
 
 /// A store bound to one `(tenant, environment)` scope. Hands out the per-kind
@@ -32476,10 +32477,140 @@ impl ActingTokenHookRepo<'_> {
                 .bind(failure_policy.as_str())
                 .execute(&mut **tx)
                 .await?;
+                // THE HISTORY ROW, in the SAME transaction as the active one. A deploy that
+                // landed without its version, or a version without its deploy, is a rollback
+                // target that never ran or a running hook nobody can roll back from.
+                //
+                // The number is `MAX(version) + 1` for this client, read inside the
+                // transaction. `write_audited` already holds the per-scope append lock by the
+                // time the enqueue below runs, but this statement does not depend on that:
+                // the PRIMARY KEY on (scope, client, version) is what makes two concurrent
+                // deploys of one client resolve to a conflict rather than to two rows sharing
+                // a number.
+                sqlx::query(
+                    "INSERT INTO token_hook_versions \
+                     (tenant_id, environment_id, client_id, version, component, \
+                      payload_version, failure_policy) \
+                     SELECT $1, $2, $3, \
+                            COALESCE(MAX(version), 0) + 1, $4, $5, $6 \
+                     FROM token_hook_versions \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&bytes)
+                .bind(payload_version)
+                .bind(failure_policy.as_str())
+                .execute(&mut **tx)
+                .await?;
                 enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
+        )
+        .await
+    }
+
+    /// Every deploy of this client's hook, newest first (issue #114 criterion 5).
+    ///
+    /// METADATA only: `octet_length` rather than the component, because a version list answers
+    /// "what did I deploy and when" and returning five components would be a forty-megabyte
+    /// response to that question.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope; [`StoreError::Database`] on a
+    /// persistence fault.
+    pub async fn versions(
+        &self,
+        env: &Env,
+        client: &ClientId,
+    ) -> Result<Vec<TokenHookVersion>, StoreError> {
+        let _ = env;
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT version, octet_length(component) AS component_bytes, payload_version, \
+             failure_policy, (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM token_hook_versions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+             ORDER BY version DESC",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                Ok(TokenHookVersion {
+                    version: row.get("version"),
+                    component_bytes: row.get::<i32, _>("component_bytes"),
+                    payload_version: row.get("payload_version"),
+                    failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                    created_at_unix_micros: row.get("created_us"),
+                })
+            })
+            .collect()
+    }
+
+    /// Roll a client's hook back to an earlier version, audited as `token_hook.set`.
+    ///
+    /// A rollback is a DEPLOY of an older component, which is why it takes the ordinary write
+    /// path and appends a new version of its own rather than rewinding a pointer. Two
+    /// consequences worth stating: the dispatch needs no second code path -- it reads the
+    /// active row it always read -- and the history stays append-only, so rolling back to v2
+    /// and then forward again leaves v4 and v5 recording both, rather than a version number
+    /// that means two different components.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope or `version` is not one this
+    /// client has; [`StoreError::Database`] on a persistence fault.
+    pub async fn rollback_to(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        version: i32,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut read = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT component, payload_version, failure_policy FROM token_hook_versions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND version = $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client.to_string())
+        .bind(version)
+        .fetch_optional(&mut *read)
+        .await?;
+        read.commit().await?;
+        // NOT FOUND rather than a silent no-op, for the reason the delete gives: reporting
+        // success for a version this client never had tells an operator their rollback took
+        // effect, and turns the endpoint into a probe for how many versions exist.
+        let Some(row) = row else {
+            return Err(StoreError::NotFound);
+        };
+        let component: Vec<u8> = row.get("component");
+        let payload_version: i32 = row.get("payload_version");
+        let failure_policy = failure_policy_from_row(row.get("failure_policy"))?;
+        self.set_with_event(
+            env,
+            client,
+            &component,
+            payload_version,
+            failure_policy,
+            event,
         )
         .await
     }

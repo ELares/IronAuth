@@ -330,6 +330,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Roll a client's token hook back to an earlier version. */
+        post: operations["rollbackTokenHook"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List every deploy of a client's token hook, newest first. */
+        get: operations["listTokenHookVersions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture": {
         parameters: {
             query?: never;
@@ -6831,6 +6865,14 @@ export interface components {
             /** @description The signal name. */
             name: string;
         };
+        /** @description The body of a token-hook rollback (issue #114 criterion 5). */
+        RollbackTokenHookRequest: {
+            /**
+             * Format: int32
+             * @description The version to make active again. It must be one this client has deployed.
+             */
+            version: number;
+        };
         /** @description A page of routing rules. */
         RoutingRuleListView: {
             /** @description Every rule in this environment, by evaluation priority. */
@@ -7599,6 +7641,36 @@ export interface components {
              *     here.
              */
             status: string;
+        };
+        /**
+         * @description One historical deploy of a client's hook (issue #114 criterion 5).
+         *
+         *     METADATA, never the component -- the same reason `TokenHookView` withholds it, multiplied
+         *     by however many versions exist.
+         */
+        TokenHookVersionView: {
+            /**
+             * Format: int32
+             * @description How many bytes that deploy's component was.
+             */
+            component_bytes: number;
+            /**
+             * Format: int64
+             * @description When it was deployed, as epoch microseconds.
+             */
+            created_at_unix_micros: number;
+            /** @description The failure policy it was deployed with. */
+            failure_policy: string;
+            /**
+             * Format: int32
+             * @description The payload version its guest was built against.
+             */
+            payload_version: number;
+            /**
+             * Format: int32
+             * @description Monotonic per client, starting at 1.
+             */
+            version: number;
         };
         /**
          * @description A deployed WASM token hook, as an operator reads it back (issue #114).
@@ -10035,6 +10107,127 @@ export interface operations {
                 };
             };
             /** @description Environment not found, malformed client id, or no hook deployed */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    rollbackTokenHook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RollbackTokenHookRequest"];
+            };
+        };
+        responses: {
+            /** @description Rolled back; the named version is active again */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookView"];
+                };
+            };
+            /** @description An unreadable body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed client id, or no such version */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listTokenHookVersions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every deploy, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookVersionView"][];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or malformed client id */
             404: {
                 headers: {
                     [name: string]: unknown;
