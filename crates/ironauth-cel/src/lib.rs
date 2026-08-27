@@ -65,15 +65,38 @@
 //! [`compile_within_budget`] now returns a [`BudgetedProgram`], which carries the shape it was
 //! budgeted against and is the ONLY way to evaluate. Bindings go in as `serde_json::Value` and
 //! results come out as one, so a caller never needs `cel` in its own manifest; and
-//! `cel::Program::compile` is a `disallowed-methods` lint in `clippy.toml`, so reaching past
-//! this crate is a build failure rather than a convention. The three call sites inside this
-//! crate carry `#[expect]`, which is self-verifying: were the lint not firing, the expectation
-//! would be unfulfilled and the build would fail on that instead.
+//! `clippy.toml` names the type `cel::Program` and the parser alongside the two functions,
+//! and the call sites inside this crate carry `#[expect]`, which is self-verifying: were a
+//! lint not firing, the expectation would be unfulfilled and the build would fail on that.
+//!
+//! FOUR routes, because naming one was not enough and the difference was measured rather than
+//! reasoned about. A reviewer built a scratch crate carrying only the `Program::compile` entry
+//! and found `cel::Program::try_from(src)`, `let p: cel::Program = src.try_into()` and
+//! `cel::Value::resolve(&Parser::default().parse(src), &Context::default())` all SILENT --
+//! `TryFrom<&str> for Program` calls `compile` internally, and a path-based lint cannot see
+//! through to a different `DefId`. Naming the TYPE closes the constructor routes; naming
+//! `resolve` closes the one that never mentions `Program`.
+//!
+//! Said exactly: this is a lint, not a capability. A crate that adds `cel` to its own manifest
+//! and writes `#[allow(clippy::disallowed_types)]` is not stopped by it, and both of those are
+//! reviewable lines in a diff. What the lint buys is that bypassing the budget cannot happen
+//! by accident or by not knowing this crate exists.
 //!
 //! [`BudgetedProgram::evaluate`] also ENFORCES the declared shape rather than trusting it.
 //! `max_collection_size` is a promise the input document makes, the estimate is `n^(depth+1)`
-//! over that promise, and an input that breaks it costs more than the budget admitted. The
-//! declared bound and the enforced bound are now the same number checked in the same place.
+//! over that promise, and an input that breaks it costs more than the budget admitted.
+//!
+//! Two holes in that, both found by review measuring rather than arguing:
+//!
+//! - **The expression is an input too.** `n` was read only from the declared shape, so a
+//!   collection written as a LITERAL never passed through a binding and was never counted.
+//!   Measured: a 20,000-element literal under a declared 10 estimated 100, was admitted, and
+//!   ran 6.2 seconds. `n` is now the larger of what the caller declared and what the
+//!   expression carries.
+//! - **Strings are bounded separately.** One string is one element, so every cardinality check
+//!   passed while roughly 4 MB of compliant input allocated on the order of a gigabyte. Length
+//!   drives allocation, cardinality drives iteration, and the `n^(depth+1)` model sees only
+//!   the second, so [`InputShape::max_string_bytes`] is its own number.
 //!
 //! # What this crate still does NOT do
 //!
@@ -82,6 +105,10 @@
 //! is the weaker statement that any expression that DOES execute cannot avoid the budget. That
 //! is the enforceable half, and it is worth having in place before the first caller rather than
 //! after; it is not the criterion.
+//!
+//! What the model still does not see is per-element work that is not iteration: `matches`
+//! recompiles its regex per element, so an ADMITTED expression can still be expensive. That is
+//! open, and it is a property of the estimate rather than of the enforcement.
 //!
 //! Wiring the first caller is not free, and the cost is recorded here so it is not
 //! rediscovered: this crate declares `rust-version = "1.86"` because `cel` 0.14 does, while the
@@ -158,7 +185,29 @@ impl std::error::Error for CostError {}
 pub struct InputShape {
     /// The largest number of elements any collection in the input may hold.
     pub max_collection_size: u64,
+    /// The largest number of BYTES any single string in the input may hold.
+    ///
+    /// # Why this is not `max_collection_size`
+    ///
+    /// They bound different costs and their natural magnitudes differ by orders of magnitude.
+    /// Cardinality drives ITERATION, which is what the `n^(depth+1)` estimate models; string
+    /// length drives ALLOCATION, which that estimate does not see at all. A tenant whose
+    /// documents declare at most 10 groups is not thereby promising that every string in them
+    /// is 10 bytes, so folding the two into one number would refuse ordinary input.
+    ///
+    /// It exists because leaving strings unbounded left a hole the estimate could not
+    /// express: review measured roughly 4 MB of otherwise-compliant input allocating on the
+    /// order of a gigabyte inside an expression the budget had ADMITTED, because concatenation
+    /// and `+` scale with size while the model counts only elements.
+    pub max_string_bytes: u64,
 }
+
+/// A generous default for [`InputShape::max_string_bytes`].
+///
+/// 64 KiB is far above any claim value an identity token carries -- a long display name, a
+/// URL, a serialised group path -- and far below the megabytes at which allocation becomes
+/// the dominant cost. It is a backstop against a pathological document, not a schema.
+pub const DEFAULT_MAX_STRING_BYTES: u64 = 64 * 1024;
 
 /// How deeply comprehensions nest in `expression`, and therefore how many times the input
 /// cardinality multiplies into the cost.
@@ -245,6 +294,78 @@ fn entries_depth(entries: &[IdedEntryExpr]) -> u32 {
         .unwrap_or(0)
 }
 
+/// The largest list or map literal written INSIDE the expression.
+///
+/// # Why the expression is an input too
+///
+/// The model's `n` is the cardinality a comprehension multiplies by. It was read solely from
+/// the declared [`InputShape`], on the assumption that collections arrive through bindings.
+/// They do not have to. A collection written as a literal in the expression never passes
+/// through a binding, so it was never counted and never bounded.
+///
+/// Measured, in review, against the real crate: `[<20,000 integer literals>].filter(g, g > 0)
+/// .size()` with `max_collection_size: 10` estimated 10^2 = 100 against a budget of
+/// 1,000,000,000, was ADMITTED, and ran for 6.2 SECONDS. The declared bound of 10 bounded
+/// nothing, because the data was not in the binding. At the 200,000 this module's header pins
+/// at 423 seconds it reproduces the exact denial of service the budget exists to refuse.
+///
+/// So `n` is the larger of what the caller declared and what the expression carries, and both
+/// are known before evaluation, which keeps the verdict a pure function of
+/// (expression, declared shape, budget).
+fn largest_literal_collection(expression: &Expr) -> u64 {
+    match expression {
+        Expr::Comprehension(comprehension) => [
+            &comprehension.iter_range,
+            &comprehension.accu_init,
+            &comprehension.loop_cond,
+            &comprehension.loop_step,
+            &comprehension.result,
+        ]
+        .into_iter()
+        .map(|part| largest_literal_collection(&part.expr))
+        .max()
+        .unwrap_or(0),
+        Expr::Call(call) => call
+            .target
+            .iter()
+            .map(|target| largest_literal_collection(&target.expr))
+            .chain(
+                call.args
+                    .iter()
+                    .map(|arg| largest_literal_collection(&arg.expr)),
+            )
+            .max()
+            .unwrap_or(0),
+        Expr::Select(select) => largest_literal_collection(&select.operand.expr),
+        // THE COUNT and the recursion, because a large literal can hold a larger one.
+        Expr::List(list) => (list.elements.len() as u64).max(
+            list.elements
+                .iter()
+                .map(|element| largest_literal_collection(&element.expr))
+                .max()
+                .unwrap_or(0),
+        ),
+        Expr::Map(map) => (map.entries.len() as u64).max(entries_literal(&map.entries)),
+        Expr::Struct(structure) => {
+            (structure.entries.len() as u64).max(entries_literal(&structure.entries))
+        }
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => 0,
+    }
+}
+
+/// The largest literal collection inside a map or struct literal's entries, both arms.
+fn entries_literal(entries: &[IdedEntryExpr]) -> u64 {
+    entries
+        .iter()
+        .map(|entry| match &entry.expr {
+            EntryExpr::StructField(field) => largest_literal_collection(&field.value.expr),
+            EntryExpr::MapEntry(entry) => largest_literal_collection(&entry.key.expr)
+                .max(largest_literal_collection(&entry.value.expr)),
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// The estimated worst-case cost of a parsed expression against `shape`: `n^(depth + 1)`.
 ///
 /// # Why `depth + 1` and not `depth`
@@ -265,13 +386,21 @@ fn entries_depth(entries: &[IdedEntryExpr]) -> u32 {
 pub fn estimate_parsed_cost(expression: &Expr, shape: InputShape) -> u64 {
     let depth = comprehension_depth(expression);
     if depth == 0 {
-        // Nothing iterates, so the cost does not scale with the input at all.
+        // Nothing iterates, so the cost does not scale with the CARDINALITY of the input.
+        //
+        // Narrower than it used to read. An earlier version said "the cost does not scale with
+        // the input at all", which is false: a depth-0 expression still concatenates strings
+        // and still allocates in proportion to the SIZE of what it was handed. What this
+        // model bounds is iteration, and a depth-0 expression performs none.
         return 1;
     }
-    shape
+    // The larger of what the caller DECLARED and what the expression CARRIES. See
+    // `largest_literal_collection`: a 20,000-element literal under a declared 10 was admitted
+    // at an estimate of 100 and ran for 6.2 seconds.
+    let n = shape
         .max_collection_size
-        .checked_pow(depth.saturating_add(1))
-        .unwrap_or(u64::MAX)
+        .max(largest_literal_collection(expression));
+    n.checked_pow(depth.saturating_add(1)).unwrap_or(u64::MAX)
 }
 
 /// Compile `expression`, refusing it when its estimated cost exceeds `budget`.
@@ -295,6 +424,7 @@ pub fn compile_within_budget(
     // estimate now walks the parsed tree -- it is the only thing that produces a tree to walk.
     #[expect(
         clippy::disallowed_methods,
+        clippy::disallowed_types,
         reason = "this crate IS the budget: it compiles here and refuses over-budget expressions before returning, which is what every other caller is forbidden from bypassing"
     )]
     let program = cel::Program::compile(expression)
@@ -324,10 +454,26 @@ pub fn compile_within_budget(
 ///
 /// Not `Clone`, because `cel::Program` is not. A caller that wants one per expression holds
 /// it behind an `Arc`, which is what a compiled-once-evaluated-many caller wants anyway.
-#[derive(Debug)]
 pub struct BudgetedProgram {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "this crate IS the budget: it owns the only compiled program, and every other crate is forbidden from naming this type so it cannot hold an unbudgeted one"
+    )]
     program: cel::Program,
     shape: InputShape,
+}
+
+/// Hand-written, because the derived one prints the whole parsed tree.
+///
+/// An expression carrying a 20,000-element literal produced a megabyte-wide panic message in
+/// a failing test, which is a real cost: a panic nobody can read is a panic nobody diagnoses,
+/// and this type appears in `expect`/`unwrap` messages by construction.
+impl core::fmt::Debug for BudgetedProgram {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BudgetedProgram")
+            .field("max_collection_size", &self.shape.max_collection_size)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why an evaluation was refused or failed.
@@ -425,7 +571,12 @@ impl BudgetedProgram {
     ) -> Result<serde_json::Value, EvalError> {
         let mut context = cel::Context::default();
         for (name, value) in bindings {
-            let converted = to_cel(name, value, self.shape.max_collection_size)?;
+            let converted = to_cel(
+                name,
+                value,
+                self.shape.max_collection_size,
+                self.shape.max_string_bytes,
+            )?;
             context.add_variable_from_value(*name, converted);
         }
         let resolved = self
@@ -448,6 +599,7 @@ fn to_cel(
     variable: &str,
     value: &serde_json::Value,
     declared: u64,
+    max_string_bytes: u64,
 ) -> Result<cel::Value, EvalError> {
     match value {
         serde_json::Value::Null => Ok(cel::Value::Null),
@@ -465,6 +617,17 @@ fn to_cel(
             Ok,
         ),
         serde_json::Value::String(inner) => {
+            // BYTES, not chars: the allocation this bounds is in bytes, and `chars().count()`
+            // would walk the whole string to answer a question `len()` answers in constant
+            // time -- doing linear work to bound linear work.
+            let size = inner.len() as u64;
+            if size > max_string_bytes {
+                return Err(EvalError::OversizedInput {
+                    variable: variable.to_owned(),
+                    size,
+                    declared: max_string_bytes,
+                });
+            }
             Ok(cel::Value::String(std::sync::Arc::new(inner.clone())))
         }
         serde_json::Value::Array(items) => {
@@ -478,7 +641,7 @@ fn to_cel(
             }
             let converted = items
                 .iter()
-                .map(|item| to_cel(variable, item, declared))
+                .map(|item| to_cel(variable, item, declared, max_string_bytes))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(cel::Value::List(std::sync::Arc::new(converted)))
         }
@@ -499,7 +662,7 @@ fn to_cel(
             for (key, item) in entries {
                 map.insert(
                     cel::objects::Key::String(std::sync::Arc::new(key.clone())),
-                    to_cel(variable, item, declared)?,
+                    to_cel(variable, item, declared, max_string_bytes)?,
                 );
             }
             Ok(cel::Value::Map(cel::objects::Map {
@@ -512,13 +675,14 @@ fn to_cel(
 #[cfg(test)]
 mod tests {
     use super::{
-        CostError, DEFAULT_COST_BUDGET, InputShape, compile_within_budget, comprehension_depth,
-        estimate_parsed_cost,
+        CostError, DEFAULT_COST_BUDGET, DEFAULT_MAX_STRING_BYTES, InputShape,
+        compile_within_budget, comprehension_depth, estimate_parsed_cost,
     };
 
     fn shape(n: u64) -> InputShape {
         InputShape {
             max_collection_size: n,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
         }
     }
 
@@ -527,6 +691,10 @@ mod tests {
         #[expect(
             clippy::disallowed_methods,
             reason = "a test helper that measures the parser itself, not a caller evaluating an expression"
+        )]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "a test helper measuring the parser itself"
         )]
         let program = cel::Program::compile(expression).expect("compiles");
         comprehension_depth(&program.expression().expr)
@@ -601,6 +769,10 @@ mod tests {
         #[expect(
             clippy::disallowed_methods,
             reason = "a test helper that measures the parser itself, not a caller evaluating an expression"
+        )]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "a test helper measuring the parser itself"
         )]
         let parsed = |expression: &str| cel::Program::compile(expression).expect("compiles");
         assert_eq!(
@@ -725,13 +897,17 @@ mod tests {
 /// and what happens when the input breaks the promise the prediction rested on.
 #[cfg(test)]
 mod evaluation_tests {
-    use super::{DEFAULT_COST_BUDGET, EvalError, InputShape, compile_within_budget};
+    use super::{
+        CostError, DEFAULT_COST_BUDGET, DEFAULT_MAX_STRING_BYTES, EvalError, InputShape,
+        compile_within_budget,
+    };
 
     fn program(expression: &str, n: u64) -> super::BudgetedProgram {
         compile_within_budget(
             expression,
             InputShape {
                 max_collection_size: n,
+                max_string_bytes: DEFAULT_MAX_STRING_BYTES,
             },
             DEFAULT_COST_BUDGET,
         )
@@ -779,6 +955,7 @@ mod evaluation_tests {
                 expression,
                 InputShape {
                     max_collection_size: 16,
+                    max_string_bytes: DEFAULT_MAX_STRING_BYTES,
                 },
                 DEFAULT_COST_BUDGET,
             )
@@ -869,6 +1046,130 @@ mod evaluation_tests {
             .evaluate(&[("attrs", &oversized)])
             .expect_err("an 11-entry map against a declared 10 must be refused");
         assert!(matches!(error, EvalError::OversizedInput { size: 11, .. }));
+    }
+
+    /// A collection the EXPRESSION carries, which no binding bounds.
+    ///
+    /// Review reproduced this against the real crate: `[<20,000 literals>].filter(..).size()`
+    /// with `max_collection_size: 10` estimated 10^2 = 100 against a budget of 1,000,000,000
+    /// and ran for 6.2 seconds. `evaluate` could not have caught it either -- the only binding
+    /// was a one-element list that passed the shape check honestly.
+    ///
+    /// Asserted on the ESTIMATE rather than on a refusal, deliberately. 20,000^2 is 4x10^8,
+    /// which the default budget genuinely admits, so demanding a refusal here would be
+    /// asserting the budget's calibration rather than this fix. What this fix changes is the
+    /// number the model uses: 100 before, 400,000,000 after. The sibling below pins that a
+    /// literal large enough to exceed the budget is now actually refused.
+    #[test]
+    fn a_collection_written_into_the_expression_is_counted() {
+        let expression = literal_list_expression(20_000);
+        let compiled = compile_within_budget(
+            &expression,
+            InputShape {
+                max_collection_size: 10,
+                max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+            },
+            DEFAULT_COST_BUDGET,
+        )
+        .expect("4x10^8 is within the default budget");
+        assert_eq!(compiled.shape().max_collection_size, 10);
+        assert_eq!(
+            super::estimate_parsed_cost(&compiled.program.expression().expr, compiled.shape()),
+            20_000_u64.pow(2),
+            "the estimate must use the literal's cardinality, not the declared 10"
+        );
+    }
+
+    /// And a literal big enough to break the budget is refused, which is the point of counting.
+    #[test]
+    fn a_literal_over_the_budget_is_refused() {
+        let expression = literal_list_expression(40_000);
+        let error = compile_within_budget(
+            &expression,
+            InputShape {
+                max_collection_size: 10,
+                max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+            },
+            DEFAULT_COST_BUDGET,
+        )
+        .expect_err("40,000^2 = 1.6x10^9 exceeds the budget");
+        assert!(
+            matches!(error, CostError::OverBudget { estimated, .. } if estimated == 40_000_u64.pow(2)),
+            "refused for cost, at the literal's cardinality: {error}"
+        );
+    }
+
+    /// The declared shape still wins when it is the larger of the two, so the fix did not
+    /// quietly replace one bound with the other.
+    #[test]
+    fn a_small_literal_does_not_lower_the_declared_bound() {
+        let error = compile_within_budget(
+            "[1, 2].filter(g, g > 0).size() + groups.filter(g, g > 0).size()",
+            InputShape {
+                max_collection_size: 100_000,
+                max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+            },
+            DEFAULT_COST_BUDGET,
+        )
+        .expect_err("the DECLARED 100,000 still governs");
+        assert!(matches!(
+            error,
+            CostError::OverBudget { estimated, .. } if estimated == 100_000_u64.pow(2)
+        ));
+    }
+
+    /// `[0,1,...,n-1].filter(g, g > 0).size()`.
+    fn literal_list_expression(n: usize) -> String {
+        let literal = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        format!("[{literal}].filter(g, g > 0).size()")
+    }
+
+    /// A string large enough to matter is refused, which the cardinality bound cannot see.
+    ///
+    /// One string is one element, so every collection check passes; what it costs is
+    /// ALLOCATION, and the `n^(depth+1)` model counts iteration only. Review measured roughly
+    /// 4 MB of otherwise-compliant input allocating on the order of a gigabyte inside an
+    /// expression the budget had admitted.
+    #[test]
+    fn an_oversized_string_is_refused_although_it_is_one_element() {
+        let huge = serde_json::json!("x".repeat(
+            usize::try_from(DEFAULT_MAX_STRING_BYTES + 1).expect("fits on a 64-bit test host")
+        ));
+        let error = program("name.size()", 10)
+            .evaluate(&[("name", &huge)])
+            .expect_err("a string past the byte bound must be refused");
+        assert!(
+            matches!(error, EvalError::OversizedInput { size, declared, .. }
+                if size == DEFAULT_MAX_STRING_BYTES + 1
+                    && declared == DEFAULT_MAX_STRING_BYTES),
+            "refused on the STRING bound, not the collection bound: {error}"
+        );
+    }
+
+    /// And a string inside a collection is reached too, not only a top-level one.
+    #[test]
+    fn an_oversized_string_nested_in_a_list_is_refused() {
+        let huge = serde_json::json!([
+            "ok",
+            "x".repeat(
+                usize::try_from(DEFAULT_MAX_STRING_BYTES + 1).expect("fits on a 64-bit test host")
+            )
+        ]);
+        let error = program("names.size()", 10)
+            .evaluate(&[("names", &huge)])
+            .expect_err("the inner string breaks the bound even though the list does not");
+        assert!(matches!(error, EvalError::OversizedInput { size, .. }
+            if size == DEFAULT_MAX_STRING_BYTES + 1));
+    }
+
+    /// An ordinary string is admitted, so the bound is a bound rather than a refusal.
+    #[test]
+    fn an_ordinary_string_is_admitted() {
+        let name = serde_json::json!("a reasonable display name");
+        let result = program("name.size()", 10)
+            .evaluate(&[("name", &name)])
+            .expect("an ordinary string is well within the bound");
+        assert_eq!(result, serde_json::json!(25));
     }
 
     /// A list INSIDE a list, which the object case does not cover.
