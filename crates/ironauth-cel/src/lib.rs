@@ -37,10 +37,18 @@
 //!
 //! # The rule
 //!
-//! Refuse before evaluating when `n^depth` exceeds the budget, where `depth` is macro nesting
-//! read off the expression and `n` is the largest DECLARED cardinality of the input
-//! collections. Both are known without running anything, so the verdict is a pure function of
+//! Refuse before evaluating when the estimate exceeds the budget. `depth` is macro nesting
+//! read off the expression, and `n` is the largest cardinality the expression can iterate:
+//! the greater of what the input document DECLARES and what the expression itself carries as
+//! a literal. A comprehension-free expression iterates nothing, and is bounded instead by the
+//! bytes it can touch -- its node count times the declared string bound.
+//!
+//! Every term is known without running anything, so the verdict is a pure function of
 //! (expression, declared shape, budget).
+//!
+//! This section said `n^depth` over the DECLARED cardinality alone through two revisions
+//! after both halves of that had been corrected elsewhere in this file. It is the one place a
+//! reader looks for the rule, so it is the one place a stale statement of it does most harm.
 //!
 //! # What it costs, said plainly
 //!
@@ -65,9 +73,13 @@
 //! [`compile_within_budget`] now returns a [`BudgetedProgram`], which carries the shape it was
 //! budgeted against and is the ONLY way to evaluate. Bindings go in as `serde_json::Value` and
 //! results come out as one, so a caller never needs `cel` in its own manifest; and
-//! `clippy.toml` names the type `cel::Program` and the parser alongside the two functions,
-//! and the call sites inside this crate carry `#[expect]`, which is self-verifying: were a
-//! lint not firing, the expectation would be unfulfilled and the build would fail on that.
+//! `clippy.toml` names the type `cel::Program` and the parser alongside the two functions.
+//! The call sites inside this crate carry `#[expect]`, and where one does, it is
+//! self-verifying: an expectation that stopped being met would fail the build on its own. That
+//! covers the entries this crate actually trips -- `Program::compile` and the `cel::Program`
+//! type. The `cel::parser::Parser` and `cel::Value::resolve` entries are not exercised here at
+//! all, so nothing in this build proves they are spelled correctly; review verified those two
+//! by hand in a scratch crate, which is weaker and is worth saying rather than implying.
 //!
 //! FOUR routes, because naming one was not enough and the difference was measured rather than
 //! reasoned about. A reviewer built a scratch crate carrying only the `Program::compile` entry
@@ -366,6 +378,60 @@ fn entries_literal(entries: &[IdedEntryExpr]) -> u64 {
         .unwrap_or(0)
 }
 
+/// How many nodes the expression has.
+///
+/// This is the multiplier for work that is not iteration. A comprehension-free expression
+/// performs no loop, which is why the estimate used to return the constant 1 for it -- and
+/// that was wrong in a way `max_string_bytes` alone does not fix. Bounding one string's SIZE
+/// says nothing about how many times an expression moves it: `a + a + a + ...` repeated k
+/// times over a 64 KiB string allocates on the order of k * 64 KiB, and every one of those
+/// expressions estimated 1.
+///
+/// So depth 0 is bounded by nodes times the string bound, which is the number of bytes the
+/// expression can touch.
+fn node_count(expression: &Expr) -> u64 {
+    1 + match expression {
+        Expr::Comprehension(comprehension) => [
+            &comprehension.iter_range,
+            &comprehension.accu_init,
+            &comprehension.loop_cond,
+            &comprehension.loop_step,
+            &comprehension.result,
+        ]
+        .into_iter()
+        .map(|part| node_count(&part.expr))
+        .sum(),
+        Expr::Call(call) => call
+            .target
+            .iter()
+            .map(|target| node_count(&target.expr))
+            .chain(call.args.iter().map(|arg| node_count(&arg.expr)))
+            .sum(),
+        Expr::Select(select) => node_count(&select.operand.expr),
+        Expr::List(list) => list
+            .elements
+            .iter()
+            .map(|element| node_count(&element.expr))
+            .sum(),
+        Expr::Map(map) => entries_nodes(&map.entries),
+        Expr::Struct(structure) => entries_nodes(&structure.entries),
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => 0,
+    }
+}
+
+/// The nodes inside a map or struct literal's entries, both arms.
+fn entries_nodes(entries: &[IdedEntryExpr]) -> u64 {
+    entries
+        .iter()
+        .map(|entry| match &entry.expr {
+            EntryExpr::StructField(field) => node_count(&field.value.expr),
+            EntryExpr::MapEntry(entry) => {
+                node_count(&entry.key.expr) + node_count(&entry.value.expr)
+            }
+        })
+        .sum()
+}
+
 /// The estimated worst-case cost of a parsed expression against `shape`: `n^(depth + 1)`.
 ///
 /// # Why `depth + 1` and not `depth`
@@ -386,13 +452,20 @@ fn entries_literal(entries: &[IdedEntryExpr]) -> u64 {
 pub fn estimate_parsed_cost(expression: &Expr, shape: InputShape) -> u64 {
     let depth = comprehension_depth(expression);
     if depth == 0 {
-        // Nothing iterates, so the cost does not scale with the CARDINALITY of the input.
+        // NOTHING ITERATES, so cardinality does not enter. That is not the same as free, and
+        // returning the constant 1 here (which two earlier versions did) left the whole
+        // allocation-dominated family unbounded: `a + a + a + ...` repeated k times over a
+        // 64 KiB string allocates on the order of k * 64 KiB and estimated 1 every time.
         //
-        // Narrower than it used to read. An earlier version said "the cost does not scale with
-        // the input at all", which is false: a depth-0 expression still concatenates strings
-        // and still allocates in proportion to the SIZE of what it was handed. What this
-        // model bounds is iteration, and a depth-0 expression performs none.
-        return 1;
+        // The bound is the bytes the expression can touch: nodes times the string bound.
+        //
+        // MIXED UNITS, said plainly rather than hidden. This arm counts BYTES and the arm
+        // below counts ELEMENTS, and both are compared against one budget. The budget is
+        // therefore a bound on work units of either kind, which is an approximation -- it is
+        // the same approximation the `n^(depth+1)` arm already makes by treating an append and
+        // a comparison as one unit each. What matters is that both arms are monotonic in the
+        // thing that actually grows, and neither returns a constant.
+        return node_count(expression).saturating_mul(shape.max_string_bytes);
     }
     // The larger of what the caller DECLARED and what the expression CARRIES. See
     // `largest_literal_collection`: a 20,000-element literal under a declared 10 was admitted
@@ -479,20 +552,25 @@ impl core::fmt::Debug for BudgetedProgram {
 /// Why an evaluation was refused or failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvalError {
-    /// An input collection is larger than the shape the expression was budgeted against.
+    /// An input exceeds the shape the expression was budgeted against.
     ///
     /// This is the enforcement half of the cost model, and without it the model is
-    /// decoration. `max_collection_size` is a DECLARATION: the estimate is `n^(depth+1)`
-    /// where `n` is what the document PROMISED, so an input that exceeds the promise costs
-    /// more than the budget admitted, and the budget bounded nothing. Refusing here means the
-    /// declared bound and the enforced bound are the same number, checked in the same place.
+    /// decoration: the estimate is computed over what the document PROMISED, so an input that
+    /// exceeds the promise costs more than the budget admitted and the budget bounded nothing.
+    ///
+    /// Carries its [`Unit`], because the same variant now reports two different bounds and an
+    /// operator reading "holds 4194304 elements" about a STRING is being told something false
+    /// about their own data. The first version of the string bound reused this variant with
+    /// its cardinality wording intact.
     OversizedInput {
         /// The binding that carried it.
         variable: String,
-        /// How many elements it actually had.
+        /// How much it actually had, in [`unit`](Self::OversizedInput::unit).
         size: u64,
-        /// The largest the shape allows.
+        /// The largest the shape allows, in the same unit.
         declared: u64,
+        /// Which bound was exceeded.
+        unit: Unit,
     },
     /// An input value has no CEL representation.
     NotRepresentable {
@@ -507,6 +585,24 @@ pub enum EvalError {
     ResultNotRepresentable(String),
 }
 
+/// Which of the two declared bounds an input exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unit {
+    /// Elements in a collection, bounded by [`InputShape::max_collection_size`].
+    Elements,
+    /// Bytes in a single string, bounded by [`InputShape::max_string_bytes`].
+    Bytes,
+}
+
+impl core::fmt::Display for Unit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Elements => f.write_str("elements"),
+            Self::Bytes => f.write_str("bytes"),
+        }
+    }
+}
+
 impl core::fmt::Display for EvalError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -514,10 +610,11 @@ impl core::fmt::Display for EvalError {
                 variable,
                 size,
                 declared,
+                unit,
             } => write!(
                 f,
-                "input `{variable}` holds {size} elements against a declared maximum of \
-                 {declared}; the expression was budgeted against the declared figure"
+                "input `{variable}` holds {size} {unit} against a declared maximum of \
+                 {declared} {unit}"
             ),
             Self::NotRepresentable { variable, reason } => {
                 write!(
@@ -626,6 +723,7 @@ fn to_cel(
                     variable: variable.to_owned(),
                     size,
                     declared: max_string_bytes,
+                    unit: Unit::Bytes,
                 });
             }
             Ok(cel::Value::String(std::sync::Arc::new(inner.clone())))
@@ -637,6 +735,7 @@ fn to_cel(
                     variable: variable.to_owned(),
                     size,
                     declared,
+                    unit: Unit::Elements,
                 });
             }
             let converted = items
@@ -656,10 +755,25 @@ fn to_cel(
                     variable: variable.to_owned(),
                     size,
                     declared,
+                    unit: Unit::Elements,
                 });
             }
             let mut map = std::collections::HashMap::new();
             for (key, item) in entries {
+                // THE KEY IS A STRING TOO, and the first version of this bound checked only
+                // the value. `{"<4 MiB string>": 1}` is one entry, so the cardinality check
+                // passes, and the value is a small integer, so the recursion finds nothing --
+                // the entire string bound was bypassable through the key position. Found by
+                // review asking of the value check "what is the column beside it".
+                let key_size = key.len() as u64;
+                if key_size > max_string_bytes {
+                    return Err(EvalError::OversizedInput {
+                        variable: variable.to_owned(),
+                        size: key_size,
+                        declared: max_string_bytes,
+                        unit: Unit::Bytes,
+                    });
+                }
                 map.insert(
                     cel::objects::Key::String(std::sync::Arc::new(key.clone())),
                     to_cel(variable, item, declared, max_string_bytes)?,
@@ -775,9 +889,15 @@ mod tests {
             reason = "a test helper measuring the parser itself"
         )]
         let parsed = |expression: &str| cel::Program::compile(expression).expect("compiles");
+        // A DEPTH-0 EXPRESSION IS NOT FREE, which this used to assert by pinning it at 1.
+        // `user.email` is two nodes (a select over an ident), and the bound on a
+        // comprehension-free expression is the bytes it can touch: nodes times the string
+        // bound. 2 * 65,536. It is far under the budget, which is the point -- an ordinary
+        // claim read stays admitted while `a + a + a + ...` repeated fifteen thousand times
+        // over a 64 KiB string no longer estimates 1.
         assert_eq!(
             estimate_parsed_cost(&parsed("user.email").expression().expr, shape(10_000)),
-            1
+            2 * DEFAULT_MAX_STRING_BYTES
         );
         assert_eq!(
             estimate_parsed_cost(
@@ -1018,6 +1138,7 @@ mod evaluation_tests {
                 variable: "groups".to_owned(),
                 size: 11,
                 declared: 10,
+                unit: super::Unit::Elements,
             }
         );
     }
@@ -1160,6 +1281,56 @@ mod evaluation_tests {
             .expect_err("the inner string breaks the bound even though the list does not");
         assert!(matches!(error, EvalError::OversizedInput { size, .. }
             if size == DEFAULT_MAX_STRING_BYTES + 1));
+    }
+
+    /// A map KEY is a string, and the first version of the string bound checked only values.
+    ///
+    /// `{"<huge>": 1}` is ONE entry, so the cardinality check passes; the value is a small
+    /// integer, so the recursion finds nothing. The entire string bound was bypassable
+    /// through the key position.
+    #[test]
+    fn an_oversized_map_key_is_refused_like_an_oversized_value() {
+        let mut entries = serde_json::Map::new();
+        entries.insert(
+            "x".repeat(usize::try_from(DEFAULT_MAX_STRING_BYTES + 1).expect("fits")),
+            serde_json::json!(1),
+        );
+        let huge = serde_json::Value::Object(entries);
+        let error = program("attrs.size()", 10)
+            .evaluate(&[("attrs", &huge)])
+            .expect_err("a map KEY past the byte bound must be refused");
+        assert!(
+            matches!(error, EvalError::OversizedInput { size, unit, .. }
+                if size == DEFAULT_MAX_STRING_BYTES + 1 && unit == super::Unit::Bytes),
+            "refused on the STRING bound, in bytes: {error}"
+        );
+    }
+
+    /// A string refusal must not describe itself in elements.
+    ///
+    /// The same variant now carries both bounds, and an operator told their 200 KB display
+    /// name "holds 204800 elements" has been told something false about their own data.
+    #[test]
+    fn a_string_refusal_reports_bytes_and_a_collection_refusal_reports_elements() {
+        let huge = serde_json::json!(
+            "x".repeat(usize::try_from(DEFAULT_MAX_STRING_BYTES + 1).expect("fits"))
+        );
+        let string_error = program("name.size()", 10)
+            .evaluate(&[("name", &huge)])
+            .expect_err("refused");
+        assert!(
+            string_error.to_string().contains("bytes"),
+            "a string refusal must say bytes: {string_error}"
+        );
+
+        let oversized = serde_json::json!((0..11).collect::<Vec<i32>>());
+        let list_error = program("groups.size()", 10)
+            .evaluate(&[("groups", &oversized)])
+            .expect_err("refused");
+        assert!(
+            list_error.to_string().contains("elements"),
+            "a collection refusal must say elements: {list_error}"
+        );
     }
 
     /// An ordinary string is admitted, so the bound is a bound rather than a refusal.
