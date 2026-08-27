@@ -1134,3 +1134,125 @@ async fn a_delivery_enqueue_does_not_block_on_the_append_lock() {
     enqueueing.await.expect("the delivery enqueue succeeded");
     holder.commit().await.expect("holder releases the lock");
 }
+
+/// THE APPEND LOCK MUST BE THE LAST LOCK A TRANSACTION TAKES.
+///
+/// That invariant is what makes a transaction-scoped global lock safe, and #1009's first
+/// version broke it. `insert_session_row` enqueued `user.signed_in` internally, so it took the
+/// append lock as the FIRST statement of `rotate_inner`'s closure -- before
+/// `reconcile_prior_session_at_rotation` takes `FOR UPDATE` on the prior session. Every other
+/// producer in the module enqueues LAST, holding row locks and then wanting the append lock.
+/// Two orders, one cycle: `revoke_all_for_user_with_event` locks a subject's sessions and then
+/// wants the append lock while a concurrent rotation holds the append lock and wants one of
+/// those rows. Postgres aborts one with 40P01, so "revoke every session" racing that user's own
+/// re-authentication -- the ordinary post-password-reset flow -- fails a login or a revoke.
+///
+/// # Why this shape rather than racing two writers
+///
+/// Reproducing a deadlock is a race and would be a flake. The INVARIANT is not a race: a
+/// rotation that is waiting on a row lock must not already be holding the append lock, and that
+/// is directly observable from a third session. Hold the prior session's row, start a rotation,
+/// and ask whether the append lock is still free. If it is, the rotation cannot be the second
+/// half of a cycle, because it has nothing the other side could want.
+///
+/// `pg_try_advisory_xact_lock` rather than a blocking take, so the probe answers immediately
+/// and cannot itself join the wait graph.
+#[tokio::test]
+async fn a_rotation_waiting_on_a_row_does_not_hold_the_append_lock() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let key = appender_lock_key(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    );
+    let store = db.store().clone();
+
+    let new_session = |subject: &'static str| ironauth_store::NewSession {
+        impersonation: None,
+        subject,
+        auth_methods: "pwd",
+        auth_time_micros: 0,
+        idle_expires_micros: i64::MAX / 4,
+        absolute_expires_micros: i64::MAX / 4,
+        user_agent: None,
+        peer_ip: None,
+    };
+
+    // A live PRIOR session for the rotation to supersede.
+    let prior = ironauth_store::SessionId::generate(&env, &scope);
+    store
+        .scoped(scope)
+        .acting(
+            db.test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .sessions()
+        .rotate(&env, &prior, None, new_session("usr_lock_order"))
+        .await
+        .expect("seed the prior session");
+
+    // Another session holds that row, so the rotation below must stop at the reconcile.
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT id FROM sessions WHERE id = $1 FOR UPDATE")
+        .bind(prior.to_string())
+        .fetch_one(&mut *holder)
+        .await
+        .expect("hold the prior session row");
+
+    let successor = ironauth_store::SessionId::generate(&env, &scope);
+    let actor = db.test_actor(&env);
+    let rotating = tokio::spawn({
+        let store = store.clone();
+        let env = env.clone();
+        let prior = prior.clone();
+        let actor = actor.clone();
+        async move {
+            store
+                .scoped(scope)
+                .acting(actor, ironauth_store::CorrelationId::generate(&env))
+                .sessions()
+                .rotate(
+                    &env,
+                    &successor,
+                    Some(&prior),
+                    new_session("usr_lock_order"),
+                )
+                .await
+        }
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !rotating.is_finished(),
+        "the rotation must be BLOCKED on the prior session's row; if it finished, this test \
+         proves nothing about what it holds while waiting"
+    );
+
+    // THE ASSERTION. A third session takes the append lock without waiting. It can only
+    // succeed if the blocked rotation is not holding it.
+    let mut probe = pool.begin().await.expect("begin probe");
+    let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *probe)
+        .await
+        .expect("probe the append lock");
+    assert!(
+        free,
+        "the rotation is holding the per-scope append lock while waiting for a session row. \
+         That is the ABBA half of #1009's deadlock: any producer that locks a row and then \
+         wants the append lock now has a cycle with it. The append lock must be the LAST lock \
+         a transaction takes."
+    );
+    probe.rollback().await.expect("release the probe");
+
+    holder
+        .commit()
+        .await
+        .expect("release the prior session row");
+    rotating
+        .await
+        .expect("the rotation task finishes")
+        .expect("the rotation succeeds once unblocked");
+}

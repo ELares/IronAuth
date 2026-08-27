@@ -20310,7 +20310,7 @@ impl ActingImpersonationAuthorizationRepo<'_> {
             Some(act),
         )
         .await?;
-        insert_session_row(
+        let signed_in = insert_session_row(
             &mut tx,
             env,
             scope,
@@ -20328,6 +20328,16 @@ impl ActingImpersonationAuthorizationRepo<'_> {
                 peer_ip: None,
             },
             now_micros,
+        )
+        .await?;
+        // The append lock is taken here and this transaction takes no row lock afterwards, so
+        // the "append lock last" invariant holds. `audit_impersonation_start` already ran
+        // ABOVE the insert on this path.
+        enqueue_domain_event(
+            &mut tx,
+            env,
+            scope,
+            signed_in.as_ref().map(OwnedDomainEvent::borrowed).as_ref(),
         )
         .await?;
         tx.commit().await?;
@@ -20457,7 +20467,10 @@ impl ActingSessionRepo<'_> {
                 target: id,
             },
             async move |tx| {
-                insert_session_row(tx, env, scope, id, params, now_micros).await?;
+                // HELD, NOT ENQUEUED YET. The enqueue takes the per-scope append lock and is
+                // therefore the last thing this closure does; see `insert_session_row` for the
+                // cycle that taking it first produced.
+                let signed_in = insert_session_row(tx, env, scope, id, params, now_micros).await?;
                 if let (Some(prior_id), Some(prior_text)) = (prior, &prior_text) {
                     *out = reconcile_prior_session_at_rotation(
                         PriorReconcile {
@@ -20488,6 +20501,17 @@ impl ActingSessionRepo<'_> {
                     env,
                     id,
                     params.impersonation,
+                )
+                .await?;
+                // LAST, after every row lock this transaction takes. `reconcile_prior_session_
+                // at_rotation` above locks the prior session `FOR UPDATE` and moves its client
+                // sessions and refresh families; doing that while already holding the append
+                // lock is the ABBA half of the deadlock.
+                enqueue_domain_event(
+                    tx,
+                    env,
+                    scope,
+                    signed_in.as_ref().map(OwnedDomainEvent::borrowed).as_ref(),
                 )
                 .await?;
                 Ok(())
@@ -20657,6 +20681,18 @@ impl ActingSessionRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         insert_idempotency(&mut tx, idempotency).await?;
         let mut flipped = 0_u64;
+        // COLLECTED, NOT ENQUEUED IN THE LOOP.
+        //
+        // Enqueuing per iteration takes the per-scope append lock on the first flipped session
+        // and holds it -- `pg_advisory_xact_lock` is held to commit -- across every remaining
+        // `UPDATE sessions` in this loop. A concurrent single revoke or a sign-in rotation
+        // holding one of those rows and wanting the append lock closes an ABBA cycle, and
+        // Postgres resolves it by aborting one side with 40P01.
+        //
+        // Draining after the loop keeps the append lock the LAST lock this transaction takes,
+        // which is the invariant that makes a transaction-scoped global lock safe. Ordering
+        // among the events is unchanged: they are appended in `ids` order either way.
+        let mut pending_events: Vec<&DomainEvent<'_>> = Vec::new();
         for (index, id) in ids.iter().enumerate() {
             // Scope-fence: a foreign-scope id is a uniform no-op (never a query).
             if id.scope() != scope {
@@ -20677,7 +20713,7 @@ impl ActingSessionRepo<'_> {
                 // Only what actually changed: a session already revoked is a no-op here, and
                 // announcing it would tell a receiver to tear down what it already has.
                 if let Some(events) = events {
-                    enqueue_domain_event(&mut tx, env, scope, Some(&events[index])).await?;
+                    pending_events.push(&events[index]);
                 }
             }
             // One audit row per session, so the trail names every revoked session
@@ -20695,6 +20731,10 @@ impl ActingSessionRepo<'_> {
                 None,
             )
             .await?;
+        }
+        // AFTER every row lock this transaction takes.
+        for event in pending_events {
+            enqueue_domain_event(&mut tx, env, scope, Some(event)).await?;
         }
         tx.commit().await?;
         Ok(flipped)
@@ -42461,7 +42501,7 @@ async fn insert_session_row(
     id: &SessionId,
     params: NewSession<'_>,
     now_micros: i64,
-) -> Result<(), StoreError> {
+) -> Result<Option<OwnedDomainEvent>, StoreError> {
     sqlx::query(
         "INSERT INTO sessions \
          (id, tenant_id, environment_id, subject, auth_methods, auth_time, \
@@ -42515,29 +42555,43 @@ async fn insert_session_row(
     // payload. Built here rather than by a handler because there is no handler: a sign-in is
     // a data-plane fact, and the store is its only producer.
     let event_id = format!("evt_{}", CorrelationId::generate(env));
-    if let Some(envelope) = crate::event_catalog::envelope(
+    // BUILT HERE, ENQUEUED BY THE CALLER, and the split is a deadlock fix rather than taste.
+    //
+    // This used to enqueue directly, which made it the FIRST statement of `rotate_inner`'s
+    // closure to take the per-scope append lock -- before `reconcile_prior_session_at_rotation`
+    // takes `FOR UPDATE` on the prior session. Every other producer in this module enqueues
+    // LAST, so it holds row locks and then wants the append lock. Two orders, one cycle:
+    // `revoke_all_for_user_with_event` locks a subject's sessions and then wants the append
+    // lock, while a concurrent rotation holds the append lock and wants one of those rows.
+    // Postgres aborts one with 40P01, so "revoke all sessions" racing that user's own
+    // re-authentication -- the ordinary post-password-reset flow -- fails a login or a revoke.
+    //
+    // The invariant that makes a transaction-scoped global lock safe is that it is the LAST
+    // lock the transaction takes, and returning the event is what lets this path obey it.
+    //
+    // It is an invariant about LOCKS, not about position: `write_audited` inserts its audit row
+    // after the closure, and that is fine, because an INSERT of a new row takes only that row's
+    // lock and no other transaction can be waiting on a row that does not exist yet.
+    //
+    // The CONTENTS still come from one place, which is what the previous comment here was
+    // protecting: a producer can now get the placement wrong but not the envelope. The type
+    // enforces the rest -- the event is returned, so a caller that drops it fails
+    // `#[must_use]` rather than silently announcing nothing.
+    Ok(crate::event_catalog::envelope(
         &event_id,
         "user.signed_in",
         &scope.tenant().to_string(),
         &scope.environment().to_string(),
         now_micros / 1000,
         &serde_json::json!({ "subject": params.subject }),
-    ) {
-        enqueue_domain_event(
-            tx,
-            env,
-            scope,
-            Some(&DomainEvent {
-                id: &event_id,
-                // The SUBJECT is the ordering key: one person's sign-ins stay ordered, which
-                // is what lets a consumer reason about a session timeline at all.
-                subject: params.subject,
-                envelope: &envelope,
-            }),
-        )
-        .await?;
-    }
-    Ok(())
+    )
+    .map(|envelope| OwnedDomainEvent {
+        id: event_id.clone(),
+        // The SUBJECT is the ordering key: one person's sign-ins stay ordered, which is what
+        // lets a consumer reason about a session timeline at all.
+        subject: params.subject.to_owned(),
+        envelope,
+    }))
 }
 
 /// Write the impersonation START event, when the session being created carries one.
