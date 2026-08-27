@@ -534,12 +534,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f82399e72d100a28a0cac14251a8aba16d124af2a237d8a60ab7997ba7380cc3"
 dependencies = [
  "antlr4rust",
+ "base64 0.22.1",
  "chrono",
  "lazy_static",
  "nom",
  "pastey",
  "regex",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -1982,6 +1984,7 @@ name = "ironauth-cel"
 version = "0.1.0"
 dependencies = [
  "cel",
+ "serde_json",
 ]
 
 [[package]]

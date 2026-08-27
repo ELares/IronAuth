@@ -55,19 +55,39 @@
 //! larger change; this one lands entirely inside IronAuth and does not foreclose it, because
 //! callers see a verdict rather than the model behind it.
 //!
-//! # What this crate does NOT yet do
+//! # The wall, which used to be open
 //!
-//! It does not ENFORCE anything, because nothing calls it. [`compile_within_budget`] is the
-//! only gate, and it hands back a `cel::Program` a caller can also obtain by calling
-//! `cel::Program::compile` directly -- so the budget is a door beside an open wall until the
-//! hook that evaluates these expressions exists and is made to go through it.
+//! An earlier version of this header said the budget was "a door beside an open wall": a
+//! caller handed a `cel::Program` could evaluate it against anything, and a caller who wanted
+//! one could call `cel::Program::compile` and skip the budget entirely. It prescribed the fix
+//! and this is it.
 //!
-//! Said plainly rather than left implied: this crate is criterion 2's MODEL, measured and
-//! bounded, and criterion 2 is not closed until a caller cannot avoid it. The shape that closes
-//! it is for this crate to own evaluation end to end -- wrapping `Context` and exposing an
-//! `evaluate` that takes the shape -- so a caller never needs `cel` in its own manifest, plus a
-//! `disallowed-methods` lint on `cel::Program::compile` outside this crate. That belongs with
-//! the hook, which is where the first caller will be.
+//! [`compile_within_budget`] now returns a [`BudgetedProgram`], which carries the shape it was
+//! budgeted against and is the ONLY way to evaluate. Bindings go in as `serde_json::Value` and
+//! results come out as one, so a caller never needs `cel` in its own manifest; and
+//! `cel::Program::compile` is a `disallowed-methods` lint in `clippy.toml`, so reaching past
+//! this crate is a build failure rather than a convention. The three call sites inside this
+//! crate carry `#[expect]`, which is self-verifying: were the lint not firing, the expectation
+//! would be unfulfilled and the build would fail on that instead.
+//!
+//! [`BudgetedProgram::evaluate`] also ENFORCES the declared shape rather than trusting it.
+//! `max_collection_size` is a promise the input document makes, the estimate is `n^(depth+1)`
+//! over that promise, and an input that breaks it costs more than the budget admitted. The
+//! declared bound and the enforced bound are now the same number checked in the same place.
+//!
+//! # What this crate still does NOT do
+//!
+//! **Nothing in the shipped server calls it.** Criterion 2 says "CEL expressions execute under
+//! a cost budget", and no CEL expression executes anywhere in IronAuth today, so what is true
+//! is the weaker statement that any expression that DOES execute cannot avoid the budget. That
+//! is the enforceable half, and it is worth having in place before the first caller rather than
+//! after; it is not the criterion.
+//!
+//! Wiring the first caller is not free, and the cost is recorded here so it is not
+//! rediscovered: this crate declares `rust-version = "1.86"` because `cel` 0.14 does, while the
+//! workspace and `docs/COMPATIBILITY.md` promise 1.85. The CI msrv lane excludes this crate for
+//! exactly as long as nothing depends on it. The first production dependency raises the shipped
+//! binary's MSRV, which is a compatibility promise, not an implementation detail.
 
 use cel::common::ast::{EntryExpr, Expr, IdedEntryExpr};
 
@@ -268,18 +288,225 @@ pub fn compile_within_budget(
     expression: &str,
     shape: InputShape,
     budget: u64,
-) -> Result<cel::Program, CostError> {
+) -> Result<BudgetedProgram, CostError> {
     // COMPILE FIRST, and estimate from the SAME program. A malformed expression is a different
     // fault from an expensive one, and an operator who gets "over budget" for a typo is sent to
     // the wrong place. It is also where CEL's own recursion limit fires, and -- since the
     // estimate now walks the parsed tree -- it is the only thing that produces a tree to walk.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this crate IS the budget: it compiles here and refuses over-budget expressions before returning, which is what every other caller is forbidden from bypassing"
+    )]
     let program = cel::Program::compile(expression)
         .map_err(|error| CostError::Uncompilable(error.to_string()))?;
     let estimated = estimate_parsed_cost(&program.expression().expr, shape);
     if estimated > budget {
         return Err(CostError::OverBudget { estimated, budget });
     }
-    Ok(program)
+    Ok(BudgetedProgram { program, shape })
+}
+
+/// An expression that passed the budget, together with the shape it was budgeted against.
+///
+/// # Why this is not a `cel::Program`
+///
+/// It used to be, and that made the budget a door beside an open wall: a caller handed a
+/// `cel::Program` can evaluate it against anything, and a caller who wants one can call
+/// `cel::Program::compile` and skip the budget entirely. Neither is a hypothetical, because
+/// nothing in the estimate binds it to the input it is later run against.
+///
+/// Owning both halves is what closes it. The shape travels WITH the program, evaluation is
+/// only reachable through [`evaluate`](Self::evaluate), and `evaluate` enforces the shape it
+/// was budgeted against rather than trusting that someone else did.
+///
+/// It also means a caller never needs `cel` in its own manifest: bindings go in as
+/// `serde_json::Value` and results come out as one.
+///
+/// Not `Clone`, because `cel::Program` is not. A caller that wants one per expression holds
+/// it behind an `Arc`, which is what a compiled-once-evaluated-many caller wants anyway.
+#[derive(Debug)]
+pub struct BudgetedProgram {
+    program: cel::Program,
+    shape: InputShape,
+}
+
+/// Why an evaluation was refused or failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvalError {
+    /// An input collection is larger than the shape the expression was budgeted against.
+    ///
+    /// This is the enforcement half of the cost model, and without it the model is
+    /// decoration. `max_collection_size` is a DECLARATION: the estimate is `n^(depth+1)`
+    /// where `n` is what the document PROMISED, so an input that exceeds the promise costs
+    /// more than the budget admitted, and the budget bounded nothing. Refusing here means the
+    /// declared bound and the enforced bound are the same number, checked in the same place.
+    OversizedInput {
+        /// The binding that carried it.
+        variable: String,
+        /// How many elements it actually had.
+        size: u64,
+        /// The largest the shape allows.
+        declared: u64,
+    },
+    /// An input value has no CEL representation.
+    NotRepresentable {
+        /// The binding that carried it.
+        variable: String,
+        /// What was wrong with it.
+        reason: String,
+    },
+    /// Evaluation itself failed: an unbound name, a type error, a bad index.
+    Failed(String),
+    /// The result has no JSON representation.
+    ResultNotRepresentable(String),
+}
+
+impl core::fmt::Display for EvalError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::OversizedInput {
+                variable,
+                size,
+                declared,
+            } => write!(
+                f,
+                "input `{variable}` holds {size} elements against a declared maximum of \
+                 {declared}; the expression was budgeted against the declared figure"
+            ),
+            Self::NotRepresentable { variable, reason } => {
+                write!(
+                    f,
+                    "input `{variable}` is not representable in CEL: {reason}"
+                )
+            }
+            Self::Failed(message) => write!(f, "expression evaluation failed: {message}"),
+            Self::ResultNotRepresentable(message) => {
+                write!(f, "the result is not representable as JSON: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EvalError {}
+
+impl BudgetedProgram {
+    /// The shape this expression was budgeted against, and which [`evaluate`](Self::evaluate)
+    /// enforces.
+    #[must_use]
+    pub const fn shape(&self) -> InputShape {
+        self.shape
+    }
+
+    /// Evaluate against `bindings`, refusing any input larger than the declared shape.
+    ///
+    /// # What the expression can reach, which is criterion 3
+    ///
+    /// Exactly these bindings and CEL's standard library, because the context is built here
+    /// and built fresh. There is no ambient anything to withhold: `cel::Env::stdlib()` is
+    /// string, arithmetic, collection and type functions, and the CEL specification gives it
+    /// no IO, no clock, no environment and no host bridge. This crate registers no additional
+    /// function, so an expression naming `fetch`, `http`, `env` or `readFile` fails to
+    /// resolve rather than being caught by a denylist -- which is the difference between a
+    /// surface that has no doors and one that has locked ones.
+    ///
+    /// Cross-tenant access is the same property seen from the caller's side: an expression can
+    /// only name what it was bound, so the isolation is the caller's choice of bindings and
+    /// cannot be widened from inside the expression.
+    ///
+    /// # Errors
+    ///
+    /// [`EvalError::OversizedInput`] when a binding exceeds the declared shape,
+    /// [`EvalError::NotRepresentable`] when an input has no CEL form,
+    /// [`EvalError::Failed`] when evaluation fails, and
+    /// [`EvalError::ResultNotRepresentable`] when the result has no JSON form.
+    pub fn evaluate(
+        &self,
+        bindings: &[(&str, &serde_json::Value)],
+    ) -> Result<serde_json::Value, EvalError> {
+        let mut context = cel::Context::default();
+        for (name, value) in bindings {
+            let converted = to_cel(name, value, self.shape.max_collection_size)?;
+            context.add_variable_from_value(*name, converted);
+        }
+        let resolved = self
+            .program
+            .execute(&context)
+            .map_err(|error| EvalError::Failed(error.to_string()))?;
+        resolved
+            .json()
+            .map_err(|error| EvalError::ResultNotRepresentable(error.to_string()))
+    }
+}
+
+/// Convert one binding to a CEL value, enforcing the declared cardinality on the way.
+///
+/// Conversion and enforcement in ONE pass, deliberately. Walking the document twice invites
+/// the two walks to disagree about what counts as a collection, and the disagreement would be
+/// silent: a shape check that misses a nesting the converter produces is a check that passes
+/// on the input it was meant to refuse.
+fn to_cel(
+    variable: &str,
+    value: &serde_json::Value,
+    declared: u64,
+) -> Result<cel::Value, EvalError> {
+    match value {
+        serde_json::Value::Null => Ok(cel::Value::Null),
+        serde_json::Value::Bool(inner) => Ok(cel::Value::Bool(*inner)),
+        serde_json::Value::Number(number) => number.as_i64().map(cel::Value::Int).map_or_else(
+            || {
+                number
+                    .as_f64()
+                    .map(cel::Value::Float)
+                    .ok_or_else(|| EvalError::NotRepresentable {
+                        variable: variable.to_owned(),
+                        reason: format!("the number {number} is neither an i64 nor an f64"),
+                    })
+            },
+            Ok,
+        ),
+        serde_json::Value::String(inner) => {
+            Ok(cel::Value::String(std::sync::Arc::new(inner.clone())))
+        }
+        serde_json::Value::Array(items) => {
+            let size = items.len() as u64;
+            if size > declared {
+                return Err(EvalError::OversizedInput {
+                    variable: variable.to_owned(),
+                    size,
+                    declared,
+                });
+            }
+            let converted = items
+                .iter()
+                .map(|item| to_cel(variable, item, declared))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(cel::Value::List(std::sync::Arc::new(converted)))
+        }
+        serde_json::Value::Object(entries) => {
+            // A MAP IS A COLLECTION TOO. CEL's macros comprehend over maps exactly as they do
+            // over lists, so a shape check that counted only arrays would admit an
+            // unbounded map and the depth-times-cardinality estimate would be wrong by the
+            // whole of it.
+            let size = entries.len() as u64;
+            if size > declared {
+                return Err(EvalError::OversizedInput {
+                    variable: variable.to_owned(),
+                    size,
+                    declared,
+                });
+            }
+            let mut map = std::collections::HashMap::new();
+            for (key, item) in entries {
+                map.insert(
+                    cel::objects::Key::String(std::sync::Arc::new(key.clone())),
+                    to_cel(variable, item, declared)?,
+                );
+            }
+            Ok(cel::Value::Map(cel::objects::Map {
+                map: std::sync::Arc::new(map),
+            }))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -297,6 +524,10 @@ mod tests {
 
     /// The depth of an expression, via the same parser the evaluator uses.
     fn depth(expression: &str) -> u32 {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test helper that measures the parser itself, not a caller evaluating an expression"
+        )]
         let program = cel::Program::compile(expression).expect("compiles");
         comprehension_depth(&program.expression().expr)
     }
@@ -367,6 +598,10 @@ mod tests {
     /// The estimate is `n^(depth + 1)`, and it SATURATES rather than wrapping.
     #[test]
     fn the_estimate_saturates_instead_of_wrapping_to_cheap() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test helper that measures the parser itself, not a caller evaluating an expression"
+        )]
         let parsed = |expression: &str| cel::Program::compile(expression).expect("compiles");
         assert_eq!(
             estimate_parsed_cost(&parsed("user.email").expression().expr, shape(10_000)),
@@ -480,5 +715,188 @@ mod tests {
                 .contains("1000000000000"),
             "the message must carry the estimate, not merely the fact of refusal"
         );
+    }
+}
+
+/// Criterion 3, and criterion 2's enforcement half.
+///
+/// These are separated from the cost-estimate tests above because they measure a different
+/// thing: not what the model PREDICTS an expression costs, but what an expression can reach
+/// and what happens when the input breaks the promise the prediction rested on.
+#[cfg(test)]
+mod evaluation_tests {
+    use super::{DEFAULT_COST_BUDGET, EvalError, InputShape, compile_within_budget};
+
+    fn program(expression: &str, n: u64) -> super::BudgetedProgram {
+        compile_within_budget(
+            expression,
+            InputShape {
+                max_collection_size: n,
+            },
+            DEFAULT_COST_BUDGET,
+        )
+        .expect("compiles within budget")
+    }
+
+    /// The positive control: without this, every refusal below could be a broken evaluator.
+    #[test]
+    fn an_ordinary_expression_evaluates_against_its_bindings() {
+        let groups = serde_json::json!(["g1:admin", "g2:reader", "other"]);
+        let result = program("groups.filter(g, g.startsWith('g1')).size()", 100)
+            .evaluate(&[("groups", &groups)])
+            .expect("evaluates");
+        assert_eq!(result, serde_json::json!(1));
+    }
+
+    /// CRITERION 3: "adversarial expressions attempting network, environment, or cross-tenant
+    /// access fail to compile or evaluate".
+    ///
+    /// Every one of these fails because the name RESOLVES TO NOTHING, not because a denylist
+    /// caught it. That distinction is the whole property: a denylist is a list of the attacks
+    /// someone thought of, and this is a surface with no doors on it. `cel::Env::stdlib()` is
+    /// string, arithmetic, collection and type functions, the CEL specification gives it no IO,
+    /// and this crate registers no function of its own.
+    ///
+    /// If a future change calls `add_function`, these tests do NOT automatically catch it --
+    /// they catch the specific names below. The property that must be preserved is "this crate
+    /// registers no host function", and the assertion for that is the absence of `add_function`
+    /// in this file, which `no_host_function_is_registered` pins.
+    #[test]
+    fn adversarial_expressions_reach_nothing() {
+        let bound = serde_json::json!({"sub": "user-1"});
+        for expression in [
+            "fetch('http://169.254.169.254/latest/meta-data/')",
+            "http.get('https://example.invalid')",
+            "env('PATH')",
+            "os.environ['AWS_SECRET_ACCESS_KEY']",
+            "readFile('/etc/passwd')",
+            "import('std')",
+            // Cross-tenant: naming a binding that was not supplied.
+            "other_tenant.claims",
+            "claims.sub",
+        ] {
+            let outcome = compile_within_budget(
+                expression,
+                InputShape {
+                    max_collection_size: 16,
+                },
+                DEFAULT_COST_BUDGET,
+            )
+            .map_err(|_| ())
+            .and_then(|compiled| compiled.evaluate(&[("subject", &bound)]).map_err(|_| ()));
+            assert!(
+                outcome.is_err(),
+                "`{expression}` must fail to compile or to evaluate; it resolved instead"
+            );
+        }
+    }
+
+    /// The guard on the guard: this crate must register no host function.
+    ///
+    /// `adversarial_expressions_reach_nothing` names eight specific attacks, and a list of
+    /// names cannot express "and nothing else either". This can: the surface is empty because
+    /// nothing adds to it, and adding to it is one call. A source scan is a weak instrument in
+    /// general, but here the thing being asserted IS a property of the source text -- that a
+    /// particular constructor is never invoked in this crate -- rather than a property of
+    /// behaviour that a scan is standing in for.
+    #[test]
+    fn no_host_function_is_registered() {
+        // The needle is ASSEMBLED rather than written, because a scan of the file it lives in
+        // matches its own source otherwise. The first version did exactly that and failed on
+        // its own assertion message, which is the same shape as a process watcher whose
+        // pattern matches its own command line.
+        //
+        // The leading dot is load-bearing too: it matches the CALL and not the prose above,
+        // which discusses `add_function` by name on purpose.
+        let needle = format!(".add_{}(", "function");
+        let source = include_str!("lib.rs");
+        let registrations = source
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .count();
+        assert_eq!(
+            registrations, 0,
+            "this crate registers a host function, which widens what every CEL expression in \
+             IronAuth can reach. Criterion 3 asks that expressions have no ambient fetch or \
+             IO; adding a function here is how that stops being true."
+        );
+    }
+
+    /// CRITERION 2's enforcement half: the declared shape is checked, not trusted.
+    ///
+    /// The estimate is `n^(depth+1)` where `n` is the DECLARED maximum. If an input may exceed
+    /// it, the budget bounded nothing: the measured case behind this is a single filter over
+    /// 200,000 elements taking 423 seconds, which is admitted by any budget that was computed
+    /// against a declared 1,000.
+    #[test]
+    fn an_input_larger_than_the_declared_shape_is_refused() {
+        let oversized = serde_json::json!((0..11).collect::<Vec<i32>>());
+        let error = program("groups.size()", 10)
+            .evaluate(&[("groups", &oversized)])
+            .expect_err("11 elements against a declared 10 must be refused");
+        assert_eq!(
+            error,
+            EvalError::OversizedInput {
+                variable: "groups".to_owned(),
+                size: 11,
+                declared: 10,
+            }
+        );
+    }
+
+    /// Exactly at the bound is admitted, which is what makes the test above about the BOUND
+    /// rather than about refusing everything.
+    #[test]
+    fn an_input_exactly_at_the_declared_shape_is_admitted() {
+        let exact = serde_json::json!((0..10).collect::<Vec<i32>>());
+        let result = program("groups.size()", 10)
+            .evaluate(&[("groups", &exact)])
+            .expect("10 elements against a declared 10 is within the promise");
+        assert_eq!(result, serde_json::json!(10));
+    }
+
+    /// A MAP is a collection too, and counting only arrays would leave the estimate wrong by
+    /// the whole of it: CEL's macros comprehend over maps exactly as they do over lists.
+    #[test]
+    fn an_oversized_map_is_refused_like_an_oversized_list() {
+        let mut entries = serde_json::Map::new();
+        for i in 0..11 {
+            entries.insert(format!("k{i}"), serde_json::json!(i));
+        }
+        let oversized = serde_json::Value::Object(entries);
+        let error = program("attrs.size()", 10)
+            .evaluate(&[("attrs", &oversized)])
+            .expect_err("an 11-entry map against a declared 10 must be refused");
+        assert!(matches!(error, EvalError::OversizedInput { size: 11, .. }));
+    }
+
+    /// A list INSIDE a list, which the object case does not cover.
+    ///
+    /// Found by mutation: passing `u64::MAX` down the ARRAY branch's recursion survived every
+    /// other test here, because the only nested fixture was an object holding a list and that
+    /// path recurses through the MAP branch. Two branches recurse, so two fixtures are needed;
+    /// one nested fixture reads like coverage of "nesting" and was coverage of one of them.
+    #[test]
+    fn a_list_nested_in_a_list_over_the_shape_is_refused() {
+        let nested = serde_json::json!([(0..11).collect::<Vec<i32>>()]);
+        let error = program("groups.size()", 10)
+            .evaluate(&[("groups", &nested)])
+            .expect_err("the inner list breaks the promise even though the outer list does not");
+        assert!(matches!(error, EvalError::OversizedInput { size: 11, .. }));
+    }
+
+    /// The check reaches NESTED collections, not just the top level.
+    ///
+    /// A top-level-only check is the cheapest wrong way to write this and it passes every test
+    /// above: `{"a": [ ...20000 items... ]}` is one entry at the top, and the comprehension
+    /// that costs 423 seconds runs over the inner list.
+    #[test]
+    fn a_nested_collection_over_the_shape_is_refused() {
+        let nested = serde_json::json!({"inner": (0..11).collect::<Vec<i32>>()});
+        let error = program("attrs.size()", 10)
+            .evaluate(&[("attrs", &nested)])
+            .expect_err("the inner list breaks the promise even though the outer map does not");
+        assert!(matches!(error, EvalError::OversizedInput { size: 11, .. }));
     }
 }

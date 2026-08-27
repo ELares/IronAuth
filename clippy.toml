@@ -1,1 +1,16 @@
 doc-valid-idents = ["IronAuth", "IronCache", "IronBus", "OpenID", "OAuth", "OpenAPI", "RateLimit", "GitHub", "PostgreSQL", "WebAuthn", "FedCM", "IdP", "JavaScript", "TypeScript", ".."]
+
+# The cost budget is only a budget if it cannot be walked around.
+#
+# `ironauth-cel` refuses an expression whose estimated cost exceeds the budget and returns a
+# `BudgetedProgram` that carries the shape it was budgeted against. A caller that reaches
+# `cel::Program::compile` directly gets an unbudgeted program it can evaluate against any
+# input at all, which is issue #113 criterion 2 defeated in one line -- and defeated silently,
+# because the expression still works.
+#
+# The crate itself is the one place that must call it, and it does so behind an
+# `#[expect(clippy::disallowed_methods)]` with the reason attached, so the exemption is a
+# reviewable line rather than an absence.
+disallowed-methods = [
+    { path = "cel::Program::compile", reason = "compile through ironauth_cel::compile_within_budget, which refuses an expression whose cost exceeds the budget; calling this directly yields an unbudgeted program (issue #113 criterion 2)" },
+]
