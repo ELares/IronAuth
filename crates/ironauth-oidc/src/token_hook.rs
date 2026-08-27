@@ -1170,8 +1170,19 @@ mod tests {
                 .expect("a keyed artifact loads");
             let elapsed = started.elapsed();
 
+            // 25 ms, and the derivation matters because I got this wrong twice.
+            //
+            // The two things being told apart are a DESERIALIZE (~0.1 ms measured) and a
+            // COMPILE (~33 ms idle, 470 ms measured under this suite's parallel load). A bound
+            // has to sit between them with margin on BOTH sides, and the fast path's typical
+            // value is the wrong thing to derive it from: at 1 ms this failed at 1.16 ms, and
+            // at 5 ms it failed at 10.37 ms, both times on a correct deserialize that the
+            // scheduler had simply descheduled while 813 other unit tests ran.
+            //
+            // 25 ms is ~250x the deserialize and still below an idle compile, so it cannot be
+            // reached by scheduling noise on the fast path and cannot be passed by the slow one.
             assert!(
-                elapsed < std::time::Duration::from_millis(5),
+                elapsed < std::time::Duration::from_millis(25),
                 "loading a keyed artifact took {elapsed:?}, which is a COMPILE. Criterion 4 \
                  bounds cold start at 1 ms and a compile is tens of milliseconds, so this arm \
                  not running means the criterion cannot be met at any cache hit rate: the \
