@@ -526,6 +526,13 @@ func (c *Client) DeleteTenant(tenant_id string, query url.Values) (*http.Respons
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id), query, nil)
 }
 
+// DeleteTokenHook performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook.
+//
+// Remove a client's WASM token hook.
+func (c *Client) DeleteTokenHook(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook", query, nil)
+}
+
 // DeleteUser performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}.
 //
 // Delete a user (a soft-delete offboarding that cascades sessions).
@@ -552,6 +559,13 @@ func (c *Client) DeleteWebhookEndpoint(tenant_id string, environment_id string, 
 // Stop allowing SMS to a country calling code.
 func (c *Client) DenySmsCountry(tenant_id string, environment_id string, country_code string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/sms-otp/allowlist/" + escape(country_code), query, nil)
+}
+
+// DeployTokenHook performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook.
+//
+// Deploy (create or replace) a client's WASM token hook.
+func (c *Client) DeployTokenHook(tenant_id string, environment_id string, client_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook", query, body)
 }
 
 // DisableOrganization performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable.
@@ -888,6 +902,13 @@ func (c *Client) GetSmsOtpConfig(tenant_id string, environment_id string, query 
 // Get one tenant.
 func (c *Client) GetTenant(tenant_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id), query, nil)
+}
+
+// GetTokenHook performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook.
+//
+// Describe a client's deployed token hook.
+func (c *Client) GetTokenHook(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook", query, nil)
 }
 
 // GetTraitMigrationJob performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/trait-schemas/migrations/{job_id}.

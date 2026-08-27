@@ -38,3 +38,17 @@ impl std::fmt::Debug for TokenHookRecord {
             .finish()
     }
 }
+
+/// A deployed hook's metadata, without the component (issue #114).
+///
+/// The management read reports a LENGTH, so it reads a length: `TokenHookRecord` carries up to
+/// eight megabytes that this surface would immediately discard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenHookMetadata {
+    /// The OAuth client whose tokens this hook shapes.
+    pub client_id: String,
+    /// How many bytes the deployed component is.
+    pub component_bytes: i32,
+    /// The payload version the guest expects.
+    pub payload_version: i32,
+}

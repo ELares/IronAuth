@@ -2161,6 +2161,45 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A hook is CODE that runs inside the token mint, so a deploy changes what every token
+        // this client is issued can contain -- by computation rather than by rearrangement,
+        // which is strictly more than a claim mapping does. It belongs on the stream a SIEM
+        // watches for the same reason, with more force.
+        //
+        // THE CLIENT AND THE SHAPE, never the component. An event is a notification, not a
+        // binary store: the bytes are already durable in the row this points at, and putting
+        // megabytes of WASM on every subscriber's stream would be a denial of service dressed
+        // as an announcement. The byte count and the payload version are what let a consumer
+        // tell one deploy from another without refetching.
+        "token_hook.deployed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1},
+                "component_bytes": {"type": "integer", "minimum": 1},
+                "payload_version": {"type": "integer", "minimum": 0}
+            },
+            "required": ["client_id", "component_bytes", "payload_version"]
+        }"#,
+    ),
+    (
+        // Removing a hook restores the UNSHAPED token: a claim the hook computed stops being
+        // minted, so a resource server authorizing on it starts refusing. A consumer cannot
+        // tell that from silence, which is exactly why the removal announces itself.
+        "token_hook.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_id"]
+        }"#,
+    ),
+    (
         // A signup form governs what a self-service REGISTRATION collects and requires, so
         // removing one changes who can sign up and with what. The client id rides along
         // because a signup form is per-client and that is how an operator refers to it.

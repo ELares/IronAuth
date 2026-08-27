@@ -43,9 +43,10 @@ use crate::views::{
     SetSignupFormRequest, SetUserStateRequest, SignupFormFieldView, SignupFormView,
     SignupQuarantineCaseView, SignupQuarantineDecisionView, SignupQuarantineList,
     SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated, TenantList,
-    TenantStatusView, TenantView, TraitAnnotationsView, TraitSchemaVersionView, UpdateUserRequest,
-    UserConsentList, UserConsentView, UserExternalIdView, UserList, UserRevocationView,
-    UserStateChangeView, UserStateView, UserTraitsView, UserView, VerificationAddressView,
+    TenantStatusView, TenantView, TokenHookView, TraitAnnotationsView, TraitSchemaVersionView,
+    UpdateUserRequest, UserConsentList, UserConsentView, UserExternalIdView, UserList,
+    UserRevocationView, UserStateChangeView, UserStateView, UserTraitsView, UserView,
+    VerificationAddressView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -340,6 +341,9 @@ use crate::views::{
         crate::claims_mappings::set_claims_mapping,
         crate::claims_mappings::get_claims_mapping,
         crate::claims_mappings::delete_claims_mapping,
+        crate::token_hooks::deploy_token_hook,
+        crate::token_hooks::get_token_hook,
+        crate::token_hooks::delete_token_hook,
         crate::signup_forms::set_signup_form,
         crate::signup_forms::get_signup_form,
         crate::signup_forms::delete_signup_form,
@@ -555,6 +559,7 @@ use crate::views::{
         LocaleBundleView,
         SetClaimsMappingRequest,
         ClaimsMappingView,
+        TokenHookView,
         SetSignupFormRequest,
         SignupFormFieldView,
         SignupFormView,

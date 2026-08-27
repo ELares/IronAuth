@@ -132,6 +132,7 @@ mod state;
 mod step_up_policies;
 mod sudo;
 mod tenants;
+mod token_hooks;
 pub mod trait_migration_worker;
 mod trait_schemas;
 mod users;
@@ -810,6 +811,21 @@ pub fn management_router(state: AdminState) -> Router {
             put(claims_mappings::set_claims_mapping)
                 .get(claims_mappings::get_claims_mapping)
                 .delete(claims_mappings::delete_claims_mapping),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook",
+            put(token_hooks::deploy_token_hook)
+                .get(token_hooks::get_token_hook)
+                .delete(token_hooks::delete_token_hook)
+                // AXUM'S DEFAULT BODY LIMIT IS 2 MiB and this route's own cap is 8, so without
+                // this a legal 3 MiB component is a plain-text 413 from the framework before
+                // the handler runs -- an undocumented status, no `ErrorBody`, and the handler's
+                // own "component_too_large" message unreachable for every body that could
+                // actually trigger it. Set one byte above the cap so the refusal at the
+                // boundary is this API's 400 rather than the framework's 413.
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    token_hooks::MAX_COMPONENT_BYTES + 1,
+                )),
         )
         // Per-environment, per-client signup forms as data (issue #87): set (fail-fast validated
         // against the active trait schema), get, and delete a form keyed on the authorize client

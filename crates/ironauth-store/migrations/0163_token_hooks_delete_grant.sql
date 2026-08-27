@@ -1,0 +1,20 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The control plane's DELETE on token_hooks (issue #114, criterion 5).
+--
+-- 0162 created the table with SELECT, INSERT and UPDATE and withheld DELETE, on the same
+-- reasoning 0159 gave for claims_mappings: a privilege held by nobody is one an attacker
+-- inherits for free, and removing a hook was not an operation that existed.
+--
+-- It exists now: `ActingTokenHookRepo::delete`, audited as `token_hook.delete`, behind the
+-- management API's `DELETE .../token-hook`.
+--
+-- CONTROL PLANE ONLY, the same split 0162 drew for INSERT and UPDATE, and the split matters
+-- more here than for a claim mapping. Removing a hook restores the UNSHAPED token: a claim the
+-- hook computed stops being minted, so a resource server authorizing on it starts refusing.
+-- A data plane that could delete its own hook could strip a security-relevant claim from every
+-- token it issues, which is precisely the escalation the read-only grant on that role prevents.
+--
+-- The removal is also the BREAK-GLASS path for a hook that is failing logins, which is an
+-- argument for the operation existing and never for widening who holds it.
+GRANT DELETE ON token_hooks TO ironauth_control;

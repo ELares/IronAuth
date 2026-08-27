@@ -3509,3 +3509,131 @@ async fn read_is_required_and_sufficient_for_a_claims_mapping_read() {
          {response}"
     );
 }
+
+/// `management.write_config` is required AND sufficient for a token-hook DEPLOY (#114).
+///
+/// Both directions, for the reason every sibling here gives: refusal-only passes against an
+/// endpoint that refuses everybody, and success-only passes against one with no gate.
+///
+/// The allowed half lands on 404 because the client id names no client in this scope, and that
+/// is what is wanted -- the question is WHICH permission reaches the handler, and 403 versus
+/// 404 answers it. A hook is code running inside the token mint, so this is the most
+/// consequential `write_config` on the surface.
+#[tokio::test]
+async fn write_config_is_required_and_sufficient_for_a_token_hook_deploy() {
+    let h = Harness::start(212).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-hook-deploy").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/token-hook?payload_version=1"
+    );
+    // A real component preamble, so a refusal cannot be the structural check answering instead
+    // of the permission gate.
+    let body = "\u{0}asm\u{d}\u{0}\u{1}\u{0}";
+
+    // A credential restricted to a DIFFERENT permission, not to none: an empty set could be
+    // refused by an earlier check and would say nothing about which permission this requires.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.put_as(&path, &secret, body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not deploy code into the token mint: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.put_as(&path, &secret, body).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_config credential must reach the handler, which then reports the absent \
+         client: {response}"
+    );
+}
+
+/// `management.write_config` is required AND sufficient for a token-hook REMOVAL (#114).
+///
+/// Pinned separately from the deploy, because the reason is the one that is easy to get wrong.
+/// Removing a hook restores the UNSHAPED token: a claim the hook computed stops being minted,
+/// so a resource server authorizing on it starts refusing. A removal is not a tidy-up, it is a
+/// change to the shape of every token this client is issued, exactly as the deploy is -- which
+/// is why it must not be reachable with a weaker credential just because it deletes rather
+/// than writes.
+#[tokio::test]
+async fn write_config_is_required_and_sufficient_for_a_token_hook_removal() {
+    let h = Harness::start(213).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-hook-delete").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/token-hook"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.delete_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not remove a hook: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.delete_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_config credential must reach the handler: {response}"
+    );
+}
+
+/// `management.read` is required AND sufficient for a token-hook read (#114).
+///
+/// The read returns metadata rather than the component, but it still answers "is this client's
+/// token shaped by code", which is a configuration fact and therefore `read` rather than
+/// `write_config`.
+#[tokio::test]
+async fn read_is_required_and_sufficient_for_a_token_hook_read() {
+    let h = Harness::start(214).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-hook-read").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/token-hook"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential must not read a hook: {response}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a read credential must reach the handler, which then reports the absent client: \
+         {response}"
+    );
+}
