@@ -935,9 +935,13 @@ impl Harness {
         let precompiled = self.hook_runtime().and_then(|runtime| {
             let engine = runtime.engine();
             engine.compile(component).ok().map(|artifact| {
+                use sha2::Digest as _;
                 ironauth_store::token_hook_store::PrecompiledHook {
                     artifact,
                     engine_key: engine.compatibility_key().to_vec(),
+                    // The digest of what was compiled, so a reader can tell this artifact from
+                    // one left behind by an earlier deploy.
+                    precompiled_for: sha2::Sha256::digest(component).to_vec(),
                 }
             })
         });

@@ -194,6 +194,11 @@ name = "claims_mappings"
 path = "tests/claims_mappings.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "token_hooks"
+path = "tests/token_hooks.rs"
+required-features = ["testing"]
+
 # Per-environment, per-client signup forms (issue #87): the control-plane set / data-plane read
 # repo, the overwrite-idempotent-on-client invariant, the promotable snapshot round-trip (export
 # both-sides, byte-identical), delete, and cross-tenant isolation, against a real database.

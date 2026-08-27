@@ -457,8 +457,24 @@ async fn loaded_hook(
     // on a different CPU, or on any row deployed before the artifact columns existed -- and it
     // is exactly what every request did before this arm existed, so the fallback is the
     // previously shipped behaviour rather than a degraded mode.
+    // TWO facts, not one, and review demonstrated why one is not enough.
+    //
+    // The engine key answers "can this engine load these bytes". It does NOT answer "are these
+    // the bytes for the hook that is deployed", and those come apart during a rolling upgrade:
+    // migration 0163 is `Phase::Expand` so an old binary keeps serving, and an old binary's
+    // UPSERT names only `component` and `payload_version` -- so redeploying a hook through one
+    // leaves the PREVIOUS hook's artifact in the row with a key that still matches. Review drove
+    // it end to end: deploy GOOD on a new binary, redeploy DECLINER on an old one, and the next
+    // login mints GOOD's `tier` claim. The hook that was deployed never ran, and nothing said so.
+    //
+    // `precompiled_for` is the digest of the component the artifact was built from, so the
+    // comparison below is against the component THIS request just read. A stale artifact carries
+    // a stale digest, which is a mismatch, which compiles from source.
+    let component_digest = digest(component);
     let usable_artifact = precompiled.and_then(|pair| {
-        (pair.engine_key == engine.compatibility_key()).then(|| pair.artifact.clone())
+        let same_engine = pair.engine_key == engine.compatibility_key();
+        let same_component = pair.precompiled_for == component_digest;
+        (same_engine && same_component).then(|| pair.artifact.clone())
     });
 
     let compiling = Arc::clone(engine);
@@ -473,7 +489,32 @@ async fn loaded_hook(
             reason = "criterion 4's cold start is a deserialize, and there is no safe API for \
                       it; the key equality above is the provenance `load_precompiled` requires"
         )]
-        Some(artifact) => unsafe { compiling.load_precompiled(&artifact) },
+        Some(artifact) => match unsafe { compiling.load_precompiled(&artifact) } {
+            Ok(hook) => Ok(hook),
+            // FALLS BACK, and the first version did not. A key can match while the artifact
+            // beside it does not deserialize: truncated by a restore or an ETL, corrupted in
+            // storage, an ELF whose flags say Module rather than Component, or simply
+            // `Component::deserialize` reporting OutOfMemory under pressure. The key says
+            // "this engine could load an artifact from that engine", not "these bytes are
+            // intact".
+            //
+            // Returning the error made that permanent: `from_load` classifies it `Invalid`,
+            // which the refusal cache deliberately does not memoise, so EVERY request for that
+            // client failed closed forever while a perfectly good component sat in the same
+            // row -- already moved into this closure, unread. That falsified the whole design's
+            // claim that a bad artifact costs "a slower first request, not undefined
+            // behaviour".
+            Err(artifact_error) => {
+                tracing::warn!(
+                    target: "ironauth.hooks",
+                    %artifact_error,
+                    "a key-matching precompiled artifact did not deserialize; compiling the \
+                     component instead. The stored artifact is unusable and should be \
+                     regenerated, but the hook still runs."
+                );
+                compiling.load(&bytes)
+            }
+        },
         None => compiling.load(&bytes),
     })
     .await
@@ -776,7 +817,7 @@ fn as_pairs(claims: &serde_json::Map<String, serde_json::Value>) -> Vec<(String,
 
 #[cfg(test)]
 mod tests {
-    use super::{PAYLOAD_VERSION, limits, loaded_hook};
+    use super::{PAYLOAD_VERSION, digest, limits, loaded_hook};
 
     /// The deadline clears any plausible scheduling delay, and is still short enough to bound.
     ///
@@ -1120,6 +1161,7 @@ mod tests {
             let stored = ironauth_store::token_hook_store::PrecompiledHook {
                 artifact,
                 engine_key: engine.compatibility_key().to_vec(),
+                precompiled_for: digest(component).to_vec(),
             };
 
             let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement: deserializing and compiling both yield a working hook, so elapsed time is the only thing that distinguishes the arm that ran, and criterion 4 is stated in those units
@@ -1171,6 +1213,9 @@ mod tests {
             let foreign = ironauth_store::token_hook_store::PrecompiledHook {
                 artifact: vec![0xde, 0xad, 0xbe, 0xef],
                 engine_key: vec![0xaa_u8; 32],
+                // The digest IS correct here, so the only thing refusing this artifact is the
+                // engine key. Getting both wrong would let either check take the credit.
+                precompiled_for: digest(ironauth_hooks::fixtures::GOOD).to_vec(),
             };
             assert_ne!(
                 foreign.engine_key,
@@ -1198,6 +1243,139 @@ mod tests {
                     .iter()
                     .any(|(name, _)| name == "tier"),
                 "the COMPONENT ran, so the foreign artifact was ignored rather than executed"
+            );
+        });
+    }
+
+    /// AN ARTIFACT BUILT FROM A DIFFERENT COMPONENT IS IGNORED, even when the key matches.
+    ///
+    /// The engine key answers "can this engine load these bytes" and nothing more. Review drove
+    /// the gap end to end through a real token endpoint: deploy hook GOOD on a #1008 binary,
+    /// then redeploy DECLINER through a PRE-#1008 binary -- which `Phase::Expand` exists to
+    /// allow during a rolling upgrade, and whose UPSERT does not know the artifact columns. The
+    /// row ends up as component=DECLINER with GOOD's artifact and a still-matching key, and the
+    /// next login mints GOOD's `tier` claim. The deployed hook never ran; had it run, the
+    /// issuance would have failed. No error, no log, nothing observable.
+    ///
+    /// So the artifact carries the digest of what it was compiled FROM, and the check is
+    /// against the component this request actually read.
+    #[test]
+    fn an_artifact_built_from_another_component_is_ignored_even_with_a_matching_key() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            let engine =
+                std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine"));
+            let cache: std::sync::Arc<super::HookCache> =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let scope = ironauth_store::Scope::new(
+                ironauth_store::TenantId::from_seed_bytes([15_u8; 16]),
+                ironauth_store::EnvironmentId::from_seed_bytes([16_u8; 16]),
+            );
+
+            // GOOD's artifact, GOOD's digest, this engine's key -- all internally consistent,
+            // and all describing a hook that is NOT the one deployed. `DECLINER` is the
+            // deployed component, and it refuses every invocation, so if the stale artifact
+            // were loaded the call below would SUCCEED where it must fail.
+            let stale = ironauth_store::token_hook_store::PrecompiledHook {
+                artifact: engine
+                    .compile(ironauth_hooks::fixtures::GOOD)
+                    .expect("precompile the previous hook"),
+                engine_key: engine.compatibility_key().to_vec(),
+                precompiled_for: digest(ironauth_hooks::fixtures::GOOD).to_vec(),
+            };
+
+            let hook = loaded_hook(
+                &engine,
+                &cache,
+                scope,
+                "a-client",
+                ironauth_hooks::fixtures::DECLINER,
+                Some(&stale),
+            )
+            .await
+            .expect("a component-digest mismatch compiles from source, it does not fail");
+
+            let outcome = hook.customize(&engine, &limits(), &super::Request::default());
+            assert!(
+                outcome.is_err(),
+                "the DEPLOYED component ran and declined. If the stale artifact had been \
+                 loaded this would have succeeded and minted the previous hook's claims, \
+                 which is the server running one hook while every record says another."
+            );
+        });
+    }
+
+    /// A KEY-MATCHING ARTIFACT THAT WILL NOT DESERIALIZE falls back to the component.
+    ///
+    /// The key says "this engine could load an artifact from that engine". It does not say the
+    /// bytes are intact. An artifact can be truncated by a restore or an ETL, corrupted in
+    /// storage, carry ELF flags saying Module rather than Component, or simply meet an
+    /// `OutOfMemory` from `Component::deserialize` under pressure -- all with a perfectly valid
+    /// key and digest beside it.
+    ///
+    /// The first version returned that error, and review showed what it cost: `from_load`
+    /// classifies it `Invalid`, which the refusal cache deliberately does NOT memoise, so every
+    /// request for that client failed closed FOREVER while a valid component sat in the same
+    /// row, already moved into the same closure, unread. That falsified this design's central
+    /// claim -- that a bad artifact costs a slower first request rather than an outage.
+    #[test]
+    fn a_corrupt_artifact_with_a_valid_key_falls_back_to_the_component() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            let engine =
+                std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine"));
+            let cache: std::sync::Arc<super::HookCache> =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let scope = ironauth_store::Scope::new(
+                ironauth_store::TenantId::from_seed_bytes([17_u8; 16]),
+                ironauth_store::EnvironmentId::from_seed_bytes([18_u8; 16]),
+            );
+            let component = ironauth_hooks::fixtures::GOOD;
+
+            // TRUNCATED, which is what a partial restore leaves. Everything else about the row
+            // is correct -- this engine's key, this component's digest -- so the ONLY thing
+            // wrong is the bytes, and the fallback is the only thing that can save the login.
+            let mut artifact = engine.compile(component).expect("precompile");
+            artifact.truncate(artifact.len() / 2);
+            let corrupt = ironauth_store::token_hook_store::PrecompiledHook {
+                artifact,
+                engine_key: engine.compatibility_key().to_vec(),
+                precompiled_for: digest(component).to_vec(),
+            };
+
+            let hook = loaded_hook(
+                &engine,
+                &cache,
+                scope,
+                "a-client",
+                component,
+                Some(&corrupt),
+            )
+            .await
+            .expect(
+                "a corrupt artifact must compile the component, not fail the issuance: \
+                     returning the error here fails every request for this client forever, \
+                     because an `Invalid` refusal is deliberately not cached and so is retried \
+                     and re-failed on each one",
+            );
+
+            let customization = hook
+                .customize(&engine, &limits(), &super::Request::default())
+                .expect("the compiled component runs");
+            assert!(
+                customization
+                    .access_token_claims
+                    .iter()
+                    .any(|(name, _)| name == "tier"),
+                "and it is the right component: the hook that ran is the one in the row"
             );
         });
     }

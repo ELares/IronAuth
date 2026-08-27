@@ -29,6 +29,15 @@ pub struct PrecompiledHook {
     pub artifact: Vec<u8>,
     /// `HookEngine::compatibility_key` of the engine that produced `artifact`.
     pub engine_key: Vec<u8>,
+    /// SHA-256 of the COMPONENT `artifact` was compiled from.
+    ///
+    /// The engine key answers "can this engine load it". This answers "is it the right hook",
+    /// and they are different questions. A rolling upgrade can leave a previous hook's artifact
+    /// beside a new component -- an old binary's UPSERT does not know these columns exist -- and
+    /// the key would still match, so the server would run one hook while every record said
+    /// another. A reader compares this against the component it read and treats a mismatch
+    /// exactly as a key mismatch: compile from source.
+    pub precompiled_for: Vec<u8>,
 }
 
 /// Hand-written for the same reason [`TokenHookRecord`]'s is: the artifact is machine code and
@@ -38,6 +47,7 @@ impl core::fmt::Debug for PrecompiledHook {
         f.debug_struct("PrecompiledHook")
             .field("artifact_bytes", &self.artifact.len())
             .field("engine_key", &hex_key(&self.engine_key))
+            .field("precompiled_for", &hex_key(&self.precompiled_for))
             .finish()
     }
 }

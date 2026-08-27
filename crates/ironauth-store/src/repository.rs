@@ -32328,7 +32328,8 @@ impl TokenHookRepo<'_> {
     pub async fn get(&self, client_id: &str) -> Result<Option<TokenHookRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT client_id, component, payload_version, precompiled, engine_key \
+            "SELECT client_id, component, payload_version, precompiled, engine_key, \
+                    precompiled_for \
              FROM token_hooks \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
         )
@@ -32342,19 +32343,24 @@ impl TokenHookRepo<'_> {
             client_id: row.get("client_id"),
             component: row.get("component"),
             payload_version: row.get("payload_version"),
-            // Both or neither, which the table's own CHECK enforces. Rebuilt as a pair here so
-            // a caller cannot be handed an artifact it has no key to validate against -- the
-            // `zip` is the type-level half of that constraint.
+            // All THREE or none, which the table's `num_nonnulls(...) IN (0, 3)` CHECK
+            // enforces. Rebuilt as a unit here so a caller cannot be handed an artifact
+            // without both of the facts that decide whether it may be loaded: which engine
+            // can load it, and which component it was built from.
             precompiled: Option::zip(
-                row.get::<Option<Vec<u8>>, _>("precompiled"),
-                row.get::<Option<Vec<u8>>, _>("engine_key"),
+                Option::zip(
+                    row.get::<Option<Vec<u8>>, _>("precompiled"),
+                    row.get::<Option<Vec<u8>>, _>("engine_key"),
+                ),
+                row.get::<Option<Vec<u8>>, _>("precompiled_for"),
             )
-            .map(
-                |(artifact, engine_key)| crate::token_hook_store::PrecompiledHook {
+            .map(|((artifact, engine_key), precompiled_for)| {
+                crate::token_hook_store::PrecompiledHook {
                     artifact,
                     engine_key,
-                },
-            ),
+                    precompiled_for,
+                }
+            }),
         }))
     }
 }
@@ -32421,6 +32427,7 @@ impl ActingTokenHookRepo<'_> {
         let bytes = component.to_vec();
         let artifact = precompiled.map(|pair| pair.artifact.clone());
         let engine_key = precompiled.map(|pair| pair.engine_key.clone());
+        let precompiled_for = precompiled.map(|pair| pair.precompiled_for.clone());
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -32434,13 +32441,14 @@ impl ActingTokenHookRepo<'_> {
                 sqlx::query(
                     "INSERT INTO token_hooks \
                      (tenant_id, environment_id, client_id, component, payload_version, \
-                      precompiled, engine_key) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                      precompiled, engine_key, precompiled_for) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                      ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE \
                      SET component = EXCLUDED.component, \
                          payload_version = EXCLUDED.payload_version, \
                          precompiled = EXCLUDED.precompiled, \
                          engine_key = EXCLUDED.engine_key, \
+                         precompiled_for = EXCLUDED.precompiled_for, \
                          updated_at = now()",
                 )
                 .bind(scope.tenant().to_string())
@@ -32450,6 +32458,7 @@ impl ActingTokenHookRepo<'_> {
                 .bind(payload_version)
                 .bind(artifact.as_deref())
                 .bind(engine_key.as_deref())
+                .bind(precompiled_for.as_deref())
                 .execute(&mut **tx)
                 .await?;
                 Ok(())

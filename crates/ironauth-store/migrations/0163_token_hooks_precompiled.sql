@@ -35,13 +35,35 @@
 -- nothing. The CHECK makes the pair the unit, so no reader has to handle a half-written row --
 -- and a row written before this migration has NULL for both, which is the "compile from source"
 -- case that already works.
+-- # THREE columns, because the key alone is not enough
+--
+-- `engine_key` says WHICH ENGINE can load the artifact. It says nothing about WHICH COMPONENT
+-- the artifact was built from, and those are different questions.
+--
+-- Review demonstrated the gap end to end. `Phase::Expand` exists so an old binary keeps running
+-- during a rolling upgrade -- and an old binary's UPSERT names only `component` and
+-- `payload_version`, so redeploying a hook through one leaves the PREVIOUS hook's artifact in
+-- place beside the new component, with a key that still matches. The next login then
+-- deserializes the old machine code: the server runs one hook while the row, the audit log and
+-- the operator all say another. No error, no log, nothing observable.
+--
+-- `precompiled_for` closes it: the SHA-256 of the component the artifact was compiled from. A
+-- reader compares it against the component it just read, and a mismatch is exactly a key
+-- mismatch -- compile from source. An old binary that leaves a stale artifact leaves a stale
+-- DIGEST with it, so the mismatch is self-announcing rather than silent.
 ALTER TABLE token_hooks
-    ADD COLUMN precompiled bytea,
-    ADD COLUMN engine_key  bytea;
+    ADD COLUMN precompiled     bytea,
+    ADD COLUMN engine_key      bytea,
+    ADD COLUMN precompiled_for bytea;
 
 ALTER TABLE token_hooks
     ADD CONSTRAINT token_hooks_precompiled_is_keyed
-    CHECK ((precompiled IS NULL) = (engine_key IS NULL));
+    CHECK (num_nonnulls(precompiled, engine_key, precompiled_for) IN (0, 3));
+
+-- The component digest is SHA-256 too, so 32 bytes.
+ALTER TABLE token_hooks
+    ADD CONSTRAINT token_hooks_precompiled_for_is_a_digest
+    CHECK (precompiled_for IS NULL OR octet_length(precompiled_for) = 32);
 
 -- A SHA-256 digest, so exactly 32 bytes. A key of another length is not a key this deployment
 -- produced, and the artifact beside it is not one this deployment can vouch for.
