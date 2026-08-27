@@ -172,7 +172,7 @@ fn validate_component(component: &[u8]) -> Result<(), ApiError> {
     security(("bearer" = [])),
     responses(
         (status = 200, description = "Deployed", body = TokenHookView),
-        (status = 400, description = "An unknown payload version, or bytes that are not a component", body = ErrorBody),
+        (status = 400, description = "An unknown or absent payload version, an unknown failure policy, or bytes that are not a WebAssembly component", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Environment not found or malformed client id", body = ErrorBody)

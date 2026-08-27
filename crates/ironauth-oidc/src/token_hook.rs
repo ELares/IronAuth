@@ -593,7 +593,9 @@ async fn invoke(
         .unwrap_or_else(|join| {
             // A panic INSIDE the guest cannot reach here -- wasmtime turns a guest trap into an
             // error -- so a join failure is the host panicking or the task being cancelled. Both
-            // are aborts as far as the issuance is concerned, and both must fail closed.
+            // are aborts as far as the issuance is concerned, so both are faults the client's
+            // failure policy decides the meaning of -- not unconditional refusals, which is
+            // what this said before that policy existed.
             Err(HookError::Declined(format!(
                 "the hook task did not complete: {join}"
             )))
@@ -664,7 +666,8 @@ pub const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10)
 /// # The cost, stated rather than papered over
 ///
 /// A hook that hangs for a reason nobody predicted now holds its request for up to a second
-/// instead of up to 20 ms. That is a real availability cost on a fail-closed path, and it is
+/// instead of up to 20 ms. That is a real availability cost on a path that is fail-closed by
+/// default, and it is
 /// the trade being made: a bound that fires on a busy machine costs a random `server_error` on
 /// every hooked login, and a bound that fires a second late costs one slow request on the rare
 /// occasion anything reaches it.

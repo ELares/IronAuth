@@ -2166,6 +2166,25 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // which is strictly more than a claim mapping does. It belongs on the stream a SIEM
         // watches for the same reason, with more force.
         //
+        // `failure_policy` IS PRESENT BUT NOT REQUIRED, and that is not an oversight.
+        //
+        // Making it required under an unchanged version is a BREAKING payload change, and
+        // `scripts/event-registry-compat.py` says exactly that: the first version of this
+        // change did, and the gate went red. The consequence is worse than a red build.
+        // Migration 0164 is `Phase::Expand` so a rolling upgrade can run, an OLD pod's
+        // `deployed_event` emits three fields, and a NEW pod's fan-out validates the envelope
+        // on CONSUME -- so every in-flight deploy event from the old pod would be refused
+        // permanently as `event_failed_catalog_validation`, with no retry and no delivery. The
+        // operator installs code into the token mint and every subscriber hears nothing.
+        //
+        // Bumping to version 2 does not help: `validate_event` keeps ONE live version per type
+        // and compares `declared != entry.payload_version`, so the same old envelopes become
+        // `VersionMismatch` instead -- equally permanent.
+        //
+        // Optional-but-present is the additive shape. The producer always sets it, so every
+        // event a binary carrying this change mints has it, and `additionalProperties: false`
+        // still validates its value when it is there.
+        //
         // THE CLIENT AND THE SHAPE, never the component. An event is a notification, not a
         // binary store: the bytes are already durable in the row this points at, and putting
         // megabytes of WASM on every subscriber's stream would be a denial of service dressed
@@ -2182,9 +2201,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
                 "payload_version": {"type": "integer", "minimum": 0},
                 "failure_policy": {"type": "string", "enum": ["fail_closed", "fail_open"]}
             },
-            "required": [
-                "client_id", "component_bytes", "payload_version", "failure_policy"
-            ]
+            "required": ["client_id", "component_bytes", "payload_version"]
         }"#,
     ),
     (

@@ -1680,9 +1680,20 @@ pub const MAX_REFUSALS_REPORTED: usize = MAX_HOOK_CLAIMS * 2;
 /// the whole invocation would mean one reserved claim in a hook's response fails every login it
 /// touches, which converts a bug in an integrator's code into an outage in ours.
 ///
-/// So the reserved names are dropped and REPORTED. The caller audits what was attempted, and
-/// the failure policy #113 requires per client decides whether a refusal is fatal -- which is
-/// where that decision belongs, since it is the thing configured per client.
+/// So the reserved names are dropped and REPORTED, and the issuance SUCCEEDS. The caller
+/// reports what was attempted.
+///
+/// An earlier version of this said "the failure policy #113 requires per client decides
+/// whether a refusal is fatal". That policy now exists -- `token_hooks.failure_policy`, issue
+/// #114 criterion 3 -- and it does NOT decide this. It governs a hook that did not COMPLETE:
+/// a trap, exhausted fuel, a passed deadline, a decline, a component that will not load. A
+/// reserved-name refusal is none of those; this function returns a value rather than an error,
+/// `fence` has no channel to raise one on, and `run_deployed_hook` returns `Ok`.
+///
+/// Left as a sentence rather than quietly deleted, because an operator who read the old one
+/// would set `fail_closed` believing a hook attempting to forge `sub` would refuse the
+/// issuance and be caught loudly. It will not. Wiring the refusal path to the policy needs an
+/// error channel out of the fence that does not exist, and that is its own change.
 ///
 /// The fence is the same one mappings get: the release floor UNION the mint fold, because
 /// criterion 5's sentence covers "any mapping OR HOOK" and a hook is the side with the wider

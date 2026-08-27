@@ -2743,8 +2743,7 @@
         "required": [
           "client_id",
           "component_bytes",
-          "payload_version",
-          "failure_policy"
+          "payload_version"
         ],
         "type": "object"
       },

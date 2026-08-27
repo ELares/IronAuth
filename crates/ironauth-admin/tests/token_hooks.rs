@@ -457,6 +457,15 @@ async fn the_failure_policy_round_trips_and_defaults_to_fail_closed() {
         body.contains("\"failure_policy\":\"fail_closed\""),
         "a deploy that names no policy reads back as the safe one: {body}"
     );
+    // THE RESPONSE IS AN ECHO of the handler's own local, so it proves nothing about what was
+    // STORED. The GET reads the row back, which is the assertion that would fail if the write
+    // dropped the policy on the floor.
+    let (status, _, stored_body) = harness.get(&base).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        stored_body.contains("\"failure_policy\":\"fail_closed\""),
+        "and the STORED row says so too, not just the response: {stored_body}"
+    );
 
     // Asks for fail-open -> stored and read back.
     let (status, _, body) = harness

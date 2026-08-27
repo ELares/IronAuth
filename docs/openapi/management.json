@@ -2494,7 +2494,7 @@
             }
           },
           "400": {
-            "description": "An unknown payload version, or bytes that are not a component",
+            "description": "An unknown or absent payload version, an unknown failure policy, or bytes that are not a WebAssembly component",
             "content": {
               "application/json": {
                 "schema": {

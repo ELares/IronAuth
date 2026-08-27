@@ -9955,7 +9955,7 @@ export interface operations {
                     "application/json": components["schemas"]["TokenHookView"];
                 };
             };
-            /** @description An unknown payload version, or bytes that are not a component */
+            /** @description An unknown or absent payload version, an unknown failure policy, or bytes that are not a WebAssembly component */
             400: {
                 headers: {
                     [name: string]: unknown;

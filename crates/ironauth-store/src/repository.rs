@@ -32558,8 +32558,8 @@ impl ActingTokenHookRepo<'_> {
 /// invisible. The CHECK constraint makes this unreachable; this is what happens if it is ever
 /// dropped.
 fn failure_policy_from_row(raw: &str) -> Result<HookFailurePolicy, StoreError> {
-    // `decode_error`, NOT `InvalidName`. The sibling `flow_target_from_row` decodes the
-    // identical column shape this way, and the difference is what reaches the operator:
+    // `decode_error`, NOT `InvalidName`. The flow-target reader decodes the identical
+    // `failure_policy` column shape this way, and the difference is what reaches the operator:
     // `InvalidName` is documented as a SUBMITTED environment secret or variable name
     // "rejected before it is written", renders as "invalid secret or variable name", and
     // classifies as a 400 -- so a corrupt stored row would tell an operator their request was

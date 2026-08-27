@@ -4374,8 +4374,7 @@ as a sentinel, so an absent one means absent.
   "required": [
     "client_id",
     "component_bytes",
-    "payload_version",
-    "failure_policy"
+    "payload_version"
   ],
   "type": "object"
 }
@@ -4389,8 +4388,7 @@ as a sentinel, so an absent one means absent.
 {
   "client_id": "client_id_example",
   "component_bytes": 1,
-  "payload_version": 1,
-  "failure_policy": "failure_policy_example"
+  "payload_version": 1
 }
 ```
 
