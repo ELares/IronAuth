@@ -18,8 +18,11 @@
 -- component and needs no second code path in the dispatch at all.
 --
 -- The cost, said rather than discovered: the component bytes are stored twice for the active
--- version. A claim-shaping component is tens of kilobytes and the bound is eight megabytes, so
--- the duplication is bounded by the retention below rather than unbounded.
+-- version, and the history is otherwise unbounded. A component may be eight megabytes, so a
+-- client redeployed a thousand times would hold eight gigabytes of history nobody will roll
+-- back to. `TOKEN_HOOK_VERSION_RETENTION` in the store prunes to the newest N on every deploy,
+-- which is what the DELETE grant below is for; the retention lives there rather than here
+-- because it is a policy number and this is a shape.
 CREATE TABLE token_hook_versions (
     tenant_id       text        NOT NULL,
     environment_id  text        NOT NULL,

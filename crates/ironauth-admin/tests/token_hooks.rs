@@ -685,3 +685,55 @@ async fn a_client_with_no_hook_lists_no_versions() {
     assert_eq!(status, StatusCode::OK, "an empty history is a 200: {body}");
     assert_eq!(body.trim(), "[]");
 }
+
+/// The history is PRUNED to the newest few, and the pruning keeps the newest.
+///
+/// Without it the history is unbounded: a component may be eight megabytes and nothing else
+/// deletes these rows, so a client redeployed a thousand times would hold eight gigabytes of
+/// versions nobody will roll back to. The migration used to claim a retention that did not
+/// exist, which is how this got written.
+#[tokio::test]
+async fn the_version_history_is_pruned_to_the_retention_bound() {
+    let harness = Harness::start(229).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // Two past the bound, so the assertion is about the BOUND and not about "some pruning
+    // happened": exactly `RETENTION` must survive and exactly the newest ones.
+    let deploys = usize::try_from(ironauth_store::TOKEN_HOOK_VERSION_RETENTION).expect("fits") + 2;
+    for index in 0..deploys {
+        let mut component = COMPONENT.to_vec();
+        component.extend_from_slice(format!("deploy {index}").as_bytes());
+        let (status, _, body) = harness
+            .put_bytes(&format!("{base}?payload_version=1"), &component)
+            .await;
+        assert_eq!(status, StatusCode::OK, "deploy {index}: {body}");
+    }
+
+    let (status, _, body) = harness.get(&format!("{base}/versions")).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let listed = listed.as_array().expect("array");
+    assert_eq!(
+        i32::try_from(listed.len()).expect("fits"),
+        ironauth_store::TOKEN_HOOK_VERSION_RETENTION,
+        "exactly the retention survives, not merely fewer than everything: {body}"
+    );
+
+    // THE NEWEST ONES, which is the half that matters. Pruning that kept the OLDEST would also
+    // satisfy a count assertion and would throw away every version anyone would roll back to.
+    assert_eq!(
+        listed[0]["version"],
+        i32::try_from(deploys).expect("fits"),
+        "the most recent deploy is still there: {body}"
+    );
+    let oldest_kept =
+        deploys - usize::try_from(ironauth_store::TOKEN_HOOK_VERSION_RETENTION).expect("fits") + 1;
+    assert_eq!(
+        listed[listed.len() - 1]["version"],
+        i32::try_from(oldest_kept).expect("fits"),
+        "and the window is the newest N, so the oldest survivor is deploys - N + 1: {body}"
+    );
+}

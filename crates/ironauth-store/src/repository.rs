@@ -32504,6 +32504,30 @@ impl ActingTokenHookRepo<'_> {
                 .bind(failure_policy.as_str())
                 .execute(&mut **tx)
                 .await?;
+                // PRUNE TO THE NEWEST FEW, in the same transaction as the insert that grew it.
+                //
+                // A component may be eight megabytes and nothing else deletes these rows, so a
+                // client redeployed a thousand times would hold eight gigabytes of history --
+                // and a rollback target a hundred deploys back is not one anybody reaches for.
+                //
+                // Keyed on the VERSION NUMBER rather than on age: "the last twenty deploys" is
+                // what an operator rolling back is thinking about, and a time window would
+                // discard the whole history of a client that had not deployed in a while,
+                // which is exactly the client whose last-known-good matters most.
+                sqlx::query(
+                    "DELETE FROM token_hook_versions \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                       AND version <= ( \
+                           SELECT MAX(version) FROM token_hook_versions \
+                           WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                       ) - $4",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(TOKEN_HOOK_VERSION_RETENTION)
+                .execute(&mut **tx)
+                .await?;
                 enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
@@ -32680,6 +32704,18 @@ impl ActingTokenHookRepo<'_> {
         .await
     }
 }
+
+/// How many deploys of one client's hook are kept.
+///
+/// Twenty, which is a policy number rather than a derived one, so here is the reasoning: a
+/// rollback answers "what did this look like before the change that broke it", and the change
+/// that broke it is one of the last few. Twenty covers a bad week of iteration and bounds the
+/// storage at twenty times the eight-megabyte component ceiling per client.
+///
+/// The pruning is by version number, not by age. A time window would discard the entire history
+/// of a client that had not deployed in months -- which is precisely the client whose
+/// last-known-good version matters most when something finally does change.
+pub const TOKEN_HOOK_VERSION_RETENTION: i32 = 20;
 
 /// Read a stored `failure_policy`, refusing a value no dispatch could honour.
 ///
