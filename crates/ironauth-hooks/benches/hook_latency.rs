@@ -98,21 +98,41 @@ fn request() -> Request {
 fn main() {
     let engine = HookEngine::new().expect("engine");
     let wasm = std::fs::read(env!("IRONAUTH_GUEST_GOOD")).expect("the benchmark guest");
+    // Compiled ONCE, standing in for the deploy-time write. The request path never does this:
+    // it reads the artifact out of `token_hooks` alongside the key that vouches for it.
+    let artifact = engine.compile(&wasm).expect("precompile at deploy time");
     let limits = Limits::claim_shaping();
     let request = request();
 
     let mut cold_samples = Vec::with_capacity(COLD_ITERATIONS);
     for _ in 0..COLD_ITERATIONS {
         let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement: elapsed time is this benchmark's entire output, and a bench target is not protocol logic (it is not compiled into the server), which is what the rule protects
-        // `load`, which is `Component::new`: the SAME call the dispatch makes on a cache miss.
-        // No `unsafe`, because the dispatch has none either -- the AOT pair measured slower
-        // (34.0 ms against 32.8) and was the only unsafe block in the crate it lived in.
-        let hook = engine.load(&wasm).expect("load");
+        // DESERIALIZE, which is the call the dispatch now makes on a cache miss when the
+        // stored artifact's key matches the running engine. That is criterion 4's cold start.
+        //
+        // It was `engine.load` (a full `Component::new` compile) for one release, because the
+        // dispatch compiled. That was honest at the time -- a benchmark must time the sequence
+        // the server runs -- and it measured ~93 ms on the pinned runner against a 1 ms
+        // criterion. Deploy-time precompilation is what closed that, so this follows it back.
+        //
+        // SAFETY: `artifact` is the output of `compile` on THIS engine, in this process, a few
+        // lines above. That is the provenance `load_precompiled` requires, and it is the same
+        // fact the dispatch establishes with a key comparison.
+        #[expect(
+            unsafe_code,
+            reason = "criterion 4's cold start IS the deserialize; there is no safe API for it, \
+                      and the artifact was produced by this very engine"
+        )]
+        let hook = unsafe { engine.load_precompiled(&artifact) }.expect("load");
         hook.customize(&engine, &limits, &request).expect("call");
         cold_samples.push(started.elapsed().as_nanos());
     }
 
-    let hook = engine.load(&wasm).expect("load");
+    #[expect(
+        unsafe_code,
+        reason = "same provenance as the cold loop; the warm loop needs one loaded hook"
+    )]
+    let hook = unsafe { engine.load_precompiled(&artifact) }.expect("load");
     // One call outside the measurement so the warm number is not the first call.
     hook.customize(&engine, &limits, &request).expect("warm up");
     let mut warm_samples = Vec::with_capacity(WARM_ITERATIONS);
@@ -129,7 +149,9 @@ fn main() {
         "{{\"cold_p95_micros\":{:.3},\"warm_p95_micros\":{:.3},\"artifact_bytes\":{},\"cold_iterations\":{},\"warm_iterations\":{}}}",
         micros(cold_p95_ns),
         micros(warm_p95_ns),
-        wasm.len(),
+        // The ARTIFACT's size, not the component's. Cold now loads the artifact, so reporting
+        // the wasm length would describe a different object than the number beside it.
+        artifact.len(),
         // The LENGTHS, not the constants. They agree today because the constants are the loop
         // bounds, but the gate's sample floor would then be reading a claim about the data
         // rather than the data -- and a loop that broke early would report the count it meant

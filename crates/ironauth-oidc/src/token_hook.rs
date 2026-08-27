@@ -346,18 +346,25 @@ pub async fn run(
         return Err(HookFault::PayloadVersion);
     }
 
-    let loaded = loaded_hook(engine, cache, scope, client_id, &record.component)
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                target: "ironauth.hooks",
-                tenant = %scope.tenant(),
-                client_id,
-                ?error,
-                "the deployed hook component could not be compiled"
-            );
-            HookFault::Unloadable
-        })?;
+    let loaded = loaded_hook(
+        engine,
+        cache,
+        scope,
+        client_id,
+        &record.component,
+        record.precompiled.as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(
+            target: "ironauth.hooks",
+            tenant = %scope.tenant(),
+            client_id,
+            ?error,
+            "the deployed hook component could not be compiled"
+        );
+        HookFault::Unloadable
+    })?;
 
     let request = Request {
         payload_version: PAYLOAD_VERSION,
@@ -416,6 +423,7 @@ async fn loaded_hook(
     scope: Scope,
     client_id: &str,
     component: &[u8],
+    precompiled: Option<&ironauth_store::token_hook_store::PrecompiledHook>,
 ) -> Result<Arc<LoadedHook>, HookError> {
     let key: HookKey = (
         scope.tenant().to_string(),
@@ -436,15 +444,44 @@ async fn loaded_hook(
         None => {}
     }
 
+    // THE AOT ARM, and the key comparison is the whole of its safety.
+    //
+    // `load_precompiled` executes the bytes as machine code, so handing it an artifact from a
+    // different wasmtime version, configuration or CPU is undefined behaviour rather than an
+    // error. wasmtime's own guarantee is what makes this sound: engines reporting the same
+    // `compatibility_key` can load each other's artifacts. So an artifact whose stored key does
+    // not equal this engine's is not "probably fine", it is refused, and the component is
+    // compiled instead.
+    //
+    // A mismatch costs a compile. It is the ordinary case on a node one wasmtime version ahead,
+    // on a different CPU, or on any row deployed before the artifact columns existed -- and it
+    // is exactly what every request did before this arm existed, so the fallback is the
+    // previously shipped behaviour rather than a degraded mode.
+    let usable_artifact = precompiled.and_then(|pair| {
+        (pair.engine_key == engine.compatibility_key()).then(|| pair.artifact.clone())
+    });
+
     let compiling = Arc::clone(engine);
     let bytes = component.to_vec();
-    let outcome = tokio::task::spawn_blocking(move || compiling.load(&bytes))
-        .await
-        .unwrap_or_else(|join| {
-            Err(HookError::Declined(format!(
-                "the compile task did not complete: {join}"
-            )))
-        });
+    let outcome = tokio::task::spawn_blocking(move || match usable_artifact {
+        // SAFETY: the artifact's stored key equals this engine's `compatibility_key`, checked
+        // immediately above. wasmtime documents that guarantee as sufficient for an artifact
+        // from one engine to deserialize in another, and it is the same check
+        // `an_artifact_crosses_between_two_engines_that_report_the_same_key` measures.
+        #[expect(
+            unsafe_code,
+            reason = "criterion 4's cold start is a deserialize, and there is no safe API for \
+                      it; the key equality above is the provenance `load_precompiled` requires"
+        )]
+        Some(artifact) => unsafe { compiling.load_precompiled(&artifact) },
+        None => compiling.load(&bytes),
+    })
+    .await
+    .unwrap_or_else(|join| {
+        Err(HookError::Declined(format!(
+            "the compile task did not complete: {join}"
+        )))
+    });
 
     let loaded = match outcome {
         Ok(hook) => Arc::new(hook),
@@ -904,6 +941,7 @@ mod tests {
                 scope,
                 "a-client",
                 ironauth_hooks::fixtures::GOOD,
+                None,
             )
             .await
             .expect("the shipped fixture compiles");
@@ -956,6 +994,7 @@ mod tests {
                 scope,
                 "a-client",
                 ironauth_hooks::fixtures::NET_ESCAPE,
+                None,
             )
             .await
             .expect_err("an unlinkable component cannot load");
@@ -972,6 +1011,7 @@ mod tests {
                 scope,
                 "a-client",
                 ironauth_hooks::fixtures::NET_ESCAPE,
+                None,
             )
             .await
             .expect_err("still refused");
@@ -982,8 +1022,14 @@ mod tests {
                 Some(ironauth_hooks::AbortKind::Unlinkable),
                 "and the recalled refusal classifies identically: {second}"
             );
+            // FIVE milliseconds, not one. The bound has to be sized against the thing it
+            // distinguishes -- a compile, tens of milliseconds -- and not against the fast
+            // path's typical value, which is microseconds. At 1 ms this failed at 1.16 ms with
+            // eight unit tests running in parallel: a correct recall, rejected because the
+            // margin was the scheduler's noise rather than the gap being measured. Five leaves
+            // a 6x margin to a compile and does not care how busy the machine is.
             assert!(
-                elapsed < std::time::Duration::from_millis(1),
+                elapsed < std::time::Duration::from_millis(5),
                 "the second refusal took {elapsed:?}, which is a COMPILE, not a recall. The \
                  entry being present is not the property; reading it is."
             );
@@ -1020,7 +1066,7 @@ mod tests {
                 ironauth_store::EnvironmentId::from_seed_bytes([6_u8; 16]),
             );
 
-            let error = loaded_hook(&engine, &cache, scope, "a-client", b"not a component")
+            let error = loaded_hook(&engine, &cache, scope, "a-client", b"not a component", None)
                 .await
                 .expect_err("garbage is not a component");
             assert_eq!(
@@ -1034,6 +1080,124 @@ mod tests {
                 "an `Invalid` must NOT be remembered: it is indistinguishable from a host that \
                  could not allocate for a second, and remembering that refuses a healthy hook \
                  until the process restarts"
+            );
+        });
+    }
+
+    /// A STORED ARTIFACT IS DESERIALIZED, not recompiled, when its key matches.
+    ///
+    /// This is criterion 4's cold start. Compiling is tens of milliseconds; deserializing is
+    /// hundreds of microseconds, and the criterion bounds cold at 1 ms -- so the difference
+    /// between the two arms IS the criterion, and a test that only checked the hook ran would
+    /// pass on either.
+    ///
+    /// Timed rather than observed structurally, because "which arm ran" has no other visible
+    /// effect: both produce a working `LoadedHook`. The margin is two orders of magnitude, and
+    /// there is no login around it -- the failure of the fuel test was timing an exchange that
+    /// was 92% Argon2id.
+    #[test]
+    fn a_keyed_artifact_is_deserialized_rather_than_compiled() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            let engine =
+                std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine"));
+            let cache: std::sync::Arc<super::HookCache> =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let scope = ironauth_store::Scope::new(
+                ironauth_store::TenantId::from_seed_bytes([11_u8; 16]),
+                ironauth_store::EnvironmentId::from_seed_bytes([12_u8; 16]),
+            );
+            let component = ironauth_hooks::fixtures::GOOD;
+
+            // What a deploy-time write stores.
+            let artifact = engine
+                .compile(component)
+                .expect("precompile at deploy time");
+            let stored = ironauth_store::token_hook_store::PrecompiledHook {
+                artifact,
+                engine_key: engine.compatibility_key().to_vec(),
+            };
+
+            let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement: deserializing and compiling both yield a working hook, so elapsed time is the only thing that distinguishes the arm that ran, and criterion 4 is stated in those units
+            loaded_hook(&engine, &cache, scope, "a-client", component, Some(&stored))
+                .await
+                .expect("a keyed artifact loads");
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < std::time::Duration::from_millis(5),
+                "loading a keyed artifact took {elapsed:?}, which is a COMPILE. Criterion 4 \
+                 bounds cold start at 1 ms and a compile is tens of milliseconds, so this arm \
+                 not running means the criterion cannot be met at any cache hit rate: the \
+                 first request in every process pays it."
+            );
+        });
+    }
+
+    /// AN ARTIFACT FROM A DIFFERENT ENGINE IS REFUSED, and the component is compiled instead.
+    ///
+    /// The safety of storing machine code in a table every node reads rests entirely on this.
+    /// `load_precompiled` executes the bytes, so a node on a different CPU or one wasmtime
+    /// version ahead must not touch an artifact built elsewhere -- and "must not" has to be a
+    /// check, not a convention.
+    ///
+    /// The wrong key here is a real 32-byte digest that simply is not this engine's, which is
+    /// what a foreign node's key looks like. The load must still SUCCEED, because falling back
+    /// to the component is the point: a mismatch costs a compile, not an outage.
+    #[test]
+    fn an_artifact_whose_key_does_not_match_is_ignored_and_the_component_compiled() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            let engine =
+                std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine"));
+            let cache: std::sync::Arc<super::HookCache> =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let scope = ironauth_store::Scope::new(
+                ironauth_store::TenantId::from_seed_bytes([13_u8; 16]),
+                ironauth_store::EnvironmentId::from_seed_bytes([14_u8; 16]),
+            );
+
+            // GARBAGE where the artifact goes, under a key that is not this engine's. If the
+            // key were ignored, `load_precompiled` would be handed this -- so the assertion is
+            // that the load succeeds, which it can only do by compiling the component.
+            let foreign = ironauth_store::token_hook_store::PrecompiledHook {
+                artifact: vec![0xde, 0xad, 0xbe, 0xef],
+                engine_key: vec![0xaa_u8; 32],
+            };
+            assert_ne!(
+                foreign.engine_key,
+                engine.compatibility_key().to_vec(),
+                "the fixture key must differ, or this test asserts nothing"
+            );
+
+            let hook = loaded_hook(
+                &engine,
+                &cache,
+                scope,
+                "a-client",
+                ironauth_hooks::fixtures::GOOD,
+                Some(&foreign),
+            )
+            .await
+            .expect("a key mismatch falls back to compiling, it does not fail the issuance");
+
+            let customization = hook
+                .customize(&engine, &limits(), &super::Request::default())
+                .expect("and the compiled component runs");
+            assert!(
+                customization
+                    .access_token_claims
+                    .iter()
+                    .any(|(name, _)| name == "tier"),
+                "the COMPONENT ran, so the foreign artifact was ignored rather than executed"
             );
         });
     }

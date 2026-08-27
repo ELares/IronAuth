@@ -45,21 +45,17 @@ class = "ubuntu-latest"
 # these two lines ARE the criterion: as plain unbounded config they were one edit away from a
 # gate that admits a full second, and the run still printed "clean". Lowering them as the
 # runtime improves is exactly what this file is for; raising them is an edit to the script.
-# 250 ms, and the 60 ms it replaces is a lesson about where a bound may be calibrated.
+# THE CRITERION'S 1 ms, restored, because cold start is a DESERIALIZE again.
 #
-# 60 ms came from 33 ms measured on a developer laptop. The pinned runner then compiled the same
-# component at 86.9 ms and the job failed on a healthy system. A ceiling derived from the machine
-# that is not going to enforce it is not a ceiling.
+# The deploy-time write now precompiles and stores the artifact beside the component, keyed on
+# `Engine::compatibility_key`, and the dispatch deserializes when that key matches the running
+# engine. Measured locally: 102 us, against ~33,000 us for the `Component::new` it replaces.
 #
-# So: 86.9 ms observed on `ubuntu-latest`, and this is roughly 3x that -- wide enough that a
-# slower runner in the same class does not turn the gate into noise.
-#
-# It does NOT catch a doubling, and an earlier version of this sentence claimed it did. 86.9 x 2
-# is 174 ms, under this ceiling, so a change that doubled compile time would pass. What catches
-# that is the RELATIVE check below, against a committed baseline, with its own 100% tolerance --
-# this absolute number is the backstop for a collapse, not the regression detector. Saying
-# otherwise was arithmetic contradicted by the same sentence's own figure.
-cold_p95_micros = 250000
+# A node whose key does NOT match -- a different CPU, a wasmtime version ahead, a row written
+# before the artifact columns existed -- compiles from source and pays that ~33,000 us on its
+# first request per process. That is the fallback, not the gate: this number bounds the shipped
+# path, and the shipped path is the keyed one.
+cold_p95_micros = 1000
 # UNCHANGED at the criterion's own number, and now MET on the enforcing runner -- but read the
 # margin below before calling it comfortable.
 #

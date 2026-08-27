@@ -1268,6 +1268,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0162_token_hooks.sql"),
         },
+        Migration {
+            version: 163,
+            name: "token_hooks_precompiled",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0163_token_hooks_precompiled.sql"),
+        },
     ]
 }
 

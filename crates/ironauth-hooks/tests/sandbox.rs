@@ -818,3 +818,64 @@ fn a_precompiled_hook_behaves_the_same_as_a_compiled_one() {
         "AOT must change the latency and nothing else"
     );
 }
+
+/// TWO ENGINES BUILT THE SAME WAY AGREE, and an artifact from one loads in the other.
+///
+/// This is the property the whole AOT design rests on. Storing machine code in a table every
+/// node reads is undefined behaviour if the loading engine differs from the producing one, so
+/// the artifact travels with a KEY and is only deserialized when the key matches. If two
+/// identically-configured engines disagreed, every node would recompile forever and the stored
+/// artifact would be dead weight; if the key matched across engines that were NOT compatible,
+/// it would be worse than dead weight.
+///
+/// wasmtime's own guarantee is the one being leaned on: "If this Hash matches between two
+/// Engines then binaries from one are guaranteed to deserialize in the other." This asserts the
+/// key agrees AND that a real artifact actually crosses, because the guarantee is only useful
+/// if both halves hold in this configuration.
+#[test]
+fn an_artifact_crosses_between_two_engines_that_report_the_same_key() {
+    let producer = HookEngine::new().expect("engine");
+    let consumer = HookEngine::new().expect("engine");
+    assert_eq!(
+        producer.compatibility_key(),
+        consumer.compatibility_key(),
+        "two engines built by `HookEngine::new` are configured identically, so they must agree"
+    );
+
+    let artifact = producer.compile(&guest(GOOD)).expect("precompile");
+    // SAFETY: the artifact is the output of `compile` on an engine whose compatibility key
+    // equals this one's, asserted immediately above. That is exactly the provenance
+    // `load_precompiled` requires, and it is the same check the dispatch makes before it calls
+    // this in production.
+    #[expect(
+        unsafe_code,
+        reason = "the AOT path is the subject: the property under test is that an artifact \
+                  crosses between key-equal engines, which cannot be shown without loading one"
+    )]
+    let hook = unsafe { consumer.load_precompiled(&artifact) }
+        .expect("an artifact from a key-equal engine loads");
+
+    let customization = hook
+        .customize(&consumer, &Limits::claim_shaping(), &request())
+        .expect("and it runs");
+    assert!(
+        customization
+            .access_token_claims
+            .iter()
+            .any(|(name, _)| name == "tier"),
+        "the hook that crossed is the hook that ran: {:?}",
+        customization.access_token_claims
+    );
+}
+
+/// The key is STABLE within a process, so reading it twice cannot invalidate stored artifacts.
+///
+/// Cheap, and it guards a real hazard: a key derived from anything incidental -- an address, an
+/// allocation order, a timestamp -- would differ between the deploy-time write and the
+/// request-time comparison, and every artifact would be recompiled on every load while the
+/// mechanism looked correct.
+#[test]
+fn the_compatibility_key_is_stable_across_reads() {
+    let engine = HookEngine::new().expect("engine");
+    assert_eq!(engine.compatibility_key(), engine.compatibility_key());
+}

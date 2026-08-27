@@ -32328,7 +32328,8 @@ impl TokenHookRepo<'_> {
     pub async fn get(&self, client_id: &str) -> Result<Option<TokenHookRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT client_id, component, payload_version FROM token_hooks \
+            "SELECT client_id, component, payload_version, precompiled, engine_key \
+             FROM token_hooks \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
         )
         .bind(self.scope.tenant().to_string())
@@ -32341,6 +32342,19 @@ impl TokenHookRepo<'_> {
             client_id: row.get("client_id"),
             component: row.get("component"),
             payload_version: row.get("payload_version"),
+            // Both or neither, which the table's own CHECK enforces. Rebuilt as a pair here so
+            // a caller cannot be handed an artifact it has no key to validate against -- the
+            // `zip` is the type-level half of that constraint.
+            precompiled: Option::zip(
+                row.get::<Option<Vec<u8>>, _>("precompiled"),
+                row.get::<Option<Vec<u8>>, _>("engine_key"),
+            )
+            .map(
+                |(artifact, engine_key)| crate::token_hook_store::PrecompiledHook {
+                    artifact,
+                    engine_key,
+                },
+            ),
         }))
     }
 }
@@ -32370,12 +32384,43 @@ impl ActingTokenHookRepo<'_> {
         component: &[u8],
         payload_version: i32,
     ) -> Result<(), StoreError> {
+        self.set_with_artifact(env, client, component, payload_version, None)
+            .await
+    }
+
+    /// [`Self::set`], additionally storing a precompiled artifact and the key that vouches for
+    /// it (issue #114 criterion 4).
+    ///
+    /// DEPLOY-TIME COMPILATION is what the criterion means by "AOT". A dispatch that compiles
+    /// on the request path cannot meet a 1 ms cold start at any cache hit rate, because the
+    /// first request in every process pays the compile -- ~93 ms on the pinned runner against
+    /// ~200 to 440 us to deserialize.
+    ///
+    /// The artifact is OPTIONAL, and a caller with no engine passes `None`. That is not a
+    /// degraded mode: a reader that finds no artifact compiles the component, which is what
+    /// every reader did before this existed. What it must never do is load an artifact it
+    /// cannot vouch for, which is why the key travels with it and why the two are one argument.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`], plus the table's CHECKs: an artifact must be non-empty and within
+    /// 64 MiB, and its key must be a 32-byte digest.
+    pub async fn set_with_artifact(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        component: &[u8],
+        payload_version: i32,
+        precompiled: Option<&crate::token_hook_store::PrecompiledHook>,
+    ) -> Result<(), StoreError> {
         if client.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
         let client_id = client.to_string();
         let bytes = component.to_vec();
+        let artifact = precompiled.map(|pair| pair.artifact.clone());
+        let engine_key = precompiled.map(|pair| pair.engine_key.clone());
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -32388,11 +32433,14 @@ impl ActingTokenHookRepo<'_> {
             async move |tx| {
                 sqlx::query(
                     "INSERT INTO token_hooks \
-                     (tenant_id, environment_id, client_id, component, payload_version) \
-                     VALUES ($1, $2, $3, $4, $5) \
+                     (tenant_id, environment_id, client_id, component, payload_version, \
+                      precompiled, engine_key) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
                      ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE \
                      SET component = EXCLUDED.component, \
                          payload_version = EXCLUDED.payload_version, \
+                         precompiled = EXCLUDED.precompiled, \
+                         engine_key = EXCLUDED.engine_key, \
                          updated_at = now()",
                 )
                 .bind(scope.tenant().to_string())
@@ -32400,6 +32448,8 @@ impl ActingTokenHookRepo<'_> {
                 .bind(&client_id)
                 .bind(&bytes)
                 .bind(payload_version)
+                .bind(artifact.as_deref())
+                .bind(engine_key.as_deref())
                 .execute(&mut **tx)
                 .await?;
                 Ok(())

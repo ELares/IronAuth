@@ -98,6 +98,59 @@ impl HookEngine {
         })
     }
 
+    /// The key that says whether a precompiled artifact from another engine will load here.
+    ///
+    /// # Why a precompiled artifact needs one at all
+    ///
+    /// `compile` emits MACHINE CODE for this engine's exact wasmtime version, configuration and
+    /// CPU. Handing that to a different engine is undefined behaviour, not an error, which is
+    /// why `load_precompiled` is `unsafe` -- and it is why storing artifacts in a table every
+    /// node reads was refused the first time issue #114 considered it.
+    ///
+    /// wasmtime answers the question directly. `Engine::precompile_compatibility_hash` is
+    /// documented as: "If this Hash matches between two Engines then binaries from one are
+    /// guaranteed to deserialize in the other." So an artifact stored WITH this key, and loaded
+    /// only when the key matches the running engine's, is safe by the runtime's own guarantee
+    /// rather than by a version string somebody remembered to bump.
+    ///
+    /// # Why SHA-256 and not `DefaultHasher`
+    ///
+    /// The key is written to a database and compared by a different process, possibly built by
+    /// a different Rust toolchain. `DefaultHasher`'s output is explicitly not stable across
+    /// releases, so a toolchain bump would silently invalidate every stored artifact -- which
+    /// fails SAFE (everything recompiles) but would be a permanent, invisible performance
+    /// cliff nobody could explain.
+    ///
+    /// A mismatch is always safe: the caller compiles from source instead. A false MATCH would
+    /// not be, which is why this is a 256-bit digest and not a 64-bit one.
+    #[must_use]
+    pub fn compatibility_key(&self) -> [u8; 32] {
+        use sha2::Digest as _;
+        use std::hash::{Hash as _, Hasher};
+
+        /// A `Hasher` that accumulates into SHA-256.
+        ///
+        /// `finish` is part of the trait and returns a `u64`, which cannot carry a 256-bit
+        /// digest -- so it returns zero and the digest is taken from the state directly. That
+        /// is sound only because nothing outside this function ever holds this hasher: `Hash`
+        /// implementations call `write*`, never `finish`.
+        struct Accumulate(sha2::Sha256);
+        impl Hasher for Accumulate {
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.update(bytes);
+            }
+            fn finish(&self) -> u64 {
+                0
+            }
+        }
+
+        let mut hasher = Accumulate(sha2::Sha256::new());
+        self.engine
+            .precompile_compatibility_hash()
+            .hash(&mut hasher);
+        hasher.0.finalize().into()
+    }
+
     /// Compile a hook from WebAssembly to a precompiled artifact.
     ///
     /// This is the deploy-time half. It is safe to call on bytes a hook author uploaded:

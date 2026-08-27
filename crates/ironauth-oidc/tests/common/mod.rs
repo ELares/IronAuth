@@ -924,13 +924,36 @@ impl Harness {
         component: &[u8],
         payload_version: i32,
     ) {
+        // PRECOMPILES, as a deploy-time write should (issue #114 criterion 4). Without this
+        // the artifact columns are never populated in any integration test, so the dispatch's
+        // AOT arm would be exercised by unit tests only and every end-to-end path would
+        // silently take the compile fallback -- which is the shape of "a layer with no caller"
+        // this crate has produced before.
+        //
+        // `None` when the harness has no engine: a deployment without hooks enabled still
+        // stores the component, and a reader with no artifact compiles it.
+        let precompiled = self.hook_runtime().and_then(|runtime| {
+            let engine = runtime.engine();
+            engine.compile(component).ok().map(|artifact| {
+                ironauth_store::token_hook_store::PrecompiledHook {
+                    artifact,
+                    engine_key: engine.compatibility_key().to_vec(),
+                }
+            })
+        });
         let env = self.env().clone();
         self.db()
             .control_store()
             .scoped(self.scope())
             .acting(self.db().test_actor(&env), CorrelationId::generate(&env))
             .token_hooks()
-            .set(&env, client, component, payload_version)
+            .set_with_artifact(
+                &env,
+                client,
+                component,
+                payload_version,
+                precompiled.as_ref(),
+            )
             .await
             .expect("deploy the hook");
     }

@@ -23,15 +23,24 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# SHA-256 for the engine's compatibility KEY. `Engine::precompile_compatibility_hash` hands back
+# a `Hash` rather than bytes, and this key is PERSISTED beside a precompiled artifact -- so the
+# digest has to be stable across processes and across Rust versions, which `DefaultHasher` is
+# explicitly not.
+sha2.workspace = true
 # The WASM runtime (issue #114). Apache-2.0 WITH LLVM-exception, which the licence policy
 # already allows. Its MSRV is 1.95, ABOVE the workspace promise of 1.85, which is why this
 # crate carries its own `rust-version` above and why the msrv lane scopes itself to what the
 # shipped binary reaches.
 #
-# `cranelift` is the compiling backend and is what makes AOT precompilation possible; the
-# runtime never compiles a hook on the request path, only deserializes what deployment
-# already compiled. See `engine.rs` for why that distinction is a security boundary and
-# not just a latency one.
+# `cranelift` is the compiling backend and is what makes AOT precompilation possible. On the
+# KEYED path the runtime does not compile: the deploy-time write stores an artifact with
+# `Engine::compatibility_key`, and the request path deserializes it when that key matches.
+#
+# It DOES compile when the key does not match -- a different CPU, a wasmtime version ahead, a
+# row predating the artifact columns -- which is why cranelift is not optional. This comment
+# claimed the unconditional version for a release during which the dispatch compiled on every
+# cache miss, which made it false exactly when it mattered.
 wasmtime = { version = "48", default-features = false, features = [
     "component-model",
     "cranelift",

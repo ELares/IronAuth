@@ -119,7 +119,12 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 # assertion sits two orders of magnitude between them. Reading the frozen Clock seam there
 # would report zero for both and make the distinction unmeasurable, which is the one case
 # this rule is not protecting. It is a unit test in the lib, not a request path.
-scan time-via-env 'SystemTime::now|Instant::now' 12
+# 12 -> 13: `a_keyed_artifact_is_deserialized_rather_than_compiled`. Deserializing and
+# compiling both produce a working `LoadedHook`, so WHICH ARM RAN has no other visible
+# effect -- elapsed time is the only discriminator, and criterion 4 is itself stated in
+# those units (cold start below 1 ms). A frozen Clock seam reports zero for both and makes
+# the distinction unmeasurable. Unit test in the lib, not a request path.
+scan time-via-env 'SystemTime::now|Instant::now' 13
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.
