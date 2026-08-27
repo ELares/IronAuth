@@ -326,103 +326,112 @@ fn entries_depth(entries: &[IdedEntryExpr]) -> u32 {
 
 /// An upper bound on how many elements this expression can EVALUATE TO.
 ///
-/// # Why the largest source node was the wrong question
+/// # The rule, in one sentence
 ///
-/// The model's `n` is the cardinality a comprehension multiplies by, and two earlier versions
-/// answered it by taking a MAXIMUM over source nodes: first the declared shape alone, then the
-/// greater of that and the largest literal. Both are wrong for the same reason, and CEL's `+`
-/// is the counterexample: it CONCATENATES lists (`objects.rs:1583`), so `k` sources of size
-/// `m` iterate `k * m` while a maximum reports `m`.
+/// A node's bound is the larger of what it IS and what it CONTAINS.
 ///
-/// Measured by review against the real crate, at the previous HEAD:
+/// The second half is the part four separate revisions got wrong, each time by special-casing
+/// one container and leaving the others. The reason it has to be uniform is that CEL can
+/// descend into any container: `_[_]`, a dot-select, and a comprehension body all hand back
+/// something that was nested a moment earlier, so a bound that stops at the outer node is a
+/// bound anything can step around by adding two characters. Every one of these was MEASURED
+/// against the real crate rather than argued:
 ///
 /// ```text
-/// (groups + groups + ... 40 copies).filter(g, g > 0).size()
-///   383 bytes of expression, `groups` bound to exactly the declared 1,000
-///   estimate 1,000,000 -> ADMITTED -> ran 20.8 SECONDS over 40,000 elements
+/// [<40,000 literals>][0]...          scored 1          admitted   20.76 s
+/// {'k': <40,000 literals>}['k']...   scored 1          admitted   20.93 s
+/// {'k': 40 x groups}.k...            scored 1,000,000  admitted   20.51 s
+/// [1].map(x, 90 x groups)[0]...      scored 997,002,999 admitted  106.54 s
 /// ```
 ///
-/// It also defeated the literal fix by rewriting the same data: forty concatenated
-/// 1,000-element literals is a SMALLER source (155,783 bytes) than one 40,000-element literal
-/// (228,915 bytes), and the small one was admitted while the large one was correctly refused.
-/// A bound that a rewrite can walk around is not a bound.
+/// The first two were fixed by recursing into list and map LITERALS, and the third and fourth
+/// then arrived through select and through a comprehension body. Fixing containers one at a
+/// time loses that race, so the recursion below is over EVERY child of every node.
 ///
-/// So this answers the actual question -- what can this node evaluate to -- and `_+_` sums.
+/// # What each node IS
+///
+/// A binding contributes the declared `max_collection_size`, a literal its own length, and
+/// `_+_` the SUM of its operands, because CEL concatenates lists (`objects.rs:1583`) -- forty
+/// copies of a declared 1,000 iterate 40,000, which a maximum would report as 1,000.
+/// Everything else contributes nothing of its own and is bounded by what it contains.
 fn cardinality_bound(expression: &Expr, shape: InputShape) -> u64 {
-    match expression {
-        // A binding, or a field of one: whatever the input document declared. This is the
-        // case the original model handled, and it is still the common one.
+    // CHILDREN ONCE, into a slice, and both uses read from it.
+    //
+    // The first version of this computed each child twice -- once inside the `_+_` sum and
+    // again for the containment maximum -- which is exponential in the nesting depth of `+`.
+    // The suite hung: `(groups + groups + ... 40 copies)` is 40 nested `_+_` nodes, so 2^40
+    // evaluations of the same tree. An estimator that has to be cheap to be deterministic
+    // cannot afford a second traversal per node.
+    let children = child_bounds(expression, shape);
+    let within = children.iter().copied().max().unwrap_or(0);
+    let own = match expression {
+        // A binding, or a field read: whatever the input document declared.
         Expr::Ident(_) | Expr::Select(_) => shape.max_collection_size,
-        // A literal: its own length, OR the largest collection it contains, whichever is
-        // bigger.
-        //
-        // The recursion is the load-bearing half and this file deleted it once. The previous
-        // model had it, with the comment "THE COUNT and the recursion, because a large literal
-        // can hold a larger one"; the first version of `cardinality_bound` replaced that with
-        // the count alone and defended it as "a nested collection is bounded where it is
-        // itself iterated". That defence is wrong, because the `_[_]` index that descends from
-        // a container to its member is an ordinary call and inherits the CONTAINER's bound.
-        //
-        // Measured by review: a bare 40,000-element literal scores 1,600,000,000 and is
-        // refused, and the SAME literal wrapped as `[ ... ][0]` -- five more characters --
-        // scored 1, was admitted, and ran 20.76 seconds. `{'k': ...}['k']` does the same. The
-        // test directly below this fix says "a bound a rewrite can step around is not a
-        // bound", and five characters stepped around it.
-        Expr::List(list) => (list.elements.len() as u64).max(
-            list.elements
-                .iter()
-                .map(|element| cardinality_bound(&element.expr, shape))
-                .max()
-                .unwrap_or(0),
-        ),
-        Expr::Map(map) => (map.entries.len() as u64).max(entries_cardinality(&map.entries, shape)),
-        Expr::Struct(structure) => {
-            (structure.entries.len() as u64).max(entries_cardinality(&structure.entries, shape))
-        }
-        Expr::Call(call) => {
-            if call.func_name == "_+_" {
-                // CONCATENATION SUMS. Saturating, because an estimate that wrapped to a small
-                // number would admit the most expensive thing anyone could write.
-                call.args.iter().fold(0_u64, |total, arg| {
-                    total.saturating_add(cardinality_bound(&arg.expr, shape))
-                })
-            } else {
-                // Every other call is at most as large as what it was called on: `filter`
-                // narrows, `map` preserves, `size` returns a scalar. Taking the maximum over
-                // the target and the arguments over-estimates rather than under-estimates,
-                // which is the safe direction for a bound.
-                call.target
+        // A literal: exactly what is written at this level.
+        Expr::List(list) => list.elements.len() as u64,
+        Expr::Map(map) => map.entries.len() as u64,
+        Expr::Struct(structure) => structure.entries.len() as u64,
+        // CONCATENATION SUMS. Saturating, because an estimate that wrapped to a small number
+        // would admit the most expensive thing anyone could write.
+        Expr::Call(call) if call.func_name == "_+_" => children
+            .iter()
+            .fold(0_u64, |total, bound| total.saturating_add(*bound)),
+        _ => 0,
+    };
+    own.max(within)
+}
+
+/// Every child of a node, already bounded.
+///
+/// Exhaustive by construction: there is no `_ =>` arm, so a new `Expr` variant is a compile
+/// error here rather than a silent zero. A silent zero is exactly how the select and
+/// comprehension-body bypasses got in.
+fn child_bounds(expression: &Expr, shape: InputShape) -> Vec<u64> {
+    match expression {
+        Expr::Comprehension(comprehension) => [
+            &comprehension.iter_range,
+            &comprehension.accu_init,
+            &comprehension.loop_cond,
+            &comprehension.loop_step,
+            &comprehension.result,
+        ]
+        .into_iter()
+        .map(|part| cardinality_bound(&part.expr, shape))
+        .collect(),
+        Expr::Call(call) => call
+            .target
+            .iter()
+            .map(|target| cardinality_bound(&target.expr, shape))
+            .chain(
+                call.args
                     .iter()
-                    .map(|target| cardinality_bound(&target.expr, shape))
-                    .chain(
-                        call.args
-                            .iter()
-                            .map(|arg| cardinality_bound(&arg.expr, shape)),
-                    )
-                    .max()
-                    .unwrap_or(0)
-            }
-        }
-        // A comprehension yields at most what it iterated.
-        Expr::Comprehension(comprehension) => {
-            cardinality_bound(&comprehension.iter_range.expr, shape)
-        }
-        // A scalar is not a collection.
-        Expr::Literal(_) | Expr::Unspecified => 0,
+                    .map(|arg| cardinality_bound(&arg.expr, shape)),
+            )
+            .collect(),
+        Expr::Select(select) => vec![cardinality_bound(&select.operand.expr, shape)],
+        Expr::List(list) => list
+            .elements
+            .iter()
+            .map(|element| cardinality_bound(&element.expr, shape))
+            .collect(),
+        Expr::Map(map) => entries_bounds(&map.entries, shape),
+        Expr::Struct(structure) => entries_bounds(&structure.entries, shape),
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => Vec::new(),
     }
 }
 
-/// The largest collection inside a map or struct literal's entries, both arms.
-fn entries_cardinality(entries: &[IdedEntryExpr], shape: InputShape) -> u64 {
+/// Every child of a map or struct literal's entries, already bounded, both arms.
+fn entries_bounds(entries: &[IdedEntryExpr], shape: InputShape) -> Vec<u64> {
     entries
         .iter()
-        .map(|entry| match &entry.expr {
-            EntryExpr::StructField(field) => cardinality_bound(&field.value.expr, shape),
-            EntryExpr::MapEntry(entry) => cardinality_bound(&entry.key.expr, shape)
-                .max(cardinality_bound(&entry.value.expr, shape)),
+        .flat_map(|entry| match &entry.expr {
+            EntryExpr::StructField(field) => vec![cardinality_bound(&field.value.expr, shape)],
+            EntryExpr::MapEntry(entry) => vec![
+                cardinality_bound(&entry.key.expr, shape),
+                cardinality_bound(&entry.value.expr, shape),
+            ],
         })
-        .max()
-        .unwrap_or(0)
+        .collect()
 }
 
 /// The largest cardinality any comprehension in the expression actually iterates.
@@ -1413,6 +1422,58 @@ mod evaluation_tests {
                 "wrapping the literal in a container must not hide it: {error}"
             );
         }
+    }
+
+    /// TWO SPELLINGS OF ONE DATUM must score the same.
+    ///
+    /// `{'k': x}['k']` parses to a `_[_]` call and `{'k': x}.k` parses to a `Select`, so they
+    /// took different arms and only the call arm recursed. Measured: the bracket spelling of
+    /// `{'k': 40 x groups}` scored 1,600,000,000 and was refused, the dot spelling scored
+    /// 1,000,000 and ran 20.51 seconds. Two characters.
+    ///
+    /// The direct form carries a `+` deliberately: without one, both sides are just the
+    /// declared floor and the comparison holds for the wrong reason.
+    #[test]
+    fn a_dot_select_and_an_index_score_the_same_datum_alike() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        let indexed = estimate("{'k': groups + groups}['k'].filter(g, g > 0).size()", shape);
+        let selected = estimate("{'k': groups + groups}.k.filter(g, g > 0).size()", shape);
+        assert_eq!(
+            selected, indexed,
+            "a dot-select must carry its operand's cardinality exactly as an index does"
+        );
+        assert_eq!(
+            selected,
+            2_000_u64.pow(2),
+            "and both must see the concatenation: 2 x 1,000"
+        );
+    }
+
+    /// A COMPREHENSION BODY's cardinality escapes through the value it yields.
+    ///
+    /// `cardinality_bound` on a comprehension used to read only the `iter_range`, so
+    /// `[1].map(x, 90 x groups)[0]` reported 1 element -- the map's OUTPUT length -- while
+    /// `[0]` hands back the body's 89,910-element list. Measured: 846 bytes, estimate
+    /// 997,002,999 (strictly under budget), ADMITTED, ran 106.54 seconds.
+    #[test]
+    fn a_comprehension_bodys_cardinality_is_counted() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        let plain = estimate("[1].map(x, groups)[0].filter(g, g > 0).size()", shape);
+        let doubled = estimate(
+            "[1].map(x, groups + groups)[0].filter(g, g > 0).size()",
+            shape,
+        );
+        assert!(
+            doubled > plain,
+            "doubling the map BODY's cardinality must raise the estimate ({plain} -> \
+             {doubled}); the model read only the iter_range, which is unchanged at 1"
+        );
     }
 
     /// Adding a loop around an expression must never LOWER its estimate.
