@@ -303,13 +303,11 @@ pub async fn run(
     invocation: &Invocation<'_>,
 ) -> Result<Option<HookClaims>, HookFault> {
     let (engine, cache) = (&runtime.engine, &runtime.cache);
+    // ONLY what this half needs. The claim lists and the grant belong to
+    // `run_deployed_hook`, which is where the hook is actually invoked; naming them here as
+    // well would be two destructures of one struct that have to agree about nothing.
     let Invocation {
-        scope,
-        client_id,
-        grant_type,
-        subject,
-        id_token_claims,
-        access_token_claims,
+        scope, client_id, ..
     } = *invocation;
     let record = store
         .scoped(scope)
@@ -329,6 +327,54 @@ pub async fn run(
     let Some(record) = record else {
         return Ok(None);
     };
+
+    // THE POLICY IS THE RECORD'S, so it is only knowable once the record is read -- which is
+    // why a failure to READ one is unconditionally fail-closed below and cannot be otherwise:
+    // there is no policy to consult when the thing carrying it is what did not load.
+    let failure_policy = record.failure_policy;
+    match run_deployed_hook(engine, cache, invocation, &record).await {
+        Ok(claims) => Ok(claims),
+        Err(fault) => match failure_policy {
+            ironauth_store::HookFailurePolicy::FailClosed => Err(fault),
+            ironauth_store::HookFailurePolicy::FailOpen => {
+                // LOUD, and at error rather than warn. Fail-open means a token is being minted
+                // that the operator's own hook did not shape, which is the situation they most
+                // need to know about and the one that is otherwise invisible: the request
+                // succeeds, the client is happy, and the claim the hook was deployed to add or
+                // REMOVE is simply not applied.
+                tracing::error!(
+                    target: "ironauth.hooks",
+                    tenant = %scope.tenant(),
+                    client_id,
+                    ?fault,
+                    "the client's hook did not complete and its policy is fail-open, so the \
+                     token is being minted WITHOUT the hook's contribution"
+                );
+                Ok(None)
+            }
+        },
+    }
+}
+
+/// Run the deployed hook, with every fault reported as one.
+///
+/// Split out of [`run`] so the failure policy is applied in ONE place: every `?` in here is a
+/// fault the policy decides the meaning of, and threading that decision through each of them
+/// individually is how one of them ends up deciding differently.
+async fn run_deployed_hook(
+    engine: &Arc<HookEngine>,
+    cache: &Arc<HookCache>,
+    invocation: &Invocation<'_>,
+    record: &ironauth_store::token_hook_store::TokenHookRecord,
+) -> Result<Option<HookClaims>, HookFault> {
+    let Invocation {
+        scope,
+        client_id,
+        grant_type,
+        subject,
+        id_token_claims,
+        access_token_claims,
+    } = *invocation;
 
     // THE VERSION, before the component is even compiled. Refusing here rather than after means
     // a mismatched hook costs nothing and, more importantly, is never INVOKED with a payload it

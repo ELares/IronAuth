@@ -1191,3 +1191,66 @@ async fn an_unlinkable_hook_is_refused_once_and_then_remembered() {
          that can never run. {runtime}"
     );
 }
+
+/// FAIL-OPEN: the same declining hook is SKIPPED and the token is minted without it.
+///
+/// Issue #114 criterion 3 asks that an abort applies "the configured failure policy". Until
+/// this existed there was no policy to configure -- every fault refused the issuance
+/// unconditionally, and `a_hook_that_declines_fails_the_issuance` above pins that as the
+/// DEFAULT rather than as the only behaviour.
+///
+/// The pair is what makes either meaningful. A refusal-only test passes against a dispatch
+/// that refuses everything, and a success-only test passes against one with no hook at all;
+/// only running the same component under both policies shows the policy is being read.
+#[tokio::test]
+async fn a_declining_hook_is_skipped_when_the_policy_is_fail_open() {
+    let harness = harness_with_hooks().await;
+    harness
+        .deploy_token_hook_with_policy(
+            harness.client_id(),
+            ironauth_hooks::fixtures::DECLINER,
+            1,
+            ironauth_store::HookFailurePolicy::FailOpen,
+        )
+        .await;
+
+    let (access, _id) = exchange(&harness)
+        .await
+        .expect("fail-open mints the token even though the hook declined");
+
+    // AND THE HOOK'S CONTRIBUTION IS ABSENT, which is the half that matters. A token that
+    // succeeded but silently carried the hook's claims anyway would mean the dispatch ran it
+    // after all, and a token is not evidence of a policy unless what it lacks is checked.
+    let claims = claims(&access);
+    assert!(
+        claims.get("tier").is_none(),
+        "fail-open mints WITHOUT the hook's contribution; a `tier` here means the hook ran: \
+         {claims:?}"
+    );
+}
+
+/// The DEFAULT is fail-closed, and it is the stored default rather than a handler's choice.
+///
+/// `a_hook_that_declines_fails_the_issuance` proves the behaviour; this proves nobody has to
+/// ask for it. A deploy that names no policy must read back as fail-closed, because the
+/// dangerous setting is the one an operator should have to type.
+#[tokio::test]
+async fn a_deploy_that_names_no_policy_is_fail_closed() {
+    let harness = harness_with_hooks().await;
+    deploy(&harness, ironauth_hooks::fixtures::GOOD, 1).await;
+
+    let record = harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .token_hooks()
+        .get(&harness.client_id().to_string())
+        .await
+        .expect("read the hook")
+        .expect("a hook is deployed");
+    assert_eq!(
+        record.failure_policy,
+        ironauth_store::HookFailurePolicy::FailClosed,
+        "a deploy that names no policy must store the safe one"
+    );
+}

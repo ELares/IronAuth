@@ -935,6 +935,36 @@ impl Harness {
             .expect("deploy the hook");
     }
 
+    /// Deploy a hook with an explicit FAILURE POLICY (issue #114 criterion 3).
+    ///
+    /// Separate from `deploy_token_hook` rather than a parameter on it, so the twenty callers
+    /// that want the default keep saying nothing about a policy: a test that had to name
+    /// `FailClosed` everywhere would make the default look like a choice each of them made.
+    pub async fn deploy_token_hook_with_policy(
+        &self,
+        client: &ClientId,
+        component: &[u8],
+        payload_version: i32,
+        failure_policy: ironauth_store::HookFailurePolicy,
+    ) {
+        let env = self.env().clone();
+        self.db()
+            .control_store()
+            .scoped(self.scope())
+            .acting(self.db().test_actor(&env), CorrelationId::generate(&env))
+            .token_hooks()
+            .set_with_event(
+                &env,
+                client,
+                component,
+                payload_version,
+                failure_policy,
+                None,
+            )
+            .await
+            .expect("deploy the hook");
+    }
+
     /// The seeded client identifier (its string is the `client_id`).
     #[must_use]
     pub fn client_id(&self) -> &ClientId {

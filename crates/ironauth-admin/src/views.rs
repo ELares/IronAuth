@@ -1941,6 +1941,8 @@ pub struct TokenHookView {
     pub component_bytes: usize,
     /// The token-customize payload version the guest was built against.
     pub payload_version: u32,
+    /// What the dispatch does when this hook does not complete.
+    pub failure_policy: String,
 }
 
 /// The query parameters a token-hook deploy carries (issue #114).
@@ -1968,6 +1970,12 @@ pub struct TokenHookView {
 pub struct DeployTokenHookQuery {
     /// The token-customize payload version the guest was built against.
     pub payload_version: Option<String>,
+    /// What the dispatch should do when this hook does not complete: `fail_closed` (the
+    /// default) or `fail_open`.
+    ///
+    /// OPTIONAL, and absent means fail-closed. That asymmetry is deliberate: the dangerous
+    /// setting is the one an operator has to type.
+    pub failure_policy: Option<String>,
 }
 
 /// The body to create a new version of a custom journey (issue #92, PR 5).

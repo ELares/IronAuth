@@ -352,10 +352,7 @@ async fn an_absent_payload_version_is_this_apis_refusal() {
     let absent_environment =
         ironauth_store::EnvironmentId::generate(&ironauth_env::Env::system()).to_string();
     let (status, _, body) = harness
-        .put_bytes(
-            &hook_path(&tenant, "env_00000000000000000000000000", &client),
-            COMPONENT,
-        )
+        .put_bytes(&hook_path(&tenant, &absent_environment, &client), COMPONENT)
         .await;
     assert_eq!(
         status,
@@ -431,6 +428,61 @@ async fn audit_targets(
     .iter()
     .map(|row| row.get::<String, _>("target_id"))
     .collect()
+}
+
+/// The FAILURE POLICY round-trips, defaults to fail-closed, and refuses an unknown spelling.
+///
+/// The default is the load-bearing half. Fail-open means minting a token the operator's own
+/// hook did not shape -- and because a hook's answer REPLACES the claim set, a hook deployed to
+/// STRIP a claim that fails open issues a token still carrying it. So the dangerous setting has
+/// to be the one an operator types, and a deploy that says nothing must get the safe one.
+#[tokio::test]
+async fn the_failure_policy_round_trips_and_defaults_to_fail_closed() {
+    let harness = Harness::start(223).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // Says nothing -> fail-closed.
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy: {body}");
+    assert!(
+        body.contains("\"failure_policy\":\"fail_closed\""),
+        "a deploy that names no policy reads back as the safe one: {body}"
+    );
+
+    // Asks for fail-open -> stored and read back.
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&failure_policy=fail_open"),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "redeploy: {body}");
+    let (status, _, body) = harness.get(&base).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("\"failure_policy\":\"fail_open\""),
+        "the read reports the stored policy: {body}"
+    );
+
+    // A TYPO IS REFUSED rather than read as the default. Silently selecting the safe answer
+    // would be indistinguishable from asking for it, and an operator whose `fail-open` did
+    // nothing would never learn.
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&failure_policy=fail-open"),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a typo is refused: {body}");
+    assert!(
+        body.contains("unknown_failure_policy"),
+        "named refusal: {body}"
+    );
 }
 
 /// A REAL component, built by a compiler, is accepted -- and its first eight bytes are the

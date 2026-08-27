@@ -7615,6 +7615,8 @@ export interface components {
              *     running is the thing they pushed.
              */
             component_bytes: number;
+            /** @description What the dispatch does when this hook does not complete. */
+            failure_policy: string;
             /**
              * Format: int32
              * @description The token-customize payload version the guest was built against.
@@ -9923,6 +9925,8 @@ export interface operations {
             query: {
                 /** @description The token-customize payload version the guest was built against */
                 payload_version: number;
+                /** @description What the dispatch does when this hook does not complete: `fail_closed` (the default) or `fail_open` */
+                failure_policy?: string;
             };
             header?: never;
             path: {
