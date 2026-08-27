@@ -118,9 +118,27 @@
 //! is the enforceable half, and it is worth having in place before the first caller rather than
 //! after; it is not the criterion.
 //!
-//! What the model still does not see is per-element work that is not iteration: `matches`
-//! recompiles its regex per element, so an ADMITTED expression can still be expensive. That is
-//! open, and it is a property of the estimate rather than of the enforcement.
+//! # What this model does NOT bound, measured rather than hedged
+//!
+//! **Allocation.** What an expression allocates is roughly (string size) x (string operations)
+//! x (loop repetitions), and this model counts only the last. `max_string_bytes` caps the
+//! first and nothing caps the product. Review measured `groups.map(g, name + name).size()`
+//! with `groups` at exactly the declared 2,000 and `name` at exactly the declared 64 KiB:
+//! **74 KB of fully compliant input, estimated at 0.4% of the budget, allocated 1.59 GB in
+//! 8.5 seconds.**
+//!
+//! This is stated rather than modelled because three attempts to model it were each wrong in a
+//! way testing caught: counting every node refused `groups.filter(g, g == 'a')` at 917,504,000
+//! against a measured 4.9 ms, and counting `+` nodes counted the `@result + [x]` that `filter`
+//! itself expands to as though it moved a 64 KiB string per element. A fourth guess is worth
+//! less than an accurate statement of the gap. Bounding it properly needs a byte-denominated
+//! budget computed by the same pre-evaluation walk, which is its own change.
+//!
+//! **Per-element work that is not iteration.** `matches` recompiles its regex per element, so
+//! an ADMITTED expression can still be expensive.
+//!
+//! Both are properties of the ESTIMATE. The enforcement half -- that an input may not exceed
+//! the shape the estimate was computed from -- holds.
 //!
 //! Wiring the first caller is not free, and the cost is recorded here so it is not
 //! rediscovered: this crate declares `rust-version = "1.86"` because `cel` 0.14 does, while the
@@ -306,25 +324,76 @@ fn entries_depth(entries: &[IdedEntryExpr]) -> u32 {
         .unwrap_or(0)
 }
 
-/// The largest list or map literal written INSIDE the expression.
+/// An upper bound on how many elements this expression can EVALUATE TO.
 ///
-/// # Why the expression is an input too
+/// # The rule, in one sentence
 ///
-/// The model's `n` is the cardinality a comprehension multiplies by. It was read solely from
-/// the declared [`InputShape`], on the assumption that collections arrive through bindings.
-/// They do not have to. A collection written as a literal in the expression never passes
-/// through a binding, so it was never counted and never bounded.
+/// A node's bound is the larger of what it IS and what it CONTAINS.
 ///
-/// Measured, in review, against the real crate: `[<20,000 integer literals>].filter(g, g > 0)
-/// .size()` with `max_collection_size: 10` estimated 10^2 = 100 against a budget of
-/// 1,000,000,000, was ADMITTED, and ran for 6.2 SECONDS. The declared bound of 10 bounded
-/// nothing, because the data was not in the binding. At the 200,000 this module's header pins
-/// at 423 seconds it reproduces the exact denial of service the budget exists to refuse.
+/// The second half is the part four separate revisions got wrong, each time by special-casing
+/// one container and leaving the others. The reason it has to be uniform is that CEL can
+/// descend into any container: `_[_]`, a dot-select, and a comprehension body all hand back
+/// something that was nested a moment earlier, so a bound that stops at the outer node is a
+/// bound anything can step around by adding two characters. Every one of these was MEASURED
+/// against the real crate rather than argued:
 ///
-/// So `n` is the larger of what the caller declared and what the expression carries, and both
-/// are known before evaluation, which keeps the verdict a pure function of
-/// (expression, declared shape, budget).
-fn largest_literal_collection(expression: &Expr) -> u64 {
+/// ```text
+/// [<40,000 literals>][0]...          scored 1          admitted   20.76 s
+/// {'k': <40,000 literals>}['k']...   scored 1          admitted   20.93 s
+/// {'k': 40 x groups}.k...            scored 1,000,000  admitted   20.51 s
+/// [1].map(x, 90 x groups)[0]...      scored 997,002,999 admitted  106.54 s
+/// ```
+///
+/// The first two were fixed by recursing into list and map LITERALS, and the third and fourth
+/// then arrived through select and through a comprehension body. Fixing containers one at a
+/// time loses that race, so the recursion below is over EVERY child of every node.
+///
+/// # What each node IS
+///
+/// A binding contributes the declared `max_collection_size`, a literal its own length, and
+/// `_+_` the SUM of its operands, because CEL concatenates lists (`objects.rs:1583`) -- forty
+/// copies of a declared 1,000 iterate 40,000, which a maximum would report as 1,000.
+/// Everything else contributes nothing of its own and is bounded by what it contains.
+fn cardinality_bound(expression: &Expr, shape: InputShape) -> u64 {
+    // CHILDREN ONCE, into a slice, and both uses read from it.
+    //
+    // The first version of this computed each child twice -- once inside the `_+_` sum and
+    // again for the containment maximum -- which is exponential in the nesting depth of `+`.
+    // The suite hung: `(groups + groups + ... 40 copies)` is 40 nested `_+_` nodes, so 2^40
+    // evaluations of the same tree. An estimator that has to be cheap to be deterministic
+    // cannot afford a second traversal per node.
+    let children = child_bounds(expression, shape);
+    let within = children.iter().copied().max().unwrap_or(0);
+    let own = match expression {
+        // THE MACRO'S OWN ACCUMULATOR IS NOT A BINDING. Every cel expander injects
+        // `@result` (`parser/macros.rs:76,127,174,232,292`), and scoring it as a declared
+        // collection makes the `@result + [x]` append SUM it once per part -- so counting all
+        // five comprehension parts above would over-refuse ordinary expressions on a name the
+        // author never wrote. No source identifier can begin with `@`, so this is exact
+        // rather than a heuristic.
+        Expr::Ident(name) if name.starts_with('@') => 0,
+        // A binding, or a field read: whatever the input document declared.
+        Expr::Ident(_) | Expr::Select(_) => shape.max_collection_size,
+        // A literal: exactly what is written at this level.
+        Expr::List(list) => list.elements.len() as u64,
+        Expr::Map(map) => map.entries.len() as u64,
+        Expr::Struct(structure) => structure.entries.len() as u64,
+        // CONCATENATION SUMS. Saturating, because an estimate that wrapped to a small number
+        // would admit the most expensive thing anyone could write.
+        Expr::Call(call) if call.func_name == "_+_" => children
+            .iter()
+            .fold(0_u64, |total, bound| total.saturating_add(*bound)),
+        _ => 0,
+    };
+    own.max(within)
+}
+
+/// Every child of a node, already bounded.
+///
+/// Exhaustive by construction: there is no `_ =>` arm, so a new `Expr` variant is a compile
+/// error here rather than a silent zero. A silent zero is exactly how the select and
+/// comprehension-body bypasses got in.
+fn child_bounds(expression: &Expr, shape: InputShape) -> Vec<u64> {
     match expression {
         Expr::Comprehension(comprehension) => [
             &comprehension.iter_range,
@@ -334,63 +403,66 @@ fn largest_literal_collection(expression: &Expr) -> u64 {
             &comprehension.result,
         ]
         .into_iter()
-        .map(|part| largest_literal_collection(&part.expr))
-        .max()
-        .unwrap_or(0),
+        .map(|part| cardinality_bound(&part.expr, shape))
+        .collect(),
         Expr::Call(call) => call
             .target
             .iter()
-            .map(|target| largest_literal_collection(&target.expr))
+            .map(|target| cardinality_bound(&target.expr, shape))
             .chain(
                 call.args
                     .iter()
-                    .map(|arg| largest_literal_collection(&arg.expr)),
+                    .map(|arg| cardinality_bound(&arg.expr, shape)),
             )
-            .max()
-            .unwrap_or(0),
-        Expr::Select(select) => largest_literal_collection(&select.operand.expr),
-        // THE COUNT and the recursion, because a large literal can hold a larger one.
-        Expr::List(list) => (list.elements.len() as u64).max(
-            list.elements
-                .iter()
-                .map(|element| largest_literal_collection(&element.expr))
-                .max()
-                .unwrap_or(0),
-        ),
-        Expr::Map(map) => (map.entries.len() as u64).max(entries_literal(&map.entries)),
-        Expr::Struct(structure) => {
-            (structure.entries.len() as u64).max(entries_literal(&structure.entries))
-        }
-        Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => 0,
+            .collect(),
+        Expr::Select(select) => vec![cardinality_bound(&select.operand.expr, shape)],
+        Expr::List(list) => list
+            .elements
+            .iter()
+            .map(|element| cardinality_bound(&element.expr, shape))
+            .collect(),
+        Expr::Map(map) => entries_bounds(&map.entries, shape),
+        Expr::Struct(structure) => entries_bounds(&structure.entries, shape),
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => Vec::new(),
     }
 }
 
-/// The largest literal collection inside a map or struct literal's entries, both arms.
-fn entries_literal(entries: &[IdedEntryExpr]) -> u64 {
+/// Every child of a map or struct literal's entries, already bounded, both arms.
+fn entries_bounds(entries: &[IdedEntryExpr], shape: InputShape) -> Vec<u64> {
     entries
         .iter()
-        .map(|entry| match &entry.expr {
-            EntryExpr::StructField(field) => largest_literal_collection(&field.value.expr),
-            EntryExpr::MapEntry(entry) => largest_literal_collection(&entry.key.expr)
-                .max(largest_literal_collection(&entry.value.expr)),
+        .flat_map(|entry| match &entry.expr {
+            EntryExpr::StructField(field) => vec![cardinality_bound(&field.value.expr, shape)],
+            EntryExpr::MapEntry(entry) => vec![
+                cardinality_bound(&entry.key.expr, shape),
+                cardinality_bound(&entry.value.expr, shape),
+            ],
         })
-        .max()
-        .unwrap_or(0)
+        .collect()
 }
 
-/// How many nodes the expression has.
+/// The largest cardinality any comprehension in the expression actually iterates.
 ///
-/// This is the multiplier for work that is not iteration. A comprehension-free expression
-/// performs no loop, which is why the estimate used to return the constant 1 for it -- and
-/// that was wrong in a way `max_string_bytes` alone does not fix. Bounding one string's SIZE
-/// says nothing about how many times an expression moves it: `a + a + a + ...` repeated k
-/// times over a 64 KiB string allocates on the order of k * 64 KiB, and every one of those
-/// expressions estimated 1.
-///
-/// So depth 0 is bounded by nodes times the string bound, which is the number of bytes the
-/// expression can touch.
-fn node_count(expression: &Expr) -> u64 {
-    1 + match expression {
+/// Every comprehension is visited, not only the deepest, because the expensive one is not
+/// necessarily the most nested.
+fn largest_iterated_cardinality(expression: &Expr, shape: InputShape) -> u64 {
+    // EVERY PART, not just the iter_range.
+    //
+    // A comprehension re-materialises its body once per iteration, so a collection built in
+    // `loop_step` costs the same as one iterated directly -- and scored ZERO here, because
+    // this sampled `iter_range` alone. Measured: `groups.all(g, (groups + ... 40 copies)
+    // .size() > 0)` is 385 bytes, no literal anywhere, `groups` bound to exactly the declared
+    // 1,000, estimate 1,000,000 (0.1% of budget), ADMITTED, and it ran 24.15 SECONDS. The
+    // SAME concatenation moved into iter_range position is refused at 1,600,000,000.
+    //
+    // Forced through with an unlimited budget, the two invert: the refused spelling runs in
+    // 48.8 ms and the admitted one in 23.98 s. A model that refuses the cheap expression and
+    // admits the one 491x more expensive is not loose, it is backwards.
+    //
+    // This was also a REGRESSION rather than an unfixed gap. `origin/main` derived its
+    // cardinality from a whole-tree literal walk, so a 50,000-element literal in body position
+    // scored 2,500,000,000 and was refused there while scoring 1,000,000 here.
+    let here = match expression {
         Expr::Comprehension(comprehension) => [
             &comprehension.iter_range,
             &comprehension.accu_init,
@@ -399,37 +471,59 @@ fn node_count(expression: &Expr) -> u64 {
             &comprehension.result,
         ]
         .into_iter()
-        .map(|part| node_count(&part.expr))
-        .sum(),
+        .map(|part| cardinality_bound(&part.expr, shape))
+        .max()
+        .unwrap_or(0),
+        _ => 0,
+    };
+    let within = match expression {
+        Expr::Comprehension(comprehension) => [
+            &comprehension.iter_range,
+            &comprehension.accu_init,
+            &comprehension.loop_cond,
+            &comprehension.loop_step,
+            &comprehension.result,
+        ]
+        .into_iter()
+        .map(|part| largest_iterated_cardinality(&part.expr, shape))
+        .max()
+        .unwrap_or(0),
         Expr::Call(call) => call
             .target
             .iter()
-            .map(|target| node_count(&target.expr))
-            .chain(call.args.iter().map(|arg| node_count(&arg.expr)))
-            .sum(),
-        Expr::Select(select) => node_count(&select.operand.expr),
+            .map(|target| largest_iterated_cardinality(&target.expr, shape))
+            .chain(
+                call.args
+                    .iter()
+                    .map(|arg| largest_iterated_cardinality(&arg.expr, shape)),
+            )
+            .max()
+            .unwrap_or(0),
+        Expr::Select(select) => largest_iterated_cardinality(&select.operand.expr, shape),
         Expr::List(list) => list
             .elements
             .iter()
-            .map(|element| node_count(&element.expr))
-            .sum(),
-        Expr::Map(map) => entries_nodes(&map.entries),
-        Expr::Struct(structure) => entries_nodes(&structure.entries),
+            .map(|element| largest_iterated_cardinality(&element.expr, shape))
+            .max()
+            .unwrap_or(0),
+        Expr::Map(map) => entries_iterated(&map.entries, shape),
+        Expr::Struct(structure) => entries_iterated(&structure.entries, shape),
         Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => 0,
-    }
+    };
+    here.max(within)
 }
 
-/// The nodes inside a map or struct literal's entries, both arms.
-fn entries_nodes(entries: &[IdedEntryExpr]) -> u64 {
+/// The largest iterated cardinality inside a map or struct literal's entries, both arms.
+fn entries_iterated(entries: &[IdedEntryExpr], shape: InputShape) -> u64 {
     entries
         .iter()
         .map(|entry| match &entry.expr {
-            EntryExpr::StructField(field) => node_count(&field.value.expr),
-            EntryExpr::MapEntry(entry) => {
-                node_count(&entry.key.expr) + node_count(&entry.value.expr)
-            }
+            EntryExpr::StructField(field) => largest_iterated_cardinality(&field.value.expr, shape),
+            EntryExpr::MapEntry(entry) => largest_iterated_cardinality(&entry.key.expr, shape)
+                .max(largest_iterated_cardinality(&entry.value.expr, shape)),
         })
-        .sum()
+        .max()
+        .unwrap_or(0)
 }
 
 /// The estimated worst-case cost of a parsed expression against `shape`: `n^(depth + 1)`.
@@ -452,27 +546,35 @@ fn entries_nodes(entries: &[IdedEntryExpr]) -> u64 {
 pub fn estimate_parsed_cost(expression: &Expr, shape: InputShape) -> u64 {
     let depth = comprehension_depth(expression);
     if depth == 0 {
-        // NOTHING ITERATES, so cardinality does not enter. That is not the same as free, and
-        // returning the constant 1 here (which two earlier versions did) left the whole
-        // allocation-dominated family unbounded: `a + a + a + ...` repeated k times over a
-        // 64 KiB string allocates on the order of k * 64 KiB and estimated 1 every time.
+        // NOTHING ITERATES, so this model has nothing to say and returns its floor.
         //
-        // The bound is the bytes the expression can touch: nodes times the string bound.
-        //
-        // MIXED UNITS, said plainly rather than hidden. This arm counts BYTES and the arm
-        // below counts ELEMENTS, and both are compared against one budget. The budget is
-        // therefore a bound on work units of either kind, which is an approximation -- it is
-        // the same approximation the `n^(depth+1)` arm already makes by treating an append and
-        // a comparison as one unit each. What matters is that both arms are monotonic in the
-        // thing that actually grows, and neither returns a constant.
-        return node_count(expression).saturating_mul(shape.max_string_bytes);
+        // Not a claim that the expression is free. Three attempts were made to have this arm
+        // bound ALLOCATION instead -- nodes times the string bound, then concatenations times
+        // the string bound times the loop count -- and each had a hole: the first refused
+        // `groups.filter(g, g == 'a')` at 917,504,000 against a measured 4.9 ms, and the
+        // second counted the `@result + [x]` that `filter` itself expands to as though it
+        // moved a 64 KiB string per element. Allocation is now stated as unmodelled in the
+        // header rather than modelled badly, which is the honest form of the same information.
+        return 1;
     }
-    // The larger of what the caller DECLARED and what the expression CARRIES. See
-    // `largest_literal_collection`: a 20,000-element literal under a declared 10 was admitted
-    // at an estimate of 100 and ran for 6.2 seconds.
+
+    // THE DECLARED SHAPE IS A FLOOR, and dropping it was a regression this file introduced.
+    //
+    // `largest_iterated_cardinality` is a STRUCTURAL bound, and a structural bound can be
+    // driven DOWN by an indirection the walk does not follow. Measured by review:
+    // `[groups][0].all(a, [groups][0].all(b, [groups][0].all(c, c >= 0)))` is 66 characters,
+    // scored 1, was ADMITTED, and ran 153.65 SECONDS over an honest 1,000-element binding --
+    // while the same expression without the five added characters scored 10^12 and was
+    // refused. `[groups]` is a one-element list, and the `_[_]` index that pulls `groups` back
+    // out is an ordinary call, so the bound came out as 1.
+    //
+    // Taking the maximum with what the document DECLARED restores the property that no
+    // rewrite can push `n` below the input's own promise, while keeping everything the
+    // structural walk adds above it: `(groups + groups)` is max(1000, 2000) = 2000, and a
+    // 40,000-element literal under a declared 10 is max(10, 40000) = 40000.
     let n = shape
         .max_collection_size
-        .max(largest_literal_collection(expression));
+        .max(largest_iterated_cardinality(expression, shape));
     n.checked_pow(depth.saturating_add(1)).unwrap_or(u64::MAX)
 }
 
@@ -889,15 +991,12 @@ mod tests {
             reason = "a test helper measuring the parser itself"
         )]
         let parsed = |expression: &str| cel::Program::compile(expression).expect("compiles");
-        // A DEPTH-0 EXPRESSION IS NOT FREE, which this used to assert by pinning it at 1.
-        // `user.email` is two nodes (a select over an ident), and the bound on a
-        // comprehension-free expression is the bytes it can touch: nodes times the string
-        // bound. 2 * 65,536. It is far under the budget, which is the point -- an ordinary
-        // claim read stays admitted while `a + a + a + ...` repeated fifteen thousand times
-        // over a 64 KiB string no longer estimates 1.
+        // A comprehension-free expression iterates nothing, so this model's floor is what it
+        // reports. That is not a claim the expression is free -- see the header on allocation,
+        // which is deliberately unmodelled rather than modelled badly.
         assert_eq!(
             estimate_parsed_cost(&parsed("user.email").expression().expr, shape(10_000)),
-            2 * DEFAULT_MAX_STRING_BYTES
+            1
         );
         assert_eq!(
             estimate_parsed_cost(
@@ -1218,6 +1317,274 @@ mod evaluation_tests {
             matches!(error, CostError::OverBudget { estimated, .. } if estimated == 40_000_u64.pow(2)),
             "refused for cost, at the literal's cardinality: {error}"
         );
+    }
+
+    /// CONCATENATION SUMS, which a maximum over source nodes could not see.
+    ///
+    /// Measured by review at the previous HEAD: `(groups + groups + ... 40 copies)
+    /// .filter(g, g > 0).size()` is 383 bytes, `groups` was bound to exactly the declared
+    /// 1,000 and passed the shape check honestly, the estimate was 1,000,000 -- and it ran for
+    /// 20.8 seconds over 40,000 elements. No literal is involved, so neither the declared
+    /// bound nor the largest-literal fix applied to it.
+    #[test]
+    fn concatenated_bindings_multiply_the_iterated_cardinality() {
+        let concatenated = std::iter::repeat_n("groups", 40)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let expression = format!("({concatenated}).filter(g, g > 0).size()");
+        let error = compile_within_budget(
+            &expression,
+            InputShape {
+                max_collection_size: 1_000,
+                max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+            },
+            DEFAULT_COST_BUDGET,
+        )
+        .expect_err("40 x 1,000 iterates 40,000, which is over the budget at depth 1");
+        assert!(
+            matches!(error, CostError::OverBudget { estimated, .. } if estimated == 40_000_u64.pow(2)),
+            "the estimate must sum the concatenated sources, not take their maximum: {error}"
+        );
+    }
+
+    /// The same rewrite against the literal bound, which it also walked around.
+    ///
+    /// Forty concatenated 1,000-element literals is a SMALLER source than one 40,000-element
+    /// literal, and the large one was already refused while the small one was admitted. A
+    /// bound a rewrite can step around is not a bound.
+    #[test]
+    fn concatenated_literals_are_summed_like_one_large_literal() {
+        let one_thousand = format!(
+            "[{}]",
+            (0..1_000)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let concatenated = std::iter::repeat_n(one_thousand.as_str(), 40)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let expression = format!("({concatenated}).filter(g, g > 0).size()");
+        let error = compile_within_budget(
+            &expression,
+            InputShape {
+                max_collection_size: 10,
+                max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+            },
+            DEFAULT_COST_BUDGET,
+        )
+        .expect_err("40,000 elements, however they are spelled");
+        assert!(
+            matches!(error, CostError::OverBudget { estimated, .. } if estimated == 40_000_u64.pow(2)),
+            "spelling the same data as a concatenation must not lower the estimate: {error}"
+        );
+    }
+
+    /// AN INDIRECTION MUST NOT LOWER THE ESTIMATE, which is the same property as the loop
+    /// test below, on the other axis.
+    ///
+    /// Measured by review against the version that dropped the declared floor:
+    /// `[groups][0].all(a, [groups][0].all(b, [groups][0].all(c, c >= 0)))` is 66 characters,
+    /// scored 1, was ADMITTED, and ran 153.65 seconds over a binding holding exactly the
+    /// declared 1,000. Removing the five added characters per reference scored 10^12 and was
+    /// refused. Five characters must not be worth twelve orders of magnitude.
+    #[test]
+    fn an_indirection_cannot_lower_the_estimate() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        let direct = estimate("groups.filter(g, g > 0).size()", shape);
+        for indirect in [
+            "[groups][0].filter(g, g > 0).size()",
+            "{'k': groups}['k'].filter(g, g > 0).size()",
+            "[[groups][0]][0].filter(g, g > 0).size()",
+            // THE ONE THAT NEEDS THE FLOOR, and the reason it is listed separately.
+            //
+            // The three above are all caught by the container recursion alone: the walk
+            // descends into the literal and finds `groups`. This one it cannot, because the
+            // container's members are the comprehension's OUTPUT rather than a literal, and
+            // `cardinality_bound(Comprehension)` reads only the iter_range -- which is
+            // `[1, 2, 3]`, three elements. Without the declared floor it scores single digits.
+            //
+            // Measured: mutating the floor away leaves the other three passing and only this
+            // one failing, which is why a fix needs a fixture the OTHER fix does not cover.
+            "[1, 2, 3].map(x, groups)[0].filter(g, g > 0).size()",
+        ] {
+            assert!(
+                estimate(indirect, shape) >= direct,
+                "`{indirect}` estimated below the direct form ({direct}); an indirection the \
+                 walk does not follow must not push the bound under what the input declared"
+            );
+        }
+    }
+
+    /// A LARGE LITERAL INSIDE A CONTAINER is still counted.
+    ///
+    /// The previous model recursed into container literals, with the comment "THE COUNT and
+    /// the recursion, because a large literal can hold a larger one". `cardinality_bound`'s
+    /// first version replaced that with the count alone and argued a nested collection is
+    /// bounded where it is iterated -- which is wrong, because the `_[_]` that descends from a
+    /// container to its member is an ordinary call and inherits the CONTAINER's bound.
+    ///
+    /// Measured: the bare 40,000-element literal was refused at 1,600,000,000, and the same
+    /// literal wrapped as `[ ... ][0]` scored 1, was admitted, and ran 20.76 seconds.
+    #[test]
+    fn a_large_literal_inside_a_container_is_still_counted() {
+        let literal = format!(
+            "[{}]",
+            (0..40_000)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let shape = InputShape {
+            max_collection_size: 10,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        for wrapped in [
+            format!("[{literal}][0].filter(g, g > 0).size()"),
+            format!("{{'k': {literal}}}['k'].filter(g, g > 0).size()"),
+        ] {
+            let error = compile_within_budget(&wrapped, shape, DEFAULT_COST_BUDGET)
+                .expect_err("40,000 elements, however they are wrapped");
+            assert!(
+                matches!(error, CostError::OverBudget { estimated, .. } if estimated == 40_000_u64.pow(2)),
+                "wrapping the literal in a container must not hide it: {error}"
+            );
+        }
+    }
+
+    /// TWO SPELLINGS OF ONE DATUM must score the same.
+    ///
+    /// `{'k': x}['k']` parses to a `_[_]` call and `{'k': x}.k` parses to a `Select`, so they
+    /// took different arms and only the call arm recursed. Measured: the bracket spelling of
+    /// `{'k': 40 x groups}` scored 1,600,000,000 and was refused, the dot spelling scored
+    /// 1,000,000 and ran 20.51 seconds. Two characters.
+    ///
+    /// The direct form carries a `+` deliberately: without one, both sides are just the
+    /// declared floor and the comparison holds for the wrong reason.
+    #[test]
+    fn a_dot_select_and_an_index_score_the_same_datum_alike() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        let indexed = estimate("{'k': groups + groups}['k'].filter(g, g > 0).size()", shape);
+        let selected = estimate("{'k': groups + groups}.k.filter(g, g > 0).size()", shape);
+        assert_eq!(
+            selected, indexed,
+            "a dot-select must carry its operand's cardinality exactly as an index does"
+        );
+        assert_eq!(
+            selected,
+            2_000_u64.pow(2),
+            "and both must see the concatenation: 2 x 1,000"
+        );
+    }
+
+    /// A COMPREHENSION BODY's cardinality escapes through the value it yields.
+    ///
+    /// `cardinality_bound` on a comprehension used to read only the `iter_range`, so
+    /// `[1].map(x, 90 x groups)[0]` reported 1 element -- the map's OUTPUT length -- while
+    /// `[0]` hands back the body's 89,910-element list. Measured: 846 bytes, estimate
+    /// 997,002,999 (strictly under budget), ADMITTED, ran 106.54 seconds.
+    #[test]
+    fn a_comprehension_bodys_cardinality_is_counted() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        let plain = estimate("[1].map(x, groups)[0].filter(g, g > 0).size()", shape);
+        let doubled = estimate(
+            "[1].map(x, groups + groups)[0].filter(g, g > 0).size()",
+            shape,
+        );
+        assert!(
+            doubled > plain,
+            "doubling the map BODY's cardinality must raise the estimate ({plain} -> \
+             {doubled}); the model read only the iter_range, which is unchanged at 1"
+        );
+    }
+
+    /// A COLLECTION IN THE BODY costs what one in the `iter_range` costs.
+    ///
+    /// A comprehension re-materialises its body once per iteration, and this scored zero
+    /// because the walk sampled `iter_range` alone. Measured: `groups.all(g, (groups + ... 40
+    /// copies).size() > 0)` is 385 bytes with no literal anywhere, estimated 1,000,000, was
+    /// ADMITTED, and ran 24.15 seconds -- while the same concatenation in `iter_range` position
+    /// is refused at 1,600,000,000. Forced through with an unlimited budget the two invert:
+    /// the REFUSED spelling runs in 48.8 ms and the ADMITTED one in 23.98 s.
+    ///
+    /// Every other fixture in this file puts its collection in an `iter_range` or in a container
+    /// the `iter_range` walk descends into, which is why all 31 passed with this open.
+    #[test]
+    fn a_collection_in_a_comprehension_body_is_counted_like_one_it_iterates() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        let in_iter_range = estimate("(groups + groups).all(g, g != '')", shape);
+        let in_body = estimate("groups.all(g, (groups + groups).size() > 0)", shape);
+        assert!(
+            in_body >= in_iter_range,
+            "a concatenation in the BODY is rebuilt per iteration, so it cannot be cheaper \
+             than the same concatenation iterated directly ({in_body} < {in_iter_range})"
+        );
+    }
+
+    /// And the fix must not refuse ordinary expressions.
+    ///
+    /// Counting every comprehension part means the walk now meets the macro's own `@result`
+    /// accumulator, which every cel expander injects. Scoring that as a declared collection
+    /// would make the `@result + [x]` append SUM it and over-refuse a plain filter on a name
+    /// the author never wrote. This is the control for that.
+    #[test]
+    fn an_ordinary_comprehension_is_unaffected_by_the_body_walk() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        assert_eq!(
+            estimate("groups.filter(g, g != '').size()", shape),
+            1_000_u64.pow(2),
+            "a plain filter must still score n^2 on the declared size, not a multiple of it"
+        );
+        compile_within_budget("groups.all(g, g != '')", shape, DEFAULT_COST_BUDGET)
+            .expect("an ordinary all() stays admitted");
+    }
+
+    /// Adding a loop around an expression must never LOWER its estimate.
+    ///
+    /// Review measured the inversion on an earlier attempt at an allocation term: a body
+    /// estimated 2,621,440,000 and was refused, and the same body wrapped in `groups.all(..)`
+    /// -- strictly more work -- estimated 100 and was admitted, because wrapping it moved the
+    /// estimate to a different arm. One model with one unit cannot do that, and this pins it.
+    #[test]
+    fn wrapping_an_expression_in_a_loop_does_not_lower_its_estimate() {
+        let shape = InputShape {
+            max_collection_size: 1_000,
+            max_string_bytes: DEFAULT_MAX_STRING_BYTES,
+        };
+        let inner = "(groups + groups).filter(g, g > 0).size()";
+        let wrapped = format!("groups.all(h, {inner} > 0)");
+        let bare = estimate(inner, shape);
+        let looped = estimate(&wrapped, shape);
+        assert!(
+            looped >= bare,
+            "wrapping raised the work and lowered the estimate: {bare} -> {looped}"
+        );
+    }
+
+    /// The estimate for `expression` under `shape`, refused or not.
+    fn estimate(expression: &str, shape: InputShape) -> u64 {
+        #[expect(
+            clippy::disallowed_types,
+            clippy::disallowed_methods,
+            reason = "a test helper reading the estimate directly, not a caller evaluating"
+        )]
+        let program = cel::Program::compile(expression).expect("compiles");
+        super::estimate_parsed_cost(&program.expression().expr, shape)
     }
 
     /// The declared shape still wins when it is the larger of the two, so the fix did not
