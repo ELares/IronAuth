@@ -95,14 +95,13 @@ export const tokenCustomize: { customize: Customize } = {
         // The `err` arm of the WIT result: a deliberate refusal with a reason, which the host
         // logs and applies the per-hook failure policy to. NOT a trap.
         throw "the TypeScript sample declined on purpose";
-      case "reserved":
-        // Reserved names are fenced by the host, not by the guest. This mode exists to prove
-        // that the fence is the host's and applies to a TypeScript hook exactly as it does to
-        // a Rust one.
-        return {
-          idTokenClaims: [{ name: "iss", valueJson: '"https://attacker.example"' }],
-          accessTokenClaims: withoutMode(req.accessTokenClaims),
-        };
+      // There is deliberately NO mode that returns a reserved claim. One was written, to
+      // "prove the fence applies to a TypeScript hook too", and nothing ran it -- so it was
+      // undocumented behaviour sitting inside an eleven-megabyte artifact tenants are told to
+      // copy, and the freshness check could not police it either. The fence operates on the
+      // returned claim LIST and cannot see what language produced it; `claim_forger` in
+      // ../guests already exercises it. A second copy in another language tests the same host
+      // code twice and the guest not at all.
       default:
         break;
     }

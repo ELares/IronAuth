@@ -28,20 +28,56 @@
 -- ISSUANCE path, so an unbounded one is an unbounded read on every login for that client.
 -- Doubling it doubles that worst case, which is the cost being accepted here.
 --
--- # Dropped and re-added rather than altered
+-- # Dropped and re-added rather than altered, and NOT with the NOT VALID dance
 --
--- Postgres has no ALTER CONSTRAINT for a CHECK expression. The re-add is NOT VALID plus a
--- separate VALIDATE so the second step takes only SHARE UPDATE EXCLUSIVE: a full-table
--- validation under ACCESS EXCLUSIVE would block issuance reads on this table for its duration,
--- and this table is read on every hooked login. The new bound is strictly weaker than the old
--- one, so no existing row can fail validation.
+-- Postgres has no ALTER CONSTRAINT for a CHECK expression, so the bound has to be dropped and
+-- re-added. The obvious next move is ADD ... NOT VALID followed by a separate VALIDATE, so the
+-- table scan runs under SHARE UPDATE EXCLUSIVE instead of ACCESS EXCLUSIVE and readers keep
+-- going. An earlier version of this migration did exactly that and said so.
+--
+-- IT BUYS NOTHING HERE, and the reason is in the runner rather than in this file.
+-- `MigrationRunner::run_locked` does `let mut tx = self.pool.begin()` and then
+-- `sqlx::raw_sql(migration.sql)` -- ONE transaction per FILE (crates/ironauth-store/src/
+-- migrate.rs). So the ACCESS EXCLUSIVE lock the DROP takes is held until the file commits,
+-- across any VALIDATE that follows it. Splitting the work into two statements changes which
+-- lock the second one ASKS for and not which lock is already held, and writing a comment
+-- claiming otherwise would be a migration that describes a concurrency property it does not
+-- have -- frozen at merge, since the checksum covers the whole file including this text.
+--
+-- So: two statements, the constraint validated immediately, and the cost stated plainly.
+-- `token_hooks` holds at most one row per client that has a hook, so the validating scan is
+-- proportional to the number of clients WITH HOOKS in the deployment rather than to logins or
+-- tokens, and it runs under a lock that blocks issuance reads of this table for its duration.
+-- On the deployments this ships to that is milliseconds. A deployment where it is not has a
+-- problem with the one-transaction-per-file runner, not with this bound, and the fix belongs
+-- there.
+--
+-- No existing row can fail: the old bound was strictly TIGHTER, so everything that satisfied
+-- 8388608 satisfies 16777216.
 
 ALTER TABLE token_hooks
     DROP CONSTRAINT token_hooks_component_bounded;
 
 ALTER TABLE token_hooks
     ADD CONSTRAINT token_hooks_component_bounded
-    CHECK (octet_length(component) > 0 AND octet_length(component) <= 16777216) NOT VALID;
+    CHECK (octet_length(component) > 0 AND octet_length(component) <= 16777216);
 
-ALTER TABLE token_hooks
-    VALIDATE CONSTRAINT token_hooks_component_bounded;
+-- AND THE HISTORY TABLE, which carries a deliberate copy of the same bound.
+--
+-- 0165 duplicated it on purpose -- its own comment says "a history row is a candidate for
+-- becoming the active row, so anything this table admits that `token_hooks` would refuse is a
+-- rollback that fails at the write instead of at the read" -- and the copy is what makes
+-- raising one and not the other a real defect: a TypeScript hook would deploy and then fail to
+-- be RECORDED, so the write that installed it would roll back.
+--
+-- This table did not exist when this migration was first written. It arrived from another
+-- branch carrying 0162's number, and `every_component_bound_admits_the_shipped_typescript_hook`
+-- is what found it: that test evaluates every component bound in the schema against the real
+-- artifact rather than naming the tables it knows about, so a table nobody thought to list is
+-- exactly the case it exists for.
+ALTER TABLE token_hook_versions
+    DROP CONSTRAINT token_hook_versions_component_bounded;
+
+ALTER TABLE token_hook_versions
+    ADD CONSTRAINT token_hook_versions_component_bounded
+    CHECK (octet_length(component) > 0 AND octet_length(component) <= 16777216);

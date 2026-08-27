@@ -63,8 +63,11 @@
 //!
 //! 1. a STORE READ of the `token_hooks` row, ~378 microseconds, paid on EVERY hooked login
 //!    because that read is how the server learns a hook is deployed at all
-//! 2. SHA-256 over the bytes it returned, which the 8 MiB `token_hooks_component_bounded` CHECK
-//!    is what keeps finite
+//! 2. SHA-256 over the bytes it returned, which the 16 MiB `token_hooks_component_bounded`
+//!    CHECK is what keeps finite. That bound DOUBLED for the TypeScript hook (#114 criterion
+//!    1), so this step's worst case doubled with it: a hook written in a scripting language
+//!    carries its interpreter, and hashing ten megabytes is the price of the cache key being
+//!    the component itself
 //! 3. a hash lookup, then instantiate + call -- the tens of microseconds the benchmark measures
 //!
 //! Step 3 is the part "in microseconds" is a claim about, and it holds. Steps 1 and 2 dominate

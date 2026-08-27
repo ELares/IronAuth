@@ -50,11 +50,20 @@ artifact without reading the diff.
 
 ## Two things a hook author should know before writing one
 
-**Turn every componentize-js feature off.** Each feature left enabled adds a `wasi:*` import to
-the component, and the host linker offers nothing at all: that is criterion 2's deny-by-default
-sandbox. With `fetch-event` still enabled this component imported `wasi:io/poll`,
-`wasi:io/streams` and `wasi:http/types` because the JavaScript engine has a `fetch` global, and
-it then failed to LINK. That is the sandbox working. `build.mjs` disables all five.
+**Turn every componentize-js feature off.** Each feature left enabled adds `wasi:*` imports,
+and the host linker satisfies only the fourteen interfaces `Sandbox::link` adds by hand: no
+sockets, no filesystem, no `wasi:http`. Measured, with `fetch-event` left on, the component
+imports `wasi:io/poll`, `wasi:io/streams` and `wasi:http/types`, and loading it fails with
+
+```
+hook asked for a capability it was not granted: component imports instance
+`wasi:http/types@0.2.3`, but a matching implementation was not found in the linker
+```
+
+Note which one. `wasi:io/poll` and `wasi:io/streams` are in the linker and resolve fine, because
+std's startup needs them. It is `wasi:http/types`, pulled in because the JavaScript engine has a
+`fetch` global, that nothing satisfies. That is criterion 2's deny-by-default sandbox working.
+`build.mjs` disables all five features.
 
 **A JavaScript hook carries a JavaScript engine.** This one is roughly 10.6 MiB, of which about
 four kilobytes is the code in `src/`. That is not a footnote:
@@ -78,6 +87,11 @@ strips it from its output:
 | *(absent)* | Adds `ts_hook_tier`, derived from the grant type, client and subject | Criterion 1 |
 | `spin` | Loops forever | Fuel aborts a JavaScript interpreter loop |
 | `decline` | Throws a string | The WIT `err` arm is a decline, not a trap |
+
+Every mode in the source is in that table and every one is exercised by
+`tests/typescript_hook.rs`. That is a rule, not an observation: a fourth mode was written and
+never tested, which made it undocumented behaviour inside an eleven-megabyte artifact tenants
+are told to copy, and the freshness check cannot police a branch nothing calls. It was removed.
 
 A hook a tenant actually ships would have none of this. It is here because the alternative was
 three more copies of SpiderMonkey.

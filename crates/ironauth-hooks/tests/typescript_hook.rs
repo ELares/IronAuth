@@ -92,6 +92,29 @@ fn claim<'a>(claims: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+/// PRINTS THE PATH THE OTHER TESTS LOAD, so the freshness check can prove its override took.
+///
+/// `component()` falls back to the committed artifact when
+/// `IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE_OVERRIDE` is unset, which is right for an ordinary run and
+/// dangerous for `scripts/ts-hook-freshness.sh`: that script's entire job is to run these
+/// assertions against a component it just REBUILT, and a typo in the variable name would make
+/// it test the committed one twice and report success. Silently. That is the outcome the whole
+/// check exists to rule out.
+///
+/// So the script greps this test's output for the path it handed over. An assertion cannot do
+/// that job -- the test does not know what the script intended -- but printing the path lets
+/// the caller check its own instruction was obeyed.
+#[test]
+fn the_override_is_the_component_under_test() {
+    let path = std::env::var("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE_OVERRIDE")
+        .unwrap_or_else(|_| env!("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE").to_owned());
+    let bytes = std::fs::metadata(&path)
+        .expect("the component must exist")
+        .len();
+    println!("typescript hook under test: {path} ({bytes} bytes)");
+    assert!(bytes > 0, "an empty component is not a component");
+}
+
 /// CRITERION 1, the TypeScript half: a TypeScript hook customizes claims under sandbox limits.
 ///
 /// First, and every other test in this file depends on it: if the TypeScript component cannot
@@ -233,7 +256,7 @@ fn the_typescript_hook_fits_the_shipped_limits_with_margin() {
     let shipped = Limits::claim_shaping();
 
     // MEMORY. The engine's heap has to fit under the same 16 MiB a Rust hook gets. Halving the
-    // cap is the probe: if the hook still runs at 8 MiB, the shipped cap has at least 2x of
+    // cap is the probe: if the hook still runs at half of it, the shipped cap has at least 2x
     // room, and if it does not, the margin is thinner than that and this test says so.
     let halved = Limits {
         memory_bytes: shipped.memory_bytes / 2,
