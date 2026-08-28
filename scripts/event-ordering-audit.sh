@@ -537,9 +537,11 @@ if ! git diff --exit-code "$INVENTORY"; then
     echo
     echo "                      What the feed guarantees for every producer is completeness"
     echo "                      and replay stability, from the visibility watermark in"
-    echo "                      events_after. It does NOT guarantee that sequence order equals"
-    echo "                      commit order, so a consumer that needs commit order needs more"
-    echo "                      than a place on this list. See docs/EVENTS-VS-WEBHOOKS.md."
+    echo "                      events_after -- and, since issue #107 criterion 2, that within"
+    echo "                      one environment sequence order EQUALS commit order, because the"
+    echo "                      per-scope append lock is taken at the event insert itself. This"
+    echo "                      text used to say the opposite, which was accurate while the only"
+    echo "                      lock sat on an appender nothing called."
     exit 1
 fi
 

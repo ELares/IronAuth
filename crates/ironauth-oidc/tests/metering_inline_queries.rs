@@ -162,6 +162,14 @@ fn touches_the_event_feed_other_than_appending(text: &str) -> bool {
 /// which is the price criterion 2 names for ordering that matches commit order. Stated
 /// rather than absorbed, because it is the token redemption path.
 ///
+/// AND ON THIS PATH "TO THE COMMIT" IS LONGER THAN ON MOST. `take_event_append_lock`'s doc
+/// used to say the window is "an insert plus a commit rather than the whole transaction",
+/// which holds where the enqueue is the last statement. Here it is not: `meter_redeemed_tokens`
+/// enqueues and the caller then inserts `issued_tokens` and `opaque_access_tokens`, or
+/// `opaque_access_tokens` and the audit row. The extra statements this constant just counted
+/// are the same ones that sit inside the serialised window, so the number moving and the
+/// window being longer are two readings of one fact.
+///
 /// It can be bought back. Folding the lock into the insert as
 /// `INSERT ... SELECT ... FROM (SELECT pg_advisory_xact_lock($n)) l` takes it in the same
 /// statement and returns this to 69, since the lock is then evaluated to produce the source

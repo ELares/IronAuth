@@ -22622,10 +22622,24 @@ pub enum EventPage {
 ///
 /// # What it costs
 ///
-/// Event writes to ONE scope serialise from here to COMMIT. The lock is taken immediately
-/// before the insert, which in a domain write is the last statement, so the serialised
-/// window is an insert plus a commit rather than the whole transaction. It is per scope, so
-/// one tenant's write rate does not gate another's.
+/// Event writes to ONE scope serialise from here to COMMIT, and it is per scope, so one
+/// tenant's write rate does not gate another's.
+///
+/// HOW LONG THAT WINDOW IS DEPENDS ON THE PRODUCER, and an earlier version of this section
+/// gave one figure for all of them: "the lock is taken immediately before the insert, which in
+/// a domain write is the last statement, so the serialised window is an insert plus a commit
+/// rather than the whole transaction." That is true of the great majority of producers, where
+/// the enqueue really is last. It is false on the highest-traffic path this change touches.
+///
+/// `meter_redeemed_tokens` enqueues `token.issued`, and its callers CONTINUE afterwards: one
+/// then inserts `issued_tokens` and `opaque_access_tokens`, another inserts
+/// `opaque_access_tokens` and then the audit row. So on token redemption the window is the
+/// lock to the commit across several more inserts, not an insert plus a commit -- which is
+/// also why `REDEMPTION_STATEMENTS` moved 69 -> 71 rather than staying put.
+///
+/// The honest general statement is the first sentence: from here to COMMIT. Whether that is
+/// two statements or seven is a property of the producer, and the ones where it is seven are
+/// the ones worth measuring before assuming this is cheap.
 ///
 /// # Errors
 ///
@@ -24144,8 +24158,17 @@ impl OutboxRepo<'_> {
     /// So the read is gated on a VISIBILITY WATERMARK.
     /// `pg_snapshot_xmin(pg_current_snapshot())` is the oldest transaction id still
     /// running; a row whose `xmin` is below it is visible to everyone, and nothing can
-    /// ever commit beneath it afterwards. Serving only those rows means a cursor cannot
-    /// advance past a point another writer could still fill in.
+    /// ever commit beneath it afterwards.
+    ///
+    /// The page STOPS at the first row that is not yet settled, rather than filtering
+    /// unsettled rows out and continuing. That distinction is the guarantee: a filter still
+    /// serves the settled rows ABOVE a gap, so the cursor advances past a row that is later
+    /// filled in, and a cursor consumer never returns. `a_committed_event_below_the_cursor_is_never_skipped`
+    /// builds that inversion deterministically and fails under a filter.
+    ///
+    /// A filter is what this was, and the append lock did not rescue it: the lock orders
+    /// INSERTs, while `xmin` is fixed at a transaction's FIRST write, so two producers can
+    /// take the lock in one order, commit in that order, and still have inverted xmins.
     ///
     /// # What this costs, measured rather than estimated
     ///
@@ -24191,9 +24214,32 @@ impl OutboxRepo<'_> {
             // wraparound boundary is not a one-line change, so it is tracked on its own
             // (issue #980) rather than smuggled into an unrelated diff. Anything that edits
             // this predicate must keep `events_cursor_ordering.rs`'s duplicate in step.
+            // A PREFIX CUT, NOT A ROW FILTER, and the difference is the whole guarantee.
+            //
+            // Filtering unsettled rows OUT still serves the settled rows ABOVE them, so the
+            // cursor advances past a gap that is later filled in -- and a cursor consumer
+            // never returns. The append lock does not prevent it: the lock orders INSERTs,
+            // while `xmin` is fixed at a transaction's FIRST write, arbitrarily many
+            // statements earlier. So two producers can take the lock in one order, commit in
+            // that order, and still have INVERTED xmins; any unrelated transaction whose xid
+            // sits in the gap makes the reader serve the higher sequence and skip the lower
+            // one permanently. Review measured exactly that.
+            //
+            // Stopping at the first unsettled row instead means the cursor never advances
+            // over anything that could still be filled in, which is what the paragraph above
+            // claims and what a filter cannot deliver.
+            //
+            // THE APPEND LOCK IS WHAT MAKES THIS CHEAP. Event writes in a scope now
+            // serialise, so at most one event row in a scope is mid-commit at a time and the
+            // cut is at worst one row back. Without the lock a prefix cut would stall behind
+            // every overlapping writer; with it, the two changes pay for each other.
             "SELECT {OUTBOX_COLUMNS} FROM outbox_messages \
              WHERE tenant_id = $1 AND environment_id = $2 AND sequence > $3 \
-             AND xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint \
+             AND sequence < COALESCE(( \
+                 SELECT MIN(sequence) FROM outbox_messages \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND sequence > $3 \
+                 AND xmin::text::bigint >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint \
+             ), 9223372036854775807) \
              ORDER BY sequence LIMIT $4"
         );
         let mut tx = begin_scoped(self.store, scope).await?;
@@ -42511,15 +42557,34 @@ where
 ///
 /// Split out of `rotate_inner` for the function-length lint. It is also the natural unit: one
 /// statement writing one row, with the impersonation columns riding along or staying NULL.
-/// Every session in the system is inserted HERE, which is why the metering event is emitted
-/// here too (issue #107).
+/// Every session in the system is inserted HERE, which is why the metering event is BUILT
+/// here (issue #107).
 ///
 /// `UsageTally` counts monthly actives off `user.signed_in`, and the constant naming that
 /// type had no producer at all: the fold read a feed that never contained it, so metering
-/// reported zero for every tenant. The fix belongs at the choke point rather than at each of
-/// the three call sites above, for the same reason the fan-out validates in one place -- a
-/// producer added per call site is a producer the next call site forgets, and the failure is
-/// silent undercounting that surfaces as a billing dispute.
+/// reported zero for every tenant.
+///
+/// # Built here, ENQUEUED BY THE CALLER, and this doc used to argue against that
+///
+/// It said "the fix belongs at the choke point rather than at each of the three call sites
+/// above ... a producer added per call site is a producer the next call site forgets, and the
+/// failure is silent undercounting that surfaces as a billing dispute." The reasoning is
+/// sound and the conclusion had to give way to a deadlock: enqueuing here made this the FIRST
+/// statement to take the per-scope append lock, before `reconcile_prior_session_at_rotation`
+/// takes `FOR UPDATE`, which inverts the lock order every other producer in this module uses.
+/// See the note at the return value.
+///
+/// So the risk that paragraph names is real and is now carried by a test rather than by the
+/// shape of the code: `a_rotation_meters_the_sign_in_it_created` drives the ordinary sign-in
+/// path and asserts the event lands on the feed, so a caller that takes the returned event and
+/// drops it is a failing test rather than a billing dispute.
+///
+/// THAT COVERS ONE OF THE TWO PRODUCTION CALL SITES. The other is
+/// `ActingImpersonationAuthorizationRepo::redeem`, which mints an impersonation session and is
+/// not covered here -- its fixture needs an impersonation authorization, and this PR did not
+/// build one. Written down rather than left implied, because "a producer added per call site
+/// is a producer the next call site forgets" is exactly the failure this arrangement invites,
+/// and an uncovered site is where it would happen.
 ///
 /// In the write's OWN transaction, so a rolled-back sign-in is not metered. That is one
 /// outbox insert on the authentication path, and it is the event stream rather than a
@@ -42603,14 +42668,30 @@ async fn insert_session_row(
     // The invariant that makes a transaction-scoped global lock safe is that it is the LAST
     // lock the transaction takes, and returning the event is what lets this path obey it.
     //
-    // It is an invariant about LOCKS, not about position: `write_audited` inserts its audit row
-    // after the closure, and that is fine, because an INSERT of a new row takes only that row's
-    // lock and no other transaction can be waiting on a row that does not exist yet.
+    // It is an invariant about LOCKS, not about position -- but the exception this comment used
+    // to license was WRONG, and the same commit that wrote it retracts the sentence elsewhere
+    // in this file. It said `write_audited`'s audit row after the closure "is fine, because an
+    // INSERT of a new row takes only that row's lock". An insert takes its own row's lock AND
+    // a `FOR KEY SHARE` on every FK parent it names, and `audit_log` carries foreign keys to
+    // `tenants` and `environments` -- so the audit row DOES take locks while the append lock
+    // is held. `take_event_append_lock`'s own note calls that sentence "false for any table
+    // with a foreign key". Shipping the rule and its refutation in one change would have left
+    // the refuted one as what a future producer applies.
+    //
+    // What is actually true is narrower and is the residual risk this PR does not close: the
+    // FK parent locks are `FOR KEY SHARE`, which conflicts only with `FOR UPDATE` on the same
+    // parent row, and the one place that takes `FOR UPDATE` on `environments` is
+    // `ActingTenantRepo::delete_with_event`. That cycle is real and is documented on
+    // `take_event_append_lock`.
     //
     // The CONTENTS still come from one place, which is what the previous comment here was
-    // protecting: a producer can now get the placement wrong but not the envelope. The type
-    // enforces the rest -- the event is returned, so a caller that drops it fails
-    // `#[must_use]` rather than silently announcing nothing.
+    // protecting: a producer can now get the placement wrong but not the envelope. NOT the
+    // placement -- an earlier version claimed "the type enforces the rest ... a caller that
+    // drops it fails `#[must_use]`". It does not: `OwnedDomainEvent` carries no `#[must_use]`,
+    // and `?` discharges the `Result`, leaving a plain `Option` no lint objects to. The thing
+    // that actually catches a caller who forgets to enqueue is
+    // `a_sign_in_through_every_call_site_reaches_the_feed`, and a claim of type-level safety
+    // where there is none is worse than no claim, because it stops the next person looking.
     Ok(crate::event_catalog::envelope(
         &event_id,
         "user.signed_in",
@@ -50471,6 +50552,34 @@ impl ActingTenantRepo<'_> {
             },
             async move |tx| {
                 let now_micros = epoch_micros(env.clock().now_utc());
+                // 0. THE IDEMPOTENCY ROW FIRST, and this ordering is the whole reason
+                //    the step is numbered zero.
+                //
+                //    `insert_idempotency` opens with an UNSCOPED prune -- `DELETE FROM
+                //    idempotency_keys WHERE ... expires_at <= now() ORDER BY expires_at
+                //    LIMIT 100` -- so every concurrent idempotent writer in the
+                //    DEPLOYMENT targets the same globally-oldest rows and takes their
+                //    locks. The cascade below takes one per-scope append lock per
+                //    ENVIRONMENT of this tenant and holds them all to commit. Running
+                //    the prune after them is therefore an ABBA cycle against any
+                //    idempotent event-producing write that prunes first and then wants
+                //    one of those scopes, and Postgres aborts one side with 40P01 --
+                //    surfacing as a 500 on a tenant suspend, or on the unrelated write
+                //    that lost the coin toss.
+                //
+                //    THIS PR IS WHAT CREATED THAT CYCLE: before it, `enqueue_domain_event`
+                //    took no advisory lock at all, so the order did not matter here. The
+                //    same move was made in `publish_snapshot_inner`, and making it there
+                //    and not here is what left the two halves of the cycle facing each
+                //    other. It is a pure move -- see step 3 for why the row does not
+                //    depend on the scoping variables.
+                //
+                //    The general rule it follows: THE APPEND LOCK IS THE LAST LOCK THIS
+                //    TRANSACTION TAKES. That is not enforceable by a type, so every
+                //    producer that takes another lock afterwards has to be found by
+                //    reading, which is what `an_idempotent_tenant_write_prunes_before_it_
+                //    takes_any_append_lock` exists to stop being true again.
+                insert_idempotency(tx, idempotency).await?;
                 // 1. Flip the tenant status, guarded on the source state so a
                 //    concurrent transition cannot double-apply. A level table (no
                 //    row-level security).
@@ -50552,9 +50661,15 @@ impl ActingTenantRepo<'_> {
                     enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
                 }
                 // 3. Restore the audit scope's row-level-security variables so the
-                //    audited-write's audit row (and the idempotency insert) run under
-                //    (tenant, oldest environment), after the per-environment
-                //    re-scoping above.
+                //    audited-write's audit row runs under (tenant, oldest
+                //    environment), after the per-environment re-scoping above.
+                //
+                //    NOT the idempotency insert, which this used to say and which
+                //    moved above the cascade -- see the hoist at the top of this
+                //    closure. `idempotency_keys` carries no row-level security
+                //    (0003_management_api.sql calls it "deliberately CREDENTIAL-scoped,
+                //    not tenant-row-level-security scoped"), so its row never depended
+                //    on which environment these variables name.
                 sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
                     .bind(scope.tenant().to_string())
                     .execute(&mut **tx)
@@ -50563,10 +50678,6 @@ impl ActingTenantRepo<'_> {
                     .bind(scope.environment().to_string())
                     .execute(&mut **tx)
                     .await?;
-                // Store the idempotency replay row in the SAME transaction as the
-                // transition, so a replay returns the original response and writes no
-                // second audit row.
-                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             false,
@@ -50721,6 +50832,41 @@ impl ActingTenantRepo<'_> {
                 //    rather than assumed. The `(EXTRACT * 1000000)::bigint` idiom is used
                 //    widely in this file; this is the only site where an inexact result
                 //    would be a security regression rather than a wrong display value.
+                // THE APPEND LOCKS FIRST, BEFORE ANY ROW LOCK, and this is the one place in
+                // the tree that has to do it explicitly.
+                //
+                // Every event producer now takes `pg_advisory_xact_lock(key(tenant, env))` and
+                // holds it to commit, and its outbox INSERT then takes `FOR KEY SHARE` on the
+                // `environments` parent through the foreign key. The statement below takes
+                // `FOR UPDATE` on those same rows -- the only `environments ... FOR UPDATE` in
+                // the tree -- and this closure does not reach its own enqueue until much later.
+                // So without this, the two sides take the same two locks in opposite orders:
+                // a producer holds the advisory lock and waits for FOR KEY SHARE, while this
+                // holds FOR UPDATE and waits for the advisory lock. Postgres aborts one with
+                // 40P01, and it is either an operator's tenant delete or an end user's write.
+                //
+                // THIS PR IS WHAT CREATED THAT CYCLE: before it the outbox insert took no
+                // advisory lock, so there was only one lock in play and no order to get wrong.
+                // Taking them here, in the same `ORDER BY id` the lock below uses, gives every
+                // transaction in the deployment one order -- advisory before row -- which is
+                // what makes the cycle unconstructible rather than merely unlikely.
+                //
+                // It costs what a tenant delete should already cost: the delete waits for
+                // in-flight event producers in that tenant, and new ones wait for it. Advisory
+                // locks are re-entrant within a transaction, so the enqueue later in this
+                // closure re-takes a key it already holds and returns immediately.
+                let env_ids: Vec<String> = sqlx::query_scalar(
+                    "SELECT id FROM environments WHERE tenant_id = $1 ORDER BY id",
+                )
+                .bind(id.to_string())
+                .fetch_all(&mut **tx)
+                .await?;
+                for env_id in &env_ids {
+                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                        .bind(append_lock_key_from_parts(&id.to_string(), env_id))
+                        .execute(&mut **tx)
+                        .await?;
+                }
                 let env_rows = sqlx::query(
                     "SELECT id, (EXTRACT(EPOCH FROM deleted_at) * 1000000)::bigint AS deleted_us \
                      FROM environments WHERE tenant_id = $1 ORDER BY id FOR UPDATE",
@@ -51119,6 +51265,19 @@ impl ActingTenantRepo<'_> {
                 let status = TenantStatus::from_wire(&restored.get::<String, _>("status"))
                     .ok_or(StoreError::NotFound)?;
                 let serving_status = serving_status_str(serving_state_for(status));
+                // THE IDEMPOTENCY ROW BEFORE ANY APPEND LOCK, and it is here rather than at
+                // the top of the closure because unlike its two siblings this one records the
+                // status the restore COMMITTED (issue #438) -- so it cannot be written before
+                // that status is known. This is the first line where it is.
+                //
+                // `insert_resolved_idempotency` reaches `insert_idempotency`, which opens with
+                // an UNSCOPED prune of the globally-oldest expired keys; the cascade below
+                // takes a per-scope append lock per ENVIRONMENT and holds them to commit. Doing
+                // the prune afterwards is an ABBA cycle against any idempotent event-producing
+                // write that prunes first and then wants one of those scopes. This PR created
+                // that cycle by giving `enqueue_domain_event` a lock; see the long note in
+                // `transition`.
+                insert_resolved_idempotency(tx, idempotency, &status).await?;
                 // 2. Per environment: restore the data-plane serving state and clear the grace
                 //    delete's credential tombstones, re-scoping to each environment
                 //    for the forced row-level security on management_credentials and
@@ -51239,12 +51398,6 @@ impl ActingTenantRepo<'_> {
                     .bind(scope.environment().to_string())
                     .execute(&mut **tx)
                     .await?;
-                // The stored response is rendered from the status this restore
-                // COMMITTED, not from a post-condition the caller predicted (issue
-                // #438), in the same transaction as the write, so the 200, every
-                // replay of that Idempotency-Key and a subsequent tenant READ all
-                // report the one value that was persisted.
-                insert_resolved_idempotency(tx, idempotency, &status).await?;
                 Ok(status)
             },
             false,
@@ -51346,6 +51499,14 @@ impl ActingTenantRepo<'_> {
             },
             async move |tx| {
                 let purged_micros = epoch_micros(env.clock().now_utc());
+                // THE IDEMPOTENCY ROW FIRST. `insert_idempotency` opens with an UNSCOPED
+                // prune of the globally-oldest expired keys, and the cascade below takes a
+                // per-scope append lock per ENVIRONMENT and holds them to commit -- so running
+                // the prune afterwards is an ABBA cycle against any idempotent
+                // event-producing write that prunes first and then wants one of those scopes.
+                // This PR created that cycle by giving `enqueue_domain_event` a lock; see the
+                // long note in `transition` for the rule and why the move is safe.
+                insert_idempotency(tx, idempotency).await?;
                 // 1. Stamp the terminal marker, guarded on the grace predicate so a
                 //    concurrent restore/purge cannot double-apply.
                 let result = sqlx::query(
@@ -51432,7 +51593,6 @@ impl ActingTenantRepo<'_> {
                     .bind(scope.environment().to_string())
                     .execute(&mut **tx)
                     .await?;
-                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             false,
