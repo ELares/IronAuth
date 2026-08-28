@@ -189,9 +189,16 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("listTokenHookVersions", ManagementPermission::Read),
     ("rollbackTokenHook", ManagementPermission::WriteConfig),
     // READ, unlike its three write-shaped neighbours, and the reason is that it writes
-    // nothing: a draft run is a read of a hook the caller can already fetch plus a
-    // computation over an event they supplied. Classifying it with the deploy would demand
+    // nothing. It is a read of a hook resource this credential may already read, plus a
+    // computation over an event it supplied. Classifying it with the deploy would demand
     // `write_config` and sudo freshness to ask a question.
+    //
+    // It DOES disclose more than the metadata read does, and an earlier version of this note
+    // said otherwise ("a hook the caller can already fetch"): no endpoint returns the
+    // component. What bounds the disclosure is the guest world importing nothing -- a run is a
+    // pure function of the component and the supplied event -- and `getClaimsMapping` is the
+    // precedent, handing this same reader the whole declarative rule list shaping the same
+    // tokens.
     ("testTokenHook", ManagementPermission::Read),
     // User sub-surfaces: identifiers, trait schemas, signup quarantine and recovery
     // approvals. Identifier UNIQUENESS and trait schemas are config rather than user
@@ -634,8 +641,12 @@ const PERMISSION_PROVEN: &[&str] = &[
     // it changes what every token this client is issued carries.
     "listTokenHookVersions",
     "rollbackTokenHook",
-    // Proven in `a_draft_run_reports_what_the_deployed_hook_would_do_and_writes_nothing` and
-    // its siblings: a `management.read` credential reaches the handler and gets an answer.
+    // Proven in `delegated_admin.rs::read_is_required_and_sufficient_for_a_token_hook_draft_run`,
+    // in BOTH directions: a `write_users` credential gets 403 and a `read` one reaches the
+    // handler, so neither a blanket refusal nor a missing gate would pass it. An earlier
+    // version of this entry cited `a_draft_run_reports_what_the_deployed_hook_would_do_and_
+    // writes_nothing`, which drives the unrestricted bootstrap operator and would pass with the
+    // gate deleted -- the false coverage claim this list's own header warns about.
     "testTokenHook",
     // Proven in `read_is_required_and_sufficient_for_the_event_feed_and_usage_export`, in
     // BOTH directions: a `write_config` credential is refused and a `read` one is allowed,

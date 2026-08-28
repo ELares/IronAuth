@@ -3683,9 +3683,11 @@ async fn read_is_required_and_sufficient_for_listing_token_hook_versions() {
 /// `management.read` is required AND sufficient for a token-hook DRAFT RUN (#114 criterion 5).
 ///
 /// Classified with the READS rather than with its three write-shaped neighbours, and that is
-/// the classification this test exists to hold: a draft run stores nothing and discloses
-/// nothing a reader of the hook does not already have. Getting it wrong in the other direction
-/// would demand `write_config` and sudo freshness to ask a question.
+/// the classification this test exists to hold: a draft run stores nothing, and what it reads
+/// is a hook resource this credential may already read. It DOES disclose the hook's behaviour,
+/// which the metadata read does not -- no endpoint returns the component -- and that is what
+/// the endpoint is for, bounded by a guest world that imports nothing. Getting it wrong in the
+/// other direction would demand `write_config` and sudo freshness to ask a question.
 ///
 /// Both directions, because a blanket refusal and a missing gate are indistinguishable from
 /// one of them.

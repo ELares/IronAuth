@@ -32627,31 +32627,59 @@ impl TokenHookRepo<'_> {
         .transpose()
     }
 
-    /// The NEWEST version number in this client's history, or [`None`] if it has none.
+    /// This client's ACTIVE hook and the version number that names it, in ONE statement.
     ///
-    /// Which is the version of the hook currently deployed: a deploy appends a row, and so does
-    /// a rollback -- it is a deploy of an older component. `token_hooks` carries no version
-    /// column, so this is the only place the active hook's number exists.
-    ///
+    /// `token_hooks` carries no version column, so the number lives only in the history:
+    /// a deploy appends a row, and so does a rollback -- it is a deploy of an older component.
     /// `MAX(version)` rather than reading the list and taking the first, because a draft run
     /// wants one number and the components are megabytes each.
+    ///
+    /// ONE STATEMENT, and that is the point rather than tidiness. Two reads cannot answer this,
+    /// and neither can two reads in one transaction: `begin_scoped` pins READ COMMITTED, which
+    /// takes a fresh snapshot per STATEMENT, so a deploy landing between them returns the OLD
+    /// component beside the NEW number -- a draft report naming a version whose bytes did not
+    /// run, which is exactly the thing an operator would then roll back to. One statement is
+    /// one snapshot, so the pair is consistent even when a deploy commits while it runs.
+    ///
+    /// The subquery stays HERE and not on [`Self::get`]: the issuance path calls `get` as the
+    /// data-plane role, and `0165_token_hook_versions.sql` grants that role nothing at all on
+    /// `token_hook_versions`, so adding it there turns the hottest read in the feature into a
+    /// permission error.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn newest_version(&self, client_id: &str) -> Result<Option<i32>, StoreError> {
+    pub async fn active_with_version(
+        &self,
+        client_id: &str,
+    ) -> Result<Option<(TokenHookRecord, Option<i32>)>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        let newest: Option<i32> = sqlx::query_scalar(
-            "SELECT MAX(version) FROM token_hook_versions \
-             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        let row = sqlx::query(
+            "SELECT h.client_id, h.component, h.payload_version, h.failure_policy, \
+                    (SELECT MAX(v.version) FROM token_hook_versions v \
+                      WHERE v.tenant_id = $1 AND v.environment_id = $2 AND v.client_id = $3) \
+                    AS version \
+             FROM token_hooks h \
+             WHERE h.tenant_id = $1 AND h.environment_id = $2 AND h.client_id = $3",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(client_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(newest)
+        row.map(|row| {
+            Ok((
+                TokenHookRecord {
+                    client_id: row.get("client_id"),
+                    component: row.get("component"),
+                    payload_version: row.get("payload_version"),
+                    failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                },
+                row.get::<Option<i32>, _>("version"),
+            ))
+        })
+        .transpose()
     }
 
     /// The deployed hook's METADATA, without reading the component.

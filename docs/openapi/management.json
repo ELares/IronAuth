@@ -2730,7 +2730,7 @@
           "token-hooks"
         ],
         "summary": "Run a client's token hook against a recorded event, without deploying anything.",
-        "description": "Issue #114 criterion 5's fixture-based draft testing, and the half of the Auth0 Actions loop\nthis surface was missing: deploy, ROLL BACK and list already worked, so an operator could\nrecover from a bad hook but could not avoid shipping one.\n\n# It runs the SHIPPED dispatch, not a copy of it\n\n`ironauth_oidc::token_hook::run_record` is the same function an issuance calls, with the\nsame limits, the same payload-version check, the same fence and the same fault\nclassification. A second implementation built for this endpoint would answer about itself,\nwhich is the one thing a draft run must not do.\n\nTwo deliberate departures, both because a draft run has no login to protect:\n\n* THE FAILURE POLICY IS NOT APPLIED. `run` swallows a fault under `fail_open` so a broken\n  hook does not fail a login. Here the operator IS the audience, and hiding the fault is\n  hiding the answer, so the outcome reports `aborted` with the reason.\n\n# A deliberate DECLINE is reported as `aborted`, and that is a real limitation\n\nThe WIT contract distinguishes them -- its own doc says the error arm \"is NOT the same thing\nas a trap\" -- and `HookFault` does not: `Aborted` is documented as \"exhausted a bound,\ntrapped, OR DECLINED\", because at issuance the difference changes nothing a client may see.\nIt changes plenty for an operator testing a hook, and carrying it out means giving\n`HookFault` a payload it deliberately does not have. Not done here. Said rather than papered\nover with an outcome value nothing can produce.\n* THE FENCE'S REFUSALS ARE REPORTED. At issuance they are logged and dropped, because\n  nobody can act on them mid-request. An operator asking what a hook would do can act on\n  \"it tried to set `sub`\" immediately.\n\n# Nothing is written\n\nNo deploy, no version row, no audit `token_hook.set`. It is a READ plus a computation, which\nis why it is `management.read` rather than `write_config` -- and why it does not take the\nsudo freshness a deploy does. Running a hook the operator can already read the bytes of,\nagainst an event they supplied, discloses nothing they did not already have.",
+        "description": "Issue #114 criterion 5's fixture-based draft testing, and the half of the Auth0 Actions loop\nthis surface was missing: deploy, ROLL BACK and list already worked, so an operator could\nrecover from a bad hook but could not avoid shipping one.\n\n# It runs the SHIPPED dispatch, not a copy of it\n\n`ironauth_oidc::token_hook::run_record` is the same function an issuance calls, with the\nsame limits, the same payload-version check, the same fence and the same fault\nclassification. A second implementation built for this endpoint would answer about itself,\nwhich is the one thing a draft run must not do.\n\nTwo deliberate departures, both because a draft run has no login to protect:\n\n* THE FAILURE POLICY IS NOT APPLIED. `run` swallows a fault under `fail_open` so a broken\n  hook does not fail a login. Here the operator IS the audience, and hiding the fault is\n  hiding the answer, so the outcome reports `aborted` with the reason.\n\n# A deliberate DECLINE is reported as `aborted`, and that is a real limitation\n\nThe WIT contract distinguishes them -- its own doc says the error arm \"is NOT the same thing\nas a trap\" -- and `HookFault` does not: `Aborted` is documented as \"exhausted a bound,\ntrapped, OR DECLINED\", because at issuance the difference changes nothing a client may see.\nIt changes plenty for an operator testing a hook, and carrying it out means giving\n`HookFault` a payload it deliberately does not have. Not done here. Said rather than papered\nover with an outcome value nothing can produce.\n* THE FENCE'S REFUSALS ARE REPORTED, and so is the count of claims whose VALUE was not\n  JSON. At issuance both are logged and dropped, because nobody can act on them\n  mid-request. An operator asking what a hook would do can act on \"it tried to set `sub`\"\n  immediately -- and on \"one of your values is not JSON\", which is the one class that\n  otherwise leaves no trace at all: the claim is missing from the maps and missing from\n  `refused`, exactly as it is for a hook that dropped it on purpose.\n\n# The GRANT decides whether there is an ID half\n\n`client_credentials`, `jwt:bearer` and token exchange mint no ID token, and their shipped\ndispatch is `apply_to_machine_token`, which hands the guest an EMPTY ID-token list and drops\nthe one it returns. A draft run on those grants does the same and reports\n`id_token_claims_discarded` instead, so the answer is the one that door would give rather\nthan the one the fixture asked for. That is not a third departure: it is the shipped\nbehaviour of the grant the request names.\n\n# Nothing is written, and one thing IS disclosed\n\nNo deploy, no version row, no audit `token_hook.set`. It is a READ plus a computation, which\nis why it is `management.read` rather than `write_config` -- and why it does not take the\nsudo freshness a deploy does.\n\nIt does disclose the hook's BEHAVIOUR, which the metadata read does not, and an earlier\nversion of this paragraph said the opposite: that running a hook the operator can already\nread the bytes of discloses nothing new. No endpoint returns the component. `TokenHookView`\nand `TokenHookVersionView` carry a byte LENGTH, and `get_token_hook` calls `metadata` rather\nthan `get` precisely so the bytes stay in the database. So a `management.read` credential\nthat could previously learn a length, a payload version and a failure policy can now learn\nwhat the hook EMITS for an event it chose, for the deployed hook and for every retained\nversion. That is what the endpoint is for, and it is bounded by the guest world importing\nNOTHING: a run is a pure function of the component and the supplied event, reaching no user,\nno stored row and no network. It sits with the reads on the same ground as\n`getClaimsMapping`, which hands this same reader the complete declarative rule list shaping\nthe same tokens.",
         "operationId": "testTokenHook",
         "parameters": [
           {
@@ -2773,7 +2773,7 @@
         },
         "responses": {
           "200": {
-            "description": "The hook ran. `outcome` is `completed` or `aborted`; an aborted run is still a 200, because the QUESTION was answered. `refused` is capped, so read `refusals_not_reported` before treating it as complete",
+            "description": "The hook ran. `outcome` is `completed` or `aborted`; an aborted run is still a 200, because the QUESTION was answered. `refused` is capped, so read `refusals_not_reported` before treating it as complete, and on a grant that mints no ID token `id_token_claims` is empty with `id_token_claims_discarded` saying how many the hook returned, and `values_not_json` for claims the hook mis-serialised, which are dropped and appear in neither list",
             "content": {
               "application/json": {
                 "schema": {
@@ -31989,7 +31989,9 @@
           "id_token_claims",
           "access_token_claims",
           "refused",
-          "refusals_not_reported"
+          "refusals_not_reported",
+          "values_not_json",
+          "id_token_claims_discarded"
         ],
         "properties": {
           "access_token_claims": {
@@ -32002,11 +32004,16 @@
           },
           "id_token_claims": {
             "type": "object",
-            "description": "The ID-token claims the hook contributed, AFTER the protected-claim fence.\n\nAfter the fence, deliberately: what an operator wants to know is what would reach a\ntoken, and a hook's own output is not that. A claim it tried to mint and the fence\nrefused appears in `refused` instead.",
+            "description": "The ID-token claims the hook contributed, AFTER the protected-claim fence.\n\nAfter the fence, deliberately: what an operator wants to know is what would reach a\ntoken, and a hook's own output is not that. A claim it tried to mint and the fence\nrefused appears in `refused` instead.\n\nALWAYS EMPTY on a grant that mints no ID token -- `client_credentials`, `jwt:bearer` and\ntoken exchange. Those doors hand the guest an empty ID-token list and drop the one it\nreturns, so a draft run does the same rather than reporting a half no token on that\ngrant can carry. `id_token_claims_discarded` says how many the hook returned.",
             "additionalProperties": {},
             "propertyNames": {
               "type": "string"
             }
+          },
+          "id_token_claims_discarded": {
+            "type": "integer",
+            "description": "How many ID-token claims the hook returned that this GRANT discards.\n\nZero on every grant that mints an ID token, and zero on a hook that filled nothing.\nNon-zero says \"your hook filled the ID list and this grant threw it away\", which an\nempty `id_token_claims` alone cannot distinguish from a hook that contributed nothing.\nAt issuance that discard is an `info` log line the operator has to go and find; here\nthey are the audience, which is the same reason `refused` is returned at all.",
+            "minimum": 0
           },
           "outcome": {
             "type": "string",
@@ -32017,11 +32024,11 @@
               "string",
               "null"
             ],
-            "description": "Why, for `declined` and `aborted`. Absent for `completed`."
+            "description": "Why, for an `aborted` run. Absent for `completed`.\n\nThe retraction three lines above applies here too, and this copy was missed the first\ntime: there is no `declined` outcome, so there is no `declined` to carry a reason for.\nOne of four stable tokens -- `store_unavailable`, `component_unloadable`,\n`aborted_or_declined`, `payload_version` -- and the third is what a decline reports,\nbecause `HookFault::Aborted` covers a trap, an exhausted bound and a decline alike."
           },
           "refusals_not_reported": {
             "type": "integer",
-            "description": "How many refusals did not fit `refused`.\n\nZero on any ordinary hook. Non-zero means `refused` is truncated, and the names missing\nfrom it are the alphabetically last -- which a hook author controls.",
+            "description": "An UPPER BOUND on how many refused names are missing from `refused`.\n\nNOT a count of them, and `refused.len() + refusals_not_reported` is not a total of\nanything -- do not do that arithmetic. `refused` is a deduplicated UNION over the two\ntokens and this is a per-token SUM, so a name dropped from one token's report can still\nreach the list through the other's: a hook padding only the ID token reports `sub` in\nthe list AND a remainder of one, with nothing actually missing. It is a sum rather than\na maximum because the two tokens can drop DIFFERENT names, and a maximum would then\nunderstate.\n\nZERO IS EXACT. Zero means neither token's list was truncated, so `refused` is complete.\nThat is the reading to build on; a non-zero value means \"there may be more, go look at\nthe hook\" and nothing more precise. Computing the true distinct-missing count would\nrequire materialising the dropped names, which is the allocation the cap exists to\navoid.",
             "minimum": 0
           },
           "refused": {
@@ -32029,7 +32036,12 @@
             "items": {
               "type": "string"
             },
-            "description": "Claim names the fence refused.\n\nCAPPED, and `refusals_not_reported` is how you know. The fence reports at most\nsixty-four names per token and keeps the alphabetically first, so a hook that returns\nninety-six claims called `a000`..`a095` alongside `sub` pushes `sub` off this list. The\nrefusal still happens -- the fence blocks it at issuance either way -- but a reviewer\nreading this list as complete would approve a hook that attempted a reserved name.\n\nSo read the count first. A non-zero `refusals_not_reported` means this list is a\nsample."
+            "description": "Claim names the fence refused, DEDUPLICATED across the two tokens.\n\nCAPPED per token, and `refusals_not_reported` is how you know. The fence reports at most\nsixty-four names for each of the two tokens and keeps the alphabetically first, so a\nhook that returns ninety-six claims called `a000`..`a095` alongside `sub` pushes `sub`\noff that token's list. The refusal still happens -- the fence blocks it at issuance\neither way -- but a reviewer reading this list as complete would approve a hook that\nattempted a reserved name.\n\nDeduplicated because a hook setting `sub` in both tokens is making one mistake, so this\nlist holds at most a hundred and twenty-eight names, not sixty-four. Read\n`refusals_not_reported` first: while it is zero this list is complete."
+          },
+          "values_not_json": {
+            "type": "integer",
+            "description": "How many claims the hook returned with a value that is not JSON.\n\nA SEPARATE class from `refused`, and it has to be reported separately because it leaves\nno other trace. A refused claim is one the fence would not let the hook write; this is\none the hook mis-serialised, so the host cannot read it and drops it -- and under the\nreplace contract dropping it REMOVES it from the token.\n\nWithout this number the report for such a claim is indistinguishable from the report for\na hook that deliberately dropped it: absent from the claim maps, absent from `refused`,\nand `refusals_not_reported` zero. An operator would approve a hook that silently strips\na claim from every token it shapes.\n\nIt is a COUNT and not a name list because the names are unbounded -- a hook may return\nany number of claims -- and a second capped list would need its own truncation count,\nwhich is the truncation problem `refusals_not_reported` already exists for. WHICH claims\nthey were is not reported anywhere, the server log included: it carries this same count\nand no names. What the count buys is the difference between \"the hook dropped these on\npurpose\" and \"look at your serialisation\", and the missing names are the claims you\nexpected to see in the maps above and do not.",
+            "minimum": 0
           },
           "version_run": {
             "type": [
@@ -32037,7 +32049,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "Which version ran.\n\nRESOLVED, not echoed. A run that named a version gets that number back; a run that named\nnone gets the version of the hook that is currently deployed, which is the newest row in\nthe history. `null` only when the client has no history at all -- which after the\nbackfill in `0165_token_hook_versions.sql` means a hook deployed and then deleted."
+            "description": "Which version ran.\n\nRESOLVED, not echoed. A run that named a version gets that number back; a run that named\nnone gets the version of the hook that is currently deployed, which is the newest row in\nthe history.\n\nNOT `null` on any path this API offers, and the sentence that stood here said the\nopposite: it named \"a hook deployed and then deleted\", which is the one case that\ncertainly does not produce one. The delete removes the `token_hooks` row and leaves\n`token_hook_versions` alone -- that table has no foreign key to it and no trigger -- so a\ndeleted hook keeps its history, and asking this endpoint about it answers 404, an\n`ErrorBody` with no version in it at all.\n\nA `null` needs the reverse: an ACTIVE hook whose history is EMPTY. A deploy writes both\nrows in one transaction, `0165_token_hook_versions.sql` backfills version 1 for every\nhook that predates the history, and the prune deletes only\n`version <= MAX(version) - TOKEN_HOOK_VERSION_RETENTION` -- so no write this server\nperforms leaves that state behind. Measured: reaching it took a hand-run\n`DELETE FROM token_hook_versions` under a live hook. The field stays optional because\nthe database can hold that row set, not because a client can produce it."
           }
         }
       },

@@ -260,6 +260,8 @@ pub mod token_hook {
         pub refused: Vec<String>,
         /// How many refusals did not fit `refused`.
         pub refusals_not_reported: usize,
+        /// How many returned claims had a value that is not JSON.
+        pub values_not_json: usize,
     }
 
     /// Why a hook did not contribute, with the feature off. Unreachable by construction.

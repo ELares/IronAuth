@@ -160,6 +160,55 @@ async fn a_draft_run_can_name_an_older_version() {
         serde_json::json!("gold"),
         "version 1 ran, not the ACTIVE version 2 -- which strips rather than adding: {body}"
     );
+
+    // AND THE OMITTED CASE RESOLVES TO THE NEWEST, which only a client with more than one
+    // version can say. The sibling test above asserts `version_run == 1` on a client with a
+    // single deploy, where the newest version, the oldest surviving one, how many there are and
+    // the literal 1 are all the same number -- so `MIN(version)` passes it, and so does a
+    // hardcoded `Some(1)`. Here they differ: newest 2, oldest 1, and 1 is also what the request
+    // above named, so an echo cannot pass this either.
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/test"),
+            "k-draft-2b",
+            &request_without_version(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "draft run of the active version: {body}"
+    );
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["version_run"], 2,
+        "a run naming no version reports the DEPLOYED version, which is the NEWEST row in the \
+         history and not the oldest surviving one: {body}"
+    );
+    // AND THE NUMBER NAMES THE COMPONENT THAT RAN. Asserting the number alone is what let the
+    // echo survive round 1; asserting the claims alone would not pin the number. v2 strips
+    // `email` and adds `stripper_ran`, v1 adds `tier` -- so a report pairing v1's output with
+    // the number 2 fails here, which is the two-transaction skew `active_with_version` closes.
+    assert_eq!(
+        view["access_token_claims"]["stripper_ran"],
+        serde_json::json!(true),
+        "`version_run` and the claims must name the SAME component: {body}"
+    );
+    assert!(
+        view["access_token_claims"]["tier"].is_null(),
+        "and not v1's, which adds `tier`: {body}"
+    );
+}
+
+/// The same fixture event as the tests above, with no `version`, so the handler resolves it.
+fn request_without_version() -> String {
+    serde_json::json!({
+        "grant_type": "authorization_code",
+        "subject": "user-1",
+        "id_token_claims": { "email": "ada@example.test" },
+        "access_token_claims": { "sub": "user-1" }
+    })
+    .to_string()
 }
 
 /// THE FENCE'S REFUSALS ARE REPORTED, which is the half a log line cannot give an operator.
@@ -275,4 +324,188 @@ async fn a_draft_run_of_an_absent_hook_or_version_is_not_found() {
         .post(&format!("{base}/test"), "k-draft-6", &request)
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "no such version: {body}");
+}
+
+/// A PADDED HOOK CANNOT HIDE A FORGERY FROM THE REPORT -- the round-1 HIGH, pinned.
+///
+/// `refused` holds at most sixty-four names per token and keeps the alphabetically FIRST, so a
+/// hook that pads its output pushes `sub` off the very report an operator is reading to decide
+/// whether to deploy it. `refusals_not_reported` is what turns that list from something that
+/// reads complete into a stated sample.
+///
+/// `CLAIM_FLOOD` is here because no other fixture can make the count non-zero -- `claim-forger`,
+/// the widest, refuses five of the sixty-five it would take. Asserting zero on an ordinary hook
+/// is compatible with a handler that hardcodes zero, which is the defect this test exists to
+/// stop from coming back.
+#[tokio::test]
+async fn a_padded_hook_cannot_hide_a_forgery_from_the_report() {
+    let harness = Harness::start(55).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1"),
+            ironauth_hooks::fixtures::CLAIM_FLOOD,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy: {body}");
+
+    let (status, _, body) = harness
+        .post(&format!("{base}/test"), "k-draft-7", &fixture())
+        .await;
+    assert_eq!(status, StatusCode::OK, "draft run: {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let refused: Vec<String> = view["refused"]
+        .as_array()
+        .expect("refused is a list")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+
+    // THE FORGERY IS NOT IN THE LIST, which is the premise. If `sub` were here the count below
+    // would be measuring nothing an operator needed.
+    assert!(
+        !refused.iter().any(|name| name == "sub"),
+        "the padding must push `sub` off the report, or this fixture no longer exercises \
+         truncation: {body}"
+    );
+    // AND THE COUNT SAYS SO. Two, not one: the tokens are capped independently and their
+    // remainders are summed, so a count taken from one token reports half of what is hidden.
+    assert_eq!(
+        view["refusals_not_reported"], 2,
+        "sixty-five refusals per token, sixty-four reported, so one per token was dropped -- a \
+         report that says zero tells an operator this list is complete while the reserved name \
+         they are reviewing for is missing from it: {body}"
+    );
+}
+
+/// A claim the hook MIS-SERIALISED is reported, not silently absent.
+///
+/// `fence` cannot read a value that is not JSON, so it drops the claim -- and under the WIT
+/// replace contract a dropped claim is one the token loses. Every other signal in the response
+/// reads "nothing happened": the claim is missing from the maps, `refused` is empty and
+/// `refusals_not_reported` is zero, which is byte-for-byte the report for a hook that dropped
+/// the claim ON PURPOSE. An operator reviewing a hook before deploying it would approve one
+/// that silently strips a claim from every token it shapes.
+///
+/// `ECHO_REQUEST` is the fixture because its values are built with `format!("\"{subject}\"")`,
+/// an unescaped interpolation -- the serialisation bug this class is about, in a guest this
+/// repo already ships. The CONTROL run varies one dimension, the subject string, so a failure
+/// here cannot be the hook not running.
+#[tokio::test]
+async fn a_draft_run_reports_a_claim_whose_value_is_not_json() {
+    let harness = Harness::start(55).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1"),
+            ironauth_hooks::fixtures::ECHO_REQUEST,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy: {body}");
+
+    // CONTROL: an ordinary subject. Same hook, same request, one character different.
+    let control = serde_json::json!({ "subject": "user-1" }).to_string();
+    let (_, _, body) = harness
+        .post(&format!("{base}/test"), "k-draft-7", &control)
+        .await;
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["id_token_claims"]["echo_subject"],
+        serde_json::json!("user-1"),
+        "the control must carry the claim, or this test measures a hook that never ran: {body}"
+    );
+    assert_eq!(
+        view["values_not_json"], 0,
+        "a hook whose values are all JSON has none of them dropped: {body}"
+    );
+
+    // The same hook and a subject with one double quote in it, which its unescaped `format!`
+    // turns into text no JSON parser accepts.
+    let broken = serde_json::json!({ "subject": "ada\"x" }).to_string();
+    let (_, _, body) = harness
+        .post(&format!("{base}/test"), "k-draft-8", &broken)
+        .await;
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    // The DROP is real: this is what the token would lose.
+    assert!(
+        view["id_token_claims"].get("echo_subject").is_none()
+            && view["access_token_claims"]
+                .get("echo_access_subject")
+                .is_none(),
+        "the host cannot read a value that is not JSON, so the claims are gone: {body}"
+    );
+    // AND NEITHER OTHER SIGNAL FIRES, which is why the count has to exist. Asserting these
+    // is what makes the assertion below pin the NEW field rather than pass on `refused`
+    // having quietly grown a name.
+    assert!(
+        view["refused"]
+            .as_array()
+            .expect("refused is a list")
+            .is_empty()
+            && view["refusals_not_reported"] == serde_json::json!(0),
+        "this is not a fence refusal and must not be reported as one: {body}"
+    );
+    assert_eq!(
+        view["values_not_json"],
+        serde_json::json!(2),
+        "BOTH mis-serialised claims are counted -- one per token list -- or the report is \
+         indistinguishable from a hook that dropped them deliberately: {body}"
+    );
+}
+
+/// AN ABORTED RUN NAMES WHICH FAULT AND WHICH VERSION, and only one of the four was tested.
+///
+/// The `Err` arm maps four faults to four stable tokens, and the comment above it says the four
+/// exist so an operator can tell a store outage from a component that will not load. Exactly one
+/// path had a test -- `FUEL_BOMB` reaching `aborted_or_declined` -- so swapping the other three
+/// strings passed the suite, and an operator whose component will not load would have been told
+/// their payload version is stale. `version_run` on the error arm had no test at all.
+///
+/// TWO DEPLOYS ARE LOAD-BEARING here rather than scenery: with one, `version_run == 2` collapses
+/// to `== 1` and stops distinguishing the newest version from the oldest surviving one.
+#[tokio::test]
+async fn a_faulted_draft_run_names_the_fault_and_the_version() {
+    let harness = Harness::start(55).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // v1 loads. v2 does NOT: `NET_ESCAPE` imports `wasi:sockets`, which the sandbox does not
+    // link, and the deploy admits it because `validate_component` reads the preamble rather
+    // than compiling.
+    for component in [
+        ironauth_hooks::fixtures::GOOD,
+        ironauth_hooks::fixtures::NET_ESCAPE,
+    ] {
+        let (status, _, body) = harness
+            .put_bytes(&format!("{base}?payload_version=1"), component)
+            .await;
+        assert_eq!(status, StatusCode::OK, "deploy: {body}");
+    }
+
+    let (status, _, body) = harness
+        .post(&format!("{base}/test"), "k-draft-7", &fixture())
+        .await;
+    assert_eq!(status, StatusCode::OK, "the QUESTION was answered: {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(view["outcome"], "aborted", "{body}");
+    assert_eq!(
+        view["reason"], "component_unloadable",
+        "the component would not load, which is a different sentence to an operator from a \
+         stale payload version or a store outage: {body}"
+    );
+    assert_eq!(
+        view["version_run"], 2,
+        "and an aborted run still says WHICH version aborted, or the operator cannot tell \
+         which one to roll back from: {body}"
+    );
 }

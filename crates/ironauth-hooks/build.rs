@@ -47,6 +47,11 @@ const GUESTS: &[(&str, &str)] = &[
     // becomes a cap on the TOKEN, and no fixture echoed enough claims to reach the 32-claim
     // bound.
     ("echo_only", "IRONAUTH_GUEST_ECHO_ONLY"),
+    // Refuses MORE than the fence will REPORT (issue #114 criterion 5). The refusal list
+    // is capped at sixty-four per token and every other fixture refuses a handful, so
+    // `refusals_not_reported` was zero on every test in the tree -- and a draft report
+    // that threw the count away read exactly like one that carried it.
+    ("claim_flood", "IRONAUTH_GUEST_CLAIM_FLOOD"),
 ];
 
 /// The committed TypeScript component, relative to this crate's root.
