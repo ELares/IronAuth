@@ -699,8 +699,9 @@ async fn an_echoing_hook_does_not_lose_claims_past_the_contribution_cap() {
 
 // THE JWT BEARER DOOR'S TEST IS NOT IN THIS FILE. It is
 // `tests/jwt_bearer.rs::the_jwt_bearer_grant_runs_the_hook`, which deploys `ECHO_REQUEST`
-// through this same seam and asserts both `echo_grant_type` and `echo_access_subject` against
-// the mapped principal.
+// through this same seam and asserts `echo_grant_type` against the `jwt:bearer` grant URN and
+// `echo_access_subject` against the mapped principal -- the door identity and the subject, which
+// are the two properties this seam carries.
 //
 // This is a POINTER and not a test, deliberately. A copy of it was written here, and review
 // measured that it caught nothing: five mutants of the seam call at `src/jwt_bearer.rs` --
@@ -708,9 +709,19 @@ async fn an_echoing_hook_does_not_lose_claims_past_the_contribution_cap() {
 // argument -- each failed BOTH binaries, and both run in the same lane
 // (`cargo test --workspace --all-features`). The reason it measured nothing is that it was the
 // same test: same door, same client, same shared `register_external_issuer` /
-// `create_subject_mapping` scaffolding, same fixture, and a subset of the assertions. What it
-// added was a second export of that function name for the door table on `MappedAccessClaims`
-// to resolve to, which is the drift the device-grant doc below refuses to create.
+// `create_subject_mapping` scaffolding, and one extra fixture that measures less.
+//
+// NOT A SUBSET OF THE ASSERTIONS, which an earlier version of this comment claimed. The copy
+// deployed `GOOD` before `ECHO_REQUEST` and asserted its `tier` claim, which no test on this
+// door makes; `tests/jwt_bearer.rs` asserts a `sub` its own comment there records as unfailable.
+// Neither assertion set contains the other. A subset of the DETECTION, which is the relation
+// that justifies deleting it: `GOOD` reads no field of the request and adds one fence-allowed
+// claim, where `ECHO_REQUEST` reports the seam's scalars as four claims in the access list this
+// door mints, so every mutant here that hides `tier` hides the echoes too.
+//
+// What the copy added was a second export of that function name for the door table on
+// `MappedAccessClaims` to resolve to, which is the drift the device-grant doc below refuses to
+// create.
 //
 // It lives there because the trusted-issuer and subject-mapping setup a `jwt:bearer` exchange
 // needs is built up in that file. Renaming a duplicate would not fix this: a distinct name for
