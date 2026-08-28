@@ -919,6 +919,11 @@ path = "tests/events_cursor_ordering.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "metering_from_real_activity"
+path = "tests/metering_from_real_activity.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "project_grants"
 path = "tests/project_grants.rs"
 required-features = ["testing"]
