@@ -140,11 +140,26 @@
 //! Both are properties of the ESTIMATE. The enforcement half -- that an input may not exceed
 //! the shape the estimate was computed from -- holds.
 //!
-//! Wiring the first caller is not free, and the cost is recorded here so it is not
-//! rediscovered: this crate declares `rust-version = "1.86"` because `cel` 0.14 does, while the
-//! workspace and `docs/COMPATIBILITY.md` promise 1.85. The CI msrv lane excludes this crate for
-//! exactly as long as nothing depends on it. The first production dependency raises the shipped
-//! binary's MSRV, which is a compatibility promise, not an implementation detail.
+//! # The MSRV cost, and how it was paid
+//!
+//! This paragraph used to read: "this crate declares `rust-version = \"1.86\"` because `cel`
+//! 0.14 does ... the CI msrv lane excludes this crate for exactly as long as nothing depends
+//! on it. The first production dependency raises the shipped binary's MSRV." Every clause of
+//! that is now false, and it is rewritten rather than deleted because the reasoning is what
+//! stops the cost being rediscovered.
+//!
+//! `ironauth-oidc` depends on this crate, non-optionally, for the `cel` mapping rule (#113
+//! criterion 2) -- so it IS in the shipped binary's graph and the exclusion had to come out.
+//! Raising a published compatibility promise as a side effect of shipping a mapping rule is an
+//! owner decision, so the promise was kept instead: `cel` is pinned to **0.12**, which declares
+//! `rust-version = "1.82.0"`, where 0.13 and 0.14 declare 1.86. The crate compiles against it
+//! unchanged.
+//!
+//! The pin has a price and it is named in `deny.toml`: 0.12 reaches `paste`, which is
+//! unmaintained (RUSTSEC-2024-0436) where 0.14 moved to the maintained fork. That is a
+//! maintenance notice against a compile-time proc macro rather than a defect, and it carries a
+//! scoped ignore. When the workspace MSRV moves to 1.86 or above, drop the ignore and take
+//! `cel` 0.14.
 
 use cel::common::ast::{EntryExpr, Expr, IdedEntryExpr};
 

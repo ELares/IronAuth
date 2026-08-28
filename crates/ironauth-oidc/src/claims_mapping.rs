@@ -286,11 +286,73 @@ impl MappingRule {
 /// `n^(depth+1)`. A tenant with ten groups and a tenant with ten thousand get very different
 /// answers from the same budget.
 ///
-/// The budget itself is a product-wide ceiling on how much work one login may do computing a
-/// claim, which is not a property of anyone's environment. Making it a per-tenant setting would
-/// let a tenant raise the ceiling on the shared issuance path, which is the one direction a
-/// safety bound must not be tunable in.
+/// The budget is product-wide rather than per-tenant because what it bounds is not a property
+/// of anyone's environment. Making it a per-tenant setting would let a tenant raise it on the
+/// shared issuance path, which is the one direction a safety bound must not be tunable in.
+///
+/// # IT IS NOT A CEILING ON LOGIN CPU, and an earlier version of this doc said it was
+///
+/// It bounds the MODELLED ITERATION COST, `n^(depth+1)`, and nothing else.
+/// `estimate_parsed_cost` returns a FLOOR OF 1 for any expression containing no comprehension
+/// at all -- before `n` is even computed -- so for a macro-free expression the budget, the
+/// declared cardinality and the node count play no part in the verdict. That is deliberate and
+/// documented in `ironauth-cel`, which records three attempts to make that arm bound
+/// allocation and a hole in each; it states allocation as unmodelled rather than modelling it
+/// badly.
+///
+/// What that leaves open is per-CALL work in the standard library, which no amount of
+/// iteration accounting sees. Review measured it through this exact compile path: an
+/// expression of a thousand `matches()` terms reads no binding, estimates 1, is ADMITTED, and
+/// evaluates in **6.1 seconds**; five thousand terms took **30.2 seconds**. `cel`'s `matches`
+/// compiles a regular expression per invocation with no cache, so the cost is per term and
+/// linear in how many an operator can write down.
+///
+/// [`MAX_CEL_EXPRESSION_BYTES`] is what closes that, and it closes it the way a configuration
+/// layer can: by bounding what an operator may write, not by pricing what it does.
 pub const CEL_COST_BUDGET: u64 = ironauth_cel::DEFAULT_COST_BUDGET;
+
+/// The longest CEL source a `cel` rule may carry.
+///
+/// A SIZE bound, standing in for a cost model that cannot price per-call work. The iteration
+/// model returns its floor for any expression without a comprehension, so an operator could
+/// otherwise put a hundred and seventy kilobytes of `matches()` terms on the issuance path of
+/// every login for a client and have it admitted at an estimate of 1 -- measured at thirty
+/// seconds of a shared worker.
+///
+/// Two kilobytes because a claims mapping is a claims mapping. The shipped example is forty
+/// characters; something elaborate is a few hundred. An expression that does not fit here is
+/// not a mapping rule, it is a program, and the answer to wanting one is a hook -- which runs
+/// under fuel, a memory cap and a deadline, all of which this layer has none of.
+///
+/// WHAT THE BOUND BUYS, measured on the worst shape found rather than assumed. Packing that
+/// shape to each size and evaluating it through `compile_rule`'s exact configuration:
+///
+/// ```text
+///   2,036 bytes    60 terms   admitted    453 ms
+///   4,076 bytes   120 terms   admitted    790 ms
+///  33,996 bytes  1000 terms   admitted   6.33 s
+/// 170,000 bytes  5000 terms   admitted   30.2 s   (review's measurement)
+/// ```
+///
+/// So the cap does not make a `cel` rule free -- 453 ms is still real work on a login, and an
+/// operator who wants that is allowed to have it. It makes the worst case bounded and roughly
+/// the same order as the ~350 ms the crate calibrated its iteration budget against, instead of
+/// unbounded in the length of a string an operator can paste into a JSON field.
+pub const MAX_CEL_EXPRESSION_BYTES: usize = 2 * 1024;
+
+/// The largest `max_collection_size` a `cel` rule may declare.
+///
+/// The declared cardinality is the `n` the budget is computed against AND the bound
+/// `BudgetedProgram::evaluate` enforces on the input -- the crate calls that enforcement "the
+/// enforcement half of the cost model" and says that without it the model is decoration.
+/// Declaring `u64::MAX` therefore did two things at once: it made every expression's estimate
+/// astronomically large (so anything with a comprehension was refused) while making the input
+/// check INCAPABLE OF FIRING, since no document can exceed `u64::MAX` elements.
+///
+/// A hundred thousand is far above any claim an identity token carries -- the motivating case
+/// is a tenant with three thousand groups -- and small enough that the enforcement half stays
+/// able to refuse something.
+pub const MAX_CEL_COLLECTION_SIZE: u64 = 100_000;
 
 /// The binding a `cel` expression reads its input from.
 ///
@@ -349,6 +411,15 @@ pub enum RefusalReason {
     /// actually has, and telling someone their working expression has a syntax error would
     /// send them looking for one that is not there.
     ExpressionOverBudget,
+    /// A `cel` rule's expression is longer than [`MAX_CEL_EXPRESSION_BYTES`].
+    ///
+    /// A SIZE refusal, not a cost one, and separate from [`Self::ExpressionOverBudget`] for
+    /// the reason every split in this enum exists: the operator's next action differs. Over
+    /// budget means "this iterates too much, flatten it or declare the cardinality you have".
+    /// Too long means "this is not a mapping rule any more".
+    ExpressionTooLong,
+    /// A `cel` rule declares a `max_collection_size` above [`MAX_CEL_COLLECTION_SIZE`].
+    DeclaredCardinalityTooLarge,
     /// A `cel` rule's expression compiled and then failed to evaluate.
     ///
     /// The only one of the three that is a RUNTIME event: an input exceeding the declared
@@ -388,6 +459,14 @@ impl RefusalReason {
                 "computes `{claim}` from an expression costing more than the \
                  {CEL_COST_BUDGET} budget at its declared cardinality"
             ),
+            Self::ExpressionTooLong => format!(
+                "computes `{claim}` from an expression longer than the \
+                 {MAX_CEL_EXPRESSION_BYTES} byte limit"
+            ),
+            Self::DeclaredCardinalityTooLarge => format!(
+                "computes `{claim}` from an expression declaring a collection size above the \
+                 {MAX_CEL_COLLECTION_SIZE} limit"
+            ),
             Self::ExpressionFailed => {
                 format!("computes `{claim}` from an expression that failed to evaluate")
             }
@@ -411,6 +490,8 @@ impl core::fmt::Display for RefusalReason {
             Self::TooManyClaims => "more claims than the limit allows",
             Self::ExpressionUncompilable => "an expression that does not compile",
             Self::ExpressionOverBudget => "an expression over the cost budget",
+            Self::ExpressionTooLong => "an expression over the length limit",
+            Self::DeclaredCardinalityTooLarge => "a declared collection size over the limit",
             Self::ExpressionFailed => "an expression that failed to evaluate",
         };
         f.write_str(text)
@@ -492,6 +573,32 @@ pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
         // evaluation, from the parsed tree and the declared shape, so the same rule reaches
         // the same verdict on every machine under any load. That is criterion 2's "aborts
         // deterministically".
+        // THE SIZE BOUNDS FIRST, because the cost model cannot see what they bound. An
+        // expression with no comprehension estimates 1 whatever its length, so a compile-only
+        // check would admit a hundred and seventy kilobytes of `matches()` terms -- measured
+        // at thirty seconds of issuance CPU. Refusing on LENGTH is what a configuration layer
+        // can decide; pricing the work is what the model cannot.
+        if let MappingRule::Cel {
+            expression,
+            max_collection_size,
+            ..
+        } = rule
+        {
+            let size_refusal = if expression.len() > MAX_CEL_EXPRESSION_BYTES {
+                Some(RefusalReason::ExpressionTooLong)
+            } else if *max_collection_size > MAX_CEL_COLLECTION_SIZE {
+                Some(RefusalReason::DeclaredCardinalityTooLarge)
+            } else {
+                None
+            };
+            if let Some(reason) = size_refusal {
+                return Err(MappingRefusal {
+                    rule_index: index,
+                    claim: reportable(written),
+                    reason,
+                });
+            }
+        }
         if let MappingRule::Cel {
             expression,
             max_collection_size,
@@ -634,7 +741,11 @@ pub fn apply_for(
     // `place` is for and what criterion 4 asks for by name.
     let mut placements: BTreeMap<String, Placement> = BTreeMap::new();
 
-    for rule in rules {
+    // ENUMERATED, because a `cel` rule can be refused at issuance and the refusal carries a
+    // rule index an operator looks the rule up by. Reporting 0 for the third rule sends them
+    // to the wrong line, and `MappingRefusal`'s own field doc is "which rule, by position, so
+    // an operator can find it in a list of forty".
+    for (rule_index, rule) in rules.iter().enumerate() {
         match rule {
             MappingRule::Rename { from, to } => {
                 // A PROTECTED source is COPIED, not moved. Renaming `sub` to `subject` is
@@ -713,7 +824,7 @@ pub fn apply_for(
                     // "unreachable" here is an argument about two call sites agreeing, and a
                     // panic on the issuance path is a bad way to discover they stopped.
                     MappingRefusal {
-                        rule_index: 0,
+                        rule_index,
                         claim: reportable(name),
                         reason: RefusalReason::ExpressionUncompilable,
                     }
@@ -725,7 +836,7 @@ pub fn apply_for(
                 let produced = program
                     .evaluate(&[(CEL_CLAIMS_BINDING, &bound)])
                     .map_err(|_| MappingRefusal {
-                        rule_index: 0,
+                        rule_index,
                         claim: reportable(name),
                         reason: RefusalReason::ExpressionFailed,
                     })?;
@@ -902,6 +1013,78 @@ mod tests {
             }])
             .is_ok(),
             "eight elements deep three times is well inside the budget"
+        );
+    }
+
+    /// CRITERION 2's HOLE: a macro-free expression is priced at the model's FLOOR, so length
+    /// is what bounds it.
+    ///
+    /// `estimate_parsed_cost` returns 1 for any expression containing no comprehension, before
+    /// the declared cardinality is even read -- deliberately, and documented in `ironauth-cel`,
+    /// which records three attempts to make that arm model allocation and a hole in each. So
+    /// the budget cannot see an expression whose cost is per-CALL rather than per-iteration.
+    /// Review measured a thousand `matches()` terms: estimate 1, admitted, 6.1 seconds of
+    /// issuance CPU; five thousand terms, 30.2 seconds.
+    ///
+    /// This asserts the two ends of the fix: the shape is refused on LENGTH, and it is refused
+    /// as a length problem rather than mislabelled as a cost one, because "your expression is
+    /// too expensive" sends an operator to flatten a comprehension that is not there.
+    #[test]
+    fn a_macro_free_expression_is_bounded_by_length_because_the_budget_cannot_see_it() {
+        let term = "'x'.matches('(?:a{400}){400}')";
+        let mut expression = String::new();
+        while expression.len() + term.len() + 4 <= super::MAX_CEL_EXPRESSION_BYTES * 4 {
+            if !expression.is_empty() {
+                expression.push_str(" || ");
+            }
+            expression.push_str(term);
+        }
+        assert!(expression.len() > super::MAX_CEL_EXPRESSION_BYTES);
+
+        // THE BUDGET ADMITS IT. Stated as an assertion rather than as prose, because the whole
+        // justification for a length cap is that the cost model does not object here -- and if
+        // the model ever learns to, this test says so by failing.
+        assert!(
+            super::compile_rule(&expression, 64).is_ok(),
+            "the cost model is expected to ADMIT this shape; if it now refuses it, the length \
+             cap may no longer be the thing carrying the bound"
+        );
+
+        let refusal = validate(&[cel("expensive", &expression)]).expect_err("too long");
+        assert_eq!(
+            refusal.reason,
+            RefusalReason::ExpressionTooLong,
+            "refused on LENGTH, not mislabelled as a cost problem"
+        );
+    }
+
+    /// A declared cardinality above the cap is refused, which is what keeps the ENFORCEMENT
+    /// half of the cost model able to fire.
+    ///
+    /// `u64::MAX` was accepted, and it did two things at once: it made any expression with a
+    /// comprehension astronomically expensive (so those were refused) while making
+    /// `evaluate`'s input check incapable of refusing anything, since no document can exceed
+    /// `u64::MAX` elements. The crate calls that check "the enforcement half of the cost
+    /// model" and says without it the model is decoration.
+    #[test]
+    fn a_declared_cardinality_over_the_cap_is_refused() {
+        let refusal = validate(&[MappingRule::Cel {
+            name: "counted".to_owned(),
+            expression: "claims.groups.size()".to_owned(),
+            max_collection_size: u64::MAX,
+        }])
+        .expect_err("over the cap");
+        assert_eq!(refusal.reason, RefusalReason::DeclaredCardinalityTooLarge);
+
+        // AND THE CAP ITSELF IS ADMITTED, so the assertion above is the cap rather than every
+        // large declaration being refused.
+        assert!(
+            validate(&[MappingRule::Cel {
+                name: "counted".to_owned(),
+                expression: "claims.groups.size()".to_owned(),
+                max_collection_size: super::MAX_CEL_COLLECTION_SIZE,
+            }])
+            .is_ok()
         );
     }
 

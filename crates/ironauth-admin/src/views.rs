@@ -1910,13 +1910,26 @@ pub struct SetClaimsMappingRequest {
     /// - `place` -- `{name, placement}`. Puts a claim in `id_token`, `access_token` or `both`.
     /// - `cel` -- `{name, expression, max_collection_size}`. Computes a claim from a CEL
     ///   expression, for the cases the four above cannot express. The expression reads one
-    ///   binding, `claims`, holding the claim set as earlier rules left it, and it is compiled
-    ///   against a COST BUDGET when this request is made: one too expensive at the declared
-    ///   `max_collection_size` is refused here with `expression_over_budget` rather than
-    ///   failing logins later. `max_collection_size` is the operator's declaration about their
-    ///   own data and is the `n` the budget is computed against, so declaring more than you
-    ///   have refuses expressions that would have run, and declaring less makes evaluation
-    ///   fail at issuance.
+    ///   binding, `claims`, holding the claim set as earlier rules left it.
+    ///
+    ///   Three refusals happen when this request is made rather than at a later login:
+    ///   `expression_too_long` (over 2048 bytes of source), `declared_cardinality_too_large`
+    ///   (`max_collection_size` above 100000), and `expression_over_budget` -- the iteration
+    ///   cost model, which prices a nested comprehension at `n^(depth+1)` against the declared
+    ///   `max_collection_size`.
+    ///
+    ///   `max_collection_size` is the operator's declaration about their OWN data, and it is
+    ///   both the `n` the budget uses and the limit the input is checked against at issuance.
+    ///   Declaring more than you have refuses expressions that would have run; declaring less
+    ///   makes evaluation fail at issuance with `expression_failed`.
+    ///
+    ///   THE LENGTH CAP IS NOT REDUNDANT WITH THE BUDGET. The cost model prices ITERATION, and
+    ///   an expression with no comprehension is priced at its floor whatever it contains -- so
+    ///   the budget cannot see a long chain of per-call work such as repeated `matches()`.
+    ///   Measured: 2 KiB of that shape evaluates in about 450 ms, 34 KiB in 6.3 seconds. The
+    ///   length cap is what bounds it. An expression that needs more room than this is a
+    ///   program rather than a mapping rule, and the mechanism for one is a hook, which runs
+    ///   under fuel, a memory cap and a deadline.
     ///
     /// Rules run in order, so a later one sees what an earlier one wrote.
     #[schema(value_type = Object)]
