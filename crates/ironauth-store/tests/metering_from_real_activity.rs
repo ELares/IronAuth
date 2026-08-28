@@ -108,17 +108,38 @@ async fn redeem_one_token(db: &TestDatabase, env: &Env, scope: Scope, subject: &
         .expect("the redemption commits");
 }
 
-/// Fold the whole feed for a scope, waiting out the cluster-wide visibility watermark.
+/// The event types this file's activity produces, and the ones `UsageTally` folds.
+///
+/// The wait below counts these rather than every row on the feed, so a producer that starts
+/// emitting some unrelated envelope cannot satisfy the wait on this test's behalf.
+const METERABLE: &[&str] = &["user.signed_in", "token.issued", "connection.opened"];
+
+/// Fold the whole feed for a scope, waiting for the events this test's own activity produced.
 ///
 /// Polled, not read once: `events_page_after` withholds a row until every transaction open
 /// anywhere on the instance has finished, so a single read can legitimately see less than was
-/// written. The loop waits for a STABLE count rather than for a number this test predicts,
-/// so it cannot pass by asserting what it waited for.
-async fn meter(db: &TestDatabase, scope: Scope) -> UsageTally {
+/// written.
+///
+/// IT WAITS FOR THIS TEST'S OWN WRITES, NOT FOR THE NUMBER TO STOP MOVING, and an earlier
+/// version got that exactly backwards: it waited for three equal non-empty reads and called
+/// that settled. A stalled watermark is PRECISELY what makes the count stable -- the withheld
+/// rows are what holds it steady -- so the hazard this poll exists to survive satisfied the
+/// criterion for having survived it. Review reproduced the consequence: one unrelated
+/// transaction holding an xid across the writes (`events_cursor_ordering.rs`'s
+/// `an_unrelated_open_transaction_stalls_the_whole_feed` opens exactly one, in this crate,
+/// under the same one-cluster `cargo test --workspace`) leaves the sign-ins visible and the
+/// token rows withheld, the count is stable at 3, and the fold returns `tokens_issued() == 0`
+/// as though it had measured something.
+///
+/// `want_meterable` is what this test performed, so waiting for it cannot pass the test by
+/// itself: the WAIT counts meterable ROWS ON THE FEED, while the assertions are on the fold's
+/// three counters. A fold that counted sign-ins instead of subjects, crossed the two counters,
+/// or crossed scopes converges the wait and then fails the assertion. A missing producer -- the
+/// defect this whole file exists to catch -- never converges and panics naming the watermark,
+/// which is a loud failure rather than a wrong number. That is the shape
+/// `crates/ironauth-admin/tests/usage_export.rs` already adopted for this same race.
+async fn meter(db: &TestDatabase, scope: Scope, want_meterable: usize) -> UsageTally {
     let outbox_scope = db.store().scoped(scope);
-    let mut previous = usize::MAX;
-    let mut stable = 0;
-    let mut tally = UsageTally::new();
     for _ in 0..100 {
         if let EventPage::Page(events) = outbox_scope
             .outbox()
@@ -126,20 +147,53 @@ async fn meter(db: &TestDatabase, scope: Scope) -> UsageTally {
             .await
             .expect("read the feed")
         {
-            if events.len() == previous && !events.is_empty() {
-                stable += 1;
-                if stable >= 2 {
-                    tally = UsageTally::new();
-                    tally.absorb(&events);
-                    return tally;
-                }
-            } else {
-                stable = 0;
-                previous = events.len();
+            let meterable = events
+                .iter()
+                .filter(|message| {
+                    message
+                        .payload
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| METERABLE.contains(&kind))
+                })
+                .count();
+            if meterable >= want_meterable {
+                let mut tally = UsageTally::new();
+                tally.absorb(&events);
+                return tally;
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    panic!(
+        "the feed never carried the {want_meterable} meterable events this test performed. \
+         Either a producer is missing -- which is the defect this file exists to catch -- or \
+         the cluster-wide visibility watermark never advanced past them"
+    );
+}
+
+/// Fold a scope's feed as it stands, for a scope that is expected to have written nothing.
+///
+/// NOT `meter(db, scope, 0)`, and the difference is what makes this a control. A scope that
+/// never wrote has nothing to wait for -- the watermark can withhold rows, never invent them --
+/// so one read is the whole truth, and the fold has to actually RUN for the three zero
+/// assertions to be about the fold rather than about `UsageTally::new()`. The earlier version
+/// of this file called `meter` here, whose settle criterion an empty feed can never meet, so it
+/// spent 100 reads falling through to the default tally: review replaced the body of
+/// `UsageTally::absorb` with a `panic!` and both quiet sites stayed green.
+async fn meter_quiet(db: &TestDatabase, scope: Scope) -> UsageTally {
+    let EventPage::Page(events) = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .events_page_after(EventCursor::beginning(), 200)
+        .await
+        .expect("read the feed")
+    else {
+        panic!("the feed was pruned out from under a scope that never wrote to it")
+    };
+    let mut tally = UsageTally::new();
+    tally.absorb(&events);
     tally
 }
 
@@ -163,7 +217,8 @@ async fn metering_counts_activity_the_system_actually_performed() {
     redeem_one_token(&db, &env, scope, "usr_alice").await;
     redeem_one_token(&db, &env, scope, "usr_bob").await;
 
-    let tally = meter(&db, scope).await;
+    // 5 meterable rows: three `user.signed_in` and two `token.issued`.
+    let tally = meter(&db, scope, 5).await;
 
     assert_eq!(
         tally.monthly_active_users(),
@@ -177,8 +232,12 @@ async fn metering_counts_activity_the_system_actually_performed() {
         2,
         "two redemptions issued one token each, through the shipped `redeem`"
     );
-    // AND NOT CONFUSED WITH EACH OTHER. Without this, a fold that added sign-ins into
-    // `tokens_issued` would still satisfy one of the assertions above by coincidence.
+    // THE THIRD COUNTER, PINNED AT ZERO, and it is worth being exact about what that catches
+    // and what it does not. It is NOT what catches a fold that added sign-ins into
+    // `tokens_issued` -- an earlier version of this comment said so, and the assertion above
+    // is what catches that; this one reads zero either way. What it catches is a fold that
+    // routes either of this test's two event types into the counter neither of them belongs
+    // to, which the two assertions above cannot see because they only check their own.
     assert_eq!(
         tally.connections(),
         0,
@@ -196,7 +255,7 @@ async fn a_scope_with_no_activity_meters_nothing() {
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
 
-    let tally = meter(&db, scope).await;
+    let tally = meter_quiet(&db, scope).await;
     assert_eq!(tally.monthly_active_users(), 0);
     assert_eq!(tally.tokens_issued(), 0);
     assert_eq!(tally.connections(), 0);
@@ -207,6 +266,15 @@ async fn a_scope_with_no_activity_meters_nothing() {
 /// The criterion says "connections per tenant", and every counter here is per tenant for the
 /// same reason: metering feeds billing, so a fold that crossed scopes would put one customer's
 /// usage on another's invoice.
+///
+/// WHAT ENFORCES THAT IS POSTGRES, not the fold, and this test measures the enforcement rather
+/// than the fold's own scoping. `outbox_messages` carries `FORCE ROW LEVEL SECURITY` with a
+/// tenant-and-environment policy (migrations/0099_outbox_messages.sql) and `begin_scoped` sets
+/// both settings on every read, so the read this test performs cannot return the other scope's
+/// rows whatever the metering query says. That is the right layer for the guarantee and this is
+/// still worth asserting -- it is the test that would go red if RLS were dropped from that
+/// table, or if a future fold read the feed through an unscoped pool -- but it does not
+/// substitute for a predicate in the query, and it is not evidence that one is present.
 #[tokio::test]
 async fn activity_is_metered_to_the_scope_that_performed_it() {
     let db = TestDatabase::start().await;
@@ -217,11 +285,12 @@ async fn activity_is_metered_to_the_scope_that_performed_it() {
     sign_in(&db, &env, busy, "usr_alice").await;
     redeem_one_token(&db, &env, busy, "usr_alice").await;
 
-    let busy_tally = meter(&db, busy).await;
+    // 2 meterable rows: one `user.signed_in` and one `token.issued`.
+    let busy_tally = meter(&db, busy, 2).await;
     assert_eq!(busy_tally.monthly_active_users(), 1);
     assert_eq!(busy_tally.tokens_issued(), 1);
 
-    let quiet_tally = meter(&db, quiet).await;
+    let quiet_tally = meter_quiet(&db, quiet).await;
     assert_eq!(
         quiet_tally.monthly_active_users(),
         0,
