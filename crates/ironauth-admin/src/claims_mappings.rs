@@ -110,6 +110,32 @@ fn refusal_reason(refusal: &MappingRefusal) -> &'static str {
         // alternative is a catch-all arm that would give a future reason the wrong token
         // silently -- which is the one thing the distinctness test exists to prevent.
         RefusalReason::TooManyClaims => "too_many_claims",
+        // The `cel` rule's five WRITE-time refusals (issue #113 criterion 2). All five are
+        // reachable from this surface and are the point of it: `validate` size-checks and then
+        // compiles every expression against the cost budget, so an operator who writes one we
+        // will not run learns it here, in a 400 they read, rather than from failed logins.
+        //
+        // Separate tokens for separate operator actions, which is what this function is for:
+        // an auditor grouping by reason can tell "someone is writing expressions we refuse to
+        // run" from "someone has a typo", and those want different responses.
+        //
+        // The three COMPILE refusals first.
+        RefusalReason::ExpressionUncompilable => "expression_uncompilable",
+        RefusalReason::ExpressionOverBudget => "expression_over_budget",
+        // Not a cost verdict but the ABSENCE of one: the expression calls a function whose cost
+        // the iteration model cannot see (`matches`, whose cost lives in the binding), so it is
+        // refused rather than priced. The operator's next action is "express this without that
+        // function, or use a hook", which is neither of the two below.
+        RefusalReason::ExpressionUnpriceable => "expression_unpriceable",
+        // Then the two SIZE refusals, distinct from the cost ones because the operator's next
+        // action differs: over budget means "flatten it or declare the cardinality you have",
+        // too long means "this is not a mapping rule any more".
+        RefusalReason::ExpressionTooLong => "expression_too_long",
+        RefusalReason::DeclaredCardinalityTooLarge => "declared_cardinality_too_large",
+        // UNREACHABLE from this surface, like `too_many_claims` above and for the same kind of
+        // reason: it is the one `cel` refusal that is a RUNTIME event. It needs a claim set,
+        // and `validate` has none -- it decides what a rule would do, not what it did.
+        RefusalReason::ExpressionFailed => "expression_failed",
     }
 }
 
@@ -379,15 +405,33 @@ mod tests {
     #[test]
     fn every_refusal_reason_has_its_own_token() {
         // EVERY variant, listed here rather than sampled: the point of the test is that no two
-        // share a token, and a list that omits one cannot see the collision it introduces. The
-        // match in `refusal_reason` is exhaustive, so a new variant fails the build; this is
-        // what makes it fail with a REASON rather than only a missing arm.
+        // share a token, and a list that omits one cannot see the collision it introduces.
+        //
+        // NOTHING ENFORCES THAT THIS LIST IS COMPLETE, and saying so is the point of this
+        // paragraph. An earlier version claimed the exhaustive match in `refusal_reason` did
+        // it ("a new variant fails the build"): that forces a new ARM, in a different file,
+        // and nothing brings the author back here. Measured -- five variants were added for
+        // the `cel` rule and this list kept its original five, so a collision among the new
+        // ones would have been invisible.
+        //
+        // The `assert_eq!` below compares `distinct` against `reasons.len()`, which is this
+        // list against ITSELF: it catches two entries sharing a token and cannot catch an
+        // entry that is missing. Rust has no way to iterate an enum's variants without a
+        // derive this workspace does not carry, so the completeness of this list is a reading
+        // discipline, and a reader who does not know that will trust it further than it goes.
+        // ADD EVERY NEW VARIANT HERE when you add its arm to `refusal_reason`.
         let reasons = [
             RefusalReason::Reserved,
             RefusalReason::EmptyName,
             RefusalReason::Untrimmed,
             RefusalReason::NameTooLong,
             RefusalReason::TooManyClaims,
+            RefusalReason::ExpressionUncompilable,
+            RefusalReason::ExpressionOverBudget,
+            RefusalReason::ExpressionUnpriceable,
+            RefusalReason::ExpressionTooLong,
+            RefusalReason::DeclaredCardinalityTooLarge,
+            RefusalReason::ExpressionFailed,
         ];
         let mut tokens: Vec<&'static str> = reasons
             .iter()

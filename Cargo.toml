@@ -63,7 +63,11 @@ ironauth-kms = { path = "crates/ironauth-kms", version = "0.1.0" }
 ironauth-admin = { path = "crates/ironauth-admin", version = "0.1.0" }
 ironauth-admin-ui = { path = "crates/ironauth-admin-ui", version = "0.1.0" }
 ironauth-oidc = { path = "crates/ironauth-oidc", version = "0.1.0" }
-ironauth-cel = { path = "crates/ironauth-cel" }
+# `version` alongside `path`, like every sibling above. Without it this is a WILDCARD
+# dependency and `cargo deny check bans` refuses it -- which nothing noticed while
+# `ironauth-cel` had no dependents, because a wildcard nobody depends on is never resolved.
+# Wiring it into `ironauth-oidc` for #113 criterion 2 is what surfaced it.
+ironauth-cel = { path = "crates/ironauth-cel", version = "0.1.0" }
 ironauth-quota = { path = "crates/ironauth-quota", version = "0.1.0" }
 ironauth-screening = { path = "crates/ironauth-screening", version = "0.1.0" }
 ironauth-apply = { path = "crates/ironauth-apply", version = "0.1.0" }

@@ -94,7 +94,7 @@ ceiling = parts(msrv)
 # The roots are what the CI msrv lane COMPILES, which is the workspace minus the crates that
 # lane excludes -- not the binary alone. Rooting at `ironauth` was narrower than the lane and
 # made `ironauth-importers`, which the lane does compile, invisible to this audit.
-EXCLUDED = {"ironauth-hooks", "ironauth-cel"}
+EXCLUDED = {"ironauth-hooks"}
 
 
 def load(path):

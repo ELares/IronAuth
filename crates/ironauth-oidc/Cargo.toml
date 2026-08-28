@@ -40,6 +40,15 @@ ironauth-config.workspace = true
 # artifact. That leaves the owner one line to change -- making the feature default-on -- rather
 # than a promise already broken in a diff about something else.
 ironauth-hooks = { workspace = true, optional = true }
+# The cost-bounded CEL evaluator (issue #113 criterion 2), for the `cel` mapping rule.
+#
+# NOT optional, unlike `ironauth-hooks` above, and the difference is the whole reason `cel` is
+# pinned to 0.11.6 in that crate's manifest. wasmtime declares 1.95 and there is no pin that
+# changes that, so hooks stay behind a feature; `cel` 0.11.6 COMPILES at 1.85, this product's
+# published MSRV, so the CEL budget can be in the DEFAULT build. (Compiles, not declares: see
+# that manifest for why the version with the lowest declared floor is not the right pin.) A criterion about a cost
+# budget is not met by a budget a default deployment does not compile.
+ironauth-cel.workspace = true
 ironauth-store.workspace = true
 ironauth-jose.workspace = true
 # The declarative journey engine (issue #92): the pure artifact model, its load-time

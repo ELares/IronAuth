@@ -100,6 +100,94 @@ async fn set_get_delete_lifecycle_for_a_real_rule_set() {
     assert_eq!(removed[0].0, client);
 }
 
+/// CRITERION 2: AN EXPRESSION OVER THE COST BUDGET IS REFUSED WHEN IT IS WRITTEN.
+///
+/// This is the whole point of putting the budget at the write door rather than at issuance.
+/// `filter_hook_claims` states the rule this follows: "a mapping is configuration: it is
+/// written once, by an operator, and a refusal at write time is a message that person reads and
+/// acts on." An expression's cost is decidable from the rule alone, with no login in front of
+/// you, so an operator learns their comprehension is too deep here -- not from a support ticket
+/// about failed logins.
+///
+/// Three nested comprehensions over a declared 4096 elements. The estimate is `n^(depth+1)`, so
+/// this is roughly 4096^4, and it is refused from the PARSED TREE without ever evaluating --
+/// which is what makes the abort deterministic rather than a timeout.
+#[tokio::test]
+async fn a_cel_rule_over_the_cost_budget_is_refused_and_audited() {
+    let harness = Harness::start(74).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let path = mapping_path(&tenant, &env, &client);
+
+    let (status, _, body) = harness
+        .put(
+            &path,
+            r#"{"rules":[{"kind":"cel","name":"expensive","expression":"claims.groups.exists(a, claims.groups.exists(b, claims.groups.exists(c, a == b && b == c)))","max_collection_size":4096}]}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "over budget: {body}");
+    assert!(
+        body.contains("budget"),
+        "the 400 must name the BUDGET, not report a syntax error: an operator told their \
+         working expression does not compile goes looking for a typo that is not there: {body}"
+    );
+
+    // NOTHING WAS STORED, for the reason the protected-claim test gives: a refusal that
+    // recorded the attempt and stored the document anyway is worse than no fence.
+    let (status, _, _) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing was written");
+
+    let refused = audit_rows(&harness, &tenant, &env, "claims_mapping.refused").await;
+    assert_eq!(refused.len(), 1, "one attempt, one audit row: {refused:?}");
+    let detail = refused[0].1.clone().expect("the refusal carries a detail");
+    assert_eq!(
+        detail.get("reason").and_then(serde_json::Value::as_str),
+        Some("expression_over_budget"),
+        "its OWN reason token, distinct from a syntax error, so an auditor can tell \
+         'someone is writing expressions we refuse to run' from 'someone has a typo': {detail}"
+    );
+    assert!(
+        !detail.to_string().contains("exists"),
+        "and the refused expression is NOT copied onto the audit stream: {detail}"
+    );
+}
+
+/// THE SAME EXPRESSION IS ACCEPTED AT A SMALLER DECLARED CARDINALITY, and then it RUNS.
+///
+/// Without this the test above passes against a surface that refuses every `cel` rule, and
+/// against a `max_collection_size` the code ignores. It is what makes the declared shape
+/// observably the `n` in the cost model rather than a field nothing reads.
+#[tokio::test]
+async fn a_cel_rule_within_the_budget_is_stored_and_read_back() {
+    let harness = Harness::start(75).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let path = mapping_path(&tenant, &env, &client);
+
+    let (status, _, body) = harness
+        .put(
+            &path,
+            r#"{"rules":[{"kind":"cel","name":"expensive","expression":"claims.groups.exists(a, claims.groups.exists(b, claims.groups.exists(c, a == b && b == c)))","max_collection_size":8}]}"#,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "eight elements deep three times is well inside the budget, so the ONLY difference \
+         from the refused document above is the declared cardinality: {body}"
+    );
+
+    let (status, _, body) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("\"kind\":\"cel\"") && body.contains("\"max_collection_size\":8"),
+        "the rule round-trips with its declared shape, which is what the budget was computed \
+         against and what evaluation later enforces: {body}"
+    );
+}
+
 /// A rule writing a PROTECTED claim is refused, and the refusal is AUDITED.
 ///
 /// Criterion 5's two halves, and the second is the one a validate-then-write path throws away:

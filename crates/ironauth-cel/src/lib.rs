@@ -140,11 +140,35 @@
 //! Both are properties of the ESTIMATE. The enforcement half -- that an input may not exceed
 //! the shape the estimate was computed from -- holds.
 //!
-//! Wiring the first caller is not free, and the cost is recorded here so it is not
-//! rediscovered: this crate declares `rust-version = "1.86"` because `cel` 0.14 does, while the
-//! workspace and `docs/COMPATIBILITY.md` promise 1.85. The CI msrv lane excludes this crate for
-//! exactly as long as nothing depends on it. The first production dependency raises the shipped
-//! binary's MSRV, which is a compatibility promise, not an implementation detail.
+//! # The MSRV cost, and how it was paid
+//!
+//! This paragraph used to read: "this crate declares `rust-version = \"1.86\"` because `cel`
+//! 0.14 does ... the CI msrv lane excludes this crate for exactly as long as nothing depends
+//! on it. The first production dependency raises the shipped binary's MSRV." Every clause of
+//! that is now false, and it is rewritten rather than deleted because the reasoning is what
+//! stops the cost being rediscovered.
+//!
+//! `ironauth-oidc` depends on this crate, non-optionally, for the `cel` mapping rule (#113
+//! criterion 2) -- so it IS in the shipped binary's graph and the exclusion had to come out.
+//! Raising a published compatibility promise as a side effect of shipping a mapping rule is an
+//! owner decision, so the promise was kept instead: `cel` is `=` pinned to **0.11.6**, the
+//! newest release that COMPILES at 1.85. The crate compiles against it unchanged.
+//!
+//! THE PIN IS CHOSEN BY COMPILING, NOT BY READING MANIFESTS, and an earlier revision of this
+//! change got that wrong: it pinned 0.12.0 on the strength of its `rust-version = "1.82.0"`.
+//! That declaration is false. `cel-0.12.0/src/objects.rs` upcasts `&dyn Opaque` to `&dyn Any`
+//! in an unconditional `impl dyn Opaque` block, and trait upcasting coercion stabilized in
+//! Rust 1.86, so `cargo check` at 1.85 fails there with E0658 -- upstream corrected the
+//! manifest in 0.13.0. 0.13 and 0.14 declare 1.86 honestly. So the real floor of every release
+//! above 0.11.6 is 1.86, and the one that says otherwise is the one that says it wrongly.
+//! `scripts/msrv-audit.sh` cannot see this: it reads DECLARED fields and says so in its own
+//! header. The msrv CI lane compiling this crate at 1.85 is what holds the pin honest.
+//!
+//! The pin has a price and it is named in `deny.toml`: 0.11.6 reaches `paste`, which is
+//! unmaintained (RUSTSEC-2024-0436) where 0.14 moved to the maintained fork. That is a
+//! maintenance notice against a compile-time proc macro rather than a defect, and it carries a
+//! scoped ignore. When the workspace MSRV moves to 1.86 or above, drop the ignore and take
+//! `cel` 0.14.
 
 use cel::common::ast::{EntryExpr, Expr, IdedEntryExpr};
 
@@ -189,6 +213,105 @@ pub enum CostError {
         /// The budget it exceeded.
         budget: u64,
     },
+    /// The expression calls a function this model CANNOT price, so admitting it would be a
+    /// budget that does not bound anything.
+    ///
+    /// See [`UNPRICEABLE_FUNCTIONS`] for which, and why a refusal is the honest answer rather
+    /// than a bigger number.
+    Unpriceable {
+        /// The function named in the expression.
+        function: String,
+    },
+}
+
+/// Functions no expression may call, because this model cannot price them.
+///
+/// # `matches`, and the measurement that put it here
+///
+/// The cost model prices ITERATION: `n^(depth+1)` over the declared cardinality. Everything
+/// else is unmodelled, which the header already says about allocation. `matches` is where
+/// unmodelled becomes unbounded, because its cost is
+///
+/// ```text
+/// (regex states) x (haystack bytes)
+/// ```
+///
+/// and NEITHER factor is anything the estimate sees. The states come from a literal inside the
+/// expression, and the HAYSTACK COMES FROM THE BINDING -- which is the caller's input, not the
+/// expression, so no bound on the expression can reach it.
+///
+/// Measured in release against `ironauth-oidc`'s claims mapping, with an expression of 2,036
+/// bytes -- inside that layer's own 2 KiB cap -- and a 64 KiB string binding, which is exactly
+/// what [`DEFAULT_MAX_STRING_BYTES`] admits:
+///
+/// ```text
+///   pad  8 KiB     27.8 ms
+///   pad 32 KiB     61.3 s
+///   pad 64 KiB    131.7 s
+/// ```
+///
+/// Every one of those was ADMITTED at an estimate of 1, because the expression contains no
+/// comprehension and the floor arm returns 1 before the cardinality is read.
+///
+/// # Why a denylist, and what it does not do
+///
+/// Three attempts to make the estimate cover this are recorded in this module's header, and a
+/// fourth -- bounding the SOURCE LENGTH -- was tried in `ironauth-oidc` and is what the
+/// measurement above defeats: it bounds the number of terms and not the haystack. A wall-clock
+/// timeout is the other obvious answer and this crate refuses one by design, because a
+/// deterministic verdict is the whole product.
+///
+/// So the function is refused. That is honest about the model rather than pretending a number
+/// covers it, and it is checked from the PARSED TREE, so a caller cannot reach it by spelling.
+///
+/// IT IS A DENYLIST AND SHARES A DENYLIST'S WEAKNESS. `matches` is the only regex entry point
+/// in `cel` 0.11.6 -- `regex::Regex::new` appears once in its `functions.rs` -- so today this is
+/// complete for the cost this shape. A future `cel` that adds another unpriceable function
+/// admits it here silently. What would close that properly is an ALLOWLIST of functions whose
+/// cost the model can state, which is a larger change than this one.
+pub const UNPRICEABLE_FUNCTIONS: &[&str] = &["matches"];
+
+/// The first unpriceable function this expression calls, if any.
+///
+/// Walks the same tree [`comprehension_depth`] does, and for the same reason: the question
+/// "does this call `matches`" is answered by the parser that decides what a call IS, rather
+/// than by a text scan that a string literal or a comment can fool. That scan was tried for
+/// comprehension depth and had three holes, all in the unsafe direction.
+fn unpriceable_call(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Call(call) => {
+            if UNPRICEABLE_FUNCTIONS.contains(&call.func_name.as_str()) {
+                return Some(call.func_name.clone());
+            }
+            call.target
+                .iter()
+                .find_map(|target| unpriceable_call(&target.expr))
+                .or_else(|| call.args.iter().find_map(|arg| unpriceable_call(&arg.expr)))
+        }
+        Expr::Comprehension(comprehension) => unpriceable_call(&comprehension.iter_range.expr)
+            .or_else(|| unpriceable_call(&comprehension.accu_init.expr))
+            .or_else(|| unpriceable_call(&comprehension.loop_cond.expr))
+            .or_else(|| unpriceable_call(&comprehension.loop_step.expr))
+            .or_else(|| unpriceable_call(&comprehension.result.expr)),
+        Expr::Select(select) => unpriceable_call(&select.operand.expr),
+        Expr::List(list) => list
+            .elements
+            .iter()
+            .find_map(|element| unpriceable_call(&element.expr)),
+        Expr::Map(map) => entries_unpriceable(&map.entries),
+        Expr::Struct(structure) => entries_unpriceable(&structure.entries),
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => None,
+    }
+}
+
+/// The first unpriceable call in a map or struct literal's entries, keys included.
+fn entries_unpriceable(entries: &[IdedEntryExpr]) -> Option<String> {
+    entries.iter().find_map(|entry| match &entry.expr {
+        EntryExpr::StructField(field) => unpriceable_call(&field.value.expr),
+        EntryExpr::MapEntry(entry) => {
+            unpriceable_call(&entry.key.expr).or_else(|| unpriceable_call(&entry.value.expr))
+        }
+    })
 }
 
 impl core::fmt::Display for CostError {
@@ -198,6 +321,10 @@ impl core::fmt::Display for CostError {
             Self::OverBudget { estimated, budget } => write!(
                 f,
                 "expression may cost up to {estimated} operations against a budget of {budget}"
+            ),
+            Self::Unpriceable { function } => write!(
+                f,
+                "expression calls `{function}`, whose cost this model cannot bound"
             ),
         }
     }
@@ -586,7 +713,9 @@ pub fn estimate_parsed_cost(expression: &Expr, shape: InputShape) -> u64 {
 ///
 /// # Errors
 ///
-/// [`CostError::Uncompilable`] when the expression does not compile, and
+/// [`CostError::Uncompilable`] when the expression does not compile,
+/// [`CostError::Unpriceable`] when it calls a function in [`UNPRICEABLE_FUNCTIONS`] -- checked
+/// before the estimate, because for those the estimate is absent rather than wrong -- and
 /// [`CostError::OverBudget`] when its estimate exceeds `budget`.
 pub fn compile_within_budget(
     expression: &str,
@@ -604,6 +733,11 @@ pub fn compile_within_budget(
     )]
     let program = cel::Program::compile(expression)
         .map_err(|error| CostError::Uncompilable(error.to_string()))?;
+    // BEFORE THE ESTIMATE, because for these the estimate is not wrong so much as absent: an
+    // expression whose cost this model cannot see must not be admitted BY the model.
+    if let Some(function) = unpriceable_call(&program.expression().expr) {
+        return Err(CostError::Unpriceable { function });
+    }
     let estimated = estimate_parsed_cost(&program.expression().expr, shape);
     if estimated > budget {
         return Err(CostError::OverBudget { estimated, budget });
