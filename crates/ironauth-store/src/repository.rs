@@ -42583,12 +42583,16 @@ where
 /// path and asserts the event lands on the feed, so a caller that takes the returned event and
 /// drops it is a failing test rather than a billing dispute.
 ///
-/// THAT COVERS ONE OF THE TWO PRODUCTION CALL SITES. The other is
-/// `ActingImpersonationAuthorizationRepo::redeem`, which mints an impersonation session and is
-/// not covered here -- its fixture needs an impersonation authorization, and this PR did not
-/// build one. Written down rather than left implied, because "a producer added per call site
-/// is a producer the next call site forgets" is exactly the failure this arrangement invites,
-/// and an uncovered site is where it would happen.
+/// BOTH PRODUCTION CALL SITES ARE COVERED. The other is
+/// `ActingImpersonationAuthorizationRepo::redeem`, and
+/// `impersonation_sessions.rs::a_real_sign_in_is_metered_as_an_active_user` drives it, asserts
+/// one `user.signed_in` on the feed and asserts the metered active. It predates this PR.
+///
+/// An earlier version of this note said that site was uncovered and that its fixture "did not
+/// exist"; the fixture is `issue_authorization` in that file and seven tests use it. Claiming
+/// a gap that is not there is the same defect as claiming a guard that is not there -- both
+/// send the next reader somewhere untrue -- and this one would have had someone write a test
+/// that already existed.
 ///
 /// In the write's OWN transaction, so a rolled-back sign-in is not metered. That is one
 /// outbox insert on the authentication path, and it is the event stream rather than a
@@ -42694,10 +42698,11 @@ async fn insert_session_row(
     // drops it fails `#[must_use]`". It does not: `OwnedDomainEvent` carries no `#[must_use]`,
     // and `?` discharges the `Result`, leaving a plain `Option` no lint objects to. The thing
     // that actually catches a caller who forgets to enqueue is
-    // `a_rotation_meters_the_sign_in_it_created`, which covers the ROTATION call site only --
-    // the impersonation one is uncovered, and that is recorded on `insert_session_row`. A claim
-    // of type-level safety where there is none is worse than no claim, because it stops the
-    // next person looking, and so is naming a test that does not exist.
+    // `a_rotation_meters_the_sign_in_it_created` for the rotation site, and
+    // `impersonation_sessions.rs::a_real_sign_in_is_metered_as_an_active_user` for the
+    // impersonation one -- both production call sites. A claim of type-level safety where
+    // there is none is worse than no claim, because it stops the next person looking, and so
+    // is naming a test that does not exist or a gap that is not there.
     Ok(crate::event_catalog::envelope(
         &event_id,
         "user.signed_in",
@@ -50580,13 +50585,22 @@ impl ActingTenantRepo<'_> {
                 //    other. It is a pure move -- see step 3 for why the row does not
                 //    depend on the scoping variables.
                 //
-                //    The general rule it follows: THE APPEND LOCK IS THE LAST LOCK THIS
-                //    TRANSACTION TAKES. That is not enforceable by a type, and NOTHING
-                //    GUARDS IT -- every producer that takes another lock afterwards has to
-                //    be found by reading. An earlier version of this note named a test that
-                //    would stop it being true again; no such test exists, and naming one is
-                //    worse than admitting there is none, because it stops the next person
-                //    looking.
+                //    The rule it follows, stated precisely because the loose form is FALSE
+                //    HERE: every lock this transaction takes OUTSIDE the announcement loop is
+                //    taken before the loop starts.
+                //
+                //    "The append lock is the last lock this transaction takes" is the shape
+                //    the rule takes for an ordinary producer, and a per-environment cascade
+                //    cannot obey it: iteration 2 upserts `environment_states` while already
+                //    holding iteration 1's append lock. That is inherent to announcing per
+                //    environment, and it is safe against OTHER cascades only because they all
+                //    iterate in the same `ORDER BY id` -- see the note on that query.
+                //
+                //    NOTHING GUARDS EITHER FORM. A producer that takes another lock after its
+                //    enqueue has to be found by reading; round 3 found one this way, the
+                //    trailing `UPDATE environments` in `restore_with_event`. An earlier
+                //    version of this note named a test that would stop that happening; no such
+                //    test exists, and naming one is worse than admitting there is none.
                 insert_idempotency(tx, idempotency).await?;
                 // 1. Flip the tenant status, guarded on the source state so a
                 //    concurrent transition cannot double-apply. A level table (no
@@ -50625,8 +50639,18 @@ impl ActingTenantRepo<'_> {
                 //    that fences it rather than being left to the absent-row default,
                 //    which serves.
                 let env_rows = sqlx::query(
+                    // ORDER BY id, and it is a DEADLOCK FIX rather than tidiness.
+                    //
+                    // This loop takes one append lock per environment and holds them all to
+                    // commit. Without an ORDER BY, Postgres may return the rows in any order --
+                    // seq-scan order tracks physical layout, which HOT updates change -- so two
+                    // concurrent cascades on one tenant could take the same set of locks in
+                    // OPPOSITE orders and deadlock. Before this PR the enqueue took no lock and
+                    // the order did not matter; giving it one is what makes this reachable.
+                    //
+                    // Any total order works as long as every cascade uses the same one.
                     "SELECT id, (deleted_at IS NOT NULL) AS deleted \
-                     FROM environments WHERE tenant_id = $1",
+                     FROM environments WHERE tenant_id = $1 ORDER BY id",
                 )
                 .bind(id.to_string())
                 .fetch_all(&mut **tx)
@@ -51306,14 +51330,55 @@ impl ActingTenantRepo<'_> {
                 //    is fenced here rather than left serving under a tenant the
                 //    operator restored into `suspended`.
                 let env_rows = sqlx::query(
+                    // ORDER BY id, and it is a DEADLOCK FIX rather than tidiness.
+                    //
+                    // This loop takes one append lock per environment and holds them all to
+                    // commit. Without an ORDER BY, Postgres may return the rows in any order --
+                    // seq-scan order tracks physical layout, which HOT updates change -- so two
+                    // concurrent cascades on one tenant could take the same set of locks in
+                    // OPPOSITE orders and deadlock. Before this PR the enqueue took no lock and
+                    // the order did not matter; giving it one is what makes this reachable.
+                    //
+                    // Any total order works as long as every cascade uses the same one.
                     "SELECT id, \
                             (deleted_at = TIMESTAMPTZ 'epoch' \
                              + ($2::text || ' microseconds')::interval) IS TRUE AS matched \
-                     FROM environments WHERE tenant_id = $1",
+                     FROM environments WHERE tenant_id = $1 ORDER BY id",
                 )
                 .bind(id.to_string())
                 .bind(deleted_micros)
                 .fetch_all(&mut **tx)
+                .await?;
+                // 2b. CLEAR THE TOMBSTONES NOW -- after the read above, before the loop below.
+                //
+                //     BOTH SIDES MATTER. It must run after the `env_rows` SELECT, because that
+                //     query computes `matched` from the very `deleted_at` this clears: hoisting
+                //     it above the read makes every environment unmatched, and four
+                //     `tenant_lifecycle` tests said so.
+                //
+                //     This ran AFTER the loop, which made this closure the one producer in the
+                //     file taking a row lock while already holding an advisory lock -- and that
+                //     is the exact cycle measured against the reverted tenant-delete pre-lock:
+                //     an ordinary `UPDATE environments` elsewhere takes `FOR NO KEY UPDATE` and
+                //     then wants the append lock, so a restore holding the append locks and
+                //     wanting those rows deadlocks against it. `delete_with_event` already
+                //     places its environments write before its announcement loop; this now
+                //     matches, and the order across the deployment is ROWS BEFORE ADVISORY
+                //     without exception.
+                //
+                //     Safe to hoist: the loop's `matched` flag is computed from `env_rows`,
+                //     which was read above and is already materialised, and nothing inside the
+                //     loop reads `environments.deleted_at`.
+                //
+                //     Matched on the deletion instant, for the reason step 2 gives.
+                sqlx::query(
+                    "UPDATE environments SET deleted_at = NULL \
+                     WHERE tenant_id = $1 \
+                     AND deleted_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval",
+                )
+                .bind(id.to_string())
+                .bind(deleted_micros)
+                .execute(&mut **tx)
                 .await?;
                 for env_row in &env_rows {
                     let env_id: String = env_row.get("id");
@@ -51377,18 +51442,7 @@ impl ActingTenantRepo<'_> {
                         .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
                     enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
                 }
-                // 3. Clear the tombstones this delete wrote on the environments (a
-                //    level table), matched on its instant for the reason step 2 gives.
-                sqlx::query(
-                    "UPDATE environments SET deleted_at = NULL \
-                     WHERE tenant_id = $1 \
-                     AND deleted_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval",
-                )
-                .bind(id.to_string())
-                .bind(deleted_micros)
-                .execute(&mut **tx)
-                .await?;
-                // 4. Restore the audit scope's row-level-security variables.
+                // 3. Restore the audit scope's row-level-security variables.
                 sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
                     .bind(scope.tenant().to_string())
                     .execute(&mut **tx)
@@ -51529,10 +51583,13 @@ impl ActingTenantRepo<'_> {
                 //    the tenant's envelope-protected PII is permanently unreadable. A
                 //    scope that never provisioned a KEK matches no row. The control
                 //    role holds exactly this column-scoped UPDATE on tenant_keks.
-                let env_rows = sqlx::query("SELECT id FROM environments WHERE tenant_id = $1")
-                    .bind(id.to_string())
-                    .fetch_all(&mut **tx)
-                    .await?;
+                // ORDER BY id: see the note in `transition`. One lock order across every
+                // cascade, because each holds one append lock per environment to commit.
+                let env_rows =
+                    sqlx::query("SELECT id FROM environments WHERE tenant_id = $1 ORDER BY id")
+                        .bind(id.to_string())
+                        .fetch_all(&mut **tx)
+                        .await?;
                 for env_row in &env_rows {
                     let env_id: String = env_row.get("id");
                     sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")

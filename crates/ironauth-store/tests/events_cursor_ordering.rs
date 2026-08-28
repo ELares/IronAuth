@@ -576,6 +576,10 @@ async fn serialising_appenders_on_a_scope_lock_makes_sequence_order_equal_commit
 
 #[tokio::test]
 async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
+    // ENOUGH WRITERS TO ACTUALLY RACE. Two was the original count and it does not catch a
+    // missing lock: measured, removing `append_event`'s `pg_advisory_xact_lock` left this test
+    // passing 8 runs out of 8, because two writers on a local database rarely interleave.
+    const WRITERS: i64 = 16;
     // The same property through the SHIPPED method rather than hand-written SQL. The
     // raw-SQL test above proves the mechanism; this proves `append_event` actually uses it,
     // which is the gap between "the idea works" and "the code does it".
@@ -586,10 +590,20 @@ async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
 
     // Two appenders racing. Whatever order they interleave in, the lock decides, and the
     // feed must agree with whatever the lock decided.
+    // COMMIT ORDER IS RECORDED, because the feed cannot reveal it. `append_event` returns
+    // after its transaction commits, so each writer stamps itself into this list at the moment
+    // it becomes durable, and the order of the list IS the commit order.
+    //
+    // Without it there is nothing here to assert. The feed serves `ORDER BY sequence`, so any
+    // check on the sequences it returns is satisfied by the query's own ordering whatever the
+    // lock did -- which is what the assertion at the end of this test used to be.
+    let commit_order: std::sync::Arc<std::sync::Mutex<Vec<i64>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut handles = Vec::new();
-    for i in 0..2 {
+    for i in 0..WRITERS {
         let store = store.clone();
         let env = env.clone();
+        let commit_order = std::sync::Arc::clone(&commit_order);
         handles.push(tokio::spawn(async move {
             store
                 .scoped(scope)
@@ -604,18 +618,21 @@ async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
                     },
                 )
                 .await
-                .expect("append")
+                .expect("append");
+            commit_order.lock().expect("not poisoned").push(i);
         }));
     }
     for handle in handles {
         handle.await.expect("appender finishes");
     }
+    let commit_order = commit_order.lock().expect("not poisoned").clone();
 
     // The bounded poll again: `events_page_after` still watermarks, and the watermark is
     // cluster-wide, so appended events wait for unrelated transactions exactly as any other
     // event does. Serialising the WRITES does not un-serialise the READ.
     let outbox = store.scoped(scope).outbox();
     let mut sequences: Vec<i64> = Vec::new();
+    let mut by_writer: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
     for _ in 0..100 {
         match outbox
             .events_page_after(EventCursor::beginning(), 100)
@@ -623,8 +640,18 @@ async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
             .expect("read")
         {
             EventPage::Page(events) => {
+                // Keyed by WRITER, from the payload, so the assertion below can ask "what
+                // sequence did the writer that committed first get" rather than "are these
+                // numbers increasing".
+                by_writer = events
+                    .iter()
+                    .filter_map(|m| {
+                        let i = m.payload.get("i")?.as_i64()?;
+                        Some((i, m.sequence))
+                    })
+                    .collect();
                 sequences = events.iter().map(|m| m.sequence).collect();
-                if sequences.len() == 2 {
+                if sequences.len() == usize::try_from(WRITERS).expect("fits") {
                     break;
                 }
             }
@@ -633,10 +660,35 @@ async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    assert_eq!(sequences.len(), 2, "both appends must be on the feed");
+    assert_eq!(
+        sequences.len(),
+        usize::try_from(WRITERS).expect("fits"),
+        "every append must be on the feed"
+    );
+    assert_eq!(
+        commit_order.len(),
+        usize::try_from(WRITERS).expect("fits"),
+        "every writer must have committed"
+    );
+
+    // THE PROPERTY: the writer that committed FIRST holds the LOWER sequence. That is what
+    // "sequence order equals commit order" means for two writers, and the append lock is what
+    // makes it hold -- without it the second writer can insert first and commit second.
+    //
+    // This used to assert `sequences.windows(2).all(|pair| pair[0] < pair[1])`, described as
+    // "strictly increasing". The feed serves ORDER BY sequence, so that could not fail: it
+    // restated the query's own ordering. It passed with the lock removed.
+    let in_commit_order: Vec<i64> = commit_order.iter().map(|w| by_writer[w]).collect();
+    let inverted: Vec<(i64, i64)> = in_commit_order
+        .windows(2)
+        .filter(|pair| pair[0] > pair[1])
+        .map(|pair| (pair[0], pair[1]))
+        .collect();
     assert!(
-        sequences.windows(2).all(|pair| pair[0] < pair[1]),
-        "strictly increasing: {sequences:?}"
+        inverted.is_empty(),
+        "sequence order is NOT commit order: these consecutive pairs, listed in the order \
+         their writers COMMITTED, hold descending sequences {inverted:?}. Commit order was \
+         {commit_order:?} and the feed served {sequences:?}"
     );
 }
 
