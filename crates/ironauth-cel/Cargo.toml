@@ -9,6 +9,9 @@ edition.workspace = true
 # that an unreachable crate is checked at its own MSRV instead of blocking the lane. Wiring
 # it into the issuance path retires that exemption -- the rule says so -- and the pin is what
 # makes the promise survive the wiring rather than the wiring move the promise.
+#
+# The pin is chosen by COMPILING, not by reading manifests. See the note on `cel` below: the
+# version whose manifest declares the lowest floor is not the version with the lowest floor.
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -23,23 +26,39 @@ repository.workspace = true
 # binding half is hand-written (`to_cel`) because it enforces the declared cardinality while
 # it converts, which a general-purpose converter has no reason to do.
 #
-# PINNED TO 0.12, DELIBERATELY BELOW THE LATEST, and the reason is a published promise.
-# `cel` 0.13 and 0.14 declare `rust-version = "1.86.0"`; 0.12 declares 1.82.0. This crate is
-# now reachable from the shipped binary, so ITS dependency's MSRV becomes the PRODUCT's, and
-# docs/COMPATIBILITY.md promises 1.85. Taking 0.14 would raise a published compatibility
-# promise as a side effect of shipping a feature, which is an owner decision rather than
-# something a mapping rule gets to do.
+# PINNED TO EXACTLY 0.11.6, DELIBERATELY BELOW THE LATEST, and the reason is a published
+# promise. This crate is now reachable from the shipped binary, so ITS dependency's MSRV
+# becomes the PRODUCT's, and docs/COMPATIBILITY.md promises 1.85. Taking a version that needs
+# a newer compiler would raise a published compatibility promise as a side effect of shipping
+# a feature, which is an owner decision rather than something a mapping rule gets to do.
 #
-# The cost of the pin, stated plainly: 0.12 pulls `paste`, which is unmaintained
+# WHY 0.11.6 AND NOT 0.12, WHICH DECLARES A LOWER FLOOR. Both 0.11.6 and 0.12.0 declare
+# `rust-version = "1.82.0"`, and 0.12.0's declaration is WRONG: `cel-0.12.0/src/objects.rs`
+# upcasts `&dyn Opaque` to `&dyn Any` in an unconditional `impl dyn Opaque` block, and trait
+# upcasting coercion stabilized in Rust 1.86, so `cargo check` at 1.85 fails there with
+# E0658. Upstream corrected the manifest in 0.13.0, which is the first version to declare
+# 1.86.0 -- 0.12.0's real floor is the same 1.86, it just does not say so. 0.11.6 is the last
+# release that actually COMPILES at 1.85, which is the property this pin needs and the one a
+# manifest cannot be trusted for. That is also why this is an `=` pin rather than "0.11": the
+# floor here is a compiled fact that the manifests get wrong, so a caret range could drift
+# back over it without any gate noticing. `scripts/msrv-audit.sh` reads declared fields only
+# and says so in its own header; the check that holds this is the `ironauth-cel at the
+# published MSRV` step in the msrv CI job, which compiles the crate at exactly the toolchain
+# docs/COMPATIBILITY.md publishes for it.
+#
+# The cost of the pin, stated plainly: 0.11.6 pulls `paste`, which is unmaintained
 # (RUSTSEC-2024-0436), where 0.14 moved to `pastey`, the maintained fork of the same macro.
 # That advisory is an unmaintained notice rather than a vulnerability, against a COMPILE-TIME
 # proc macro that expands identifiers and contributes no runtime code, and `deny.toml`
 # carries a scoped ignore saying so. The tree already resolves one MSRV-versus-advisory
 # conflict this way, for `time`.
 #
-# Measured before pinning: the crate's source compiles against 0.12 UNCHANGED and all of its
-# tests pass, so nothing here is written around an older API.
-cel = { version = "0.12", features = ["json"] }
+# Measured before pinning: the crate's source compiles against 0.11.6 UNCHANGED and all of
+# its tests pass, so nothing here is written around an older API. The one behaviour this
+# crate depends on across the range also holds: `regex::Regex::new` appears exactly once in
+# `cel-0.11.6/src/functions.rs`, so `matches` is still the only regex entry point the
+# `UNPRICEABLE_FUNCTIONS` denylist has to cover.
+cel = { version = "=0.11.6", features = ["json"] }
 # The wire form on this crate's own boundary. Bindings arrive as `serde_json::Value` and
 # results leave as one, so a caller never needs `cel` in its manifest and `cel::Program`
 # never escapes -- which is what makes the cost budget unavoidable rather than optional.

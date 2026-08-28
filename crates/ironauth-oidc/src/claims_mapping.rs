@@ -231,7 +231,7 @@ pub enum MappingRule {
     ///
     /// One binding, `claims`, an object holding the claim set AS THE PREVIOUS RULES LEFT IT.
     /// That is the isolation: `ironauth-cel` evaluates against a `cel::Context` it builds and
-    /// adds ONE variable to, and `cel` 0.12's function set contains no network, filesystem or
+    /// adds ONE variable to, and `cel` 0.11.6's function set contains no network, filesystem or
     /// environment call to reach for. So an expression can only name what it was bound, and
     /// cross-tenant access is a question about this list rather than about the sandbox.
     ///
@@ -339,22 +339,26 @@ impl MappingRule {
 ///
 /// What that leaves open is per-CALL work in the standard library, which no amount of
 /// iteration accounting sees. Review measured it through this exact compile path: an
-/// expression of a thousand `matches()` terms reads no binding, estimates 1, is ADMITTED, and
-/// evaluates in **6.1 seconds**; five thousand terms took **30.2 seconds**. `cel`'s `matches`
-/// compiles a regular expression per invocation with no cache, so the cost is per term and
-/// linear in how many an operator can write down.
+/// expression of a thousand `matches()` terms reads no binding and estimates 1, so nothing in
+/// the model has an opinion about it, and it evaluates in **6.1 seconds** against a
+/// one-character haystack -- **131.7 seconds** against a 64 KiB one, because `cel`'s `matches`
+/// compiles a regular expression per invocation with no cache AND runs it over whatever the
+/// binding holds.
 ///
-/// [`MAX_CEL_EXPRESSION_BYTES`] is what closes that, and it closes it the way a configuration
-/// layer can: by bounding what an operator may write, not by pricing what it does.
+/// [`ironauth_cel::UNPRICEABLE_FUNCTIONS`] is what closes that, by REFUSING such a function
+/// outright rather than pricing or bounding it -- the cost of that shape lives in the binding,
+/// so no bound on what an operator writes can reach it. [`MAX_CEL_EXPRESSION_BYTES`] is a
+/// separate bound on a separate thing: how many PRICEABLE operations one expression can name.
 pub const CEL_COST_BUDGET: u64 = ironauth_cel::DEFAULT_COST_BUDGET;
 
 /// The longest CEL source a `cel` rule may carry.
 ///
-/// A SIZE bound, standing in for a cost model that cannot price per-call work. The iteration
-/// model returns its floor for any expression without a comprehension, so an operator could
-/// otherwise put a hundred and seventy kilobytes of `matches()` terms on the issuance path of
-/// every login for a client and have it admitted at an estimate of 1 -- measured at thirty
-/// seconds of a shared worker.
+/// A SIZE bound on how much an operator may write, which is a different question from what any
+/// of it costs. The iteration model returns its floor for any expression without a
+/// comprehension, so without SOME bound an operator could put a hundred and seventy kilobytes
+/// of expression on the issuance path of every login for a client and have it admitted at an
+/// estimate of 1. For the specific shape that paragraph used to name -- `matches()` terms --
+/// this cap is NOT the answer and never was; see "WHAT THE BOUND BUYS" below.
 ///
 /// Two kilobytes because a claims mapping is a claims mapping. The shipped example is forty
 /// characters; something elaborate is a few hundred. An expression that does not fit here is
@@ -409,7 +413,7 @@ pub const MAX_CEL_COLLECTION_SIZE: u64 = 100_000;
 /// The binding a `cel` expression reads its input from.
 ///
 /// ONE name, and that is the isolation. `ironauth-cel` evaluates against a `cel::Context` it
-/// builds and adds this one variable to, and `cel` 0.12 offers no IO function to call, so what
+/// builds and adds this one variable to, and `cel` 0.11.6 offers no IO function to call, so what
 /// an expression can reach is exactly this list -- and it holds this client's claim set and
 /// nothing else. Cross-tenant access is therefore not a question about a sandbox but about
 /// this constant.
@@ -639,9 +643,10 @@ pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
         // deterministically".
         // THE SIZE BOUNDS FIRST, because the cost model cannot see what they bound. An
         // expression with no comprehension estimates 1 whatever its length, so a compile-only
-        // check would admit a hundred and seventy kilobytes of `matches()` terms -- measured
-        // at thirty seconds of issuance CPU. Refusing on LENGTH is what a configuration layer
-        // can decide; pricing the work is what the model cannot.
+        // check would admit a hundred and seventy kilobytes of expression at an estimate of 1.
+        // Refusing on LENGTH is what a configuration layer can decide; pricing the work is what
+        // the model cannot. It is not what stops `matches()` -- that is refused outright by
+        // `compile_rule` below, at any length, because its cost lives in the binding.
         if let MappingRule::Cel {
             expression,
             max_collection_size,
@@ -663,13 +668,18 @@ pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
                 });
             }
         }
-        if let MappingRule::Cel {
-            expression,
-            max_collection_size,
-            ..
-        } = rule
-            && let Err(error) = compile_rule(expression, *max_collection_size)
-        {
+        // NOT A LET-CHAIN, deliberately. `if let ... = rule && let Err(error) = ...` reads
+        // better and needs Rust 1.88; this crate is compiled at the published MSRV
+        // (docs/COMPATIBILITY.md) by the msrv CI lane, and let-chains are unstable there.
+        let cel_error = match rule {
+            MappingRule::Cel {
+                expression,
+                max_collection_size,
+                ..
+            } => compile_rule(expression, *max_collection_size).err(),
+            _ => None,
+        };
+        if let Some(error) = cel_error {
             return Err(MappingRefusal {
                 rule_index: index,
                 claim: reportable(written),
@@ -1341,7 +1351,7 @@ mod tests {
 
     /// CRITERION 3: an expression has no ambient IO, and the sandbox is the BINDING LIST.
     ///
-    /// `cel` 0.12's function set has no network, filesystem or environment access, so there is
+    /// `cel` 0.11.6's function set has no network, filesystem or environment access, so there is
     /// no such function to call. What an expression can reach is what it was bound, and
     /// it is bound exactly one name. So the adversarial case that matters is not "can it call
     /// fetch" -- there is no fetch -- but "can it name something it was not given", and an

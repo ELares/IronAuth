@@ -72,11 +72,13 @@ yanked = "deny"
 # Scoped advisory ignore (issue #113). RUSTSEC-2024-0436 is an UNMAINTAINED notice, not a
 # vulnerability, against `paste` -- a COMPILE-TIME proc macro that pastes identifiers
 # together and contributes no runtime code to any binary. It reaches this workspace through
-# exactly one path: ironauth-cel -> cel 0.12.
+# exactly one path: ironauth-cel -> cel 0.11.6.
 #
 # `cel` 0.13 and 0.14 drop it for `pastey`, the maintained fork of the same macro, and both
-# declare `rust-version = "1.86.0"`. ironauth-cel is reachable from the shipped binary now,
-# so taking either would make the PRODUCT MSRV 1.86 against the 1.85 promised in
+# declare `rust-version = "1.86.0"`. 0.12.0 declares 1.82.0 but needs 1.86 in fact (trait
+# upcasting in its `objects.rs`), so 0.11.6 is the newest release that compiles at 1.85 and
+# it is `=` pinned. ironauth-cel is reachable from the shipped binary now, so taking any of
+# the three would make the PRODUCT MSRV 1.86 against the 1.85 promised in
 # docs/COMPATIBILITY.md. That is the same MSRV-versus-advisory conflict the `time` entry
 # below records, resolved the same way and on weaker grounds than that one: this advisory
 # describes maintenance status rather than a defect, and the crate is not in the binary.
@@ -84,7 +86,7 @@ yanked = "deny"
 # Re-confirm before trusting this ignore: `cargo tree -i paste` must still show cel as the
 # only path. If the MSRV promise moves to 1.86 or above, drop this entry and take cel 0.14.
 ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "paste is UNMAINTAINED, not vulnerable, and is a compile-time proc macro contributing no runtime code. It reaches the graph only through cel 0.12, which is pinned below 0.13/0.14 because those declare rustc 1.86 against this workspace's 1.85 MSRV promise. Drop this and take cel 0.14 when the MSRV moves." },
+    { id = "RUSTSEC-2024-0436", reason = "paste is UNMAINTAINED, not vulnerable, and is a compile-time proc macro contributing no runtime code. It reaches the graph only through cel 0.11.6, which is pinned below 0.12/0.13/0.14 because none of those COMPILES at this workspace's 1.85 MSRV promise (0.13/0.14 declare 1.86; 0.12.0 declares 1.82 but needs 1.86). Drop this and take cel 0.14 when the MSRV moves." },
     { id = "RUSTSEC-2023-0071", reason = "rsa crate used only for RS256 keygen + DER export (crates/ironauth-jose); never decrypts or signs, so the Marvin decryption-timing path is unreachable. Signing/verification is on ring." },
     { id = "RUSTSEC-2026-0009", reason = "time 0.3.41 reaches the graph ONLY through rcgen, an optional dependency behind ironauth-fetch's non-default test-harness feature; no default build links it, so the parser DoS is unreachable in any released artifact. The fix (0.3.47) requires rustc 1.88 against this workspace's 1.85 MSRV promise." },
 ]

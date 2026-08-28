@@ -151,11 +151,20 @@
 //! `ironauth-oidc` depends on this crate, non-optionally, for the `cel` mapping rule (#113
 //! criterion 2) -- so it IS in the shipped binary's graph and the exclusion had to come out.
 //! Raising a published compatibility promise as a side effect of shipping a mapping rule is an
-//! owner decision, so the promise was kept instead: `cel` is pinned to **0.12**, which declares
-//! `rust-version = "1.82.0"`, where 0.13 and 0.14 declare 1.86. The crate compiles against it
-//! unchanged.
+//! owner decision, so the promise was kept instead: `cel` is `=` pinned to **0.11.6**, the
+//! newest release that COMPILES at 1.85. The crate compiles against it unchanged.
 //!
-//! The pin has a price and it is named in `deny.toml`: 0.12 reaches `paste`, which is
+//! THE PIN IS CHOSEN BY COMPILING, NOT BY READING MANIFESTS, and an earlier revision of this
+//! change got that wrong: it pinned 0.12.0 on the strength of its `rust-version = "1.82.0"`.
+//! That declaration is false. `cel-0.12.0/src/objects.rs` upcasts `&dyn Opaque` to `&dyn Any`
+//! in an unconditional `impl dyn Opaque` block, and trait upcasting coercion stabilized in
+//! Rust 1.86, so `cargo check` at 1.85 fails there with E0658 -- upstream corrected the
+//! manifest in 0.13.0. 0.13 and 0.14 declare 1.86 honestly. So the real floor of every release
+//! above 0.11.6 is 1.86, and the one that says otherwise is the one that says it wrongly.
+//! `scripts/msrv-audit.sh` cannot see this: it reads DECLARED fields and says so in its own
+//! header. The msrv CI lane compiling this crate at 1.85 is what holds the pin honest.
+//!
+//! The pin has a price and it is named in `deny.toml`: 0.11.6 reaches `paste`, which is
 //! unmaintained (RUSTSEC-2024-0436) where 0.14 moved to the maintained fork. That is a
 //! maintenance notice against a compile-time proc macro rather than a defect, and it carries a
 //! scoped ignore. When the workspace MSRV moves to 1.86 or above, drop the ignore and take
@@ -256,7 +265,7 @@ pub enum CostError {
 /// covers it, and it is checked from the PARSED TREE, so a caller cannot reach it by spelling.
 ///
 /// IT IS A DENYLIST AND SHARES A DENYLIST'S WEAKNESS. `matches` is the only regex entry point
-/// in `cel` 0.12 -- `regex::Regex::new` appears once in its `functions.rs` -- so today this is
+/// in `cel` 0.11.6 -- `regex::Regex::new` appears once in its `functions.rs` -- so today this is
 /// complete for the cost this shape. A future `cel` that adds another unpriceable function
 /// admits it here silently. What would close that properly is an ALLOWLIST of functions whose
 /// cost the model can state, which is a larger change than this one.
@@ -704,7 +713,9 @@ pub fn estimate_parsed_cost(expression: &Expr, shape: InputShape) -> u64 {
 ///
 /// # Errors
 ///
-/// [`CostError::Uncompilable`] when the expression does not compile, and
+/// [`CostError::Uncompilable`] when the expression does not compile,
+/// [`CostError::Unpriceable`] when it calls a function in [`UNPRICEABLE_FUNCTIONS`] -- checked
+/// before the estimate, because for those the estimate is absent rather than wrong -- and
 /// [`CostError::OverBudget`] when its estimate exceeds `budget`.
 pub fn compile_within_budget(
     expression: &str,

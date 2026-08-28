@@ -110,20 +110,26 @@ fn refusal_reason(refusal: &MappingRefusal) -> &'static str {
         // alternative is a catch-all arm that would give a future reason the wrong token
         // silently -- which is the one thing the distinctness test exists to prevent.
         RefusalReason::TooManyClaims => "too_many_claims",
-        // The `cel` rule's three (issue #113 criterion 2). The first two ARE reachable from
-        // this surface and are the point of it: `validate` compiles every expression against
-        // the cost budget, so an operator who writes one too expensive to run learns it here,
-        // in a 400 they read, rather than from failed logins.
+        // The `cel` rule's five WRITE-time refusals (issue #113 criterion 2). All five are
+        // reachable from this surface and are the point of it: `validate` size-checks and then
+        // compiles every expression against the cost budget, so an operator who writes one we
+        // will not run learns it here, in a 400 they read, rather than from failed logins.
         //
         // Separate tokens for separate operator actions, which is what this function is for:
         // an auditor grouping by reason can tell "someone is writing expressions we refuse to
         // run" from "someone has a typo", and those want different responses.
+        //
+        // The three COMPILE refusals first.
         RefusalReason::ExpressionUncompilable => "expression_uncompilable",
         RefusalReason::ExpressionOverBudget => "expression_over_budget",
-        // The two SIZE refusals, distinct from the cost one because the operator's next action
-        // differs: over budget means "flatten it or declare the cardinality you have", too
-        // long means "this is not a mapping rule any more".
+        // Not a cost verdict but the ABSENCE of one: the expression calls a function whose cost
+        // the iteration model cannot see (`matches`, whose cost lives in the binding), so it is
+        // refused rather than priced. The operator's next action is "express this without that
+        // function, or use a hook", which is neither of the two below.
         RefusalReason::ExpressionUnpriceable => "expression_unpriceable",
+        // Then the two SIZE refusals, distinct from the cost ones because the operator's next
+        // action differs: over budget means "flatten it or declare the cardinality you have",
+        // too long means "this is not a mapping rule any more".
         RefusalReason::ExpressionTooLong => "expression_too_long",
         RefusalReason::DeclaredCardinalityTooLarge => "declared_cardinality_too_large",
         // UNREACHABLE from this surface, like `too_many_claims` above and for the same kind of

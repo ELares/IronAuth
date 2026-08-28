@@ -1912,22 +1912,30 @@ pub struct SetClaimsMappingRequest {
     ///   expression, for the cases the four above cannot express. The expression reads one
     ///   binding, `claims`, holding the claim set as earlier rules left it.
     ///
-    ///   Three refusals happen when this request is made rather than at a later login:
+    ///   Five refusals happen when this request is made rather than at a later login:
     ///   `expression_too_long` (over 2048 bytes of source), `declared_cardinality_too_large`
-    ///   (`max_collection_size` above 100000), and `expression_over_budget` -- the iteration
-    ///   cost model, which prices a nested comprehension at `n^(depth+1)` against the declared
-    ///   `max_collection_size`.
+    ///   (`max_collection_size` above 100000), `expression_uncompilable` (it does not parse),
+    ///   `expression_over_budget` -- the iteration cost model, which prices a nested
+    ///   comprehension at `n^(depth+1)` against the declared `max_collection_size` -- and
+    ///   `expression_unpriceable`, for an expression calling a function whose cost that model
+    ///   cannot see. Those five are the tokens the AUDIT stream records; the 400 body carries
+    ///   `error: "bad_request"` and a prose reason, not the token.
     ///
     ///   `max_collection_size` is the operator's declaration about their OWN data, and it is
     ///   both the `n` the budget uses and the limit the input is checked against at issuance.
     ///   Declaring more than you have refuses expressions that would have run; declaring less
     ///   makes evaluation fail at issuance with `expression_failed`.
     ///
-    ///   THE LENGTH CAP IS NOT REDUNDANT WITH THE BUDGET. The cost model prices ITERATION, and
-    ///   an expression with no comprehension is priced at its floor whatever it contains -- so
-    ///   the budget cannot see a long chain of per-call work such as repeated `matches()`.
-    ///   Measured: 2 KiB of that shape evaluates in about 450 ms, 34 KiB in 6.3 seconds. The
-    ///   length cap is what bounds it. An expression that needs more room than this is a
+    ///   THE LENGTH CAP IS NOT REDUNDANT WITH THE BUDGET, and it is not what bounds per-call
+    ///   work either. The cost model prices ITERATION, and an expression with no comprehension
+    ///   is priced at its floor whatever it contains, so the budget cannot see per-call work
+    ///   at all. Where the cost of a call lives in the BINDING rather than in the expression,
+    ///   no length cap reaches it: `matches()` costs regex states times the HAYSTACK, and the
+    ///   haystack comes from `claims`, so 2 KiB of it against a 64 KiB claim value measured
+    ///   131.7 seconds. Such a function is therefore REFUSED outright -- that is
+    ///   `expression_unpriceable`, and `matches()` is the only member of that set today; it is
+    ///   refused at any length. What the length cap still does is bound how many PRICEABLE
+    ///   operations one expression can name. An expression that needs more room than this is a
     ///   program rather than a mapping rule, and the mechanism for one is a hook, which runs
     ///   under fuel, a memory cap and a deadline.
     ///

@@ -460,9 +460,17 @@ jobs:
       #
       # IRONAUTH-CEL WAS THE SECOND, AND IT CAME OUT (issue #113 criterion 2), which is what
       # that sentence looks like when it is honoured. Wiring the CEL cost budget into issuance
-      # made the crate reachable, so rather than move the promise, `cel` is pinned to 0.12,
-      # which declares 1.82. The pin's cost is one scoped advisory ignore, recorded in
-      # deny.toml. The crate is now checked by the workspace line below like any other.
+      # made the crate reachable, so rather than move the promise, `cel` is pinned to exactly
+      # 0.11.6 -- the newest release that COMPILES at 1.85. Not the newest that DECLARES a
+      # floor at or below it: 0.12.0 declares 1.82.0 and needs 1.86 in fact, because
+      # `objects.rs` upcasts `&dyn Opaque` to `&dyn Any` and trait upcasting stabilized in
+      # 1.86. An earlier revision of this branch pinned 0.12 on the strength of that manifest
+      # and would have turned this lane red on merge. The pin's cost is one scoped advisory
+      # ignore, recorded in deny.toml. The crate is now checked by the workspace line below
+      # like any other, which is also what compiles it at exactly the number
+      # docs/COMPATIBILITY.md publishes for it -- the check that would have caught the wrong
+      # manifest, and the reason `scripts/msrv-audit.sh` alone is not enough (it reads
+      # DECLARED fields, and this is a case of a declared field being false).
       #
       # This lane has been RED on main since ironauth-cel landed (#993); branch protection
       # requires a review but no CI job, so nothing surfaced it. Fixed here because a branch
