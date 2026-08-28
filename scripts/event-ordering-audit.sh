@@ -15,17 +15,25 @@
 # it" and the registry it generated recorded one row as appender-ordered. Both were wrong in
 # the same direction: the one function serialised against other lock-takers,
 # `publish_snapshot_inner`, takes the advisory lock DIRECTLY and never goes through the
-# appender.) Every producer goes through `enqueue_domain_event`, which takes no
-# lock, so its rows carry the divergence `events_cursor_ordering.rs::
-# the_feed_orders_by_sequence_which_is_not_commit_order` measures: a sequence is allocated
-# when the row is written, not when its transaction commits, so two overlapping transactions
-# can commit in the opposite order to their sequences.
+# appender.)
 #
-# That is not a bug to be fixed by routing everything through the appender. The lock is held
-# to COMMIT, so putting session-ended and token metering behind it serialises sign-in per
-# environment: `append_lock_key` hashes tenant and environment, and both `insert_session_row`
-# and `meter_token_issued` sit on those paths. Trading a throughput cliff on the
-# authentication path for a documentation sentence is the wrong trade.
+# THAT WAS TRUE AND IS NOT ANY MORE, and the paragraph it replaces argued against the change
+# that made it false, so it is worth stating both. It read: "Every producer goes through
+# `enqueue_domain_event`, which takes no lock ... That is not a bug to be fixed by routing
+# everything through the appender. The lock is held to COMMIT, so putting session-ended and
+# token metering behind it serialises sign-in per environment ... Trading a throughput cliff
+# on the authentication path for a documentation sentence is the wrong trade."
+#
+# The reasoning about COST was right and the conclusion has been overruled by issue #107
+# criterion 2, which asks for commit-ordered events in as many words. `enqueue_domain_event`
+# now takes the per-scope append lock at the INSERT, so every producer takes it -- the
+# authentication path included -- and the cost that paragraph names is now being paid rather
+# than avoided. `docs/EVENTS-VS-WEBHOOKS.md` says so to consumers in the same terms.
+#
+# What is NOT bought: an event and a webhook DELIVERY row in one scope are still unordered
+# relative to each other, because the lock is scoped to event rows. Interleaving a delivery
+# row changes the sequences two events get and not their order relative to one another, which
+# is all the criterion asks for.
 #
 # (An earlier version of this comment cited
 # `events_cursor_ordering.rs::an_unrelated_open_transaction_stalls_the_whole_feed` as having
@@ -63,8 +71,13 @@
 # The naming point that column was carrying is still worth keeping, because it is why nobody
 # should reintroduce it casually: `pg_advisory_xact_lock` excludes only other sessions
 # requesting the SAME key. A lock-taker's rows are serialised against other lock-takers and
-# against nothing else, and with zero production lock-takers reached through the appender,
-# "commit-ordered" would have named a guarantee no consumer actually receives.
+# against nothing else.
+#
+# That used to end "and with zero production lock-takers reached through the appender,
+# 'commit-ordered' would have named a guarantee no consumer actually receives" -- true when
+# the only lock sat on a method nothing called, and false now that every event insert takes
+# one. What the caveat still means is the delivery-row exclusion above: same key, same
+# guarantee, and a webhook delivery row is not on that key.
 #
 # WHY A REGISTRY AND NOT A LINT. A new producer joining the sequence-ordered set is a
 # legitimate choice most of the time. What must not happen is joining it SILENTLY, which is
@@ -537,9 +550,11 @@ if ! git diff --exit-code "$INVENTORY"; then
     echo
     echo "                      What the feed guarantees for every producer is completeness"
     echo "                      and replay stability, from the visibility watermark in"
-    echo "                      events_after. It does NOT guarantee that sequence order equals"
-    echo "                      commit order, so a consumer that needs commit order needs more"
-    echo "                      than a place on this list. See docs/EVENTS-VS-WEBHOOKS.md."
+    echo "                      events_after -- and, since issue #107 criterion 2, that within"
+    echo "                      one environment sequence order EQUALS commit order, because the"
+    echo "                      per-scope append lock is taken at the event insert itself. This"
+    echo "                      text used to say the opposite, which was accurate while the only"
+    echo "                      lock sat on an appender nothing called."
     exit 1
 fi
 

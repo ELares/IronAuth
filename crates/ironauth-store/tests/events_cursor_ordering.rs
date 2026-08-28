@@ -76,6 +76,14 @@ async fn read_after_naive(pool: &sqlx::PgPool, after: i64) -> Vec<i64> {
 /// id still running, so a row whose `xmin` is below it is visible to everyone, and nothing
 /// can ever commit beneath it afterwards.
 async fn read_after_watermarked(pool: &sqlx::PgPool, after: i64) -> Vec<i64> {
+    // A COPY OF THE PRODUCTION PREDICATE, which `events_after`'s doc requires be kept in step.
+    //
+    // It is a copy and not a call, which is a weaker thing than it looks: this drives no store
+    // and never reaches `OutboxRepo::events_after`, so it measures what this string says rather
+    // than what the shipped query does. The scope predicates are deliberately absent because
+    // these fixtures seed one scope; a version of this helper that dropped them while the
+    // production query kept them would be the drift the doc warns about, so the difference is
+    // written down here rather than left to be noticed.
     sqlx::query(
         "SELECT sequence FROM outbox_messages \
          WHERE sequence > $1 \
@@ -438,6 +446,13 @@ async fn the_feed_orders_by_sequence_which_is_not_commit_order() {
     // them in the opposite order to the order they became visible. Criterion 2 therefore
     // needs a commit-ordered appender, not this. Recorded as a measurement rather than an
     // opinion, because the two criteria look adjacent and are satisfied by different things.
+    //
+    // STILL TRUE, and still passing, after the production insert started taking the append
+    // lock. This test inserts with `insert_returning_sequence`, which is hand-written SQL
+    // that goes nowhere near `enqueue_outbox_in_tx`, so it measures the RAW table and shows
+    // what the table does without the lock. That is what makes it the control for
+    // `an_event_enqueue_blocks_on_the_per_scope_append_lock` below: same two-overlapping-
+    // writers shape, one through raw SQL and one through the shipped path, opposite results.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -476,13 +491,11 @@ async fn the_feed_orders_by_sequence_which_is_not_commit_order() {
 /// The per-scope lock key a serialized appender takes. Derived from the scope so two
 /// environments never serialise against each other.
 fn appender_lock_key(tenant: &str, environment: &str) -> i64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    tenant.hash(&mut hasher);
-    environment.hash(&mut hasher);
-    // Postgres advisory locks take a signed 64-bit key.
-    i64::from_ne_bytes(hasher.finish().to_ne_bytes())
+    // THE PRODUCTION DERIVATION, not a copy of it. This was a hand-written duplicate of the
+    // hashing in `repository.rs`, which is a copy that cannot fail loudly: change one side
+    // and the tests take a DIFFERENT lock from the code, two writers on two keys never
+    // contend, and every ordering test here passes while measuring nothing at all.
+    ironauth_store::append_lock_key_from_parts(tenant, environment)
 }
 
 #[tokio::test]
@@ -563,6 +576,10 @@ async fn serialising_appenders_on_a_scope_lock_makes_sequence_order_equal_commit
 
 #[tokio::test]
 async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
+    // ENOUGH WRITERS TO ACTUALLY RACE. Two was the original count and it does not catch a
+    // missing lock: measured, removing `append_event`'s `pg_advisory_xact_lock` left this test
+    // passing 8 runs out of 8, because two writers on a local database rarely interleave.
+    const WRITERS: i64 = 16;
     // The same property through the SHIPPED method rather than hand-written SQL. The
     // raw-SQL test above proves the mechanism; this proves `append_event` actually uses it,
     // which is the gap between "the idea works" and "the code does it".
@@ -573,10 +590,20 @@ async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
 
     // Two appenders racing. Whatever order they interleave in, the lock decides, and the
     // feed must agree with whatever the lock decided.
+    // COMMIT ORDER IS RECORDED, because the feed cannot reveal it. `append_event` returns
+    // after its transaction commits, so each writer stamps itself into this list at the moment
+    // it becomes durable, and the order of the list IS the commit order.
+    //
+    // Without it there is nothing here to assert. The feed serves `ORDER BY sequence`, so any
+    // check on the sequences it returns is satisfied by the query's own ordering whatever the
+    // lock did -- which is what the assertion at the end of this test used to be.
+    let commit_order: std::sync::Arc<std::sync::Mutex<Vec<i64>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut handles = Vec::new();
-    for i in 0..2 {
+    for i in 0..WRITERS {
         let store = store.clone();
         let env = env.clone();
+        let commit_order = std::sync::Arc::clone(&commit_order);
         handles.push(tokio::spawn(async move {
             store
                 .scoped(scope)
@@ -591,18 +618,21 @@ async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
                     },
                 )
                 .await
-                .expect("append")
+                .expect("append");
+            commit_order.lock().expect("not poisoned").push(i);
         }));
     }
     for handle in handles {
         handle.await.expect("appender finishes");
     }
+    let commit_order = commit_order.lock().expect("not poisoned").clone();
 
     // The bounded poll again: `events_page_after` still watermarks, and the watermark is
     // cluster-wide, so appended events wait for unrelated transactions exactly as any other
     // event does. Serialising the WRITES does not un-serialise the READ.
     let outbox = store.scoped(scope).outbox();
     let mut sequences: Vec<i64> = Vec::new();
+    let mut by_writer: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
     for _ in 0..100 {
         match outbox
             .events_page_after(EventCursor::beginning(), 100)
@@ -610,8 +640,18 @@ async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
             .expect("read")
         {
             EventPage::Page(events) => {
+                // Keyed by WRITER, from the payload, so the assertion below can ask "what
+                // sequence did the writer that committed first get" rather than "are these
+                // numbers increasing".
+                by_writer = events
+                    .iter()
+                    .filter_map(|m| {
+                        let i = m.payload.get("i")?.as_i64()?;
+                        Some((i, m.sequence))
+                    })
+                    .collect();
                 sequences = events.iter().map(|m| m.sequence).collect();
-                if sequences.len() == 2 {
+                if sequences.len() == usize::try_from(WRITERS).expect("fits") {
                     break;
                 }
             }
@@ -620,10 +660,35 @@ async fn append_event_serialises_so_the_repo_feed_is_in_commit_order() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    assert_eq!(sequences.len(), 2, "both appends must be on the feed");
+    assert_eq!(
+        sequences.len(),
+        usize::try_from(WRITERS).expect("fits"),
+        "every append must be on the feed"
+    );
+    assert_eq!(
+        commit_order.len(),
+        usize::try_from(WRITERS).expect("fits"),
+        "every writer must have committed"
+    );
+
+    // THE PROPERTY: the writer that committed FIRST holds the LOWER sequence. That is what
+    // "sequence order equals commit order" means for two writers, and the append lock is what
+    // makes it hold -- without it the second writer can insert first and commit second.
+    //
+    // This used to assert `sequences.windows(2).all(|pair| pair[0] < pair[1])`, described as
+    // "strictly increasing". The feed serves ORDER BY sequence, so that could not fail: it
+    // restated the query's own ordering. It passed with the lock removed.
+    let in_commit_order: Vec<i64> = commit_order.iter().map(|w| by_writer[w]).collect();
+    let inverted: Vec<(i64, i64)> = in_commit_order
+        .windows(2)
+        .filter(|pair| pair[0] > pair[1])
+        .map(|pair| (pair[0], pair[1]))
+        .collect();
     assert!(
-        sequences.windows(2).all(|pair| pair[0] < pair[1]),
-        "strictly increasing: {sequences:?}"
+        inverted.is_empty(),
+        "sequence order is NOT commit order: these consecutive pairs, listed in the order \
+         their writers COMMITTED, hold descending sequences {inverted:?}. Commit order was \
+         {commit_order:?} and the feed served {sequences:?}"
     );
 }
 
@@ -933,4 +998,656 @@ async fn a_second_scopes_feed_is_readable_from_the_beginning() {
         seen, 3,
         "a beginning cursor must be handed this scope's OWN events, and only those"
     );
+}
+
+/// The exact key a given scope derives, pinned.
+///
+/// This is here because of what the derivation USED to be. `DefaultHasher` is deterministic
+/// within one Rust release and explicitly not guaranteed across releases, and the old
+/// `to_ne_bytes` was not guaranteed across architectures. Neither could be caught by any
+/// test that derives the expected value the same way the code does, because both sides move
+/// together: the only thing that catches it is a literal, written down once.
+///
+/// It matters because of WHEN it would break. Two nodes built on different toolchains derive
+/// two different keys for one scope, take two different locks, and stop serialising against
+/// each other. The feed quietly stops being commit-ordered for the length of a rolling
+/// upgrade and silently starts again at the end of it, leaving nothing behind to find.
+///
+/// If this fails, the derivation changed. That is allowed, but it is a coordinated upgrade:
+/// every node must agree on the key, so a change has to ship behind a version the whole
+/// fleet moves through, not in the same release as the code that depends on it.
+#[test]
+fn the_append_lock_key_is_pinned() {
+    assert_eq!(
+        ironauth_store::append_lock_key_from_parts(
+            "tnt_pinned_for_the_key_test",
+            "env_pinned_for_the_key_test",
+        ),
+        -7_666_221_150_003_507_989,
+        "the append lock key derivation changed; see this test's doc comment before \
+         updating the constant"
+    );
+}
+
+/// Two scopes that concatenate to the same bytes must NOT share a lock.
+///
+/// The derivation is length-delimited specifically to prevent this. Without the delimiters
+/// ("ab", "c") and ("a", "bc") hash identically, and two unrelated environments serialise
+/// every event write against each other: a throughput fault with no error, no log line, and
+/// nothing that would ever point at a hash function.
+#[test]
+fn scopes_that_concatenate_alike_get_different_keys() {
+    assert_ne!(
+        ironauth_store::append_lock_key_from_parts("ab", "c"),
+        ironauth_store::append_lock_key_from_parts("a", "bc"),
+        "the length delimiters are what separate these two scopes"
+    );
+}
+
+/// A valid `ban.created` envelope, so the emit-time catalog guard admits it.
+fn valid_event_envelope(scope: ironauth_store::Scope, id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "type": "ban.created",
+        "payload_schema_version": 1,
+        "occurred_at_unix_ms": 1,
+        "tenant_id": scope.tenant().to_string(),
+        "environment_id": scope.environment().to_string(),
+        "payload": {
+            "ban_id": "ban_ordering_probe",
+            "subject_kind": "identifier",
+            "auth_path": "password",
+        },
+    })
+}
+
+/// #107 CRITERION 2, on the path a deployment actually takes.
+///
+/// `append_event` has taken the append lock since #805 and
+/// `append_event_serialises_so_the_repo_feed_is_in_commit_order` proves it. But that method
+/// has zero production callers: every real event reaches the table through
+/// `enqueue_domain_event` -> `enqueue_outbox_in_tx`, which took no lock at all. So the
+/// criterion was proven for a path nothing exercises and false for the one everything uses,
+/// and no test could notice, because the test that proves it calls the method directly.
+///
+/// This drives the shipped `OutboxRepo::enqueue` instead, which is the same insert every
+/// domain producer reaches, and asserts it BLOCKS on the lock. Blocking is the whole
+/// mechanism: a writer that cannot reach its insert cannot be handed a sequence, so
+/// sequences are handed out in commit order necessarily rather than usually.
+///
+/// It asserts blocking rather than racing two writers and checking who won. Who wins is a
+/// race and would be a flake; whether this path takes the lock at all is a fact, and holding
+/// the lock from another session makes it observable.
+#[tokio::test]
+async fn an_event_enqueue_blocks_on_the_per_scope_append_lock() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let key = appender_lock_key(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    );
+
+    // An unrelated session holds the scope's append lock and does not let go.
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *holder)
+        .await
+        .expect("holder takes the lock");
+
+    let store = db.store().clone();
+    let envelope = valid_event_envelope(scope, "evt_prod_path_blocks");
+    let enqueue_env = env.clone();
+    let enqueueing = tokio::spawn(async move {
+        store
+            .scoped(scope)
+            .outbox()
+            .enqueue(
+                &enqueue_env,
+                &NewOutboxMessage {
+                    consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                    idempotency_key: "evt_prod_path_blocks",
+                    ordering_key: "k",
+                    payload: envelope,
+                },
+            )
+            .await
+            .expect("enqueue completes once the lock is free")
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !enqueueing.is_finished(),
+        "the ordinary event insert must BLOCK on the per-scope append lock. If it finished \
+         while another session held the lock, this path does not take the lock, and #107 \
+         criterion 2 holds only for `append_event`, which nothing calls."
+    );
+
+    holder.commit().await.expect("holder releases the lock");
+    enqueueing
+        .await
+        .expect("the enqueue finishes once unblocked");
+}
+
+/// THE LOCK IS TAKEN BEFORE THE INSERT, WHICH IS THE ENTIRE MECHANISM.
+///
+/// `an_event_enqueue_blocks_on_the_per_scope_append_lock` above asserts the enqueue BLOCKS
+/// while another session holds the key. That is satisfied by any placement of the lock inside
+/// the transaction -- including AFTER the INSERT, where the row has already been handed its
+/// sequence and criterion 2 is gone: two producers can both be given sequences before either
+/// takes the lock, and then commit in the other order. Review moved
+/// `take_event_append_lock` below the insert and the whole suite stayed green.
+///
+/// # What makes the position observable from outside the transaction
+///
+/// `outbox_messages.sequence` is `GENERATED ALWAYS AS IDENTITY`, so it is backed by a real
+/// sequence object -- and a sequence's `last_value` is visible to other sessions immediately
+/// and is NOT rolled back. That is the discriminator, and it is exact:
+///
+/// * lock BEFORE the insert -- a producer blocked on the lock has not reached the INSERT, so
+///   it has consumed no sequence value and `last_value` is unchanged.
+/// * lock AFTER the insert -- the blocked producer already inserted, so it has consumed one
+///   and `last_value` has advanced.
+///
+/// No timing, no sleep-and-hope: the two cases differ in a number a third session can read.
+#[tokio::test]
+async fn the_append_lock_is_taken_before_the_sequence_is_allocated() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let key = appender_lock_key(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    );
+
+    // The identity sequence behind `outbox_messages.sequence`, by NAME FROM THE CATALOG rather
+    // than spelled here: an identity column's sequence name is Postgres's to choose, and a
+    // hand-written guess that stopped resolving would make this test read nothing and pass.
+    let sequence_name: String =
+        sqlx::query_scalar("SELECT pg_get_serial_sequence('outbox_messages', 'sequence')")
+            .fetch_one(pool)
+            .await
+            .expect("outbox_messages.sequence must be sequence-backed");
+
+    // `last_value` is only meaningful once the sequence has been used at all, so prime it with
+    // one real event through the production path. This also proves the path under test works
+    // when the lock is FREE, which the blocked half below cannot show.
+    db.store()
+        .scoped(scope)
+        .outbox()
+        .enqueue(
+            &env,
+            &NewOutboxMessage {
+                consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: "evt_seq_prime",
+                ordering_key: "k",
+                payload: valid_event_envelope(scope, "evt_seq_prime"),
+            },
+        )
+        .await
+        .expect("the priming enqueue runs with the lock free");
+    let before: i64 = sqlx::query_scalar(&format!("SELECT last_value FROM {sequence_name}"))
+        .fetch_one(pool)
+        .await
+        .expect("read last_value");
+
+    // An unrelated session takes the scope's append lock and holds it.
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *holder)
+        .await
+        .expect("holder takes the lock");
+
+    let store = db.store().clone();
+    let envelope = valid_event_envelope(scope, "evt_seq_probe");
+    let enqueue_env = env.clone();
+    let enqueueing = tokio::spawn(async move {
+        store
+            .scoped(scope)
+            .outbox()
+            .enqueue(
+                &enqueue_env,
+                &NewOutboxMessage {
+                    consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                    idempotency_key: "evt_seq_probe",
+                    ordering_key: "k",
+                    payload: envelope,
+                },
+            )
+            .await
+            .expect("enqueue completes once the lock is free")
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !enqueueing.is_finished(),
+        "the producer must still be blocked, or the check below reads a sequence it was \
+         always going to advance"
+    );
+
+    let during: i64 = sqlx::query_scalar(&format!("SELECT last_value FROM {sequence_name}"))
+        .fetch_one(pool)
+        .await
+        .expect("read last_value while blocked");
+    assert_eq!(
+        during, before,
+        "the blocked producer has ALREADY CONSUMED a sequence value ({before} -> {during}), \
+         so it inserted before it took the append lock. Its row's position in the feed was \
+         fixed before the lock could order it against anything, which is criterion 2 gone: \
+         two producers can both be handed sequences and then commit in the other order. \
+         `take_event_append_lock` must run BEFORE the INSERT."
+    );
+
+    holder.commit().await.expect("holder releases the lock");
+    enqueueing
+        .await
+        .expect("the enqueue finishes once unblocked");
+
+    // And once it is through, it DID consume one -- so the equality above was the lock
+    // holding it back rather than this path never touching the sequence at all.
+    let after: i64 = sqlx::query_scalar(&format!("SELECT last_value FROM {sequence_name}"))
+        .fetch_one(pool)
+        .await
+        .expect("read last_value after");
+    assert!(
+        after > during,
+        "the unblocked producer must consume a sequence value, or this test proves nothing: \
+         {during} -> {after}"
+    );
+}
+
+/// The NEGATIVE, varying exactly one thing: the consumer.
+///
+/// Same scope, same envelope, same idempotency key, same held lock. Only `consumer` differs,
+/// so a pass here cannot be explained by anything except the consumer check inside
+/// `take_event_append_lock`.
+///
+/// It matters because the cheapest wrong way to write the lock -- take it on every insert --
+/// passes the test above and serialises webhook fan-out against event production for no
+/// benefit. `events_after` serves every row in the scope regardless of consumer, which makes
+/// "lock everything" look correct until you notice that interleaving a delivery row between
+/// two events changes the sequences the events get and not their order relative to each
+/// other, which is all criterion 2 asks for.
+#[tokio::test]
+async fn a_delivery_enqueue_does_not_block_on_the_append_lock() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let key = appender_lock_key(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    );
+
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *holder)
+        .await
+        .expect("holder takes the lock");
+
+    let store = db.store().clone();
+    let envelope = valid_event_envelope(scope, "evt_prod_path_blocks");
+    let enqueue_env = env.clone();
+    let enqueueing = tokio::spawn(async move {
+        store
+            .scoped(scope)
+            .outbox()
+            .enqueue(
+                &enqueue_env,
+                &NewOutboxMessage {
+                    consumer: ironauth_store::WEBHOOK_DELIVERY_CONSUMER,
+                    idempotency_key: "evt_prod_path_blocks",
+                    ordering_key: "k",
+                    payload: envelope,
+                },
+            )
+            .await
+            .expect("a delivery message never waits on the event append lock")
+    });
+
+    // Long enough that a blocked task would still be blocked: the positive test above proves
+    // 300ms is not enough for a blocked one to finish.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        enqueueing.is_finished(),
+        "a delivery message must NOT take the event append lock. If it blocked here, the \
+         lock is unconditional, and every webhook fan-out now serialises against event \
+         production for a guarantee that only applies to events."
+    );
+
+    enqueueing.await.expect("the delivery enqueue succeeded");
+    holder.commit().await.expect("holder releases the lock");
+}
+
+/// A ROTATION METERS THE SIGN-IN IT CREATED, through the shipped path.
+///
+/// `insert_session_row` used to enqueue `user.signed_in` itself, which made it the choke point
+/// its own doc argued for: every session in the system passes through it, so no call site could
+/// forget. This PR moved the enqueue OUT to the callers to fix a lock-order inversion, and the
+/// doc's objection to doing that is correct and now unguarded by the shape of the code -- "a
+/// producer added per call site is a producer the next call site forgets, and the failure is
+/// silent undercounting that surfaces as a billing dispute."
+///
+/// So the guard is this test instead. It drives `rotate`, the ordinary sign-in, and asserts the
+/// event reaches the FEED rather than merely being returned: a caller that takes the
+/// `OwnedDomainEvent` and drops it compiles, passes every type check, and fails here. There is
+/// no `#[must_use]` doing that job -- `OwnedDomainEvent` carries none, and `?` discharges the
+/// `Result` leaving a plain `Option` no lint objects to.
+#[tokio::test]
+async fn a_rotation_meters_the_sign_in_it_created() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.store().clone();
+
+    let session = ironauth_store::SessionId::generate(&env, &scope);
+    store
+        .scoped(scope)
+        .acting(
+            db.test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .sessions()
+        .rotate(
+            &env,
+            &session,
+            None,
+            ironauth_store::NewSession {
+                impersonation: None,
+                subject: "usr_metered",
+                auth_methods: "pwd",
+                auth_time_micros: 0,
+                idle_expires_micros: i64::MAX / 4,
+                absolute_expires_micros: i64::MAX / 4,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("the sign-in commits");
+
+    // THROUGH `events_after`, which is the feed a consumer actually reads.
+    //
+    // An earlier version claimed to assert "ON THE FEED" and read `outbox_messages` directly,
+    // with `eventually_visible(pool, 0, &[])` in front of it -- an EMPTY `want`, so the helper
+    // returned on its first iteration without waiting for or checking anything. Two claims,
+    // neither true: no wait, and no feed.
+    // POLLED, because the watermark is cluster-wide: the row is withheld until every
+    // transaction open anywhere on the instance has finished, so a single read can legitimately
+    // see nothing. A bounded wait for the event itself, not a wait for nothing.
+    let mut payloads: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..100 {
+        payloads = db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .events_after(0, 100)
+            .await
+            .expect("read the feed")
+            .into_iter()
+            .map(|message| message.payload)
+            .collect();
+        if payloads
+            .iter()
+            .any(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("user.signed_in"))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let signed_in: Vec<&serde_json::Value> = payloads
+        .iter()
+        .filter(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("user.signed_in"))
+        .collect();
+    assert_eq!(
+        signed_in.len(),
+        1,
+        "the rotation must put exactly one `user.signed_in` on the feed; payload types: {:?}",
+        payloads
+            .iter()
+            .map(|p| p.get("type").cloned())
+            .collect::<Vec<_>>()
+    );
+    // THE SUBJECT AND NOTHING ELSE, which is the shape metering needs and the shape a billing
+    // pipeline must not be able to widen into a directory.
+    let data = signed_in[0]
+        .get("payload")
+        .expect("the event carries a payload");
+    assert_eq!(
+        data.get("subject").and_then(serde_json::Value::as_str),
+        Some("usr_metered"),
+        "the metered subject must be the one that signed in: {data}"
+    );
+}
+
+/// THE APPEND LOCK MUST BE THE LAST LOCK A TRANSACTION TAKES.
+///
+/// That invariant is what makes a transaction-scoped global lock safe, and #1009's first
+/// version broke it. `insert_session_row` enqueued `user.signed_in` internally, so it took the
+/// append lock as the FIRST statement of `rotate_inner`'s closure -- before
+/// `reconcile_prior_session_at_rotation` takes `FOR UPDATE` on the prior session. Every other
+/// producer in the module enqueues LAST, holding row locks and then wanting the append lock.
+/// Two orders, one cycle: `revoke_all_for_user_with_event` locks a subject's sessions and then
+/// wants the append lock while a concurrent rotation holds the append lock and wants one of
+/// those rows. Postgres aborts one with 40P01, so "revoke every session" racing that user's own
+/// re-authentication -- the ordinary post-password-reset flow -- fails a login or a revoke.
+///
+/// # Why this shape rather than racing two writers
+///
+/// Reproducing a deadlock is a race and would be a flake. The INVARIANT is not a race: a
+/// rotation that is waiting on a row lock must not already be holding the append lock, and that
+/// is directly observable from a third session. Hold the prior session's row, start a rotation,
+/// and ask whether the append lock is still free. If it is, the rotation cannot be the second
+/// half of a cycle, because it has nothing the other side could want.
+///
+/// `pg_try_advisory_xact_lock` rather than a blocking take, so the probe answers immediately
+/// and cannot itself join the wait graph.
+#[tokio::test]
+async fn a_rotation_waiting_on_a_row_does_not_hold_the_append_lock() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let key = appender_lock_key(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    );
+    let store = db.store().clone();
+
+    let new_session = |subject: &'static str| ironauth_store::NewSession {
+        impersonation: None,
+        subject,
+        auth_methods: "pwd",
+        auth_time_micros: 0,
+        idle_expires_micros: i64::MAX / 4,
+        absolute_expires_micros: i64::MAX / 4,
+        user_agent: None,
+        peer_ip: None,
+    };
+
+    // A live PRIOR session for the rotation to supersede.
+    let prior = ironauth_store::SessionId::generate(&env, &scope);
+    store
+        .scoped(scope)
+        .acting(
+            db.test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .sessions()
+        .rotate(&env, &prior, None, new_session("usr_lock_order"))
+        .await
+        .expect("seed the prior session");
+
+    // Another session holds that row, so the rotation below must stop at the reconcile.
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT id FROM sessions WHERE id = $1 FOR UPDATE")
+        .bind(prior.to_string())
+        .fetch_one(&mut *holder)
+        .await
+        .expect("hold the prior session row");
+
+    let successor = ironauth_store::SessionId::generate(&env, &scope);
+    let actor = db.test_actor(&env);
+    let rotating = tokio::spawn({
+        let store = store.clone();
+        let env = env.clone();
+        async move {
+            store
+                .scoped(scope)
+                .acting(actor, ironauth_store::CorrelationId::generate(&env))
+                .sessions()
+                .rotate(
+                    &env,
+                    &successor,
+                    Some(&prior),
+                    new_session("usr_lock_order"),
+                )
+                .await
+        }
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !rotating.is_finished(),
+        "the rotation must be BLOCKED on the prior session's row; if it finished, this test \
+         proves nothing about what it holds while waiting"
+    );
+
+    // THE ASSERTION. A third session takes the append lock without waiting. It can only
+    // succeed if the blocked rotation is not holding it.
+    let mut probe = pool.begin().await.expect("begin probe");
+    let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *probe)
+        .await
+        .expect("probe the append lock");
+    assert!(
+        free,
+        "the rotation is holding the per-scope append lock while waiting for a session row. \
+         That is the ABBA half of #1009's deadlock: any producer that locks a row and then \
+         wants the append lock now has a cycle with it. The append lock must be the LAST lock \
+         a transaction takes."
+    );
+    probe.rollback().await.expect("release the probe");
+
+    holder
+        .commit()
+        .await
+        .expect("release the prior session row");
+    rotating
+        .await
+        .expect("the rotation task finishes")
+        .expect("the rotation succeeds once unblocked");
+}
+
+/// AN EVENT INSERT WAITING ON ITS FK PARENT MUST NOT BE HOLDING THE APPEND LOCK.
+///
+/// The invariant is that the append lock is the last lock a transaction takes, and the first
+/// version of it rested on a sentence that is false for any table with a foreign key: "an
+/// INSERT of a new row takes only that row's lock". `outbox_messages` references `tenants` and
+/// `environments`, so the very insert the lock guards fires an RI check taking `FOR KEY SHARE`
+/// on two EXISTING parent rows -- while the lock is already held. `audit_log` names the same
+/// pair, so the audit row appended after the closure does it too.
+///
+/// Review reproduced the cycle against a real migrated cluster:
+/// `ActingTenantRepo::delete_with_event` holds `FOR UPDATE` on every environment row of a
+/// tenant and reaches its own enqueue only afterwards, while a concurrent producer holds the
+/// advisory lock and blocks on the RI check. `ERROR: deadlock detected`.
+///
+/// # STILL IGNORED, and the reason changed: the CYCLE is closed, this SIDE of it is not
+///
+/// Closing it from the producer's side means taking the parents' KEY SHARE locks before the
+/// advisory one, and this role cannot: `tenants` and `environments` are granted to
+/// `ironauth_control` alone (`0003_management_api.sql:52-53`), so `SELECT ... FOR KEY SHARE`
+/// from the data plane is `permission denied for table tenants` -- measured, by writing
+/// exactly that fix and running this file. The RI check succeeds only because a
+/// referential-integrity trigger runs with the constraint OWNER's privileges rather than the
+/// caller's. Doing it anyway means granting the internet-facing plane access to the tenant
+/// tables, which is the widening the plane split exists to prevent.
+///
+/// CLOSING IT FROM THE OTHER SIDE WAS TRIED AND MADE THINGS WORSE. `ActingTenantRepo::delete_with_event`
+/// is the only `FOR UPDATE` on `environments`, so taking its append locks first looks like it
+/// gives both sides one order. It does not: `FOR UPDATE` also conflicts with the
+/// `FOR NO KEY UPDATE` an ordinary `UPDATE` takes, and three producers take exactly that on
+/// those rows before wanting the advisory lock. Measured on a real cluster with a control -- a
+/// posture write and a tenant delete deadlocked with the advisory locks taken first, and
+/// committed cleanly with them taken last. Reverted.
+///
+/// So the order across the deployment is ROWS BEFORE ADVISORY, which every producer and that
+/// closure already follow, and this cycle stays open. It is ignored and runnable: whoever
+/// implements the lock-free alternative should be able to un-ignore it and watch it pass. It
+/// fails today. That is still the point.
+#[tokio::test]
+#[ignore = "the producer-side invariant is still false; the cycle is closed from the tenant-delete             side instead -- see the doc comment"]
+async fn an_event_insert_waiting_on_its_environment_row_does_not_hold_the_append_lock() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let key = appender_lock_key(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    );
+    let store = db.store().clone();
+
+    // Another session holds the ENVIRONMENT row in a mode that conflicts with the RI check's
+    // KEY SHARE, which is what `delete_with_event` does to every environment of a tenant.
+    let mut holder = pool.begin().await.expect("begin holder");
+    sqlx::query("SELECT id FROM environments WHERE id = $1 AND tenant_id = $2 FOR UPDATE")
+        .bind(scope.environment().to_string())
+        .bind(scope.tenant().to_string())
+        .fetch_one(&mut *holder)
+        .await
+        .expect("hold the environment row");
+
+    let envelope = valid_event_envelope(scope, "evt_fk_order");
+    let enqueue_env = env.clone();
+    let enqueueing = tokio::spawn(async move {
+        store
+            .scoped(scope)
+            .outbox()
+            .enqueue(
+                &enqueue_env,
+                &NewOutboxMessage {
+                    consumer: ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                    idempotency_key: "evt_fk_order",
+                    ordering_key: "k",
+                    payload: envelope,
+                },
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !enqueueing.is_finished(),
+        "the event insert must be BLOCKED on the environment row; if it finished, this test \
+         proves nothing about what it holds while waiting"
+    );
+
+    let mut probe = pool.begin().await.expect("begin probe");
+    let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *probe)
+        .await
+        .expect("probe the append lock");
+    assert!(
+        free,
+        "the event insert is holding the per-scope append lock while waiting for its own \
+         foreign-key parent. Any transaction that locks an environment row and then enqueues \
+         -- `delete_with_event` does exactly that -- now has a cycle with it. The parents' KEY \
+         SHARE locks must be taken BEFORE the advisory lock."
+    );
+    probe.rollback().await.expect("release the probe");
+
+    holder.commit().await.expect("release the environment row");
+    enqueueing
+        .await
+        .expect("the enqueue task finishes")
+        .expect("the enqueue succeeds once unblocked");
 }

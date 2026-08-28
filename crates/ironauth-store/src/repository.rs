@@ -8412,6 +8412,18 @@ impl ActingUsageRepo<'_> {
         write_audited(
             spec,
             async |tx: &mut Transaction<'_, Postgres>| {
+                // THE IDEMPOTENCY WRITE FIRST, because it takes row locks and the append lock
+                // must be the last lock this transaction acquires.
+                //
+                // `insert_idempotency`'s first statement is an UNSCOPED prune --
+                // `DELETE FROM idempotency_keys WHERE expires_at <= now() ORDER BY expires_at
+                // LIMIT 100` -- so every concurrent idempotent writer in the deployment
+                // targets the same oldest rows. Running it while already holding the append
+                // lock is an ABBA cycle against any other idempotent write in the scope that
+                // pruned first and then wants the lock; review reproduced it. Moving it above
+                // the lock costs nothing: the prune and the key row are unrelated to the
+                // ordering the lock exists for.
+                insert_idempotency(tx, idempotency).await?;
                 // The same per-scope append lock `OutboxRepo::append_event` takes, so a
                 // publish orders against ordinary producers rather than racing them.
                 //
@@ -8430,7 +8442,6 @@ impl ActingUsageRepo<'_> {
                     .execute(&mut **tx)
                     .await?;
                 let id = enqueue_outbox_in_tx(tx, env, scope, message).await?;
-                insert_idempotency(tx, idempotency).await?;
                 Ok(id.to_string())
             },
             poison_after_audit,
@@ -20310,7 +20321,7 @@ impl ActingImpersonationAuthorizationRepo<'_> {
             Some(act),
         )
         .await?;
-        insert_session_row(
+        let signed_in = insert_session_row(
             &mut tx,
             env,
             scope,
@@ -20328,6 +20339,16 @@ impl ActingImpersonationAuthorizationRepo<'_> {
                 peer_ip: None,
             },
             now_micros,
+        )
+        .await?;
+        // The append lock is taken here and this transaction takes no row lock afterwards, so
+        // the "append lock last" invariant holds. `audit_impersonation_start` already ran
+        // ABOVE the insert on this path.
+        enqueue_domain_event(
+            &mut tx,
+            env,
+            scope,
+            signed_in.as_ref().map(OwnedDomainEvent::borrowed).as_ref(),
         )
         .await?;
         tx.commit().await?;
@@ -20457,7 +20478,10 @@ impl ActingSessionRepo<'_> {
                 target: id,
             },
             async move |tx| {
-                insert_session_row(tx, env, scope, id, params, now_micros).await?;
+                // HELD, NOT ENQUEUED YET. The enqueue takes the per-scope append lock and is
+                // therefore the last thing this closure does; see `insert_session_row` for the
+                // cycle that taking it first produced.
+                let signed_in = insert_session_row(tx, env, scope, id, params, now_micros).await?;
                 if let (Some(prior_id), Some(prior_text)) = (prior, &prior_text) {
                     *out = reconcile_prior_session_at_rotation(
                         PriorReconcile {
@@ -20488,6 +20512,17 @@ impl ActingSessionRepo<'_> {
                     env,
                     id,
                     params.impersonation,
+                )
+                .await?;
+                // LAST, after every row lock this transaction takes. `reconcile_prior_session_
+                // at_rotation` above locks the prior session `FOR UPDATE` and moves its client
+                // sessions and refresh families; doing that while already holding the append
+                // lock is the ABBA half of the deadlock.
+                enqueue_domain_event(
+                    tx,
+                    env,
+                    scope,
+                    signed_in.as_ref().map(OwnedDomainEvent::borrowed).as_ref(),
                 )
                 .await?;
                 Ok(())
@@ -20657,6 +20692,18 @@ impl ActingSessionRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         insert_idempotency(&mut tx, idempotency).await?;
         let mut flipped = 0_u64;
+        // COLLECTED, NOT ENQUEUED IN THE LOOP.
+        //
+        // Enqueuing per iteration takes the per-scope append lock on the first flipped session
+        // and holds it -- `pg_advisory_xact_lock` is held to commit -- across every remaining
+        // `UPDATE sessions` in this loop. A concurrent single revoke or a sign-in rotation
+        // holding one of those rows and wanting the append lock closes an ABBA cycle, and
+        // Postgres resolves it by aborting one side with 40P01.
+        //
+        // Draining after the loop keeps the append lock the LAST lock this transaction takes,
+        // which is the invariant that makes a transaction-scoped global lock safe. Ordering
+        // among the events is unchanged: they are appended in `ids` order either way.
+        let mut pending_events: Vec<&DomainEvent<'_>> = Vec::new();
         for (index, id) in ids.iter().enumerate() {
             // Scope-fence: a foreign-scope id is a uniform no-op (never a query).
             if id.scope() != scope {
@@ -20677,7 +20724,7 @@ impl ActingSessionRepo<'_> {
                 // Only what actually changed: a session already revoked is a no-op here, and
                 // announcing it would tell a receiver to tear down what it already has.
                 if let Some(events) = events {
-                    enqueue_domain_event(&mut tx, env, scope, Some(&events[index])).await?;
+                    pending_events.push(&events[index]);
                 }
             }
             // One audit row per session, so the trail names every revoked session
@@ -20695,6 +20742,10 @@ impl ActingSessionRepo<'_> {
                 None,
             )
             .await?;
+        }
+        // AFTER every row lock this transaction takes.
+        for event in pending_events {
+            enqueue_domain_event(&mut tx, env, scope, Some(event)).await?;
         }
         tx.commit().await?;
         Ok(flipped)
@@ -22128,6 +22179,9 @@ async fn enqueue_outbox_in_tx_at_inner(
             );
         }
     }
+    // BEFORE the insert, so the sequence this row is handed cannot be handed out until the
+    // previous event producer in this scope has committed. See `take_event_append_lock`.
+    take_event_append_lock(tx, scope, message.consumer).await?;
     let id = OutboxMessageId::generate(env, &scope);
     let now_micros = epoch_micros(env.clock().now_utc());
     let due_micros = not_before_unix_micros.unwrap_or(now_micros);
@@ -22219,6 +22273,10 @@ async fn enqueue_outbox_in_tx_ignoring_conflict(
             );
         }
     }
+    // THE SECOND insert into `outbox_messages`, and so the second place this lock has to be
+    // taken. The emit-time assertion above was missed here once for exactly this reason: a
+    // rule enforced at "the insert" has to be enforced at BOTH of them.
+    take_event_append_lock(tx, scope, message.consumer).await?;
     let id = OutboxMessageId::generate(env, &scope);
     let now_micros = epoch_micros(env.clock().now_utc());
     let inserted = sqlx::query(
@@ -22536,17 +22594,150 @@ pub enum EventPage {
 /// Per SCOPE rather than global, so one tenant's append rate never gates another's. The
 /// hash is not a security boundary and does not need to be: a collision between two scopes
 /// costs unnecessary serialisation, never a wrong order.
-fn append_lock_key(scope: Scope) -> i64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+/// Take the per-scope append lock when the row being inserted is an EVENT, so the feed's
+/// sequence order is the order the producing transactions COMMITTED (issue #107 criterion 2).
+///
+/// # Why the insert and not the producer
+///
+/// [`OutboxRepo::append_event`] has taken this lock since #805 and is correct, but it has
+/// zero production callers: every real event reaches the table through
+/// [`enqueue_domain_event`] instead. So the criterion was proven for a path no deployment
+/// exercises and false for every path one does, which is invisible precisely because the
+/// test that proves it passes. Putting the lock at the INSERT means a producer cannot get
+/// this wrong by choosing the wrong entry point.
+///
+/// # Why only event rows
+///
+/// [`OutboxRepo::events_after`] does NOT filter by consumer: it serves every row in the
+/// scope and its readers filter afterwards (`ironauth_admin::usage` does exactly that). It
+/// would be easy to read that as "every insert must take the lock", and it is worth saying
+/// why it does not. Interleaving a delivery row between two event rows changes the
+/// SEQUENCES the events get, but not their ORDER relative to each other, and their relative
+/// order is the whole of what criterion 2 asks for. Locking delivery rows too would
+/// serialise webhook fan-out against event production and buy nothing.
+///
+/// This keeps the property [`OutboxRepo::append_event`]'s doc argues for -- "ordinary
+/// enqueue is unchanged and should not pay for it" -- while making it true of the path that
+/// actually needed it.
+///
+/// # What it costs
+///
+/// Event writes to ONE scope serialise from here to COMMIT, and it is per scope, so one
+/// tenant's write rate does not gate another's.
+///
+/// HOW LONG THAT WINDOW IS DEPENDS ON THE PRODUCER, and an earlier version of this section
+/// gave one figure for all of them: "the lock is taken immediately before the insert, which in
+/// a domain write is the last statement, so the serialised window is an insert plus a commit
+/// rather than the whole transaction." That is true of the great majority of producers, where
+/// the enqueue really is last. It is false on the highest-traffic path this change touches.
+///
+/// `meter_redeemed_tokens` enqueues `token.issued`, and its callers CONTINUE afterwards: one
+/// then inserts `issued_tokens` and `opaque_access_tokens`, another inserts
+/// `opaque_access_tokens` and then the audit row. So on token redemption the window is the
+/// lock to the commit across several more inserts, not an insert plus a commit -- which is
+/// also why `REDEMPTION_STATEMENTS` moved 69 -> 71 rather than staying put.
+///
+/// The honest general statement is the first sentence: from here to COMMIT. Whether that is
+/// two statements or seven is a property of the producer, and the ones where it is seven are
+/// the ones worth measuring before assuming this is cheap.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a persistence fault.
+async fn take_event_append_lock(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    consumer: &str,
+) -> Result<(), StoreError> {
+    if consumer != WEBHOOK_EVENT_CONSUMER {
+        return Ok(());
+    }
+    // THE FK PARENTS CANNOT BE PRE-LOCKED FROM HERE, and that is the finding rather than an
+    // omission.
+    //
+    // The invariant this lock needs is that it is the last lock the transaction takes, and an
+    // earlier version of that argument rested on a sentence which is false for any table with
+    // a foreign key: "an INSERT of a new row takes only that row's lock". `outbox_messages`
+    // references `tenants` and `environments`, so the insert this guards fires an RI check
+    // taking `FOR KEY SHARE` on two EXISTING parent rows while the advisory lock is held.
+    // `audit_log` names the same pair. Review reproduced the resulting cycle against a real
+    // migrated cluster: `ActingTenantRepo::delete_with_event` holds `FOR UPDATE` on every
+    // environment of a tenant and enqueues only afterwards.
+    //
+    // The fix for that ordering is to take the parents' KEY SHARE locks BEFORE the advisory
+    // one. THIS ROLE CANNOT: `tenants` and `environments` are granted to `ironauth_control`
+    // alone (0003:52-53), so a `SELECT ... FOR KEY SHARE` from the data plane is
+    // `permission denied for table tenants` -- measured, not predicted. The RI check itself
+    // succeeds only because a referential-integrity trigger runs with the constraint owner's
+    // privileges rather than the caller's.
+    //
+    // So the deadlock cannot be closed from here without granting the internet-facing plane
+    // access to the tenant tables, which is the widening the plane split exists to prevent.
+    // That is why #1009 stops at this design rather than patching it again: see the issue for
+    // the lock-free alternative.
+    // Held until this transaction ends, by `pg_advisory_xact_lock`'s definition, so there is
+    // no unlock path to leak on an error return.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(append_lock_key(scope))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
 
-    let mut hasher = DefaultHasher::new();
-    scope.tenant().to_string().hash(&mut hasher);
-    scope.environment().to_string().hash(&mut hasher);
+/// The per-scope advisory lock key the commit-ordered appender takes.
+///
+/// # Why this is not `DefaultHasher`
+///
+/// It was, and that was safe only by accident. `DefaultHasher`'s output is explicitly not
+/// guaranteed stable across Rust releases, and `to_ne_bytes` is not stable across
+/// architectures. Nothing PERSISTS this key, so both looked harmless -- and both were,
+/// while the only caller was [`OutboxRepo::append_event`], which no production path calls.
+///
+/// Putting the lock on the ordinary event insert makes it load-bearing. Two nodes built with
+/// different toolchains would derive DIFFERENT keys for the same scope, take two different
+/// locks, and therefore not serialise against each other at all. The feed would quietly stop
+/// being commit-ordered for exactly as long as a rolling upgrade lasted, and would start
+/// again when it finished, leaving nothing behind to find.
+///
+/// SHA-256 over a length-delimited `(tenant, environment)` is stable across toolchains, and
+/// big-endian truncation is stable across architectures. `the_append_lock_key_is_pinned`
+/// fails if either changes.
+pub(crate) fn append_lock_key(scope: Scope) -> i64 {
+    append_lock_key_from_parts(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    )
+}
+
+/// [`append_lock_key`] over the raw scope parts.
+///
+/// Split out for two reasons, both of which are about keeping the derivation in ONE place.
+/// A `TenantId` can only be generated, never built from a literal, so a test that pins the
+/// derived constant needs this entry point. And `events_cursor_ordering.rs` used to carry
+/// its own hand-written copy of the derivation, which would take a DIFFERENT lock the moment
+/// this one changed: the tests would keep passing while measuring nothing, because two
+/// writers on two different keys never contend. It now calls this.
+#[must_use]
+pub fn append_lock_key_from_parts(tenant: &str, environment: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ironauth.outbox.append.v1\0");
+    // LENGTH-DELIMITED, so ("ab", "c") and ("a", "bc") cannot hash to one key. Concatenating
+    // them raw would let two unrelated environments serialise against each other, which is a
+    // throughput fault nothing would ever attribute to a hash.
+    hasher.update((tenant.len() as u64).to_be_bytes());
+    hasher.update(tenant.as_bytes());
+    hasher.update((environment.len() as u64).to_be_bytes());
+    hasher.update(environment.as_bytes());
+
+    let digest = hasher.finalize();
+    let mut key = [0u8; 8];
+    key.copy_from_slice(&digest[..8]);
     // Postgres advisory locks take a SIGNED 64-bit key. Reinterpreting the bits rather
     // than casting says that explicitly: every bit pattern is a valid key, so this is a
     // reinterpretation and not a narrowing that could lose one.
-    i64::from_ne_bytes(hasher.finish().to_ne_bytes())
+    i64::from_be_bytes(key)
 }
 /// One enqueued outbound message, as an operator reads it back (issue #111).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23609,6 +23800,12 @@ impl OutboxRepo<'_> {
         // Held until this transaction ends, by `pg_advisory_xact_lock`'s definition. That
         // is the property the ordering rests on: releasing it before commit would let the
         // next appender take a sequence while this one is still uncommitted.
+        //
+        // The insert underneath now takes this same lock too (`take_event_append_lock`), so
+        // this line is redundant for an event message and is NOT dead: it is what makes the
+        // guarantee unconditional for this entry point, whatever consumer a caller names.
+        // Advisory locks are re-entrant within a transaction, so taking it twice costs a
+        // round trip and nothing else.
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(append_lock_key(scope))
             .execute(&mut *tx)
@@ -23961,8 +24158,18 @@ impl OutboxRepo<'_> {
     /// So the read is gated on a VISIBILITY WATERMARK.
     /// `pg_snapshot_xmin(pg_current_snapshot())` is the oldest transaction id still
     /// running; a row whose `xmin` is below it is visible to everyone, and nothing can
-    /// ever commit beneath it afterwards. Serving only those rows means a cursor cannot
-    /// advance past a point another writer could still fill in.
+    /// ever commit beneath it afterwards.
+    ///
+    /// Serving only those rows is a FILTER, and it does not make the feed skip-free. A filter
+    /// serves settled rows that sit ABOVE an unsettled one, so a cursor can advance past a row
+    /// that is later filled in and a consumer never sees it. The append lock does not rescue
+    /// that: the lock orders INSERTs, while `xmin` is fixed at a transaction's FIRST write, so
+    /// two producers can take the lock in one order, commit in that order, and still have
+    /// inverted xmins.
+    ///
+    /// Stopping the page at the first unsettled row was tried and reverted -- it does not close
+    /// the skip either, and its cost is unbounded. The measurement is in the SQL below. The
+    /// skip is real, PREDATES this change, and belongs to criterion 1.
     ///
     /// # What this costs, measured rather than estimated
     ///
@@ -23990,6 +24197,32 @@ impl OutboxRepo<'_> {
     ) -> Result<Vec<OutboxMessage>, StoreError> {
         let scope = self.scope;
         let sql = format!(
+            // A ROW FILTER, and a PREFIX CUT was tried and reverted. The attempt and why it
+            // failed are worth more than the diff would have been.
+            //
+            // The filter serves settled rows that sit ABOVE an unsettled one, so a cursor can
+            // advance past a row that is later filled in and a cursor consumer never returns.
+            // Stopping the page at the first unsettled row looks like the fix and is not, for
+            // two measured reasons:
+            //
+            // * IT DOES NOT CLOSE THE SKIP. The cut is a `MIN(sequence)` over the READER'S OWN
+            //   SNAPSHOT, and a row whose producer has not committed is not in that snapshot at
+            //   all -- so it contributes nothing to the MIN and cuts nothing. Reproduced: an
+            //   in-flight event row at sequence 1 and a committed DELIVERY row at sequence 2
+            //   with a lower xmin; the reader served 2, the cursor advanced, and 1 was lost
+            //   after it committed. The append lock cannot help, because it deliberately
+            //   serialises only `WEBHOOK_EVENT_CONSUMER` inserts while this query serves every
+            //   row in the scope.
+            // * ITS COST IS UNBOUNDED. "At most one row back" was the justification, and it is
+            //   wrong twice: the cut is set by rows that are COMMITTED but above the
+            //   CLUSTER-WIDE watermark, so it is bounded by the deployment's write rate times
+            //   the longest open transaction anywhere on the instance -- and by delivery rows,
+            //   which no lock serialises.
+            //
+            // So the skip is real, it PREDATES this change, and it belongs to criterion 1
+            // rather than criterion 2. Closing it needs the watermark to know about rows it
+            // cannot see, which is not a predicate.
+            //
             // THE WIDTHS ON THE TWO SIDES OF THIS COMPARISON DIFFER, and that is a standing
             // assumption rather than an oversight nobody noticed.
             //
@@ -42328,15 +42561,38 @@ where
 ///
 /// Split out of `rotate_inner` for the function-length lint. It is also the natural unit: one
 /// statement writing one row, with the impersonation columns riding along or staying NULL.
-/// Every session in the system is inserted HERE, which is why the metering event is emitted
-/// here too (issue #107).
+/// Every session in the system is inserted HERE, which is why the metering event is BUILT
+/// here (issue #107).
 ///
 /// `UsageTally` counts monthly actives off `user.signed_in`, and the constant naming that
 /// type had no producer at all: the fold read a feed that never contained it, so metering
-/// reported zero for every tenant. The fix belongs at the choke point rather than at each of
-/// the three call sites above, for the same reason the fan-out validates in one place -- a
-/// producer added per call site is a producer the next call site forgets, and the failure is
-/// silent undercounting that surfaces as a billing dispute.
+/// reported zero for every tenant.
+///
+/// # Built here, ENQUEUED BY THE CALLER, and this doc used to argue against that
+///
+/// It said "the fix belongs at the choke point rather than at each of the three call sites
+/// above ... a producer added per call site is a producer the next call site forgets, and the
+/// failure is silent undercounting that surfaces as a billing dispute." The reasoning is
+/// sound and the conclusion had to give way to a deadlock: enqueuing here made this the FIRST
+/// statement to take the per-scope append lock, before `reconcile_prior_session_at_rotation`
+/// takes `FOR UPDATE`, which inverts the lock order every other producer in this module uses.
+/// See the note at the return value.
+///
+/// So the risk that paragraph names is real and is now carried by a test rather than by the
+/// shape of the code: `a_rotation_meters_the_sign_in_it_created` drives the ordinary sign-in
+/// path and asserts the event lands on the feed, so a caller that takes the returned event and
+/// drops it is a failing test rather than a billing dispute.
+///
+/// BOTH PRODUCTION CALL SITES ARE COVERED. The other is
+/// `ActingImpersonationAuthorizationRepo::redeem`, and
+/// `impersonation_sessions.rs::a_real_sign_in_is_metered_as_an_active_user` drives it, asserts
+/// one `user.signed_in` on the feed and asserts the metered active. It predates this PR.
+///
+/// An earlier version of this note said that site was uncovered and that its fixture "did not
+/// exist"; the fixture is `issue_authorization` in that file and seven tests use it. Claiming
+/// a gap that is not there is the same defect as claiming a guard that is not there -- both
+/// send the next reader somewhere untrue -- and this one would have had someone write a test
+/// that already existed.
 ///
 /// In the write's OWN transaction, so a rolled-back sign-in is not metered. That is one
 /// outbox insert on the authentication path, and it is the event stream rather than a
@@ -42352,7 +42608,7 @@ async fn insert_session_row(
     id: &SessionId,
     params: NewSession<'_>,
     now_micros: i64,
-) -> Result<(), StoreError> {
+) -> Result<Option<OwnedDomainEvent>, StoreError> {
     sqlx::query(
         "INSERT INTO sessions \
          (id, tenant_id, environment_id, subject, auth_methods, auth_time, \
@@ -42406,29 +42662,62 @@ async fn insert_session_row(
     // payload. Built here rather than by a handler because there is no handler: a sign-in is
     // a data-plane fact, and the store is its only producer.
     let event_id = format!("evt_{}", CorrelationId::generate(env));
-    if let Some(envelope) = crate::event_catalog::envelope(
+    // BUILT HERE, ENQUEUED BY THE CALLER, and the split is a deadlock fix rather than taste.
+    //
+    // This used to enqueue directly, which made it the FIRST statement of `rotate_inner`'s
+    // closure to take the per-scope append lock -- before `reconcile_prior_session_at_rotation`
+    // takes `FOR UPDATE` on the prior session. Every other producer in this module enqueues
+    // LAST, so it holds row locks and then wants the append lock. Two orders, one cycle:
+    // `revoke_all_for_user_with_event` locks a subject's sessions and then wants the append
+    // lock, while a concurrent rotation holds the append lock and wants one of those rows.
+    // Postgres aborts one with 40P01, so "revoke all sessions" racing that user's own
+    // re-authentication -- the ordinary post-password-reset flow -- fails a login or a revoke.
+    //
+    // The invariant that makes a transaction-scoped global lock safe is that it is the LAST
+    // lock the transaction takes, and returning the event is what lets this path obey it.
+    //
+    // It is an invariant about LOCKS, not about position -- but the exception this comment used
+    // to license was WRONG, and the same commit that wrote it retracts the sentence elsewhere
+    // in this file. It said `write_audited`'s audit row after the closure "is fine, because an
+    // INSERT of a new row takes only that row's lock". An insert takes its own row's lock AND
+    // a `FOR KEY SHARE` on every FK parent it names, and `audit_log` carries foreign keys to
+    // `tenants` and `environments` -- so the audit row DOES take locks while the append lock
+    // is held. `take_event_append_lock`'s own note calls that sentence "false for any table
+    // with a foreign key". Shipping the rule and its refutation in one change would have left
+    // the refuted one as what a future producer applies.
+    //
+    // What is actually true is narrower and is the residual risk this PR does not close: the
+    // FK parent locks are `FOR KEY SHARE`, which conflicts only with `FOR UPDATE` on the same
+    // parent row, and the one place that takes `FOR UPDATE` on `environments` is
+    // `ActingTenantRepo::delete_with_event`. That cycle is real and is documented on
+    // `take_event_append_lock`.
+    //
+    // The CONTENTS still come from one place, which is what the previous comment here was
+    // protecting: a producer can now get the placement wrong but not the envelope. NOT the
+    // placement -- an earlier version claimed "the type enforces the rest ... a caller that
+    // drops it fails `#[must_use]`". It does not: `OwnedDomainEvent` carries no `#[must_use]`,
+    // and `?` discharges the `Result`, leaving a plain `Option` no lint objects to. The thing
+    // that actually catches a caller who forgets to enqueue is
+    // `a_rotation_meters_the_sign_in_it_created` for the rotation site, and
+    // `impersonation_sessions.rs::a_real_sign_in_is_metered_as_an_active_user` for the
+    // impersonation one -- both production call sites. A claim of type-level safety where
+    // there is none is worse than no claim, because it stops the next person looking, and so
+    // is naming a test that does not exist or a gap that is not there.
+    Ok(crate::event_catalog::envelope(
         &event_id,
         "user.signed_in",
         &scope.tenant().to_string(),
         &scope.environment().to_string(),
         now_micros / 1000,
         &serde_json::json!({ "subject": params.subject }),
-    ) {
-        enqueue_domain_event(
-            tx,
-            env,
-            scope,
-            Some(&DomainEvent {
-                id: &event_id,
-                // The SUBJECT is the ordering key: one person's sign-ins stay ordered, which
-                // is what lets a consumer reason about a session timeline at all.
-                subject: params.subject,
-                envelope: &envelope,
-            }),
-        )
-        .await?;
-    }
-    Ok(())
+    )
+    .map(|envelope| OwnedDomainEvent {
+        id: event_id.clone(),
+        // The SUBJECT is the ordering key: one person's sign-ins stay ordered, which is what
+        // lets a consumer reason about a session timeline at all.
+        subject: params.subject.to_owned(),
+        envelope,
+    }))
 }
 
 /// Write the impersonation START event, when the session being created carries one.
@@ -50274,6 +50563,45 @@ impl ActingTenantRepo<'_> {
             },
             async move |tx| {
                 let now_micros = epoch_micros(env.clock().now_utc());
+                // 0. THE IDEMPOTENCY ROW FIRST, and this ordering is the whole reason
+                //    the step is numbered zero.
+                //
+                //    `insert_idempotency` opens with an UNSCOPED prune -- `DELETE FROM
+                //    idempotency_keys WHERE ... expires_at <= now() ORDER BY expires_at
+                //    LIMIT 100` -- so every concurrent idempotent writer in the
+                //    DEPLOYMENT targets the same globally-oldest rows and takes their
+                //    locks. The cascade below takes one per-scope append lock per
+                //    ENVIRONMENT of this tenant and holds them all to commit. Running
+                //    the prune after them is therefore an ABBA cycle against any
+                //    idempotent event-producing write that prunes first and then wants
+                //    one of those scopes, and Postgres aborts one side with 40P01 --
+                //    surfacing as a 500 on a tenant suspend, or on the unrelated write
+                //    that lost the coin toss.
+                //
+                //    THIS PR IS WHAT CREATED THAT CYCLE: before it, `enqueue_domain_event`
+                //    took no advisory lock at all, so the order did not matter here. The
+                //    same move was made in `publish_snapshot_inner`, and making it there
+                //    and not here is what left the two halves of the cycle facing each
+                //    other. It is a pure move -- see step 3 for why the row does not
+                //    depend on the scoping variables.
+                //
+                //    The rule it follows, stated precisely because the loose form is FALSE
+                //    HERE: every lock this transaction takes OUTSIDE the announcement loop is
+                //    taken before the loop starts.
+                //
+                //    "The append lock is the last lock this transaction takes" is the shape
+                //    the rule takes for an ordinary producer, and a per-environment cascade
+                //    cannot obey it: iteration 2 upserts `environment_states` while already
+                //    holding iteration 1's append lock. That is inherent to announcing per
+                //    environment, and it is safe against OTHER cascades only because they all
+                //    iterate in the same `ORDER BY id` -- see the note on that query.
+                //
+                //    NOTHING GUARDS EITHER FORM. A producer that takes another lock after its
+                //    enqueue has to be found by reading; round 3 found one this way, the
+                //    trailing `UPDATE environments` in `restore_with_event`. An earlier
+                //    version of this note named a test that would stop that happening; no such
+                //    test exists, and naming one is worse than admitting there is none.
+                insert_idempotency(tx, idempotency).await?;
                 // 1. Flip the tenant status, guarded on the source state so a
                 //    concurrent transition cannot double-apply. A level table (no
                 //    row-level security).
@@ -50311,8 +50639,18 @@ impl ActingTenantRepo<'_> {
                 //    that fences it rather than being left to the absent-row default,
                 //    which serves.
                 let env_rows = sqlx::query(
+                    // ORDER BY id, and it is a DEADLOCK FIX rather than tidiness.
+                    //
+                    // This loop takes one append lock per environment and holds them all to
+                    // commit. Without an ORDER BY, Postgres may return the rows in any order --
+                    // seq-scan order tracks physical layout, which HOT updates change -- so two
+                    // concurrent cascades on one tenant could take the same set of locks in
+                    // OPPOSITE orders and deadlock. Before this PR the enqueue took no lock and
+                    // the order did not matter; giving it one is what makes this reachable.
+                    //
+                    // Any total order works as long as every cascade uses the same one.
                     "SELECT id, (deleted_at IS NOT NULL) AS deleted \
-                     FROM environments WHERE tenant_id = $1",
+                     FROM environments WHERE tenant_id = $1 ORDER BY id",
                 )
                 .bind(id.to_string())
                 .fetch_all(&mut **tx)
@@ -50355,9 +50693,15 @@ impl ActingTenantRepo<'_> {
                     enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
                 }
                 // 3. Restore the audit scope's row-level-security variables so the
-                //    audited-write's audit row (and the idempotency insert) run under
-                //    (tenant, oldest environment), after the per-environment
-                //    re-scoping above.
+                //    audited-write's audit row runs under (tenant, oldest
+                //    environment), after the per-environment re-scoping above.
+                //
+                //    NOT the idempotency insert, which this used to say and which
+                //    moved above the cascade -- see the hoist at the top of this
+                //    closure. `idempotency_keys` carries no row-level security
+                //    (0003_management_api.sql calls it "deliberately CREDENTIAL-scoped,
+                //    not tenant-row-level-security scoped"), so its row never depended
+                //    on which environment these variables name.
                 sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
                     .bind(scope.tenant().to_string())
                     .execute(&mut **tx)
@@ -50366,10 +50710,6 @@ impl ActingTenantRepo<'_> {
                     .bind(scope.environment().to_string())
                     .execute(&mut **tx)
                     .await?;
-                // Store the idempotency replay row in the SAME transaction as the
-                // transition, so a replay returns the original response and writes no
-                // second audit row.
-                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             false,
@@ -50524,6 +50864,32 @@ impl ActingTenantRepo<'_> {
                 //    rather than assumed. The `(EXTRACT * 1000000)::bigint` idiom is used
                 //    widely in this file; this is the only site where an inexact result
                 //    would be a security regression rather than a wrong display value.
+                // NO PRE-TAKEN APPEND LOCKS HERE, and the attempt is worth recording.
+                //
+                // Giving `enqueue_domain_event` an advisory lock creates a cycle with this
+                // closure: a producer holds the advisory lock and wants `FOR KEY SHARE` on an
+                // `environments` row through its outbox insert's foreign key, while this holds
+                // `FOR UPDATE` on that row and wants the advisory lock much later. The obvious
+                // fix is to take the advisory locks up here, giving both sides one order.
+                //
+                // IT TRADES ONE DEADLOCK FOR TWO, measured on a real cluster with a control.
+                // `FOR UPDATE` conflicts with `FOR NO KEY UPDATE`, which is what an ordinary
+                // `UPDATE` of a non-key column takes -- and three producers take exactly that on
+                // the rows this closure locks, then want the advisory lock at their own enqueue:
+                // `ActingEnvironmentRepo::set_auto_link_posture_with_event`,
+                // `ActingEnvironmentRepo::delete_with_event`, and
+                // `ActingManagementCredentialRepo::revoke_with_event`. With the advisory locks
+                // taken first, a posture write and a tenant delete deadlock; with them taken
+                // last, as here, the same pair commits cleanly.
+                //
+                // So the order that holds across the deployment is ROWS BEFORE ADVISORY, which
+                // is what every producer already does and what this closure does. The residual
+                // FK cycle is documented on `take_event_append_lock` and reproduced by an
+                // ignored test; closing it needs grants the data plane is deliberately denied.
+                //
+                // The comment that briefly sat here also opened "THE APPEND LOCKS FIRST, BEFORE
+                // ANY ROW LOCK", which was false on its face: step 1 above takes
+                // `FOR NO KEY UPDATE` on the `tenants` row and holds it to commit.
                 let env_rows = sqlx::query(
                     "SELECT id, (EXTRACT(EPOCH FROM deleted_at) * 1000000)::bigint AS deleted_us \
                      FROM environments WHERE tenant_id = $1 ORDER BY id FOR UPDATE",
@@ -50922,6 +51288,19 @@ impl ActingTenantRepo<'_> {
                 let status = TenantStatus::from_wire(&restored.get::<String, _>("status"))
                     .ok_or(StoreError::NotFound)?;
                 let serving_status = serving_status_str(serving_state_for(status));
+                // THE IDEMPOTENCY ROW BEFORE ANY APPEND LOCK, and it is here rather than at
+                // the top of the closure because unlike its two siblings this one records the
+                // status the restore COMMITTED (issue #438) -- so it cannot be written before
+                // that status is known. This is the first line where it is.
+                //
+                // `insert_resolved_idempotency` reaches `insert_idempotency`, which opens with
+                // an UNSCOPED prune of the globally-oldest expired keys; the cascade below
+                // takes a per-scope append lock per ENVIRONMENT and holds them to commit. Doing
+                // the prune afterwards is an ABBA cycle against any idempotent event-producing
+                // write that prunes first and then wants one of those scopes. This PR created
+                // that cycle by giving `enqueue_domain_event` a lock; see the long note in
+                // `transition`.
+                insert_resolved_idempotency(tx, idempotency, &status).await?;
                 // 2. Per environment: restore the data-plane serving state and clear the grace
                 //    delete's credential tombstones, re-scoping to each environment
                 //    for the forced row-level security on management_credentials and
@@ -50951,14 +51330,55 @@ impl ActingTenantRepo<'_> {
                 //    is fenced here rather than left serving under a tenant the
                 //    operator restored into `suspended`.
                 let env_rows = sqlx::query(
+                    // ORDER BY id, and it is a DEADLOCK FIX rather than tidiness.
+                    //
+                    // This loop takes one append lock per environment and holds them all to
+                    // commit. Without an ORDER BY, Postgres may return the rows in any order --
+                    // seq-scan order tracks physical layout, which HOT updates change -- so two
+                    // concurrent cascades on one tenant could take the same set of locks in
+                    // OPPOSITE orders and deadlock. Before this PR the enqueue took no lock and
+                    // the order did not matter; giving it one is what makes this reachable.
+                    //
+                    // Any total order works as long as every cascade uses the same one.
                     "SELECT id, \
                             (deleted_at = TIMESTAMPTZ 'epoch' \
                              + ($2::text || ' microseconds')::interval) IS TRUE AS matched \
-                     FROM environments WHERE tenant_id = $1",
+                     FROM environments WHERE tenant_id = $1 ORDER BY id",
                 )
                 .bind(id.to_string())
                 .bind(deleted_micros)
                 .fetch_all(&mut **tx)
+                .await?;
+                // 2b. CLEAR THE TOMBSTONES NOW -- after the read above, before the loop below.
+                //
+                //     BOTH SIDES MATTER. It must run after the `env_rows` SELECT, because that
+                //     query computes `matched` from the very `deleted_at` this clears: hoisting
+                //     it above the read makes every environment unmatched, and four
+                //     `tenant_lifecycle` tests said so.
+                //
+                //     This ran AFTER the loop, which made this closure the one producer in the
+                //     file taking a row lock while already holding an advisory lock -- and that
+                //     is the exact cycle measured against the reverted tenant-delete pre-lock:
+                //     an ordinary `UPDATE environments` elsewhere takes `FOR NO KEY UPDATE` and
+                //     then wants the append lock, so a restore holding the append locks and
+                //     wanting those rows deadlocks against it. `delete_with_event` already
+                //     places its environments write before its announcement loop; this now
+                //     matches, and the order across the deployment is ROWS BEFORE ADVISORY
+                //     without exception.
+                //
+                //     Safe to hoist: the loop's `matched` flag is computed from `env_rows`,
+                //     which was read above and is already materialised, and nothing inside the
+                //     loop reads `environments.deleted_at`.
+                //
+                //     Matched on the deletion instant, for the reason step 2 gives.
+                sqlx::query(
+                    "UPDATE environments SET deleted_at = NULL \
+                     WHERE tenant_id = $1 \
+                     AND deleted_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval",
+                )
+                .bind(id.to_string())
+                .bind(deleted_micros)
+                .execute(&mut **tx)
                 .await?;
                 for env_row in &env_rows {
                     let env_id: String = env_row.get("id");
@@ -51022,18 +51442,7 @@ impl ActingTenantRepo<'_> {
                         .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
                     enqueue_domain_event(tx, env, Scope::new(*id, announced), event).await?;
                 }
-                // 3. Clear the tombstones this delete wrote on the environments (a
-                //    level table), matched on its instant for the reason step 2 gives.
-                sqlx::query(
-                    "UPDATE environments SET deleted_at = NULL \
-                     WHERE tenant_id = $1 \
-                     AND deleted_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval",
-                )
-                .bind(id.to_string())
-                .bind(deleted_micros)
-                .execute(&mut **tx)
-                .await?;
-                // 4. Restore the audit scope's row-level-security variables.
+                // 3. Restore the audit scope's row-level-security variables.
                 sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
                     .bind(scope.tenant().to_string())
                     .execute(&mut **tx)
@@ -51042,12 +51451,6 @@ impl ActingTenantRepo<'_> {
                     .bind(scope.environment().to_string())
                     .execute(&mut **tx)
                     .await?;
-                // The stored response is rendered from the status this restore
-                // COMMITTED, not from a post-condition the caller predicted (issue
-                // #438), in the same transaction as the write, so the 200, every
-                // replay of that Idempotency-Key and a subsequent tenant READ all
-                // report the one value that was persisted.
-                insert_resolved_idempotency(tx, idempotency, &status).await?;
                 Ok(status)
             },
             false,
@@ -51149,6 +51552,14 @@ impl ActingTenantRepo<'_> {
             },
             async move |tx| {
                 let purged_micros = epoch_micros(env.clock().now_utc());
+                // THE IDEMPOTENCY ROW FIRST. `insert_idempotency` opens with an UNSCOPED
+                // prune of the globally-oldest expired keys, and the cascade below takes a
+                // per-scope append lock per ENVIRONMENT and holds them to commit -- so running
+                // the prune afterwards is an ABBA cycle against any idempotent
+                // event-producing write that prunes first and then wants one of those scopes.
+                // This PR created that cycle by giving `enqueue_domain_event` a lock; see the
+                // long note in `transition` for the rule and why the move is safe.
+                insert_idempotency(tx, idempotency).await?;
                 // 1. Stamp the terminal marker, guarded on the grace predicate so a
                 //    concurrent restore/purge cannot double-apply.
                 let result = sqlx::query(
@@ -51172,10 +51583,13 @@ impl ActingTenantRepo<'_> {
                 //    the tenant's envelope-protected PII is permanently unreadable. A
                 //    scope that never provisioned a KEK matches no row. The control
                 //    role holds exactly this column-scoped UPDATE on tenant_keks.
-                let env_rows = sqlx::query("SELECT id FROM environments WHERE tenant_id = $1")
-                    .bind(id.to_string())
-                    .fetch_all(&mut **tx)
-                    .await?;
+                // ORDER BY id: see the note in `transition`. One lock order across every
+                // cascade, because each holds one append lock per environment to commit.
+                let env_rows =
+                    sqlx::query("SELECT id FROM environments WHERE tenant_id = $1 ORDER BY id")
+                        .bind(id.to_string())
+                        .fetch_all(&mut **tx)
+                        .await?;
                 for env_row in &env_rows {
                     let env_id: String = env_row.get("id");
                     sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
@@ -51235,7 +51649,6 @@ impl ActingTenantRepo<'_> {
                     .bind(scope.environment().to_string())
                     .execute(&mut **tx)
                     .await?;
-                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             false,

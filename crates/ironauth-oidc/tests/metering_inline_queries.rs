@@ -154,7 +154,33 @@ fn touches_the_event_feed_other_than_appending(text: &str) -> bool {
 /// exchange, for a feature most clients have not configured. Making it cheaper means either
 /// caching per (scope, client) with an invalidation story, or threading the resolver into a
 /// transaction the redemption already opens. Both are their own change.
-const REDEMPTION_STATEMENTS: usize = 69;
+/// 69 -> 71 (#107 criterion 2): the two event inserts a redemption performs each now take
+/// the per-scope append lock, and `pg_advisory_xact_lock` is its own statement.
+///
+/// This is the ratchet working. The cost is a round trip per event insert on the hot path,
+/// and per-environment serialisation of event-producing writes from the lock to the commit,
+/// which is the price criterion 2 names for ordering that matches commit order. Stated
+/// rather than absorbed, because it is the token redemption path.
+///
+/// AND ON THIS PATH "TO THE COMMIT" IS LONGER THAN ON MOST. `take_event_append_lock`'s doc
+/// used to say the window is "an insert plus a commit rather than the whole transaction",
+/// which holds where the enqueue is the last statement. Here it is not: `meter_redeemed_tokens`
+/// enqueues and the caller then inserts `issued_tokens` and `opaque_access_tokens`, or
+/// `opaque_access_tokens` and the audit row. The extra statements this constant just counted
+/// are the same ones that sit inside the serialised window, so the number moving and the
+/// window being longer are two readings of one fact.
+///
+/// It can be bought back. Folding the lock into the insert as
+/// `INSERT ... SELECT ... FROM (SELECT pg_advisory_xact_lock($n)) l` takes it in the same
+/// statement and returns this to 69, since the lock is then evaluated to produce the source
+/// row before the sequence default is computed. It is not done here because it trades an
+/// obvious two-statement sequence for a subtle one-statement argument about executor
+/// ordering, and this PR's job is the ordering guarantee itself. The three tests that would
+/// have to keep passing already exist:
+/// `an_event_enqueue_blocks_on_the_per_scope_append_lock` (the lock is taken),
+/// `serialising_appenders_on_a_scope_lock_makes_sequence_order_equal_commit_order` (it
+/// orders), and this count (the round trip is gone).
+const REDEMPTION_STATEMENTS: usize = 71;
 
 /// Redeeming an authorization code touches the event feed ONLY to append to it.
 ///

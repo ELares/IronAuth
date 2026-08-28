@@ -51,7 +51,7 @@ crates/ironauth-store/src/repository.rs:create_with_id_with_event:2
 crates/ironauth-store/src/repository.rs:create_with_user_inner:1
 crates/ironauth-store/src/repository.rs:decide:2
 crates/ironauth-store/src/repository.rs:delete:2
-crates/ironauth-store/src/repository.rs:delete_with_event:22
+crates/ironauth-store/src/repository.rs:delete_with_event:23
 crates/ironauth-store/src/repository.rs:enqueue:2
 crates/ironauth-store/src/repository.rs:enqueue_all:1
 crates/ironauth-store/src/repository.rs:enqueue_async_delivery:1
@@ -59,7 +59,6 @@ crates/ironauth-store/src/repository.rs:enqueue_session_ended_event:1
 crates/ironauth-store/src/repository.rs:extend_with_event:1
 crates/ironauth-store/src/repository.rs:hard_delete_with_event:1
 crates/ironauth-store/src/repository.rs:hygiene_refusal:1
-crates/ironauth-store/src/repository.rs:insert_session_row:1
 crates/ironauth-store/src/repository.rs:issue_with_event:1
 crates/ironauth-store/src/repository.rs:lift_with_event:1
 crates/ironauth-store/src/repository.rs:link_external_id_with_event:1
@@ -70,6 +69,7 @@ crates/ironauth-store/src/repository.rs:publish_snapshot_inner:1
 crates/ironauth-store/src/repository.rs:put_with_event:1
 crates/ironauth-store/src/repository.rs:record_domain_verification_with_event:1
 crates/ironauth-store/src/repository.rs:record_with_event:1
+crates/ironauth-store/src/repository.rs:redeem:1
 crates/ironauth-store/src/repository.rs:register_with_event:1
 crates/ironauth-store/src/repository.rs:reject_with_event:1
 crates/ironauth-store/src/repository.rs:remove_allowlist_country_with_event:1
@@ -83,6 +83,7 @@ crates/ironauth-store/src/repository.rs:restore_with_event:1
 crates/ironauth-store/src/repository.rs:revoke_all_for_user_with_event:1
 crates/ironauth-store/src/repository.rs:revoke_inner:1
 crates/ironauth-store/src/repository.rs:revoke_with_event:3
+crates/ironauth-store/src/repository.rs:rotate_inner:1
 crates/ironauth-store/src/repository.rs:rotate_secret_with_event:1
 crates/ironauth-store/src/repository.rs:rotate_with_event:1
 crates/ironauth-store/src/repository.rs:set_active_with_event:1
@@ -96,7 +97,7 @@ crates/ironauth-store/src/repository.rs:set_permission_claims_with_event:1
 crates/ironauth-store/src/repository.rs:set_require_pushed_authorization_requests_with_event:1
 crates/ironauth-store/src/repository.rs:set_state_with_event:2
 crates/ironauth-store/src/repository.rs:set_traits_with_visibility:1
-crates/ironauth-store/src/repository.rs:set_with_event:11
+crates/ironauth-store/src/repository.rs:set_with_event:12
 crates/ironauth-store/src/repository.rs:transition:1
 crates/ironauth-store/src/repository.rs:transition_with_event:1
 crates/ironauth-store/src/repository.rs:unassign_with_event:3

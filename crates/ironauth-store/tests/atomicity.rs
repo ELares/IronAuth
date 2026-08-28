@@ -274,19 +274,24 @@ async fn a_mid_transaction_failure_leaves_no_publish_no_key_and_no_audit_row() {
 /// fixture, so nothing depends on scheduling.
 #[tokio::test]
 async fn a_publish_blocks_on_the_per_scope_append_lock() {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
 
-    // The SAME key the store derives, computed the same way, so this cannot pass by holding
-    // an unrelated lock.
-    let mut hasher = DefaultHasher::new();
-    scope.tenant().to_string().hash(&mut hasher);
-    scope.environment().to_string().hash(&mut hasher);
-    let key = i64::from_ne_bytes(hasher.finish().to_ne_bytes());
+    // THE key the store derives, by calling the store's own derivation rather than
+    // reproducing it.
+    //
+    // This was a hand-written copy whose comment claimed it was "the SAME key the store
+    // derives, computed the same way, so this cannot pass by holding an unrelated lock".
+    // The claim was true only for as long as nobody edited either side. Changing the
+    // production derivation broke it immediately and exactly as predicted: the holder took
+    // one lock, `publish_snapshot` took a different one, the publish did not block, and the
+    // test failed. Had it been written the other way round -- a copy that agreed by accident
+    // where the code took no lock at all -- it would have passed while measuring nothing.
+    let key = ironauth_store::append_lock_key_from_parts(
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+    );
 
     let mut holder = db.owner_pool().begin().await.expect("begin the holder");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
