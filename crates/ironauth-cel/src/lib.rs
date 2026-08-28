@@ -204,6 +204,105 @@ pub enum CostError {
         /// The budget it exceeded.
         budget: u64,
     },
+    /// The expression calls a function this model CANNOT price, so admitting it would be a
+    /// budget that does not bound anything.
+    ///
+    /// See [`UNPRICEABLE_FUNCTIONS`] for which, and why a refusal is the honest answer rather
+    /// than a bigger number.
+    Unpriceable {
+        /// The function named in the expression.
+        function: String,
+    },
+}
+
+/// Functions no expression may call, because this model cannot price them.
+///
+/// # `matches`, and the measurement that put it here
+///
+/// The cost model prices ITERATION: `n^(depth+1)` over the declared cardinality. Everything
+/// else is unmodelled, which the header already says about allocation. `matches` is where
+/// unmodelled becomes unbounded, because its cost is
+///
+/// ```text
+/// (regex states) x (haystack bytes)
+/// ```
+///
+/// and NEITHER factor is anything the estimate sees. The states come from a literal inside the
+/// expression, and the HAYSTACK COMES FROM THE BINDING -- which is the caller's input, not the
+/// expression, so no bound on the expression can reach it.
+///
+/// Measured in release against `ironauth-oidc`'s claims mapping, with an expression of 2,036
+/// bytes -- inside that layer's own 2 KiB cap -- and a 64 KiB string binding, which is exactly
+/// what [`DEFAULT_MAX_STRING_BYTES`] admits:
+///
+/// ```text
+///   pad  8 KiB     27.8 ms
+///   pad 32 KiB     61.3 s
+///   pad 64 KiB    131.7 s
+/// ```
+///
+/// Every one of those was ADMITTED at an estimate of 1, because the expression contains no
+/// comprehension and the floor arm returns 1 before the cardinality is read.
+///
+/// # Why a denylist, and what it does not do
+///
+/// Three attempts to make the estimate cover this are recorded in this module's header, and a
+/// fourth -- bounding the SOURCE LENGTH -- was tried in `ironauth-oidc` and is what the
+/// measurement above defeats: it bounds the number of terms and not the haystack. A wall-clock
+/// timeout is the other obvious answer and this crate refuses one by design, because a
+/// deterministic verdict is the whole product.
+///
+/// So the function is refused. That is honest about the model rather than pretending a number
+/// covers it, and it is checked from the PARSED TREE, so a caller cannot reach it by spelling.
+///
+/// IT IS A DENYLIST AND SHARES A DENYLIST'S WEAKNESS. `matches` is the only regex entry point
+/// in `cel` 0.12 -- `regex::Regex::new` appears once in its `functions.rs` -- so today this is
+/// complete for the cost this shape. A future `cel` that adds another unpriceable function
+/// admits it here silently. What would close that properly is an ALLOWLIST of functions whose
+/// cost the model can state, which is a larger change than this one.
+pub const UNPRICEABLE_FUNCTIONS: &[&str] = &["matches"];
+
+/// The first unpriceable function this expression calls, if any.
+///
+/// Walks the same tree [`comprehension_depth`] does, and for the same reason: the question
+/// "does this call `matches`" is answered by the parser that decides what a call IS, rather
+/// than by a text scan that a string literal or a comment can fool. That scan was tried for
+/// comprehension depth and had three holes, all in the unsafe direction.
+fn unpriceable_call(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Call(call) => {
+            if UNPRICEABLE_FUNCTIONS.contains(&call.func_name.as_str()) {
+                return Some(call.func_name.clone());
+            }
+            call.target
+                .iter()
+                .find_map(|target| unpriceable_call(&target.expr))
+                .or_else(|| call.args.iter().find_map(|arg| unpriceable_call(&arg.expr)))
+        }
+        Expr::Comprehension(comprehension) => unpriceable_call(&comprehension.iter_range.expr)
+            .or_else(|| unpriceable_call(&comprehension.accu_init.expr))
+            .or_else(|| unpriceable_call(&comprehension.loop_cond.expr))
+            .or_else(|| unpriceable_call(&comprehension.loop_step.expr))
+            .or_else(|| unpriceable_call(&comprehension.result.expr)),
+        Expr::Select(select) => unpriceable_call(&select.operand.expr),
+        Expr::List(list) => list
+            .elements
+            .iter()
+            .find_map(|element| unpriceable_call(&element.expr)),
+        Expr::Map(map) => entries_unpriceable(&map.entries),
+        Expr::Struct(structure) => entries_unpriceable(&structure.entries),
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => None,
+    }
+}
+
+/// The first unpriceable call in a map or struct literal's entries, keys included.
+fn entries_unpriceable(entries: &[IdedEntryExpr]) -> Option<String> {
+    entries.iter().find_map(|entry| match &entry.expr {
+        EntryExpr::StructField(field) => unpriceable_call(&field.value.expr),
+        EntryExpr::MapEntry(entry) => {
+            unpriceable_call(&entry.key.expr).or_else(|| unpriceable_call(&entry.value.expr))
+        }
+    })
 }
 
 impl core::fmt::Display for CostError {
@@ -213,6 +312,10 @@ impl core::fmt::Display for CostError {
             Self::OverBudget { estimated, budget } => write!(
                 f,
                 "expression may cost up to {estimated} operations against a budget of {budget}"
+            ),
+            Self::Unpriceable { function } => write!(
+                f,
+                "expression calls `{function}`, whose cost this model cannot bound"
             ),
         }
     }
@@ -619,6 +722,11 @@ pub fn compile_within_budget(
     )]
     let program = cel::Program::compile(expression)
         .map_err(|error| CostError::Uncompilable(error.to_string()))?;
+    // BEFORE THE ESTIMATE, because for these the estimate is not wrong so much as absent: an
+    // expression whose cost this model cannot see must not be admitted BY the model.
+    if let Some(function) = unpriceable_call(&program.expression().expr) {
+        return Err(CostError::Unpriceable { function });
+    }
     let estimated = estimate_parsed_cost(&program.expression().expr, shape);
     if estimated > budget {
         return Err(CostError::OverBudget { estimated, budget });

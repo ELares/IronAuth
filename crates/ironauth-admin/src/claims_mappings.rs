@@ -123,6 +123,7 @@ fn refusal_reason(refusal: &MappingRefusal) -> &'static str {
         // The two SIZE refusals, distinct from the cost one because the operator's next action
         // differs: over budget means "flatten it or declare the cardinality you have", too
         // long means "this is not a mapping rule any more".
+        RefusalReason::ExpressionUnpriceable => "expression_unpriceable",
         RefusalReason::ExpressionTooLong => "expression_too_long",
         RefusalReason::DeclaredCardinalityTooLarge => "declared_cardinality_too_large",
         // UNREACHABLE from this surface, like `too_many_claims` above and for the same kind of
@@ -421,6 +422,7 @@ mod tests {
             RefusalReason::TooManyClaims,
             RefusalReason::ExpressionUncompilable,
             RefusalReason::ExpressionOverBudget,
+            RefusalReason::ExpressionUnpriceable,
             RefusalReason::ExpressionTooLong,
             RefusalReason::DeclaredCardinalityTooLarge,
             RefusalReason::ExpressionFailed,

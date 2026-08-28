@@ -230,12 +230,32 @@ pub enum MappingRule {
     /// # What an expression can see
     ///
     /// One binding, `claims`, an object holding the claim set AS THE PREVIOUS RULES LEFT IT.
-    /// That is the isolation: `ironauth-cel` evaluates against `cel::Env::stdlib()`, which has
-    /// no ambient IO by specification, so an expression can only name what it was bound and
+    /// That is the isolation: `ironauth-cel` evaluates against a `cel::Context` it builds and
+    /// adds ONE variable to, and `cel` 0.12's function set contains no network, filesystem or
+    /// environment call to reach for. So an expression can only name what it was bound, and
     /// cross-tenant access is a question about this list rather than about the sandbox.
     ///
     /// Rules run in order, so a `cel` rule reads what earlier rules wrote and later rules see
-    /// what it wrote. That is the same sequencing `rename` and `place` already have.
+    /// what it wrote.
+    ///
+    /// # It writes a NEW name, and a new name is UNPLACED
+    ///
+    /// An earlier version of this said it has "the same sequencing `rename` and `place` already
+    /// have". It does not, in the way that matters. `rename` CARRIES a placement across with
+    /// the value -- `placements.remove(from)` then insert under `to` -- and this does not:
+    /// a computed claim has no placement of its own.
+    ///
+    /// Unplaced means the ID token on a two-token grant, and on `Destination::OneAccessToken`
+    /// it means THE ONE TOKEN THERE IS. So an expression that copies a claim an operator had
+    /// placed into the ID token puts the copy in a machine client's access token. That is the
+    /// disclosure shape `OneAccessToken`'s own "A RULE ORDER THAT DISCLOSES" section describes
+    /// for `place` after `rename`, reached a second way.
+    ///
+    /// Not changed here, because inventing a placement for a computed claim is a guess: the
+    /// value came from an expression and not from a claim, so there is nothing to carry. The
+    /// remedy is the one the module already documents -- follow the `cel` rule with an explicit
+    /// `place` -- and `a_computed_claim_is_unplaced_until_a_place_rule_says_otherwise` pins it
+    /// so the behaviour is measured rather than assumed.
     Cel {
         /// The claim to write. Subject to the reserved-name fence like every other rule.
         name: String,
@@ -286,6 +306,23 @@ impl MappingRule {
 /// `n^(depth+1)`. A tenant with ten groups and a tenant with ten thousand get very different
 /// answers from the same budget.
 ///
+/// # Criterion 2's last clause is NOT met, and this is where that is written down
+///
+/// The criterion reads "an expression exceeding it aborts deterministically with a typed error
+/// AND THE CONFIGURED FAILURE POLICY APPLIES". The first two clauses hold: the refusal is
+/// decided from the parsed tree before any evaluation, and it carries a typed reason.
+///
+/// No failure policy governs mappings. `token_hooks.failure_policy` is the hook half's --
+/// `apply_to_with_hook`'s own Errors section says the mapping half faults "always" and the hook
+/// half "only when the client's policy is `fail_closed`" -- so a `cel` refusal at issuance is
+/// unconditionally a `ServerError`, and there is no setting an operator can change.
+///
+/// FAIL-CLOSED IS THE RIGHT DEFAULT and it is argued on its own merits on
+/// [`RefusalReason::ExpressionFailed`]: skipping a rule mints a token missing a claim an
+/// operator configured, silently, on some logins and not others. What is missing is the
+/// CHOICE, and adding one means a policy column on `claims_mappings` and a decision about what
+/// `fail_open` means for a mapping -- which is its own change, not a line in this one.
+///
 /// The budget is product-wide rather than per-tenant because what it bounds is not a property
 /// of anyone's environment. Making it a per-tenant setting would let a tenant raise it on the
 /// shared issuance path, which is the one direction a safety bound must not be tunable in.
@@ -324,20 +361,35 @@ pub const CEL_COST_BUDGET: u64 = ironauth_cel::DEFAULT_COST_BUDGET;
 /// not a mapping rule, it is a program, and the answer to wanting one is a hook -- which runs
 /// under fuel, a memory cap and a deadline, all of which this layer has none of.
 ///
-/// WHAT THE BOUND BUYS, measured on the worst shape found rather than assumed. Packing that
-/// shape to each size and evaluating it through `compile_rule`'s exact configuration:
+/// WHAT THE BOUND BUYS, AND WHAT IT DOES NOT. It bounds how many operations an expression can
+/// NAME. It does not bound what any one of them costs, and an earlier version of this
+/// paragraph said it did -- "the worst case bounded and roughly the same order as the ~350 ms
+/// the crate calibrated its iteration budget against". That was measured against a shape whose
+/// cost lives in the expression:
 ///
 /// ```text
 ///   2,036 bytes    60 terms   admitted    453 ms
-///   4,076 bytes   120 terms   admitted    790 ms
 ///  33,996 bytes  1000 terms   admitted   6.33 s
-/// 170,000 bytes  5000 terms   admitted   30.2 s   (review's measurement)
+/// 170,000 bytes  5000 terms   admitted   30.2 s
 /// ```
 ///
-/// So the cap does not make a `cel` rule free -- 453 ms is still real work on a login, and an
-/// operator who wants that is allowed to have it. It makes the worst case bounded and roughly
-/// the same order as the ~350 ms the crate calibrated its iteration budget against, instead of
-/// unbounded in the length of a string an operator can paste into a JSON field.
+/// The measurement chose `'x'.matches(...)` -- a ONE-CHARACTER haystack -- so it priced regex
+/// COMPILATION and nothing else. `matches` costs states times HAYSTACK, and the haystack is the
+/// BINDING, which no bound on the expression reaches. Re-measured with a 64 KiB string in
+/// `claims`, which one `static` rule in the same document can supply and which
+/// `DEFAULT_MAX_STRING_BYTES` admits:
+///
+/// ```text
+///   2,036 bytes   51 terms   pad  8 KiB    27.8 ms
+///   2,036 bytes   51 terms   pad 32 KiB    61.3 s
+///   2,036 bytes   51 terms   pad 64 KiB   131.7 s
+/// ```
+///
+/// Inside this cap, 4x worse than the number the cap was introduced to fix. So the length cap
+/// is NOT what bounds per-call work; `ironauth_cel::UNPRICEABLE_FUNCTIONS` is, by refusing the
+/// function outright. What this cap still does is honest and worth keeping: it bounds the
+/// number of PRICEABLE operations an expression can name, and it keeps a mapping rule a mapping
+/// rule rather than a program.
 pub const MAX_CEL_EXPRESSION_BYTES: usize = 2 * 1024;
 
 /// The largest `max_collection_size` a `cel` rule may declare.
@@ -356,10 +408,11 @@ pub const MAX_CEL_COLLECTION_SIZE: u64 = 100_000;
 
 /// The binding a `cel` expression reads its input from.
 ///
-/// ONE name, and that is the isolation. `ironauth-cel` evaluates against `cel::Env::stdlib()`,
-/// which has no ambient IO by specification, so what an expression can reach is exactly this
-/// list -- and it holds this client's claim set and nothing else. Cross-tenant access is
-/// therefore not a question about the sandbox but about this constant.
+/// ONE name, and that is the isolation. `ironauth-cel` evaluates against a `cel::Context` it
+/// builds and adds this one variable to, and `cel` 0.12 offers no IO function to call, so what
+/// an expression can reach is exactly this list -- and it holds this client's claim set and
+/// nothing else. Cross-tenant access is therefore not a question about a sandbox but about
+/// this constant.
 pub const CEL_CLAIMS_BINDING: &str = "claims";
 
 /// Why a mapping was refused.
@@ -411,6 +464,12 @@ pub enum RefusalReason {
     /// actually has, and telling someone their working expression has a syntax error would
     /// send them looking for one that is not there.
     ExpressionOverBudget,
+    /// A `cel` rule's expression calls a function the cost model cannot price.
+    ///
+    /// Its own reason because the operator's next action is neither "make it cheaper" nor
+    /// "fix the syntax": the function is refused outright and the expression has to be written
+    /// without it. See `ironauth_cel::UNPRICEABLE_FUNCTIONS`.
+    ExpressionUnpriceable,
     /// A `cel` rule's expression is longer than [`MAX_CEL_EXPRESSION_BYTES`].
     ///
     /// A SIZE refusal, not a cost one, and separate from [`Self::ExpressionOverBudget`] for
@@ -459,6 +518,10 @@ impl RefusalReason {
                 "computes `{claim}` from an expression costing more than the \
                  {CEL_COST_BUDGET} budget at its declared cardinality"
             ),
+            Self::ExpressionUnpriceable => format!(
+                "computes `{claim}` from an expression calling a function whose cost cannot be \
+                 bounded"
+            ),
             Self::ExpressionTooLong => format!(
                 "computes `{claim}` from an expression longer than the \
                  {MAX_CEL_EXPRESSION_BYTES} byte limit"
@@ -490,6 +553,7 @@ impl core::fmt::Display for RefusalReason {
             Self::TooManyClaims => "more claims than the limit allows",
             Self::ExpressionUncompilable => "an expression that does not compile",
             Self::ExpressionOverBudget => "an expression over the cost budget",
+            Self::ExpressionUnpriceable => "an expression calling an unpriceable function",
             Self::ExpressionTooLong => "an expression over the length limit",
             Self::DeclaredCardinalityTooLarge => "a declared collection size over the limit",
             Self::ExpressionFailed => "an expression that failed to evaluate",
@@ -612,6 +676,9 @@ pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
                 reason: match error {
                     ironauth_cel::CostError::OverBudget { .. } => {
                         RefusalReason::ExpressionOverBudget
+                    }
+                    ironauth_cel::CostError::Unpriceable { .. } => {
+                        RefusalReason::ExpressionUnpriceable
                     }
                     ironauth_cel::CostError::Uncompilable(_) => {
                         RefusalReason::ExpressionUncompilable
@@ -899,6 +966,12 @@ mod tests {
         claims
     }
 
+    /// The claim as a ONE-TOKEN grant would carry it: `OneAccessToken` projects onto the
+    /// access token, so that is where an emitted claim lands.
+    fn claim_of<'a>(mapped: &'a MappedClaims, name: &str) -> Option<&'a serde_json::Value> {
+        mapped.access_token.get(name)
+    }
+
     fn only(rule: MappingRule) -> MappedClaims {
         apply_for(&[rule], &source(), Destination::TwoTokens).expect("applies")
     }
@@ -1016,22 +1089,126 @@ mod tests {
         );
     }
 
-    /// CRITERION 2's HOLE: a macro-free expression is priced at the model's FLOOR, so length
-    /// is what bounds it.
+    /// A COMPUTED CLAIM IS UNPLACED UNTIL A `place` RULE SAYS OTHERWISE.
+    ///
+    /// `rename` carries a placement across with the value; a `cel` rule writes a NEW name and
+    /// has none to carry. On a two-token grant unplaced means the ID token, and on
+    /// `OneAccessToken` it means the one token there is -- so a computed copy of a claim the
+    /// operator placed into the ID token reaches a machine client's access token.
+    ///
+    /// Asserted rather than left to be discovered, and asserted in BOTH directions: without the
+    /// second half this would pass against a rule kind whose output never lands anywhere.
+    #[test]
+    fn a_computed_claim_is_unplaced_until_a_place_rule_says_otherwise() {
+        // UNPLACED: on a one-token grant, the computed claim is emitted.
+        let mapped = apply_for(
+            &[
+                MappingRule::Static {
+                    name: "email".to_owned(),
+                    value: serde_json::json!("ada@example.test"),
+                },
+                MappingRule::Place {
+                    name: "email".to_owned(),
+                    placement: Placement::IdToken,
+                },
+                cel("email_copy", "claims.email"),
+            ],
+            &source(),
+            Destination::OneAccessToken,
+        )
+        .expect("applies");
+        assert_eq!(
+            claim_of(&mapped, "email_copy"),
+            Some(&serde_json::json!("ada@example.test")),
+            "a computed claim carries NO placement, so on a one-token grant it is emitted even \
+             though the claim it copied was placed into the ID token: {mapped:?}"
+        );
+
+        // AND A FOLLOWING `place` IS THE REMEDY, which is what makes the above a documented
+        // behaviour rather than a defect with no answer.
+        let mapped = apply_for(
+            &[
+                MappingRule::Static {
+                    name: "email".to_owned(),
+                    value: serde_json::json!("ada@example.test"),
+                },
+                cel("email_copy", "claims.email"),
+                MappingRule::Place {
+                    name: "email_copy".to_owned(),
+                    placement: Placement::IdToken,
+                },
+            ],
+            &source(),
+            Destination::OneAccessToken,
+        )
+        .expect("applies");
+        assert_eq!(
+            claim_of(&mapped, "email_copy"),
+            None,
+            "placed into the ID token, a one-token grant must not carry it: {mapped:?}"
+        );
+    }
+
+    /// AN ISSUANCE-TIME REFUSAL NAMES THE RULE THAT CAUSED IT.
+    ///
+    /// `MappingRefusal::rule_index` is "which rule, by position, so an operator can find it in
+    /// a list of forty", and the apply loop reported 0 for every rule until it was enumerated.
+    /// Nothing tested that: forcing the value back to a constant left the whole PR green, so
+    /// the exact regression could return silently.
+    ///
+    /// The THIRD rule fails, so a constant 0 and a constant 1 both fall.
+    #[test]
+    fn an_issuance_refusal_names_the_rule_that_caused_it() {
+        let refusal = apply_for(
+            &[
+                MappingRule::Static {
+                    name: "a".to_owned(),
+                    value: serde_json::json!(1),
+                },
+                MappingRule::Static {
+                    name: "b".to_owned(),
+                    value: serde_json::json!(2),
+                },
+                // Declares two, and `source()` hands it three groups: an oversized input is the
+                // one refusal `validate` cannot decide, so it comes from the APPLY loop.
+                MappingRule::Cel {
+                    name: "counted".to_owned(),
+                    expression: "claims.groups.size()".to_owned(),
+                    max_collection_size: 2,
+                },
+            ],
+            &source(),
+            Destination::TwoTokens,
+        )
+        .expect_err("the third rule fails at evaluation");
+        assert_eq!(
+            refusal.reason,
+            RefusalReason::ExpressionFailed,
+            "the runtime refusal, not a write-time one"
+        );
+        assert_eq!(
+            refusal.rule_index, 2,
+            "the operator is sent to the rule that failed, not to the first one"
+        );
+    }
+
+    /// A MACRO-FREE EXPRESSION IS PRICED AT THE MODEL'S FLOOR, so LENGTH is what bounds how
+    /// many operations it can name.
     ///
     /// `estimate_parsed_cost` returns 1 for any expression containing no comprehension, before
-    /// the declared cardinality is even read -- deliberately, and documented in `ironauth-cel`,
+    /// the declared cardinality is read -- deliberately, and documented in `ironauth-cel`,
     /// which records three attempts to make that arm model allocation and a hole in each. So
-    /// the budget cannot see an expression whose cost is per-CALL rather than per-iteration.
-    /// Review measured a thousand `matches()` terms: estimate 1, admitted, 6.1 seconds of
-    /// issuance CPU; five thousand terms, 30.2 seconds.
+    /// the budget cannot see a long chain of per-call work, and the length cap is what stops
+    /// an operator writing a hundred and seventy kilobytes of it.
     ///
-    /// This asserts the two ends of the fix: the shape is refused on LENGTH, and it is refused
-    /// as a length problem rather than mislabelled as a cost one, because "your expression is
-    /// too expensive" sends an operator to flatten a comprehension that is not there.
+    /// THE SHAPE HERE IS PRICEABLE ON PURPOSE. An earlier version used repeated `matches()`,
+    /// and that function is now refused outright because its cost lives in the BINDING rather
+    /// than the expression -- see the test below. Using it here would have made this test pass
+    /// for the wrong reason, and it did: its own guard, asserting the model still ADMITS the
+    /// shape, went red when the refusal landed. That is the guard working.
     #[test]
-    fn a_macro_free_expression_is_bounded_by_length_because_the_budget_cannot_see_it() {
-        let term = "'x'.matches('(?:a{400}){400}')";
+    fn a_macro_free_expression_is_bounded_by_length() {
+        let term = "claims.pad.startsWith('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')";
         let mut expression = String::new();
         while expression.len() + term.len() + 4 <= super::MAX_CEL_EXPRESSION_BYTES * 4 {
             if !expression.is_empty() {
@@ -1041,20 +1218,75 @@ mod tests {
         }
         assert!(expression.len() > super::MAX_CEL_EXPRESSION_BYTES);
 
-        // THE BUDGET ADMITS IT. Stated as an assertion rather than as prose, because the whole
-        // justification for a length cap is that the cost model does not object here -- and if
-        // the model ever learns to, this test says so by failing.
+        // THE BUDGET ADMITS IT, which is the whole justification for a length cap: if the model
+        // ever learns to price this, the cap stops being what carries the bound and this test
+        // says so by failing.
         assert!(
             super::compile_rule(&expression, 64).is_ok(),
             "the cost model is expected to ADMIT this shape; if it now refuses it, the length \
              cap may no longer be the thing carrying the bound"
         );
 
-        let refusal = validate(&[cel("expensive", &expression)]).expect_err("too long");
+        let refusal = validate(&[cel("long", &expression)]).expect_err("too long");
         assert_eq!(
             refusal.reason,
             RefusalReason::ExpressionTooLong,
             "refused on LENGTH, not mislabelled as a cost problem"
+        );
+
+        // AND THE SAME SHAPE INSIDE THE CAP IS ADMITTED, so the refusal above is the length
+        // rather than anything about the terms.
+        assert!(validate(&[cel("short", term)]).is_ok());
+    }
+
+    /// AN EXPRESSION WHOSE COST LIVES IN THE BINDING IS REFUSED, NOT MERELY BOUNDED.
+    ///
+    /// `matches` costs regex states times HAYSTACK, and the haystack comes from `claims` --
+    /// which no bound on the expression's own length can reach. Measured in release, at 2,036
+    /// bytes (inside `MAX_CEL_EXPRESSION_BYTES`) against a 64 KiB string that one `static`
+    /// rule in the same document supplies: **131.7 seconds** of a shared issuance worker, per
+    /// login, admitted at an estimate of 1.
+    ///
+    /// This is the review finding that defeated the length cap, and it is the reason the crate
+    /// refuses the function rather than pricing it. The fixture is the reviewer's, verbatim in
+    /// shape, so the test and the measurement are about the same thing.
+    #[test]
+    fn an_expression_whose_cost_lives_in_the_binding_is_refused() {
+        let term = "claims.pad.matches('(?:a{99}){99}b')";
+        let mut expression = String::new();
+        while expression.len() + term.len() + 4 <= super::MAX_CEL_EXPRESSION_BYTES {
+            if !expression.is_empty() {
+                expression.push_str(" || ");
+            }
+            expression.push_str(term);
+        }
+        assert!(
+            expression.len() <= super::MAX_CEL_EXPRESSION_BYTES,
+            "the fixture must fit the length cap, or it proves nothing about it"
+        );
+
+        let refusal = validate(&[cel("out", &expression)]).expect_err("refused");
+        assert_eq!(
+            refusal.reason,
+            RefusalReason::ExpressionUnpriceable,
+            "refused because the FUNCTION cannot be priced, not because the expression is long \
+             -- it is not -- and not because the budget saw the cost, which it cannot"
+        );
+
+        // AND A SINGLE CALL IS REFUSED TOO, so the assertion above is the function rather than
+        // the term count. One `matches` is as unpriceable as fifty.
+        assert_eq!(
+            validate(&[cel("out", "claims.pad.matches('a')")])
+                .expect_err("one call is refused")
+                .reason,
+            RefusalReason::ExpressionUnpriceable
+        );
+
+        // AND THE REFUSAL IS NOT A BLANKET ONE. The same shape without `matches` is admitted,
+        // so this test cannot pass against a rule kind that refuses everything.
+        assert!(
+            validate(&[cel("out", "claims.pad.startsWith('a')")]).is_ok(),
+            "an ordinary string call must still be admitted"
         );
     }
 
@@ -1109,8 +1341,8 @@ mod tests {
 
     /// CRITERION 3: an expression has no ambient IO, and the sandbox is the BINDING LIST.
     ///
-    /// `cel::Env::stdlib()` has no network, filesystem or environment access by specification,
-    /// so there is no function to call. What an expression can reach is what it was bound, and
+    /// `cel` 0.12's function set has no network, filesystem or environment access, so there is
+    /// no such function to call. What an expression can reach is what it was bound, and
     /// it is bound exactly one name. So the adversarial case that matters is not "can it call
     /// fetch" -- there is no fetch -- but "can it name something it was not given", and an
     /// undeclared identifier fails.

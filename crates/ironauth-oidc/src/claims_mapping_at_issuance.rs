@@ -64,12 +64,16 @@ use crate::claims_mapping::{self, MappedClaims};
 pub enum MappingFault {
     /// The stored document could not be read as a rule set.
     Unreadable,
-    /// The rules were read but refused: one writes a protected claim.
+    /// The rules were read but refused.
     ///
-    /// Distinct from [`Self::Unreadable`] because the two point at different operators. A
-    /// refusal means a document that the admin path should never have accepted, which is a
-    /// fence to check; an unreadable one means a document nobody can parse, which is a version
-    /// or a row to check.
+    /// Distinct from [`Self::Unreadable`] because the two point at different operators. An
+    /// unreadable document is one nobody can parse, which is a version or a row to check.
+    ///
+    /// A REFUSAL IS NOW TWO THINGS, and this doc used to name only the first. Most refusals
+    /// mean a document the admin path should never have accepted -- one writing a protected
+    /// claim -- which is a fence to check. A `cel` rule can also fail at EVALUATION, on an
+    /// input larger than it declared, and that one the write fence CANNOT see: it depends on
+    /// the claim set of the login in front of you. The logged refusal names which.
     Refused,
     /// The store could not answer.
     Unavailable,
@@ -169,7 +173,13 @@ async fn resolve_for(
                 tenant = %scope.tenant(),
                 client_id,
                 %refusal,
-                "a stored claim mapping writes a protected claim; refusing the issuance"
+                // The REFUSAL says which, and this line no longer guesses. It read "a stored
+                // claim mapping writes a protected claim", which was every case until a `cel`
+                // rule could fail at EVALUATION -- a refusal the write fence is documented as
+                // unable to see. Telling an operator to audit claim names for an oversized
+                // input sends them to the wrong place, and `%refusal` already carries the
+                // rule index and the reason.
+                "a stored claim mapping was refused; refusing the issuance"
             );
             MappingFault::Refused
         })
