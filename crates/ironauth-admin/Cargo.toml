@@ -92,6 +92,19 @@ default = []
 # Enables the ironauth-store real-database harness for the DB-backed integration
 # tests (mirrors ironauth-store's own `testing` gate). Adds no runtime surface.
 testing = ["ironauth-store/testing"]
+# The hook runtime, for the TEST HARNESS only (issue #114 criterion 5).
+#
+# The library needs no `cfg` of its own: `ironauth-oidc`'s stub module carries the whole
+# draft-run seam, so the endpoint compiles identically either way. What needs a flag is
+# `tests/common`, which installs a REAL runtime -- `HookRuntime::new` exists only on the
+# inhabited type.
+#
+# It FORWARDS, so enabling this necessarily enables `ironauth-oidc`'s. That direction is the
+# safe one and the reverse is what broke: with oidc's flag on and this one off, an earlier
+# version of the endpoint had a `cfg(not(...))` arm calling `HookRuntime::unreachable` on the
+# real type, which has no such method. Two crates' flags cannot be assumed to move together, so
+# the library stopped depending on them moving together.
+wasm-hooks = ["ironauth-oidc/wasm-hooks"]
 
 [dev-dependencies]
 # TEST ONLY, and for one assertion: `ironauth_hooks::fixtures::GOOD` is a REAL component built
@@ -104,7 +117,9 @@ ironauth-hooks = { workspace = true, features = ["testing"] }
 # The hermetic fetcher seam (issue #674). Test builds only, so no production
 # binary can construct a fetcher that skips the OS trust store.
 ironauth-fetch = { workspace = true, features = ["test-harness"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+# `time` for the draft-test harness's epoch driver (issue #114 criterion 5): a deadline is a
+# count of ticks, so a suite with nothing advancing them tests a bound that never arrives.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
 tower = { workspace = true, features = ["util"] }
 # `axum::serve` needs axum's own tokio server, which the PRODUCTION dependency
 # deliberately leaves off: this crate hands a Router to the binary and never listens. The
@@ -232,6 +247,15 @@ required-features = ["testing"]
 name = "token_hooks"
 path = "tests/token_hooks.rs"
 required-features = ["testing"]
+
+# The draft-test suite runs a REAL component through the REAL dispatch, so it needs the hook
+# runtime as well as the database harness. Both features, or the target does not build -- which
+# is right: a version of this suite that ran without a runtime would be asserting that the
+# endpoint reports "unavailable", not that draft testing works.
+[[test]]
+name = "token_hook_draft"
+path = "tests/token_hook_draft.rs"
+required-features = ["testing", "wasm-hooks"]
 
 [[test]]
 name = "signup_forms"

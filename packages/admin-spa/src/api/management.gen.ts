@@ -378,6 +378,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a client's token hook against a recorded event, without deploying anything.
+         * @description Issue #114 criterion 5's fixture-based draft testing, and the half of the Auth0 Actions loop
+         *     this surface was missing: deploy, ROLL BACK and list already worked, so an operator could
+         *     recover from a bad hook but could not avoid shipping one.
+         *
+         *     # It runs the SHIPPED dispatch, not a copy of it
+         *
+         *     `ironauth_oidc::token_hook::run_record` is the same function an issuance calls, with the
+         *     same limits, the same payload-version check, the same fence and the same fault
+         *     classification. A second implementation built for this endpoint would answer about itself,
+         *     which is the one thing a draft run must not do.
+         *
+         *     Two deliberate departures, both because a draft run has no login to protect:
+         *
+         *     * THE FAILURE POLICY IS NOT APPLIED. `run` swallows a fault under `fail_open` so a broken
+         *       hook does not fail a login. Here the operator IS the audience, and hiding the fault is
+         *       hiding the answer, so the outcome reports `aborted` with the reason.
+         *
+         *     # A deliberate DECLINE is reported as `aborted`, and that is a real limitation
+         *
+         *     The WIT contract distinguishes them -- its own doc says the error arm "is NOT the same thing
+         *     as a trap" -- and `HookFault` does not: `Aborted` is documented as "exhausted a bound,
+         *     trapped, OR DECLINED", because at issuance the difference changes nothing a client may see.
+         *     It changes plenty for an operator testing a hook, and carrying it out means giving
+         *     `HookFault` a payload it deliberately does not have. Not done here. Said rather than papered
+         *     over with an outcome value nothing can produce.
+         *     * THE FENCE'S REFUSALS ARE REPORTED. At issuance they are logged and dropped, because
+         *       nobody can act on them mid-request. An operator asking what a hook would do can act on
+         *       "it tried to set `sub`" immediately.
+         *
+         *     # Nothing is written
+         *
+         *     No deploy, no version row, no audit `token_hook.set`. It is a READ plus a computation, which
+         *     is why it is `management.read` rather than `write_config` -- and why it does not take the
+         *     sudo freshness a deploy does. Running a hook the operator can already read the bytes of,
+         *     against an event they supplied, discloses nothing they did not already have.
+         */
+        post: operations["testTokenHook"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions": {
         parameters: {
             query?: never;
@@ -7727,6 +7781,86 @@ export interface components {
             status: string;
         };
         /**
+         * @description The body of a token-hook DRAFT RUN (issue #114 criterion 5, fixture-based draft testing).
+         *
+         *     A recorded event to run a hook against, so an operator can ask "what would this do to that
+         *     login" before an actual login finds out.
+         */
+        TestTokenHookRequest: {
+            /** @description The access-token claims the mint would have at the point the hook runs. */
+            access_token_claims?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description The `grant_type` to present, so a hook that shapes a refresh differently can be tested
+             *     on that door. Defaults to `authorization_code`.
+             */
+            grant_type?: string | null;
+            /** @description The ID-token claims the mint would have at the point the hook runs. */
+            id_token_claims?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description The subject to present. Omit to test a grant with no user, such as
+             *     `client_credentials` -- which is a DIFFERENT input, not a missing one.
+             */
+            subject?: string | null;
+            /**
+             * Format: int32
+             * @description Which version to run. Omit to run the one currently deployed.
+             *
+             *     A version still in the history, exactly as `rollbackTokenHook` means it: the history is
+             *     capped, so a number from an older listing may since have been pruned.
+             */
+            version?: number | null;
+        };
+        /**
+         * @description What a draft run produced (issue #114 criterion 5).
+         *
+         *     `completed` and `aborted` are distinguished because an operator acts on them differently: a
+         *     hook that completed shaped claims, and one that aborted did not finish and says why. The
+         *     reason string carries what the dispatch knows, which is less than the WIT contract expresses
+         *     -- see `outcome`.
+         */
+        TestTokenHookResponse: {
+            /** @description The access-token claims the hook contributed, after the fence. */
+            access_token_claims: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description The ID-token claims the hook contributed, AFTER the protected-claim fence.
+             *
+             *     After the fence, deliberately: what an operator wants to know is what would reach a
+             *     token, and a hook's own output is not that. A claim it tried to mint and the fence
+             *     refused appears in `refused` instead.
+             */
+            id_token_claims: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description `completed` or `aborted`.
+             *
+             *     NOT `declined`, though the WIT contract distinguishes a deliberate decline from a trap.
+             *     `HookFault::Aborted` is documented as covering "exhausted a bound, trapped, or
+             *     declined", because at issuance the difference changes nothing a client may see. A draft
+             *     run would like it and cannot have it without giving that type a payload it does not
+             *     carry. Absent rather than present-and-unreachable.
+             */
+            outcome: string;
+            /** @description Why, for `declined` and `aborted`. Absent for `completed`. */
+            reason?: string | null;
+            /**
+             * @description Claim names the fence refused, so a hook trying to forge `sub` is visible here rather
+             *     than only in a log an operator has to go and find.
+             */
+            refused: string[];
+            /**
+             * Format: int32
+             * @description Which version ran, so a run with no `version` says which one it picked.
+             */
+            version_run?: number | null;
+        };
+        /**
          * @description One historical deploy of a client's hook (issue #114 criterion 5).
          *
          *     METADATA, never the component -- the same reason `TokenHookView` withholds it, multiplied
@@ -10259,6 +10393,82 @@ export interface operations {
             };
             /** @description Environment not found, malformed client id, or no such version. A version that existed can become no-such-version: the history is capped, so a number read from an older listing may since have been pruned */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    testTokenHook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TestTokenHookRequest"];
+            };
+        };
+        responses: {
+            /** @description The hook ran. `outcome` is `completed`, `declined` or `aborted`; a declined or aborted run is still a 200, because the QUESTION was answered */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TestTokenHookResponse"];
+                };
+            };
+            /** @description An unreadable body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed client id, no hook deployed, or no such version */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description This build or this process does not carry the WASM hook runtime */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

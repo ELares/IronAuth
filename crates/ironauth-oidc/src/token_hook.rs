@@ -304,6 +304,17 @@ pub struct HookClaims {
     pub id_token: BTreeMap<String, serde_json::Value>,
     /// Accepted access-token claims.
     pub access_token: BTreeMap<String, serde_json::Value>,
+    /// Claim names the protected-claim fence REFUSED, across both tokens.
+    ///
+    /// The issuance path ignores this and is right to: the token is issued without those claims
+    /// either way, and there is nobody to show an error to mid-login. `fence`'s own doc says
+    /// exactly that, and it stays true.
+    ///
+    /// A DRAFT RUN is the caller that can act on it (issue #114 criterion 5). An operator
+    /// asking "what would version 3 do to this event" is asking a question the log line answers
+    /// after the fact and for a login that already happened; carrying the names out is what
+    /// lets the answer include "and it tried to set `sub`, which was refused".
+    pub refused: Vec<String>,
 }
 
 /// One invocation's inputs.
@@ -412,6 +423,31 @@ pub async fn run(
 /// Split out of [`run`] so the failure policy is applied in ONE place: every `?` in here is a
 /// fault the policy decides the meaning of, and threading that decision through each of them
 /// individually is how one of them ends up deciding differently.
+/// Run a hook RECORD the caller already has, rather than the one deployed for this client.
+///
+/// Issue #114 criterion 5's fixture-based draft testing: an operator asks "what would version 3
+/// do to this event", and the only honest answer runs version 3 through the same code that
+/// would run it if it were active. A second path built for the question would answer about
+/// itself.
+///
+/// So this is deliberately the SAME function the issuance path calls, exposed rather than
+/// duplicated -- the fence, the payload-version check, the limits, the cache and the fault
+/// classification are all the shipped ones. What it does NOT do is apply the failure policy:
+/// [`run`] does that, and it is a statement about whether a LOGIN proceeds. A draft run has no
+/// login to fail, and an operator testing a hook wants to see the fault rather than have it
+/// swallowed by `fail_open`.
+///
+/// # Errors
+///
+/// [`HookFault`] exactly as the issuance path would raise it, unswallowed.
+pub async fn run_record(
+    runtime: &HookRuntime,
+    invocation: &Invocation<'_>,
+    record: &ironauth_store::token_hook_store::TokenHookRecord,
+) -> Result<Option<HookClaims>, HookFault> {
+    run_deployed_hook(&runtime.engine, &runtime.cache, invocation, record).await
+}
+
 async fn run_deployed_hook(
     engine: &Arc<HookEngine>,
     cache: &Arc<HookCache>,
@@ -478,21 +514,30 @@ async fn run_deployed_hook(
             HookFault::Aborted
         })?;
 
+    let (id_token, mut refused) = fence(
+        &customization.id_token_claims,
+        id_token_claims,
+        scope,
+        client_id,
+        "id_token",
+    );
+    let (access_token, access_refused) = fence(
+        &customization.access_token_claims,
+        access_token_claims,
+        scope,
+        client_id,
+        "access_token",
+    );
+    // ONE list across both tokens, deduplicated: a hook that tries to set `sub` in both is
+    // making one mistake, and reporting it twice would read as two.
+    refused.extend(access_refused);
+    refused.sort_unstable();
+    refused.dedup();
+
     Ok(Some(HookClaims {
-        id_token: fence(
-            &customization.id_token_claims,
-            id_token_claims,
-            scope,
-            client_id,
-            "id_token",
-        ),
-        access_token: fence(
-            &customization.access_token_claims,
-            access_token_claims,
-            scope,
-            client_id,
-            "access_token",
-        ),
+        id_token,
+        access_token,
+        refused,
     }))
 }
 
@@ -743,7 +788,7 @@ fn fence(
     scope: Scope,
     client_id: &str,
     token: &'static str,
-) -> BTreeMap<String, serde_json::Value> {
+) -> (BTreeMap<String, serde_json::Value>, Vec<String>) {
     // EVERY returned claim is parsed and handed to the fence, and the reason is that truncating
     // here defeats two things `filter_hook_claims` promises. Its doc says "which claims overflow
     // is decided in claim-name order, so it is the same set on every invocation" and "the
@@ -826,7 +871,12 @@ fn fence(
     // not use the ordering to smuggle anything past the fence.
     let mut kept = echoed;
     kept.extend(outcome.accepted);
-    kept
+    let refused = outcome
+        .refused
+        .into_iter()
+        .map(|(name, _reason)| name)
+        .collect();
+    (kept, refused)
 }
 
 /// The wire shape the guest ABI takes: a name and its value as JSON TEXT.

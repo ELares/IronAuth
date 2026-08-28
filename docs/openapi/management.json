@@ -2724,6 +2724,122 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test": {
+      "post": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "Run a client's token hook against a recorded event, without deploying anything.",
+        "description": "Issue #114 criterion 5's fixture-based draft testing, and the half of the Auth0 Actions loop\nthis surface was missing: deploy, ROLL BACK and list already worked, so an operator could\nrecover from a bad hook but could not avoid shipping one.\n\n# It runs the SHIPPED dispatch, not a copy of it\n\n`ironauth_oidc::token_hook::run_record` is the same function an issuance calls, with the\nsame limits, the same payload-version check, the same fence and the same fault\nclassification. A second implementation built for this endpoint would answer about itself,\nwhich is the one thing a draft run must not do.\n\nTwo deliberate departures, both because a draft run has no login to protect:\n\n* THE FAILURE POLICY IS NOT APPLIED. `run` swallows a fault under `fail_open` so a broken\n  hook does not fail a login. Here the operator IS the audience, and hiding the fault is\n  hiding the answer, so the outcome reports `aborted` with the reason.\n\n# A deliberate DECLINE is reported as `aborted`, and that is a real limitation\n\nThe WIT contract distinguishes them -- its own doc says the error arm \"is NOT the same thing\nas a trap\" -- and `HookFault` does not: `Aborted` is documented as \"exhausted a bound,\ntrapped, OR DECLINED\", because at issuance the difference changes nothing a client may see.\nIt changes plenty for an operator testing a hook, and carrying it out means giving\n`HookFault` a payload it deliberately does not have. Not done here. Said rather than papered\nover with an outcome value nothing can produce.\n* THE FENCE'S REFUSALS ARE REPORTED. At issuance they are logged and dropped, because\n  nobody can act on them mid-request. An operator asking what a hook would do can act on\n  \"it tried to set `sub`\" immediately.\n\n# Nothing is written\n\nNo deploy, no version row, no audit `token_hook.set`. It is a READ plus a computation, which\nis why it is `management.read` rather than `write_config` -- and why it does not take the\nsudo freshness a deploy does. Running a hook the operator can already read the bytes of,\nagainst an event they supplied, discloses nothing they did not already have.",
+        "operationId": "testTokenHook",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hook shapes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestTokenHookRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The hook ran. `outcome` is `completed`, `declined` or `aborted`; a declined or aborted run is still a 200, because the QUESTION was answered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestTokenHookResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An unreadable body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, malformed client id, no hook deployed, or no such version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "This build or this process does not carry the WASM hook runtime",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions": {
       "get": {
         "tags": [
@@ -31818,6 +31934,104 @@
           "status": {
             "type": "string",
             "description": "The lifecycle status: `active` or `suspended` (issue #46). A suspended\ntenant is fenced off the data plane but keeps all its data and stays visible\nhere."
+          }
+        }
+      },
+      "TestTokenHookRequest": {
+        "type": "object",
+        "description": "The body of a token-hook DRAFT RUN (issue #114 criterion 5, fixture-based draft testing).\n\nA recorded event to run a hook against, so an operator can ask \"what would this do to that\nlogin\" before an actual login finds out.",
+        "properties": {
+          "access_token_claims": {
+            "type": "object",
+            "description": "The access-token claims the mint would have at the point the hook runs.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "grant_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `grant_type` to present, so a hook that shapes a refresh differently can be tested\non that door. Defaults to `authorization_code`."
+          },
+          "id_token_claims": {
+            "type": "object",
+            "description": "The ID-token claims the mint would have at the point the hook runs.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "subject": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The subject to present. Omit to test a grant with no user, such as\n`client_credentials` -- which is a DIFFERENT input, not a missing one."
+          },
+          "version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Which version to run. Omit to run the one currently deployed.\n\nA version still in the history, exactly as `rollbackTokenHook` means it: the history is\ncapped, so a number from an older listing may since have been pruned."
+          }
+        }
+      },
+      "TestTokenHookResponse": {
+        "type": "object",
+        "description": "What a draft run produced (issue #114 criterion 5).\n\n`completed` and `aborted` are distinguished because an operator acts on them differently: a\nhook that completed shaped claims, and one that aborted did not finish and says why. The\nreason string carries what the dispatch knows, which is less than the WIT contract expresses\n-- see `outcome`.",
+        "required": [
+          "outcome",
+          "id_token_claims",
+          "access_token_claims",
+          "refused"
+        ],
+        "properties": {
+          "access_token_claims": {
+            "type": "object",
+            "description": "The access-token claims the hook contributed, after the fence.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "id_token_claims": {
+            "type": "object",
+            "description": "The ID-token claims the hook contributed, AFTER the protected-claim fence.\n\nAfter the fence, deliberately: what an operator wants to know is what would reach a\ntoken, and a hook's own output is not that. A claim it tried to mint and the fence\nrefused appears in `refused` instead.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "outcome": {
+            "type": "string",
+            "description": "`completed` or `aborted`.\n\nNOT `declined`, though the WIT contract distinguishes a deliberate decline from a trap.\n`HookFault::Aborted` is documented as covering \"exhausted a bound, trapped, or\ndeclined\", because at issuance the difference changes nothing a client may see. A draft\nrun would like it and cannot have it without giving that type a payload it does not\ncarry. Absent rather than present-and-unreachable."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why, for `declined` and `aborted`. Absent for `completed`."
+          },
+          "refused": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Claim names the fence refused, so a hook trying to forge `sub` is visible here rather\nthan only in a log an operator has to go and find."
+          },
+          "version_run": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Which version ran, so a run with no `version` says which one it picked."
           }
         }
       },

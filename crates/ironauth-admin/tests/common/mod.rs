@@ -69,7 +69,7 @@ impl Harness {
         };
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds");
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -97,7 +97,7 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_usage_fold_limit(limit);
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -129,7 +129,7 @@ impl Harness {
             .expect("admin state builds")
             .with_txt_lookup(std::sync::Arc::clone(&lookup)
                 as std::sync::Arc<dyn ironauth_fetch::txt::TxtLookup>);
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -175,7 +175,7 @@ impl Harness {
         };
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds");
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -205,7 +205,7 @@ impl Harness {
         };
         let state =
             AdminState::new(db.control_store().clone(), env, &config).expect("admin state builds");
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -227,7 +227,7 @@ impl Harness {
         };
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds");
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -256,7 +256,7 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_max_group_depth(max_group_depth);
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -293,7 +293,7 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_identifiers(identifiers);
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -327,7 +327,7 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_token_claims(token_claims);
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -355,7 +355,7 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_signup_quarantine_enabled(armed);
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -383,7 +383,7 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_advanced_recovery_enabled(armed);
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -421,7 +421,7 @@ impl Harness {
         };
         let state =
             AdminState::new(db.control_store().clone(), env, &config).expect("admin state builds");
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         (
             Self {
                 db,
@@ -456,7 +456,7 @@ impl Harness {
         };
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds");
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         let harness = Self {
             db,
             router,
@@ -520,7 +520,7 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_signing_registry(registry);
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -622,7 +622,7 @@ impl Harness {
             // rather than being faked.
             .with_txt_lookup(std::sync::Arc::clone(&armed_txt)
                 as std::sync::Arc<dyn ironauth_fetch::txt::TxtLookup>);
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         let harness = Self {
             db,
             router,
@@ -736,7 +736,7 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_federation(runtime);
-        let router = management_router(state);
+        let router = management_router(install_hook_runtime(state));
         Self {
             db,
             router,
@@ -1303,5 +1303,47 @@ impl ironauth_fetch::txt::TxtLookup for FixedTxt {
                 Err(message) => Err(std::io::Error::other(message.clone())),
             }
         })
+    }
+}
+
+/// Give an admin state the process's WASM hook runtime, when this build has one.
+///
+/// EVERY harness gets it, not a special one, and the live-surface sweep is why. That sweep
+/// asserts no management operation answers a server error against a healthy environment,
+/// because "each one is a dead surface: no request an operator can make will ever succeed
+/// there". A harness with no engine made `testTokenHook` answer 503 and be counted as exactly
+/// that -- which was the sweep working: the endpoint IS dead in a process without an engine,
+/// and the fix is to give the harness what a real deployment has.
+///
+/// A REAL engine, not a stub. The draft endpoint's whole claim is that it runs the shipped
+/// dispatch, so a harness handing it something else would be testing the something else.
+///
+/// Without the `wasm-hooks` feature `HookRuntime` is uninhabited and there is nothing to
+/// install, which is the case the endpoint's service-unavailable answer describes.
+fn install_hook_runtime(state: AdminState) -> AdminState {
+    #[cfg(not(feature = "wasm-hooks"))]
+    {
+        state
+    }
+
+    #[cfg(feature = "wasm-hooks")]
+    {
+        let engine =
+            std::sync::Arc::new(ironauth_hooks::HookEngine::new().expect("the hook engine builds"));
+        let runtime = std::sync::Arc::new(ironauth_oidc::token_hook::HookRuntime::new(engine));
+        // THE EPOCH DRIVER, because a deadline is a count of ticks and nothing advances them
+        // otherwise. `token_hook::EPOCH_TICK` rather than a literal: a harness with its own
+        // interval is how a suite ends up harsher than production, which `main.rs` records
+        // happening once already at 1 ms against the server's 10 ms.
+        let ticker = std::sync::Arc::clone(runtime.engine());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(ironauth_oidc::token_hook::EPOCH_TICK);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                ticker.tick();
+            }
+        });
+        state.with_hook_runtime(runtime)
     }
 }

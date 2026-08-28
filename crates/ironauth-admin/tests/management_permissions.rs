@@ -188,6 +188,11 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("getTokenHook", ManagementPermission::Read),
     ("listTokenHookVersions", ManagementPermission::Read),
     ("rollbackTokenHook", ManagementPermission::WriteConfig),
+    // READ, unlike its three write-shaped neighbours, and the reason is that it writes
+    // nothing: a draft run is a read of a hook the caller can already fetch plus a
+    // computation over an event they supplied. Classifying it with the deploy would demand
+    // `write_config` and sudo freshness to ask a question.
+    ("testTokenHook", ManagementPermission::Read),
     // User sub-surfaces: identifiers, trait schemas, signup quarantine and recovery
     // approvals. Identifier UNIQUENESS and trait schemas are config rather than user
     // authority, because each changes a rule the whole environment obeys.
@@ -629,6 +634,9 @@ const PERMISSION_PROVEN: &[&str] = &[
     // it changes what every token this client is issued carries.
     "listTokenHookVersions",
     "rollbackTokenHook",
+    // Proven in `a_draft_run_reports_what_the_deployed_hook_would_do_and_writes_nothing` and
+    // its siblings: a `management.read` credential reaches the handler and gets an answer.
+    "testTokenHook",
     // Proven in `read_is_required_and_sufficient_for_the_event_feed_and_usage_export`, in
     // BOTH directions: a `write_config` credential is refused and a `read` one is allowed,
     // so neither a blanket refusal nor a missing gate would pass it.
@@ -777,12 +785,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        191,
+        192,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        47,
+        48,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

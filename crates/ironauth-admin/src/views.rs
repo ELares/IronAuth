@@ -2000,6 +2000,68 @@ pub struct TokenHookVersionView {
     pub created_at_unix_micros: i64,
 }
 
+/// The body of a token-hook DRAFT RUN (issue #114 criterion 5, fixture-based draft testing).
+///
+/// A recorded event to run a hook against, so an operator can ask "what would this do to that
+/// login" before an actual login finds out.
+#[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
+pub struct TestTokenHookRequest {
+    /// Which version to run. Omit to run the one currently deployed.
+    ///
+    /// A version still in the history, exactly as `rollbackTokenHook` means it: the history is
+    /// capped, so a number from an older listing may since have been pruned.
+    #[serde(default)]
+    pub version: Option<i32>,
+    /// The `grant_type` to present, so a hook that shapes a refresh differently can be tested
+    /// on that door. Defaults to `authorization_code`.
+    #[serde(default)]
+    pub grant_type: Option<String>,
+    /// The subject to present. Omit to test a grant with no user, such as
+    /// `client_credentials` -- which is a DIFFERENT input, not a missing one.
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// The ID-token claims the mint would have at the point the hook runs.
+    #[serde(default)]
+    pub id_token_claims: serde_json::Map<String, serde_json::Value>,
+    /// The access-token claims the mint would have at the point the hook runs.
+    #[serde(default)]
+    pub access_token_claims: serde_json::Map<String, serde_json::Value>,
+}
+
+/// What a draft run produced (issue #114 criterion 5).
+///
+/// `completed` and `aborted` are distinguished because an operator acts on them differently: a
+/// hook that completed shaped claims, and one that aborted did not finish and says why. The
+/// reason string carries what the dispatch knows, which is less than the WIT contract expresses
+/// -- see `outcome`.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct TestTokenHookResponse {
+    /// `completed` or `aborted`.
+    ///
+    /// NOT `declined`, though the WIT contract distinguishes a deliberate decline from a trap.
+    /// `HookFault::Aborted` is documented as covering "exhausted a bound, trapped, or
+    /// declined", because at issuance the difference changes nothing a client may see. A draft
+    /// run would like it and cannot have it without giving that type a payload it does not
+    /// carry. Absent rather than present-and-unreachable.
+    pub outcome: String,
+    /// Why, for `declined` and `aborted`. Absent for `completed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The ID-token claims the hook contributed, AFTER the protected-claim fence.
+    ///
+    /// After the fence, deliberately: what an operator wants to know is what would reach a
+    /// token, and a hook's own output is not that. A claim it tried to mint and the fence
+    /// refused appears in `refused` instead.
+    pub id_token_claims: serde_json::Map<String, serde_json::Value>,
+    /// The access-token claims the hook contributed, after the fence.
+    pub access_token_claims: serde_json::Map<String, serde_json::Value>,
+    /// Claim names the fence refused, so a hook trying to forge `sub` is visible here rather
+    /// than only in a log an operator has to go and find.
+    pub refused: Vec<String>,
+    /// Which version ran, so a run with no `version` says which one it picked.
+    pub version_run: Option<i32>,
+}
+
 /// The body of a token-hook rollback (issue #114 criterion 5).
 #[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
 pub struct RollbackTokenHookRequest {

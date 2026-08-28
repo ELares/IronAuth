@@ -1823,6 +1823,22 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/applications/{client}/token-hook/rollback"),
             &serde_json::json!({ "version": 1 }),
         ),
+        // The DRAFT RUN (issue #114 criterion 5). A POST that writes nothing, which is why it
+        // is here twice over: the operation sweep needs it like any other, and the
+        // soft-deleted-environment sweep classifies by METHOD, so a POST that skipped
+        // `require_live_environment` would be a write-shaped door into a decommissioned
+        // environment even though it stores nothing. Running a hook there is exactly what a
+        // fence exists to stop.
+        //
+        // No `version`, so it runs whatever is deployed: the sweeps care about the door's
+        // gates, and pinning a version here would make this case fail when the fixture's
+        // history changes for unrelated reasons.
+        Case::json(
+            "token_hooks.testTokenHook",
+            "POST",
+            format!("{base}/applications/{client}/token-hook/test"),
+            &serde_json::json!({ "grant_type": "authorization_code" }),
+        ),
         Case::empty(
             "token_hooks.deleteTokenHook",
             "DELETE",

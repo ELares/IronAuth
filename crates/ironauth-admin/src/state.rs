@@ -151,6 +151,17 @@ struct Inner {
     // `None` when no data-plane store could be opened, and every reader fails closed rather
     // than falling back to the control store, which would be the grant widening this avoids.
     data_store: Option<Store>,
+    // The WASM hook runtime, when this process built one (issue #114 criterion 5).
+    //
+    // SHARED with the OIDC data plane rather than built here, and that is not an optimization:
+    // a wasmtime `Engine` owns the compiled-code cache, so a second one would mean a draft run
+    // compiles a component the issuance path has already compiled -- six and a half seconds for
+    // a TypeScript hook -- and would answer about a cache the product does not use.
+    //
+    // `None` when the process has no engine, and ALWAYS `None` without the `wasm-hooks`
+    // feature, because `HookRuntime` is uninhabited there. The draft endpoint then answers a
+    // clean refusal rather than being absent from the surface.
+    hook_runtime: Option<Arc<ironauth_oidc::token_hook::HookRuntime>>,
     env: Env,
     // Wrapped in SecretString so it cannot leak through Debug/logs; the value is
     // reachable only via `.expose()` at the constant-time comparison site.
@@ -343,6 +354,7 @@ impl AdminState {
                 // a state built without it fails the resend closed rather than silently using
                 // the control store.
                 data_store: None,
+                hook_runtime: None,
                 env,
                 bootstrap_operator_token,
                 bootstrap_operator_id: OperatorId::from_seed_bytes(BOOTSTRAP_SEED),
@@ -444,6 +456,28 @@ impl AdminState {
     #[must_use]
     pub(crate) fn data_store(&self) -> Option<&Store> {
         self.inner.data_store.as_ref()
+    }
+
+    /// Share the process's WASM hook runtime with this plane (issue #114 criterion 5).
+    ///
+    /// Handed the SAME runtime the issuance path holds, for the reason `with_data_store` gives
+    /// about pools: two engines would be two compiled-code caches, and a draft run would answer
+    /// about the one no login uses.
+    #[must_use]
+    pub fn with_hook_runtime(
+        mut self,
+        runtime: Arc<ironauth_oidc::token_hook::HookRuntime>,
+    ) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.hook_runtime = Some(runtime);
+        }
+        self
+    }
+
+    /// The shared hook runtime, or [`None`] when this build or this process has none.
+    #[must_use]
+    pub fn hook_runtime(&self) -> Option<&Arc<ironauth_oidc::token_hook::HookRuntime>> {
+        self.inner.hook_runtime.as_ref()
     }
 
     /// Attach the data-plane store (issue #111 criterion 1).

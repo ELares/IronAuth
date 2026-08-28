@@ -1730,6 +1730,13 @@ func (c *Client) SuspendTenant(tenant_id string, query url.Values) (*http.Respon
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/suspend", query, nil)
 }
 
+// TestTokenHook performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test.
+//
+// Run a client's token hook against a recorded event, without deploying anything.
+func (c *Client) TestTokenHook(tenant_id string, environment_id string, client_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/test", query, body)
+}
+
 // UnassignOrgGroupRole performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}.
 //
 // Withdraw a role from a group.

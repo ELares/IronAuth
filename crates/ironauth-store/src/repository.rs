@@ -32584,6 +32584,49 @@ impl TokenHookRepo<'_> {
         .transpose()
     }
 
+    /// One VERSION of this client's hook, with its component, or [`None`] if there is no such
+    /// version (issue #114 criterion 5, fixture-based draft testing).
+    ///
+    /// The same shape [`Self::get`] returns, deliberately: a draft test runs a version through
+    /// the dispatch that would run it if it were active, and giving that path a different type
+    /// for "the hook under test" is how a test stops testing the thing it names.
+    ///
+    /// It reads from `token_hook_versions`, which the data plane has no grant on at all, so
+    /// this is reachable from the control plane only -- and that is the right side, because a
+    /// draft run is a management operation and not part of issuing anything.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn version(
+        &self,
+        client_id: &str,
+        version: i32,
+    ) -> Result<Option<TokenHookRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT client_id, component, payload_version, failure_policy \
+             FROM token_hook_versions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND version = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| {
+            Ok(TokenHookRecord {
+                client_id: row.get("client_id"),
+                component: row.get("component"),
+                payload_version: row.get("payload_version"),
+                failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+            })
+        })
+        .transpose()
+    }
+
     /// The deployed hook's METADATA, without reading the component.
     ///
     /// `get` SELECTs the component, which is up to sixteen megabytes, and the management read
