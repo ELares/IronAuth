@@ -136,8 +136,7 @@ const METERABLE: &[&str] = &["user.signed_in", "token.issued", "connection.opene
 /// three counters. A fold that counted sign-ins instead of subjects, crossed the two counters,
 /// or crossed scopes converges the wait and then fails the assertion. A missing producer -- the
 /// defect this whole file exists to catch -- never converges and panics naming the watermark,
-/// which is a loud failure rather than a wrong number. That is the shape
-/// `crates/ironauth-admin/tests/usage_export.rs` already adopted for this same race.
+/// which is a loud failure rather than a wrong number.
 async fn meter(db: &TestDatabase, scope: Scope, want_meterable: usize) -> UsageTally {
     let outbox_scope = db.store().scoped(scope);
     for _ in 0..100 {
@@ -232,12 +231,15 @@ async fn metering_counts_activity_the_system_actually_performed() {
         2,
         "two redemptions issued one token each, through the shipped `redeem`"
     );
-    // THE THIRD COUNTER, PINNED AT ZERO, and it is worth being exact about what that catches
-    // and what it does not. It is NOT what catches a fold that added sign-ins into
-    // `tokens_issued` -- an earlier version of this comment said so, and the assertion above
-    // is what catches that; this one reads zero either way. What it catches is a fold that
-    // routes either of this test's two event types into the counter neither of them belongs
-    // to, which the two assertions above cannot see because they only check their own.
+    // THE THIRD COUNTER, PINNED AT ZERO, and being exact about what it catches has already
+    // cost two wrong versions of this comment, one in each direction. It does NOT catch a
+    // fold that confuses this test's two event types with each other's counters: either
+    // confusion moves a number the `monthly_active_users` or `tokens_issued` assertion above
+    // checks, the test dies up there, and this line never runs. What dies HERE and nowhere
+    // else is a fold that touches `connections` while leaving both counters above correct --
+    // `token.issued` incrementing tokens AND connections, or a repeat sign-in counted here
+    // rather than deduplicated. Both of those were run against this test, and so were the two
+    // confusions; neither confusion reached this line.
     assert_eq!(
         tally.connections(),
         0,
@@ -267,14 +269,23 @@ async fn a_scope_with_no_activity_meters_nothing() {
 /// same reason: metering feeds billing, so a fold that crossed scopes would put one customer's
 /// usage on another's invoice.
 ///
-/// WHAT ENFORCES THAT IS POSTGRES, not the fold, and this test measures the enforcement rather
-/// than the fold's own scoping. `outbox_messages` carries `FORCE ROW LEVEL SECURITY` with a
-/// tenant-and-environment policy (migrations/0099_outbox_messages.sql) and `begin_scoped` sets
-/// both settings on every read, so the read this test performs cannot return the other scope's
-/// rows whatever the metering query says. That is the right layer for the guarantee and this is
-/// still worth asserting -- it is the test that would go red if RLS were dropped from that
-/// table, or if a future fold read the feed through an unscoped pool -- but it does not
-/// substitute for a predicate in the query, and it is not evidence that one is present.
+/// WHAT ENFORCES THAT IS POSTGRES, not the fold, and it enforces it TWICE. `outbox_messages`
+/// carries `FORCE ROW LEVEL SECURITY` with a tenant-and-environment policy
+/// (`migrations/0099_outbox_messages.sql`) and `begin_scoped` sets both settings on every read,
+/// so the read this test performs cannot return the other scope's rows whatever the metering
+/// query says. The query says it too: both halves of the feed read carry
+/// `WHERE tenant_id = $1 AND environment_id = $2` -- `events_page_after`'s MIN probe and
+/// `events_after` itself.
+///
+/// SO THIS TEST IS A CANARY FOR NEITHER LAYER, and an earlier version of this paragraph
+/// nominated it as the one that would go red if RLS were dropped. MEASURED, on this file:
+/// drop the policy and leave the predicate -> 3 passed; delete the predicate from both
+/// queries and leave the policy -> 3 passed; remove both -> this test alone goes red, on the
+/// `quiet` assertion below. Either layer on its own is sufficient, so losing one is invisible
+/// here. What holds the RLS half is `migration.rs`'s
+/// `outbox_messages_carries_its_isolation_and_its_structural_state_constraints`, which asserts
+/// `relrowsecurity AND relforcerowsecurity` and the named policy out of the catalogue. What
+/// THIS test adds is that the two layers together actually produce a scoped tally.
 #[tokio::test]
 async fn activity_is_metered_to_the_scope_that_performed_it() {
     let db = TestDatabase::start().await;
