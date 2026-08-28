@@ -696,6 +696,116 @@ async fn an_echoing_hook_does_not_lose_claims_past_the_contribution_cap() {
     );
 }
 
+/// THE JWT BEARER GRANT RUNS THE HOOK (issue #113 criterion 1).
+///
+/// Criterion 1 lists five doors -- authorization code, refresh, `client_credentials`, device
+/// and JWT bearer -- and asks each to be "asserted by integration tests per grant". Four had
+/// one. This is the fifth, and it was the only door whose seam call carried a comment naming
+/// the criterion ("The client's declarative MAPPING and its hook DO run, which issue #113
+/// criterion 1 names `jwt:bearer` for explicitly") without a test saying so.
+///
+/// The code was right; the assertion was missing. That is the failure mode worth closing here:
+/// a door wired correctly today and silently unwired tomorrow, with the criterion still
+/// reading as met because four of its five doors are covered.
+///
+/// A machine-shaped token, like `client_credentials`: an assertion grant mints one access token
+/// and no ID token, so the claims reach the guest as its ACCESS-token list.
+#[tokio::test]
+async fn the_jwt_bearer_grant_runs_the_hook() {
+    const EXTERNAL_ISSUER: &str = "https://workload.issuer.test";
+    const EXTERNAL_SUBJECT: &str = "spiffe://cluster.test/ns/prod/sa/alpha";
+    const MAPPED_PRINCIPAL: &str = "usr_workload_alpha";
+    const JWT_BEARER_GRANT: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+    let harness = harness_with_hooks().await;
+    let key = ironauth_jose::SigningKey::ed25519_from_seed(Some("wk".to_owned()), &[7_u8; 32])
+        .expect("issuer key");
+    let jwks = ironauth_jose::JwkSet::from_signing_keys([&key])
+        .expect("jwk set")
+        .to_json()
+        .expect("jwks json");
+    harness
+        .register_external_issuer(EXTERNAL_ISSUER, Some(&jwks), None, None, true)
+        .await;
+    harness
+        .create_subject_mapping(
+            EXTERNAL_ISSUER,
+            EXTERNAL_SUBJECT,
+            None,
+            None,
+            MAPPED_PRINCIPAL,
+        )
+        .await;
+    let client_id = harness.client_id().to_string();
+    let client = harness.client_id();
+
+    let mint = |jti: &str| {
+        let payload = serde_json::json!({
+            // AUD IS THE ISSUER, not the presenting client: an assertion is addressed to
+            // this authorization server, and the client is named in the form body.
+            "iss": EXTERNAL_ISSUER, "sub": EXTERNAL_SUBJECT, "aud": harness.issuer(),
+            "exp": 3600, "iat": 0, "jti": jti,
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize claims");
+        ironauth_jose::sign_jws(&key, &bytes, &ironauth_jose::EmissionOptions::new())
+            .expect("sign assertion")
+    };
+    let present = |assertion: &str| {
+        form(&[
+            ("grant_type", JWT_BEARER_GRANT),
+            ("assertion", assertion),
+            ("client_id", client_id.as_str()),
+        ])
+    };
+
+    deploy_for(&harness, client, ironauth_hooks::fixtures::GOOD, 1).await;
+    let (status, _, body) = harness.token(&present(&mint("jti-hook-1"))).await;
+    assert_eq!(status, StatusCode::OK, "the assertion exchanges: {body}");
+    let token: Value = serde_json::from_str(&body).expect("token response");
+    let access = token
+        .get("access_token")
+        .and_then(Value::as_str)
+        .expect("an access token");
+    let issued = claims(access);
+    assert_eq!(
+        issued.get("tier"),
+        Some(&Value::from("gold")),
+        "the assertion grant's token carries the hook's claim, or this door has no extension \
+         point while the other four do: {issued:?}"
+    );
+
+    // AND THE GUEST WAS TOLD WHICH GRANT IT IS. `GOOD` echoes its input, so the assertion above
+    // would look identical whatever grant string reached the hook -- and the door builds that
+    // string from `registry::GrantType::JwtBearer` rather than a literal, precisely so a door
+    // cannot hand a guest a name the endpoint does not accept. This is what checks the two
+    // agree.
+    deploy_for(&harness, client, ironauth_hooks::fixtures::ECHO_REQUEST, 1).await;
+    let (status, _, body) = harness.token(&present(&mint("jti-hook-2"))).await;
+    assert_eq!(status, StatusCode::OK, "the second exchange: {body}");
+    let token: Value = serde_json::from_str(&body).expect("token response");
+    let echoed = claims(
+        token
+            .get("access_token")
+            .and_then(Value::as_str)
+            .expect("an access token"),
+    );
+    assert_eq!(
+        echoed.get("echo_grant_type"),
+        Some(&Value::from(JWT_BEARER_GRANT)),
+        "the guest must be told this is the assertion grant, by the name the endpoint accepts: \
+         {echoed:?}"
+    );
+    // `echo_access_subject`, not `echo_subject`: an assertion grant mints one ACCESS token and
+    // no ID token, so the guest reports the subject into the access list. Reading the ID-token
+    // key here would assert `None == None` on this door and pass whatever the subject was.
+    assert_eq!(
+        echoed.get("echo_access_subject"),
+        Some(&Value::from(MAPPED_PRINCIPAL)),
+        "and the MAPPED principal, not the external subject: the hook shapes a token for the \
+         identity this server issued it to: {echoed:?}"
+    );
+}
+
 /// THE DEVICE GRANT RUNS THE HOOK, which is a door the token endpoint does not cover.
 ///
 /// The type fence forces every door to call `apply_to_with_hook`; it does NOT force one to pass
