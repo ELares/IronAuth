@@ -118,12 +118,12 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 # nothing else. Reading the frozen Clock seam there would report zero for both and make the
 # distinction unmeasurable, which is the one case this rule is not protecting. It is a unit
 # test in the lib, not a request path.
-# 12 -> 13: the BASELINE half of that same test. The absolute bound alone was a wall clock
-# against a shared machine and failed about one run in three, so the recompile half of the
-# assertion is now a RATIO against the first (compiling) load, which is what makes THAT half
-# independent of how loaded the box is -- and a ratio needs a second reading of the same
-# clock. Same unit test in the lib, same reasoning, not a request path.
-scan time-via-env 'SystemTime::now|Instant::now' 13
+# It stays at 12: that test reads the clock ONCE. A second read was added to time the first
+# (compiling) load as the denominator of a ratio, on the theory that a ratio is independent of
+# how loaded the box is. It is not -- loading the box stretches the denominator, so the ratio
+# only ever admitted MORE than the absolute ceiling standing beside it and could not fail. The
+# ratio and its baseline read are gone; see the assertion for the measurements.
+scan time-via-env 'SystemTime::now|Instant::now' 12
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.
