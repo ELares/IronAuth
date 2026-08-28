@@ -32627,6 +32627,33 @@ impl TokenHookRepo<'_> {
         .transpose()
     }
 
+    /// The NEWEST version number in this client's history, or [`None`] if it has none.
+    ///
+    /// Which is the version of the hook currently deployed: a deploy appends a row, and so does
+    /// a rollback -- it is a deploy of an older component. `token_hooks` carries no version
+    /// column, so this is the only place the active hook's number exists.
+    ///
+    /// `MAX(version)` rather than reading the list and taking the first, because a draft run
+    /// wants one number and the components are megabytes each.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn newest_version(&self, client_id: &str) -> Result<Option<i32>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let newest: Option<i32> = sqlx::query_scalar(
+            "SELECT MAX(version) FROM token_hook_versions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(newest)
+    }
+
     /// The deployed hook's METADATA, without reading the component.
     ///
     /// `get` SELECTs the component, which is up to sixteen megabytes, and the management read

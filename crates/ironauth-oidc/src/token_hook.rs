@@ -304,6 +304,18 @@ pub struct HookClaims {
     pub id_token: BTreeMap<String, serde_json::Value>,
     /// Accepted access-token claims.
     pub access_token: BTreeMap<String, serde_json::Value>,
+    /// How many refusals did NOT fit [`refused`](Self::refused), across both tokens.
+    ///
+    /// `filter_hook_claims` caps the reported list, and it walks a `BTreeMap` -- so the names
+    /// it keeps are the alphabetically FIRST ones, and a hook that returns ninety-six claims
+    /// called `a000`..`a095` alongside `sub` pushes `sub` off the end of the report. The
+    /// refusal still happens; what is lost is the operator seeing it.
+    ///
+    /// That matters here and not at issuance, because a DRAFT RUN is somebody deciding whether
+    /// to deploy. Carrying the count is what makes the list say "and there are more" instead of
+    /// reading as complete, which is the same reason `organization.membership_changed` carries
+    /// a required `truncated`.
+    pub refusals_not_reported: usize,
     /// Claim names the protected-claim fence REFUSED, across both tokens.
     ///
     /// The issuance path ignores this and is right to: the token is issued without those claims
@@ -418,11 +430,6 @@ pub async fn run(
     }
 }
 
-/// Run the deployed hook, with every fault reported as one.
-///
-/// Split out of [`run`] so the failure policy is applied in ONE place: every `?` in here is a
-/// fault the policy decides the meaning of, and threading that decision through each of them
-/// individually is how one of them ends up deciding differently.
 /// Run a hook RECORD the caller already has, rather than the one deployed for this client.
 ///
 /// Issue #114 criterion 5's fixture-based draft testing: an operator asks "what would version 3
@@ -448,6 +455,11 @@ pub async fn run_record(
     run_deployed_hook(&runtime.engine, &runtime.cache, invocation, record).await
 }
 
+/// Run the deployed hook, with every fault reported as one.
+///
+/// Split out of [`run`] so the failure policy is applied in ONE place: every `?` in here is a
+/// fault the policy decides the meaning of, and threading that decision through each of them
+/// individually is how one of them ends up deciding differently.
 async fn run_deployed_hook(
     engine: &Arc<HookEngine>,
     cache: &Arc<HookCache>,
@@ -514,14 +526,14 @@ async fn run_deployed_hook(
             HookFault::Aborted
         })?;
 
-    let (id_token, mut refused) = fence(
+    let (id_token, mut refused, id_not_reported) = fence(
         &customization.id_token_claims,
         id_token_claims,
         scope,
         client_id,
         "id_token",
     );
-    let (access_token, access_refused) = fence(
+    let (access_token, access_refused, access_not_reported) = fence(
         &customization.access_token_claims,
         access_token_claims,
         scope,
@@ -538,6 +550,9 @@ async fn run_deployed_hook(
         id_token,
         access_token,
         refused,
+        // SUMMED, not deduplicated: the two tokens are capped independently, so a remainder on
+        // each is two things the report does not show.
+        refusals_not_reported: id_not_reported + access_not_reported,
     }))
 }
 
@@ -779,16 +794,24 @@ fn limits() -> Limits {
 
 /// Put a hook's returned claims through the protected-claim fence, and log what it refused.
 ///
-/// The refusals are logged rather than returned, because a caller cannot act on them: the token
-/// is issued without those claims either way. What an OPERATOR can act on is the log line, which
-/// is why it names the claim and the reason.
+/// The refusals are logged AND returned, and the two audiences are why.
+///
+/// At ISSUANCE nobody can act on them: the token is minted without those claims either way and
+/// there is no one to show an error to mid-request, so the log line is the whole remedy and it
+/// names the claim and the reason. This doc said only that, and it was true until a caller
+/// appeared who is not an issuance.
+///
+/// A DRAFT RUN is that caller (issue #114 criterion 5). An operator asking what a hook would do
+/// before deploying it can act on "it tried to set `sub`" immediately, so the names come back
+/// as well -- with the count of the ones the cap dropped, because the list is a sample and
+/// reading it as complete is how a padded hook gets approved.
 fn fence(
     returned: &[(String, String)],
     handed: &serde_json::Map<String, serde_json::Value>,
     scope: Scope,
     client_id: &str,
     token: &'static str,
-) -> (BTreeMap<String, serde_json::Value>, Vec<String>) {
+) -> (BTreeMap<String, serde_json::Value>, Vec<String>, usize) {
     // EVERY returned claim is parsed and handed to the fence, and the reason is that truncating
     // here defeats two things `filter_hook_claims` promises. Its doc says "which claims overflow
     // is decided in claim-name order, so it is the same set on every invocation" and "the
@@ -876,7 +899,11 @@ fn fence(
         .into_iter()
         .map(|(name, _reason)| name)
         .collect();
-    (kept, refused)
+    // THE COUNT TRAVELS WITH THE LIST. `filter_hook_claims` caps what it reports, and its own
+    // doc says a non-zero remainder "is a thing an auditor must be told rather than left to
+    // infer" -- so dropping it here turns a truncated sample into something that reads
+    // complete.
+    (kept, refused, outcome.refusals_not_reported)
 }
 
 /// The wire shape the guest ABI takes: a name and its value as JSON TEXT.

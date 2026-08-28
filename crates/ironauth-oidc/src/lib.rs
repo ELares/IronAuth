@@ -244,6 +244,13 @@ pub mod token_hook {
     }
 
     /// What a hook contributed, with the feature off. Unreachable by construction.
+    ///
+    /// EVERY FIELD OF THE REAL ONE, and keeping that true is a build-time obligation rather
+    /// than a convention: `ironauth-admin` reads these fields with no `cfg` of its own, so a
+    /// field added to the real type and not to this one fails the no-feature build. It already
+    /// has -- `refusals_not_reported` was added to the real `HookClaims` and the OpenAPI
+    /// example, which builds without the feature, stopped compiling immediately. That is the
+    /// guard: not a lint, but the fact that a downstream crate compiles against both.
     pub struct HookClaims {
         /// Accepted ID-token claims.
         pub id_token: std::collections::BTreeMap<String, serde_json::Value>,
@@ -251,6 +258,8 @@ pub mod token_hook {
         pub access_token: std::collections::BTreeMap<String, serde_json::Value>,
         /// Claim names the protected-claim fence refused.
         pub refused: Vec<String>,
+        /// How many refusals did not fit `refused`.
+        pub refusals_not_reported: usize,
     }
 
     /// Why a hook did not contribute, with the feature off. Unreachable by construction.

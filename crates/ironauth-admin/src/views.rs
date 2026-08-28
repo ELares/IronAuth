@@ -2055,10 +2055,28 @@ pub struct TestTokenHookResponse {
     pub id_token_claims: serde_json::Map<String, serde_json::Value>,
     /// The access-token claims the hook contributed, after the fence.
     pub access_token_claims: serde_json::Map<String, serde_json::Value>,
-    /// Claim names the fence refused, so a hook trying to forge `sub` is visible here rather
-    /// than only in a log an operator has to go and find.
+    /// Claim names the fence refused.
+    ///
+    /// CAPPED, and `refusals_not_reported` is how you know. The fence reports at most
+    /// sixty-four names per token and keeps the alphabetically first, so a hook that returns
+    /// ninety-six claims called `a000`..`a095` alongside `sub` pushes `sub` off this list. The
+    /// refusal still happens -- the fence blocks it at issuance either way -- but a reviewer
+    /// reading this list as complete would approve a hook that attempted a reserved name.
+    ///
+    /// So read the count first. A non-zero `refusals_not_reported` means this list is a
+    /// sample.
     pub refused: Vec<String>,
-    /// Which version ran, so a run with no `version` says which one it picked.
+    /// How many refusals did not fit `refused`.
+    ///
+    /// Zero on any ordinary hook. Non-zero means `refused` is truncated, and the names missing
+    /// from it are the alphabetically last -- which a hook author controls.
+    pub refusals_not_reported: usize,
+    /// Which version ran.
+    ///
+    /// RESOLVED, not echoed. A run that named a version gets that number back; a run that named
+    /// none gets the version of the hook that is currently deployed, which is the newest row in
+    /// the history. `null` only when the client has no history at all -- which after the
+    /// backfill in `0165_token_hook_versions.sql` means a hook deployed and then deleted.
     pub version_run: Option<i32>,
 }
 

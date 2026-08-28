@@ -816,7 +816,7 @@ pub async fn rollback_token_hook(
     ),
     security(("bearer" = [])),
     responses(
-        (status = 200, description = "The hook ran. `outcome` is `completed`, `declined` or `aborted`; a declined or aborted run is still a 200, because the QUESTION was answered", body = TestTokenHookResponse),
+        (status = 200, description = "The hook ran. `outcome` is `completed` or `aborted`; an aborted run is still a 200, because the QUESTION was answered. `refused` is capped, so read `refusals_not_reported` before treating it as complete", body = TestTokenHookResponse),
         (status = 400, description = "An unreadable body", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
@@ -849,9 +849,23 @@ pub async fn test_token_hook(
     // The plain repo, not the acting one: this READS. `acting` exists to carry an actor onto an
     // audit row, and a draft run writes none.
     let hooks = state.store().scoped(scope).token_hooks();
-    let record = match request.version {
-        Some(version) => hooks.version(&client.to_string(), version).await?,
-        None => hooks.get(&client.to_string()).await?,
+    // AND WHICH VERSION THAT IS, resolved rather than echoed.
+    //
+    // `version_run` said "which version ran, so a run with no `version` says which one it
+    // picked" and was set to `request.version` at all three arms -- so in the case the sentence
+    // names, the omitted one, it serialised as null. The record carries no version number
+    // (`token_hooks` has no such column; the numbers live in the history), so the active
+    // version is the newest row in the history, which is what a deploy appends and what a
+    // rollback appends too.
+    let (record, version_run) = if let Some(version) = request.version {
+        (
+            hooks.version(&client.to_string(), version).await?,
+            Some(version),
+        )
+    } else {
+        let active = hooks.get(&client.to_string()).await?;
+        let newest = hooks.newest_version(&client.to_string()).await?;
+        (active, newest)
     };
     let Some(record) = record else {
         // The uniform not-found covers both "no hook deployed" and "no such version". They are
@@ -895,7 +909,8 @@ pub async fn test_token_hook(
             id_token_claims: claims.id_token.into_iter().collect(),
             access_token_claims: claims.access_token.into_iter().collect(),
             refused: claims.refused,
-            version_run: request.version,
+            refusals_not_reported: claims.refusals_not_reported,
+            version_run,
         },
         // A hook that ran and contributed nothing is COMPLETED with empty claim sets, not a
         // separate outcome: "it worked and changed nothing" is a normal answer, and an
@@ -906,7 +921,8 @@ pub async fn test_token_hook(
             id_token_claims: serde_json::Map::new(),
             access_token_claims: serde_json::Map::new(),
             refused: Vec::new(),
-            version_run: request.version,
+            refusals_not_reported: 0,
+            version_run,
         },
         Err(fault) => TestTokenHookResponse {
             outcome: "aborted".to_owned(),
@@ -927,7 +943,8 @@ pub async fn test_token_hook(
             id_token_claims: serde_json::Map::new(),
             access_token_claims: serde_json::Map::new(),
             refused: Vec::new(),
-            version_run: request.version,
+            refusals_not_reported: 0,
+            version_run,
         },
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;

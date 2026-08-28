@@ -84,6 +84,22 @@ async fn a_draft_run_reports_what_the_deployed_hook_would_do_and_writes_nothing(
             .is_empty(),
         "a hook writing no reserved name has nothing refused: {body}"
     );
+    // AND THE REPORT IS NOT TRUNCATED. `refused` is capped, so an operator may only read it as
+    // complete when this is zero -- and a test that never looked would let the field ship
+    // unset on every response.
+    assert_eq!(
+        view["refusals_not_reported"], 0,
+        "an ordinary hook refuses nothing, so nothing was dropped from the report: {body}"
+    );
+
+    // VERSION_RUN IS RESOLVED, NOT ECHOED. This request named no version, and the field's own
+    // doc says a run with none "says which one it picked". It was set to the request field
+    // verbatim, so exactly this case serialised as null.
+    assert_eq!(
+        view["version_run"], 1,
+        "a run with no version must report the version it actually ran -- the deployed one, \
+         which is the newest in the history: {body}"
+    );
 
     // NOTHING WAS WRITTEN. One deploy means one version, and a draft run that appended would be
     // a deploy wearing another name -- and would spend a slot of the capped history every time
