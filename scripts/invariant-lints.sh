@@ -115,11 +115,15 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 # add a dependency for no property gained. Still zero exemptions on a request path.
 # 11 -> 12: `token_hook.rs`'s `a_remembered_refusal_is_recalled_rather_than_recompiled`.
 # Whether the second load RECOMPILED or read the cache is a claim about elapsed time and
-# nothing else -- a compile is tens of milliseconds, a map lookup is microseconds, and the
-# assertion sits two orders of magnitude between them. Reading the frozen Clock seam there
-# would report zero for both and make the distinction unmeasurable, which is the one case
-# this rule is not protecting. It is a unit test in the lib, not a request path.
-scan time-via-env 'SystemTime::now|Instant::now' 12
+# nothing else. Reading the frozen Clock seam there would report zero for both and make the
+# distinction unmeasurable, which is the one case this rule is not protecting. It is a unit
+# test in the lib, not a request path.
+# 12 -> 13: the BASELINE half of that same test. The absolute bound alone was a wall clock
+# against a shared machine and failed about one run in three, so the recompile half of the
+# assertion is now a RATIO against the first (compiling) load, which is what makes THAT half
+# independent of how loaded the box is -- and a ratio needs a second reading of the same
+# clock. Same unit test in the lib, same reasoning, not a request path.
+scan time-via-env 'SystemTime::now|Instant::now' 13
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.

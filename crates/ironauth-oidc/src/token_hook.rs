@@ -1027,11 +1027,22 @@ mod tests {
     /// count assertion passes while every request pays the full cranelift compile the cache
     /// exists to avoid. Entry count cannot see the read.
     ///
-    /// ELAPSED TIME CAN, here, because there is no login around it. A compile of the escape
-    /// guest is tens of milliseconds; a map lookup is microseconds. The second call is asserted
-    /// at under a millisecond, which is two orders of magnitude below a compile and two above a
-    /// lookup -- a margin no scheduler noise closes, unlike the fuel test that tried to time a
-    /// whole Argon2id-bearing exchange and was measuring a password hash.
+    /// ELAPSED TIME CAN, here, because there is no login around it. But the numbers are not the
+    /// ones an earlier version of this doc quoted, and getting them wrong is what made the
+    /// assertion flaky. This test only ever runs in the unoptimized `test` profile, where
+    /// cranelift itself is unoptimized: a compile of the escape guest measures 1.2-2.3 SECONDS,
+    /// not tens of milliseconds, and a recall measures one to three milliseconds rather than
+    /// microseconds -- most of it the SHA-256 over the component that builds the cache key, not
+    /// the map lookup. A single sub-millisecond bound was tried first and scheduler noise closed
+    /// it, failing about one run in three.
+    ///
+    /// So the second call is now held to BOTH halves: a 25 ms absolute ceiling, which is what
+    /// catches a hit that really reads the cache but is pathologically slow, and a tenth of the
+    /// MEASURED compile, which is what catches a recompile without depending on how loaded the
+    /// box is. Neither alone is the property -- see the assertion for why the ratio on its own
+    /// is far looser than the millisecond it replaced. That is the difference from the fuel test
+    /// that tried to time a whole Argon2id-bearing exchange and was measuring a password hash:
+    /// the denominator here is measured in the same test rather than assumed.
     #[test]
     fn a_remembered_refusal_is_recalled_rather_than_recompiled() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1084,23 +1095,47 @@ mod tests {
                 Some(ironauth_hooks::AbortKind::Unlinkable),
                 "and the recalled refusal classifies identically: {second}"
             );
-            // A RATIO, NOT A CONSTANT, and the constant is why this test was flaky.
+            // TWO CLAUSES, because they catch different failures and neither covers the other.
             //
-            // It asserted the recall completes in under 1 ms of wall clock. A recall is
-            // microseconds and a compile is tens of milliseconds, so 1 ms looks like a wide
-            // margin -- and it is not, because it is measured against a SHARED MACHINE. A
-            // loaded CI box, a cold allocator or a scheduler that parks the task between the
-            // `Instant::now()` and the map lookup all cost more than a millisecond while the
-            // code does exactly the right thing. Measured: about one run in three failed on a
-            // machine running other test binaries, at 2.46 ms.
+            // THE RATIO catches a RECOMPILE, and it is a ratio rather than a constant because
+            // the constant is what made this test flaky. A single `elapsed < 1 ms` is measured
+            // against a SHARED MACHINE: a loaded CI box, a cold allocator or a scheduler that
+            // parks the task between the clock read and the map lookup all cost more than a
+            // millisecond while the code does exactly the right thing. Measured on this
+            // machine, the twelve clean recalls ran 0.94 ms to 3.07 ms, so 1 ms failed six of
+            // twelve. Comparing two measurements taken moments apart on the same machine is
+            // what makes the recompile half machine-independent.
             //
-            // The property is not "the recall is fast in absolute terms". It is "the second
-            // call did not do what the first did", and that is a comparison between two
-            // measurements taken on the SAME machine moments apart, which is what makes it
-            // machine-independent. Ten times is a wide margin on a real gap of about a
-            // thousand: the compile is tens of milliseconds and the recall is a map lookup.
+            // THE CEILING catches a hit that really reads the cache and is still slow -- a lock
+            // held too long, a synchronous re-validation, an fsync on this path. The ratio
+            // cannot: the denominator is a full cranelift compile, which in the `test` profile
+            // this test always runs in measures 1.2-2.3 s, so `elapsed * 10 < compile_elapsed`
+            // permits a recall of 120-230 ms. That is LOOSER than the millisecond it replaced,
+            // not tighter, and an earlier version of this comment sold it as tighter by putting
+            // the compile at "tens of milliseconds" -- a release-profile number (33 ms in
+            // `loaded_hook`'s doc, 86.9 ms in scripts/hook-bench-gate.sh) quoted for a debug
+            // build. Measured: a 50 ms sleep on the cache-hit arm passes the ratio at 61 ms.
+            //
+            // 25 ms because the worst clean recall observed over twelve runs was 3.07 ms, and
+            // it stayed under 3 ms even with the machine loaded enough to push the compile to
+            // 2.35 s. That is roughly 8x headroom over the worst observation while still
+            // catching the 50 ms mutant.
+            //
+            // Why a slow HIT matters and is not merely untidy: the compile goes to
+            // `spawn_blocking` precisely so cranelift does not stall the reactor, but both hit
+            // arms in `loaded_hook` return INLINE. A slow hit stalls every other request on
+            // that worker, and nothing else in the tree bounds that path -- the 100 us gate in
+            // scripts/hook-bench-gate.sh measures `hook.customize` on an ALREADY-loaded
+            // component and never touches `HookCache`.
             //
             // A flaky gate is worse than a missing one. It trains everybody to re-run.
+            const RECALL_CEILING: std::time::Duration = std::time::Duration::from_millis(25);
+            assert!(
+                elapsed < RECALL_CEILING,
+                "the second refusal took {elapsed:?}, over the {RECALL_CEILING:?} ceiling. \
+                 Over that it is not a cache read however it compares to the compile: the \
+                 entry being present is not the property, reading it CHEAPLY is."
+            );
             assert!(
                 elapsed * 10 < compile_elapsed,
                 "the second refusal took {elapsed:?} against a first of {compile_elapsed:?}, \
