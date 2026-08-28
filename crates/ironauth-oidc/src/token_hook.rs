@@ -1050,6 +1050,7 @@ mod tests {
             );
 
             // NET_ESCAPE imports `wasi:sockets`, which the sandbox does not link.
+            let compile_started = std::time::Instant::now(); // invariant-allow: time-via-env -- the BASELINE half of the comparison below; see the assertion for why a ratio and not a constant
             let first = loaded_hook(
                 &engine,
                 &cache,
@@ -1059,6 +1060,7 @@ mod tests {
             )
             .await
             .expect_err("an unlinkable component cannot load");
+            let compile_elapsed = compile_started.elapsed();
             assert_eq!(
                 first.abort_kind(),
                 Some(ironauth_hooks::AbortKind::Unlinkable),
@@ -1082,10 +1084,28 @@ mod tests {
                 Some(ironauth_hooks::AbortKind::Unlinkable),
                 "and the recalled refusal classifies identically: {second}"
             );
+            // A RATIO, NOT A CONSTANT, and the constant is why this test was flaky.
+            //
+            // It asserted the recall completes in under 1 ms of wall clock. A recall is
+            // microseconds and a compile is tens of milliseconds, so 1 ms looks like a wide
+            // margin -- and it is not, because it is measured against a SHARED MACHINE. A
+            // loaded CI box, a cold allocator or a scheduler that parks the task between the
+            // `Instant::now()` and the map lookup all cost more than a millisecond while the
+            // code does exactly the right thing. Measured: about one run in three failed on a
+            // machine running other test binaries, at 2.46 ms.
+            //
+            // The property is not "the recall is fast in absolute terms". It is "the second
+            // call did not do what the first did", and that is a comparison between two
+            // measurements taken on the SAME machine moments apart, which is what makes it
+            // machine-independent. Ten times is a wide margin on a real gap of about a
+            // thousand: the compile is tens of milliseconds and the recall is a map lookup.
+            //
+            // A flaky gate is worse than a missing one. It trains everybody to re-run.
             assert!(
-                elapsed < std::time::Duration::from_millis(1),
-                "the second refusal took {elapsed:?}, which is a COMPILE, not a recall. The \
-                 entry being present is not the property; reading it is."
+                elapsed * 10 < compile_elapsed,
+                "the second refusal took {elapsed:?} against a first of {compile_elapsed:?}, \
+                 which is a COMPILE and not a recall. The entry being present is not the \
+                 property; reading it is."
             );
         });
     }
