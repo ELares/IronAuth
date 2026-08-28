@@ -24160,15 +24160,16 @@ impl OutboxRepo<'_> {
     /// running; a row whose `xmin` is below it is visible to everyone, and nothing can
     /// ever commit beneath it afterwards.
     ///
-    /// The page STOPS at the first row that is not yet settled, rather than filtering
-    /// unsettled rows out and continuing. That distinction is the guarantee: a filter still
-    /// serves the settled rows ABOVE a gap, so the cursor advances past a row that is later
-    /// filled in, and a cursor consumer never returns. `a_committed_event_below_the_cursor_is_never_skipped`
-    /// builds that inversion deterministically and fails under a filter.
+    /// Serving only those rows is a FILTER, and it does not make the feed skip-free. A filter
+    /// serves settled rows that sit ABOVE an unsettled one, so a cursor can advance past a row
+    /// that is later filled in and a consumer never sees it. The append lock does not rescue
+    /// that: the lock orders INSERTs, while `xmin` is fixed at a transaction's FIRST write, so
+    /// two producers can take the lock in one order, commit in that order, and still have
+    /// inverted xmins.
     ///
-    /// A filter is what this was, and the append lock did not rescue it: the lock orders
-    /// INSERTs, while `xmin` is fixed at a transaction's FIRST write, so two producers can
-    /// take the lock in one order, commit in that order, and still have inverted xmins.
+    /// Stopping the page at the first unsettled row was tried and reverted -- it does not close
+    /// the skip either, and its cost is unbounded. The measurement is in the SQL below. The
+    /// skip is real, PREDATES this change, and belongs to criterion 1.
     ///
     /// # What this costs, measured rather than estimated
     ///
@@ -24196,6 +24197,32 @@ impl OutboxRepo<'_> {
     ) -> Result<Vec<OutboxMessage>, StoreError> {
         let scope = self.scope;
         let sql = format!(
+            // A ROW FILTER, and a PREFIX CUT was tried and reverted. The attempt and why it
+            // failed are worth more than the diff would have been.
+            //
+            // The filter serves settled rows that sit ABOVE an unsettled one, so a cursor can
+            // advance past a row that is later filled in and a cursor consumer never returns.
+            // Stopping the page at the first unsettled row looks like the fix and is not, for
+            // two measured reasons:
+            //
+            // * IT DOES NOT CLOSE THE SKIP. The cut is a `MIN(sequence)` over the READER'S OWN
+            //   SNAPSHOT, and a row whose producer has not committed is not in that snapshot at
+            //   all -- so it contributes nothing to the MIN and cuts nothing. Reproduced: an
+            //   in-flight event row at sequence 1 and a committed DELIVERY row at sequence 2
+            //   with a lower xmin; the reader served 2, the cursor advanced, and 1 was lost
+            //   after it committed. The append lock cannot help, because it deliberately
+            //   serialises only `WEBHOOK_EVENT_CONSUMER` inserts while this query serves every
+            //   row in the scope.
+            // * ITS COST IS UNBOUNDED. "At most one row back" was the justification, and it is
+            //   wrong twice: the cut is set by rows that are COMMITTED but above the
+            //   CLUSTER-WIDE watermark, so it is bounded by the deployment's write rate times
+            //   the longest open transaction anywhere on the instance -- and by delivery rows,
+            //   which no lock serialises.
+            //
+            // So the skip is real, it PREDATES this change, and it belongs to criterion 1
+            // rather than criterion 2. Closing it needs the watermark to know about rows it
+            // cannot see, which is not a predicate.
+            //
             // THE WIDTHS ON THE TWO SIDES OF THIS COMPARISON DIFFER, and that is a standing
             // assumption rather than an oversight nobody noticed.
             //
@@ -24214,32 +24241,9 @@ impl OutboxRepo<'_> {
             // wraparound boundary is not a one-line change, so it is tracked on its own
             // (issue #980) rather than smuggled into an unrelated diff. Anything that edits
             // this predicate must keep `events_cursor_ordering.rs`'s duplicate in step.
-            // A PREFIX CUT, NOT A ROW FILTER, and the difference is the whole guarantee.
-            //
-            // Filtering unsettled rows OUT still serves the settled rows ABOVE them, so the
-            // cursor advances past a gap that is later filled in -- and a cursor consumer
-            // never returns. The append lock does not prevent it: the lock orders INSERTs,
-            // while `xmin` is fixed at a transaction's FIRST write, arbitrarily many
-            // statements earlier. So two producers can take the lock in one order, commit in
-            // that order, and still have INVERTED xmins; any unrelated transaction whose xid
-            // sits in the gap makes the reader serve the higher sequence and skip the lower
-            // one permanently. Review measured exactly that.
-            //
-            // Stopping at the first unsettled row instead means the cursor never advances
-            // over anything that could still be filled in, which is what the paragraph above
-            // claims and what a filter cannot deliver.
-            //
-            // THE APPEND LOCK IS WHAT MAKES THIS CHEAP. Event writes in a scope now
-            // serialise, so at most one event row in a scope is mid-commit at a time and the
-            // cut is at worst one row back. Without the lock a prefix cut would stall behind
-            // every overlapping writer; with it, the two changes pay for each other.
             "SELECT {OUTBOX_COLUMNS} FROM outbox_messages \
              WHERE tenant_id = $1 AND environment_id = $2 AND sequence > $3 \
-             AND sequence < COALESCE(( \
-                 SELECT MIN(sequence) FROM outbox_messages \
-                 WHERE tenant_id = $1 AND environment_id = $2 AND sequence > $3 \
-                 AND xmin::text::bigint >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint \
-             ), 9223372036854775807) \
+             AND xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint \
              ORDER BY sequence LIMIT $4"
         );
         let mut tx = begin_scoped(self.store, scope).await?;
@@ -42690,8 +42694,10 @@ async fn insert_session_row(
     // drops it fails `#[must_use]`". It does not: `OwnedDomainEvent` carries no `#[must_use]`,
     // and `?` discharges the `Result`, leaving a plain `Option` no lint objects to. The thing
     // that actually catches a caller who forgets to enqueue is
-    // `a_sign_in_through_every_call_site_reaches_the_feed`, and a claim of type-level safety
-    // where there is none is worse than no claim, because it stops the next person looking.
+    // `a_rotation_meters_the_sign_in_it_created`, which covers the ROTATION call site only --
+    // the impersonation one is uncovered, and that is recorded on `insert_session_row`. A claim
+    // of type-level safety where there is none is worse than no claim, because it stops the
+    // next person looking, and so is naming a test that does not exist.
     Ok(crate::event_catalog::envelope(
         &event_id,
         "user.signed_in",
@@ -50575,10 +50581,12 @@ impl ActingTenantRepo<'_> {
                 //    depend on the scoping variables.
                 //
                 //    The general rule it follows: THE APPEND LOCK IS THE LAST LOCK THIS
-                //    TRANSACTION TAKES. That is not enforceable by a type, so every
-                //    producer that takes another lock afterwards has to be found by
-                //    reading, which is what `an_idempotent_tenant_write_prunes_before_it_
-                //    takes_any_append_lock` exists to stop being true again.
+                //    TRANSACTION TAKES. That is not enforceable by a type, and NOTHING
+                //    GUARDS IT -- every producer that takes another lock afterwards has to
+                //    be found by reading. An earlier version of this note named a test that
+                //    would stop it being true again; no such test exists, and naming one is
+                //    worse than admitting there is none, because it stops the next person
+                //    looking.
                 insert_idempotency(tx, idempotency).await?;
                 // 1. Flip the tenant status, guarded on the source state so a
                 //    concurrent transition cannot double-apply. A level table (no
@@ -50832,41 +50840,32 @@ impl ActingTenantRepo<'_> {
                 //    rather than assumed. The `(EXTRACT * 1000000)::bigint` idiom is used
                 //    widely in this file; this is the only site where an inexact result
                 //    would be a security regression rather than a wrong display value.
-                // THE APPEND LOCKS FIRST, BEFORE ANY ROW LOCK, and this is the one place in
-                // the tree that has to do it explicitly.
+                // NO PRE-TAKEN APPEND LOCKS HERE, and the attempt is worth recording.
                 //
-                // Every event producer now takes `pg_advisory_xact_lock(key(tenant, env))` and
-                // holds it to commit, and its outbox INSERT then takes `FOR KEY SHARE` on the
-                // `environments` parent through the foreign key. The statement below takes
-                // `FOR UPDATE` on those same rows -- the only `environments ... FOR UPDATE` in
-                // the tree -- and this closure does not reach its own enqueue until much later.
-                // So without this, the two sides take the same two locks in opposite orders:
-                // a producer holds the advisory lock and waits for FOR KEY SHARE, while this
-                // holds FOR UPDATE and waits for the advisory lock. Postgres aborts one with
-                // 40P01, and it is either an operator's tenant delete or an end user's write.
+                // Giving `enqueue_domain_event` an advisory lock creates a cycle with this
+                // closure: a producer holds the advisory lock and wants `FOR KEY SHARE` on an
+                // `environments` row through its outbox insert's foreign key, while this holds
+                // `FOR UPDATE` on that row and wants the advisory lock much later. The obvious
+                // fix is to take the advisory locks up here, giving both sides one order.
                 //
-                // THIS PR IS WHAT CREATED THAT CYCLE: before it the outbox insert took no
-                // advisory lock, so there was only one lock in play and no order to get wrong.
-                // Taking them here, in the same `ORDER BY id` the lock below uses, gives every
-                // transaction in the deployment one order -- advisory before row -- which is
-                // what makes the cycle unconstructible rather than merely unlikely.
+                // IT TRADES ONE DEADLOCK FOR TWO, measured on a real cluster with a control.
+                // `FOR UPDATE` conflicts with `FOR NO KEY UPDATE`, which is what an ordinary
+                // `UPDATE` of a non-key column takes -- and three producers take exactly that on
+                // the rows this closure locks, then want the advisory lock at their own enqueue:
+                // `ActingEnvironmentRepo::set_auto_link_posture_with_event`,
+                // `ActingEnvironmentRepo::delete_with_event`, and
+                // `ActingManagementCredentialRepo::revoke_with_event`. With the advisory locks
+                // taken first, a posture write and a tenant delete deadlock; with them taken
+                // last, as here, the same pair commits cleanly.
                 //
-                // It costs what a tenant delete should already cost: the delete waits for
-                // in-flight event producers in that tenant, and new ones wait for it. Advisory
-                // locks are re-entrant within a transaction, so the enqueue later in this
-                // closure re-takes a key it already holds and returns immediately.
-                let env_ids: Vec<String> = sqlx::query_scalar(
-                    "SELECT id FROM environments WHERE tenant_id = $1 ORDER BY id",
-                )
-                .bind(id.to_string())
-                .fetch_all(&mut **tx)
-                .await?;
-                for env_id in &env_ids {
-                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                        .bind(append_lock_key_from_parts(&id.to_string(), env_id))
-                        .execute(&mut **tx)
-                        .await?;
-                }
+                // So the order that holds across the deployment is ROWS BEFORE ADVISORY, which
+                // is what every producer already does and what this closure does. The residual
+                // FK cycle is documented on `take_event_append_lock` and reproduced by an
+                // ignored test; closing it needs grants the data plane is deliberately denied.
+                //
+                // The comment that briefly sat here also opened "THE APPEND LOCKS FIRST, BEFORE
+                // ANY ROW LOCK", which was false on its face: step 1 above takes
+                // `FOR NO KEY UPDATE` on the `tenants` row and holds it to commit.
                 let env_rows = sqlx::query(
                     "SELECT id, (EXTRACT(EPOCH FROM deleted_at) * 1000000)::bigint AS deleted_us \
                      FROM environments WHERE tenant_id = $1 ORDER BY id FOR UPDATE",

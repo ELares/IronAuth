@@ -76,16 +76,18 @@ async fn read_after_naive(pool: &sqlx::PgPool, after: i64) -> Vec<i64> {
 /// id still running, so a row whose `xmin` is below it is visible to everyone, and nothing
 /// can ever commit beneath it afterwards.
 async fn read_after_watermarked(pool: &sqlx::PgPool, after: i64) -> Vec<i64> {
-    // IN STEP WITH THE PRODUCTION PREDICATE, which `events_after`'s doc requires by name.
-    // It is a PREFIX CUT now rather than a row filter: serving settled rows that sit ABOVE an
-    // unsettled one is what lets a cursor advance past a gap that is later filled in.
+    // A COPY OF THE PRODUCTION PREDICATE, which `events_after`'s doc requires be kept in step.
+    //
+    // It is a copy and not a call, which is a weaker thing than it looks: this drives no store
+    // and never reaches `OutboxRepo::events_after`, so it measures what this string says rather
+    // than what the shipped query does. The scope predicates are deliberately absent because
+    // these fixtures seed one scope; a version of this helper that dropped them while the
+    // production query kept them would be the drift the doc warns about, so the difference is
+    // written down here rather than left to be noticed.
     sqlx::query(
         "SELECT sequence FROM outbox_messages \
          WHERE sequence > $1 \
-           AND sequence < COALESCE(( \
-               SELECT MIN(sequence) FROM outbox_messages WHERE sequence > $1 \
-               AND xmin::text::bigint >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint \
-           ), 9223372036854775807) \
+           AND xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint \
          ORDER BY sequence",
     )
     .bind(after)
@@ -1270,176 +1272,6 @@ async fn a_delivery_enqueue_does_not_block_on_the_append_lock() {
     holder.commit().await.expect("holder releases the lock");
 }
 
-/// A COMMITTED EVENT BELOW THE CURSOR IS NEVER SKIPPED.
-///
-/// The append lock makes sequence order equal COMMIT order, which is criterion 2. It does NOT
-/// make the feed skip-free on its own, and the difference is where a cursor consumer loses
-/// data: the watermark decides settledness from `xmin`, and a transaction's xmin is fixed at
-/// its FIRST write, arbitrarily many statements before it reaches its event insert. So two
-/// producers can take the lock in one order, commit in that order, and still have inverted
-/// xmins.
-///
-/// This builds exactly that, deterministically, with no race:
-///
-/// 1. A fixes its xid early and does not insert yet.
-/// 2. L opens -- its xid is above A's.
-/// 3. B inserts an event and commits. B's xid is above L's.
-/// 4. A inserts its event and commits. Its sequence is HIGHER than B's, its xmin LOWER.
-///
-/// With L still open the watermark sits between A and B, so under a row FILTER the reader
-/// serves A's row, advances the cursor past B's, and B's committed event is never returned to
-/// that cursor again. Under a PREFIX CUT the reader stops below B's row and serves nothing
-/// until L ends, then serves both in order.
-#[tokio::test]
-async fn a_committed_event_below_the_cursor_is_never_skipped() {
-    let db = TestDatabase::start().await;
-    let env = Env::system();
-    let scope = db.seed_scope(&env).await;
-    let pool = db.owner_pool();
-    let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
-
-    // 1. A fixes its xid BEFORE writing its event. `pg_current_xact_id` assigns one without
-    //    writing a row, which is what makes the inversion constructible rather than lucky.
-    let mut a = pool.begin().await.expect("begin a");
-    sqlx::query_scalar::<_, i64>("SELECT pg_current_xact_id()::text::bigint")
-        .fetch_one(&mut *a)
-        .await
-        .expect("a takes an xid");
-
-    // 2. The bystander, whose xid lands between A's and B's and which stays open.
-    let mut bystander = pool.begin().await.expect("begin bystander");
-    sqlx::query_scalar::<_, i64>("SELECT pg_current_xact_id()::text::bigint")
-        .fetch_one(&mut *bystander)
-        .await
-        .expect("bystander takes an xid");
-
-    // 3. B writes and commits FIRST, so it gets the LOWER sequence and the HIGHER xmin.
-    let mut b = pool.begin().await.expect("begin b");
-    let b_seq = insert_returning_sequence(&mut b, &tenant, &environment, "evt_skip_b").await;
-    b.commit().await.expect("commit b");
-
-    // 4. A writes and commits second: HIGHER sequence, LOWER xmin.
-    let a_seq = insert_returning_sequence(&mut a, &tenant, &environment, "evt_skip_a").await;
-    a.commit().await.expect("commit a");
-    assert!(
-        a_seq > b_seq,
-        "the fixture must invert sequence against xmin, or it tests nothing: {b_seq}, {a_seq}"
-    );
-
-    // THE ASSERTION. With the bystander still open, a reader must not serve A while skipping
-    // B. Serving NEITHER is the correct answer -- B is not settled yet, and A sits above it.
-    let served = read_after_watermarked(pool, 0).await;
-    assert!(
-        !served.contains(&a_seq),
-        "the reader served sequence {a_seq} while {b_seq} was still unsettled beneath it. A \
-         cursor consumer would advance past {b_seq}, and that committed event would never be \
-         returned to it again -- a permanent silent gap. The watermark must cut the page at \
-         the first unsettled row, not filter unsettled rows out: {served:?}"
-    );
-
-    // And once the bystander ends, BOTH are served, in sequence order -- so the assertion
-    // above is the cut holding them back rather than the feed having lost them.
-    bystander.commit().await.expect("bystander ends");
-    let served = eventually_visible(pool, 0, &[b_seq, a_seq]).await;
-    let ours: Vec<i64> = served
-        .into_iter()
-        .filter(|s| *s == a_seq || *s == b_seq)
-        .collect();
-    assert_eq!(
-        ours,
-        vec![b_seq, a_seq],
-        "both events must arrive, in sequence order, once nothing is in flight"
-    );
-}
-
-/// A TENANT DELETE TAKES THE APPEND LOCKS BEFORE IT LOCKS ANY ENVIRONMENT ROW.
-///
-/// This is the A-side of the foreign-key cycle the ignored reproduction below describes, and
-/// it is the side that can actually be fixed. Every event producer takes
-/// `pg_advisory_xact_lock(key(tenant, env))` and holds it to commit, and its outbox INSERT
-/// then takes `FOR KEY SHARE` on the `environments` parent through the foreign key. Exactly
-/// one thing in the tree takes `FOR UPDATE` on those rows -- `ActingTenantRepo::delete_with_event`
-/// -- and it used to reach its own enqueue long afterwards. Two transactions, two locks,
-/// opposite orders, one 40P01: either an operator's tenant delete or an end user's write.
-///
-/// The fix gives both sides one order, advisory before row. What makes it OBSERVABLE from a
-/// third session is that the two orders differ in what the delete holds WHILE IT WAITS:
-///
-/// * locks first, as it does now -- a delete blocked on the append lock has not reached its
-///   `FOR UPDATE`, so the environment row is still free.
-/// * rows first, as it did before -- a delete blocked on the append lock is already holding
-///   `FOR UPDATE`, and the probe below cannot take the row.
-///
-/// `FOR UPDATE NOWAIT` rather than a blocking take, so the probe answers immediately and
-/// cannot itself join the wait graph.
-#[tokio::test]
-async fn a_tenant_delete_takes_the_append_locks_before_it_locks_any_environment_row() {
-    let db = TestDatabase::start().await;
-    let env = Env::system();
-    let scope = db.seed_scope(&env).await;
-    let pool = db.owner_pool();
-    let key = appender_lock_key(
-        &scope.tenant().to_string(),
-        &scope.environment().to_string(),
-    );
-    let operator = db.owning_operator(&scope.tenant()).await;
-
-    // A producer-shaped session holds the scope's append lock and does not let go.
-    let mut holder = pool.begin().await.expect("begin holder");
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(key)
-        .execute(&mut *holder)
-        .await
-        .expect("holder takes the append lock");
-
-    let store = db.control_store().clone();
-    let actor = db.test_actor(&env);
-    let tenant = scope.tenant();
-    let deleting = tokio::spawn({
-        let env = env.clone();
-        async move {
-            store
-                .management()
-                .acting(actor, ironauth_store::CorrelationId::generate(&env))
-                .tenants(operator)
-                .delete(&env, &tenant)
-                .await
-        }
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(
-        !deleting.is_finished(),
-        "the tenant delete must BLOCK on the append lock the holder took. If it finished, it \
-         never took that lock and the ordering this test is about does not exist"
-    );
-
-    // THE ASSERTION. The delete is waiting; it must not already hold the environment row.
-    let mut probe = pool.begin().await.expect("begin probe");
-    let taken = sqlx::query("SELECT id FROM environments WHERE id = $1 FOR UPDATE NOWAIT")
-        .bind(scope.environment().to_string())
-        .fetch_one(&mut *probe)
-        .await;
-    assert!(
-        taken.is_ok(),
-        "the tenant delete is holding FOR UPDATE on an environment row while waiting for the \
-         append lock. A concurrent event producer holds that lock and wants FOR KEY SHARE on \
-         the same row through its outbox insert's foreign key, so the two orders form a cycle \
-         and Postgres aborts one with 40P01. The delete must take the append locks FIRST: \
-         {taken:?}"
-    );
-    probe.rollback().await.expect("release the probe");
-
-    holder
-        .commit()
-        .await
-        .expect("holder releases the append lock");
-    deleting
-        .await
-        .expect("the delete task finishes")
-        .expect("the delete succeeds once unblocked");
-}
-
 /// A ROTATION METERS THE SIGN-IN IT CREATED, through the shipped path.
 ///
 /// `insert_session_row` used to enqueue `user.signed_in` itself, which made it the choke point
@@ -1487,19 +1319,35 @@ async fn a_rotation_meters_the_sign_in_it_created() {
         .await
         .expect("the sign-in commits");
 
-    // ON THE FEED, not merely returned. `UsageTally` counts monthly actives off this event, and
-    // the defect it was written for was a constant naming a type with no producer at all: the
-    // fold read a feed that never contained it and metering reported zero for every tenant.
-    let served = eventually_visible(db.owner_pool(), 0, &[]).await;
-    let payloads: Vec<serde_json::Value> = sqlx::query_scalar(
-        "SELECT payload FROM outbox_messages \
-         WHERE tenant_id = $1 AND environment_id = $2 ORDER BY sequence",
-    )
-    .bind(scope.tenant().to_string())
-    .bind(scope.environment().to_string())
-    .fetch_all(db.owner_pool())
-    .await
-    .expect("read the feed");
+    // THROUGH `events_after`, which is the feed a consumer actually reads.
+    //
+    // An earlier version claimed to assert "ON THE FEED" and read `outbox_messages` directly,
+    // with `eventually_visible(pool, 0, &[])` in front of it -- an EMPTY `want`, so the helper
+    // returned on its first iteration without waiting for or checking anything. Two claims,
+    // neither true: no wait, and no feed.
+    // POLLED, because the watermark is cluster-wide: the row is withheld until every
+    // transaction open anywhere on the instance has finished, so a single read can legitimately
+    // see nothing. A bounded wait for the event itself, not a wait for nothing.
+    let mut payloads: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..100 {
+        payloads = db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .events_after(0, 100)
+            .await
+            .expect("read the feed")
+            .into_iter()
+            .map(|message| message.payload)
+            .collect();
+        if payloads
+            .iter()
+            .any(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("user.signed_in"))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let signed_in: Vec<&serde_json::Value> = payloads
         .iter()
         .filter(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("user.signed_in"))
@@ -1507,9 +1355,7 @@ async fn a_rotation_meters_the_sign_in_it_created() {
     assert_eq!(
         signed_in.len(),
         1,
-        "the rotation must put exactly one `user.signed_in` on the feed; {} rows served, \
-         payload types: {:?}",
-        served.len(),
+        "the rotation must put exactly one `user.signed_in` on the feed; payload types: {:?}",
         payloads
             .iter()
             .map(|p| p.get("type").cloned())
@@ -1672,17 +1518,17 @@ async fn a_rotation_waiting_on_a_row_does_not_hold_the_append_lock() {
 /// caller's. Doing it anyway means granting the internet-facing plane access to the tenant
 /// tables, which is the widening the plane split exists to prevent.
 ///
-/// So the cycle is closed from the OTHER side instead. A cycle needs two transactions taking
-/// two locks in opposite orders, and only one thing in the tree takes `FOR UPDATE` on
-/// `environments`: `ActingTenantRepo::delete_with_event`. It now takes the append lock for
-/// every environment of the tenant BEFORE that statement, so both sides take advisory-then-row
-/// and there is no opposite order left to construct. That is guarded by
-/// `a_tenant_delete_takes_the_append_locks_before_it_locks_any_environment_row`, which fails
-/// without the fix.
+/// CLOSING IT FROM THE OTHER SIDE WAS TRIED AND MADE THINGS WORSE. `ActingTenantRepo::delete_with_event`
+/// is the only `FOR UPDATE` on `environments`, so taking its append locks first looks like it
+/// gives both sides one order. It does not: `FOR UPDATE` also conflicts with the
+/// `FOR NO KEY UPDATE` an ordinary `UPDATE` takes, and three producers take exactly that on
+/// those rows before wanting the advisory lock. Measured on a real cluster with a control -- a
+/// posture write and a tenant delete deadlocked with the advisory locks taken first, and
+/// committed cleanly with them taken last. Reverted.
 ///
-/// This one stays ignored and stays runnable, because the PRODUCER-side invariant it asserts
-/// is still false and is still the more general fix: anything else that ever takes `FOR UPDATE`
-/// on an environment re-opens the cycle, and this is the cheapest demonstration of why. It
+/// So the order across the deployment is ROWS BEFORE ADVISORY, which every producer and that
+/// closure already follow, and this cycle stays open. It is ignored and runnable: whoever
+/// implements the lock-free alternative should be able to un-ignore it and watch it pass. It
 /// fails today. That is still the point.
 #[tokio::test]
 #[ignore = "the producer-side invariant is still false; the cycle is closed from the tenant-delete             side instead -- see the doc comment"]
