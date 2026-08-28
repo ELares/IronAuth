@@ -41,10 +41,9 @@ type Customize = (req: Request) => Response;
  * The claim that switches this hook into a test mode.
  *
  * A hook cannot take arguments beyond its request, and the integration suite needs a guest
- * that spins, one that declines, and one that tries to mint a reserved name. Building four
- * TypeScript components would put four copies of an eleven-megabyte JavaScript engine in the
- * repository, so instead there is one component and the suite selects a behaviour through an
- * ordinary input claim.
+ * that spins and one that declines. Building three TypeScript components would put three
+ * copies of an eleven-megabyte JavaScript engine in the repository, so instead there is one
+ * component and the suite selects a behaviour through an ordinary input claim.
  *
  * The mode is read from the ID-token claim set, and the claim is REMOVED from the output, so
  * the sample path is unaffected by its existence.

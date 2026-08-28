@@ -45,11 +45,36 @@
 //! # Compilation is CACHED, and that is what makes the criterion true
 //!
 //! M11's exit criterion says "in microseconds". Compiling a component is not microseconds:
-//! measured on the shipped fixture, `precompile_component` is a median of 34 ms and
+//! measured on the shipped RUST fixture, `precompile_component` is a median of 34 ms and
 //! `Component::new` 33 ms. The first version of this module compiled on every issuance, on a
 //! reactor thread, so the shipped path cost 34 ms per login and the claim was false -- and the
 //! latency benchmark could not see it, because that benchmark measures deserialize + instantiate
 //! + call, which is the path the dispatch did not take.
+//!
+//! # AND THOSE FIGURES ARE A RUST HOOK'S. A JAVASCRIPT HOOK IS TWO HUNDRED TIMES WORSE
+//!
+//! Issue #114 criterion 1 asks for a TypeScript hook as well, and one carries a JavaScript
+//! engine. Measured on the same engine, release, 14 cores, against the component this
+//! repository ships in `ironauth-hooks/guests-ts`:
+//!
+//! ```text
+//!                      Rust `good`      TypeScript sample
+//!   Component::new       33.6 ms            6.54 s
+//!   precompile           33.6 ms            6.47 s   (32.4 MiB of machine code)
+//!   warm instantiate     15 us              0.44-0.67 ms
+//! ```
+//!
+//! The WARM path is fine and is what "microsecond-scale" describes. The COLD path is not: a
+//! cache miss for a TypeScript hook blocks that login for six and a half seconds. There is no
+//! in-flight deduplication, so K concurrent first logins each start their own compile and each
+//! allocate 32 MiB of machine code. And once `MAX_CACHED_HOOKS` evicts an entry, the warning
+//! below -- "every issuance for it will recompile until a process restart" -- means 6.5 s per
+//! login rather than 33 ms.
+//!
+//! Nothing here fixes that; criterion 4's AOT precompilation AT DEPLOY TIME is what would, and
+//! it is a different criterion. It is written down because this block is where a maintainer
+//! sizes the risk, and reading "33 ms" while shipping a 6.5-second artifact is how a
+//! deployment discovers it from a pager instead.
 //!
 //! So a loaded component is held per (scope, client, component digest). The digest is in the
 //! key rather than a version counter: it is the artifact's own identity, so a redeploy of
@@ -80,8 +105,9 @@
 //! `LoadedHook::customize` blocks, and wasmtime's `in_tokio` PANICS on a tokio worker thread.
 //! Measured on this runtime: the same hook that returns in 1.16 ms under `spawn_blocking` panics
 //! when called directly. So the invocation goes through `spawn_blocking`, and so does the
-//! COMPILE on a cache miss -- 33 ms of cranelift is not something to run on a reactor either,
-//! which the first version did.
+//! COMPILE on a cache miss -- 33 ms of cranelift for a Rust hook, and 6.5 SECONDS for the
+//! TypeScript one, neither of which is something to run on a reactor, which the first version
+//! did.
 //!
 //! There is no `unsafe` here. It used the AOT pair -- `precompile_component` then the `unsafe`
 //! `Component::deserialize` -- on the reasoning that AOT is what a deployment pays at deploy

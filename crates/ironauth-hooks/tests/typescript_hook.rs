@@ -4,12 +4,35 @@
 //! > A Rust hook and a TypeScript hook each customize token claims through `token.customize`
 //! > under sandbox limits in the integration suite.
 //!
-//! The Rust half is `tests/sandbox.rs`, which runs fourteen Rust components. This file runs the
-//! ONE TypeScript component, and it exists as its own file for a reason worth stating: a
+//! # The two halves are NOT symmetric, and this is where that is written down
+//!
+//! The Rust half is met twice over: `tests/sandbox.rs` runs fourteen components directly, AND
+//! `ironauth-oidc/tests/token_hook_at_issuance.rs` drives one through a REAL token issuance --
+//! the deploy handler, the store, the mint, the protected-claim fence, and
+//! `token_hook::limits()` against a live epoch driver, across five grant doors.
+//!
+//! The TypeScript half is met ONCE, here, by loading the component and calling it. It never
+//! crosses the dispatch, the fence, or the database. What that leaves unproven is not the WIT
+//! transport -- that is language-agnostic and the Rust issuance test covers it -- but no test
+//! asserts a TypeScript hook shapes a REAL token end to end.
+//!
+//! Measured rather than assumed: the component DOES run under the limits the server applies
+//! (`Limits::claim_shaping` with `EPOCH_TICKS_PER_HOOK`, against a free-running 10 ms ticker),
+//! at 0.5 to 1.4 ms per invocation. So the gap is test coverage, not a known failure.
+//!
+//! This file runs the ONE TypeScript component, and it exists as its own file for a reason
+//! worth stating: a
 //! JavaScript hook carries a JavaScript engine, so compiling it costs seconds in a release
 //! build and around two minutes in a debug one. Every test here therefore shares a single
 //! compiled hook through a `OnceLock`, which is why the module is arranged around
 //! [`typescript_hook`] rather than loading per test.
+//!
+//! THAT COST IS NOT ONLY A TEST CONCERN. Measured against the limits the server applies --
+//! `Limits::claim_shaping` with `EPOCH_TICKS_PER_HOOK` and a free-running 10 ms epoch ticker --
+//! `HookEngine::load` takes 6.5 s and each invocation afterwards takes 0.5 to 1.4 ms. The
+//! server's hook cache fills lazily on a miss, so the first login after a TypeScript hook is
+//! deployed pays the 6.5 s inline. The warm number is what "microsecond-scale" describes; the
+//! cold one is what an operator meets first. See `guests-ts/README.md`.
 //!
 //! # What "under sandbox limits" is made to mean here
 //!
@@ -124,14 +147,17 @@ fn the_override_is_the_component_under_test() {
         .unwrap_or_else(|error| panic!("the component must exist at {path}: {error}"))
         .len();
     println!("typescript hook under test: {path} ({bytes} bytes)");
-    // AND THE BYTES ARE THE ONES THE OTHER TESTS LOAD, not merely a file at that path. This is
-    // the half a printed path cannot carry on its own: it closes the gap between "the name
-    // resolves" and "the reader used it".
-    assert_eq!(
-        u64::try_from(component().len()).expect("fits"),
-        bytes,
-        "the component the tests read is not the file at the path this reports"
-    );
+    // NO ASSERTION THAT THE BYTES MATCH THE PATH, because there is nothing to compare.
+    //
+    // Round 2 added `component().len() == metadata(path).len()` and called it "the half a
+    // printed path cannot carry". It is a TAUTOLOGY: `component()` reads the file at
+    // `component_path()`, and `path` above IS `component_path()`, so it compared a file's
+    // length to its own and could not fail.
+    //
+    // What closes the gap is the SINGLE SOURCE. Both this test and `component()` call
+    // `component_path()`, so there is no second literal left to diverge -- that is the whole
+    // fix, and an assertion on top of it reads like a guard while being decoration.
+    assert!(bytes > 0, "an empty component is not a component");
 }
 
 /// CRITERION 1, the TypeScript half: a TypeScript hook customizes claims under sandbox limits.
@@ -274,33 +300,58 @@ fn the_typescript_hook_fits_the_shipped_limits_with_margin() {
     let (engine, hook) = typescript_hook();
     let shipped = Limits::claim_shaping();
 
-    // MEMORY. The engine's heap has to fit under the same 16 MiB a Rust hook gets. Halving the
-    // cap is the probe: if the hook still runs at half of it, the shipped cap has at least 2x
-    // room, and if it does not, the margin is thinner than that and this test says so.
-    let halved = Limits {
-        memory_bytes: shipped.memory_bytes / 2,
-        ..shipped
-    };
-    assert!(
-        hook.customize(engine, &halved, &request(None)).is_ok(),
-        "the TypeScript hook needs more than half of the shipped {} MiB memory cap, so the \
-         shipped cap has under 2x of headroom for a JavaScript guest",
-        shipped.memory_bytes >> 20
+    // MEMORY. Halve until it stops running: the last cap that worked is what the hook needs,
+    // and the ratio to the shipped cap is the headroom. A search rather than one probe, so the
+    // output is a figure instead of a yes.
+    let mut memory_floor = shipped.memory_bytes;
+    while memory_floor > 1 {
+        let probe = Limits {
+            memory_bytes: memory_floor / 2,
+            ..shipped
+        };
+        if hook.customize(engine, &probe, &request(None)).is_err() {
+            break;
+        }
+        memory_floor /= 2;
+    }
+
+    // FUEL. The same search. A JavaScript engine's startup dominates this one, so it is the
+    // number most likely to creep when componentize-js is upgraded.
+    let mut fuel_floor = shipped.fuel;
+    while fuel_floor > 1 {
+        let probe = Limits {
+            fuel: fuel_floor / 2,
+            ..shipped
+        };
+        if hook.customize(engine, &probe, &request(None)).is_err() {
+            break;
+        }
+        fuel_floor /= 2;
+    }
+
+    // PRINTED, which is what the doc above promises and what the previous version did not do:
+    // it made two booleans and emitted nothing under `--nocapture`.
+    println!(
+        "typescript hook headroom: memory runs at {} MiB of the shipped {} MiB ({}x); fuel \
+         runs at {} of the shipped {} ({}x)",
+        memory_floor >> 20,
+        shipped.memory_bytes >> 20,
+        shipped.memory_bytes / memory_floor.max(1),
+        fuel_floor,
+        shipped.fuel,
+        shipped.fuel / fuel_floor.max(1),
     );
 
-    // FUEL. Same probe: run at a quarter of the shipped budget and report if it does not fit.
-    // A JavaScript engine's startup dominates this number, so it is the one most likely to
-    // creep when componentize-js is upgraded.
-    let quartered = Limits {
-        fuel: shipped.fuel / 4,
-        ..shipped
-    };
-    let fuel_result = hook.customize(engine, &quartered, &request(None));
     assert!(
-        fuel_result.is_ok(),
-        "the TypeScript hook needs more than a quarter of the shipped {} fuel budget, so the \
-         shipped budget has under 4x of headroom for a JavaScript guest: {:?}",
-        shipped.fuel,
-        fuel_result.err()
+        memory_floor * 2 <= shipped.memory_bytes,
+        "the TypeScript hook needs {memory_floor} bytes and the shipped cap is {} -- under 2x \
+         of headroom for a JavaScript guest",
+        shipped.memory_bytes
+    );
+    assert!(
+        fuel_floor * 4 <= shipped.fuel,
+        "the TypeScript hook needs {fuel_floor} fuel and the shipped budget is {} -- under 4x \
+         of headroom for a JavaScript guest",
+        shipped.fuel
     );
 }

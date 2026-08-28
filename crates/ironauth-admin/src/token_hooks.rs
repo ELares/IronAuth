@@ -89,9 +89,15 @@ use crate::views::{
 /// the suite reads a component from disk and never crosses this constant.
 ///
 /// So the bound is pinned to the artifact rather than to a preference:
-/// `the_shipped_typescript_sample_fits_this_bound` reads the committed component's real length
-/// and fails if it no longer fits. A componentize-js upgrade that grows the engine past this is
-/// then a failing test naming the two numbers, rather than a deploy that 400s in the field.
+/// `the_shipped_typescript_sample_fits_this_bound` reads the COMMITTED component's real length
+/// and fails if it no longer fits.
+///
+/// THAT TEST DOES NOT CATCH A componentize-js UPGRADE ON ITS OWN, and an earlier version of
+/// this paragraph said it did. Bumping the pin in `guests-ts/package.json` does not change the
+/// committed artifact, so the test goes on measuring the old bytes until someone regenerates
+/// `dist/`. What catches the upgrade is `scripts/ts-hook-freshness.sh`, which is the only thing
+/// that BUILDS from the current pin: it compares the rebuilt size against this constant and
+/// fails. The test guards the artifact; the script guards the pin, and it takes both.
 pub(crate) const MAX_COMPONENT_BYTES: usize = 16 * 1024 * 1024;
 
 /// The eight-byte preamble every WebAssembly component starts with.
@@ -556,9 +562,13 @@ mod tests {
     /// anyone would actually deploy. Under 8 MiB every TypeScript hook was refused by this
     /// surface, and no test noticed, because the hook tests read components from disk.
     ///
-    /// This reads the committed TypeScript sample's real length. It fails if a componentize-js
-    /// upgrade grows the JavaScript engine past what an operator may upload -- as a failing
-    /// test naming both numbers, rather than as a 400 in the field.
+    /// This reads the COMMITTED TypeScript sample's real length, so it fails when the artifact
+    /// in the tree no longer fits what an operator may upload.
+    ///
+    /// It does NOT see a componentize-js upgrade by itself: bumping the pin does not change the
+    /// committed bytes, so this keeps measuring the old ones until `dist/` is regenerated.
+    /// `scripts/ts-hook-freshness.sh` is what builds from the current pin and compares the
+    /// rebuilt size against this constant. Two guards, two different things guarded.
     #[test]
     fn the_shipped_typescript_sample_fits_this_bound() {
         let sample = ironauth_hooks::fixtures::TS_TOKEN_CUSTOMIZE.len();
@@ -569,7 +579,7 @@ mod tests {
              it samples"
         );
         // And the margin, so shrinking headroom is visible before it is gone. Not a tight
-        // bound: it exists to make "we are one componentize-js release from breaking" a test
+        // bound: it exists to make "the committed artifact is close to the bound" a test
         // failure instead of a discovery.
         assert!(
             sample * 5 / 4 <= MAX_COMPONENT_BYTES,

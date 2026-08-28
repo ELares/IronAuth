@@ -73,8 +73,20 @@ four kilobytes is the code in `src/`. That is not a footnote:
   now pinned against this artifact's real length rather than against a chosen number.
 - compiling it costs seconds in a release build and around two minutes in a debug one, which is
   why `tests/typescript_hook.rs` compiles it once and shares it.
-- it still runs inside the shipped `Limits::claim_shaping`, unmodified, and
-  `the_typescript_hook_fits_the_shipped_limits_with_margin` records how much room is left.
+- **the first login after deploying one pays that compile, inline.** Measured under the limits
+  the server actually applies (`Limits::claim_shaping` with `EPOCH_TICKS_PER_HOOK`, a
+  free-running 10 ms epoch ticker): `HookEngine::load` takes **6.5 s**, and every invocation
+  after it takes **0.5-1.4 ms**. `ironauth-oidc`'s hook cache is populated lazily on a miss, so
+  that 6.5 s lands on one unlucky request rather than on the deploy. A Rust hook is small enough
+  that nobody noticed; a JavaScript hook is not.
+
+  Criterion 4's AOT precompilation at DEPLOY time is what removes this, and it is a different
+  criterion. Said here because "microsecond-scale cold starts" is the headline claim for hooks,
+  and it is true of the warm path and false of the first request for this artifact.
+- it still runs inside the shipped `Limits::claim_shaping`, unmodified.
+  `the_typescript_hook_fits_the_shipped_limits_with_margin` searches for the smallest limit it
+  survives and PRINTS the ratio: memory at 8 MiB of the shipped 16 (2x), fuel at 12.5M of the
+  shipped 50M (4x).
 
 ## The test modes
 
@@ -94,4 +106,4 @@ never tested, which made it undocumented behaviour inside an eleven-megabyte art
 are told to copy, and the freshness check cannot police a branch nothing calls. It was removed.
 
 A hook a tenant actually ships would have none of this. It is here because the alternative was
-three more copies of SpiderMonkey.
+two more copies of SpiderMonkey.
