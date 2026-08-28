@@ -8515,18 +8515,35 @@ async fn every_component_bound_admits_the_shipped_typescript_hook() {
              and see 0166_token_hook_component_bound.sql for the reasoning."
         );
 
-        // AND THE SUBSTITUTION REACHES THE BOUND. Without this the loop passes for a
-        // constraint the replacement never touched, or one that is true of everything -- both
-        // of which return the same `true` as a bound that genuinely admits the sample.
-        let absurd = expression.replace("octet_length(component)", "9999999999");
-        let refuses_absurd: bool = sqlx::query_scalar(&format!("SELECT NOT ({absurd})"))
-            .fetch_one(db.owner_pool())
-            .await
-            .unwrap_or_else(|error| panic!("evaluating {table}.{name} at 10 GB: {error}"));
+        // AND THE CONSTRAINT DISCRIMINATES, or the check above proved nothing: a predicate
+        // true of every input returns the same `true` as one that genuinely admits the sample.
+        //
+        // BOTH ENDS, not just the large one. An earlier version substituted only ten gigabytes
+        // and asserted refusal, which quietly required every matched constraint to be an UPPER
+        // bound -- and this repository writes lower bounds on their own (`CHECK
+        // (octet_length(recipient_bidx) > 0)` in 0157). A perfectly correct component table
+        // written that way would have turned this test red and blamed the wrong constraint.
+        //
+        // That earlier comment also claimed to rule out "a constraint the replacement never
+        // touched". It cannot occur: the WHERE clause above already requires the substring, so
+        // every row the loop sees is one the replacement reached.
+        let mut discriminates = false;
+        for probe_value in ["9999999999", "0"] {
+            let probe = expression.replace("octet_length(component)", probe_value);
+            let holds: bool = sqlx::query_scalar(&format!("SELECT ({probe})"))
+                .fetch_one(db.owner_pool())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("evaluating {table}.{name} at {probe_value}: {error}")
+                });
+            if !holds {
+                discriminates = true;
+            }
+        }
         assert!(
-            refuses_absurd,
-            "{table}.{name} admits a ten-gigabyte component, so the check above proved \
-             nothing about it: `{expression}`"
+            discriminates,
+            "{table}.{name} admits BOTH a ten-gigabyte component and a zero-byte one, so it \
+             bounds nothing and the check above proved nothing about it: `{expression}`"
         );
     }
 }

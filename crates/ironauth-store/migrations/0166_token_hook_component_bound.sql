@@ -44,13 +44,25 @@
 -- claiming otherwise would be a migration that describes a concurrency property it does not
 -- have -- frozen at merge, since the checksum covers the whole file including this text.
 --
--- So: two statements, the constraint validated immediately, and the cost stated plainly.
--- `token_hooks` holds at most one row per client that has a hook, so the validating scan is
--- proportional to the number of clients WITH HOOKS in the deployment rather than to logins or
--- tokens, and it runs under a lock that blocks issuance reads of this table for its duration.
--- On the deployments this ships to that is milliseconds. A deployment where it is not has a
--- problem with the one-transaction-per-file runner, not with this bound, and the fix belongs
--- there.
+-- So: a drop and a re-add per table, validated immediately, and the cost stated plainly for
+-- BOTH tables -- because this file bounds two of them, and an earlier version of this sentence
+-- said "two statements" while describing only the first pair. It was written when the file had
+-- one table; `token_hook_versions` was appended below it and the sentence was not revisited.
+--
+-- `token_hooks` holds at most one row per client that has a hook, so its validating scan is
+-- proportional to the number of clients WITH HOOKS rather than to logins or tokens. That is
+-- milliseconds on the deployments this ships to.
+--
+-- `token_hook_versions` is the larger of the two and is worth naming separately: it holds up to
+-- TOKEN_HOOK_VERSION_RETENTION rows per client -- twenty -- and its rows are megabytes each.
+-- So its scan is up to twenty times the row count of the first, over far more bytes. It is
+-- still a scan of one row per historical deploy rather than of anything that grows with
+-- traffic, and the prune keeps it bounded, but a deployment with many hooked clients should
+-- expect this migration to be the slower of the two ALTERs rather than an instant one.
+--
+-- Both run under a lock that blocks issuance reads of `token_hooks` for the duration of the
+-- whole file. A deployment where that is unacceptable has a problem with the
+-- one-transaction-per-file runner, not with this bound, and the fix belongs there.
 --
 -- No existing row can fail: the old bound was strictly TIGHTER, so everything that satisfied
 -- 8388608 satisfies 16777216.

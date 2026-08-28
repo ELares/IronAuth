@@ -598,10 +598,15 @@ jobs:
     # tests against the rebuilt component, so a source change that was never rebuilt fails here
     # rather than shipping a sample whose code and artifact disagree.
     #
-    # A separate job rather than a step in the main suite because it is the only thing in this
-    # repository that needs Node, and putting a JavaScript toolchain in the critical path of
-    # the Rust tests would slow every run for a check that changes on the rare commits that
-    # touch this one directory.
+    # A separate job rather than a step in the main suite because it rebuilds an eleven-megabyte
+    # component and then runs the hook tests TWICE, and that does not belong in the critical
+    # path of a suite it can only ever confirm. It changes on the rare commits touching one
+    # directory.
+    #
+    # NOT because Node is unusual here -- an earlier version of this comment said it was "the
+    # only thing in this repository that needs Node", which is false: this file already has
+    # three other `setup-node` steps and `scripts/gate.sh` has several node lanes. The reason
+    # is the cost of THIS check, not the availability of the toolchain.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

@@ -817,7 +817,7 @@ pub fn management_router(state: AdminState) -> Router {
             put(token_hooks::deploy_token_hook)
                 .get(token_hooks::get_token_hook)
                 .delete(token_hooks::delete_token_hook)
-                // AXUM'S DEFAULT BODY LIMIT IS 2 MiB and this route's own cap is 8, so without
+                // AXUM'S DEFAULT BODY LIMIT IS 2 MiB and this route's own cap is 16, so without
                 // this a legal 3 MiB component is a plain-text 413 from the framework before
                 // the handler runs -- an undocumented status, no `ErrorBody`, and the handler's
                 // own "component_too_large" message unreachable for every body that could

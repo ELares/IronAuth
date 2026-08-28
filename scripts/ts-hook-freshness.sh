@@ -17,7 +17,10 @@
 # component through `IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE_OVERRIDE`. If the committed artifact and
 # the source disagree about what the hook DOES, one of the two runs fails.
 #
-# WHY IT IS NOT IN THE DEFAULT GATE: it needs Node and a reachable npm registry.
+# WHY IT IS NOT IN THE DEFAULT GATE: it rebuilds an eleven-megabyte component and then runs the
+# hook tests twice, which is minutes for a check that only ever confirms what the committed
+# artifact already does. Not because Node is exotic here -- `scripts/gate.sh` already has node
+# lanes -- but because of what this particular check costs.
 #
 # It SKIPS LOUDLY when npm is absent -- exit 0, because a missing toolchain is not a failing
 # check, and a message saying exactly what was not verified so the skip is never mistaken for a

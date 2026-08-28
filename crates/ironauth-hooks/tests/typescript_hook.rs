@@ -46,9 +46,13 @@ const SAMPLE_CLAIM: &str = "ts_hook_tier";
 /// can point these same tests at a component it just rebuilt from the TypeScript source. That
 /// is what keeps the committed artifact honest: the freshness check compares BEHAVIOUR against
 /// this file, not bytes.
+fn component_path() -> String {
+    std::env::var("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE_OVERRIDE")
+        .unwrap_or_else(|_| env!("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE").to_owned())
+}
+
 fn component() -> Vec<u8> {
-    let path = std::env::var("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE_OVERRIDE")
-        .unwrap_or_else(|_| env!("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE").to_owned());
+    let path = component_path();
     std::fs::read(&path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
 }
 
@@ -104,15 +108,30 @@ fn claim<'a>(claims: &'a [(String, String)], name: &str) -> Option<&'a str> {
 /// So the script greps this test's output for the path it handed over. An assertion cannot do
 /// that job -- the test does not know what the script intended -- but printing the path lets
 /// the caller check its own instruction was obeyed.
+///
+/// # It calls `component_path`, and that is the entire point
+///
+/// The first version re-implemented the env lookup from its own string literal. That proved the
+/// variable was SET AND READABLE -- a property of the script -- and nothing about what the
+/// other seven tests loaded, because the two literals were independent with nothing crossing
+/// them. Renaming the variable inside `component`, or dropping its override branch, left this
+/// test printing the right path while every other test read the committed artifact. Review
+/// measured exactly that mutant and it survived. One function answers "which component" now.
 #[test]
 fn the_override_is_the_component_under_test() {
-    let path = std::env::var("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE_OVERRIDE")
-        .unwrap_or_else(|_| env!("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE").to_owned());
+    let path = component_path();
     let bytes = std::fs::metadata(&path)
-        .expect("the component must exist")
+        .unwrap_or_else(|error| panic!("the component must exist at {path}: {error}"))
         .len();
     println!("typescript hook under test: {path} ({bytes} bytes)");
-    assert!(bytes > 0, "an empty component is not a component");
+    // AND THE BYTES ARE THE ONES THE OTHER TESTS LOAD, not merely a file at that path. This is
+    // the half a printed path cannot carry on its own: it closes the gap between "the name
+    // resolves" and "the reader used it".
+    assert_eq!(
+        u64::try_from(component().len()).expect("fits"),
+        bytes,
+        "the component the tests read is not the file at the path this reports"
+    );
 }
 
 /// CRITERION 1, the TypeScript half: a TypeScript hook customizes claims under sandbox limits.

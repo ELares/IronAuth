@@ -32516,8 +32516,8 @@ impl ActingTokenHookRepo<'_> {
                 .await?;
                 // PRUNE TO THE NEWEST FEW, in the same transaction as the insert that grew it.
                 //
-                // A component may be eight megabytes and nothing else deletes these rows, so a
-                // client redeployed a thousand times would hold eight gigabytes of history --
+                // A component may be sixteen megabytes and nothing else deletes these rows, so a
+                // client redeployed a thousand times would hold sixteen gigabytes of history --
                 // and a rollback target a hundred deploys back is not one anybody reaches for.
                 //
                 // Keyed on the VERSION NUMBER rather than on age: "the last twenty deploys" is

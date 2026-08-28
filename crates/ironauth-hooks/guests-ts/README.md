@@ -69,7 +69,7 @@ std's startup needs them. It is `wasi:http/types`, pulled in because the JavaScr
 four kilobytes is the code in `src/`. That is not a footnote:
 
 - the admin surface's upload cap had to admit it, and 8 MiB did not. See
-  `0165_token_hook_component_bound.sql`, and `MAX_COMPONENT_BYTES` in `ironauth-admin`, which is
+  `0166_token_hook_component_bound.sql`, and `MAX_COMPONENT_BYTES` in `ironauth-admin`, which is
   now pinned against this artifact's real length rather than against a chosen number.
 - compiling it costs seconds in a release build and around two minutes in a debug one, which is
   why `tests/typescript_hook.rs` compiles it once and shares it.

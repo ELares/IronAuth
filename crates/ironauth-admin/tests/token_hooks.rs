@@ -1045,8 +1045,8 @@ async fn a_client_with_no_hook_lists_no_versions() {
 
 /// The history is PRUNED to the newest few, and the pruning keeps the newest.
 ///
-/// Without it the history is unbounded: a component may be eight megabytes and nothing else
-/// deletes these rows, so a client redeployed a thousand times would hold eight gigabytes of
+/// Without it the history is unbounded: a component may be sixteen megabytes and nothing else
+/// deletes these rows, so a client redeployed a thousand times would hold sixteen gigabytes of
 /// versions nobody will roll back to. The migration used to claim a retention that did not
 /// exist, which is how this got written.
 #[tokio::test]
