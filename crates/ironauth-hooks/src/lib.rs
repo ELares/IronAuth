@@ -66,6 +66,18 @@ pub mod fixtures {
     /// means the dispatch did not run, rather than that the fence did its job.
     pub const GOOD: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_GOOD"));
 
+    /// The TypeScript sample, and the only fixture here that is not compiled from Rust.
+    ///
+    /// Issue #114 criterion 1 asks for a Rust hook AND a TypeScript hook customizing claims
+    /// through `token.customize`. `guests-ts/src/token-customize.ts` is that hook, and this is
+    /// the component built from it, committed rather than built (see `guests-ts/build.mjs`).
+    ///
+    /// IT IS ELEVEN MEGABYTES, because a JavaScript hook carries a JavaScript engine. That is
+    /// not an aside: it is the number the admin surface's upload cap has to admit, and it is
+    /// why `ironauth-admin` pins that cap against `.len()` here rather than against a number
+    /// someone chose. Nothing outside a test should reach for this constant.
+    pub const TS_TOKEN_CUSTOMIZE: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE"));
+
     /// A hook that imports `wasi:sockets`, which the sandbox does not link.
     ///
     /// The sandbox suite runs it directly to show the capability being refused. It is exported

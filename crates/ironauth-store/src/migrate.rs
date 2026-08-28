@@ -1291,6 +1291,24 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0165_token_hook_versions.sql"),
         },
+        Migration {
+            version: 166,
+            name: "token_hook_component_bound",
+            // EXPAND: the new bound is strictly WEAKER than the old one, so it admits every row
+            // an old binary could write and refuses nothing an old binary would accept. An old
+            // binary that keeps refusing at 8 MiB in its own validation is merely stricter than
+            // the schema, which is the safe direction.
+            //
+            // 166 AND NOT 165, WHICH IS WHAT THIS RULE LOOKS LIKE WHEN IT FIRES. Numbers are
+            // contiguous, enforced by `registry_versions_are_contiguous_from_one` below: the
+            // registry must be exactly 1..=N, so a branch cannot reserve a number by leaving a
+            // gap and two branches adding a migration BOTH claim the next one. This branch and
+            // #1014 both wrote 165; that one landed first, so this renumbered on rebase, and
+            // the contiguity test is what made forgetting it a failure rather than a silently
+            // skipped migration.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0166_token_hook_component_bound.sql"),
+        },
     ]
 }
 

@@ -32353,7 +32353,7 @@ impl TokenHookRepo<'_> {
 
     /// The deployed hook's METADATA, without reading the component.
     ///
-    /// `get` SELECTs the component, which is up to eight megabytes, and the management read
+    /// `get` SELECTs the component, which is up to sixteen megabytes, and the management read
     /// only reports its LENGTH. Hauling the bytes out of Postgres, across the wire and into a
     /// buffer to call `.len()` on them is work proportional to a thing nobody looks at, so the
     /// length is computed where the bytes already are.
@@ -32516,8 +32516,8 @@ impl ActingTokenHookRepo<'_> {
                 .await?;
                 // PRUNE TO THE NEWEST FEW, in the same transaction as the insert that grew it.
                 //
-                // A component may be eight megabytes and nothing else deletes these rows, so a
-                // client redeployed a thousand times would hold eight gigabytes of history --
+                // A component may be sixteen megabytes and nothing else deletes these rows, so a
+                // client redeployed a thousand times would hold sixteen gigabytes of history --
                 // and a rollback target a hundred deploys back is not one anybody reaches for.
                 //
                 // Keyed on the VERSION NUMBER rather than on age: "the last twenty deploys" is

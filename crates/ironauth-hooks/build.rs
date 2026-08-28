@@ -49,6 +49,14 @@ const GUESTS: &[(&str, &str)] = &[
     ("echo_only", "IRONAUTH_GUEST_ECHO_ONLY"),
 ];
 
+/// The committed TypeScript component, relative to this crate's root.
+///
+/// Not built here, unlike every fixture above. Building it needs Node, an npm install, and a
+/// JavaScript engine to embed; running `npm install` from a build script would put a network
+/// fetch in the path of every build of this crate. `guests-ts/build.mjs` carries the full
+/// reasoning and is what produces this file.
+const TS_GUEST: &str = "guests-ts/dist/token-customize.wasm";
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let guests = manifest.join("guests");
@@ -83,6 +91,32 @@ fn main() {
          These fixtures are not optional. They are the hooks that spin, allocate, and try to\n\
          open a socket, and without them the sandbox tests in this crate verify nothing. They\n\
          are built rather than skipped so that a green suite means the sandbox was tested.\n"
+    );
+
+    // The TypeScript component is committed rather than built, and it is checked with the same
+    // severity as a missing Rust fixture: absent means BUILD FAILURE, never a skipped test.
+    // Criterion 1 asks for a Rust hook AND a TypeScript hook customizing claims in the
+    // integration suite, and a TypeScript test that quietly does not run would leave half of
+    // that criterion unverified while the suite reported green.
+    let ts_guest = manifest.join(TS_GUEST);
+    println!("cargo:rerun-if-changed={}", ts_guest.display());
+    assert!(
+        ts_guest.exists(),
+        "\n\
+         The committed TypeScript hook component is missing:\n\
+         \n\
+             {}\n\
+         \n\
+         It is built by hand, not by this script. To rebuild it:\n\
+         \n\
+             cd crates/ironauth-hooks/guests-ts && npm install && npm run build\n\
+         \n\
+         See guests-ts/build.mjs for why it is committed rather than built here.\n",
+        ts_guest.display()
+    );
+    println!(
+        "cargo:rustc-env=IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE={}",
+        ts_guest.display()
     );
 
     let release = out.join("wasm32-wasip2").join("release");

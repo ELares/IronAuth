@@ -89,7 +89,8 @@ impl std::fmt::Debug for TokenHookRecord {
 /// A deployed hook's metadata, without the component (issue #114).
 ///
 /// The management read reports a LENGTH, so it reads a length: `TokenHookRecord` carries up to
-/// eight megabytes that this surface would immediately discard.
+/// sixteen megabytes that this surface would immediately discard -- and that is the bound after
+/// #114 criterion 1 doubled it, because the shipped TypeScript hook is over ten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenHookMetadata {
     /// The OAuth client whose tokens this hook shapes.

@@ -74,7 +74,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      backchannel approved requires grant, backchannel approved grant validated, \
      external issuer control grants, outbound messages, sealed message recipient, \
      message sending state, message suppressions, message resend count, \
-     declarative claim mappings, claim mappings data plane read, claim mapping delete grant, token hooks, token hooks delete grant, token hook failure policy, token hook versions.";
+     declarative claim mappings, claim mappings data plane read, claim mapping delete grant, token hooks, token hooks delete grant, token hook failure policy, token hook versions, \
+     token hook component bound.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -705,7 +706,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        165,
+        166,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -745,7 +746,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
             126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
             143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
-            160, 161, 162, 163, 164, 165
+            160, 161, 162, 163, 164, 165, 166
         ]
     );
     let phase_of = |version: i64| async move {
@@ -8434,4 +8435,115 @@ async fn the_version_timestamp_advances_within_a_transaction() {
          race gets the higher version number and the earlier timestamp. 0165 requires \
          clock_timestamp()."
     );
+}
+
+/// EVERY COMPONENT BOUND IN THE SCHEMA ADMITS THE HOOK WE ACTUALLY SHIP.
+///
+/// Migration 0166 raises `token_hooks`' bound from 8 MiB because that number was measured from
+/// Rust hooks, and a hook written in a scripting language carries its interpreter: the shipped
+/// TypeScript sample is around 10.6 MiB, of which about four kilobytes is the author's code.
+/// Under the old bound every TypeScript hook was undeployable through this product's own API.
+///
+/// The bound is a CHECK constraint, so it is copied wherever a component column is, and a table
+/// added later that copies the old number re-introduces the defect on a new door with every
+/// existing test still passing. This scans the SCHEMA rather than naming the tables it knows
+/// about, which is what catches the one nobody thought to list -- `token_hook_versions` from
+/// #1014 is exactly that table, and it landed carrying 0162's number.
+///
+/// # Why this evaluates the bound instead of reading it
+///
+/// The first version of this test scanned `pg_get_constraintdef` for the literal `8388608`.
+/// That decides the SPELLING of a numeral, not the bound, and Postgres does not fold constants
+/// in a stored constraint: measured, `octet_length(component) <= 8 * 1024 * 1024` comes back as
+/// `((8 * 1024) * 1024)`, which contains no `8388608` at all. So the scan reported clean on the
+/// exact spelling the Rust constant uses, and `8388608::bigint` passed only by accident.
+///
+/// This substitutes the real artifact's byte count into each constraint's own expression and
+/// asks POSTGRES whether it holds. Spelling cannot matter to that, and the number under test is
+/// the committed component's actual size rather than a copy of it.
+#[tokio::test]
+async fn every_component_bound_admits_the_shipped_typescript_hook() {
+    // `start` runs the production chain on a fresh database, so what is scanned below is the
+    // schema a real deployment gets rather than a hand-built one.
+    let db = TestDatabase::start().await;
+
+    // THE REAL ARTIFACT, by path rather than by a number written here. A constant would be a
+    // copy of the thing it describes, and the two would drift the first time the sample is
+    // rebuilt against a newer componentize-js.
+    let sample = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../ironauth-hooks/guests-ts/dist/token-customize.wasm"
+    );
+    let sample_bytes = i64::try_from(
+        std::fs::metadata(sample)
+            .unwrap_or_else(|error| {
+                panic!("the committed TypeScript component ({sample}): {error}")
+            })
+            .len(),
+    )
+    .expect("fits");
+
+    // Every CHECK that bounds a component, as its own expression rather than as prose.
+    let bounds: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT conrelid::regclass::text, conname, pg_get_expr(conbin, conrelid) \
+         FROM pg_constraint \
+         WHERE contype = 'c' AND pg_get_expr(conbin, conrelid) LIKE '%octet_length(component)%'",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("scanning constraints");
+
+    assert!(
+        !bounds.is_empty(),
+        "no component bound was found at all, so everything below is vacuous: the column or \
+         the function this scan keys on has been renamed"
+    );
+
+    for (table, name, expression) in &bounds {
+        // Substitute the size in for the length call, and let Postgres decide. Whatever
+        // arithmetic the author wrote, the server evaluates it the same way it does on a write.
+        let probe = expression.replace("octet_length(component)", &sample_bytes.to_string());
+        let admits: bool = sqlx::query_scalar(&format!("SELECT ({probe})"))
+            .fetch_one(db.owner_pool())
+            .await
+            .unwrap_or_else(|error| panic!("evaluating {table}.{name}: {error}"));
+        assert!(
+            admits,
+            "{table}.{name} REFUSES the TypeScript hook this repository ships \
+             ({sample_bytes} bytes). Its bound is `{expression}`. Every TypeScript hook is \
+             undeployable through the surface that constraint guards; raise it in a migration, \
+             and see 0166_token_hook_component_bound.sql for the reasoning."
+        );
+
+        // AND THE CONSTRAINT DISCRIMINATES, or the check above proved nothing: a predicate
+        // true of every input returns the same `true` as one that genuinely admits the sample.
+        //
+        // BOTH ENDS, not just the large one. An earlier version substituted only ten gigabytes
+        // and asserted refusal, which quietly required every matched constraint to be an UPPER
+        // bound -- and this repository writes lower bounds on their own (`CHECK
+        // (octet_length(recipient_bidx) > 0)` in 0157). A perfectly correct component table
+        // written that way would have turned this test red and blamed the wrong constraint.
+        //
+        // That earlier comment also claimed to rule out "a constraint the replacement never
+        // touched". It cannot occur: the WHERE clause above already requires the substring, so
+        // every row the loop sees is one the replacement reached.
+        let mut discriminates = false;
+        for probe_value in ["9999999999", "0"] {
+            let probe = expression.replace("octet_length(component)", probe_value);
+            let holds: bool = sqlx::query_scalar(&format!("SELECT ({probe})"))
+                .fetch_one(db.owner_pool())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("evaluating {table}.{name} at {probe_value}: {error}")
+                });
+            if !holds {
+                discriminates = true;
+            }
+        }
+        assert!(
+            discriminates,
+            "{table}.{name} admits BOTH a ten-gigabyte component and a zero-byte one, so it \
+             bounds nothing and the check above proved nothing about it: `{expression}`"
+        );
+    }
 }

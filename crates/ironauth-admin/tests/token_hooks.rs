@@ -32,7 +32,13 @@ const MICROS_2020: i64 = 1_577_836_800_000_000;
 const MICROS_2100: i64 = 4_102_444_800_000_000;
 
 /// What `token_hooks.component_bounded` permits, and what the handler's own constant says.
-const MAX_COMPONENT_BYTES: usize = 8 * 1024 * 1024;
+///
+/// A THIRD, INDEPENDENT COPY, and it must stay one: importing the handler's constant would
+/// make `a_component_at_the_documented_bound_is_stored` agree with the source by construction,
+/// and that test's whole job is to write exactly this many bytes through the real handler into
+/// the real table so a source/schema disagreement is a failed insert. Three copies that a test
+/// crosses beat one copy that nothing checks against the database.
+const MAX_COMPONENT_BYTES: usize = 16 * 1024 * 1024;
 
 fn scope_of(tenant: &str, environment: &str) -> Scope {
     Scope::new(
@@ -1039,8 +1045,8 @@ async fn a_client_with_no_hook_lists_no_versions() {
 
 /// The history is PRUNED to the newest few, and the pruning keeps the newest.
 ///
-/// Without it the history is unbounded: a component may be eight megabytes and nothing else
-/// deletes these rows, so a client redeployed a thousand times would hold eight gigabytes of
+/// Without it the history is unbounded: a component may be sixteen megabytes and nothing else
+/// deletes these rows, so a client redeployed a thousand times would hold sixteen gigabytes of
 /// versions nobody will roll back to. The migration used to claim a retention that did not
 /// exist, which is how this got written.
 #[tokio::test]

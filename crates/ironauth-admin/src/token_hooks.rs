@@ -77,7 +77,28 @@ use crate::views::{
 /// with both numbers wrong in the same direction. `a_component_at_the_documented_bound_is_stored`
 /// is what actually crosses the two: it deploys exactly this many bytes through the real
 /// handler into the real table, so a disagreement is a failed insert rather than a comment.
-pub(crate) const MAX_COMPONENT_BYTES: usize = 8 * 1024 * 1024;
+///
+/// # Where the number comes from
+///
+/// NOT from judgement. It was 8 MiB, chosen from the observation that a claim-shaping hook is
+/// "under a hundred kilobytes" -- which is true of Rust and false of every scripting language,
+/// because a hook written in one carries its interpreter. Criterion 1 of issue #114 asks for a
+/// TypeScript hook, and the shipped TypeScript sample is roughly 10.6 MiB of which about four
+/// kilobytes is the author's code. The old bound did not squeeze TypeScript hooks, it made
+/// them undeployable through this surface while the integration suite ran them happily, because
+/// the suite reads a component from disk and never crosses this constant.
+///
+/// So the bound is pinned to the artifact rather than to a preference:
+/// `the_shipped_typescript_sample_fits_this_bound` reads the COMMITTED component's real length
+/// and fails if it no longer fits.
+///
+/// THAT TEST DOES NOT CATCH A componentize-js UPGRADE ON ITS OWN, and an earlier version of
+/// this paragraph said it did. Bumping the pin in `guests-ts/package.json` does not change the
+/// committed artifact, so the test goes on measuring the old bytes until someone regenerates
+/// `dist/`. What catches the upgrade is `scripts/ts-hook-freshness.sh`, which is the only thing
+/// that BUILDS from the current pin: it compares the rebuilt size against this constant and
+/// fails. The test guards the artifact; the script guards the pin, and it takes both.
+pub(crate) const MAX_COMPONENT_BYTES: usize = 16 * 1024 * 1024;
 
 /// The eight-byte preamble every WebAssembly component starts with.
 ///
@@ -132,9 +153,16 @@ fn validate_component(component: &[u8]) -> Result<(), ApiError> {
              Content-Type: application/wasm".to_owned()));
     }
     if component.len() > MAX_COMPONENT_BYTES {
-        return Err(ApiError::BadRequest(
-            "component_too_large: the component exceeds the 8388608-byte limit".to_owned(),
-        ));
+        // INTERPOLATED, never written out. This message named 8388608 as a literal while the
+        // constant beside it moved to 16 MiB, so a refusal would have quoted a limit that was
+        // not the limit -- and the test above only asserts the error CODE, so nothing would
+        // have caught it. A number in prose next to the number it describes is a number that
+        // will disagree with it.
+        return Err(ApiError::BadRequest(format!(
+            "component_too_large: the component is {} bytes and the limit is \
+             {MAX_COMPONENT_BYTES} bytes",
+            component.len()
+        )));
     }
     if component.starts_with(&COMPONENT_PREAMBLE) {
         return Ok(());
@@ -294,7 +322,7 @@ pub async fn get_token_hook(
     principal.require_permission(ManagementPermission::Read)?;
     let client = parse_client_id(&client_id, scope)?;
 
-    // `metadata`, not `get`: the component is up to eight megabytes and this reports its
+    // `metadata`, not `get`: the component runs to tens of megabytes and this reports its
     // LENGTH, so the length is computed where the bytes already are rather than by hauling
     // them across the wire to call `.len()`.
     let record = state
@@ -524,6 +552,41 @@ mod tests {
         over.push(0);
         let error = validate_component(&over).expect_err("one byte over is refused");
         assert!(format!("{error:?}").contains("component_too_large"));
+    }
+
+    /// THE BOUND IS PINNED TO A REAL ARTIFACT, which is the whole point of it being 16 MiB.
+    ///
+    /// A bound and the thing it bounds should not be editable in the same commit without one
+    /// of them objecting, and until now they were: `MAX_COMPONENT_BYTES` was a number chosen
+    /// from a sentence about Rust hooks, and nothing in the repository held it against a hook
+    /// anyone would actually deploy. Under 8 MiB every TypeScript hook was refused by this
+    /// surface, and no test noticed, because the hook tests read components from disk.
+    ///
+    /// This reads the COMMITTED TypeScript sample's real length, so it fails when the artifact
+    /// in the tree no longer fits what an operator may upload.
+    ///
+    /// It does NOT see a componentize-js upgrade by itself: bumping the pin does not change the
+    /// committed bytes, so this keeps measuring the old ones until `dist/` is regenerated.
+    /// `scripts/ts-hook-freshness.sh` is what builds from the current pin and compares the
+    /// rebuilt size against this constant. Two guards, two different things guarded.
+    #[test]
+    fn the_shipped_typescript_sample_fits_this_bound() {
+        let sample = ironauth_hooks::fixtures::TS_TOKEN_CUSTOMIZE.len();
+        assert!(
+            sample <= MAX_COMPONENT_BYTES,
+            "the shipped TypeScript hook is {sample} bytes and this surface refuses anything \
+             over {MAX_COMPONENT_BYTES}, so the sample cannot be deployed through the product \
+             it samples"
+        );
+        // And the margin, so shrinking headroom is visible before it is gone. Not a tight
+        // bound: it exists to make "the committed artifact is close to the bound" a test
+        // failure instead of a discovery.
+        assert!(
+            sample * 5 / 4 <= MAX_COMPONENT_BYTES,
+            "the shipped TypeScript hook is {sample} bytes against a {MAX_COMPONENT_BYTES} \
+             byte bound, under 25% of headroom; raise the bound in a migration before a \
+             JavaScript engine upgrade makes every TypeScript hook undeployable"
+        );
     }
 }
 

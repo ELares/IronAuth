@@ -1,0 +1,13 @@
+node_modules/
+# `tsc` output, an intermediate on the way to the component.
+build/
+
+# THE COMPONENT IS COMMITTED, and the root .gitignore excludes `dist/` everywhere.
+#
+# Without these two lines the artifact is silently dropped from every commit, `build.rs` then
+# fails on a fresh clone with "the committed TypeScript hook component is missing", and the
+# person who hits it is not the person who caused it. Both lines are needed: git cannot
+# re-include a file whose parent DIRECTORY is excluded, so the directory has to be un-excluded
+# before the file can be.
+!dist/
+!dist/token-customize.wasm
