@@ -220,6 +220,38 @@ pub enum MappingRule {
         /// Where it goes.
         placement: Placement,
     },
+    /// Compute a claim from a CEL expression, under a cost budget (issue #113 criterion 2).
+    ///
+    /// The escape hatch this module's own header names: "a hook, a WASM module, or a CEL
+    /// expression. Those exist for the cases this cannot express." The four rules above cover
+    /// renames, constants, list filtering and placement, and nothing composes them -- an
+    /// operator who needs "the groups that start with `eng-`, joined" has to write code today.
+    ///
+    /// # What an expression can see
+    ///
+    /// One binding, `claims`, an object holding the claim set AS THE PREVIOUS RULES LEFT IT.
+    /// That is the isolation: `ironauth-cel` evaluates against `cel::Env::stdlib()`, which has
+    /// no ambient IO by specification, so an expression can only name what it was bound and
+    /// cross-tenant access is a question about this list rather than about the sandbox.
+    ///
+    /// Rules run in order, so a `cel` rule reads what earlier rules wrote and later rules see
+    /// what it wrote. That is the same sequencing `rename` and `place` already have.
+    Cel {
+        /// The claim to write. Subject to the reserved-name fence like every other rule.
+        name: String,
+        /// The CEL source.
+        expression: String,
+        /// The largest collection the operator promises their own input holds.
+        ///
+        /// REQUIRED, and it is not a limit the operator picks for comfort: it is the `n` in the
+        /// cost model, so it is what the budget is computed against. A tenant declaring 10
+        /// groups gets a far larger set of expressions admitted than one declaring 10,000,
+        /// because a nested comprehension costs `n^(depth+1)`. Declaring more than you have
+        /// refuses expressions that would have run; declaring less than you have makes the
+        /// evaluation fail at issuance rather than silently exceed the budget, because
+        /// `BudgetedProgram::evaluate` enforces the shape it was budgeted against.
+        max_collection_size: u64,
+    },
 }
 
 impl MappingRule {
@@ -233,10 +265,40 @@ impl MappingRule {
             Self::Rename { to, .. } => to,
             Self::Static { name, .. }
             | Self::FilterList { name, .. }
-            | Self::Place { name, .. } => name,
+            | Self::Place { name, .. }
+            | Self::Cel { name, .. } => name,
         }
     }
 }
+
+/// The cost budget every `cel` mapping rule is compiled against.
+///
+/// [`ironauth_cel::DEFAULT_COST_BUDGET`] rather than a number of this module's own, because a
+/// second copy of a bound is a second thing to disagree with the first. The crate that
+/// implements the cost model owns the default; this names it so a reader of a refusal message
+/// can find where it comes from.
+///
+/// # Why this is a constant and `max_collection_size` is not
+///
+/// Environment-dependent tradeoffs belong in configuration, and the one here IS exposed: the
+/// per-rule `max_collection_size` is the operator's declaration about their own data, and it is
+/// what decides which expressions are admitted, because a nested comprehension costs
+/// `n^(depth+1)`. A tenant with ten groups and a tenant with ten thousand get very different
+/// answers from the same budget.
+///
+/// The budget itself is a product-wide ceiling on how much work one login may do computing a
+/// claim, which is not a property of anyone's environment. Making it a per-tenant setting would
+/// let a tenant raise the ceiling on the shared issuance path, which is the one direction a
+/// safety bound must not be tunable in.
+pub const CEL_COST_BUDGET: u64 = ironauth_cel::DEFAULT_COST_BUDGET;
+
+/// The binding a `cel` expression reads its input from.
+///
+/// ONE name, and that is the isolation. `ironauth-cel` evaluates against `cel::Env::stdlib()`,
+/// which has no ambient IO by specification, so what an expression can reach is exactly this
+/// list -- and it holds this client's claim set and nothing else. Cross-tenant access is
+/// therefore not a question about the sandbox but about this constant.
+pub const CEL_CLAIMS_BINDING: &str = "claims";
 
 /// Why a mapping was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,6 +338,24 @@ pub enum RefusalReason {
     /// written, by an operator who can see the list; a hook's is not bounded by anything until
     /// here.
     TooManyClaims,
+    /// A `cel` rule's expression does not compile.
+    ExpressionUncompilable,
+    /// A `cel` rule's expression costs more than [`CEL_COST_BUDGET`] at its declared shape.
+    ///
+    /// Its own reason rather than folded into [`Self::ExpressionUncompilable`], for the reason
+    /// [`Self::Untrimmed`] is separate from [`Self::Reserved`]: the operator's next action
+    /// differs. An uncompilable expression is a typo. An over-budget one is arithmetic -- the
+    /// fix is to flatten a nested comprehension or to declare the cardinality the data
+    /// actually has, and telling someone their working expression has a syntax error would
+    /// send them looking for one that is not there.
+    ExpressionOverBudget,
+    /// A `cel` rule's expression compiled and then failed to evaluate.
+    ///
+    /// The only one of the three that is a RUNTIME event: an input exceeding the declared
+    /// shape, a value with no CEL form, a result with no JSON form, or an evaluation error.
+    /// Distinct from the two above because those are decided when the mapping is WRITTEN and
+    /// this one cannot be -- it depends on the claim set of the login in front of you.
+    ExpressionFailed,
 }
 
 impl RefusalReason {
@@ -301,6 +381,16 @@ impl RefusalReason {
             Self::TooManyClaims => {
                 format!("returns more than the {MAX_HOOK_CLAIMS} claim limit")
             }
+            Self::ExpressionUncompilable => {
+                format!("computes `{claim}` from an expression that does not compile")
+            }
+            Self::ExpressionOverBudget => format!(
+                "computes `{claim}` from an expression costing more than the \
+                 {CEL_COST_BUDGET} budget at its declared cardinality"
+            ),
+            Self::ExpressionFailed => {
+                format!("computes `{claim}` from an expression that failed to evaluate")
+            }
         }
     }
 }
@@ -319,6 +409,9 @@ impl core::fmt::Display for RefusalReason {
             Self::Untrimmed => "a claim name with leading or trailing whitespace",
             Self::NameTooLong => "a claim name over the byte limit",
             Self::TooManyClaims => "more claims than the limit allows",
+            Self::ExpressionUncompilable => "an expression that does not compile",
+            Self::ExpressionOverBudget => "an expression over the cost budget",
+            Self::ExpressionFailed => "an expression that failed to evaluate",
         };
         f.write_str(text)
     }
@@ -387,6 +480,38 @@ pub fn parse(rules_json: &str) -> Result<Vec<MappingRule>, serde_json::Error> {
 pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
     for (index, rule) in rules.iter().enumerate() {
         let written = rule.written_claim();
+        // THE EXPRESSION IS COMPILED HERE, which is what makes the cost budget a WRITE-time
+        // refusal. This module's own rule, stated on `filter_hook_claims`: "a mapping is
+        // configuration: it is written once, by an operator, and a refusal at write time is a
+        // message that person reads and acts on." An expression over the budget is exactly
+        // that -- it is decidable from the rule alone, with no login in front of you -- so an
+        // operator learns their comprehension is too deep when they save it, not from a
+        // support ticket about failed logins.
+        //
+        // Deterministic by construction: `compile_within_budget` refuses BEFORE any
+        // evaluation, from the parsed tree and the declared shape, so the same rule reaches
+        // the same verdict on every machine under any load. That is criterion 2's "aborts
+        // deterministically".
+        if let MappingRule::Cel {
+            expression,
+            max_collection_size,
+            ..
+        } = rule
+            && let Err(error) = compile_rule(expression, *max_collection_size)
+        {
+            return Err(MappingRefusal {
+                rule_index: index,
+                claim: reportable(written),
+                reason: match error {
+                    ironauth_cel::CostError::OverBudget { .. } => {
+                        RefusalReason::ExpressionOverBudget
+                    }
+                    ironauth_cel::CostError::Uncompilable(_) => {
+                        RefusalReason::ExpressionUncompilable
+                    }
+                },
+            });
+        }
         if let Some(reason) = refuse_name(written) {
             return Err(MappingRefusal {
                 rule_index: index,
@@ -401,6 +526,30 @@ pub fn validate(rules: &[MappingRule]) -> Result<(), MappingRefusal> {
         }
     }
     Ok(())
+}
+
+/// Compile one `cel` rule's expression against its declared shape and the shared budget.
+///
+/// One function so [`validate`] and [`apply_for`] cannot disagree about the shape or the
+/// budget an expression was admitted under. They would: the shape travels WITH the compiled
+/// program precisely so evaluation enforces what compilation budgeted, and two call sites
+/// building their own `InputShape` is how those two numbers drift apart.
+fn compile_rule(
+    expression: &str,
+    max_collection_size: u64,
+) -> Result<ironauth_cel::BudgetedProgram, ironauth_cel::CostError> {
+    ironauth_cel::compile_within_budget(
+        expression,
+        ironauth_cel::InputShape {
+            max_collection_size,
+            // The crate's own backstop against a pathological string, which the cardinality
+            // model does not see: concatenation scales with SIZE while the estimate counts
+            // ELEMENTS. Not per-rule, because unlike cardinality it is not a claim about the
+            // tenant's data -- 64 KiB is above any claim value a token carries.
+            max_string_bytes: ironauth_cel::DEFAULT_MAX_STRING_BYTES,
+        },
+        CEL_COST_BUDGET,
+    )
 }
 
 /// How many tokens the caller is going to mint from this mapping's output.
@@ -541,6 +690,56 @@ pub fn apply_for(
             MappingRule::Place { name, placement } => {
                 placements.insert(name.clone(), *placement);
             }
+            MappingRule::Cel {
+                name,
+                expression,
+                max_collection_size,
+            } => {
+                // COMPILED AGAIN HERE, and `validate` above already compiled it. That is a cost
+                // and it is the honest arrangement, not an oversight: `BudgetedProgram` is not
+                // `Clone` -- `cel::Program` is not -- so `validate` cannot hand its result
+                // over, and a compile whose result is discarded is the only way for one
+                // function to answer "would this be admitted" without also being the function
+                // that runs it. Measured on this module's own expressions, compilation is
+                // microseconds against an issuance that touches Postgres.
+                //
+                // A caller that finds it matters caches `BudgetedProgram` behind an `Arc` keyed
+                // by (expression, cardinality), which is what the type was shaped for. Doing
+                // that here would mean a cache on a pure function, so it belongs where the
+                // mapping is loaded rather than where it is applied.
+                let program = compile_rule(expression, *max_collection_size).map_err(|_| {
+                    // Unreachable in practice: `validate` ran the same call at the top of this
+                    // function and returned on failure. Mapped rather than unwrapped, because
+                    // "unreachable" here is an argument about two call sites agreeing, and a
+                    // panic on the issuance path is a bad way to discover they stopped.
+                    MappingRefusal {
+                        rule_index: 0,
+                        claim: reportable(name),
+                        reason: RefusalReason::ExpressionUncompilable,
+                    }
+                })?;
+
+                // The claim set AS THE PREVIOUS RULES LEFT IT, which is what makes a `cel` rule
+                // composable with the four declarative ones rather than a parallel world.
+                let bound = serde_json::Value::Object(working.clone().into_iter().collect());
+                let produced = program
+                    .evaluate(&[(CEL_CLAIMS_BINDING, &bound)])
+                    .map_err(|_| MappingRefusal {
+                        rule_index: 0,
+                        claim: reportable(name),
+                        reason: RefusalReason::ExpressionFailed,
+                    })?;
+
+                // REFUSED, not skipped, and this is the one runtime failure a mapping can have.
+                //
+                // `apply_for` already refuses rather than half-applies -- its own doc says a
+                // refusal "leaves the caller with no claims rather than with the claims the
+                // rules before the bad one produced" -- and an expression that failed is the
+                // same situation arriving later. Skipping it would mint a token missing a
+                // claim an operator configured, silently, on some logins and not others,
+                // which is the shape of bug nobody finds.
+                working.insert(name.clone(), produced);
+            }
         }
     }
 
@@ -591,6 +790,197 @@ mod tests {
 
     fn only(rule: MappingRule) -> MappedClaims {
         apply_for(&[rule], &source(), Destination::TwoTokens).expect("applies")
+    }
+
+    /// A `cel` rule with a generous declared cardinality, for the tests that are not about the
+    /// bound.
+    fn cel(name: &str, expression: &str) -> MappingRule {
+        MappingRule::Cel {
+            name: name.to_owned(),
+            expression: expression.to_owned(),
+            max_collection_size: 64,
+        }
+    }
+
+    /// CRITERION 2, the working half: an expression computes a claim the four declarative rules
+    /// cannot.
+    ///
+    /// Filtering by PREFIX is the case that motivates the rule. `filter_list` takes a literal
+    /// allow list, so "the groups starting with `e`" is not expressible: an operator would have
+    /// to enumerate them, which is the enumeration the mapping exists to avoid.
+    #[test]
+    fn a_cel_rule_computes_a_claim_the_declarative_rules_cannot() {
+        let mapped = only(cel(
+            "eng_groups",
+            "claims.groups.filter(g, g.startsWith('e'))",
+        ));
+        assert_eq!(
+            mapped.id_token.get("eng_groups"),
+            Some(&serde_json::json!(["eng"])),
+            "the expression reads the bound claim set and writes its result: {:?}",
+            mapped.id_token
+        );
+    }
+
+    /// The binding is THE CLAIM SET AS EARLIER RULES LEFT IT, not the original input.
+    ///
+    /// Without this a `cel` rule would be a parallel world beside the declarative ones, and an
+    /// operator composing `rename` with an expression would read a claim that no longer exists
+    /// under that name. Two rules, and the second must see the first's output.
+    #[test]
+    fn a_cel_rule_reads_what_earlier_rules_wrote() {
+        let mapped = apply_for(
+            &[
+                MappingRule::Static {
+                    name: "tier".to_owned(),
+                    value: serde_json::json!("gold"),
+                },
+                cel("greeting", "'tier:' + claims.tier"),
+            ],
+            &source(),
+            Destination::TwoTokens,
+        )
+        .expect("applies");
+        assert_eq!(
+            mapped.id_token.get("greeting"),
+            Some(&serde_json::json!("tier:gold")),
+            "the expression must see the static rule that ran before it: {:?}",
+            mapped.id_token
+        );
+    }
+
+    /// CRITERION 2: an expression over the cost budget is refused, and refused AT WRITE TIME.
+    ///
+    /// `validate` is the write-time door -- it is what the admin surface calls -- so asserting
+    /// on `validate` rather than on `apply_for` is the point. An operator learns their
+    /// expression is too expensive when they save it.
+    ///
+    /// Three nested comprehensions over a declared 4096 elements. The cost model is
+    /// `n^(depth+1)`, so this is roughly 4096^4, far past the budget, and it is refused from
+    /// the PARSED TREE without ever evaluating -- which is what makes the refusal
+    /// deterministic rather than a timeout.
+    #[test]
+    fn an_expression_over_the_budget_is_refused_when_it_is_written() {
+        let rule = MappingRule::Cel {
+            name: "expensive".to_owned(),
+            expression: "claims.groups.exists(a, claims.groups.exists(b, \
+                         claims.groups.exists(c, a == b && b == c)))"
+                .to_owned(),
+            max_collection_size: 4096,
+        };
+        let refusal = validate(std::slice::from_ref(&rule)).expect_err("over budget");
+        assert_eq!(
+            refusal.reason,
+            RefusalReason::ExpressionOverBudget,
+            "the reason must name the BUDGET, not a syntax error: an operator told their \
+             working expression does not compile goes looking for a typo that is not there"
+        );
+        // And the same rule is refused by `apply_for`, because it validates first. Without
+        // this the write-time door could be the only one and a hand-edited row would run.
+        assert_eq!(
+            apply_for(&[rule], &source(), Destination::TwoTokens)
+                .expect_err("apply validates too")
+                .reason,
+            RefusalReason::ExpressionOverBudget
+        );
+    }
+
+    /// THE SAME EXPRESSION IS ADMITTED AT A SMALLER DECLARED CARDINALITY.
+    ///
+    /// Without this, the test above passes against a budget that refuses everything, and
+    /// against a `max_collection_size` the code ignores. It is what makes the declared shape
+    /// observably the `n` in the cost model rather than a field nothing reads.
+    #[test]
+    fn the_declared_cardinality_is_what_the_budget_is_computed_against() {
+        let expression = "claims.groups.exists(a, claims.groups.exists(b, \
+                          claims.groups.exists(c, a == b && b == c)))";
+        assert!(
+            validate(&[MappingRule::Cel {
+                name: "cheap".to_owned(),
+                expression: expression.to_owned(),
+                max_collection_size: 8,
+            }])
+            .is_ok(),
+            "eight elements deep three times is well inside the budget"
+        );
+    }
+
+    /// An expression that does not parse is its own refusal, distinct from the budget.
+    #[test]
+    fn an_uncompilable_expression_is_refused_as_uncompilable() {
+        let refusal =
+            validate(&[cel("broken", "claims.groups.filter(g, ")]).expect_err("does not compile");
+        assert_eq!(refusal.reason, RefusalReason::ExpressionUncompilable);
+    }
+
+    /// CRITERION 5: a `cel` rule cannot write a reserved claim, exactly like every other rule.
+    ///
+    /// The fence is keyed on `written_claim()`, so this is really asserting the new variant was
+    /// added to that function. It was the easy thing to miss: a rule whose name the fence does
+    /// not see is a rule that can forge `sub`, and every other test here would still pass.
+    #[test]
+    fn a_cel_rule_cannot_write_a_reserved_claim() {
+        let refusal = validate(&[cel("sub", "'attacker'")]).expect_err("reserved");
+        assert_eq!(refusal.reason, RefusalReason::Reserved);
+    }
+
+    /// CRITERION 3: an expression has no ambient IO, and the sandbox is the BINDING LIST.
+    ///
+    /// `cel::Env::stdlib()` has no network, filesystem or environment access by specification,
+    /// so there is no function to call. What an expression can reach is what it was bound, and
+    /// it is bound exactly one name. So the adversarial case that matters is not "can it call
+    /// fetch" -- there is no fetch -- but "can it name something it was not given", and an
+    /// undeclared identifier fails.
+    ///
+    /// Each of these must FAIL. A single assertion that one of them fails would pass if the
+    /// others silently returned null.
+    #[test]
+    fn an_expression_cannot_reach_anything_it_was_not_bound() {
+        for expression in [
+            // Another tenant's claims, if such a binding existed.
+            "other_tenant.groups",
+            // The host environment.
+            "env.PATH",
+            // A function that does not exist in the stdlib, spelled as an attacker would.
+            "fetch('http://169.254.169.254/')",
+            "readFile('/etc/passwd')",
+        ] {
+            let outcome = apply_for(
+                &[cel("stolen", expression)],
+                &source(),
+                Destination::TwoTokens,
+            );
+            assert!(
+                outcome.is_err(),
+                "`{expression}` must not produce a claim; it either fails to compile or fails \
+                 to evaluate, and both are refusals"
+            );
+        }
+    }
+
+    /// An input EXCEEDING the declared shape fails at evaluation rather than running.
+    ///
+    /// This is the enforcement half of the cost model and the one runtime failure a `cel` rule
+    /// has. Declaring 2 and handing it 3 must not quietly evaluate: the budget was computed
+    /// against 2, so evaluating against 3 spends more than was admitted.
+    #[test]
+    fn an_input_over_the_declared_shape_fails_rather_than_running() {
+        let refusal = apply_for(
+            &[MappingRule::Cel {
+                name: "counted".to_owned(),
+                expression: "claims.groups.size()".to_owned(),
+                max_collection_size: 2,
+            }],
+            // `source()` carries three groups.
+            &source(),
+            Destination::TwoTokens,
+        )
+        .expect_err("three elements against a declared two");
+        assert_eq!(
+            refusal.reason,
+            RefusalReason::ExpressionFailed,
+            "an oversized input is a RUNTIME refusal, distinct from the two write-time ones"
+        );
     }
 
     /// A `place` naming a claim a RENAME already moved away is inert, and on a one-token grant

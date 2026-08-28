@@ -110,6 +110,20 @@ fn refusal_reason(refusal: &MappingRefusal) -> &'static str {
         // alternative is a catch-all arm that would give a future reason the wrong token
         // silently -- which is the one thing the distinctness test exists to prevent.
         RefusalReason::TooManyClaims => "too_many_claims",
+        // The `cel` rule's three (issue #113 criterion 2). The first two ARE reachable from
+        // this surface and are the point of it: `validate` compiles every expression against
+        // the cost budget, so an operator who writes one too expensive to run learns it here,
+        // in a 400 they read, rather than from failed logins.
+        //
+        // Separate tokens for separate operator actions, which is what this function is for:
+        // an auditor grouping by reason can tell "someone is writing expressions we refuse to
+        // run" from "someone has a typo", and those want different responses.
+        RefusalReason::ExpressionUncompilable => "expression_uncompilable",
+        RefusalReason::ExpressionOverBudget => "expression_over_budget",
+        // UNREACHABLE from this surface, like `too_many_claims` above and for the same kind of
+        // reason: it is the one `cel` refusal that is a RUNTIME event. It needs a claim set,
+        // and `validate` has none -- it decides what a rule would do, not what it did.
+        RefusalReason::ExpressionFailed => "expression_failed",
     }
 }
 

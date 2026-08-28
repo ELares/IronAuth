@@ -2147,6 +2147,7 @@ dependencies = [
  "http",
  "http-body-util",
  "ironauth-admin",
+ "ironauth-cel",
  "ironauth-config",
  "ironauth-connector",
  "ironauth-env",

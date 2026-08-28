@@ -239,6 +239,80 @@ async fn a_static_rule_reaches_the_id_token_and_the_access_token_only_when_place
     assert_eq!(claims(&access).get("tier"), Some(&Value::from("gold")));
 }
 
+/// CRITERION 2, END TO END: a CEL expression shapes a REAL token, under the cost budget.
+///
+/// Every other test of the `cel` rule is against the pure mapping function or the admin write
+/// door. This is the one that says the criterion is met where it is claimed -- through a real
+/// authorization-code exchange, with the expression compiled and evaluated on the issuance
+/// path.
+///
+/// The expression is one the four declarative rules cannot express. `filter_list` takes a
+/// literal allow list, so "the groups starting with `e`" would mean enumerating them, which is
+/// the enumeration a mapping exists to avoid. That is what makes this a test of the ESCAPE
+/// HATCH rather than a slower spelling of `static`.
+#[tokio::test]
+async fn a_cel_rule_shapes_a_real_token() {
+    let harness = harness().await;
+    install(
+        &harness,
+        r#"[{"kind":"static","name":"groups","value":["eng","sre","hr"]},
+            {"kind":"cel","name":"eng_groups",
+             "expression":"claims.groups.filter(g, g.startsWith('e'))",
+             "max_collection_size":64}]"#,
+    )
+    .await;
+
+    let (access, id_token) = exchange(&harness).await.expect("exchange");
+    assert_eq!(
+        claims(&id_token).get("eng_groups"),
+        Some(&Value::from(vec!["eng"])),
+        "the expression ran on the issuance path and its result reached the token: {:?}",
+        claims(&id_token)
+    );
+    // The claim it READ is still there: a `cel` rule computes, it does not consume.
+    assert_eq!(
+        claims(&id_token).get("groups"),
+        Some(&Value::from(vec!["eng", "sre", "hr"])),
+        "the source claim survives: {:?}",
+        claims(&id_token)
+    );
+    // And it obeys placement like every other rule, rather than being a parallel world: no
+    // rule placed it, so it stays out of the access token.
+    assert!(
+        !claims(&access).contains_key("eng_groups"),
+        "an unplaced computed claim must not widen the access token: {:?}",
+        claims(&access)
+    );
+}
+
+/// A `cel` rule whose EVALUATION fails refuses the issuance rather than minting a short token.
+///
+/// The declared cardinality is the `n` the budget was computed against, and
+/// `BudgetedProgram::evaluate` enforces it -- so an input larger than the operator declared is
+/// the one runtime failure a mapping has. Declaring 2 and handing it 3 must not quietly
+/// evaluate, because the budget admitted this expression against 2.
+///
+/// Refused rather than skipped, for the reason `apply_for` already refuses rather than
+/// half-applies: skipping would mint a token missing a claim an operator configured, silently,
+/// on some logins and not others.
+#[tokio::test]
+async fn a_cel_rule_whose_input_exceeds_its_declared_shape_refuses_the_issuance() {
+    let harness = harness().await;
+    install(
+        &harness,
+        r#"[{"kind":"static","name":"groups","value":["eng","sre","hr"]},
+            {"kind":"cel","name":"counted","expression":"claims.groups.size()",
+             "max_collection_size":2}]"#,
+    )
+    .await;
+
+    let outcome = exchange(&harness).await;
+    assert!(
+        outcome.is_err(),
+        "three elements against a declared two must not mint a token: {outcome:?}"
+    );
+}
+
 /// The CONTROL for every test in this file.
 ///
 /// A client with no mapping must issue what it issued before this seam existed. Without this,

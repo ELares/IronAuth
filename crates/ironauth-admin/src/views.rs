@@ -1902,7 +1902,23 @@ pub struct SignupFormView {
 /// 400 naming what it could not read.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct SetClaimsMappingRequest {
-    /// The ordered rule list.
+    /// The ordered rule list. Five kinds, each an object tagged by `kind`:
+    ///
+    /// - `rename` -- `{from, to}`. Moves a claim; the source is removed unless it is protected.
+    /// - `static` -- `{name, value}`. Writes a constant, which may be any JSON.
+    /// - `filter_list` -- `{name, allow}`. Keeps only the listed members of a list of strings.
+    /// - `place` -- `{name, placement}`. Puts a claim in `id_token`, `access_token` or `both`.
+    /// - `cel` -- `{name, expression, max_collection_size}`. Computes a claim from a CEL
+    ///   expression, for the cases the four above cannot express. The expression reads one
+    ///   binding, `claims`, holding the claim set as earlier rules left it, and it is compiled
+    ///   against a COST BUDGET when this request is made: one too expensive at the declared
+    ///   `max_collection_size` is refused here with `expression_over_budget` rather than
+    ///   failing logins later. `max_collection_size` is the operator's declaration about their
+    ///   own data and is the `n` the budget is computed against, so declaring more than you
+    ///   have refuses expressions that would have run, and declaring less makes evaluation
+    ///   fail at issuance.
+    ///
+    /// Rules run in order, so a later one sees what an earlier one wrote.
     #[schema(value_type = Object)]
     pub rules: serde_json::Value,
 }
