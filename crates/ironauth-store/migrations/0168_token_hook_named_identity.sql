@@ -41,9 +41,15 @@
 ALTER TABLE token_hooks
     DROP CONSTRAINT token_hooks_pkey;
 
--- Promote 0167's unique constraint rather than declaring a fresh primary key over the same
--- columns: `ADD PRIMARY KEY` would build a SECOND index on the identical column list and leave
--- both to be maintained on every deploy. `USING INDEX` adopts the one that is already there.
+-- DROP THE UNIQUE AND ADD THE PRIMARY KEY IN ONE STATEMENT, so the table never carries two
+-- indexes over the identical column list. Adding the primary key while 0167's unique constraint
+-- still stood would leave both, and both would be maintained on every deploy of every hook.
+--
+-- Not `ADD PRIMARY KEY ... USING INDEX`, which is the other way to avoid that and does not
+-- apply here: that form adopts an existing index, and this index is OWNED by the unique
+-- constraint, so dropping the constraint takes the index with it. An earlier version of this
+-- comment claimed `USING INDEX` was what this statement does. It is not, and the difference
+-- matters to anyone reading it to learn the pattern.
 ALTER TABLE token_hooks
     DROP CONSTRAINT token_hooks_named_identity,
     ADD PRIMARY KEY (tenant_id, environment_id, client_id, name);

@@ -8685,3 +8685,49 @@ async fn a_client_can_hold_several_named_hooks_whose_order_is_total_and_permutab
         "and the swap is what the feed reads back, or the reorder wrote nothing"
     );
 }
+
+/// THE IDENTITY MOVE LEAVES ONE INDEX ON THE IDENTITY, NOT TWO.
+///
+/// 0167 adds `token_hooks_named_identity` as a UNIQUE constraint and 0168 drops it in the same
+/// statement that adds the primary key over the identical columns. Doing those in the other
+/// order, or in two statements, would leave the table carrying two indexes over one column list
+/// -- both maintained on every deploy of every hook, on a table whose rows are megabytes.
+///
+/// A count rather than a name check, because the defect is DUPLICATION and a name check cannot
+/// see it: two indexes with different names over the same columns both pass "the primary key
+/// exists".
+#[tokio::test]
+async fn the_hook_identity_carries_exactly_one_index_after_the_move() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    for (table, columns) in [
+        ("token_hooks", "{tenant_id,environment_id,client_id,name}"),
+        (
+            "token_hook_versions",
+            "{tenant_id,environment_id,client_id,name,version}",
+        ),
+    ] {
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT i.relname \
+             FROM pg_index x \
+             JOIN pg_class i ON i.oid = x.indexrelid \
+             JOIN pg_class t ON t.oid = x.indrelid \
+             WHERE t.relname = $1 \
+               AND (SELECT array_agg(a.attname ORDER BY k.ord) \
+                    FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ord) \
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum)::text[] \
+                   = $2::text[]",
+        )
+        .bind(table)
+        .bind(columns)
+        .fetch_all(pool)
+        .await
+        .expect("read the index catalogue");
+        assert_eq!(
+            indexes.len(),
+            1,
+            "{table} must carry exactly ONE index over its identity columns; found {indexes:?}"
+        );
+    }
+}
