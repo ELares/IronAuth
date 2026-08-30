@@ -63,9 +63,9 @@ use crate::error::{ApiError, ErrorBody};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{
-    DeployTokenHookQuery, NamedTokenHookQuery, ReorderTokenHooksRequest, RollbackTokenHookRequest,
-    TestTokenHookRequest, TestTokenHookResponse, TokenHookChainEntryView, TokenHookChainView,
-    TokenHookVersionView, TokenHookView,
+    DeployTokenHookQuery, HookSecretQuery, NamedTokenHookQuery, ReorderTokenHooksRequest,
+    RollbackTokenHookRequest, TestTokenHookRequest, TestTokenHookResponse, TokenHookChainEntryView,
+    TokenHookChainView, TokenHookSecretsView, TokenHookVersionView, TokenHookView,
 };
 
 /// The largest component this surface accepts, matching `token_hooks`' own CHECK.
@@ -628,6 +628,214 @@ pub async fn reorder_token_hooks(
                 })
             })
             .collect::<Result<Vec<_>, ApiError>>()?,
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// The secret name a grant or a revoke addresses.
+///
+/// REQUIRED, unlike the hook name, and the asymmetry is deliberate: `default` is a meaningful
+/// answer for "which hook" and there is no meaningful default secret. A request that omitted it
+/// would have to mean "all of them", which is not something an operator should be able to say
+/// by leaving a parameter out.
+fn secret_name(raw: Option<&str>) -> Result<&str, ApiError> {
+    let name = raw.ok_or_else(|| {
+        ApiError::BadRequest("invalid_secret_name: secret is required".to_owned())
+    })?;
+    if name.is_empty() || name.trim() != name {
+        return Err(ApiError::BadRequest(
+            "invalid_secret_name: secret must not be empty or padded with whitespace".to_owned(),
+        ));
+    }
+    // 128, matching the CHECK on `token_hook_secrets.secret_name`, in the column's unit --
+    // Postgres `length()` counts CHARACTERS. Refusing here is what turns a constraint violation
+    // into a message an operator reads.
+    if name.chars().count() > MAX_SECRET_NAME_CHARS {
+        return Err(ApiError::BadRequest(format!(
+            "invalid_secret_name: secret must be at most {MAX_SECRET_NAME_CHARS} characters"
+        )));
+    }
+    Ok(name)
+}
+
+/// The most CHARACTERS an environment secret name may carry, matching its column's CHECK.
+const MAX_SECRET_NAME_CHARS: usize = 128;
+
+/// List the environment secrets a hook may read.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets",
+    operation_id = "listTokenHookSecrets",
+    tag = "token-hooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks; absent means `default`")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The secret NAMES this hook may read, never their values", body = TokenHookSecretsView),
+        (status = 400, description = "An invalid hook name", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found or malformed client id", body = ErrorBody)
+    )
+)]
+pub async fn list_token_hook_secrets(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<HookSecretQuery>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`. It reports NAMES and
+    // never values -- the values live sealed behind a different repository and the platform
+    // key -- so this discloses which secrets an operator wired to a hook and nothing they hold.
+    principal.require_permission(ManagementPermission::Read)?;
+    let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
+
+    let secrets = state
+        .store()
+        .scoped(scope)
+        .token_hooks()
+        .granted_secrets(&client.to_string(), hook)
+        .await?;
+    let view = TokenHookSecretsView {
+        client_id: client.to_string(),
+        hook: hook.to_owned(),
+        secrets,
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// Grant a hook permission to read an environment secret.
+#[utoipa::path(
+    put,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets",
+    operation_id = "grantTokenHookSecret",
+    tag = "token-hooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks; absent means `default`"),
+        ("secret" = String, Query, description = "The environment secret's name. REQUIRED: there is no meaningful default, and an omitted one would have to mean `all of them`")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The secret NAMES this hook may now read", body = TokenHookSecretsView),
+        (status = 400, description = "An invalid or absent secret name, or an invalid hook name", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found, malformed client id, or that hook is not deployed", body = ErrorBody)
+    )
+)]
+pub async fn grant_token_hook_secret(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<HookSecretQuery>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`, with the
+    // DEPLOY. Granting a secret to a hook widens what the operator's own code inside the token
+    // mint may read, which is a configuration change with the same reach as deploying the code.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    // FRESH PRIVILEGE, for the same reason a deploy demands it and with more force: this hands
+    // a key to code, and the code is already running on every token this client is issued.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    let client = parse_client_id(&client_id, scope)?;
+    crate::org_context::require_live_environment(&state, &scope).await?;
+    let hook = hook_name(query.name.as_deref())?;
+    let secret = secret_name(query.secret.as_deref())?;
+
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .token_hooks()
+        .grant_secret(state.env(), &client, hook, secret)
+        .await?;
+    read_back_secrets(&state, scope, &client, hook).await
+}
+
+/// Withdraw a hook's permission to read an environment secret.
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets",
+    operation_id = "revokeTokenHookSecret",
+    tag = "token-hooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks; absent means `default`"),
+        ("secret" = String, Query, description = "The environment secret's name")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The secret NAMES this hook may still read. Revoking a grant that does not exist succeeds: the caller's intent holds either way", body = TokenHookSecretsView),
+        (status = 400, description = "An invalid or absent secret name, or an invalid hook name", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found or malformed client id", body = ErrorBody)
+    )
+)]
+pub async fn revoke_token_hook_secret(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<HookSecretQuery>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    //
+    // Like the grant, and NOT a lesser permission because it is the safe direction. A caller who can narrow what a hook reads can break a working hook, which is
+    // a configuration change; and a permission that let someone revoke but not grant would be
+    // a denial-of-service primitive handed out as a read.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    let client = parse_client_id(&client_id, scope)?;
+    crate::org_context::require_live_environment(&state, &scope).await?;
+    let hook = hook_name(query.name.as_deref())?;
+    let secret = secret_name(query.secret.as_deref())?;
+
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .token_hooks()
+        .revoke_secret(state.env(), &client, hook, secret)
+        .await?;
+    read_back_secrets(&state, scope, &client, hook).await
+}
+
+/// The hook's grants as they now stand, as a response body.
+///
+/// READ BACK, not echoed. The request says what the caller asked for; this says what the hook
+/// may read, which is what they need to see to know the change took -- and on a revoke of a
+/// grant that never existed, the two differ in exactly the way the caller should be able to
+/// notice.
+async fn read_back_secrets(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    client: &ironauth_store::ClientId,
+    hook: &str,
+) -> Result<Response, ApiError> {
+    let secrets = state
+        .store()
+        .scoped(scope)
+        .token_hooks()
+        .granted_secrets(&client.to_string(), hook)
+        .await?;
+    let view = TokenHookSecretsView {
+        client_id: client.to_string(),
+        hook: hook.to_owned(),
+        secrets,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))

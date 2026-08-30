@@ -844,6 +844,16 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/order",
             post(token_hooks::reorder_token_hooks),
         )
+        // Per-hook secrets (issue #114 criterion 5): which environment secrets a hook may read.
+        // NAMES on the read, never values -- the values live sealed behind a different
+        // repository and the platform key, which is what keeps this route from being one
+        // keystroke from disclosing them.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets",
+            get(token_hooks::list_token_hook_secrets)
+                .put(token_hooks::grant_token_hook_secret)
+                .delete(token_hooks::revoke_token_hook_secret),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback",
             post(token_hooks::rollback_token_hook),

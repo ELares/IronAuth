@@ -44,10 +44,10 @@ use crate::views::{
     SignupFormFieldView, SignupFormView, SignupQuarantineCaseView, SignupQuarantineDecisionView,
     SignupQuarantineList, SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated,
     TenantList, TenantStatusView, TenantView, TestTokenHookRequest, TestTokenHookResponse,
-    TokenHookChainEntryView, TokenHookChainView, TokenHookVersionView, TokenHookView,
-    TraitAnnotationsView, TraitSchemaVersionView, UpdateUserRequest, UserConsentList,
-    UserConsentView, UserExternalIdView, UserList, UserRevocationView, UserStateChangeView,
-    UserStateView, UserTraitsView, UserView, VerificationAddressView,
+    TokenHookChainEntryView, TokenHookChainView, TokenHookSecretsView, TokenHookVersionView,
+    TokenHookView, TraitAnnotationsView, TraitSchemaVersionView, UpdateUserRequest,
+    UserConsentList, UserConsentView, UserExternalIdView, UserList, UserRevocationView,
+    UserStateChangeView, UserStateView, UserTraitsView, UserView, VerificationAddressView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -350,6 +350,9 @@ use crate::views::{
         crate::token_hooks::test_token_hook,
         crate::token_hooks::list_token_hook_chain,
         crate::token_hooks::reorder_token_hooks,
+        crate::token_hooks::list_token_hook_secrets,
+        crate::token_hooks::grant_token_hook_secret,
+        crate::token_hooks::revoke_token_hook_secret,
         crate::signup_forms::set_signup_form,
         crate::signup_forms::get_signup_form,
         crate::signup_forms::delete_signup_form,
@@ -569,6 +572,7 @@ use crate::views::{
         TokenHookVersionView,
         TokenHookChainView,
         TokenHookChainEntryView,
+        TokenHookSecretsView,
         ReorderTokenHooksRequest,
         RollbackTokenHookRequest,
         TestTokenHookRequest,

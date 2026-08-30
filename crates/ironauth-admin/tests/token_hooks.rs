@@ -16,6 +16,7 @@ mod common;
 
 use axum::http::StatusCode;
 use common::Harness;
+use ironauth_env::Env;
 use ironauth_store::{EnvironmentId, Scope, TenantId};
 use sqlx::Row as _;
 
@@ -1528,5 +1529,208 @@ async fn versions_rollback_and_draft_runs_all_address_the_named_hook() {
     assert_eq!(
         view["outcome"], "aborted",
         "and it reports what that component does, which for a bare preamble is an abort: {body}"
+    );
+}
+
+/// A HOOK'S SECRET GRANTS ARE SET, READ AND WITHDRAWN THROUGH THE ADMIN SURFACE.
+///
+/// Issue #114 criterion 5's per-hook secrets, through the routes an operator uses. The issuance
+/// suite proves a granted secret reaches a hook; this proves an operator can arrange that
+/// without touching the database.
+///
+/// # The read returns NAMES, and that is a security property rather than a shape
+///
+/// A grant records a REFERENCE. The value lives sealed in the environment secret store behind a
+/// different repository and the platform key, so this route could not return one if it tried --
+/// which is what stops "what may this hook read" ever being one keystroke from disclosing it.
+/// The assertion checks the value is absent from the whole body, not just from the field, so a
+/// future handler that added it anywhere fails here.
+///
+/// # Grants are per hook, and the read shows it
+///
+/// Two hooks, one grant each, and each read returns only its own. A store that keyed grants on
+/// the client would return both to both -- which is the arrangement that would let a hook read
+/// a key deployed for its neighbour.
+#[tokio::test]
+async fn hook_secret_grants_are_set_read_and_withdrawn_through_the_admin_surface() {
+    const VALUE: &str = "sk_live_do_not_disclose";
+
+    let harness = Harness::start(64).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    for name in ["signer", "auditor"] {
+        let (status, _, body) = harness
+            .put_bytes(&format!("{base}?payload_version=1&name={name}"), COMPONENT)
+            .await;
+        assert_eq!(status, StatusCode::OK, "deploy {name}: {body}");
+    }
+
+    // NOTHING GRANTED to start, which is the deny-by-default this whole capability rests on.
+    let (status, _, body) = harness.get(&format!("{base}/secrets?name=signer")).await;
+    assert_eq!(status, StatusCode::OK, "read the grants: {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["secrets"].as_array().expect("a list").len(),
+        0,
+        "a freshly deployed hook may read nothing: {body}"
+    );
+
+    // A REAL VALUE, so the assertion below is about a secret that EXISTS rather than one
+    // nothing could have disclosed. Written through the store rather than the API because this
+    // harness has no data-plane connection, and `setSecret` refuses without one -- the
+    // management role is deliberately not permitted to write an ordinary secret.
+    {
+        let store_env = Env::system();
+        harness
+            .store()
+            .scoped(scope)
+            .acting(
+                harness.test_actor(&store_env),
+                ironauth_store::CorrelationId::generate(&store_env),
+            )
+            .environment_secrets()
+            .put_under_platform_key(&store_env, "stripe", VALUE.as_bytes(), None)
+            .await
+            .expect("provision the secret");
+    }
+
+    let (status, _, body) = harness
+        .put(&format!("{base}/secrets?name=signer&secret=stripe"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "grant: {body}");
+    // AND THE VALUE IS NOWHERE IN THE BODY. Not merely absent from the `secrets` field: a
+    // handler that returned it under some other key, or an error path that echoed it, would
+    // pass a field-shaped assertion. This is the check that the route reports references.
+    assert!(
+        !body.contains(VALUE),
+        "the response must not carry the secret's VALUE anywhere: {body}"
+    );
+    let (status, _, body) = harness
+        .put(&format!("{base}/secrets?name=auditor&secret=siem"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "grant the other: {body}");
+
+    // EACH HOOK READS ONLY ITS OWN. A store keyed on the client would return both to both.
+    for (hook, expected) in [("signer", "stripe"), ("auditor", "siem")] {
+        let (_, _, body) = harness.get(&format!("{base}/secrets?name={hook}")).await;
+        assert!(
+            !body.contains(VALUE),
+            "nor may the LISTING carry it: {body}"
+        );
+        let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+        let names: Vec<&str> = view["secrets"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|v| v.as_str().expect("a name"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![expected],
+            "{hook} may read its OWN grant and not its neighbour's: {body}"
+        );
+    }
+
+    // A GRANT TO A HOOK THAT IS NOT DEPLOYED is a 404 an operator can act on, not a constraint
+    // violation surfacing as a 500.
+    let (status, _, body) = harness
+        .put(&format!("{base}/secrets?name=absent&secret=stripe"), "")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "granting to a hook that does not exist names the missing thing: {body}"
+    );
+
+    // AND THE REVOKE, which reads back what is left rather than echoing the request.
+    let (status, _, body) = harness
+        .delete(&format!("{base}/secrets?name=signer&secret=stripe"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "revoke: {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["secrets"].as_array().expect("a list").len(),
+        0,
+        "the response says what the hook may read NOW, not what was asked for: {body}"
+    );
+
+    // REVOKING WHAT WAS NEVER GRANTED SUCCEEDS. The caller's intent -- this hook must not read
+    // that secret -- holds either way, and refusing would make the safe direction the one an
+    // operator has to retry.
+    let (status, _, body) = harness
+        .delete(&format!("{base}/secrets?name=signer&secret=stripe"))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a repeat revoke is not an error: {body}"
+    );
+
+    // AND A SECRET NAME IS REQUIRED. An omitted one would have to mean `all of them`, which is
+    // not something an operator should be able to say by leaving a parameter out.
+    let (status, _, body) = harness.delete(&format!("{base}/secrets?name=signer")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a revoke with no secret named is refused rather than read as `everything`: {body}"
+    );
+}
+
+/// DELETING A HOOK TAKES ITS SECRET GRANTS WITH IT.
+///
+/// The claim migration 0169 makes, and the reason it makes it: without the cascade, deleting a
+/// hook would leave its grants behind, and deploying a NEW hook under the same name would
+/// silently inherit the permissions of the one it replaced. An operator removing a hook because
+/// it misused a key, then deploying a replacement under the same name, would hand the
+/// replacement that same key without ever granting it.
+///
+/// # Why this is asserted through the redeploy rather than the row count
+///
+/// A test that deleted the hook and counted rows in `token_hook_secrets` would prove the
+/// cascade fired. What matters is the consequence: the arrangement an operator would actually
+/// perform, and what the REPLACEMENT may read. So the hook is deleted, redeployed under the
+/// same name, and its grants read back through the route an operator would use.
+#[tokio::test]
+async fn deleting_a_hook_takes_its_secret_grants_so_a_replacement_inherits_nothing() {
+    let harness = Harness::start(65).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1&name=signer"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy: {body}");
+    let (status, _, body) = harness
+        .put(&format!("{base}/secrets?name=signer&secret=stripe"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "grant: {body}");
+
+    let (status, _, body) = harness.delete(&format!("{base}?name=signer")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "delete the hook: {body}");
+
+    // THE REPLACEMENT, under the SAME NAME, which is the arrangement that would inherit.
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1&name=signer"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK, "redeploy: {body}");
+
+    let (status, _, body) = harness.get(&format!("{base}/secrets?name=signer")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "read the replacement's grants: {body}"
+    );
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["secrets"].as_array().expect("a list").len(),
+        0,
+        "a hook deployed under a name that was used before must inherit NOTHING -- otherwise \
+         removing a hook that misused a key and deploying a replacement hands the replacement \
+         that same key, without anyone granting it: {body}"
     );
 }

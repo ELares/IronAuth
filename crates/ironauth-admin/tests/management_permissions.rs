@@ -208,6 +208,16 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // it produced. So it can change every claim in a token while every component stays
     // byte-identical, which is a bigger act than its name suggests.
     ("reorderTokenHooks", ManagementPermission::WriteConfig),
+    // READ, with the other reads: it reports secret NAMES and never values, so it discloses
+    // which secrets an operator wired to a hook and nothing they hold.
+    ("listTokenHookSecrets", ManagementPermission::Read),
+    // WRITE_CONFIG, both of them. A grant widens what the operator's own code inside the token
+    // mint may read, which is a configuration change with the same reach as deploying that
+    // code. The REVOKE is the same permission and not a lesser one even though it is the safe
+    // direction: a permission that let someone revoke but not grant would be a
+    // denial-of-service primitive handed out as a read.
+    ("grantTokenHookSecret", ManagementPermission::WriteConfig),
+    ("revokeTokenHookSecret", ManagementPermission::WriteConfig),
     // User sub-surfaces: identifiers, trait schemas, signup quarantine and recovery
     // approvals. Identifier UNIQUENESS and trait schemas are config rather than user
     // authority, because each changes a rule the whole environment obeys.
@@ -663,6 +673,14 @@ const PERMISSION_PROVEN: &[&str] = &[
     // a write, or the reorder as a read, passes one of these and fails the other.
     "listTokenHookChain",
     "reorderTokenHooks",
+    // Proven in `delegated_admin.rs::read_is_required_and_sufficient_for_listing_hook_secrets`
+    // and `..::write_config_is_required_and_sufficient_for_a_hook_secret_grant`, both in BOTH
+    // directions. The grant and the revoke share one test because they share one permission and
+    // one path; what the test separates is the READ from the two WRITES, which is the
+    // classification a mistake here would get wrong.
+    "listTokenHookSecrets",
+    "grantTokenHookSecret",
+    "revokeTokenHookSecret",
     // Proven in `read_is_required_and_sufficient_for_the_event_feed_and_usage_export`, in
     // BOTH directions: a `write_config` credential is refused and a `read` one is allowed,
     // so neither a blanket refusal nor a missing gate would pass it.
@@ -811,12 +829,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        194,
+        197,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        50,
+        53,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

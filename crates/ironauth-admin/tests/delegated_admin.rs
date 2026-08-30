@@ -3852,3 +3852,98 @@ async fn write_config_is_required_and_sufficient_for_a_token_hook_reorder() {
          {response}"
     );
 }
+
+/// `management.read` is required AND sufficient for LISTING a hook's secret grants (#114).
+///
+/// Classified with the reads because it reports NAMES and never values: the values live sealed
+/// in the environment secret store behind a different repository and the platform key, so this
+/// route discloses which secrets an operator wired to a hook and nothing they hold.
+#[tokio::test]
+async fn read_is_required_and_sufficient_for_listing_hook_secrets() {
+    let h = Harness::start(229).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-hook-secrets").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/token-hook/secrets"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential must not read which secrets a hook may reach: {response}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a read credential must reach the handler, which then refuses the malformed client id. \
+         403 versus 404 is what distinguishes the permission gate from the handler: {response}"
+    );
+}
+
+/// `management.write_config` is required AND sufficient for GRANTING and REVOKING a hook secret
+/// (#114).
+///
+/// Both verbs, one test, because they share one permission and one path. What matters is the
+/// separation from the READ beside them: a grant widens what the operator's own code inside the
+/// token mint may read, which is a configuration change with the same reach as deploying that
+/// code. The revoke is the same permission and not a lesser one even though it is the safe
+/// direction -- a permission that let someone revoke but not grant would be a
+/// denial-of-service primitive handed out as a read.
+#[tokio::test]
+async fn write_config_is_required_and_sufficient_for_a_hook_secret_grant() {
+    let h = Harness::start(230).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-hook-grant").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/token-hook/secrets?secret=stripe"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.put_as(&path, &secret, "").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not hand a key to code running on every token: {response}"
+    );
+    let (status, _, response) = h.delete_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "nor take one away, which would be a denial-of-service primitive handed out as a read: \
+         {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.put_as(&path, &secret, "").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_config credential reaches the handler, which reports the absent client: \
+         {response}"
+    );
+    let (status, _, response) = h.delete_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "and so does the revoke: {response}"
+    );
+}

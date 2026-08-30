@@ -211,6 +211,7 @@ fn operation_ids_are_the_stable_set() {
             "getUserRiskPosture",
             "getUserTraits",
             "getVariable",
+            "grantTokenHookSecret",
             "liftBan",
             "linkUserExternalId",
             "listBans",
@@ -255,6 +256,7 @@ fn operation_ids_are_the_stable_set() {
             "listSubjectMappings",
             "listTenants",
             "listTokenHookChain",
+            "listTokenHookSecrets",
             "listTokenHookVersions",
             "listTraitSchemaVersions",
             "listUserConsents",
@@ -293,6 +295,7 @@ fn operation_ids_are_the_stable_set() {
             "revokeOrganizationApiKey",
             "revokeServiceAccountApiKey",
             "revokeSession",
+            "revokeTokenHookSecret",
             "revokeUserConsent",
             "revokeUserPersonalAccessToken",
             "revokeUserSessions",
@@ -516,6 +519,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo",
@@ -564,6 +568,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/chain",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
@@ -747,6 +752,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/favicon",
@@ -856,7 +862,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        255,
+        258,
         "the documented route count is pinned"
     );
 

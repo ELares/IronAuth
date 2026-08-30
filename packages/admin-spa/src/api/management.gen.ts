@@ -412,6 +412,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the environment secrets a hook may read. */
+        get: operations["listTokenHookSecrets"];
+        /** Grant a hook permission to read an environment secret. */
+        put: operations["grantTokenHookSecret"];
+        post?: never;
+        /** Withdraw a hook's permission to read an environment secret. */
+        delete: operations["revokeTokenHookSecret"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test": {
         parameters: {
             query?: never;
@@ -8068,6 +8087,27 @@ export interface components {
              */
             hooks: components["schemas"]["TokenHookChainEntryView"][];
         };
+        /** @description The environment secrets one hook may read. */
+        TokenHookSecretsView: {
+            /** @description The client whose hook this is. */
+            client_id: string;
+            /** @description The hook. */
+            hook: string;
+            /**
+             * @description The secret NAMES this hook may read, sorted. Never the values.
+             *
+             *     NAMES AND NOT VALUES, and the store could not return values here if this route asked:
+             *     a grant records a reference, and the value lives sealed in the environment secret store
+             *     behind a different repository and the platform key. That separation is what stops a
+             *     "what may this hook read" route ever being one keystroke from disclosing it.
+             *
+             *     A NAME HERE MAY NOT RESOLVE. The grant table deliberately has no foreign key to the
+             *     secret, so an operator may grant before provisioning or promote a configuration into an
+             *     environment where the secret is created separately. The hook reads such a name as
+             *     absent, exactly as it reads one it was never granted.
+             */
+            secrets: string[];
+        };
         /**
          * @description One historical deploy of a client's hook (issue #114 criterion 5).
          *
@@ -10740,6 +10780,208 @@ export interface operations {
                 };
             };
             /** @description Environment not found, malformed client id, or no such version. A version that existed can become no-such-version: the history is capped, so a number read from an older listing may since have been pruned */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listTokenHookSecrets: {
+        parameters: {
+            query?: {
+                /** @description Which of the client's hooks; absent means `default` */
+                name?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The secret NAMES this hook may read, never their values */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookSecretsView"];
+                };
+            };
+            /** @description An invalid hook name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or malformed client id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    grantTokenHookSecret: {
+        parameters: {
+            query: {
+                /** @description Which of the client's hooks; absent means `default` */
+                name?: string;
+                /** @description The environment secret's name. REQUIRED: there is no meaningful default, and an omitted one would have to mean `all of them` */
+                secret: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The secret NAMES this hook may now read */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookSecretsView"];
+                };
+            };
+            /** @description An invalid or absent secret name, or an invalid hook name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed client id, or that hook is not deployed */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    revokeTokenHookSecret: {
+        parameters: {
+            query: {
+                /** @description Which of the client's hooks; absent means `default` */
+                name?: string;
+                /** @description The environment secret's name */
+                secret: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The secret NAMES this hook may still read. Revoking a grant that does not exist succeeds: the caller's intent holds either way */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookSecretsView"];
+                };
+            };
+            /** @description An invalid or absent secret name, or an invalid hook name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or malformed client id */
             404: {
                 headers: {
                     [name: string]: unknown;
