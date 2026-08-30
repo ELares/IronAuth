@@ -23,8 +23,20 @@ five rows were reasoning about what WebCrypto-only code ought to do.
 | Cloudflare Workers | yes | **measured**: same corpus, executed inside `workerd` (the real Workers runtime, not a Node shim) |
 | Vercel Edge | yes | **by proxy**: covered by the `workerd` lane. Vercel Edge and Workers are both V8 isolates with the same WebCrypto surface, and no Vercel-hosted lane runs in CI. Treat this as a strong inference rather than a measurement |
 | Lambda@Edge | yes | **by inference**: Lambda@Edge IS a full Node runtime, so the `node` lane covers it. The inference is sound because the runtime is the same, not merely similar |
-| Fastly Compute | not yet | No snippet ships. Compute runs Rust/WASM, so the WebCrypto file does not apply and a separate Rust artifact is needed. Tracked by issue #118 criterion 1 |
+| Fastly Compute | yes | **measured, with a stated limit**: `snippets/fastly-compute-verify` is a Rust snippet that runs the SAME conformance corpus under `cargo test`, and `cargo check --target wasm32-wasip2` proves it builds for the Compute target. It is NOT executed on Fastly in CI -- no Fastly lane exists -- so this is a conformance-and-builds claim, not a deployment one |
 | **CloudFront Functions** | **no** | see below |
+
+### Why Fastly needs its own file
+
+Compute runs WebAssembly, so the WebCrypto snippet does not apply. Less obviously, IronAuth's
+own verifier cannot be reused either: `ironauth-jose` is backed by `ring`, which does not build
+for `wasm32`. That is why `snippets/fastly-compute-verify` exists as a fourth implementation of
+one contract rather than a wrapper around the server's, and why it is judged against the shared
+corpus rather than trusted for resembling it.
+
+Take `src/lib.rs` and its three cryptography dependencies. It has no Fastly-specific imports:
+the JWKS arrives as bytes and the clock as a number, so the same file runs under `cargo test`,
+inside Compute, and anywhere else that builds for `wasm32`.
 
 ### CloudFront Functions is not supported
 

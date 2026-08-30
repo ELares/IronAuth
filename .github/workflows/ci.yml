@@ -832,6 +832,33 @@ jobs:
       # discriminator: it failing means the environment is still wrong, and it passing while
       # the cargo test fails means the credential code is.
 
+
+  edge-verify:
+    # Issue #118 criterion 1: the FASTLY COMPUTE snippet against the shared conformance corpus,
+    # and a build for the target it exists for.
+    #
+    # Two separate claims and both are made here. `cargo test` runs the same
+    # `verify-vectors.json` the TypeScript core and the Python reference client are judged
+    # against, asserting the REASON per case and not merely the refusal. `cargo check
+    # --target wasm32-wasip2` proves the snippet builds for WebAssembly -- which the server's own
+    # `ring`-backed verifier does not, and which is the whole reason this file exists rather than
+    # a wrapper around `ironauth-jose`.
+    #
+    # NOT a deployment claim: nothing here runs on Fastly, and `docs/edge-verification.md` says
+    # so in the row it backs.
+    name: edge verify snippet (conformance + wasm target)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the shared conformance corpus
+        run: cargo test -p ironauth-fastly-verify
+      - name: Build for the Compute target
+        run: cargo check -p ironauth-fastly-verify --target wasm32-wasip2
   invariants:
     name: invariant lints, dash scan, compat matrix
     runs-on: ubuntu-latest
