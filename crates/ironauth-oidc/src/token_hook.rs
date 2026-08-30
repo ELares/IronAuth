@@ -379,15 +379,23 @@ pub struct Invocation<'a> {
     pub access_token_claims: &'a serde_json::Map<String, serde_json::Value>,
 }
 
-/// The secrets one hook has been granted, with their values, resolved before it runs.
+/// Resolve the VALUES of the secrets a hook was granted, just before it runs.
 ///
-/// Issue #114 criterion 5's per-hook secrets. Two steps, and they are deliberately two: the
-/// GRANTS say which names this hook may read, and the VALUES come from the environment secret
-/// store where the secret machinery already keeps them sealed. Nothing here is a second place a
-/// secret lives.
+/// Issue #114 criterion 5's per-hook secrets. Two steps, deliberately two: the GRANTS say which
+/// names this hook may read and arrive on the record from the chain read, and the VALUES come
+/// from the environment secret store where the secret machinery already keeps them sealed.
+/// Nothing here is a second place a secret lives.
 ///
-/// BEFORE THE GUEST STARTS, and that is a safety property rather than a convenience. Every bound
-/// a hook runs under -- fuel, the memory cap, the epoch deadline -- is measured against a guest
+/// THE GRANTS COST NO QUERY. They ride the chain read that the dispatch already performs, in
+/// the same statement. A first version asked for them separately and so added a database round
+/// trip to every issuance that runs a hook -- including the overwhelming majority granted
+/// nothing, who paid it to learn there was nothing to pay for.
+///
+/// AND A HOOK GRANTED NOTHING TOUCHES THE SECRET STORE NOT AT ALL: the loop below has no
+/// iterations, so the common case is one `is_empty` and no read.
+///
+/// BEFORE THE GUEST STARTS, which is a safety property rather than a convenience. Every bound a
+/// hook runs under -- fuel, the memory cap, the epoch deadline -- is measured against a guest
 /// that is RUNNING, so a host function that resolved a secret on demand would sit outside all
 /// three, and a hook could hold a request thread open through it while executing no
 /// instructions. The `secrets.get` import answers from this map and performs no I/O.
@@ -397,58 +405,38 @@ pub struct Invocation<'a> {
 /// promote a configuration into an environment where it is provisioned separately. The hook
 /// then reads `none` for that name -- exactly what it reads for a name it was never granted,
 /// and what its code has to handle either way.
-///
-/// A FAILURE TO READ THE GRANTS IS ALSO NOT A FAULT. It means the hook runs with fewer secrets
-/// than the operator granted, which its own code sees as `none`; failing the issuance instead
-/// would turn a transient store error into a refused login for every user of that client. The
-/// store is unhealthy in that case and the log says so.
 #[cfg(feature = "wasm-hooks")]
 async fn resolve_secrets(
     store: &Store,
     scope: Scope,
     client_id: &str,
-    hook_name: &str,
+    record: &ironauth_store::token_hook_store::TokenHookRecord,
 ) -> BTreeMap<String, String> {
-    let scoped = store.scoped(scope);
-    let granted = match scoped
-        .token_hooks()
-        .granted_secrets(client_id, hook_name)
-        .await
-    {
-        Ok(names) => names,
-        Err(error) => {
-            tracing::error!(
-                target: "ironauth.hooks",
-                tenant = %scope.tenant(),
-                client_id,
-                hook = %hook_name,
-                ?error,
-                "a hook's secret grants could not be read; it runs as though granted nothing"
-            );
-            return BTreeMap::new();
-        }
-    };
     let mut resolved = BTreeMap::new();
-    for name in granted {
+    if record.granted_secrets.is_empty() {
+        return resolved;
+    }
+    let scoped = store.scoped(scope);
+    for name in &record.granted_secrets {
         // THE VALUE IS BYTES and a hook's import hands back a string, so a secret that is not
         // valid UTF-8 is skipped rather than lossily converted: a signing key mangled by
         // replacement characters is worse than an absent one, because the hook would use it.
         match scoped
             .environment_secrets()
-            .open_value_under_platform_key_at_uniform_cost(&name)
+            .open_value_under_platform_key_at_uniform_cost(name)
             .await
             .ok()
             .and_then(|bytes| String::from_utf8(bytes).ok())
         {
             Some(value) => {
-                resolved.insert(name, value);
+                resolved.insert(name.clone(), value);
             }
             None => {
                 tracing::warn!(
                     target: "ironauth.hooks",
                     tenant = %scope.tenant(),
                     client_id,
-                    hook = %hook_name,
+                    hook = %record.name,
                     secret = %name,
                     "a granted secret could not be resolved; the hook reads it as absent"
                 );
@@ -649,7 +637,7 @@ pub async fn run(
         // effect on the next login with no re-deploy and no cache to invalidate. Per HOOK
         // because a chain's members are separate code with separate permissions: hook A holding
         // a signing key must not make it readable by hook B running after it.
-        let secrets = resolve_secrets(store, scope, client_id, &record.name).await;
+        let secrets = resolve_secrets(store, scope, client_id, record).await;
         match run_deployed_hook(engine, cache, &step, record, secrets).await {
             Ok(Some(produced)) => {
                 id_map = Some(

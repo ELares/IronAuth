@@ -1618,3 +1618,52 @@ async fn a_granted_secret_reaches_a_hook_at_issuance_and_a_revoke_stops_it() {
          {revoked:?}"
     );
 }
+
+/// ONE HOOK'S SECRET IS NOT ANOTHER HOOK'S, even in the same chain.
+///
+/// The grant is per HOOK, not per client, and the reason is the chain: its members are separate
+/// code deployed for separate purposes, so a hook holding a signing key must not make that key
+/// readable by whatever runs after it. A grant scoped to the client would do exactly that.
+///
+/// # Why the sibling test cannot see this
+///
+/// `a_granted_secret_reaches_a_hook_at_issuance_and_a_revoke_stops_it` deploys ONE hook, so
+/// scoping the grant to the hook and scoping it to the client produce the same answer -- the
+/// client's only grant is that hook's. Measured: replacing the join's `s.hook_name = h.name`
+/// with a predicate that matches every grant leaves that test green. Two hooks is the smallest
+/// arrangement in which the two scopings differ.
+///
+/// The two hooks are the SAME COMPONENT, deliberately. Deploying different guests would leave
+/// "the second hook reads nothing" explainable by the second hook being different code; the
+/// same bytes under two names isolate the grant as the only thing that differs.
+#[tokio::test]
+async fn a_grant_to_one_hook_is_not_readable_by_another_in_the_same_chain() {
+    let harness = harness_with_hooks().await;
+    let client = *harness.client_id();
+
+    harness.put_secret("granted", "sk_live_value").await;
+    // THE SAME COMPONENT UNDER TWO NAMES. `SECRET_READER` echoes the claims it is handed and
+    // appends its own, so the second hook overwrites the first's answer with its own -- which
+    // is what makes the token report the LAST hook's view of the secret.
+    harness
+        .deploy_token_hook_at(&client, "first", 0, ironauth_hooks::fixtures::SECRET_READER)
+        .await;
+    harness
+        .deploy_token_hook_at(
+            &client,
+            "second",
+            1,
+            ironauth_hooks::fixtures::SECRET_READER,
+        )
+        .await;
+    harness.grant_hook_secret(&client, "first", "granted").await;
+
+    let (access, _) = exchange(&harness).await.expect("exchange");
+    let claims = claims(&access);
+    // THE LAST HOOK'S ANSWER is what the token carries, and the last hook was granted nothing.
+    assert!(
+        claims.get("secret_granted").is_none_or(Value::is_null),
+        "the second hook was granted nothing, so it must read nothing -- a grant scoped to the \
+         CLIENT rather than the hook would hand it the first hook's key: {claims:?}"
+    );
+}

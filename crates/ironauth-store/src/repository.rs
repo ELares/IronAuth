@@ -32558,38 +32558,6 @@ pub struct TokenHookRepo<'a> {
 }
 
 impl TokenHookRepo<'_> {
-    /// The environment secrets one hook has been GRANTED, by name.
-    ///
-    /// Issue #114 criterion 5's per-hook secrets. NAMES ONLY -- the values live sealed in
-    /// `environment_secrets`, and resolving them is the caller's step. Keeping the two apart is
-    /// what stops this becoming a second place a secret lives, a second thing to rotate, and a
-    /// second thing a backup of the wrong table would leak.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`] on a persistence failure.
-    pub async fn granted_secrets(
-        &self,
-        client_id: &str,
-        hook_name: &str,
-    ) -> Result<Vec<String>, StoreError> {
-        let mut tx = begin_scoped(self.store, self.scope).await?;
-        let names: Vec<String> = sqlx::query_scalar(
-            "SELECT secret_name FROM token_hook_secrets \
-             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
-               AND hook_name = $4 \
-             ORDER BY secret_name",
-        )
-        .bind(self.scope.tenant().to_string())
-        .bind(self.scope.environment().to_string())
-        .bind(client_id)
-        .bind(hook_name)
-        .fetch_all(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(names)
-    }
-
     /// This client's whole hook CHAIN, in the order it runs. Empty when it has none.
     ///
     /// Issue #114 criterion 5's "explicit ordering of multiple hooks on one event". The
@@ -32614,10 +32582,19 @@ impl TokenHookRepo<'_> {
     pub async fn chain(&self, client_id: &str) -> Result<Vec<TokenHookRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT client_id, name, ordinal, component, payload_version, failure_policy \
-             FROM token_hooks \
-             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
-             ORDER BY ordinal \
+            "SELECT h.client_id, h.name, h.ordinal, h.component, h.payload_version, \
+                    h.failure_policy, \
+                    COALESCE(( \
+                        SELECT array_agg(s.secret_name ORDER BY s.secret_name) \
+                        FROM token_hook_secrets s \
+                        WHERE s.tenant_id = h.tenant_id \
+                          AND s.environment_id = h.environment_id \
+                          AND s.client_id = h.client_id \
+                          AND s.hook_name = h.name \
+                    ), ARRAY[]::text[]) AS granted_secrets \
+             FROM token_hooks h \
+             WHERE h.tenant_id = $1 AND h.environment_id = $2 AND h.client_id = $3 \
+             ORDER BY h.ordinal \
              LIMIT $4",
         )
         .bind(self.scope.tenant().to_string())
@@ -32636,6 +32613,7 @@ impl TokenHookRepo<'_> {
                     component: row.get("component"),
                     payload_version: row.get("payload_version"),
                     failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                    granted_secrets: row.get("granted_secrets"),
                 })
             })
             .collect()
@@ -32671,6 +32649,11 @@ impl TokenHookRepo<'_> {
                 component: row.get("component"),
                 payload_version: row.get("payload_version"),
                 failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                // NOT PROJECTED BY THIS READ. Grants reach the dispatch through `chain`, in the
+                // same statement, so a caller that resolved them from a record built here would
+                // be reading an empty list rather than the truth. Empty is the honest value for
+                // a read that did not ask.
+                granted_secrets: Vec::new(),
             })
         })
         .transpose()
@@ -32723,6 +32706,11 @@ impl TokenHookRepo<'_> {
                 component: row.get("component"),
                 payload_version: row.get("payload_version"),
                 failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                // NOT PROJECTED BY THIS READ. Grants reach the dispatch through `chain`, in the
+                // same statement, so a caller that resolved them from a record built here would
+                // be reading an empty list rather than the truth. Empty is the honest value for
+                // a read that did not ask.
+                granted_secrets: Vec::new(),
             })
         })
         .transpose()
@@ -32783,6 +32771,8 @@ impl TokenHookRepo<'_> {
                     component: row.get("component"),
                     payload_version: row.get("payload_version"),
                     failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                    // See `get` above: grants reach the dispatch through `chain`.
+                    granted_secrets: Vec::new(),
                 },
                 row.get::<Option<i32>, _>("version"),
             ))
