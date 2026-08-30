@@ -1021,6 +1021,7 @@ impl Harness {
                     failure_policy: ironauth_store::HookFailurePolicy::FailClosed,
                     placement: ironauth_store::HookPlacement { name, ordinal },
                     fetch_budget: 0,
+                    aot: None,
                 },
                 None,
             )
@@ -1070,6 +1071,10 @@ impl Harness {
                     failure_policy: ironauth_store::HookFailurePolicy::FailClosed,
                     placement: ironauth_store::HookPlacement { name, ordinal },
                     fetch_budget,
+                    // NO ARTIFACT: this harness has no engine to precompile with, so the
+                    // dispatch compiles, which is the pre-criterion-4 path and the one every
+                    // test that does not name an artifact should be measuring.
+                    aot: None,
                 },
                 None,
             )
@@ -1167,6 +1172,7 @@ impl Harness {
                     failure_policy,
                     placement: ironauth_store::HookPlacement::default_hook(),
                     fetch_budget: 0,
+                    aot: None,
                 },
                 None,
             )

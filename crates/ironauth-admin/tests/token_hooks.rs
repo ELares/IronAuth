@@ -1983,3 +1983,64 @@ async fn a_rollback_after_a_delete_recreates_an_ungranted_hook() {
          already runs first and the whole rollback answers 500: {body}"
     );
 }
+
+/// A DEPLOY THROUGH THE ADMIN SURFACE STORES A PRECOMPILED ARTIFACT (issue #114 criterion 4).
+///
+/// The half that is easy to leave out and impossible to notice: the load path can be perfect and
+/// every row still carry no artifact, in which case every login compiles and the criterion is not
+/// met by a single deployment. Nearly shipped exactly that -- the SQL edit that adds these two
+/// columns to the token-hook upsert aborted, the deploy compiled fine, and only an unused-variable
+/// warning said the artifact was being dropped on the floor.
+///
+/// Read from the ROW rather than the response, because the response is built from the handler's
+/// own locals and would say the same thing either way.
+#[tokio::test]
+async fn a_deploy_stores_a_precompiled_artifact_for_the_login_path() {
+    let harness = Harness::start(70).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+
+    // A REAL component: the preamble fixture the other tests use is eight bytes and cannot be
+    // compiled, so it would prove the column is writable and nothing about precompilation.
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{}?payload_version=1", hook_path(&tenant, &env, &client)),
+            ironauth_hooks::fixtures::GOOD,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy the real component: {body}");
+
+    let row = sqlx::query(
+        "SELECT aot_artifact, aot_engine_key FROM token_hooks \
+         WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+    )
+    .bind(&tenant)
+    .bind(&env)
+    .bind(client.clone())
+    .fetch_one(harness.db().owner_pool())
+    .await
+    .expect("the deployed row");
+
+    let artifact: Option<Vec<u8>> = row.get("aot_artifact");
+    let key: Option<String> = row.get("aot_engine_key");
+    let artifact = artifact.expect(
+        "the deploy must store a precompiled artifact: without one every login compiles and \
+         criterion 4 is unmet by every deployment, while every other test still passes",
+    );
+    assert!(
+        artifact.len() > ironauth_hooks::fixtures::GOOD.len(),
+        "a precompiled artifact is LARGER than its source -- the shipped guests run 3x to 5x -- \
+         so a smaller one means the component bytes were stored in the artifact column: {} vs {}",
+        artifact.len(),
+        ironauth_hooks::fixtures::GOOD.len()
+    );
+    assert_eq!(
+        key.expect("and its key"),
+        ironauth_hooks::HookEngine::new()
+            .expect("engine")
+            .compatibility_key(),
+        "the stored key must be THIS build's, or the login path will refuse to load what the \
+         admin path just wrote"
+    );
+}

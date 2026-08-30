@@ -148,6 +148,77 @@ fn parse_client_id(raw: &str, scope: Scope) -> Result<ClientId, ApiError> {
     ClientId::parse_in_scope(raw, &scope).map_err(|_| ApiError::NotFound)
 }
 
+/// Precompile a component at DEPLOY time, or [`None`] when this build cannot (issue #114
+/// criterion 4).
+///
+/// # Why a failure here is not a failed deploy
+///
+/// Three things make an artifact unavailable, and none of them is a reason to refuse the code:
+/// the deployment has no hook runtime installed (a build can exclude it entirely), the crate was
+/// built without `wasm-hooks`, or the compile itself failed. In every case the row is stored with
+/// no artifact and the dispatch COMPILES on first use -- which is exactly what it did before
+/// artifacts existed.
+///
+/// Refusing the deploy instead would make whether an operator can ship a hook depend on whether
+/// the ADMIN process happens to carry a compiler, which is a coupling between two planes that
+/// have no other reason to agree.
+///
+/// # A compile failure here is worth a log line, not silence
+///
+/// If the bytes cannot be precompiled they will not link at the login either, so an operator is
+/// about to have a hook that fails closed. The deploy still succeeds -- the structural checks
+/// already passed and this is not the authority on whether a component is loadable -- but the
+/// reason is recorded where somebody debugging that failure will find it.
+#[cfg(feature = "wasm-hooks")]
+pub(crate) async fn precompile(
+    state: &AdminState,
+    component: &[u8],
+) -> Option<ironauth_store::AotArtifact> {
+    let engine = std::sync::Arc::clone(state.hook_runtime()?.engine());
+    let bytes = component.to_vec();
+    let compiled = tokio::task::spawn_blocking(move || {
+        engine
+            .compile(&bytes)
+            .map(|artifact| (artifact, engine.compatibility_key()))
+    })
+    .await;
+    match compiled {
+        Ok(Ok((artifact, engine_key))) => Some(ironauth_store::AotArtifact {
+            artifact,
+            engine_key,
+        }),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                target: "ironauth.hooks",
+                error = %error,
+                "a deployed component could not be precompiled; it will be compiled at first \
+                 use, and if it cannot link there the hook will fail closed",
+            );
+            None
+        }
+        Err(join) => {
+            // A PANIC IN THE BLOCKING POOL is not a compile failure and must not be reported as
+            // one. The deploy still stores the component, so the hook works and compiles.
+            tracing::error!(
+                target: "ironauth.hooks",
+                error = %join,
+                "the precompile task did not complete; deploying without an artifact",
+            );
+            None
+        }
+    }
+}
+
+/// Without the hook runtime there is nothing to precompile with, so every deploy stores no
+/// artifact and every dispatch compiles. That is the pre-criterion-4 behaviour, unchanged.
+#[cfg(not(feature = "wasm-hooks"))]
+pub(crate) async fn precompile(
+    _state: &AdminState,
+    _component: &[u8],
+) -> Option<ironauth_store::AotArtifact> {
+    None
+}
+
 /// Refuse a component this build could not run, naming which check failed.
 pub(crate) fn validate_component(component: &[u8]) -> Result<(), ApiError> {
     if component.is_empty() {
@@ -348,6 +419,11 @@ pub async fn deploy_token_hook(
     };
     validate_component(&body)?;
 
+    // PRECOMPILED OFF THE REACTOR (issue #114 criterion 4). Cranelift on a tokio worker
+    // stalls every other request on that thread; a deploy is rarer than an issuance,
+    // which makes the stall rarer and not smaller.
+    let aot = precompile(&state, &body).await;
+
     state
         .store()
         .scoped(scope)
@@ -357,6 +433,7 @@ pub async fn deploy_token_hook(
             state.env(),
             &client,
             ironauth_store::HookDeployment {
+                aot: aot.as_ref(),
                 component: &body,
                 payload_version: i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,
                 failure_policy,

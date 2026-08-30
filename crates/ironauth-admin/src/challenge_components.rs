@@ -245,6 +245,10 @@ pub async fn deploy_challenge_component(
     // component are both "a .wasm file", and neither the name nor the size tells them apart.
     crate::token_hooks::validate_component(&body)?;
 
+    // PRECOMPILED OFF THE REACTOR (issue #114 criterion 4): cranelift on a tokio worker
+    // stalls every other request scheduled on that thread.
+    let aot = crate::token_hooks::precompile(&state, &body).await;
+
     state
         .store()
         .scoped(scope)
@@ -253,6 +257,11 @@ pub async fn deploy_challenge_component(
         .deploy(
             state.env(),
             ChallengeDeployment {
+                // PRECOMPILED HERE, at deploy, so a login deserializes machine code rather than
+                // generating it. `None` when this build has no runtime to compile with, which
+                // stores no artifact and leaves the dispatch compiling -- the behaviour before
+                // criterion 4.
+                aot: aot.as_ref(),
                 name,
                 component: &body,
                 payload_version: i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,

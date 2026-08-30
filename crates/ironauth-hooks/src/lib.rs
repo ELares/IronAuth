@@ -126,6 +126,14 @@ pub mod fixtures {
     /// accident.
     pub const WORDMARK_CHALLENGE: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_WORDMARK_CHALLENGE"));
 
+    /// A custom factor that never returns, in every one of its three exports.
+    ///
+    /// Exported as a fixture, not only as a bounds test: it is the ONE component whose behaviour
+    /// differs observably from a working factor without differing in its world, which makes it
+    /// the way to prove that a stored PRECOMPILED ARTIFACT is what ran rather than the component
+    /// beside it (issue #114 criterion 4).
+    pub const RUNAWAY_CHALLENGE: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_RUNAWAY_CHALLENGE"));
+
     /// A hook that reads a GRANTED secret and one it was never granted.
     ///
     /// The fixture for the `secrets` import. It reports both values as claims, and the second

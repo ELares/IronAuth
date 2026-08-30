@@ -1366,6 +1366,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0171_challenge_components.sql"),
         },
+        Migration {
+            version: 172,
+            name: "aot_artifacts",
+            // EXPAND: two NULLABLE columns per table that the old binary never reads or writes.
+            // A row with no artifact compiles, which is what every row did before, so a rollback
+            // to the previous binary leaves them inert rather than degraded.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0172_aot_artifacts.sql"),
+        },
     ]
 }
 

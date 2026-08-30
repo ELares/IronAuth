@@ -32,6 +32,15 @@
 use wasmtime::component::{Component, InstancePre, Linker};
 use wasmtime::{Config, Engine, Store};
 
+/// The wasmtime version this build links, as its own constant.
+///
+/// `env!("CARGO_PKG_VERSION")` would be THIS crate's version, which is not what an artifact's
+/// compatibility depends on. Cargo does not expose a dependency's version to a dependent, so
+/// this is declared here and pinned by a test that reads `Cargo.toml` -- a literal that drifts
+/// from the dependency it names would make every artifact key wrong in the direction that
+/// LOADS one it should not.
+const WASMTIME_VERSION: &str = "48";
+
 use crate::sandbox::HasSandbox;
 use crate::{HookError, Limits, Sandbox};
 
@@ -158,6 +167,82 @@ impl HookEngine {
         self.engine
             .precompile_component(wasm)
             .map_err(HookError::from_load)
+    }
+
+    /// The key that says which precompiled artifacts THIS build can load (issue #114
+    /// criterion 4).
+    ///
+    /// # Why an artifact needs a key at all
+    ///
+    /// A precompiled artifact is MACHINE CODE. `Component::deserialize` checks a header and will
+    /// refuse an obviously foreign one, but the existing safety note on
+    /// [`Self::load_precompiled`] is the honest statement of what that check is worth: "an `Ok`
+    /// here is not evidence the artifact was trustworthy". So the decision to execute an artifact
+    /// is made BEFORE deserialization, by comparing this key, and a mismatch never reaches the
+    /// unsafe call.
+    ///
+    /// # What it is made of, and why both halves
+    ///
+    /// `Engine::precompile_compatibility_hash` is wasmtime's own answer, and its contract is
+    /// exactly the one needed: "if this Hash matches between two Engines then binaries from one
+    /// are guaranteed to deserialize in the other". It covers the `Config` this engine was built
+    /// with, so a change to fuel metering, epoch interruption or the component model moves it.
+    ///
+    /// The wasmtime CRATE VERSION is mixed in as well, and that is not redundant belt-and-braces
+    /// for its own sake: the compatibility hash is computed from whatever that version of
+    /// wasmtime decided to include, and two versions could in principle agree on a digest while
+    /// disagreeing on what the digest covers. Naming the version makes an upgrade always a new
+    /// key, which is the conservative direction -- a needless recompile, never a wrong load.
+    ///
+    /// # It is a SHA-256, not the `Hash` value
+    ///
+    /// `precompile_compatibility_hash` returns `impl Hash`, so its numeric value depends on the
+    /// hasher. `DefaultHasher`'s output is explicitly not stable across Rust releases, and a key
+    /// that changed when the toolchain moved would silently invalidate every stored artifact. So
+    /// the bytes are fed to SHA-256, which is stable by specification.
+    #[must_use]
+    pub fn compatibility_key(&self) -> String {
+        use sha2::Digest as _;
+        use std::hash::Hash as _;
+
+        /// A `Hasher` that feeds everything written to it into SHA-256.
+        ///
+        /// `finish` returns a `u64` because the trait demands one, and this type NEVER uses it:
+        /// the caller reads the digest instead. Truncating to 64 bits would throw away the
+        /// collision resistance that makes this safe to gate an unsafe load on.
+        struct Sha256Hasher(sha2::Sha256);
+
+        impl std::hash::Hasher for Sha256Hasher {
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.update(bytes);
+            }
+
+            fn finish(&self) -> u64 {
+                0
+            }
+        }
+
+        let mut hasher = Sha256Hasher(sha2::Sha256::new());
+        // The version FIRST, so it cannot be confused with compatibility-hash bytes that happen
+        // to spell a version.
+        hasher.0.update(WASMTIME_VERSION.as_bytes());
+        hasher.0.update([0xff]);
+        self.engine
+            .precompile_compatibility_hash()
+            .hash(&mut hasher);
+        // HEX BY HAND rather than `{:x}` on the digest: the digest type is a `GenericArray`,
+        // which does not implement `LowerHex`. Written out so the encoding is visible -- this
+        // string is compared against one stored in a database, and an encoding change would
+        // invalidate every artifact at once.
+        let digest = hasher.0.finalize();
+        let mut key = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write as _;
+            // `write!` into a String cannot fail; the result is consumed so a silent failure
+            // cannot leave a short key that would still compare equal to another short key.
+            let _ = write!(key, "{byte:02x}");
+        }
+        key
     }
 
     /// Load a hook straight from WebAssembly, compiling it now.

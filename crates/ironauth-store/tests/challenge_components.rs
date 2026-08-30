@@ -31,6 +31,7 @@ fn deployment(name: &str) -> ChallengeDeployment<'_> {
         component: COMPONENT,
         payload_version: 1,
         fetch_budget: 0,
+        aot: None,
     }
 }
 
@@ -107,6 +108,7 @@ async fn a_redeploy_replaces_the_code_and_applies_the_budget() {
                 component: &longer,
                 payload_version: 1,
                 fetch_budget: 3,
+                aot: None,
             },
         )
         .await
@@ -370,6 +372,7 @@ async fn the_bounds_are_refused_at_the_write() {
                 component: &[],
                 payload_version: 1,
                 fetch_budget: 0,
+                aot: None,
             },
         ),
         (
@@ -379,6 +382,7 @@ async fn the_bounds_are_refused_at_the_write() {
                 component: COMPONENT,
                 payload_version: 1,
                 fetch_budget: 0,
+                aot: None,
             },
         ),
         (
@@ -388,6 +392,7 @@ async fn the_bounds_are_refused_at_the_write() {
                 component: COMPONENT,
                 payload_version: 2,
                 fetch_budget: 0,
+                aot: None,
             },
         ),
         (
@@ -397,6 +402,7 @@ async fn the_bounds_are_refused_at_the_write() {
                 component: COMPONENT,
                 payload_version: 1,
                 fetch_budget: 17,
+                aot: None,
             },
         ),
     ];
@@ -408,5 +414,176 @@ async fn the_bounds_are_refused_at_the_write() {
             .await
             .expect_err(why);
         assert!(matches!(error, StoreError::Database(_)), "{why}: {error:?}");
+    }
+}
+
+/// AN ARTIFACT IS STORED WITH THE COMPONENT AND READ BACK WITH IT (issue #114 criterion 4).
+///
+/// The pairing is the point: the record carries both or neither, and the key is what a caller
+/// compares before deciding to execute machine code. A store that returned the artifact without
+/// the key would hand a caller something it cannot make that decision about.
+#[tokio::test]
+async fn an_artifact_and_its_key_travel_together() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let aot = ironauth_store::AotArtifact {
+        artifact: vec![0xde, 0xad, 0xbe, 0xef],
+        engine_key: "a".repeat(64),
+    };
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .challenge_components()
+        .deploy(
+            &env,
+            ChallengeDeployment {
+                aot: Some(&aot),
+                ..deployment("wordmark")
+            },
+        )
+        .await
+        .expect("deploy with an artifact");
+
+    let record = db
+        .store()
+        .scoped(scope)
+        .challenge_components()
+        .get("wordmark")
+        .await
+        .expect("read")
+        .expect("the component");
+    let stored = record.aot.expect("the artifact reaches the login path");
+    assert_eq!(stored.artifact, aot.artifact);
+    assert_eq!(
+        stored.engine_key, aot.engine_key,
+        "the KEY comes back with it, or a caller cannot decide whether to execute the bytes"
+    );
+}
+
+/// A REDEPLOY WITHOUT AN ARTIFACT CLEARS THE ONE THAT WAS THERE.
+///
+/// The dangerous direction. An artifact left behind by a previous deploy is machine code for a
+/// component that is no longer in the row -- and because the KEY would still match this build, it
+/// would load, and the code that ran would be the old one. A stale artifact is worse than none.
+#[tokio::test]
+async fn a_redeploy_without_an_artifact_clears_the_stale_one() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let acting = || {
+        control
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+    let aot = ironauth_store::AotArtifact {
+        artifact: vec![0xde, 0xad, 0xbe, 0xef],
+        engine_key: "b".repeat(64),
+    };
+
+    acting()
+        .challenge_components()
+        .deploy(
+            &env,
+            ChallengeDeployment {
+                aot: Some(&aot),
+                ..deployment("wordmark")
+            },
+        )
+        .await
+        .expect("deploy with an artifact");
+
+    // A second deploy of DIFFERENT bytes, by a caller with no engine.
+    let mut longer = COMPONENT.to_vec();
+    longer.push(0x00);
+    acting()
+        .challenge_components()
+        .deploy(
+            &env,
+            ChallengeDeployment {
+                name: "wordmark",
+                component: &longer,
+                payload_version: 1,
+                fetch_budget: 0,
+                aot: None,
+            },
+        )
+        .await
+        .expect("redeploy without one");
+
+    let record = db
+        .store()
+        .scoped(scope)
+        .challenge_components()
+        .get("wordmark")
+        .await
+        .expect("read")
+        .expect("the component");
+    assert_eq!(record.component, longer, "the new code is stored");
+    assert!(
+        record.aot.is_none(),
+        "and the stale artifact is GONE: its key would still match this build, so leaving it \
+         would mean the next login loaded machine code for the component that was just replaced"
+    );
+}
+
+/// THE COLUMN REFUSES A HALF-POPULATED ROW AND A MALFORMED KEY.
+///
+/// The `both or neither` CHECK is what lets the read return a type that cannot express one half.
+/// The key's SHAPE is checked because it gates an unsafe load through a string comparison: a
+/// column admitting an empty or truncated digest would make "the keys matched" weaker than it
+/// reads.
+#[tokio::test]
+async fn the_artifact_columns_refuse_a_half_row_and_a_malformed_key() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .challenge_components()
+        .deploy(&env, deployment("wordmark"))
+        .await
+        .expect("deploy");
+
+    // Written through the OWNER pool, because the point is the CHECK rather than the repository:
+    // the repository's type makes these unrepresentable, and the constraint is what holds for
+    // any other writer.
+    let pool = db.owner_pool();
+    for (artifact, key, why) in [
+        (
+            Some(vec![0x00_u8]),
+            None,
+            "an artifact with no key cannot be checked",
+        ),
+        (
+            None,
+            Some("c".repeat(64)),
+            "a key with no artifact describes nothing",
+        ),
+        (
+            Some(vec![0x00_u8]),
+            Some("short".to_owned()),
+            "a truncated digest is not a key",
+        ),
+        (
+            Some(vec![0x00_u8]),
+            Some("Z".repeat(64)),
+            "a non-hex key is not one this build could have written",
+        ),
+    ] {
+        let result = sqlx::query(
+            "UPDATE challenge_components SET aot_artifact = $1, aot_engine_key = $2 \
+             WHERE tenant_id = $3 AND environment_id = $4 AND name = 'wordmark'",
+        )
+        .bind(artifact)
+        .bind(key)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(pool)
+        .await;
+        assert!(result.is_err(), "{why}");
     }
 }

@@ -23,6 +23,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+sha2.workspace = true
 # The WASM runtime (issue #114). Apache-2.0 WITH LLVM-exception, which the licence policy
 # already allows. Its MSRV is 1.95, ABOVE the workspace promise of 1.85, which is why this
 # crate carries its own `rust-version` above and why the msrv lane scopes itself to what the
