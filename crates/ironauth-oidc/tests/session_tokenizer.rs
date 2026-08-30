@@ -546,3 +546,132 @@ fn the_documentation_quotes_the_bounds_the_code_enforces() {
         "the worked example must use the recommended low end"
     );
 }
+
+/// Seed a session with an explicit absolute expiry, so a test can present a cookie for one that
+/// is already over.
+///
+/// The harness helper hardcodes a far-future expiry, which is right for every test that wants a
+/// session to simply exist. These two want the opposite.
+async fn session_expiring_at(
+    harness: &Harness,
+    subject: &str,
+    absolute_expires_micros: i64,
+) -> (ironauth_store::SessionId, String) {
+    let session_id = ironauth_store::SessionId::generate(harness.env(), &harness.scope());
+    let (actor, corr) = harness.seeding_actor();
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(actor, corr)
+        .sessions()
+        .rotate(
+            harness.env(),
+            &session_id,
+            None,
+            ironauth_store::NewSession {
+                impersonation: None,
+                subject,
+                auth_methods: "pwd",
+                auth_time_micros: 0,
+                idle_expires_micros: absolute_expires_micros,
+                absolute_expires_micros,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("create session");
+    let cookie = format!("{}={session_id}", ironauth_oidc::SESSION_COOKIE);
+    (session_id, cookie)
+}
+
+#[tokio::test]
+async fn a_stolen_expired_session_cookie_mints_nothing() {
+    // The issue's own adversarial list, by name: "tokenize with a stolen EXPIRED session cookie".
+    //
+    // (The emphasis is in the comment and not in the function name: an upper-case word in an
+    // identifier is a `non_snake_case` warning, and CI runs clippy with `-D warnings`.)
+    //
+    // The cookie is WELL FORMED and names a session that really existed -- which is what makes
+    // this different from `an_unauthenticated_request_mints_nothing`. An implementation that
+    // parsed the cookie and looked the row up without re-reading the expiry would pass that test
+    // and fail this one.
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template("orders", AUDIENCE, 60, "[]")
+        .await;
+    let subject = harness.seed_unique_user().await;
+    // A short lifetime, and the clock is advanced PAST it below.
+    let (_id, cookie) = session_expiring_at(&harness, &subject, 30_000_000).await;
+
+    // IT MINTS BEFORE THE CLOCK MOVES. Without this half a 401 afterwards would be satisfied by
+    // a cookie that never worked at all -- a seeding mistake, a wrong cookie name, a template
+    // that is not installed -- and the test would report the expiry guard as covered while
+    // measuring nothing about it.
+    let (before, before_body) = tokenize(&harness, "orders", Some(&cookie)).await;
+    assert_eq!(before, StatusCode::OK, "{before_body}");
+
+    harness.clock().advance(std::time::Duration::from_secs(60));
+
+    let (status, body) = tokenize(&harness, "orders", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "unauthenticated");
+    assert!(body["token"].is_null(), "no token may be minted: {body}");
+}
+
+#[tokio::test]
+async fn a_rotated_away_session_cookie_mints_nothing() {
+    // The session-fixation defence rotates a session to a new id and marks the old one
+    // superseded. The OLD cookie is exactly what an attacker who fixed a session holds, and the
+    // store's guard refuses it on `superseded_by` rather than on expiry -- a different column
+    // from the one the test above exercises, so neither covers the other.
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template("orders", AUDIENCE, 60, "[]")
+        .await;
+    let subject = harness.seed_unique_user().await;
+    let (old_id, old_cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+
+    // It mints BEFORE the rotation, so the refusal after is attributable to the rotation rather
+    // than to a cookie that never worked.
+    let (before, body) = tokenize(&harness, "orders", Some(&old_cookie)).await;
+    assert_eq!(before, StatusCode::OK, "{body}");
+
+    let successor = ironauth_store::SessionId::generate(harness.env(), &harness.scope());
+    let (actor, corr) = harness.seeding_actor();
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(actor, corr)
+        .sessions()
+        .rotate(
+            harness.env(),
+            &successor,
+            Some(&old_id),
+            ironauth_store::NewSession {
+                impersonation: None,
+                subject: &subject,
+                auth_methods: "pwd",
+                auth_time_micros: 0,
+                idle_expires_micros: 4_102_444_800_000_000,
+                absolute_expires_micros: 4_102_444_800_000_000,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("rotate the session");
+
+    let (after, after_body) = tokenize(&harness, "orders", Some(&old_cookie)).await;
+    assert_eq!(after, StatusCode::UNAUTHORIZED, "{after_body}");
+
+    // And the SUCCESSOR still mints, so the refusal above is the rotation and not the tokenizer
+    // having broken for this subject entirely.
+    let new_cookie = format!("{}={successor}", ironauth_oidc::SESSION_COOKIE);
+    let (successor_status, successor_body) = tokenize(&harness, "orders", Some(&new_cookie)).await;
+    assert_eq!(
+        successor_status,
+        StatusCode::OK,
+        "the rotated-to session must still mint: {successor_body}"
+    );
+}
