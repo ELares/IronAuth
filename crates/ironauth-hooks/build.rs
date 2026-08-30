@@ -41,6 +41,15 @@ const GUESTS: &[(&str, &str)] = &[
     ("chain_observer", "IRONAUTH_GUEST_CHAIN_OBSERVER"),
     ("secret_reader", "IRONAUTH_GUEST_SECRET_READER"),
     ("fetcher", "IRONAUTH_GUEST_FETCHER"),
+    // The CUSTOM FACTOR (issue #114 criterion 6). Not a `token.customize` hook at all: it
+    // implements the OTHER world, `custom-challenge-hook`, which is why it is the fixture that
+    // proves one engine, one linker and one loaded component serve both.
+    ("wordmark_challenge", "IRONAUTH_GUEST_WORDMARK_CHALLENGE"),
+    // Spins in ALL THREE exports (issue #114 criteria 3 and 6). The bounds are applied per
+    // store, and `challenge.rs` builds three stores; a helper that set fuel for two of them
+    // would leave a hole exactly the size of the third, and no other challenge fixture is
+    // expensive enough to notice.
+    ("runaway_challenge", "IRONAUTH_GUEST_RUNAWAY_CHALLENGE"),
     ("claim_forger", "IRONAUTH_GUEST_CLAIM_FORGER"),
     // REMOVES a claim (issue #114). The WIT contract is a replace, and the first dispatch merged
     // -- so a hook deployed to strip a claim produced a token that still carried it, and nothing

@@ -355,6 +355,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "runaway-challenge"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "secret-reader"
 version = "0.0.0"
 dependencies = [
@@ -613,6 +620,13 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "wordmark-challenge"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
 ]
 
 [[package]]
