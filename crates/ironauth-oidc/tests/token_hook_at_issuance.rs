@@ -1336,3 +1336,60 @@ async fn a_row_written_without_the_column_reads_back_fail_closed() {
          opts every pre-existing hook into fail-open"
     );
 }
+
+/// A REFUSED HOOK CLAIM REACHES THE AUDIT STREAM, which is criterion 5's second verb.
+///
+/// #113 criterion 5 says protected claims "cannot be overridden by any mapping or hook;
+/// attempts are rejected AND AUDITED". Both halves rejected from the start and only the MAPPING
+/// half was audited -- `claims_mapping.refused`, written at configuration time in a 400 the
+/// operator reads. A hook's attempt is knowable only when the hook runs, so the whole record of
+/// it was a `tracing::warn!` on a server log: not per-tenant, not held to the audit retention
+/// policy, and not what a SIEM subscribes to.
+///
+/// THE CONTROL IS THE OTHER HALF OF THE SAME TEST, and it is what stops this passing on a
+/// dispatch that audits every issuance. `GOOD` adds one claim the fence allows, so it refuses
+/// nothing and must write NO row; `CLAIM_FORGER` reaches for `sub` and `iss` and must write
+/// exactly one. Asserting only the second is satisfied by a handler that audits unconditionally,
+/// which would put a row on every login in the product.
+///
+/// EXACTLY ONE ROW, not one per refused claim. `CLAIM_FORGER` is refused on both tokens and
+/// several names, and a stream that carried a row for each would report an operator's single
+/// bad deploy as a flood.
+#[tokio::test]
+async fn a_hook_refused_a_protected_claim_is_audited_and_a_well_behaved_one_is_not() {
+    const ACTION: &str = "token_hook.claim_refused";
+
+    let harness = harness_with_hooks().await;
+
+    // THE CONTROL FIRST, so a non-zero count below cannot be something this harness did before
+    // the hook was deployed.
+    deploy(&harness, ironauth_hooks::fixtures::GOOD, 1).await;
+    let (access, _) = exchange(&harness).await.expect("the control exchange");
+    assert_eq!(
+        claims(&access).get("tier"),
+        Some(&Value::from("gold")),
+        "the control hook ran, or its silence below is a hook that never executed"
+    );
+    assert_eq!(
+        harness.count_audit_action(ACTION).await,
+        0,
+        "a hook that writes only what it may refuses nothing, so it must put NOTHING on the \
+         audit stream -- otherwise this row is on every login in the product"
+    );
+
+    // AND THEN THE FORGERY.
+    deploy(&harness, ironauth_hooks::fixtures::CLAIM_FORGER, 1).await;
+    let (access, _) = exchange(&harness).await.expect("the forging exchange");
+    assert_eq!(
+        claims(&access).get("forger_ran"),
+        Some(&Value::from(true)),
+        "the forging hook ran, or the row below is about nothing"
+    );
+    assert_eq!(
+        harness.count_audit_action(ACTION).await,
+        1,
+        "ONE row: the hook reached for a claim it may not and an auditor can see it happened. \
+         One and not several, because a hook refused several names on two tokens is still one \
+         operator mistake on one login"
+    );
+}

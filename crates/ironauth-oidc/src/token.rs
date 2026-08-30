@@ -1713,8 +1713,7 @@ pub(crate) async fn apply_claims_mapping(
     extra_claims: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<crate::claims_mapping_at_issuance::MappedAccessClaims, TokenError> {
     crate::claims_mapping_at_issuance::apply_to_with_hook(
-        state.store(),
-        state.hook_engine(),
+        crate::claims_mapping_at_issuance::Issuance::for_state(state),
         scope,
         client_id,
         grant_type,

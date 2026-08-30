@@ -1381,8 +1381,7 @@ async fn mint_front_channel_id_token(
     // Failing closed here matches the token endpoint for the reason `claims_mapping_at_issuance`
     // gives: a mapping can REMOVE a claim, so ignoring one over-claims.
     let access_extra_claims = crate::claims_mapping_at_issuance::apply_to_with_hook(
-        state.store(),
-        state.hook_engine(),
+        crate::claims_mapping_at_issuance::Issuance::for_state(state),
         scope,
         &client_id_str,
         "implicit",

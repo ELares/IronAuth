@@ -621,8 +621,7 @@ async fn mint_device_tokens(
     // whichever door that is becomes the one to use. A fault fails the issuance, for the reason
     // `claims_mapping_at_issuance`'s header gives.
     let access_extra_claims = crate::claims_mapping_at_issuance::apply_to_with_hook(
-        state.store(),
-        state.hook_engine(),
+        crate::claims_mapping_at_issuance::Issuance::for_state(state),
         scope,
         &grant.client_id,
         // The wire value, from the registry, not a literal beside it. Issue #113 asks the

@@ -821,8 +821,7 @@ async fn mint_and_persist(
     // explicitly. The source document is empty, so with nothing configured this is the empty
     // bag it always was.
     let no_custom = crate::claims_mapping_at_issuance::apply_to_machine_token(
-        state.store(),
-        state.hook_engine(),
+        crate::claims_mapping_at_issuance::Issuance::for_state(state),
         scope,
         client_id_str,
         // The wire value, from the registry, not a literal beside it. Issue #113 asks the
