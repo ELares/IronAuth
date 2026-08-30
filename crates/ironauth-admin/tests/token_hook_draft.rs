@@ -509,3 +509,107 @@ async fn a_faulted_draft_run_names_the_fault_and_the_version() {
          which one to roll back from: {body}"
     );
 }
+
+/// A MACHINE GRANT HAS NO ID HALF, and the draft run answers the door the request names.
+///
+/// `client_credentials`, `jwt:bearer` and token exchange dispatch through
+/// `apply_to_machine_token`, which hands the guest an EMPTY ID-token list and DROPS the one it
+/// returns. A draft run that passed the request's list through would hand the guest an input no
+/// login on that grant produces -- so a hook branching on it takes a different branch here than
+/// in production -- and would report an ID half no token on that grant can carry.
+///
+/// TWO FIXTURES, because the two halves need different discriminators and every other test in
+/// this file uses `authorization_code`, where `id_token_claims_discarded` can only ever read
+/// zero. `GOOD` ECHOES the ID list it is handed, so an empty report from it says the guest was
+/// handed nothing -- had the request's list crossed, `GOOD` would have handed it straight back.
+/// `ECHO_REQUEST` emits one ID claim whatever it is handed, so it is the one that makes the
+/// DISCARD count non-zero. Neither alone is the property: the first cannot tell an empty
+/// contribution from a discarded one, and the second cannot tell an empty input from a full one.
+#[tokio::test]
+async fn a_machine_grant_draft_run_reports_no_id_half_and_counts_what_it_dropped() {
+    let harness = Harness::start(56).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    let machine = serde_json::json!({
+        "grant_type": "client_credentials",
+        "id_token_claims": { "email": "ada@example.test" },
+        "access_token_claims": { "sub": "svc-1" }
+    })
+    .to_string();
+
+    // THE GUEST IS HANDED NOTHING. `GOOD` echoes the ID list, so an empty one here is the
+    // request's list not having crossed. On `authorization_code` the same fixture reports it.
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1"),
+            ironauth_hooks::fixtures::GOOD,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy: {body}");
+    let (status, _, body) = harness
+        .post(&format!("{base}/test"), "k-draft-8", &machine)
+        .await;
+    assert_eq!(status, StatusCode::OK, "machine draft run: {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert!(
+        view["id_token_claims"]
+            .as_object()
+            .expect("an object")
+            .is_empty(),
+        "an echoing hook handed an empty ID list returns an empty one: {body}"
+    );
+    assert_eq!(
+        view["id_token_claims_discarded"], 0,
+        "and it contributed nothing to discard, which is a different fact from the one below: \
+         {body}"
+    );
+
+    let (status, _, body) = harness
+        .post(&format!("{base}/test"), "k-draft-8b", &fixture())
+        .await;
+    assert_eq!(status, StatusCode::OK, "the control run: {body}");
+    let control: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        control["id_token_claims"]["email"],
+        serde_json::json!("ada@example.test"),
+        "the SAME hook on a grant that mints an ID token reports the list, so the empty one \
+         above is the grant and not the fixture: {body}"
+    );
+
+    // AND WHAT THE GUEST CONTRIBUTED IS COUNTED. `ECHO_REQUEST` emits one ID claim whatever it
+    // is handed, and this grant throws it away -- an empty `id_token_claims` with the count at
+    // zero would be indistinguishable from the `GOOD` run above.
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1"),
+            ironauth_hooks::fixtures::ECHO_REQUEST,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "redeploy: {body}");
+    let (status, _, body) = harness
+        .post(&format!("{base}/test"), "k-draft-8c", &machine)
+        .await;
+    assert_eq!(status, StatusCode::OK, "machine draft run: {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert!(
+        view["id_token_claims"]
+            .as_object()
+            .expect("an object")
+            .is_empty(),
+        "this grant carries no ID token, so the half is empty however much the hook filled it: \
+         {body}"
+    );
+    assert_eq!(
+        view["id_token_claims_discarded"], 1,
+        "and the operator is told their hook filled it and this grant threw it away: {body}"
+    );
+    assert_eq!(
+        view["access_token_claims"]["echo_grant_type"],
+        serde_json::json!("client_credentials"),
+        "the guest ran and was told which door it is, or the empty ID half above is a hook \
+         that never ran: {body}"
+    );
+}
