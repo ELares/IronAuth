@@ -200,6 +200,14 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // precedent, handing this same reader the whole declarative rule list shaping the same
     // tokens.
     ("testTokenHook", ManagementPermission::Read),
+    // READ, with the other reads: it reports byte LENGTHS and never components, so it discloses
+    // exactly what `getTokenHook` already does, once per hook.
+    ("listTokenHookChain", ManagementPermission::Read),
+    // WRITE_CONFIG, with the DEPLOY rather than the reads, and the reason is worth stating: a
+    // reorder changes what every later hook is HANDED, since each is given what the one before
+    // it produced. So it can change every claim in a token while every component stays
+    // byte-identical, which is a bigger act than its name suggests.
+    ("reorderTokenHooks", ManagementPermission::WriteConfig),
     // User sub-surfaces: identifiers, trait schemas, signup quarantine and recovery
     // approvals. Identifier UNIQUENESS and trait schemas are config rather than user
     // authority, because each changes a rule the whole environment obeys.
@@ -648,6 +656,13 @@ const PERMISSION_PROVEN: &[&str] = &[
     // writes_nothing`, which drives the unrestricted bootstrap operator and would pass with the
     // gate deleted -- the false coverage claim this list's own header warns about.
     "testTokenHook",
+    // Proven in `delegated_admin.rs::read_is_required_and_sufficient_for_listing_the_token_hook_chain`
+    // and `..::write_config_is_required_and_sufficient_for_a_token_hook_reorder`, both in BOTH
+    // directions. The pair matters more than either alone: they are the two halves of one
+    // feature and they are classified DIFFERENTLY, so a gate that treated the chain listing as
+    // a write, or the reorder as a read, passes one of these and fails the other.
+    "listTokenHookChain",
+    "reorderTokenHooks",
     // Proven in `read_is_required_and_sufficient_for_the_event_feed_and_usage_export`, in
     // BOTH directions: a `write_config` credential is refused and a `read` one is allowed,
     // so neither a blanket refusal nor a missing gate would pass it.
@@ -796,12 +811,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        192,
+        194,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        48,
+        50,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

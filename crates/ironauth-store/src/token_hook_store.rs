@@ -173,6 +173,10 @@ impl std::fmt::Debug for TokenHookRecord {
 pub struct TokenHookMetadata {
     /// The OAuth client whose tokens this hook shapes.
     pub client_id: String,
+    /// WHICH of the client's hooks this is: the handle the admin surface addresses.
+    pub name: String,
+    /// WHERE in the client's chain it runs, ascending.
+    pub ordinal: i32,
     /// How many bytes the deployed component is.
     pub component_bytes: i32,
     /// The payload version the guest expects.

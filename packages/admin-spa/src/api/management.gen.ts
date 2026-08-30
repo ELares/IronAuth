@@ -348,6 +348,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/chain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List a client's hook chain, in the order it runs. */
+        get: operations["listTokenHookChain"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/order": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Set the order a client's hooks run in. */
+        post: operations["reorderTokenHooks"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback": {
         parameters: {
             query?: never;
@@ -6751,6 +6785,25 @@ export interface components {
             /** @description An optional space-separated algorithm allowlist. Narrowing only. */
             signing_alg_allow?: string | null;
         };
+        /** @description The body of a reorder: the client's complete hook order, first to last. */
+        ReorderTokenHooksRequest: {
+            /**
+             * @description Every one of this client's hook names, in the order they should run.
+             *
+             *     COMPLETE, not a patch, and that is the contract rather than a convenience. A partial
+             *     reorder ("put `audit` third") has to say what happens to everything it did not name, and
+             *     every answer is a surprise: shifting the others silently renumbers hooks the caller did
+             *     not mention, and leaving them makes a collision the caller cannot see. Naming the whole
+             *     order means the request IS the arrangement, so a caller who reads the chain, moves one
+             *     entry and writes it back cannot produce a state they did not intend.
+             *
+             *     A list that is not exactly this client's hook names is a 404 -- a name that is not
+             *     deployed would order a hook that does not exist, and a deployed hook missing from the
+             *     list would be left at a position the caller never chose while believing they had
+             *     arranged everything.
+             */
+            order: string[];
+        };
         /**
          * @description The acknowledgement that a replay was QUEUED.
          *
@@ -7975,6 +8028,45 @@ export interface components {
              *     the database can hold that row set, not because a client can produce it.
              */
             version_run?: number | null;
+        };
+        /** @description One hook in a client's chain, as the management API reports it. */
+        TokenHookChainEntryView: {
+            /**
+             * Format: int32
+             * @description How many bytes the deployed component is. Never the component: a chain of eight
+             *     sixteen-megabyte hooks would be a hundred and twenty-eight megabytes of response to
+             *     answer "what is my order".
+             */
+            component_bytes: number;
+            /** @description What the dispatch does when this hook does not complete. */
+            failure_policy: string;
+            /** @description The hook's name: the handle every other route addresses it by. */
+            name: string;
+            /**
+             * Format: int32
+             * @description Its position in the chain, ascending. Positions may have GAPS -- deleting the hook at
+             *     position one leaves two at two, because the ordinal orders rather than indexes, and
+             *     closing the gap would renumber hooks nobody touched.
+             */
+            ordinal: number;
+            /**
+             * Format: int32
+             * @description The payload version the guest was built against.
+             */
+            payload_version: number;
+        };
+        /** @description A client's hook chain, in the order it runs. */
+        TokenHookChainView: {
+            /** @description The client whose chain this is. */
+            client_id: string;
+            /**
+             * @description The hooks, first to last. Empty when the client has none.
+             *
+             *     EACH HOOK IS HANDED WHAT THE ONE BEFORE IT PRODUCED, which is what makes this order
+             *     load-bearing rather than cosmetic: a hook's claim set REPLACES what it was given, so
+             *     moving a hook changes what every hook after it sees.
+             */
+            hooks: components["schemas"]["TokenHookChainEntryView"][];
         };
         /**
          * @description One historical deploy of a client's hook (issue #114 criterion 5).
@@ -10274,7 +10366,10 @@ export interface operations {
     };
     getTokenHook: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Which of the client's hooks to describe; absent means `default` */
+                name?: string;
+            };
             header?: never;
             path: {
                 /** @description The tenant identifier */
@@ -10333,6 +10428,10 @@ export interface operations {
                 payload_version: number;
                 /** @description What the dispatch does when this hook does not complete: `fail_closed` (the default) or `fail_open` */
                 failure_policy?: string;
+                /** @description Which of the client's hooks this deploys; absent means `default` */
+                name?: string;
+                /** @description Where a NEW hook runs in the chain, ascending; absent means last. IGNORED when the hook already exists, so a redeploy replaces code without moving it */
+                ordinal?: number;
             };
             header?: never;
             path: {
@@ -10361,7 +10460,7 @@ export interface operations {
                     "application/json": components["schemas"]["TokenHookView"];
                 };
             };
-            /** @description An unknown or absent payload version, an unknown failure policy, or bytes that are not a WebAssembly component */
+            /** @description An unknown or absent payload version, an unknown failure policy, an invalid hook name, or bytes that are not a WebAssembly component */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -10390,6 +10489,15 @@ export interface operations {
             };
             /** @description Environment not found or malformed client id */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description This client already holds the maximum number of hooks */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -10441,6 +10549,127 @@ export interface operations {
                 };
             };
             /** @description Environment not found, malformed client id, or no hook deployed */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listTokenHookChain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hooks shape */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The chain, first to last. Empty when the client has no hooks */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookChainView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or malformed client id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    reorderTokenHooks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hooks shape */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReorderTokenHooksRequest"];
+            };
+        };
+        responses: {
+            /** @description The chain in its new order */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenHookChainView"];
+                };
+            };
+            /** @description A malformed body or a repeated name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed client id, or the order is not exactly this client's hook names */
             404: {
                 headers: {
                     [name: string]: unknown;

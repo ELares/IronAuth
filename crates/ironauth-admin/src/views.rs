@@ -2192,6 +2192,87 @@ pub struct DeployTokenHookQuery {
     /// OPTIONAL, and absent means fail-closed. That asymmetry is deliberate: the dangerous
     /// setting is the one an operator has to type.
     pub failure_policy: Option<String>,
+    /// WHICH of the client's hooks this deploy addresses. Absent means `default`.
+    ///
+    /// Issue #114 criterion 5 lets a client hold several hooks, addressed by name. A QUERY
+    /// PARAMETER rather than a path segment, and that is routing rather than taste:
+    /// `/token-hook/{name}` would collide with `/token-hook/versions`, `/rollback` and `/test`,
+    /// so a hook called `versions` would be unaddressable and a typo would silently hit another
+    /// route. The name sits beside `payload_version` and `failure_policy`, which are the
+    /// deploy's other properties.
+    ///
+    /// ABSENT MEANS `default` so every existing caller keeps working unchanged, and `default`
+    /// is what migration 0167 backfilled every hook deployed before ordering existed to.
+    pub name: Option<String>,
+    /// WHERE in the client's chain a NEW hook runs, ascending. Absent means last.
+    ///
+    /// IGNORED WHEN THE HOOK ALREADY EXISTS, which is the property a rollback depends on: a
+    /// redeploy replaces code and must not move a hook, or rolling back the hook that runs
+    /// third would silently make it run first. Moving a hook is the reorder route's job, and it
+    /// moves the whole chain at once.
+    pub ordinal: Option<String>,
+}
+
+/// Which of a client's hooks a read or a delete addresses.
+///
+/// Absent means `default`. A query parameter for the reason `DeployTokenHookQuery::name` gives:
+/// `/token-hook/{name}` would collide with this surface's own `/versions`, `/rollback` and
+/// `/test`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NamedTokenHookQuery {
+    /// The hook's name. Absent means `default`.
+    pub name: Option<String>,
+}
+
+/// The body of a reorder: the client's complete hook order, first to last.
+#[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
+pub struct ReorderTokenHooksRequest {
+    /// Every one of this client's hook names, in the order they should run.
+    ///
+    /// COMPLETE, not a patch, and that is the contract rather than a convenience. A partial
+    /// reorder ("put `audit` third") has to say what happens to everything it did not name, and
+    /// every answer is a surprise: shifting the others silently renumbers hooks the caller did
+    /// not mention, and leaving them makes a collision the caller cannot see. Naming the whole
+    /// order means the request IS the arrangement, so a caller who reads the chain, moves one
+    /// entry and writes it back cannot produce a state they did not intend.
+    ///
+    /// A list that is not exactly this client's hook names is a 404 -- a name that is not
+    /// deployed would order a hook that does not exist, and a deployed hook missing from the
+    /// list would be left at a position the caller never chose while believing they had
+    /// arranged everything.
+    pub order: Vec<String>,
+}
+
+/// One hook in a client's chain, as the management API reports it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct TokenHookChainEntryView {
+    /// The hook's name: the handle every other route addresses it by.
+    pub name: String,
+    /// Its position in the chain, ascending. Positions may have GAPS -- deleting the hook at
+    /// position one leaves two at two, because the ordinal orders rather than indexes, and
+    /// closing the gap would renumber hooks nobody touched.
+    pub ordinal: i32,
+    /// How many bytes the deployed component is. Never the component: a chain of eight
+    /// sixteen-megabyte hooks would be a hundred and twenty-eight megabytes of response to
+    /// answer "what is my order".
+    pub component_bytes: u32,
+    /// The payload version the guest was built against.
+    pub payload_version: u32,
+    /// What the dispatch does when this hook does not complete.
+    pub failure_policy: String,
+}
+
+/// A client's hook chain, in the order it runs.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct TokenHookChainView {
+    /// The client whose chain this is.
+    pub client_id: String,
+    /// The hooks, first to last. Empty when the client has none.
+    ///
+    /// EACH HOOK IS HANDED WHAT THE ONE BEFORE IT PRODUCED, which is what makes this order
+    /// load-bearing rather than cosmetic: a hook's claim set REPLACES what it was given, so
+    /// moving a hook changes what every hook after it sees.
+    pub hooks: Vec<TokenHookChainEntryView>,
 }
 
 /// The body to create a new version of a custom journey (issue #92, PR 5).

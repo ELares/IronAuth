@@ -831,6 +831,19 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions",
             get(token_hooks::list_token_hook_versions),
         )
+        // Issue #114 criterion 5's ordering, through the admin surface: read the chain, and set
+        // it. A LITERAL SEGMENT for each, and the hook NAME travels as a query parameter rather
+        // than a path segment for exactly this reason -- `/token-hook/{name}` would collide
+        // with these and with `/rollback` and `/test`, so a hook called `order` would be
+        // unaddressable and a typo would silently hit another route.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/chain",
+            get(token_hooks::list_token_hook_chain),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/order",
+            post(token_hooks::reorder_token_hooks),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback",
             post(token_hooks::rollback_token_hook),
