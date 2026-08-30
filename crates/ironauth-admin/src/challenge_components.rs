@@ -184,7 +184,9 @@ pub async fn deploy_challenge_component(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve(&state, &principal, &tenant_id, &environment_id).await?;
-    // Delegated administration (issue #102): classified `management.write_config`.
+    // Delegated administration (issue #102): classified `management.write_config`, with the
+    // token-hook deploy and for a stronger reason -- a hook shapes claims on a token the login
+    // has already earned, and this decides whether it is earned at all.
     principal.require_permission(ManagementPermission::WriteConfig)?;
     // FRESH PRIVILEGE, with more force than a token hook's: a hook shapes claims on a token the
     // login already earned, and this decides whether it is earned.
@@ -281,7 +283,9 @@ pub async fn list_challenge_components(
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve(&state, &principal, &tenant_id, &environment_id).await?;
-    // Delegated administration (issue #102): classified `management.read`.
+    // Delegated administration (issue #102): classified `management.read`. The listing returns
+    // METADATA and never a component, so demanding `write_config` would make asking which
+    // factors are deployed cost the authority to change them.
     principal.require_permission(ManagementPermission::Read)?;
 
     // METADATA, never the components. A listing exists so an operator can see WHICH factors are
@@ -340,6 +344,9 @@ pub async fn delete_challenge_component(
     Query(query): Query<NameQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`, with the
+    // deploy. A removal is not a de-escalation here -- a journey that still names the component
+    // starts refusing every login that reaches it.
     principal.require_permission(ManagementPermission::WriteConfig)?;
     // FRESH PRIVILEGE ON THE REMOVAL TOO, because a removal is not a de-escalation here: a
     // journey that still names the component starts refusing every login that reaches it, so
@@ -385,6 +392,9 @@ pub async fn list_challenge_component_secrets(
     Query(query): Query<NameQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`. NAMES and never
+    // values, which is what keeps a "what may this factor read" route from being one keystroke
+    // from disclosing them.
     principal.require_permission(ManagementPermission::Read)?;
     let name = component_name(query.name.as_deref())?;
     read_back_secrets(&state, scope, name).await
@@ -418,6 +428,9 @@ pub async fn grant_challenge_component_secret(
     Query(query): Query<SecretQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`, with the
+    // deploy. Granting a secret WIDENS what the operator's own code may read, which is a
+    // configuration change with the same reach as deploying that code.
     principal.require_permission(ManagementPermission::WriteConfig)?;
     // FRESH PRIVILEGE: this hands a key to code that decides whether logins succeed.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -463,6 +476,8 @@ pub async fn revoke_challenge_component_secret(
     Query(query): Query<SecretQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`, with the
+    // grant. A withdrawal narrows what code may read and is still a capability change.
     principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     crate::org_context::require_live_environment(&state, &scope).await?;

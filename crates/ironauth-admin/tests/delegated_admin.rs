@@ -3947,3 +3947,203 @@ async fn write_config_is_required_and_sufficient_for_a_hook_secret_grant() {
         "and so does the revoke: {response}"
     );
 }
+
+/// `management.write_config` is required AND sufficient to DEPLOY a custom factor (#114
+/// criterion 6).
+///
+/// A factor decides whether a login SUCCEEDS, which is a stronger reach than a token hook's: a
+/// hook shapes claims on a token the login has already earned. So this is the same permission as
+/// the hook deploy and must not be reachable with anything weaker.
+///
+/// The refusal is driven with a credential holding a DIFFERENT permission rather than none: an
+/// empty set could be refused by an earlier check and would say nothing about which permission
+/// this route requires.
+#[tokio::test]
+async fn write_config_is_required_and_sufficient_to_deploy_a_custom_factor() {
+    let h = Harness::start(240).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-factor-deploy").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/challenge-components?name=wordmark&payload_version=1"
+    );
+    // A real component preamble, so a refusal cannot be the structural check answering instead
+    // of the permission gate.
+    let body = "\u{0}asm\u{d}\u{0}\u{1}\u{0}";
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.put_as(&path, &secret, body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not deploy code that decides whether logins succeed: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.put_as(&path, &secret, body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a write_config credential must reach the handler and deploy: {response}"
+    );
+}
+
+/// `management.write_config` is required AND sufficient to REMOVE a custom factor (#114
+/// criterion 6).
+///
+/// Pinned separately from the deploy because the reason INVERTS the token hook's. Removing a hook
+/// restores the unshaped token; removing a component a journey still names makes every login that
+/// reaches that step REFUSE. Either way it is a change to whether people can log in, not a
+/// tidy-up, so it must not be reachable with a weaker credential just because it deletes.
+#[tokio::test]
+async fn write_config_is_required_and_sufficient_to_remove_a_custom_factor() {
+    let h = Harness::start(241).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-factor-delete").await;
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/challenge-components?name=absent");
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.delete_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not remove a factor: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.delete_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_config credential reaches the handler, which reports the absent component: \
+         {response}"
+    );
+}
+
+/// `management.read` is required AND sufficient to LIST custom factors (#114 criterion 6).
+///
+/// The listing returns METADATA -- names, sizes, payload versions -- and never a component, so it
+/// is a read. Classifying it with the deploy would demand `write_config` and sudo freshness to
+/// ask which factors are deployed.
+#[tokio::test]
+async fn read_is_required_and_sufficient_to_list_custom_factors() {
+    let h = Harness::start(242).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-factor-list").await;
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/challenge-components");
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_config credential without read must not list: this is the direction that would \
+         pass if the route required nothing: {response}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read credential lists them: {response}"
+    );
+}
+
+/// `management.read` is required AND sufficient to list a factor's SECRET NAMES, and
+/// `management.write_config` for the grant and the revoke (#114 criterion 6).
+///
+/// The three are pinned together because they share a path and differ in method, which is exactly
+/// the shape where a router-level gate would give all three the same authority. The read returns
+/// NAMES and never values; the grant WIDENS what code may read and is therefore a configuration
+/// change with the same reach as deploying that code.
+#[tokio::test]
+async fn a_factors_secret_grants_split_read_from_write_config() {
+    let h = Harness::start(243).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-factor-secrets").await;
+    let base =
+        format!("/v1/tenants/{tenant}/environments/{environment}/challenge-components/secrets");
+    let read_path = format!("{base}?name=absent");
+    let write_path = format!("{base}?name=absent&secret=api_key");
+
+    // THE READ needs `read` and is refused to a write-only credential.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.get_as(&read_path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_config credential without read must not list a factor's grants: {response}"
+    );
+
+    // THE WRITES need `write_config` and are refused to a read-only credential.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.put_as(&write_path, &secret, "").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not hand a key to code: {response}"
+    );
+    let (status, _, response) = h.delete_as(&write_path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "nor withdraw one: {response}"
+    );
+    let (status, _, response) = h.get_as(&read_path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "while the read reaches the handler on the same path: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.put_as(&write_path, &secret, "").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_config credential reaches the handler, which reports the absent component: \
+         {response}"
+    );
+    let (status, _, response) = h.delete_as(&write_path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "and the revoke, which is idempotent and so succeeds for an ungranted name: {response}"
+    );
+}
