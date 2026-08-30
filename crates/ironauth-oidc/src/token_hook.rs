@@ -540,12 +540,18 @@ pub async fn run(
     // ONE HOOK IS THE SAME CODE, not a special case beside it: a chain of one folds once and
     // produces what the single-hook dispatch produced before ordering existed.
     let mut carried: Option<HookClaims> = None;
-    // THE WIRE SHAPE, carried across hops. `Invocation` takes `serde_json::Map` and a hook hands
-    // back a `BTreeMap`, so each hop converts once. That is a copy of the CLAIM MAPS -- tens of
-    // small values -- and not of the component, which is the megabyte-scale thing and stays in
-    // the cache. A chain of one never enters the loop body's second half at all.
-    let mut id_map = invocation.id_token_claims.clone();
-    let mut access_map = invocation.access_token_claims.clone();
+    // THE WIRE SHAPE, carried across hops, and ABSENT until a hook has produced one.
+    //
+    // `Invocation` takes a `serde_json::Map` and a hook hands back a `BTreeMap`, so each hop
+    // converts once -- a copy of the CLAIM MAPS, which are tens of small values, and never of
+    // the component, which is the megabyte-scale thing and stays in the cache.
+    //
+    // `Option` rather than an eager clone of the mint's maps, because the overwhelmingly common
+    // chain is ONE hook: it is handed the mint's maps by reference and nothing is copied at
+    // all. A draft cloned them up front and paid that on every issuance in the product to
+    // serve the case where a second hook exists.
+    let mut id_map: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut access_map: Option<serde_json::Map<String, serde_json::Value>> = None;
     for record in &chain {
         // THE POLICY IS THE RECORD'S, so it is only knowable once the record is read -- which
         // is why a failure to READ one is unconditionally fail-closed above and cannot be
@@ -554,24 +560,35 @@ pub async fn run(
         // under its own policy, and a fail-closed hook after a fail-open one still refuses.
         let failure_policy = record.failure_policy;
         let step = Invocation {
-            id_token_claims: &id_map,
-            access_token_claims: &access_map,
+            id_token_claims: id_map.as_ref().unwrap_or(invocation.id_token_claims),
+            access_token_claims: access_map
+                .as_ref()
+                .unwrap_or(invocation.access_token_claims),
             ..*invocation
         };
         match run_deployed_hook(engine, cache, &step, record).await {
             Ok(Some(produced)) => {
-                id_map = produced
-                    .id_token
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect();
-                access_map = produced
-                    .access_token
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect();
+                id_map = Some(
+                    produced
+                        .id_token
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect(),
+                );
+                access_map = Some(
+                    produced
+                        .access_token
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect(),
+                );
                 carried = Some(merge_step(carried.take(), produced));
             }
+            // UNREACHABLE, and named rather than described as a behaviour: `run_deployed_hook`
+            // has exactly one non-error exit and it is `Ok(Some(..))`. The `None` in the seam's
+            // type belongs to `run`, which uses it for "no hook deployed" -- answered above by
+            // the empty chain -- and for a fail-open swallow, which is the arm below. The arm
+            // is here because the match is exhaustive, not because anything produces it.
             Ok(None) => {}
             Err(fault) => match failure_policy {
                 ironauth_store::HookFailurePolicy::FailClosed => return Err(fault),
