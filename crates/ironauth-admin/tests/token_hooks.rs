@@ -1678,3 +1678,59 @@ async fn hook_secret_grants_are_set_read_and_withdrawn_through_the_admin_surface
         "a revoke with no secret named is refused rather than read as `everything`: {body}"
     );
 }
+
+/// DELETING A HOOK TAKES ITS SECRET GRANTS WITH IT.
+///
+/// The claim migration 0169 makes, and the reason it makes it: without the cascade, deleting a
+/// hook would leave its grants behind, and deploying a NEW hook under the same name would
+/// silently inherit the permissions of the one it replaced. An operator removing a hook because
+/// it misused a key, then deploying a replacement under the same name, would hand the
+/// replacement that same key without ever granting it.
+///
+/// # Why this is asserted through the redeploy rather than the row count
+///
+/// A test that deleted the hook and counted rows in `token_hook_secrets` would prove the
+/// cascade fired. What matters is the consequence: the arrangement an operator would actually
+/// perform, and what the REPLACEMENT may read. So the hook is deleted, redeployed under the
+/// same name, and its grants read back through the route an operator would use.
+#[tokio::test]
+async fn deleting_a_hook_takes_its_secret_grants_so_a_replacement_inherits_nothing() {
+    let harness = Harness::start(65).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1&name=signer"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy: {body}");
+    let (status, _, body) = harness
+        .put(&format!("{base}/secrets?name=signer&secret=stripe"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "grant: {body}");
+
+    let (status, _, body) = harness.delete(&format!("{base}?name=signer")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "delete the hook: {body}");
+
+    // THE REPLACEMENT, under the SAME NAME, which is the arrangement that would inherit.
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1&name=signer"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK, "redeploy: {body}");
+
+    let (status, _, body) = harness.get(&format!("{base}/secrets?name=signer")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "read the replacement's grants: {body}"
+    );
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["secrets"].as_array().expect("a list").len(),
+        0,
+        "a hook deployed under a name that was used before must inherit NOTHING -- otherwise \
+         removing a hook that misused a key and deploying a replacement hands the replacement \
+         that same key, without anyone granting it: {body}"
+    );
+}
