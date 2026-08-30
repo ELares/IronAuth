@@ -101,7 +101,46 @@ interface secrets {
   get: func(name: string) -> option<string>;
 }
 
+/// An OPT-IN outbound HTTP capability, bounded by a per-invocation request budget.
+///
+/// Issue #114 criterion 2: "a hook without the HTTP capability cannot fetch; with the capability
+/// granted, exceeding the request budget fails deterministically".
+///
+/// DENY BY DEFAULT. A hook that was not granted this gets an error from the first call, and the
+/// error says which of the two refusals it is -- "not granted" and "budget exhausted" are
+/// different facts and a hook author debugging one should not be shown the other.
+///
+/// THE BUDGET IS A COUNT OF REQUESTS PER INVOCATION, and exceeding it is DETERMINISTIC in the
+/// strong sense: the refusal is decided by a counter this host owns, before any transport is
+/// reached, so it does not depend on the network, on timing, or on what the remote end does. A
+/// budget expressed in seconds would not be -- the same hook would pass on a fast day.
+///
+/// A SPENT REQUEST IS SPENT WHETHER OR NOT IT SUCCEEDED. The budget bounds what a hook may make
+/// the server DO, and a request that failed still travelled; refunding failures would let a hook
+/// with a budget of one make unbounded attempts against a host that refuses it.
+///
+/// THIS ONE CAN BLOCK, unlike every other host function here, and that is why it is bounded by a
+/// count rather than trusted to the epoch deadline. Fuel, the memory cap and the deadline are all
+/// measured against a guest that is RUNNING, so none of them sees time spent inside a host call.
+/// What bounds this is arithmetic the host does before it calls out, times whatever timeout the
+/// transport itself enforces.
+interface fetch {
+  /// What an outbound request returned.
+  record response {
+    /// The HTTP status.
+    status: u16,
+    /// The body, as text. A response that is not valid UTF-8 is an error rather than a lossy
+    /// string: a hook parsing JSON would otherwise be handed replacement characters and decide
+    /// something about them.
+    body: string,
+  }
+
+  /// Perform one outbound GET, or say why not.
+  get: func(url: string) -> result<response, string>;
+}
+
 world token-customize-hook {
   import secrets;
+  import fetch;
   export token-customize;
 }

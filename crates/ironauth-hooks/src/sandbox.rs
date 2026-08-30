@@ -84,6 +84,30 @@ impl HasData for HasTable {
     type Data<'a> = &'a mut ResourceTable;
 }
 
+/// What one outbound request returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchOutcome {
+    /// The HTTP status.
+    pub status: u16,
+    /// The body as text.
+    pub body: String,
+}
+
+/// How the host actually performs an outbound request.
+///
+/// Supplied by the CALLER so this crate owns no network code. That is not tidiness: the sandbox
+/// is the thing that must be auditable as a list of capabilities NOT granted, and a crate that
+/// linked an HTTP client would have one more thing to argue about. The caller routes through
+/// whatever hardened path it already has.
+pub type FetchTransport = Box<dyn Fn(&str) -> Result<FetchOutcome, String> + Send + Sync>;
+
+/// An outbound HTTP grant: how many requests, how many spent, and how to make one.
+struct FetchGrant {
+    budget: u32,
+    spent: u32,
+    transport: FetchTransport,
+}
+
 /// The marker for the one interface this product defines itself.
 ///
 /// `ironauth:hooks/secrets` is implemented on the store state directly rather than on a view of
@@ -266,6 +290,11 @@ pub struct Sandbox {
     /// EMPTY IS THE DEFAULT and it is the common case: a hook granted nothing gets `none` for
     /// every name, which is the deny-by-default this sandbox applies to everything else.
     secrets: std::collections::BTreeMap<String, String>,
+    /// The outbound HTTP capability, absent unless this hook was granted it.
+    ///
+    /// [`None`] is deny-by-default and it is what an ordinary hook has: `fetch.get` answers
+    /// "not granted" without reaching any transport at all.
+    fetch: Option<FetchGrant>,
 }
 
 impl Sandbox {
@@ -300,6 +329,7 @@ impl Sandbox {
             max_host_resources: limits.max_host_resources,
             observed: Observed::default(),
             secrets: std::collections::BTreeMap::new(),
+            fetch: None,
             // The memory cap alone bounds one linear memory, and a guest can multiply what it
             // costs the HOST without ever exceeding it: many memories, a growing table, or a
             // resource handle per host call. A measured example drove 137 MB of host heap under
@@ -335,6 +365,67 @@ impl Sandbox {
     pub fn with_secrets(mut self, secrets: std::collections::BTreeMap<String, String>) -> Self {
         self.secrets = secrets;
         self
+    }
+
+    /// Grant this hook the outbound HTTP capability, bounded by `budget` requests.
+    ///
+    /// `transport` is supplied by the CALLER, and this crate deliberately owns no network code:
+    /// what the sandbox owns is the BUDGET, which is the part the criterion asks to be
+    /// deterministic. Keeping them apart is also what lets the budget be tested with no network
+    /// at all -- a fake transport that counts calls proves the arithmetic, where a real one
+    /// would prove the arithmetic and the internet.
+    #[must_use]
+    pub fn with_fetch(mut self, budget: u32, transport: FetchTransport) -> Self {
+        self.fetch = Some(FetchGrant {
+            budget,
+            spent: 0,
+            transport,
+        });
+        self
+    }
+
+    /// Perform one outbound request, or say why not.
+    ///
+    /// TWO REFUSALS, and they are deliberately distinguishable. "Not granted" and "budget
+    /// exhausted" are different facts about a hook, and an author debugging one should not be
+    /// shown the other -- the first means an operator has to grant the capability, the second
+    /// means the hook is asking for more than it was given.
+    ///
+    /// A REFUSAL RETURNS RATHER THAN CALLING OUT. The check is an early return, so an attempt
+    /// past the budget reaches no transport at all -- a host that called out and discarded the
+    /// answer would already have done the thing it refused.
+    ///
+    /// AND THE BUDGET IS SPENT WHETHER OR NOT THE REQUEST SUCCEEDS. It bounds what a hook may
+    /// make the server DO; a request that failed still travelled, and refunding failures would
+    /// let a hook with a budget of one make unbounded attempts against a host that refuses it.
+    /// The increment therefore precedes the call, though on this arrangement the ORDER is not
+    /// what holds the bound -- the early return above is. What the order buys is that a
+    /// transport which panics has still spent its request.
+    ///
+    /// # Errors
+    ///
+    /// The refusal text the guest sees. Two of them come from here -- "not granted" when the
+    /// hook holds no capability, and "request budget exhausted" when it has spent one -- and any
+    /// other is the transport's own, passed through unchanged so a hook author reads what the
+    /// remote end or the fetcher said rather than a message this layer invented.
+    pub fn fetch(&mut self, url: &str) -> Result<FetchOutcome, String> {
+        let Some(grant) = self.fetch.as_mut() else {
+            return Err("fetch is not granted to this hook".to_owned());
+        };
+        if grant.spent >= grant.budget {
+            return Err(format!(
+                "request budget exhausted: {} of {} used",
+                grant.spent, grant.budget
+            ));
+        }
+        grant.spent = grant.spent.saturating_add(1);
+        (grant.transport)(url)
+    }
+
+    /// How many requests this hook has spent, for a caller that wants to report it.
+    #[must_use]
+    pub fn requests_spent(&self) -> u32 {
+        self.fetch.as_ref().map_or(0, |grant| grant.spent)
     }
 
     /// The value of a granted secret, or [`None`] when this hook may not read it.

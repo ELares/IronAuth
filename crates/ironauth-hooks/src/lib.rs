@@ -46,7 +46,7 @@ mod sandbox;
 pub use engine::{Customization, HookEngine, LoadedHook, Request};
 pub use error::{AbortKind, HookError};
 pub use limits::Limits;
-pub use sandbox::{FROZEN_RESOLUTION_NS, Observed, Sandbox};
+pub use sandbox::{FROZEN_RESOLUTION_NS, FetchOutcome, FetchTransport, Observed, Sandbox};
 
 /// The shipped guest fixtures, as bytes, for tests in other crates.
 ///
@@ -99,6 +99,13 @@ pub mod fixtures {
     /// `tier`. Every other pair of fixtures composes commutatively, so a test built from them
     /// passes with the chain read in reverse -- measured, it did.
     pub const CHAIN_OBSERVER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CHAIN_OBSERVER"));
+
+    /// A hook that makes three outbound requests and reports each attempt separately.
+    ///
+    /// THREE, so a test can grant fewer and see where the refusals begin. Reporting each attempt
+    /// as its own claim is what makes the BOUNDARY visible: "the first two succeeded and the
+    /// third did not" is a different observation from "it did not work".
+    pub const FETCHER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_FETCHER"));
 
     /// A hook that reads a GRANTED secret and one it was never granted.
     ///

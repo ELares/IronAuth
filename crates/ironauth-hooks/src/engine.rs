@@ -67,6 +67,23 @@ impl ironauth::hooks::secrets::Host for Sandbox {
     }
 }
 
+/// The host side of the `fetch` import: the budget, then the caller's transport.
+///
+/// THE ONLY HOST FUNCTION HERE THAT MAY BLOCK, and the bound on it is arithmetic rather than a
+/// clock. Fuel, the memory cap and the epoch deadline are all measured against a guest that is
+/// RUNNING, so none of them sees time spent inside a host call -- which is why the capability is
+/// bounded by a COUNT the host decides before reaching any transport, and why a budget expressed
+/// in seconds would not be deterministic in the way the criterion asks.
+impl ironauth::hooks::fetch::Host for Sandbox {
+    fn get(&mut self, url: String) -> Result<ironauth::hooks::fetch::Response, String> {
+        self.fetch(&url)
+            .map(|outcome| ironauth::hooks::fetch::Response {
+                status: outcome.status,
+                body: outcome.body,
+            })
+    }
+}
+
 /// A compiled-code cache, the configuration every hook runs under, and the linked host surface.
 ///
 /// # The linker is built ONCE, and that is the warm-path budget
@@ -120,6 +137,8 @@ impl HookEngine {
         // state. Keeping the two lists apart is what makes the WASI surface auditable as a
         // list of things NOT granted.
         ironauth::hooks::secrets::add_to_linker::<Sandbox, HasSandbox>(&mut linker, |s| s)
+            .map_err(HookError::from_engine)?;
+        ironauth::hooks::fetch::add_to_linker::<Sandbox, HasSandbox>(&mut linker, |s| s)
             .map_err(HookError::from_engine)?;
         Ok(Self {
             engine,
@@ -336,6 +355,26 @@ impl LoadedHook {
         request: &Request,
         secrets: std::collections::BTreeMap<String, String>,
     ) -> Result<Customization, HookError> {
+        self.customize_with_grants(engine, limits, request, secrets, None)
+    }
+
+    /// [`Self::customize`], granting the hook secrets and an outbound HTTP budget.
+    ///
+    /// `fetch` is `(budget, transport)` when the hook was granted the capability and [`None`]
+    /// when it was not, which is deny-by-default: the guest's `fetch.get` then answers "not
+    /// granted" without reaching any transport.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::customize`].
+    pub fn customize_with_grants(
+        &self,
+        engine: &HookEngine,
+        limits: &Limits,
+        request: &Request,
+        secrets: std::collections::BTreeMap<String, String>,
+        fetch: Option<(u32, crate::sandbox::FetchTransport)>,
+    ) -> Result<Customization, HookError> {
         // A STORE and nothing else. The linker was built when the engine was, and this hook's
         // imports were resolved against it when the hook was loaded; what is left is the state
         // that genuinely cannot be shared between two concurrent invocations -- this call's
@@ -344,6 +383,10 @@ impl LoadedHook {
         // starts running, and every bound it runs under is measured against a RUNNING guest, so
         // a host function that fetched a value would sit outside all of them.
         let sandbox = Sandbox::new(limits).with_secrets(secrets);
+        let sandbox = match fetch {
+            Some((budget, transport)) => sandbox.with_fetch(budget, transport),
+            None => sandbox,
+        };
         let mut store = Store::new(engine.inner(), sandbox);
         store.limiter(|s: &mut Sandbox| s.limits());
         store.set_fuel(limits.fuel).map_err(HookError::from_call)?;

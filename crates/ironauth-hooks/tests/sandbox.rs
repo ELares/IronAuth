@@ -27,6 +27,7 @@ const WALL_CLOCK_ESCAPE: &str = env!("IRONAUTH_GUEST_WALL_CLOCK_ESCAPE");
 const MONOTONIC_READER: &str = env!("IRONAUTH_GUEST_MONOTONIC_READER");
 const DECLINER: &str = env!("IRONAUTH_GUEST_DECLINER");
 const SECRET_READER: &str = env!("IRONAUTH_GUEST_SECRET_READER");
+const FETCHER: &str = env!("IRONAUTH_GUEST_FETCHER");
 const SLEEPER: &str = env!("IRONAUTH_GUEST_SLEEPER");
 const RANDOM_ESCAPE: &str = env!("IRONAUTH_GUEST_RANDOM_ESCAPE");
 const FS_ESCAPE: &str = env!("IRONAUTH_GUEST_FS_ESCAPE");
@@ -882,5 +883,95 @@ fn a_hook_reads_only_the_secrets_it_was_granted() {
         Some("null"),
         "a hook granted nothing reads nothing, which is what every other capability here does \
          by default: {claims:?}"
+    );
+}
+
+/// A HOOK WITHOUT THE HTTP CAPABILITY CANNOT FETCH, AND ONE WITH IT IS BOUNDED BY ITS BUDGET.
+///
+/// Issue #114 criterion 2, both halves. The first is already true of the SOCKET path -- a guest
+/// importing `wasi:sockets` cannot start at all, which `a_guest_that_opens_a_socket_cannot_start`
+/// pins -- but that is a hook reaching around the host. This is the granted door: a hook that
+/// asks the host politely and is refused.
+///
+/// # Why the budget is a count and why that is what "deterministic" means
+///
+/// The refusal is decided by a counter this host owns, BEFORE any transport is reached, so it
+/// does not depend on the network, on timing, or on what a remote end does. A budget expressed
+/// in seconds would not be: the same hook would pass on a fast day. The transport here is a
+/// closure that counts calls and returns a fixed body -- so what this test measures is the
+/// arithmetic, and a real transport would measure the arithmetic and the internet.
+///
+/// # The three assertions
+///
+/// UNGRANTED: every attempt is refused, and the refusal says "not granted" rather than
+/// "exhausted". Those are different facts about a hook and an author debugging one must not be
+/// shown the other. The transport is never reached -- asserted by its own counter, because a
+/// refusal that still called out would have already done the thing it refused.
+///
+/// GRANTED TWO OF THE THREE THE GUEST ATTEMPTS: the first two succeed and the third is refused,
+/// which is the BOUNDARY. A test that granted three, or zero, could not see it.
+///
+/// AND THE TRANSPORT RAN EXACTLY TWICE, which is the half the guest's own claims cannot show: a
+/// host that spent the budget but called out anyway would report the same three claims.
+#[test]
+fn a_hook_cannot_fetch_unless_granted_and_is_bounded_by_its_budget() {
+    let engine = HookEngine::new().expect("build the engine");
+    let hook = engine.load(&guest(FETCHER)).expect("the fetcher loads");
+
+    // UNGRANTED.
+    let customization = hook
+        .customize(&engine, &Limits::claim_shaping(), &request())
+        .expect("the hook runs; a refused fetch is not a fault");
+    let claims = &customization.access_token_claims;
+    for attempt in 1..=3 {
+        let reported = claim(claims, &format!("fetch_{attempt}")).unwrap_or_default();
+        assert!(
+            reported.contains("not granted"),
+            "attempt {attempt} must be refused as UNGRANTED, which is a different fact from a \
+             spent budget: {reported}"
+        );
+    }
+
+    // GRANTED TWO, of the three the guest attempts.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counter = std::sync::Arc::clone(&calls);
+    let transport: ironauth_hooks::FetchTransport = Box::new(move |_url| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ironauth_hooks::FetchOutcome {
+            status: 200,
+            body: "upstream".to_owned(),
+        })
+    });
+    let customization = hook
+        .customize_with_grants(
+            &engine,
+            &Limits::claim_shaping(),
+            &request(),
+            std::collections::BTreeMap::new(),
+            Some((2, transport)),
+        )
+        .expect("the hook runs");
+    let claims = &customization.access_token_claims;
+    for attempt in 1..=2 {
+        let reported = claim(claims, &format!("fetch_{attempt}")).unwrap_or_default();
+        assert!(
+            reported.contains("ok:200:upstream"),
+            "attempt {attempt} is within the budget and must reach the transport: {reported}"
+        );
+    }
+    let third = claim(claims, "fetch_3").unwrap_or_default();
+    assert!(
+        third.contains("request budget exhausted"),
+        "the third attempt is past the budget and must be refused for THAT reason: {third}"
+    );
+
+    // AND THE TRANSPORT RAN EXACTLY TWICE.
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a refused attempt must not reach the transport at all -- the refusal RETURNS rather \
+         than calling out and discarding the answer, because a host that called out first would \
+         already have done the thing it refused. The guest's own claims cannot show this: a \
+         host that spent the budget and called out anyway reports the same three"
     );
 }
