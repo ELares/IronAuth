@@ -914,6 +914,22 @@ async fn next_challenge_render(
     }
 }
 
+/// The transport a flow is on, from the row rather than assumed (issue #114 criterion 6).
+///
+/// `run_step_executor` is not handed a transport, and the first version of the custom-factor arm
+/// passed `Transport::Browser` for want of one. That is not cosmetic: `push_flow_hidden` emits
+/// the hidden `flow` node ONLY for a browser flow, so an API flow would have been rendered a node
+/// its client never posts back and the envelope would have disagreed with every other API render.
+/// `mfa.rs` and `profiling.rs` each derive it from the record the same way.
+#[cfg(feature = "wasm-hooks")]
+fn challenge_transport(record: &FlowRecord) -> Transport {
+    if record.transport == Transport::Api.as_str() {
+        Transport::Api
+    } else {
+        Transport::Browser
+    }
+}
+
 /// The context a custom factor is told about the flow it is running in (issue #114 criterion 6).
 ///
 /// NO SESSION, NO TOKENS, NO CREDENTIALS, which is the WIT contract's own posture: a factor
@@ -926,10 +942,17 @@ fn challenge_context(scratch: &PersistedState) -> ironauth_hooks::ChallengeConte
     ironauth_hooks::ChallengeContext {
         payload_version: 1,
         subject: scratch.subject.clone(),
-        // THE CLIENT IS NOT ON THE SCRATCH, and a factor that needs it reads it from a granted
-        // secret or its own configuration. Threading it here would mean widening the persisted
-        // state for a value the flow already knows but does not store, and this arm can be
-        // revisited when a factor needs it.
+        // ALWAYS EMPTY TODAY, and said plainly rather than left to look populated.
+        //
+        // `FlowRecord` carries no client id -- a flow is per journey, not per client -- so there
+        // is nothing here to put in it. A component MUST NOT branch on this field: it will read
+        // the empty string for every login, so a factor that meant to serve two clients
+        // differently would silently treat them the same.
+        //
+        // The field stays in the context because removing it would be a breaking change to a
+        // published world, and because the flow is the only thing that cannot supply it: an
+        // issuance-time world could. A factor that needs to vary by client reads a granted secret
+        // instead, which is per component and per environment.
         client_id: String::new(),
         round: scratch.challenge_round,
         previous_passed: scratch.challenge_passed,
@@ -984,7 +1007,7 @@ async fn run_step_executor(
                 // step without entering it, or a second submission raced the first. Neither
                 // proves anything, and re-rendering would need a round this flow does not have.
                 return Ok(StepOutcome::Render {
-                    nodes: custom_challenge::refused_nodes(Transport::Browser, &record.id),
+                    nodes: custom_challenge::refused_nodes(challenge_transport(record), &record.id),
                     messages: Vec::new(),
                     state_override: None,
                 });
@@ -1008,7 +1031,7 @@ async fn run_step_executor(
                     state,
                     scope,
                     factor,
-                    Transport::Browser,
+                    challenge_transport(record),
                     &record.id,
                     challenge_context(scratch),
                     custom_challenge::Call::Verify {
@@ -1031,8 +1054,15 @@ async fn run_step_executor(
             // answer returned `Advance`, the walk took this step's outgoing edge, and the login
             // completed. `define` must see every verdict, which is why this re-enters the same
             // decision procedure the entry hop uses rather than routing onward.
-            match next_challenge_render(state, scope, step, Transport::Browser, &record.id, scratch)
-                .await?
+            match next_challenge_render(
+                state,
+                scope,
+                step,
+                challenge_transport(record),
+                &record.id,
+                scratch,
+            )
+            .await?
             {
                 None => Ok(StepOutcome::Advance {
                     signals: SignalSet::new(),

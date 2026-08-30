@@ -320,6 +320,17 @@ async fn a_deployed_custom_factor_gates_a_real_login_and_completes_after_two_rou
         "the engine rendered the field the COMPONENT named, which it has never heard of: \
          {names:?}"
     );
+    // THE TRANSPORT COMES FROM THE FLOW ROW, not from an assumption.
+    //
+    // `push_flow_hidden` emits the hidden `flow` node ONLY for a browser flow, and this whole
+    // file drives the API transport. The submission executor is not handed a transport, so the
+    // first version of that arm passed `Transport::Browser` for want of one -- and every test
+    // here still passed, because none of them looked. This is the assertion that looks.
+    assert!(
+        !names.iter().any(|name| name == "flow"),
+        "an API flow must not be rendered the browser-only hidden `flow` node: the executor \
+         derives the transport from the record rather than assuming one: {names:?}"
+    );
 
     // ROUND ONE. The test knows the word because it configured the secret, which is exactly the
     // knowledge a real user has out of band and the engine does not.
@@ -344,11 +355,24 @@ async fn a_deployed_custom_factor_gates_a_real_login_and_completes_after_two_rou
         "this factor wants TWO rounds, so one correct answer must not complete the login -- a \
          factor whose round count the engine decided would complete here: {after_first}"
     );
+    let second_round = node_names(&after_first["flow"]);
     assert!(
-        node_names(&after_first["flow"])
-            .iter()
-            .any(|n| n == "wordmark"),
+        second_round.iter().any(|n| n == "wordmark"),
         "and it rendered the second round: {after_first}"
+    );
+    // THE SUBMISSION RENDER DERIVES ITS TRANSPORT FROM THE FLOW ROW.
+    //
+    // Asserted HERE and not on the first render, and the difference is the whole point: the
+    // entry render is built by the walk, which is handed a transport; the SUBMISSION render is
+    // built by the executor, which is not. The first version of that arm passed
+    // `Transport::Browser` for want of one, and `push_flow_hidden` emits the hidden `flow` node
+    // only for a browser flow -- so an API flow was rendered a node its client never posts back.
+    //
+    // This assertion started on the FIRST render and the mutant survived, because that render
+    // was never wrong. A test of the wrong hop is not a weaker test, it is a different one.
+    assert!(
+        !second_round.iter().any(|n| n == "flow"),
+        "an API flow must not be rendered the browser-only hidden `flow` node: {second_round:?}"
     );
 
     // ROUND TWO.
