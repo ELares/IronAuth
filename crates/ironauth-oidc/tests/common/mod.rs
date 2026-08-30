@@ -2394,6 +2394,24 @@ impl Harness {
             .count()
     }
 
+    /// The audit rows in the harness scope whose action equals `action`, oldest first.
+    ///
+    /// The rows and not their count, because a count cannot see what the row SAYS: whether it
+    /// names the right target, and whether its detail carries a number an operator can act on.
+    /// Review found that exact gap in this milestone once already -- an entry count that passed
+    /// while the entry said nothing.
+    pub async fn audit_rows_for_action(&self, action: &str) -> Vec<ironauth_store::AuditRecord> {
+        self.store()
+            .scoped(self.scope)
+            .audit()
+            .list()
+            .await
+            .expect("list audit")
+            .into_iter()
+            .filter(|row| row.action == action)
+            .collect()
+    }
+
     /// Resolve a presented refresh token's live state in the harness scope (issue
     /// #21), for asserting rotation, supersession, and family revocation.
     pub async fn resolve_refresh(

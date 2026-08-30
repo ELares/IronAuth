@@ -1385,11 +1385,59 @@ async fn a_hook_refused_a_protected_claim_is_audited_and_a_well_behaved_one_is_n
         Some(&Value::from(true)),
         "the forging hook ran, or the row below is about nothing"
     );
+    let rows: Vec<_> = harness
+        .audit_rows_for_action(ACTION)
+        .await
+        .into_iter()
+        .collect();
     assert_eq!(
-        harness.count_audit_action(ACTION).await,
+        rows.len(),
         1,
         "ONE row: the hook reached for a claim it may not and an auditor can see it happened. \
          One and not several, because a hook refused several names on two tokens is still one \
          operator mistake on one login"
     );
+
+    // AND THE ROW SAYS SOMETHING. A count cannot see whether the row an auditor opens names
+    // the right client or carries a number they can act on -- which is the shape of the defect
+    // review found in this feature's draft-test sibling, where an entry count passed while the
+    // entry said nothing.
+    let row = &rows[0];
+    assert_eq!(
+        row.target_id,
+        harness.client_id().to_string(),
+        "the row names the CLIENT whose deployed code did this, which is who an operator has \
+         to go and talk to: {row:?}"
+    );
+    let detail: Value = serde_json::from_str(
+        row.detail
+            .as_deref()
+            .expect("the row carries its counts, or it says only that something happened"),
+    )
+    .expect("the detail is JSON");
+    assert_eq!(
+        detail["refused"], 5,
+        "EVERY refused name is counted, not just the protected two. `CLAIM_FORGER` returns \
+         `sub`, `iss`, an untrimmed name, an empty one and a 4096-character one -- and the \
+         count is the DEDUPLICATED union across the two tokens, so it is five rather than ten: \
+         {detail}"
+    );
+    assert_eq!(
+        detail["refusals_not_reported"], 0,
+        "and nothing was truncated at this size, so the count above is exact rather than a \
+         floor: {detail}"
+    );
+    // ZERO IS THE ONLY VALUE THIS TEST SEES for that field, and that is a stated limit rather
+    // than a claim. Making it non-zero needs a hook returning more than sixty-four refusals in
+    // one token, which is what `CLAIM_FLOOD` is for -- and that fixture is driven through the
+    // draft endpoint, where the same number is asserted non-zero. What is pinned HERE is that
+    // the audit row carries the field at all and that it reads exact when nothing was dropped.
+    // NO CLAIM NAMES. They are strings chosen by operator code, and `write_audited_detailed`'s
+    // own contract is that detail "is never attacker-controlled free text".
+    for name in ["sub", "iss", "forged_untrimmed"] {
+        assert!(
+            !row.detail.as_deref().unwrap_or_default().contains(name),
+            "the row must not echo `{name}` or any other claim NAME a hook chose: {row:?}"
+        );
+    }
 }

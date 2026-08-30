@@ -393,6 +393,15 @@ pub struct Invocation<'a> {
 /// query: this is not a write on the hot path, it is a write on the path where a hook
 /// misbehaved.
 ///
+/// ITS OWN TRANSACTION, so the row outlives an issuance that fails afterwards. That is the
+/// right way round: the hook DID reach for the claim, and whether the request it was shaping
+/// went on to succeed is a different fact. An auditor reading a refusal has learned something
+/// true either way.
+///
+/// COUNTS AND NOT NAMES is also what keeps this inside the repo's own rule for the `detail`
+/// column -- `write_audited_detailed`'s doc says detail "is never attacker-controlled free
+/// text", and a hook's claim names are exactly that: strings chosen by operator code.
+///
 /// IT DOES NOT FAIL THE LOGIN, and that is a real cost stated rather than hidden. The
 /// alternative is a transient database error turning a successful issuance into a 500 because
 /// the operator's hook misbehaved, which punishes the end user for the operator's bug and
@@ -412,7 +421,13 @@ async fn audit_refusals(
     client_id: &str,
     claims: &HookClaims,
 ) {
-    if claims.refused.is_empty() && claims.refusals_not_reported == 0 {
+    // `refused` ALONE is the whole test, and an earlier version of this guard also required
+    // `refusals_not_reported == 0`. That conjunct could not change the outcome:
+    // `MAX_REFUSALS_REPORTED` is a positive constant, so nothing is counted-but-unreported
+    // until sixty-four names have been reported first, and an empty list with a non-zero
+    // remainder is unreachable. A condition that cannot be false is not defence in depth, it is
+    // a reader being told something is checked when it is not.
+    if claims.refused.is_empty() {
         return;
     }
     let Ok(client) = ironauth_store::ClientId::parse_in_scope(client_id, &scope) else {
