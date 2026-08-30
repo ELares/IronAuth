@@ -11,22 +11,28 @@
 //! COMPILED, a store built, and the hook run once. That is what a deployment pays the first time
 //! a process sees a given hook, and it is the number the criterion bounds at 1 ms.
 //!
-//! It used to be `deserialize + instantiate + call` over a precompiled artifact, and that became
-//! a measurement of a path nothing runs. When issue #114's dispatch landed it did not use the
-//! AOT pair at all: `engine.compile` and `load_precompiled` have zero production callers, and
-//! the request path calls `HookEngine::load`. So this benchmark reported 128 microseconds for a
-//! sequence the server never executes while the shipped one compiled -- measured at 33 ms, which
-//! is 33x the gate it was passing.
+//! # This measurement has moved twice, and both moves were the same rule
 //!
-//! That is the defect this file's own gate exists to prevent, wearing the benchmark instead of
-//! the code, and it is why the cold number is now the compile: a gate is only worth its runner
-//! time if the call sequence it times is the one the server makes.
+//! THE RULE: time the sequence the server makes, whatever that currently is.
 //!
-//! The consequence is that COLD NO LONGER FITS THE 1 ms BOUND, and it should not: compiling is
-//! milliseconds and always was. What the criterion's microsecond claim is about is the
-//! per-invocation cost, which is WARM -- and what makes warm the number a deployment actually
-//! pays is the dispatch's per-process component cache. See `hook-bench-gate.sh` for how the two
-//! are bounded differently now.
+//! It began as `deserialize + instantiate + call` over a precompiled artifact and reported 128
+//! microseconds -- for a path nothing ran. The dispatch that shipped with issue #114 used
+//! `HookEngine::load`, and `compile`/`load_precompiled` had ZERO production callers, so the
+//! benchmark was passing a gate on a sequence the server never executed while the real one
+//! compiled at 33 ms. So cold became the compile, and the gate was raised to 250 ms to match a
+//! truth nobody liked.
+//!
+//! It is the artifact load AGAIN, and the reason is not that the earlier move was wrong: it is
+//! that the fact it rested on has changed. Deploys now precompile and store the artifact, and the
+//! dispatch loads it when its key matches this build -- so `load_precompiled` has production
+//! callers and this sequence is the one a login makes on a cache miss. The cold gate drops from
+//! 250 ms to the criterion's 1 ms with it.
+//!
+//! WHAT THIS DOES NOT MEASURE, said plainly: a row with NO artifact still compiles, and that is
+//! milliseconds. Three things produce one -- a deployment whose admin process has no hook
+//! runtime, a build without `wasm-hooks`, and a rollback, which deliberately stores none. Those
+//! logins pay a compile, and this number is not about them. It is the AOT cold start the
+//! criterion names, on the rows a normal deploy writes.
 //!
 //! Warm is a repeated call on an already-LOADED hook. It is not a repeated call on a shared
 //! instance, and the difference is worth stating because it makes the number look worse than a
@@ -101,13 +107,25 @@ fn main() {
     let limits = Limits::claim_shaping();
     let request = request();
 
+    // THE ARTIFACT, compiled once OUTSIDE the measurement -- because the deploy pays that, not
+    // the login. Measuring the compile here would time the control plane's work and report it as
+    // the request path's, which is precisely the mistake this file's header records.
+    let artifact = engine.compile(&wasm).expect("precompile");
+
     let mut cold_samples = Vec::with_capacity(COLD_ITERATIONS);
     for _ in 0..COLD_ITERATIONS {
         let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement: elapsed time is this benchmark's entire output, and a bench target is not protocol logic (it is not compiled into the server), which is what the rule protects
-        // `load`, which is `Component::new`: the SAME call the dispatch makes on a cache miss.
-        // No `unsafe`, because the dispatch has none either -- the AOT pair measured slower
-        // (34.0 ms against 32.8) and was the only unsafe block in the crate it lived in.
-        let hook = engine.load(&wasm).expect("load");
+        // `load_precompiled + instantiate + call`: the SAME sequence the dispatch makes on a
+        // cache miss for a row whose artifact key matches this build.
+        //
+        // SAFETY: `artifact` is the output of `compile` on this same engine, in this process --
+        // the strongest provenance the unsafe contract can have.
+        #[expect(
+            unsafe_code,
+            reason = "the AOT load is the measured path; the artifact was produced by this \
+                      engine in this process, which is the provenance the contract requires"
+        )]
+        let hook = unsafe { engine.load_precompiled(&artifact) }.expect("load the artifact");
         hook.customize(&engine, &limits, &request).expect("call");
         cold_samples.push(started.elapsed().as_nanos());
     }
