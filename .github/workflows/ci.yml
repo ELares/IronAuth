@@ -707,6 +707,37 @@ jobs:
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
           ./scripts/dev-device-login.sh
+      # Issue #120 criterion 1, the other half: `ironauth login` ITSELF, on a headless host.
+      #
+      # The step above drives the SERVER with curl and proves the protocol. This runs the actual
+      # binary: it reads the user code off the CLI's own stdout (the criterion's "code
+      # displayed"), approves it from a separate session as the second device, and requires the
+      # process to exit 0 -- then asserts the credential really landed by requiring a second
+      # `login` to short circuit, and removes it with `logout`.
+      #
+      # `FLOW_FLAG` IS EMPTY HERE, which is the stronger assertion. The script defaults it to
+      # `--device` so a developer can run it at a desktop, where the host signals report a
+      # browser whatever the environment says. This runner has no display, so the CLI must CHOOSE
+      # the device flow, and the script reads its own announcement of that choice.
+      #
+      # A Secret Service is required and provided below, because the CLI stores its credential in
+      # the platform keychain unconditionally. That is what made this impossible until the
+      # keychain job proved the setup works on this runner.
+      - name: Provide a Secret Service for the CLI's keychain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gnome-keyring libsecret-tools dbus-x11
+          dbus-launch --sh-syntax > "$RUNNER_TEMP/dbus.env"
+          set -a; . "$RUNNER_TEMP/dbus.env"; set +a
+          set +u; printf '\n' | gnome-keyring-daemon --unlock --components=secrets > /dev/null; set -u
+          printf 'seed' | secret-tool store --label='ci seed' service ironauth-ci key seed
+          secret-tool lookup service ironauth-ci key seed
+          echo "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}" >> "$GITHUB_ENV"
+      - name: Assert `ironauth login` completes on a headless host
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          FLOW_FLAG= ./scripts/dev-cli-login.sh
       # Issue #122 criterion 2: a from-scratch reference client, written from the published
       # spec and contract and NOT from the generated SDKs, passes the published conformance
       # suite against the emulator. It runs here because this job already builds the binary

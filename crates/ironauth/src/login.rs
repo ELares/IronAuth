@@ -461,18 +461,50 @@ pub async fn request_token(
 }
 
 /// Tell the user what to do on the other device.
+///
+/// # The code is ALWAYS printed, including when the complete URI carries it
+///
+/// The obvious shape is to print the complete URI instead of the code, since it carries the
+/// code and there is nothing to mistype. RFC 8628 section 3.3.1 asks for the opposite, and the
+/// reason is the cross-device threat rather than typing:
+///
+/// > the client SHOULD display the `user_code` to the user and ask them to verify that it
+/// > matches the `user_code` being displayed on the [approving] device
+///
+/// A user who is walked to an approval page by an attacker's link has one defence, which is
+/// comparing the code on the page against the code their own device showed. A client that never
+/// showed one has taken that defence away, and the OAuth 2.0 for Browser-Based Apps and
+/// cross-device BCP guidance both rest on that comparison being possible.
+///
+/// So the complete URI is still preferred for the link -- there is genuinely nothing to
+/// mistype -- and the code is printed beside it to be checked rather than typed. The wording
+/// differs between the two branches because the user's job differs: enter it, or verify it.
 fn print_instructions(authorization: &DeviceAuthorization) {
-    println!("To sign in, visit:");
-    // The complete URI is preferred when offered: it carries the code, so there is nothing
-    // to mistype.
+    print!("{}", instructions(authorization));
+}
+
+/// The instruction text, BUILT rather than printed, so a test can read it.
+///
+/// Split out for exactly that reason: `print_instructions` went to stdout and nothing could
+/// assert what it said, so the property this function exists to hold -- that the code appears on
+/// both branches -- was unmeasurable. A test that captured stdout would be testing the terminal.
+fn instructions(authorization: &DeviceAuthorization) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("To sign in, visit:\n");
     if let Some(complete) = &authorization.verification_uri_complete {
-        println!("  {complete}");
+        let _ = writeln!(out, "  {complete}");
+        let _ = writeln!(
+            out,
+            "and check the page shows this code: {}",
+            authorization.user_code
+        );
     } else {
-        println!("  {}", authorization.verification_uri);
-        println!("and enter the code: {}", authorization.user_code);
+        let _ = writeln!(out, "  {}", authorization.verification_uri);
+        let _ = writeln!(out, "and enter the code: {}", authorization.user_code);
     }
-    println!();
-    println!("Waiting for approval...");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Waiting for approval...");
+    out
 }
 
 #[cfg(test)]
@@ -765,5 +797,45 @@ mod tests {
             Some(1_000 + 3_600),
             "expiry must be now + expires_in"
         );
+    }
+
+    /// RFC 8628 section 3.3.1: the client SHOULD display the `user_code` and ask the user to
+    /// verify it matches the one on the approving device -- INCLUDING when it offers the
+    /// complete URI, which already carries the code.
+    ///
+    /// The obvious implementation prints the complete URI instead of the code, since there is
+    /// then nothing to mistype, and that is what this shipped. It removes the user's only
+    /// defence against being walked to an approval page by an attacker's link: comparing the
+    /// code on the page against the code their own device showed.
+    ///
+    /// BOTH BRANCHES are asserted. A test over one would pass against exactly the version that
+    /// had the bug, because the bare-URI branch always printed the code.
+    #[test]
+    fn the_user_code_is_displayed_whether_or_not_a_complete_uri_is_offered() {
+        let bare = DeviceAuthorization {
+            device_code: "dev".to_owned(),
+            user_code: "WDJB-MJHT".to_owned(),
+            verification_uri: "https://iss.example/device".to_owned(),
+            verification_uri_complete: None,
+            interval_secs: Some(5),
+            expires_in_secs: 900,
+        };
+        let bare_text = super::instructions(&bare);
+        assert!(bare_text.contains("WDJB-MJHT"), "{bare_text}");
+
+        let complete = DeviceAuthorization {
+            verification_uri_complete: Some(
+                "https://iss.example/device?user_code=WDJB-MJHT".to_owned(),
+            ),
+            ..bare
+        };
+        let complete_text = super::instructions(&complete);
+        assert!(
+            complete_text.contains("shows this code: WDJB-MJHT"),
+            "the code must be displayed for comparison even when the link carries it: \
+             {complete_text}"
+        );
+        // And the WORDING differs, because the user's job differs: enter it, or verify it.
+        assert!(!complete_text.contains("enter the code"), "{complete_text}");
     }
 }

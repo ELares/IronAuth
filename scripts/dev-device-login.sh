@@ -9,11 +9,18 @@
 #
 # The CLI stores its credential in the platform keychain, unconditionally, and it treats a
 # backend error as a failure rather than as "not signed in" (correctly: reporting success on a
-# machine with nothing stored would send the user somewhere worse). The ubuntu runner this job
-# uses has no Secret Service, which this repository has already measured and recorded beside its
-# keychain test, so driving the CLI here would fail on the keychain rather than on anything the
-# device flow does. Making that possible needs a headless credential store, which is its own
-# change.
+# machine with nothing stored would send the user somewhere worse).
+#
+# THIS NOTE USED TO END "the ubuntu runner has no Secret Service ... making that possible needs a
+# headless credential store, which is its own change". That is no longer true, and it was the
+# NOTE that went out of date rather than the code: the `keychain` job now brings a real Secret
+# Service up on the ubuntu runner and round-trips a credential through it. `dev-cli-login.sh`
+# does the CLI half using that same setup, which is a stronger result than a headless store would
+# have been -- a store built for CI proves nothing about the one users get.
+#
+# This script stays as it is. It tests the SERVER side and asserts the poll sequence, which the
+# CLI script does not: a client that polled wrongly would still complete against a server that
+# answered correctly, and only one of the two scripts would notice.
 #
 # The CLI's own defect on this path -- it appended `/device_authorization` and `/token` to
 # `--issuer` while both are served at the deployment root -- IS fixed in this change, and the
